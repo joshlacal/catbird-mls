@@ -1,0 +1,8 @@
+[bindings.swift]
+module_name = "CatbirdMLS"
+ffi_module_name = "CatbirdMLSFFI"
+generate_module_map = true
+
+[bindings.kotlin]
+package_name = "blue.catbird.mls"
+cdylib_name = "catbird_mls"

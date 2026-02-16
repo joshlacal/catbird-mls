@@ -1,0 +1,29 @@
+# Rust
+target/
+Cargo.lock
+
+# Build artifacts
+build/
+*.dylib
+*.so
+*.a
+*.framework
+*.xcframework
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Cargo
+**/*.rs.bk

@@ -1,0 +1,182 @@
+use std::str::Utf8Error;
+use thiserror::Error;
+
+/// P2: Comprehensive error enum with detailed variants for better debugging
+#[derive(Error, Debug, uniffi::Error)]
+#[uniffi(flat_error)]
+pub enum MLSError {
+    #[error("Invalid input: {message}")]
+    InvalidInput { message: String },
+
+    #[error("Group not found: {message}")]
+    GroupNotFound { message: String },
+
+    #[error("Invalid key package")]
+    InvalidKeyPackage,
+
+    #[error("Failed to add members: {message}")]
+    AddMembersFailed { message: String },
+
+    #[error("Encryption failed")]
+    EncryptionFailed,
+
+    #[error("Decryption failed")]
+    DecryptionFailed,
+
+    #[error("Serialization error")]
+    SerializationError,
+
+    #[error("OpenMLS error")]
+    OpenMLSError,
+
+    #[error("Invalid group ID")]
+    InvalidGroupId,
+
+    #[error("Secret export failed")]
+    SecretExportFailed,
+
+    #[error("Commit processing failed")]
+    CommitProcessingFailed,
+
+    #[error("Invalid commit")]
+    InvalidCommit,
+
+    #[error("Invalid data")]
+    InvalidData,
+
+    #[error("Context not initialized")]
+    ContextNotInitialized,
+
+    #[error("Context closed - database connections have been released for iOS suspension")]
+    ContextClosed,
+
+    #[error("Wire format policy violation: {message}")]
+    WireFormatPolicyViolation { message: String },
+
+    #[error("Merge failed")]
+    MergeFailed,
+
+    #[error("No matching key package found: {message}")]
+    NoMatchingKeyPackage { message: String },
+
+    #[error("Key package desync detected for conversation {convo_id}: {message}")]
+    KeyPackageDesyncDetected { convo_id: String, message: String },
+
+    #[error("Welcome message already consumed or invalid")]
+    WelcomeConsumed,
+
+    #[error("Storage error")]
+    StorageError,
+
+    #[error("Storage operation failed")]
+    StorageFailed,
+
+    // Member operation errors
+    #[error("Member not found in group: {member_id}")]
+    MemberNotFound { member_id: String },
+
+    #[error("Cannot remove last admin from group")]
+    CannotRemoveLastAdmin,
+
+    #[error("Insufficient permissions: {operation}")]
+    InsufficientPermissions { operation: String },
+
+    // Proposal errors
+    #[error("Invalid proposal reference")]
+    InvalidProposalRef,
+
+    // Lock poisoning error
+    #[error("Internal lock poisoned: {message}")]
+    LockPoisoned { message: String },
+
+    // P2: Additional error variants for FFI with detailed context
+    /// Null pointer passed where non-null was expected
+    #[error("Null pointer: {0}")]
+    NullPointer(&'static str),
+
+    /// Invalid context handle
+    #[error("Invalid context handle")]
+    InvalidContext,
+
+    /// TLS codec error with details
+    #[error("TLS codec error: {0}")]
+    TlsCodec(String),
+
+    /// OpenMLS error with details
+    #[error("OpenMLS: {0}")]
+    OpenMLS(String),
+
+    /// Internal error for unexpected states
+    #[error("Internal error: {0}")]
+    Internal(String),
+
+    /// Invalid UTF-8 string
+    #[error("Invalid UTF-8: {0}")]
+    InvalidUtf8(#[from] Utf8Error),
+
+    /// JSON serialization error
+    #[error("JSON serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    /// Thread safety error (lock contention, etc.)
+    #[error("Thread safety: {0}")]
+    ThreadSafety(String),
+
+    /// Panic occurred (caught at FFI boundary)
+    #[error("Internal panic: {0}")]
+    Panic(String),
+}
+
+impl MLSError {
+    pub fn invalid_input(msg: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            message: msg.into(),
+        }
+    }
+
+    pub fn group_not_found(msg: impl Into<String>) -> Self {
+        Self::GroupNotFound {
+            message: msg.into(),
+        }
+    }
+
+    pub fn wire_format_policy_violation(msg: impl Into<String>) -> Self {
+        Self::WireFormatPolicyViolation {
+            message: msg.into(),
+        }
+    }
+
+    pub fn no_matching_key_package(msg: impl Into<String>) -> Self {
+        Self::NoMatchingKeyPackage {
+            message: msg.into(),
+        }
+    }
+
+    pub fn key_package_desync_detected(
+        convo_id: impl Into<String>,
+        msg: impl Into<String>,
+    ) -> Self {
+        Self::KeyPackageDesyncDetected {
+            convo_id: convo_id.into(),
+            message: msg.into(),
+        }
+    }
+
+    pub fn member_not_found(member_id: impl Into<String>) -> Self {
+        Self::MemberNotFound {
+            member_id: member_id.into(),
+        }
+    }
+
+    pub fn insufficient_permissions(operation: impl Into<String>) -> Self {
+        Self::InsufficientPermissions {
+            operation: operation.into(),
+        }
+    }
+
+    pub fn lock_poisoned(msg: impl Into<String>) -> Self {
+        Self::LockPoisoned {
+            message: msg.into(),
+        }
+    }
+}

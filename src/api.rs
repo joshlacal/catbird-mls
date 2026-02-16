@@ -1,0 +1,4057 @@
+use base64::Engine as _;
+use openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY;
+use openmls::messages::group_info::VerifiableGroupInfo;
+use openmls::prelude::tls_codec::{Deserialize, Serialize};
+use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::signatures::Signer;
+use openmls_traits::storage::StorageProvider;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+// Import StorageId to wrap public keys for storage
+use openmls_basic_credential::StorageId;
+
+use crate::error::MLSError;
+use crate::mls_context::MLSContext as MLSContextInner;
+use crate::types::*;
+
+use crate::keychain::KeychainAccess;
+
+// Helper function to safely truncate strings for display
+fn truncate_str(s: &str, max_len: usize) -> &str {
+    s.get(..max_len).unwrap_or(s)
+}
+
+/// Strip padding from ciphertext received from the server.
+/// Format: [4-byte BE length][actual MLS ciphertext][zero padding...]
+/// If the data doesn't appear padded, returns it unchanged (MLS handles trailing zeros).
+fn strip_padding(data: &[u8]) -> Vec<u8> {
+    if data.len() < 5 {
+        crate::debug_log!(
+            "[PADDING] strip_padding: data too small ({} bytes), returning as-is",
+            data.len()
+        );
+        return data.to_vec();
+    }
+    let claimed_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    // Length must be positive, fit within buffer, and the first byte after the
+    // prefix must be a valid MLS wire format byte (0..=4).
+    if claimed_len > 0 && claimed_len <= data.len() - 4 && matches!(data[4], 0x00..=0x04) {
+        crate::debug_log!(
+            "[PADDING] strip_padding: stripped padding, claimed_len={}, total={}, output={}",
+            claimed_len,
+            data.len(),
+            claimed_len
+        );
+        data[4..4 + claimed_len].to_vec()
+    } else {
+        crate::debug_log!("[PADDING] strip_padding: no padding detected (claimed_len={}, total={}, byte4=0x{:02x}), returning as-is", claimed_len, data.len(), data.get(4).copied().unwrap_or(0xff));
+        data.to_vec()
+    }
+}
+
+/// Bucket sizes for traffic-analysis-resistant padding.
+const BUCKET_SIZES: [usize; 5] = [512, 1024, 2048, 4096, 8192];
+
+/// Pad ciphertext for sending to the server.
+/// Format: [4-byte BE length][actual MLS ciphertext][zero padding to bucket]
+/// Returns (padded_ciphertext, padded_size).
+fn pad_ciphertext(ciphertext: &[u8]) -> (Vec<u8>, u32) {
+    let actual_len = ciphertext.len();
+    let total_needed = 4 + actual_len; // length prefix + ciphertext
+    let bucket = BUCKET_SIZES
+        .iter()
+        .copied()
+        .find(|&b| b >= total_needed)
+        .unwrap_or_else(|| total_needed.div_ceil(8192) * 8192);
+
+    let mut padded = Vec::with_capacity(bucket);
+    padded.extend_from_slice(&(actual_len as u32).to_be_bytes());
+    padded.extend_from_slice(ciphertext);
+    padded.resize(bucket, 0);
+    (padded, bucket as u32)
+}
+
+/// MLS context wrapper for FFI
+///
+/// Uses Mutex instead of RwLock because:
+/// - SQLite Connection uses RefCell (requires Send but not Sync)
+/// - Swift actor provides higher-level synchronization
+/// - Per-DID contexts are isolated (no shared state across accounts)
+#[derive(uniffi::Object)]
+pub struct MLSContext {
+    /// Inner context wrapped in Option to allow taking/dropping for database close.
+    /// When close_database() is called, this is set to None to drop the inner
+    /// and release all SQLite file handles (critical for 0xdead10cc prevention).
+    inner: Arc<Mutex<Option<MLSContextInner>>>,
+    credential_validator: Arc<Mutex<Option<Arc<dyn CredentialValidator>>>>,
+    external_join_authorizer: Arc<Mutex<Option<Arc<dyn ExternalJoinAuthorizer>>>>,
+}
+
+impl Drop for MLSContext {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if let Some(ref inner) = *guard {
+                let _ = inner.flush_database();
+            }
+            // Take the inner to drop it and close database connections
+            *guard = None;
+        }
+    }
+}
+
+#[uniffi::export]
+impl MLSContext {
+    /// Create a new context with per-DID SQLite storage
+    ///
+    /// Path should be unique per account, e.g., "{appSupport}/mls-state/{did_hash}.db"
+    /// This stores MLS cryptographic state only - use SQLCipher separately for user content.
+    ///
+    /// The SQLite connection is single-threaded (uses RefCell internally).
+    /// Synchronization is provided by Swift's actor system at a higher level.
+    #[uniffi::constructor]
+    pub fn new(
+        storage_path: String,
+        encryption_key: String,
+        keychain: Box<dyn KeychainAccess>,
+    ) -> Result<Arc<Self>, MLSError> {
+        let context = MLSContextInner::new(storage_path, encryption_key, keychain)?;
+        Ok(Arc::new(Self {
+            inner: Arc::new(Mutex::new(Some(context))),
+            credential_validator: Arc::new(Mutex::new(None)),
+            external_join_authorizer: Arc::new(Mutex::new(None)),
+        }))
+    }
+
+    /// Set the epoch secret storage backend
+    ///
+    /// This MUST be called during initialization before any MLS operations.
+    /// The storage implementation should persist epoch secrets in encrypted storage (SQLCipher).
+    pub fn set_epoch_secret_storage(
+        &self,
+        storage: Box<dyn EpochSecretStorage>,
+    ) -> Result<(), MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] set_epoch_secret_storage: Setting epoch secret storage backend"
+        );
+
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        inner
+            .epoch_secret_manager()
+            .set_storage(Arc::from(storage))?;
+        crate::info_log!("[MLS-FFI] set_epoch_secret_storage: Complete");
+
+        Ok(())
+    }
+
+    /// Flush all pending database writes and CLOSE the database connections.
+    ///
+    /// CRITICAL FOR 0xdead10cc PREVENTION: This method MUST be called when iOS
+    /// is transitioning to background/inactive state. It:
+    /// 1. Flushes all pending SQLite writes to disk
+    /// 2. Performs WAL checkpoint to consolidate data
+    /// 3. CLOSES all database connections by dropping the inner context
+    /// 4. Releases all file handles so iOS doesn't kill the app
+    ///
+    /// After calling this, the context is CLOSED and cannot be used for any operations.
+    /// The Swift side must create a new context if MLS operations are needed again.
+    pub fn flush_and_prepare_close(&self) -> Result<(), MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] flush_and_prepare_close: Starting graceful shutdown with database CLOSE"
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+
+        // Get the inner context (if it exists)
+        if let Some(ref inner) = *guard {
+            // Flush the manifest storage (WAL checkpoint)
+            let _ = inner.flush_database();
+            crate::info_log!("[MLS-FFI] flush_and_prepare_close: Database flushed");
+        }
+
+        // CRITICAL: Take and drop the inner context to CLOSE all database connections
+        // This releases the SQLite file handles that cause 0xdead10cc
+        let dropped = guard.take();
+        if dropped.is_some() {
+            crate::info_log!("[MLS-FFI] flush_and_prepare_close: ✅ Inner context DROPPED - database connections CLOSED");
+        } else {
+            crate::info_log!("[MLS-FFI] flush_and_prepare_close: Inner context was already closed");
+        }
+
+        Ok(())
+    }
+
+    /// Perform a launch-time TRUNCATE checkpoint to clear leftover WAL.
+    /// Call once at app startup. Safe to call even if context was just created.
+    /// Tolerates SQLITE_BUSY gracefully.
+    pub fn launch_checkpoint(&self) -> Result<(), MLSError> {
+        crate::info_log!("[MLS-FFI] launch_checkpoint: Starting launch TRUNCATE checkpoint");
+
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        inner.launch_checkpoint()
+    }
+
+    /// Check if this context has been closed.
+    /// Returns true if close_database() or flush_and_prepare_close() has been called.
+    pub fn is_closed(&self) -> bool {
+        if let Ok(guard) = self.inner.lock() {
+            guard.is_none()
+        } else {
+            true // Treat poisoned mutex as closed
+        }
+    }
+
+    /// Set the credential validator callback for client-side validation
+    ///
+    /// This enables the Swift layer to validate credentials before accepting
+    /// group state changes. The validator is called before merging commits.
+    pub fn set_credential_validator(
+        &self,
+        validator: Box<dyn CredentialValidator>,
+    ) -> Result<(), MLSError> {
+        crate::info_log!("[MLS-FFI] set_credential_validator: Setting credential validator");
+
+        let mut validator_lock = self
+            .credential_validator
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+
+        *validator_lock = Some(Arc::from(validator));
+        crate::info_log!("[MLS-FFI] set_credential_validator: Complete");
+
+        Ok(())
+    }
+
+    pub fn set_external_join_authorizer(
+        &self,
+        authorizer: Box<dyn ExternalJoinAuthorizer>,
+    ) -> Result<(), MLSError> {
+        let mut auth_lock = self
+            .external_join_authorizer
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        *auth_lock = Some(Arc::from(authorizer));
+        Ok(())
+    }
+
+    pub fn export_group_info(
+        &self,
+        group_id: Vec<u8>,
+        signer_identity_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let identity = String::from_utf8(signer_identity_bytes)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
+
+        inner.export_group_info(&group_id, &identity)
+    }
+
+    pub fn create_external_commit(
+        &self,
+        group_info_bytes: Vec<u8>,
+        identity_bytes: Vec<u8>,
+    ) -> Result<ExternalCommitResult, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let identity = String::from_utf8(identity_bytes)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
+
+        let (commit_data, group_id) = inner.create_external_commit(&group_info_bytes, &identity)?;
+
+        Ok(ExternalCommitResult {
+            commit_data,
+            group_id,
+        })
+    }
+
+    pub fn create_external_commit_with_psk(
+        &self,
+        group_info_bytes: Vec<u8>,
+        identity_bytes: Vec<u8>,
+        psk_bytes: Vec<u8>,
+    ) -> Result<ExternalCommitResult, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let identity = String::from_utf8(identity_bytes)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
+
+        let (commit_data, group_id) =
+            inner.create_external_commit_with_psk(&group_info_bytes, &identity, &psk_bytes)?;
+
+        Ok(ExternalCommitResult {
+            commit_data,
+            group_id,
+        })
+    }
+
+    /// Discard a pending external join after server rejection
+    ///
+    /// CRITICAL: Call this when the delivery service rejects an external commit.
+    /// Failure to call this leaves orphaned cryptographic material.
+    ///
+    /// # Arguments
+    /// * `group_id` - Group identifier from create_external_commit result
+    ///
+    /// # Returns
+    /// Ok(()) on success, error if group not found
+    pub fn discard_pending_external_join(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        crate::info_log!("[MLS-FFI] discard_pending_external_join: Starting cleanup");
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        inner.discard_pending_external_join(&group_id)?;
+
+        crate::info_log!("[MLS-FFI] discard_pending_external_join: Complete");
+        Ok(())
+    }
+
+    pub fn create_group(
+        &self,
+        identity_bytes: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        crate::info_log!("[MLS-FFI] create_group: Starting");
+        crate::debug_log!("[MLS-FFI] Identity bytes: {} bytes", identity_bytes.len());
+
+        let mut guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let identity = String::from_utf8(identity_bytes).map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Invalid UTF-8 in identity: {:?}", e);
+            MLSError::invalid_input("Invalid UTF-8")
+        })?;
+        crate::debug_log!("[MLS-FFI] Identity: {}", identity);
+
+        let group_config = config.unwrap_or_default();
+        crate::debug_log!("[MLS-FFI] Group config - max_past_epochs: {}, out_of_order_tolerance: {}, maximum_forward_distance: {}",
+            group_config.max_past_epochs, group_config.out_of_order_tolerance, group_config.maximum_forward_distance);
+
+        let group_id = inner.create_group(&identity, group_config)?;
+        crate::info_log!(
+            "[MLS-FFI] Group created successfully, ID: {}",
+            hex::encode(&group_id)
+        );
+
+        // 🔒 CRITICAL: Force database flush after group creation
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ⚠️ WARNING: Failed to flush database after group creation: {:?}",
+                e
+            );
+            e
+        })?;
+
+        // Signal-style budget checkpoint: keep WAL perpetually small
+        inner.maybe_truncate_checkpoint();
+        crate::debug_log!("[MLS-FFI] ✅ Database flushed after group creation");
+
+        Ok(GroupCreationResult {
+            group_id: group_id.to_vec(),
+        })
+    }
+
+    /// Async variant of create_group - offloads crypto work to avoid blocking
+    pub async fn create_group_async(
+        &self,
+        identity_bytes: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        let inner = self.inner.clone();
+
+        tokio::task::spawn_blocking(move || {
+            crate::info_log!("[MLS-FFI-ASYNC] create_group_async: Starting");
+
+            let mut guard = inner.lock().map_err(|e| {
+                crate::error_log!(
+                    "[MLS-FFI-ASYNC] ERROR: Failed to acquire write lock: {:?}",
+                    e
+                );
+                MLSError::ContextNotInitialized
+            })?;
+            let inner_ctx = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+            let identity = String::from_utf8(identity_bytes)
+                .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
+
+            let group_config = config.unwrap_or_default();
+            let group_id = inner_ctx.create_group(&identity, group_config)?;
+
+            inner_ctx.flush_database().map_err(|e| {
+                crate::error_log!("[MLS-FFI-ASYNC] ⚠️ Failed to flush database: {:?}", e);
+                e
+            })?;
+
+            // Signal-style budget checkpoint: keep WAL perpetually small
+            inner_ctx.maybe_truncate_checkpoint();
+
+            crate::info_log!(
+                "[MLS-FFI-ASYNC] Group created successfully: {}",
+                hex::encode(&group_id)
+            );
+
+            Ok(GroupCreationResult {
+                group_id: group_id.to_vec(),
+            })
+        })
+        .await
+        .map_err(|e| {
+            crate::error_log!("[MLS-FFI-ASYNC] ERROR: spawn_blocking join error: {:?}", e);
+            MLSError::OpenMLSError
+        })?
+    }
+
+    pub fn add_members(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+    ) -> Result<AddMembersResult, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        crate::debug_log!(
+            "[MLS] add_members: Processing {} key packages",
+            key_packages.len()
+        );
+        for (i, kp) in key_packages.iter().enumerate() {
+            crate::debug_log!("[MLS] KeyPackage {}: {} bytes", i, kp.data.len());
+        }
+
+        // Deserialize key packages from TLS format
+        // Try both MlsMessage-wrapped format and raw KeyPackage format
+        let kps: Vec<KeyPackage> = key_packages
+            .iter()
+            .enumerate()
+            .map(|(idx, kp_data)| {
+                crate::debug_log!("[MLS] Deserializing key package {}: {} bytes, first 16 bytes = {:02x?}",
+                    idx, kp_data.data.len(), &kp_data.data[..kp_data.data.len().min(16)]);
+
+                // First try: MlsMessage-wrapped format (server might send this)
+                if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
+                    crate::debug_log!("[MLS] Key package {} deserialized as MlsMessage", idx);
+                    match mls_msg.extract() {
+                        MlsMessageBodyIn::KeyPackage(kp_in) => {
+                            crate::debug_log!("[MLS] Extracted KeyPackage from MlsMessage");
+                            return kp_in.validate(inner.provider_crypto(), ProtocolVersion::default())
+                                .map_err(|e| {
+                                    crate::error_log!("[MLS] Key package {} validation failed: {:?}", idx, e);
+                                    MLSError::InvalidKeyPackage
+                                });
+                        }
+                        other => {
+                            crate::debug_log!("[MLS] MlsMessage contained unexpected type: {:?}, trying raw format",
+                                std::mem::discriminant(&other));
+                        }
+                    }
+                }
+
+                // Second try: Raw KeyPackage format
+                crate::debug_log!("[MLS] Trying raw KeyPackage deserialization for key package {}", idx);
+                let (kp_in, remaining) = KeyPackageIn::tls_deserialize_bytes(&kp_data.data)
+                    .map_err(|e| {
+                        crate::error_log!("[MLS] Both deserialization methods failed for key package {}: {:?}", idx, e);
+                        MLSError::SerializationError
+                    })?;
+
+                crate::debug_log!("[MLS] Key package {} deserialized as raw KeyPackage ({} bytes remaining)", idx, remaining.len());
+
+                // Validate the key package
+                kp_in.validate(inner.provider_crypto(), ProtocolVersion::default())
+                    .map_err(|e| {
+                        crate::error_log!("[MLS] Key package {} validation failed: {:?}", idx, e);
+                        MLSError::InvalidKeyPackage
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if kps.is_empty() {
+            return Err(MLSError::InvalidKeyPackage);
+        }
+
+        // Deduplicate key packages by signature key.
+        // Multiple uploads from the same device produce different hashes but identical
+        // signature keys. OpenMLS requires unique signature keys in add_members proposals.
+        let original_count = kps.len();
+        let kps: Vec<KeyPackage> = {
+            let mut seen_sig_keys = std::collections::HashSet::new();
+            let mut deduped = Vec::new();
+            for kp in kps {
+                let sig_key_hex = hex::encode(kp.leaf_node().signature_key().as_slice());
+                let identity_str =
+                    String::from_utf8_lossy(kp.leaf_node().credential().serialized_content());
+                if seen_sig_keys.insert(sig_key_hex.clone()) {
+                    crate::debug_log!(
+                        "[MLS-FFI] KeyPackage kept: identity={}, sig_key={}...",
+                        identity_str,
+                        &sig_key_hex[..sig_key_hex.len().min(16)]
+                    );
+                    deduped.push(kp);
+                } else {
+                    crate::warn_log!("[MLS-FFI] Dedup: dropping key package with duplicate signature key for {} (sig: {}...)",
+                        identity_str, &sig_key_hex[..sig_key_hex.len().min(16)]);
+                }
+            }
+            deduped
+        };
+        if kps.len() < original_count {
+            crate::info_log!("[MLS-FFI] Deduplicated key packages by signature key: {} → {} (removed {} same-device duplicates)",
+                original_count, kps.len(), original_count - kps.len());
+        }
+
+        if kps.is_empty() {
+            crate::error_log!("[MLS-FFI] All key packages had duplicate signature keys - no valid packages remain");
+            return Err(MLSError::InvalidKeyPackage);
+        }
+
+        let gid = GroupId::from_slice(&group_id);
+
+        // 🔍 DEBUG: Inspect key package details for Welcome secrets debugging
+        crate::debug_log!("[MLS-FFI] 🔍 Key package details:");
+        for (idx, kp) in kps.iter().enumerate() {
+            crate::debug_log!("[MLS-FFI]   KeyPackage[{}]:", idx);
+            crate::debug_log!("[MLS-FFI]     - Cipher suite: {:?}", kp.ciphersuite());
+            crate::debug_log!(
+                "[MLS-FFI]     - Credential identity: {} bytes",
+                kp.leaf_node().credential().serialized_content().len()
+            );
+
+            // Check key package capabilities - specifically extensions
+            let kp_capabilities = kp.leaf_node().capabilities();
+            let kp_extensions: Vec<String> = kp_capabilities
+                .extensions()
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect();
+            crate::debug_log!(
+                "[MLS-FFI]     - Supported extensions: [{}]",
+                kp_extensions.join(", ")
+            );
+        }
+
+        let (commit_data, welcome_data) = inner.with_group(&gid, |group, provider, signer| {
+            // 🔍 DEBUG: List ALL current group members
+            crate::debug_log!("[MLS-FFI] 🔍 Current group members:");
+            for (idx, member) in group.members().enumerate() {
+                let credential = member.credential.serialized_content();
+                let identity = String::from_utf8_lossy(credential);
+                crate::debug_log!("[MLS-FFI]   Member[{}]: {}", idx, identity);
+                crate::debug_log!("[MLS-FFI]            Raw credential: {}", hex::encode(credential));
+            }
+
+            // 🔍 DEBUG: Show FULL credentials of incoming key packages
+            crate::debug_log!("[MLS-FFI] 🔍 Incoming key packages full credentials:");
+            for (idx, kp) in kps.iter().enumerate() {
+                let credential = kp.leaf_node().credential().serialized_content();
+                let identity = String::from_utf8_lossy(credential);
+                crate::debug_log!("[MLS-FFI]   KeyPackage[{}]: {}", idx, identity);
+                crate::debug_log!("[MLS-FFI]                 Raw: {}", hex::encode(credential));
+            }
+
+            // 🔍 DEBUG: Check for duplicate credentials (self-add or duplicate member)
+            if let Some(own_leaf) = group.own_leaf_node() {
+                let own_credential = own_leaf.credential().serialized_content();
+
+                for (idx, kp) in kps.iter().enumerate() {
+                    let kp_credential = kp.leaf_node().credential().serialized_content();
+
+                    if own_credential == kp_credential {
+                        crate::error_log!("[MLS-FFI] ❌ DUPLICATE DETECTED: KeyPackage[{}] matches group creator!", idx);
+                        crate::error_log!("[MLS-FFI]    This will cause OpenMLS to create empty Welcome with 0 secrets");
+                        return Err(MLSError::invalid_input("Cannot add duplicate identity to group"));
+                    }
+
+                    // Check against all existing members
+                    for (member_idx, member) in group.members().enumerate() {
+                        let member_credential = member.credential.serialized_content();
+                        if kp_credential == member_credential {
+                            crate::error_log!("[MLS-FFI] ❌ DUPLICATE DETECTED: KeyPackage[{}] matches existing Member[{}]!", idx, member_idx);
+                            return Err(MLSError::invalid_input("Member already in group"));
+                        }
+                    }
+                }
+            }
+
+            // 🔍 DEBUG: Check group's required capabilities vs key packages
+            crate::debug_log!("[MLS-FFI] 🔍 Group configuration:");
+            crate::debug_log!("[MLS-FFI]   - Cipher suite: {:?}", group.ciphersuite());
+
+            // Get the group's own leaf node capabilities
+            if let Some(own_leaf) = group.own_leaf_node() {
+                let own_capabilities = own_leaf.capabilities();
+                let group_extensions: Vec<String> = own_capabilities.extensions()
+                    .iter()
+                    .map(|e| format!("{:?}", e))
+                    .collect();
+                crate::debug_log!("[MLS-FFI]   - Own leaf extensions: [{}]", group_extensions.join(", "));
+
+                // Check for capability mismatch
+                for (idx, kp) in kps.iter().enumerate() {
+                    let kp_exts = kp.leaf_node().capabilities().extensions();
+                    let own_exts = own_capabilities.extensions();
+
+                    // Check if key package supports all extensions the group's leaf supports
+                    for ext in own_exts.iter() {
+                        if !kp_exts.contains(ext) {
+                            crate::error_log!("[MLS-FFI]   ❌ CAPABILITY MISMATCH KeyPackage[{}]: Missing extension {:?}", idx, ext);
+                            crate::error_log!("[MLS-FFI]      This may cause Welcome to have no secrets!");
+                        }
+                    }
+                }
+            }
+            // 🔍 DEBUG: Get member count BEFORE adding
+            let member_count_before = group.members().count();
+            crate::debug_log!("[MLS-FFI] 🔍 DEBUG: Member count BEFORE add_members: {}", member_count_before);
+            crate::debug_log!("[MLS-FFI] 🔍 DEBUG: Adding {} key packages", kps.len());
+
+            let (commit, welcome, _group_info) = group
+                .add_members(provider, signer, &kps)
+                .map_err(|e| {
+                    let msg = format!("{:?}", e);
+                    crate::error_log!("[MLS-FFI] ❌ add_members failed: {}", msg);
+                    MLSError::AddMembersFailed { message: msg }
+                })?;
+
+            // 🔍 DEBUG: Verify member count unchanged (expected behavior - commit is staged)
+            let member_count_after = group.members().count();
+            crate::debug_log!("[MLS-FFI] 🔍 DEBUG: Member count AFTER add_members (staged): {}", member_count_after);
+            if member_count_after == member_count_before {
+                crate::debug_log!("[MLS-FFI] ✅ Commit staged correctly (members not added until merge)");
+            } else {
+                crate::error_log!("[MLS-FFI] ❌ UNEXPECTED: Member count changed before merge! Before: {}, After: {}",
+                    member_count_before, member_count_after);
+            }
+
+            // ✅ RATCHET DESYNC FIX: DO NOT merge commit here - use send-then-merge pattern
+            // The commit MUST be sent to the server and acknowledged BEFORE merging locally.
+            // Merging before server acknowledgment causes epoch mismatch and SecretReuseError:
+            //   1. Client merges immediately → advances to epoch 1
+            //   2. Server still at epoch 0
+            //   3. Messages encrypted at epoch 1 can't be decrypted by recipients at epoch 0
+            // The Welcome message contains all necessary secrets even without merging.
+            // Swift layer will call mergePendingCommit() AFTER server confirmation.
+            crate::debug_log!("[MLS-FFI] 🔄 Commit staged (NOT merged) - Swift layer will merge after server ACK");
+            crate::debug_log!("[MLS-FFI] 📊 Current epoch: {} (will advance to {} after merge)", group.epoch().as_u64(), group.epoch().as_u64() + 1);
+
+            // Serialize the commit (MlsMessageOut)
+            let commit_bytes = commit
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+
+            // ✅ CRITICAL FIX: Serialize Welcome WITH MlsMessage wrapper
+            // The receiver expects MlsMessageIn format, not bare Welcome
+            // Both commit and welcome should be serialized as MlsMessageOut
+            crate::debug_log!("[MLS-FFI] 🔄 Serializing Welcome with MlsMessage wrapper");
+
+            let welcome_bytes = welcome
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+
+            crate::debug_log!("[MLS-FFI] ✅ Welcome serialized with wrapper");
+
+            // 🔍 DEBUG: Log key package hash_refs that the Welcome references
+            // These are the hashes the RECEIVER must have in their local storage
+            crate::info_log!("[MLS-WELCOME-DEBUG] 🔍 Welcome created for {} recipient(s):", kps.len());
+            for (idx, kp) in kps.iter().enumerate() {
+                if let Ok(href) = kp.hash_ref(provider.crypto()) {
+                    crate::info_log!("[MLS-WELCOME-DEBUG]   Recipient[{}] key_package hash_ref (computed) = {}",
+                        idx, hex::encode(href.as_slice()));
+                }
+                let identity = String::from_utf8_lossy(kp.leaf_node().credential().serialized_content());
+                crate::info_log!("[MLS-WELCOME-DEBUG]   Recipient[{}] identity = {}", idx, identity);
+                crate::info_log!("[MLS-WELCOME-DEBUG]   Recipient[{}] cipher_suite = {:?}", idx, kp.ciphersuite());
+            }
+
+            // 🔍 DEBUG: Log the actual hash_refs stored INSIDE the Welcome message
+            // (these might differ from the computed ones above if something is wrong)
+            let welcome_inner = welcome.body();
+            if let MlsMessageBodyOut::Welcome(ref w) = welcome_inner {
+                crate::info_log!("[MLS-WELCOME-DEBUG] 🔍 Welcome message contains {} encrypted group secrets:", w.secrets().len());
+                for (idx, egs) in w.secrets().iter().enumerate() {
+                    let embedded_ref = egs.new_member();
+                    crate::info_log!("[MLS-WELCOME-DEBUG]   Welcome-Secret[{}] embedded hash_ref = {}",
+                        idx, hex::encode(embedded_ref.as_slice()));
+                }
+            }
+
+            // 🔍 DEBUG: Inspect Welcome message structure
+            crate::debug_log!("[MLS-FFI] 🔍 Welcome message diagnosis:");
+            crate::debug_log!("[MLS-FFI]   - Total size: {} bytes", welcome_bytes.len());
+            crate::debug_log!("[MLS-FFI]   ✅ Welcome serialized for {} new member(s)", kps.len());
+
+            Ok((commit_bytes, welcome_bytes))
+        })?;
+
+        Ok(AddMembersResult {
+            commit_data,
+            welcome_data,
+        })
+    }
+
+    /// Remove members from the group (cryptographically secure)
+    ///
+    /// Creates a commit with Remove proposals. Follows send-then-merge pattern:
+    /// caller must send commit to server and call merge_pending_commit() after ACK.
+    ///
+    /// # Security Note
+    /// This is the ONLY secure way to remove members. Server-side removal
+    /// does not revoke cryptographic access until the epoch advances.
+    ///
+    /// # Arguments
+    /// * `group_id` - Group identifier
+    /// * `member_identities` - Array of member credentials (DID bytes) to remove
+    ///
+    /// # Returns
+    /// Commit data to send to server (no welcome for removals)
+    ///
+    /// # Errors
+    /// * `InvalidInput` - No valid members found to remove
+    /// * `GroupNotFound` - Group does not exist
+    /// * `OpenMLSError` - OpenMLS operation failed
+    pub fn remove_members(
+        &self,
+        group_id: Vec<u8>,
+        member_identities: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>, MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] remove_members: Removing {} members from group {}",
+            member_identities.len(),
+            hex::encode(&group_id)
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        // Log member identities being removed
+        for (i, identity) in member_identities.iter().enumerate() {
+            crate::debug_log!(
+                "[MLS-FFI] Member[{}]: {}",
+                i,
+                String::from_utf8_lossy(identity)
+            );
+        }
+
+        let commit_data = inner.remove_members_internal(&group_id, &member_identities)?;
+
+        crate::info_log!(
+            "[MLS-FFI] remove_members: Complete, commit size: {} bytes",
+            commit_data.len()
+        );
+
+        Ok(commit_data)
+    }
+
+    /// Propose adding a member (does not commit)
+    ///
+    /// Creates a proposal that can be committed later with commit_pending_proposals.
+    /// This enables multi-admin workflows where proposals accumulate before commit.
+    ///
+    /// # Arguments
+    /// * `group_id` - Group identifier
+    /// * `key_package_data` - Serialized key package of member to add
+    ///
+    /// # Returns
+    /// ProposeResult containing proposal message to send and reference for tracking
+    pub fn propose_add_member(
+        &self,
+        group_id: Vec<u8>,
+        key_package_data: Vec<u8>,
+    ) -> Result<ProposeResult, MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] propose_add_member: Creating add proposal for group {}",
+            hex::encode(&group_id)
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let (msg, ref_bytes) = inner.propose_add_internal(&group_id, &key_package_data)?;
+
+        crate::info_log!(
+            "[MLS-FFI] propose_add_member: Complete, message: {} bytes, ref: {} bytes",
+            msg.len(),
+            ref_bytes.len()
+        );
+
+        Ok(ProposeResult {
+            proposal_message: msg,
+            proposal_ref: ref_bytes,
+        })
+    }
+
+    /// Propose removing a member (does not commit)
+    ///
+    /// Creates a proposal that can be committed later with commit_pending_proposals.
+    ///
+    /// # Arguments
+    /// * `group_id` - Group identifier  
+    /// * `member_identity` - DID bytes of member to remove
+    ///
+    /// # Returns
+    /// ProposeResult containing proposal message to send and reference for tracking
+    ///
+    /// # Errors
+    /// * `MemberNotFound` - Member not in group
+    pub fn propose_remove_member(
+        &self,
+        group_id: Vec<u8>,
+        member_identity: Vec<u8>,
+    ) -> Result<ProposeResult, MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] propose_remove_member: Creating remove proposal for {}",
+            String::from_utf8_lossy(&member_identity)
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let (msg, ref_bytes) = inner.propose_remove_internal(&group_id, &member_identity)?;
+
+        crate::info_log!(
+            "[MLS-FFI] propose_remove_member: Complete, message: {} bytes, ref: {} bytes",
+            msg.len(),
+            ref_bytes.len()
+        );
+
+        Ok(ProposeResult {
+            proposal_message: msg,
+            proposal_ref: ref_bytes,
+        })
+    }
+
+    /// Propose self-update (does not commit)
+    ///
+    /// Creates a proposal to update your own leaf node. Can be committed later
+    /// with commit_pending_proposals, or by another group member.
+    ///
+    /// # Arguments
+    /// * `group_id` - Group identifier
+    ///
+    /// # Returns
+    /// ProposeResult containing proposal message to send and reference for tracking
+    pub fn propose_self_update(&self, group_id: Vec<u8>) -> Result<ProposeResult, MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] propose_self_update: Creating update proposal for group {}",
+            hex::encode(&group_id)
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let (msg, ref_bytes) = inner.propose_self_update_internal(&group_id)?;
+
+        crate::info_log!(
+            "[MLS-FFI] propose_self_update: Complete, message: {} bytes, ref: {} bytes",
+            msg.len(),
+            ref_bytes.len()
+        );
+
+        Ok(ProposeResult {
+            proposal_message: msg,
+            proposal_ref: ref_bytes,
+        })
+    }
+
+    /// Async variant of add_members - offloads crypto work to avoid blocking
+    pub async fn add_members_async(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+    ) -> Result<AddMembersResult, MLSError> {
+        let inner = self.inner.clone();
+
+        tokio::task::spawn_blocking(move || {
+            crate::debug_log!(
+                "[MLS-ASYNC] add_members_async: Processing {} key packages",
+                key_packages.len()
+            );
+
+            let mut guard = inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+            let inner_ctx = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+            // Deserialize and validate key packages
+            let kps: Vec<KeyPackage> = key_packages
+                .iter()
+                .map(|kp_data| {
+                    // Try MlsMessage-wrapped format first
+                    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
+                        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+                            return kp_in
+                                .validate(inner_ctx.provider_crypto(), ProtocolVersion::default())
+                                .map_err(|_| MLSError::InvalidKeyPackage);
+                        }
+                    }
+
+                    // Try raw KeyPackage format
+                    let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(&kp_data.data)
+                        .map_err(|_| MLSError::SerializationError)?;
+
+                    kp_in
+                        .validate(inner_ctx.provider_crypto(), ProtocolVersion::default())
+                        .map_err(|_| MLSError::InvalidKeyPackage)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            if kps.is_empty() {
+                return Err(MLSError::InvalidKeyPackage);
+            }
+
+            let gid = GroupId::from_slice(&group_id);
+
+            let (commit_data, welcome_data) =
+                inner_ctx.with_group(&gid, |group, provider, signer| {
+                    let (commit, welcome, _) =
+                        group.add_members(provider, signer, &kps).map_err(|e| {
+                            crate::error_log!("[MLS-ASYNC] ERROR: Failed to add members: {:?}", e);
+                            MLSError::OpenMLSError
+                        })?;
+
+                    let commit_bytes = commit
+                        .tls_serialize_detached()
+                        .map_err(|_| MLSError::SerializationError)?;
+
+                    let welcome_bytes = welcome
+                        .tls_serialize_detached()
+                        .map_err(|_| MLSError::SerializationError)?;
+
+                    Ok((commit_bytes, welcome_bytes))
+                })?;
+
+            crate::debug_log!("[MLS-ASYNC] add_members_async completed successfully");
+
+            Ok(AddMembersResult {
+                commit_data,
+                welcome_data,
+            })
+        })
+        .await
+        .map_err(|e| {
+            crate::error_log!("[MLS-ASYNC] ERROR: spawn_blocking join error: {:?}", e);
+            MLSError::OpenMLSError
+        })?
+    }
+
+    /// Export the identity key pair for backup/recovery
+    /// This allows the application to store the identity key in a separate secure location (e.g. Keychain)
+    /// to survive app deletion/reinstall.
+    pub fn export_identity_key(&self, identity: String) -> Result<Vec<u8>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let signer = inner
+            .get_signer_for_identity(&identity)
+            .ok_or_else(|| MLSError::invalid_input("Identity not found"))?;
+
+        // Serialize the SignatureKeyPair
+        serde_json::to_vec(&signer).map_err(|_| MLSError::SerializationError)
+    }
+
+    /// Import an identity key pair from backup/recovery
+    /// This restores the identity key into the current storage provider
+    pub fn import_identity_key(&self, identity: String, key_data: Vec<u8>) -> Result<(), MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let signer: SignatureKeyPair =
+            serde_json::from_slice(&key_data).map_err(|_| MLSError::SerializationError)?;
+
+        // Store in provider (HybridStorage will route to Keychain)
+        // We need to extract the public key to use as the key
+        // Assuming SignatureKeyPair has a .public() method or similar
+        // OpenMLS SignatureKeyPair usually has .public() returning SignaturePublicKey
+
+        // Use the provider's write method
+        // Wrap the public key bytes in StorageId which implements SignaturePublicKey trait
+        let storage_id = StorageId::from(signer.public().to_vec());
+        inner
+            .provider
+            .storage()
+            .write_signature_key_pair(&storage_id, &signer)
+            .map_err(|_| MLSError::StorageFailed)?;
+
+        // Register the signer mapping
+        let public_key = signer.public().to_vec();
+        inner.register_signer(&identity, public_key);
+
+        Ok(())
+    }
+
+    /// Create a self-update commit to refresh own leaf node
+    /// This forces epoch advancement and is useful for preventing ratchet desync
+    /// when changing senders (prevents SecretReuseError from concurrent sends in same epoch)
+    ///
+    /// # Arguments
+    /// * `group_id` - Group identifier to update
+    ///
+    /// # Returns
+    /// Commit data to be sent to server (no welcome needed for self-updates)
+    ///
+    /// # Note
+    /// This uses the send-then-merge pattern - caller must merge after server ACK
+    pub fn self_update(&self, group_id: Vec<u8>) -> Result<AddMembersResult, MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] self_update: Starting for group {}",
+            hex::encode(&group_id)
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        let commit_data = inner.with_group(&gid, |group, provider, signer| {
+            crate::debug_log!("[MLS-FFI] Creating self-update commit at epoch {}", group.epoch().as_u64());
+
+            // Create self-update (refreshes own leaf node, forces epoch advancement)
+            let bundle = group
+                .self_update(provider, signer, LeafNodeParameters::builder().build())
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] ❌ self_update failed: {:?}", e);
+                    MLSError::OpenMLSError
+                })?;
+
+            let commit = bundle.commit();
+            let welcome_option = bundle.welcome();
+
+            // ✅ RATCHET DESYNC FIX: DO NOT merge commit here - use send-then-merge pattern
+            crate::debug_log!("[MLS-FFI] ✅ Self-update commit created (NOT merged) - Swift layer will merge after server ACK");
+            crate::debug_log!("[MLS-FFI] 📊 Current epoch: {} (will advance to {} after merge)", group.epoch().as_u64(), group.epoch().as_u64() + 1);
+
+            // Serialize commit
+            let commit_bytes = commit
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+
+            crate::debug_log!("[MLS-FFI] ✅ Self-update commit serialized: {} bytes", commit_bytes.len());
+
+            // Self-updates typically don't produce a welcome (no new members)
+            if welcome_option.is_some() {
+                crate::warn_log!("[MLS-FFI] ⚠️ Unexpected: self_update produced a Welcome message");
+            }
+
+            Ok(commit_bytes)
+        })?;
+
+        crate::info_log!(
+            "[MLS-FFI] self_update: Complete, commit size: {} bytes",
+            commit_data.len()
+        );
+
+        Ok(AddMembersResult {
+            commit_data,
+            welcome_data: Vec::new(), // Self-updates don't produce welcomes
+        })
+    }
+
+    /// Delete an MLS group from storage
+    /// This should be called when a conversation is deleted or the user leaves
+    pub fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+        let group_id_hex = hex::encode(&group_id);
+
+        crate::info_log!("[MLS-FFI] delete_group: Deleting group {}", group_id_hex);
+
+        // Remove from groups HashMap using MLSContextInner method
+        if inner.delete_group(gid.as_slice()) {
+            crate::info_log!("[MLS-FFI] ✅ Removed group from context: {}", group_id_hex);
+            Ok(())
+        } else {
+            crate::warn_log!("[MLS-FFI] ⚠️ Group not found in context: {}", group_id_hex);
+            Err(MLSError::group_not_found(group_id_hex))
+        }
+    }
+
+    pub fn encrypt_message(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+    ) -> Result<EncryptResult, MLSError> {
+        crate::debug_log!("[MLS-FFI] encrypt_message: Starting");
+        crate::debug_log!(
+            "[MLS-FFI] Group ID: {} ({} bytes)",
+            hex::encode(&group_id),
+            group_id.len()
+        );
+        crate::debug_log!("[MLS-FFI] Plaintext size: {} bytes", plaintext.len());
+
+        let mut guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+        crate::debug_log!("[MLS-FFI] GroupId created");
+
+        let ciphertext = inner.with_group(&gid, |group, provider, signer| {
+            // Secret tree state logging BEFORE encryption
+            let epoch_before = group.epoch().as_u64();
+            crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - encrypt_message");
+            crate::debug_log!("[MLS-FFI]   Group: {}", hex::encode(&group_id));
+            crate::debug_log!("[MLS-FFI]   Epoch before: {}", epoch_before);
+            crate::debug_log!("[MLS-FFI]   Operation type: APPLICATION_MESSAGE");
+            crate::debug_log!("[MLS-FFI]   Member count: {}", group.members().count());
+
+            // 🔥 SIGNATURE KEY FORENSICS: Log the signature key being used to sign this message
+            let signer_public_key = signer.public().to_vec();
+            crate::info_log!("🔑 [SIGNATURE KEY FORENSICS - Message Signing]");
+            crate::info_log!("   Public Signature Key (32 bytes): {}", hex::encode(&signer_public_key));
+            crate::info_log!("   ⚠️  This is the ACTUAL key being used to SIGN the outgoing message");
+            crate::info_log!("   ⚠️  Receiver will verify signature using this public key");
+
+            crate::debug_log!("[MLS-FFI] Creating encrypted message...");
+            let msg = group
+                .create_message(provider, signer, &plaintext)
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] ERROR: Failed to create message: {:?}", e);
+                    crate::error_log!("[MLS-FFI] 🔐 SECRET TREE ERROR - encryption failed at epoch {}", epoch_before);
+                    MLSError::EncryptionFailed
+                })?;
+
+            // Secret tree state logging AFTER encryption
+            let epoch_after = group.epoch().as_u64();
+            crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - after encryption");
+            crate::debug_log!("[MLS-FFI]   Epoch after: {}", epoch_after);
+            if epoch_after != epoch_before {
+                crate::warn_log!("[MLS-FFI] ⚠️ UNEXPECTED: Epoch changed during encryption! Before: {}, After: {}", epoch_before, epoch_after);
+            }
+            crate::debug_log!("[MLS-FFI] Message created successfully");
+
+            crate::debug_log!("[MLS-FFI] Serializing message...");
+            msg.tls_serialize_detached()
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] ERROR: Failed to serialize message: {:?}", e);
+                    MLSError::SerializationError
+                })
+        })?;
+
+        crate::debug_log!(
+            "[MLS-FFI] encrypt_message: Completed successfully, ciphertext size: {} bytes",
+            ciphertext.len()
+        );
+        let (padded, padded_size) = pad_ciphertext(&ciphertext);
+        Ok(EncryptResult {
+            ciphertext: padded,
+            padded_size,
+        })
+    }
+
+    /// Async variant of encrypt_message - offloads crypto work to avoid blocking
+    pub async fn encrypt_message_async(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+    ) -> Result<EncryptResult, MLSError> {
+        let inner = self.inner.clone();
+
+        tokio::task::spawn_blocking(move || {
+            crate::debug_log!("[MLS-FFI] encrypt_message_async: Starting on worker thread");
+            crate::debug_log!("[MLS-FFI] Group ID: {} ({} bytes)", hex::encode(&group_id), group_id.len());
+            crate::debug_log!("[MLS-FFI] Plaintext size: {} bytes", plaintext.len());
+
+            let mut guard = inner.lock()
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
+                    MLSError::ContextNotInitialized
+                })?;
+            let inner_ctx = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+            let gid = GroupId::from_slice(&group_id);
+
+            let ciphertext = inner_ctx.with_group(&gid, |group, provider, signer| {
+                let epoch_before = group.epoch().as_u64();
+                crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - encrypt_message_async");
+                crate::debug_log!("[MLS-FFI]   Group: {}", hex::encode(&group_id));
+                crate::debug_log!("[MLS-FFI]   Epoch before: {}", epoch_before);
+                crate::debug_log!("[MLS-FFI]   Operation type: APPLICATION_MESSAGE");
+                crate::debug_log!("[MLS-FFI]   Member count: {}", group.members().count());
+
+                let signer_public_key = signer.public().to_vec();
+                crate::info_log!("🔑 [SIGNATURE KEY FORENSICS - Message Signing (async)]");
+                crate::info_log!("   Public Signature Key (32 bytes): {}", hex::encode(&signer_public_key));
+
+                let msg = group
+                    .create_message(provider, signer, &plaintext)
+                    .map_err(|e| {
+                        crate::error_log!("[MLS-FFI] ERROR: Failed to create message: {:?}", e);
+                        MLSError::EncryptionFailed
+                    })?;
+
+                let epoch_after = group.epoch().as_u64();
+                if epoch_after != epoch_before {
+                    crate::warn_log!("[MLS-FFI] ⚠️ UNEXPECTED: Epoch changed during encryption! Before: {}, After: {}", epoch_before, epoch_after);
+                }
+
+                msg.tls_serialize_detached()
+                    .map_err(|e| {
+                        crate::error_log!("[MLS-FFI] ERROR: Failed to serialize message: {:?}", e);
+                        MLSError::SerializationError
+                    })
+            })?;
+
+            crate::debug_log!("[MLS-FFI] encrypt_message_async: Completed successfully, ciphertext size: {} bytes", ciphertext.len());
+            let (padded, padded_size) = pad_ciphertext(&ciphertext);
+            Ok(EncryptResult { ciphertext: padded, padded_size })
+        })
+        .await
+        .map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: spawn_blocking join error: {:?}", e);
+            MLSError::OpenMLSError
+        })?
+    }
+
+    pub fn decrypt_message(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<DecryptResult, MLSError> {
+        // 🔍 DIAGNOSTIC: Thread tracking
+        let thread_id = std::thread::current().id();
+        let timestamp = std::time::SystemTime::now();
+
+        crate::debug_log!(
+            "[DECRYPT] 🧵 Thread {:?} starting decrypt_message at {:?}",
+            thread_id,
+            timestamp
+        );
+        crate::debug_log!(
+            "[DECRYPT] Group ID: {} ({} bytes)",
+            hex::encode(&group_id),
+            group_id.len()
+        );
+        crate::debug_log!("[DECRYPT] Ciphertext size: {} bytes", ciphertext.len());
+        crate::debug_log!(
+            "[DECRYPT] Ciphertext first 32 bytes: {:02x?}",
+            &ciphertext[..ciphertext.len().min(32)]
+        );
+
+        // 🔍 DIAGNOSTIC: Lock acquisition tracking
+        crate::debug_log!(
+            "[DECRYPT] 🔒 Thread {:?} attempting to acquire lock",
+            thread_id
+        );
+        let lock_start = std::time::SystemTime::now();
+
+        let mut guard = self.inner.lock().map_err(|e| {
+            crate::error_log!(
+                "[DECRYPT] ❌ Thread {:?} failed to acquire lock: {:?}",
+                thread_id,
+                e
+            );
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let lock_duration = lock_start.elapsed().unwrap_or_default();
+        crate::debug_log!(
+            "[DECRYPT] ✅ Thread {:?} acquired lock (waited {:?})",
+            thread_id,
+            lock_duration
+        );
+
+        let gid = GroupId::from_slice(&group_id);
+
+        // Capture epoch manager for staged commit auto-merge
+        let epoch_manager = inner.epoch_secret_manager().clone();
+
+        // Strip padding envelope before MLS deserialization
+        let ciphertext = strip_padding(&ciphertext);
+
+        // Deserialize to peek at message epoch for diagnostics (outside with_group)
+        let (mls_msg, remaining) =
+            MlsMessageIn::tls_deserialize_bytes(&ciphertext).map_err(|e| {
+                crate::error_log!("[DECRYPT] ❌ Failed to deserialize MlsMessage: {:?}", e);
+                MLSError::SerializationError
+            })?;
+        crate::debug_log!(
+            "[DECRYPT] MlsMessage deserialized ({} bytes remaining)",
+            remaining.len()
+        );
+
+        let protocol_msg: ProtocolMessage = mls_msg.try_into().map_err(|e| {
+            crate::error_log!("[DECRYPT] ❌ Failed to convert to ProtocolMessage: {:?}", e);
+            MLSError::DecryptionFailed
+        })?;
+
+        let message_epoch = protocol_msg.epoch().as_u64();
+
+        // 🔍 DIAGNOSTIC: Replay detection check (using per-context storage)
+        // Note: We can't extract generation without processing, so we track by epoch only for now
+        {
+            let group_history = inner
+                .processed_messages
+                .entry(group_id.clone())
+                .or_insert_with(Vec::new);
+
+            // Check if we've seen this exact epoch recently (simple replay detection)
+            let recent_epochs: Vec<u64> = group_history.iter().map(|(e, _)| *e).collect();
+            // Get current epoch from group for comparison
+            let current_epoch = inner
+                .groups
+                .get(&group_id)
+                .map(|gs| gs.group.epoch().as_u64())
+                .unwrap_or(0);
+
+            if recent_epochs.contains(&message_epoch) && message_epoch < current_epoch {
+                crate::error_log!(
+                    "[DECRYPT] 🔴 REPLAY SUSPECTED: Message from epoch {} was already processed!",
+                    message_epoch
+                );
+                crate::error_log!("[DECRYPT]   Current epoch: {}", current_epoch);
+                crate::error_log!("[DECRYPT]   Recent processed epochs: {:?}", recent_epochs);
+            }
+
+            crate::debug_log!(
+                "[DECRYPT] Recently processed epochs for this group: {:?}",
+                recent_epochs
+            );
+        }
+
+        let (plaintext, epoch, sender_credential) = inner.with_group(&gid, |group, provider, _signer| {
+            // 🔍 DIAGNOSTIC: Get current epoch and estimated generation BEFORE processing
+            let current_epoch = group.epoch().as_u64();
+            crate::info_log!("[DECRYPT] 📊 PRE-PROCESSING STATE:");
+            crate::info_log!("[DECRYPT]   Group: {}", hex::encode(&group_id));
+            crate::info_log!("[DECRYPT]   Current epoch: {}", current_epoch);
+            crate::info_log!("[DECRYPT]   Thread: {:?}", thread_id);
+
+            // 🔍 DIAGNOSTIC: Message metadata
+            crate::info_log!("[DECRYPT] 📨 MESSAGE METADATA:");
+            crate::info_log!("[DECRYPT]   Message epoch: {}", message_epoch);
+            crate::info_log!("[DECRYPT]   Message wire format: {:?}", protocol_msg.wire_format());
+
+            // 🔍 DIAGNOSTIC: Epoch mismatch check
+            if message_epoch != current_epoch {
+                crate::warn_log!("[DECRYPT] ⚠️ EPOCH MISMATCH DETECTED!");
+                crate::warn_log!("[DECRYPT]   Message epoch: {}, Group epoch: {}", message_epoch, current_epoch);
+                if message_epoch < current_epoch {
+                    crate::warn_log!("[DECRYPT]   Message is from PAST epoch (likely replayed or delayed)");
+                } else {
+                    crate::warn_log!("[DECRYPT]   Message is from FUTURE epoch (group out of sync)");
+                }
+            }
+
+            crate::debug_log!("[DECRYPT] 🔄 Calling OpenMLS process_message...");
+            let process_start = std::time::SystemTime::now();
+
+            let processed = group
+                .process_message(provider, protocol_msg)
+                .map_err(|e| {
+                    crate::error_log!("[DECRYPT] ❌ OpenMLS process_message FAILED!");
+                    crate::error_log!("[DECRYPT]   Error: {:?}", e);
+                    crate::error_log!("[DECRYPT]   Error type: {}", std::any::type_name_of_val(&e));
+                    crate::error_log!("[DECRYPT]   Message epoch: {}", message_epoch);
+                    crate::error_log!("[DECRYPT]   Group epoch: {}", current_epoch);
+
+                    // Check if this is a SecretReuseError
+                    let error_str = format!("{:?}", e);
+                    if error_str.contains("SecretReuse") {
+                        crate::error_log!("[DECRYPT] 🔴 SECRET REUSE ERROR DETECTED!");
+                        crate::error_log!("[DECRYPT]   This indicates either:");
+                        crate::error_log!("[DECRYPT]   1. Message replay (same message processed twice)");
+                        crate::error_log!("[DECRYPT]   2. Concurrent access (multiple threads racing)");
+                        crate::error_log!("[DECRYPT]   3. Storage corruption (secret tree not persisted correctly)");
+                    }
+
+                    MLSError::DecryptionFailed
+                })?;
+
+            let process_duration = process_start.elapsed().unwrap_or_default();
+            crate::debug_log!("[DECRYPT] ✅ OpenMLS process_message succeeded (took {:?})", process_duration);
+
+            // 🔍 DIAGNOSTIC: Post-processing state
+            let epoch_after = group.epoch().as_u64();
+            crate::info_log!("[DECRYPT] 📊 POST-PROCESSING STATE:");
+            crate::info_log!("[DECRYPT]   Epoch after: {}", epoch_after);
+            if epoch_after != current_epoch {
+                crate::warn_log!("[DECRYPT]   ⚠️ Epoch CHANGED during processing! {} -> {}", current_epoch, epoch_after);
+            }
+
+            // Extract sender credential BEFORE consuming the processed message
+            let sender_cred = processed.credential().clone();
+            let sender_credential = CredentialData {
+                credential_type: format!("{:?}", sender_cred.credential_type()),
+                identity: sender_cred.serialized_content().to_vec(),
+            };
+            crate::debug_log!("[DECRYPT] Sender credential extracted: {} bytes", sender_credential.identity.len());
+
+            match processed.into_content() {
+                ProcessedMessageContent::ApplicationMessage(app_msg) => {
+                    let bytes = app_msg.into_bytes();
+                    crate::debug_log!("[DECRYPT] ApplicationMessage processed: {} bytes", bytes.len());
+                    if !bytes.is_empty() {
+                        crate::debug_log!("[DECRYPT] Plaintext preview: {:?}", String::from_utf8_lossy(&bytes[..bytes.len().min(200)]));
+                    }
+                    Ok((bytes, message_epoch, sender_credential))
+                },
+                ProcessedMessageContent::ProposalMessage(prop) => {
+                    crate::debug_log!("[DECRYPT] ProposalMessage received: {:?}", std::any::type_name_of_val(&prop));
+                    Ok((vec![], message_epoch, sender_credential))
+                },
+                ProcessedMessageContent::ExternalJoinProposalMessage(ext) => {
+                    crate::debug_log!("[DECRYPT] ExternalJoinProposalMessage received: {:?}", std::any::type_name_of_val(&ext));
+                    Ok((vec![], message_epoch, sender_credential))
+                },
+                ProcessedMessageContent::StagedCommitMessage(staged) => {
+                    crate::info_log!("[DECRYPT] StagedCommitMessage received - auto-merging to advance epoch");
+
+                    // Export current epoch secret before merging
+                    if let Err(e) = crate::async_runtime::block_on(
+                        epoch_manager.export_current_epoch_secret(group, provider)
+                    ) {
+                        crate::warn_log!("[DECRYPT] ⚠️ Failed to export epoch secret before merge: {:?}", e);
+                    }
+
+                    let epoch_before = group.epoch().as_u64();
+
+                    // Merge the staged commit to advance the epoch
+                    group.merge_staged_commit(provider, *staged)
+                        .map_err(|e| {
+                            crate::error_log!("[DECRYPT] ❌ Failed to merge staged commit: {:?}", e);
+                            MLSError::MergeFailed
+                        })?;
+
+                    let epoch_after = group.epoch().as_u64();
+                    crate::info_log!("[DECRYPT] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
+
+                    Ok((vec![], epoch_after, sender_credential))
+                },
+            }
+        })?;
+
+        let total_duration = timestamp.elapsed().unwrap_or_default();
+        crate::debug_log!(
+            "[DECRYPT] 🧵 Thread {:?} completed decrypt_message in {:?}",
+            thread_id,
+            total_duration
+        );
+        crate::debug_log!("[DECRYPT] ✅ Plaintext size: {} bytes", plaintext.len());
+
+        // 🔍 DIAGNOSTIC: Record this successful processing (using per-context storage)
+        // Note: We still don't have generation here, but we record the epoch
+        {
+            let group_history = inner
+                .processed_messages
+                .entry(group_id.clone())
+                .or_insert_with(Vec::new);
+
+            // Keep only last 100 messages per group to avoid unbounded growth
+            if group_history.len() >= 100 {
+                group_history.remove(0);
+            }
+
+            // Record (epoch, generation=0) since we don't track generation separately
+            group_history.push((message_epoch, 0));
+            crate::debug_log!(
+                "[DECRYPT] Recorded message processing: epoch {}",
+                message_epoch
+            );
+        }
+
+        // Increment and get sequence number for this group (using per-context storage)
+        let sequence_number = {
+            let counter = inner.sequence_counters.entry(group_id.clone()).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+
+        crate::debug_log!(
+            "[DECRYPT] Message metadata - epoch: {}, sequence_number: {}",
+            epoch,
+            sequence_number
+        );
+
+        Ok(DecryptResult {
+            plaintext,
+            epoch,
+            sequence_number,
+            sender_credential,
+        })
+    }
+
+    /// Async variant of decrypt_message - offloads crypto work to avoid blocking
+    pub async fn decrypt_message_async(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<DecryptResult, MLSError> {
+        let inner = self.inner.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let thread_id = std::thread::current().id();
+            let timestamp = std::time::SystemTime::now();
+
+            crate::debug_log!(
+                "[DECRYPT-ASYNC] 🧵 Thread {:?} starting decrypt_message_async",
+                thread_id
+            );
+            crate::debug_log!(
+                "[DECRYPT-ASYNC] Group ID: {} ({} bytes)",
+                hex::encode(&group_id),
+                group_id.len()
+            );
+            crate::debug_log!(
+                "[DECRYPT-ASYNC] Ciphertext size: {} bytes",
+                ciphertext.len()
+            );
+
+            let mut guard = inner.lock().map_err(|e| {
+                crate::error_log!(
+                    "[DECRYPT-ASYNC] ❌ Thread {:?} failed to acquire lock: {:?}",
+                    thread_id,
+                    e
+                );
+                MLSError::ContextNotInitialized
+            })?;
+            let inner_ctx = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+            let gid = GroupId::from_slice(&group_id);
+
+            let (plaintext, epoch, sender_credential) =
+                inner_ctx.with_group(&gid, |group, provider, _signer| {
+                    let current_epoch = group.epoch().as_u64();
+                    crate::info_log!("[DECRYPT-ASYNC] 📊 PRE-PROCESSING STATE:");
+                    crate::info_log!("[DECRYPT-ASYNC]   Group: {}", hex::encode(&group_id));
+                    crate::info_log!("[DECRYPT-ASYNC]   Current epoch: {}", current_epoch);
+
+                    let ciphertext = strip_padding(&ciphertext);
+
+                    let (mls_msg, _) =
+                        MlsMessageIn::tls_deserialize_bytes(&ciphertext).map_err(|e| {
+                            crate::error_log!("[DECRYPT-ASYNC] ❌ Failed to deserialize: {:?}", e);
+                            MLSError::SerializationError
+                        })?;
+
+                    let protocol_msg: ProtocolMessage = mls_msg.try_into().map_err(|e| {
+                        crate::error_log!("[DECRYPT-ASYNC] ❌ Failed to convert: {:?}", e);
+                        MLSError::DecryptionFailed
+                    })?;
+
+                    let message_epoch = protocol_msg.epoch().as_u64();
+
+                    if message_epoch != current_epoch {
+                        crate::warn_log!(
+                            "[DECRYPT-ASYNC] ⚠️ EPOCH MISMATCH: {} vs {}",
+                            message_epoch,
+                            current_epoch
+                        );
+                    }
+
+                    let processed = group.process_message(provider, protocol_msg).map_err(|e| {
+                        crate::error_log!(
+                            "[DECRYPT-ASYNC] ❌ OpenMLS process_message FAILED: {:?}",
+                            e
+                        );
+                        MLSError::DecryptionFailed
+                    })?;
+
+                    crate::debug_log!("[DECRYPT-ASYNC] ✅ Message processed successfully");
+
+                    // Extract sender credential BEFORE consuming the processed message
+                    let sender_cred = processed.credential().clone();
+                    let sender_credential = CredentialData {
+                        credential_type: format!("{:?}", sender_cred.credential_type()),
+                        identity: sender_cred.serialized_content().to_vec(),
+                    };
+
+                    match processed.into_content() {
+                        ProcessedMessageContent::ApplicationMessage(app_msg) => {
+                            Ok((app_msg.into_bytes(), message_epoch, sender_credential))
+                        }
+                        ProcessedMessageContent::ProposalMessage(_)
+                        | ProcessedMessageContent::ExternalJoinProposalMessage(_)
+                        | ProcessedMessageContent::StagedCommitMessage(_) => {
+                            Ok((vec![], message_epoch, sender_credential))
+                        }
+                    }
+                })?;
+
+            // Increment and get sequence number for this group (using per-context storage)
+            let sequence_number = {
+                let counter = inner_ctx
+                    .sequence_counters
+                    .entry(group_id.clone())
+                    .or_insert(0);
+                *counter += 1;
+                *counter
+            };
+
+            let total_duration = timestamp.elapsed().unwrap_or_default();
+            crate::debug_log!("[DECRYPT-ASYNC] Completed in {:?}", total_duration);
+
+            Ok(DecryptResult {
+                plaintext,
+                epoch,
+                sequence_number,
+                sender_credential,
+            })
+        })
+        .await
+        .map_err(|e| {
+            crate::error_log!("[DECRYPT-ASYNC] ERROR: spawn_blocking join error: {:?}", e);
+            MLSError::OpenMLSError
+        })?
+    }
+
+    pub fn process_message(
+        &self,
+        group_id: Vec<u8>,
+        message_data: Vec<u8>,
+    ) -> Result<ProcessedContent, MLSError> {
+        crate::debug_log!("[MLS-FFI] process_message: Starting");
+        crate::debug_log!(
+            "[MLS-FFI] Group ID: {} ({} bytes)",
+            hex::encode(&group_id),
+            group_id.len()
+        );
+        crate::debug_log!("[MLS-FFI] Message data size: {} bytes", message_data.len());
+        crate::debug_log!(
+            "[MLS-FFI] Message data first 32 bytes: {:02x?}",
+            &message_data[..message_data.len().min(32)]
+        );
+
+        let mut guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+        crate::debug_log!("[MLS-FFI] GroupId created: {}", hex::encode(gid.as_slice()));
+
+        // Capture epoch manager for use inside the closure (for staged commit auto-merge)
+        let epoch_manager = inner.epoch_secret_manager().clone();
+
+        // Capture authorizer
+        let _external_join_authorizer = self
+            .external_join_authorizer
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?
+            .clone();
+
+        inner.with_group(&gid, |group, provider, _signer| {
+            crate::debug_log!("[MLS-FFI] Inside with_group closure for process_message");
+
+            // Strip padding envelope before MLS deserialization
+            let message_data = strip_padding(&message_data);
+
+            // Secret tree state logging BEFORE processing
+            let epoch_before = group.epoch().as_u64();
+            crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - process_message");
+            crate::debug_log!("[MLS-FFI]   Group: {}", hex::encode(&group_id));
+            crate::debug_log!("[MLS-FFI]   Epoch before: {}", epoch_before);
+            crate::debug_log!("[MLS-FFI]   Group ciphersuite: {:?}", group.ciphersuite());
+            crate::debug_log!("[MLS-FFI]   Group members count: {}", group.members().count());
+
+            crate::debug_log!("[MLS-FFI] Deserializing MlsMessage...");
+            let (mls_msg, remaining) = MlsMessageIn::tls_deserialize_bytes(&message_data)
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] ERROR: Failed to deserialize MlsMessage: {:?}", e);
+                    MLSError::SerializationError
+                })?;
+            crate::debug_log!("[MLS-FFI] MlsMessage deserialized ({} bytes remaining)", remaining.len());
+
+            crate::debug_log!("[MLS-FFI] Converting to ProtocolMessage...");
+            let protocol_msg: ProtocolMessage = mls_msg.try_into()
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] ERROR: Failed to convert to ProtocolMessage: {:?}", e);
+                    MLSError::DecryptionFailed
+                })?;
+            crate::debug_log!("[MLS-FFI] ProtocolMessage created");
+            let message_epoch = protocol_msg.epoch();
+            let current_epoch = group.epoch();
+            crate::debug_log!("[MLS-FFI]   Message epoch: {}", message_epoch.as_u64());
+            crate::debug_log!("[MLS-FFI]   Current epoch: {}", current_epoch.as_u64());
+            crate::debug_log!("[MLS-FFI]   Protocol message content type: {:?}", std::any::type_name_of_val(&protocol_msg));
+
+            // Check for epoch mismatch BEFORE attempting to decrypt
+            if message_epoch != current_epoch {
+                // 🔍 FIX #1: Enhanced epoch transition detection
+                // Distinguish between "future epoch" (might be a commit we need) vs "past epoch" (unrecoverable)
+                let msg_epoch = message_epoch.as_u64();
+                let cur_epoch = current_epoch.as_u64();
+                
+                if msg_epoch == cur_epoch + 1 {
+                    // This could be an epoch-advancing Commit message we need to process
+                    crate::warn_log!("[MLS-FFI] 📥 POTENTIAL EPOCH TRANSITION MESSAGE DETECTED!");
+                    crate::warn_log!("[MLS-FFI]   Message epoch: {} (current: {})", msg_epoch, cur_epoch);
+                    crate::warn_log!("[MLS-FFI]   ⚠️  This message MAY transition epoch {} → {}", cur_epoch, msg_epoch);
+                    crate::warn_log!("[MLS-FFI]   ⚠️  If this is a Commit from another member, it MUST be processed to stay in sync");
+                    crate::warn_log!("[MLS-FFI]   ⚠️  Attempting to process anyway - OpenMLS will handle if it's a valid Commit");
+                    // Let it through - OpenMLS can process Commits that advance the epoch
+                } else if msg_epoch > cur_epoch + 1 {
+                    // Message is from too far in the future - we missed commits
+                    crate::error_log!("[MLS-FFI] 🚨 EPOCH GAP DETECTED - MISSED COMMITS!");
+                    crate::error_log!("[MLS-FFI]   Message epoch: {} (current: {})", msg_epoch, cur_epoch);
+                    crate::error_log!("[MLS-FFI]   Missing {} epochs worth of commits", msg_epoch - cur_epoch);
+                    crate::error_log!("[MLS-FFI]   Client needs to sync commits from server before processing");
+                    return Err(MLSError::invalid_input(format!(
+                        "Cannot decrypt message from epoch {} - group is at epoch {} (missing {} commits - sync required)",
+                        msg_epoch, cur_epoch, msg_epoch - cur_epoch
+                    )));
+                } else {
+                    // Message is from the past - forward secrecy prevents decryption
+                    crate::warn_log!("[MLS-FFI] ⚠️ OLD EPOCH MESSAGE - Forward secrecy prevents decryption");
+                    crate::debug_log!("[MLS-FFI]   Message epoch: {} (current: {})", msg_epoch, cur_epoch);
+                    crate::debug_log!("[MLS-FFI]   Epoch keys were deleted after advancing past epoch {}", msg_epoch);
+                    crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - epoch mismatch rejection");
+                    return Err(MLSError::invalid_input(format!(
+                        "Cannot decrypt message from epoch {} - group is at epoch {} (forward secrecy prevents decrypting old epochs)",
+                        msg_epoch, cur_epoch
+                    )));
+                }
+            }
+
+            crate::debug_log!("[MLS-FFI] Calling OpenMLS process_message...");
+            let processed = group
+                .process_message(provider, protocol_msg)
+                .map_err(|e| {
+                    let error_details = format!("{:?}", e);
+                    crate::error_log!("[MLS-FFI] ERROR: OpenMLS process_message failed!");
+                    crate::error_log!("[MLS-FFI] ERROR: Error details: {}", error_details);
+                    crate::error_log!("[MLS-FFI] ERROR: Error type: {}", std::any::type_name_of_val(&e));
+                    crate::error_log!("[MLS-FFI] ERROR: Current epoch: {:?}", group.epoch());
+                    crate::error_log!("[MLS-FFI] 🔐 SECRET TREE ERROR - decryption failed");
+                    // CRITICAL FIX: Include error details so Swift can detect specific error types
+                    // (e.g., epoch mismatch, SecretTreeError, etc.)
+                    MLSError::OpenMLS(format!("process_message failed: {}", error_details))
+                })?;
+
+            // Secret tree state logging AFTER processing
+            let epoch_after = group.epoch().as_u64();
+            crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - after process_message");
+            crate::debug_log!("[MLS-FFI]   Epoch after: {}", epoch_after);
+            if epoch_after != epoch_before {
+                crate::debug_log!("[MLS-FFI]   Epoch changed from {} to {} during process", epoch_before, epoch_after);
+            }
+            crate::debug_log!("[MLS-FFI] OpenMLS process_message succeeded!");
+
+            crate::debug_log!("[MLS-FFI] Processing message content type...");
+
+            // Extract sender credential BEFORE consuming the processed message
+            let sender_credential = processed.credential();
+            let sender = CredentialData {
+                credential_type: format!("{:?}", sender_credential.credential_type()),
+                identity: sender_credential.serialized_content().to_vec(),
+            };
+            crate::debug_log!("[MLS-FFI] Sender extracted: {} bytes identity", sender.identity.len());
+
+            match processed.into_content() {
+                ProcessedMessageContent::ApplicationMessage(app_msg) => {
+                    let plaintext = app_msg.into_bytes();
+                    crate::debug_log!("[MLS-FFI] ApplicationMessage processed: {} bytes", plaintext.len());
+
+                    Ok(ProcessedContent::ApplicationMessage {
+                        plaintext,
+                        sender,
+                    })
+                },
+                ProcessedMessageContent::ProposalMessage(proposal_msg) => {
+                    crate::debug_log!("[MLS-FFI] ProposalMessage received, processing...");
+                    let proposal = proposal_msg.proposal();
+
+                    // Compute proposal reference by hashing the proposal
+                    // Since proposal_reference() is pub(crate), we compute our own identifier
+                    let proposal_bytes = proposal
+                        .tls_serialize_detached()
+                        .map_err(|e| {
+                            crate::error_log!("[MLS-FFI] ERROR: Failed to serialize proposal: {:?}", e);
+                            MLSError::SerializationError
+                        })?;
+
+                    let proposal_ref_bytes = provider.crypto()
+                        .hash(group.ciphersuite().hash_algorithm(), &proposal_bytes)
+                        .map_err(|e| {
+                            crate::error_log!("[MLS-FFI] ERROR: Failed to hash proposal: {:?}", e);
+                            MLSError::OpenMLSError
+                        })?;
+
+                    crate::debug_log!("[MLS-FFI] Proposal ref computed: {}", hex::encode(&proposal_ref_bytes));
+                    
+                    let proposal_info = match proposal {
+                        Proposal::Add(add_proposal) => {
+                            crate::debug_log!("[MLS-FFI] Add proposal detected");
+                            let key_package = add_proposal.key_package();
+                            let credential = key_package.leaf_node().credential();
+
+                            let credential_info = CredentialData {
+                                credential_type: format!("{:?}", credential.credential_type()),
+                                identity: credential.serialized_content().to_vec(),
+                            };
+
+                            ProposalInfo::Add {
+                                info: AddProposalInfo {
+                                    credential: credential_info,
+                                    key_package_ref: key_package.hash_ref(provider.crypto())
+                                        .map_err(|_| MLSError::OpenMLSError)?
+                                        .as_slice()
+                                        .to_vec(),
+                                }
+                            }
+                        },
+                        Proposal::Remove(remove_proposal) => {
+                            crate::debug_log!("[MLS-FFI] Remove proposal detected, index: {}", remove_proposal.removed().u32());
+                            ProposalInfo::Remove {
+                                info: RemoveProposalInfo {
+                                    removed_index: remove_proposal.removed().u32(),
+                                }
+                            }
+                        },
+                        Proposal::Update(update_proposal) => {
+                            crate::debug_log!("[MLS-FFI] Update proposal detected");
+                            let leaf_node = update_proposal.leaf_node();
+                            let credential = leaf_node.credential();
+
+                            let credential_info = CredentialData {
+                                credential_type: format!("{:?}", credential.credential_type()),
+                                identity: credential.serialized_content().to_vec(),
+                            };
+
+                            let leaf_index = group.own_leaf_index().u32();
+                            crate::debug_log!("[MLS-FFI] Update proposal leaf index: {}", leaf_index);
+
+                            ProposalInfo::Update {
+                                info: UpdateProposalInfo {
+                                    leaf_index,
+                                    old_credential: credential_info.clone(),
+                                    new_credential: credential_info,
+                                }
+                            }
+                        },
+                        _ => {
+                            crate::error_log!("[MLS-FFI] ERROR: Unsupported proposal type");
+                            return Err(MLSError::invalid_input("Unsupported proposal type"));
+                        }
+                    };
+
+                    crate::debug_log!("[MLS-FFI] Proposal processed successfully");
+                    Ok(ProcessedContent::Proposal {
+                        proposal: proposal_info,
+                        proposal_ref: ProposalRef {
+                            data: proposal_ref_bytes,
+                        },
+                    })
+                },
+                ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                    crate::debug_log!("[MLS-FFI] ExternalJoinProposalMessage received");
+                    // TODO: Implement authorization. Currently we can't easily extract credential from QueuedProposal for ExternalInit.
+                    crate::warn_log!("[MLS-FFI] ⚠️ External join proposals not supported yet");
+                    Err(MLSError::invalid_input("External join proposals not supported"))
+                },
+                ProcessedMessageContent::StagedCommitMessage(staged) => {
+                    crate::debug_log!("[MLS-FFI] StagedCommitMessage received, processing...");
+                    let new_epoch = staged.group_context().epoch().as_u64();
+                    crate::info_log!("[MLS-FFI] 📦 Staged commit received for epoch transition to {}", new_epoch);
+
+                    // CRITICAL FIX: Auto-merge staged commits from other members
+                    // Unlike pending commits (which we created), staged commits from other members
+                    // must be merged immediately to advance the epoch. The "send-then-merge" pattern
+                    // only applies to commits WE create, not commits we receive.
+                    //
+                    // The previous code returned without merging, leaving the group stuck at the old epoch
+                    // while other members advanced. This caused epoch mismatch errors for subsequent messages.
+                    crate::info_log!("[MLS-FFI] 🔄 Auto-merging staged commit (incoming commit from another member)");
+                    
+                    // Export current epoch secret before merging
+                    if let Err(e) = crate::async_runtime::block_on(
+                        epoch_manager.export_current_epoch_secret(group, provider)
+                    ) {
+                        crate::warn_log!("[MLS-FFI] ⚠️ Failed to export epoch secret before merge: {:?}", e);
+                    }
+                    
+                    let epoch_before = group.epoch().as_u64();
+                    
+                    // Merge the staged commit to advance the epoch
+                    group.merge_staged_commit(provider, *staged)
+                        .map_err(|e| {
+                            crate::error_log!("[MLS-FFI] ❌ Failed to merge staged commit: {:?}", e);
+                            MLSError::MergeFailed
+                        })?;
+                    
+                    let epoch_after = group.epoch().as_u64();
+                    crate::info_log!("[MLS-FFI] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
+                    
+                    if epoch_after <= epoch_before {
+                        crate::error_log!("[MLS-FFI] ❌ CRITICAL: Epoch did not advance after merge! Before: {}, After: {}", epoch_before, epoch_after);
+                    }
+
+                    Ok(ProcessedContent::StagedCommit { new_epoch: epoch_after })
+                },
+            }
+        })
+    }
+
+    /// Async variant of process_message - offloads crypto work to avoid blocking
+    pub async fn process_message_async(
+        &self,
+        group_id: Vec<u8>,
+        message_data: Vec<u8>,
+    ) -> Result<ProcessedContent, MLSError> {
+        let inner = self.inner.clone();
+
+        tokio::task::spawn_blocking(move || {
+            crate::debug_log!("[MLS-FFI-ASYNC] process_message_async: Starting");
+            crate::debug_log!("[MLS-FFI-ASYNC] Group ID: {} ({} bytes)", hex::encode(&group_id), group_id.len());
+
+            let mut guard = inner.lock()
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI-ASYNC] ERROR: Failed to acquire write lock: {:?}", e);
+                    MLSError::ContextNotInitialized
+                })?;
+            let inner_ctx = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+            let gid = GroupId::from_slice(&group_id);
+
+            // Capture epoch manager for use inside the closure
+            let epoch_manager = inner_ctx.epoch_secret_manager().clone();
+
+            inner_ctx.with_group(&gid, |group, provider, _signer| {
+                let epoch_before = group.epoch().as_u64();
+                crate::debug_log!("[MLS-FFI-ASYNC] 🔐 Current epoch: {}", epoch_before);
+
+                // Strip padding envelope before MLS deserialization
+                let message_data = strip_padding(&message_data);
+
+                let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(&message_data)
+                    .map_err(|e| {
+                        crate::error_log!("[MLS-FFI-ASYNC] ERROR: Failed to deserialize: {:?}", e);
+                        MLSError::SerializationError
+                    })?;
+
+                let protocol_msg: ProtocolMessage = mls_msg.try_into()
+                    .map_err(|e| {
+                        crate::error_log!("[MLS-FFI-ASYNC] ERROR: Failed to convert: {:?}", e);
+                        MLSError::DecryptionFailed
+                    })?;
+
+                let message_epoch = protocol_msg.epoch();
+
+                if message_epoch != group.epoch() {
+                    return Err(MLSError::invalid_input(format!(
+                        "Epoch mismatch: {} vs {}",
+                        message_epoch.as_u64(),
+                        group.epoch().as_u64()
+                    )));
+                }
+
+                let processed = group
+                    .process_message(provider, protocol_msg)
+                    .map_err(|e| {
+                        crate::error_log!("[MLS-FFI-ASYNC] ERROR: process_message failed: {:?}", e);
+                        MLSError::DecryptionFailed
+                    })?;
+
+                let sender_credential = processed.credential();
+                let sender = CredentialData {
+                    credential_type: format!("{:?}", sender_credential.credential_type()),
+                    identity: sender_credential.serialized_content().to_vec(),
+                };
+
+                match processed.into_content() {
+                    ProcessedMessageContent::ApplicationMessage(app_msg) => {
+                        let plaintext = app_msg.into_bytes();
+                        Ok(ProcessedContent::ApplicationMessage { plaintext, sender })
+                    },
+                    ProcessedMessageContent::ProposalMessage(proposal_msg) => {
+                        let proposal = proposal_msg.proposal();
+                        let proposal_bytes = proposal
+                            .tls_serialize_detached()
+                            .map_err(|_| MLSError::SerializationError)?;
+
+                        let proposal_ref_bytes = provider.crypto()
+                            .hash(group.ciphersuite().hash_algorithm(), &proposal_bytes)
+                            .map_err(|_| MLSError::OpenMLSError)?;
+
+                        // Simplified proposal handling for async variant
+                        let proposal_info = match proposal {
+                            Proposal::Add(add_proposal) => {
+                                let key_package = add_proposal.key_package();
+                                let credential = key_package.leaf_node().credential();
+                                ProposalInfo::Add {
+                                    info: AddProposalInfo {
+                                        credential: CredentialData {
+                                            credential_type: format!("{:?}", credential.credential_type()),
+                                            identity: credential.serialized_content().to_vec(),
+                                        },
+                                        key_package_ref: key_package.hash_ref(provider.crypto())
+                                            .map_err(|_| MLSError::OpenMLSError)?
+                                            .as_slice()
+                                            .to_vec(),
+                                    }
+                                }
+                            },
+                            Proposal::Remove(remove_proposal) => {
+                                ProposalInfo::Remove {
+                                    info: RemoveProposalInfo {
+                                        removed_index: remove_proposal.removed().u32(),
+                                    }
+                                }
+                            },
+                            Proposal::Update(update_proposal) => {
+                                let leaf_node = update_proposal.leaf_node();
+                                let credential = leaf_node.credential();
+                                let leaf_index = group.own_leaf_index().u32();
+                                ProposalInfo::Update {
+                                    info: UpdateProposalInfo {
+                                        leaf_index,
+                                        old_credential: CredentialData {
+                                            credential_type: format!("{:?}", credential.credential_type()),
+                                            identity: credential.serialized_content().to_vec(),
+                                        },
+                                        new_credential: CredentialData {
+                                            credential_type: format!("{:?}", credential.credential_type()),
+                                            identity: credential.serialized_content().to_vec(),
+                                        },
+                                    }
+                                }
+                            },
+                            _ => {
+                                return Err(MLSError::invalid_input("Unsupported proposal type"));
+                            }
+                        };
+
+                        Ok(ProcessedContent::Proposal {
+                            proposal: proposal_info,
+                            proposal_ref: ProposalRef {
+                                data: proposal_ref_bytes,
+                            },
+                        })
+                    },
+                    ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                        Err(MLSError::invalid_input("External join proposals not supported"))
+                    },
+                    ProcessedMessageContent::StagedCommitMessage(staged) => {
+                        // CRITICAL FIX: Auto-merge staged commits from other members (same as sync variant)
+                        crate::info_log!("[MLS-FFI-ASYNC] 📦 Staged commit received, auto-merging...");
+                        
+                        // Export current epoch secret before merging
+                        if let Err(e) = crate::async_runtime::block_on(
+                            epoch_manager.export_current_epoch_secret(group, provider)
+                        ) {
+                            crate::warn_log!("[MLS-FFI-ASYNC] ⚠️ Failed to export epoch secret before merge: {:?}", e);
+                        }
+                        
+                        let epoch_before = group.epoch().as_u64();
+                        
+                        // Merge the staged commit to advance the epoch
+                        group.merge_staged_commit(provider, *staged)
+                            .map_err(|e| {
+                                crate::error_log!("[MLS-FFI-ASYNC] ❌ Failed to merge staged commit: {:?}", e);
+                                MLSError::MergeFailed
+                            })?;
+                        
+                        let epoch_after = group.epoch().as_u64();
+                        crate::info_log!("[MLS-FFI-ASYNC] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
+                        
+                        Ok(ProcessedContent::StagedCommit { new_epoch: epoch_after })
+                    },
+                }
+            })
+        })
+        .await
+        .map_err(|e| {
+            crate::error_log!("[MLS-FFI-ASYNC] ERROR: spawn_blocking join error: {:?}", e);
+            MLSError::OpenMLSError
+        })?
+    }
+
+    pub fn create_key_package(
+        &self,
+        identity_bytes: Vec<u8>,
+    ) -> Result<KeyPackageResult, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let identity = String::from_utf8(identity_bytes)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
+
+        let credential = Credential::new(CredentialType::Basic, identity.as_bytes().to_vec());
+
+        // Use persistent identity keypair instead of generating new one each time
+        // Try to retrieve existing signature keypair for this identity
+        crate::debug_log!(
+            "[CREATE-KEY-PACKAGE] Looking for signer for identity: {}",
+            identity
+        );
+        let signature_keys = match inner.get_signer_for_identity(&identity) {
+            Some(existing_signer) => {
+                crate::debug_log!(
+                    "[CREATE-KEY-PACKAGE] Reusing existing signer, PK: {}",
+                    hex::encode(existing_signer.public())
+                );
+                existing_signer
+            }
+            None => {
+                // No existing signer - create a new persistent one
+                crate::info_log!(
+                    "[CREATE-KEY-PACKAGE] Creating NEW signer for identity: {}",
+                    identity
+                );
+                let new_keys = SignatureKeyPair::new(SignatureScheme::ED25519).map_err(|e| {
+                    MLSError::OpenMLS(format!("Failed to create SignatureKeyPair: {:?}", e))
+                })?;
+
+                let signer_public_key = new_keys.public().to_vec();
+                crate::debug_log!(
+                    "[CREATE-KEY-PACKAGE]   New signer PK: {}",
+                    hex::encode(&signer_public_key)
+                );
+
+                // Store in OpenMLS storage
+                crate::debug_log!("[CREATE-KEY-PACKAGE]   Calling new_keys.store()...");
+                new_keys.store(inner.provider.storage()).map_err(|e| {
+                    MLSError::OpenMLS(format!("Failed to store SignatureKeyPair: {:?}", e))
+                })?;
+                crate::debug_log!("[CREATE-KEY-PACKAGE]   store() completed without error");
+
+                // Verify the signer can be loaded back immediately
+                match SignatureKeyPair::read(
+                    inner.provider.storage(),
+                    &signer_public_key,
+                    SignatureScheme::ED25519,
+                ) {
+                    Some(_) => {
+                        crate::debug_log!("[CREATE-KEY-PACKAGE]   VERIFIED: Signer can be loaded back from storage");
+                    }
+                    None => {
+                        crate::error_log!("[CREATE-KEY-PACKAGE]   CRITICAL: Signer NOT found in storage immediately after store()!");
+                    }
+                }
+
+                // Register the signer for this identity so it can be found later
+                inner.register_signer(&identity, signer_public_key.clone());
+                crate::debug_log!("[CREATE-KEY-PACKAGE]   Registered signer mapping");
+
+                new_keys
+            }
+        };
+
+        // 🔥 SIGNATURE KEY FORENSICS: Log the public key being embedded in this KeyPackage
+        let signer_public_key = signature_keys.public().to_vec();
+        crate::info_log!("🔑 [SIGNATURE KEY FORENSICS - KeyPackage Creation]");
+        crate::info_log!("   Identity: {}", identity);
+        crate::info_log!(
+            "   Public Signature Key (32 bytes): {}",
+            hex::encode(&signer_public_key)
+        );
+        crate::info_log!("   ⚠️  This is the PERSISTENT identity key for this user");
+        crate::info_log!("   ⚠️  All KeyPackages and messages will use THIS SAME KEY");
+
+        let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+
+        // CRITICAL: Key packages must advertise support for RatchetTree extension
+        // This must match the group config's use_ratchet_tree_extension setting
+        let capabilities = Capabilities::builder()
+            .extensions(vec![ExtensionType::RatchetTree])
+            .build();
+
+        let key_package_bundle = KeyPackage::builder()
+            .leaf_node_capabilities(capabilities)
+            .build(
+                ciphersuite,
+                &inner.provider,
+                &signature_keys,
+                CredentialWithKey {
+                    credential,
+                    signature_key: signature_keys.public().into(),
+                },
+            )
+            .map_err(|e| MLSError::OpenMLS(format!("Failed to build KeyPackage: {:?}", e)))?;
+
+        // Serialize key package directly (raw format for compatibility)
+        let key_package = key_package_bundle.key_package().clone();
+
+        let key_package_data = key_package
+            .tls_serialize_detached()
+            .map_err(|_| MLSError::SerializationError)?;
+
+        // Get hash reference (keep both typed and bytes versions)
+        let hash_ref_typed = key_package.hash_ref(inner.provider_crypto()).map_err(|e| {
+            MLSError::OpenMLS(format!("Failed to compute KeyPackage hash_ref: {:?}", e))
+        })?;
+        let hash_ref = hash_ref_typed.as_slice().to_vec();
+
+        // CRITICAL FIX: Store the bundle in the cache for serialization and Welcome message processing
+        // This ensures the private key material is available when processing Welcome messages
+        crate::debug_log!(
+            "[MLS-FFI] Storing key package bundle in cache (hash_ref: {})",
+            hex::encode(&hash_ref)
+        );
+        crate::info_log!(
+            "[MLS-WELCOME-DEBUG] 📦 Key package CREATED: hash_ref = {}",
+            hex::encode(&hash_ref)
+        );
+        // Also log how many OpenMLS has in its internal table right after build()
+        let openmls_count = inner.manifest_storage.debug_count_openmls_key_packages();
+        crate::info_log!(
+            "[MLS-WELCOME-DEBUG] 📦 OpenMLS internal key_packages count after build(): {}",
+            openmls_count
+        );
+        inner
+            .key_package_bundles_mut()
+            .insert(hash_ref.clone(), key_package_bundle.clone());
+        crate::debug_log!(
+            "[MLS-FFI] Bundle cached successfully, cache now has {} bundles",
+            inner.key_package_bundles_mut().len()
+        );
+
+        // 🔥 PERSISTENCE FIX: Serialize and store the bundle using serde_json
+        // We can't use OpenMLS's write_key_package() because it causes UNIQUE constraint violations
+        // (OpenMLS already persists the private key during .build(), but not the full bundle)
+        // Instead, we serialize the bundle and store it using a custom storage key
+        crate::info_log!("[MLS-FFI] ✍️ Persisting key package bundle to custom storage...");
+
+        let bundle_json = serde_json::to_vec(&key_package_bundle).map_err(|e| {
+            crate::error_log!("[MLS-FFI] ❌ Failed to serialize bundle: {:?}", e);
+            MLSError::SerializationError
+        })?;
+
+        // Persist bundle to manifest storage
+        let storage = &inner.manifest_storage;
+        let hex_ref = hex::encode(&hash_ref);
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_json);
+
+        // Read existing bundles map or create new one
+        let mut bundles_map: HashMap<String, String> = storage
+            .read_manifest("key_package_bundles")?
+            .unwrap_or_else(HashMap::new);
+
+        // Add or update this bundle
+        bundles_map.insert(hex_ref.clone(), bundle_b64);
+
+        // Write updated map back to storage
+        storage.write_manifest("key_package_bundles", &bundles_map)?;
+
+        crate::debug_log!(
+            "[MLS-FFI] 📋 Updated bundle manifest, now tracking {} bundles",
+            bundles_map.len()
+        );
+
+        // 🔒 CRITICAL FIX: Force database flush after key package bundle creation
+        // Without this, SQLite WAL entries may not be checkpointed to the main database file,
+        // causing NoMatchingKeyPackage errors after app restart when bundles are lost.
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ⚠️ WARNING: Failed to flush database after bundle creation: {:?}",
+                e
+            );
+            e
+        })?;
+        crate::debug_log!("[MLS-FFI] ✅ Database flushed after bundle creation");
+
+        crate::info_log!("[MLS-FFI] ✅ Key package bundle persisted successfully");
+
+        Ok(KeyPackageResult {
+            key_package_data,
+            hash_ref,
+        })
+    }
+
+    pub fn process_welcome(
+        &self,
+        welcome_bytes: Vec<u8>,
+        identity_bytes: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<WelcomeResult, MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] process_welcome: Starting with {} byte Welcome message",
+            welcome_bytes.len()
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let identity = String::from_utf8(identity_bytes)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
+        crate::info_log!("[MLS-FFI] process_welcome: Identity = {}", identity);
+
+        let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(&welcome_bytes).map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ERROR: Failed to deserialize Welcome message: {:?}",
+                e
+            );
+            MLSError::SerializationError
+        })?;
+        crate::debug_log!("[MLS-FFI] process_welcome: Welcome message deserialized successfully");
+
+        let welcome = match mls_msg.extract() {
+            MlsMessageBodyIn::Welcome(w) => w,
+            _ => {
+                crate::error_log!("[MLS-FFI] ERROR: MlsMessage is not a Welcome message");
+                return Err(MLSError::invalid_input("Not a Welcome message"));
+            }
+        };
+
+        // 📦 NOTE: OpenMLS automatically loads KeyPackages from storage via the provider
+        // The in-memory key_package_bundles HashMap is only used for optimization/caching
+        // StagedWelcome::new_from_welcome will look up the key package from SQLite storage
+        crate::info_log!("[MLS-FFI] process_welcome: OpenMLS will load KeyPackage from storage");
+
+        // 🔍 DEBUG: Query OpenMLS's ACTUAL key package storage (not just our manifest)
+        let openmls_kp_count = inner.manifest_storage.debug_count_openmls_key_packages();
+        crate::info_log!(
+            "[MLS-WELCOME-DEBUG] 🔍 OpenMLS internal key_packages table: {} entries",
+            openmls_kp_count
+        );
+        let openmls_kp_refs = inner
+            .manifest_storage
+            .debug_list_openmls_key_package_refs(5);
+        for (i, href) in openmls_kp_refs.iter().enumerate() {
+            crate::info_log!(
+                "[MLS-WELCOME-DEBUG]   OpenMLS-KP[{}] hash_ref = {}",
+                i,
+                &href[..href.len().min(32)]
+            );
+        }
+
+        // 🔍 DEBUG: Log what the Welcome expects and what we have
+        crate::info_log!(
+            "[MLS-WELCOME-DEBUG] 🔍 Welcome secrets count: {}",
+            welcome.secrets().len()
+        );
+        for (idx, egs) in welcome.secrets().iter().enumerate() {
+            let hash_ref = egs.new_member();
+            crate::info_log!(
+                "[MLS-WELCOME-DEBUG]   Secret[{}] key_package hash_ref = {}",
+                idx,
+                hex::encode(hash_ref.as_slice())
+            );
+        }
+
+        // List what's in our local key package manifest
+        let manifest = &inner.manifest_storage;
+        if let Ok(Some(bundles_map)) = manifest
+            .read_manifest::<std::collections::HashMap<String, String>>("key_package_bundles")
+        {
+            crate::info_log!(
+                "[MLS-WELCOME-DEBUG] 🔍 Local manifest has {} key package bundles:",
+                bundles_map.len()
+            );
+            for (i, hash_hex) in bundles_map.keys().enumerate() {
+                if i < 5 {
+                    crate::info_log!("[MLS-WELCOME-DEBUG]   Local[{}] hash = {}", i, hash_hex);
+                }
+            }
+            if bundles_map.len() > 5 {
+                crate::info_log!(
+                    "[MLS-WELCOME-DEBUG]   ... and {} more",
+                    bundles_map.len() - 5
+                );
+            }
+
+            // Check if any Welcome hash matches local manifest
+            for (idx, egs) in welcome.secrets().iter().enumerate() {
+                let hash_ref_hex = hex::encode(egs.new_member().as_slice());
+                let found = bundles_map.contains_key(&hash_ref_hex);
+                crate::info_log!(
+                    "[MLS-WELCOME-DEBUG]   Secret[{}] hash {} MATCH in local manifest: {}",
+                    idx,
+                    &hash_ref_hex[..hash_ref_hex.len().min(16)],
+                    found
+                );
+            }
+        } else {
+            crate::warn_log!("[MLS-WELCOME-DEBUG] ⚠️ No key_package_bundles manifest found");
+        }
+
+        let group_config = config.unwrap_or_default();
+        crate::debug_log!("[MLS-FFI] process_welcome: Group config - max_past_epochs: {}, out_of_order_tolerance: {}, maximum_forward_distance: {}",
+            group_config.max_past_epochs, group_config.out_of_order_tolerance, group_config.maximum_forward_distance);
+
+        // Build join config with forward secrecy settings
+        let join_config = MlsGroupJoinConfig::builder()
+            .max_past_epochs(group_config.max_past_epochs as usize)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::new(
+                group_config.out_of_order_tolerance,
+                group_config.maximum_forward_distance,
+            ))
+            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true) // CRITICAL: Must match group creation config
+            .build();
+        crate::debug_log!(
+            "[MLS-FFI] process_welcome: Join config created with ratchet tree extension"
+        );
+
+        crate::info_log!("[MLS-FFI] process_welcome: Calling StagedWelcome::new_from_welcome...");
+        let group = {
+            let provider = &inner.provider;
+            StagedWelcome::new_from_welcome(
+                provider,
+                &join_config,
+                welcome,
+                None,
+            )
+            .map_err(|e| {
+                crate::error_log!("[MLS-FFI] ❌ ERROR: StagedWelcome::new_from_welcome failed!");
+                crate::error_log!("[MLS-FFI] ERROR: OpenMLS error details: {:?}", e);
+                crate::error_log!("[MLS-FFI] ERROR: Error type: {}", std::any::type_name_of_val(&e));
+                
+                // Map specific WelcomeError variants to corresponding MLSError types
+                match &e {
+                    WelcomeError::NoMatchingKeyPackage => {
+                        crate::error_log!("[MLS-FFI] ❌ NoMatchingKeyPackage: Welcome references a key package not in local storage");
+                        crate::error_log!("[MLS-FFI] DIAGNOSTIC: This device may not have the key package used to create this Welcome");
+                        crate::error_log!("[MLS-FFI] DIAGNOSTIC: The Welcome was likely created for a different device");
+                        MLSError::no_matching_key_package("Welcome references a key package not found in local storage")
+                    }
+                    WelcomeError::NoMatchingEncryptionKey => {
+                        crate::error_log!("[MLS-FFI] ❌ NoMatchingEncryptionKey: Encryption key not in storage");
+                        MLSError::no_matching_key_package("No matching encryption key found in storage")
+                    }
+                    _ => {
+                        crate::error_log!("[MLS-FFI] DIAGNOSTIC: Unhandled WelcomeError variant");
+                        MLSError::OpenMLS(format!("StagedWelcome failed: {:?}", e))
+                    }
+                }
+            })?
+            .into_group(provider)
+            .map_err(|e| {
+                crate::error_log!("[MLS-FFI] ❌ ERROR: into_group failed!");
+                crate::error_log!("[MLS-FFI] ERROR: OpenMLS error details: {:?}", e);
+                MLSError::OpenMLS(format!("into_group failed: {:?}", e))
+            })
+        }?;
+
+        crate::info_log!("[MLS-FFI] process_welcome: Successfully joined group via Welcome");
+
+        let group_id = group.group_id().as_slice().to_vec();
+
+        // 🔍 DEBUG: Log initial member count after processing Welcome
+        let initial_member_count = group.members().count();
+        crate::debug_log!(
+            "[MLS-FFI] 🔍 DEBUG: Group created from Welcome with {} members at epoch {}",
+            initial_member_count,
+            group.epoch().as_u64()
+        );
+
+        // CRITICAL: Export epoch secret immediately after joining
+        // The group may already be at epoch > 0 when we join via Welcome
+        let epoch_manager = inner.epoch_secret_manager().clone();
+        crate::debug_log!(
+            "[MLS-FFI] process_welcome: Group joined at epoch {}",
+            group.epoch().as_u64()
+        );
+        if let Err(e) = crate::async_runtime::block_on(
+            epoch_manager.export_current_epoch_secret(&group, &inner.provider),
+        ) {
+            crate::warn_log!(
+                "[MLS-FFI] ⚠️ WARNING: Failed to export epoch secret after Welcome: {:?}",
+                e
+            );
+        } else {
+            crate::info_log!(
+                "[MLS-FFI] ✅ Exported epoch {} secret after processing Welcome",
+                group.epoch().as_u64()
+            );
+        }
+
+        inner.add_group(group, &identity)?;
+
+        // 🔍 DIAGNOSTIC: Verify the group was successfully added and is accessible
+        crate::info_log!(
+            "[MLS-FFI] process_welcome: 🔍 Verifying group was stored successfully..."
+        );
+        let gid = GroupId::from_slice(&group_id);
+
+        // Try to access the group to verify it's accessible
+        // Note: OpenMLS SqliteStorageProvider automatically persists group state to SQLite
+        inner.with_group_ref(&gid, |group, provider| {
+            let stored_epoch = group.epoch().as_u64();
+            crate::info_log!("[MLS-FFI] ✅ Group successfully stored and accessible in memory - epoch: {}", stored_epoch);
+
+            // 🔍 DIAGNOSTIC: Immediately reload from storage to verify persistence
+            crate::info_log!("[MLS-FFI] 🔍 Verifying storage round-trip...");
+            match MlsGroup::load(provider.storage(), &gid) {
+                Ok(Some(loaded_group)) => {
+                    let loaded_epoch = loaded_group.epoch().as_u64();
+                    if loaded_epoch == stored_epoch {
+                        crate::info_log!("[MLS-FFI] ✅ Storage verification PASSED: Reloaded group at epoch {}", loaded_epoch);
+                    } else {
+                        crate::error_log!("[MLS-FFI] ❌ STORAGE MISMATCH: Memory epoch {} != Storage epoch {}",
+                            stored_epoch, loaded_epoch);
+                    }
+
+                    // 🔍 DIAGNOSTIC: Verify member count matches
+                    let memory_members = group.members().count();
+                    let storage_members = loaded_group.members().count();
+                    if memory_members == storage_members {
+                        crate::info_log!("[MLS-FFI] ✅ Member count matches: {} members", memory_members);
+                    } else {
+                        crate::error_log!("[MLS-FFI] ❌ MEMBER COUNT MISMATCH: Memory {} != Storage {}",
+                            memory_members, storage_members);
+                    }
+                }
+                Ok(None) => {
+                    crate::error_log!("[MLS-FFI] ❌ CRITICAL: Group NOT found in storage immediately after add!");
+                    crate::error_log!("[MLS-FFI]   This indicates storage.save() may have failed silently");
+                }
+                Err(e) => {
+                    crate::error_log!("[MLS-FFI] ❌ CRITICAL: Failed to reload group from storage: {:?}", e);
+                }
+            }
+
+            Ok(())
+        }).map_err(|e| {
+            crate::error_log!("[MLS-FFI] ❌ CRITICAL: Group was not stored after Welcome processing!");
+            crate::error_log!("[MLS-FFI] ERROR: {:?}", e);
+            MLSError::StorageFailed
+        })?;
+
+        crate::info_log!("[MLS-FFI] process_welcome: Group storage verified successfully");
+
+        // 🔒 CRITICAL FIX: Force database flush to ensure secret tree state is durably persisted
+        // Without this, SQLite WAL entries may not be checkpointed to the main database file,
+        // causing SecretReuseError after app restart when the group state is incomplete.
+        crate::info_log!("[MLS-FFI] process_welcome: Flushing database to ensure persistence...");
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ❌ CRITICAL: Failed to flush database after Welcome processing!"
+            );
+            crate::error_log!("[MLS-FFI] ERROR: {:?}", e);
+            e
+        })?;
+
+        // Signal-style budget checkpoint: keep WAL perpetually small
+        inner.maybe_truncate_checkpoint();
+        crate::info_log!("[MLS-FFI] ✅ Database flushed successfully - group state is durable");
+
+        Ok(WelcomeResult { group_id })
+    }
+
+    pub fn export_secret(
+        &self,
+        group_id: Vec<u8>,
+        label: String,
+        context: Vec<u8>,
+        key_length: u64,
+    ) -> Result<ExportedSecret, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        let secret = inner.with_group(&gid, |group, provider, _signer| {
+            group
+                .export_secret(provider.crypto(), &label, &context, key_length as usize)
+                .map_err(|_| MLSError::SecretExportFailed)
+        })?;
+
+        Ok(ExportedSecret {
+            secret: secret.to_vec(),
+        })
+    }
+
+    pub fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        crate::debug_log!("[MLS-FFI] get_epoch: Starting");
+        crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
+
+        let guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire read lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group_ref(&gid, |group, _provider| {
+            let epoch = group.epoch().as_u64();
+            crate::debug_log!("[MLS-FFI] Current epoch: {}", epoch);
+            Ok(epoch)
+        })
+    }
+
+    /// Get the tree hash for a group at its current epoch
+    /// Used for tree hash pinning to detect state divergence
+    pub fn get_tree_hash(&self, group_id: Vec<u8>) -> Result<TreeHashData, MLSError> {
+        crate::debug_log!("[MLS-FFI] get_tree_hash: Starting");
+        crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
+
+        let guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire read lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group_ref(&gid, |group, _provider| {
+            let epoch = group.epoch().as_u64();
+            // tree_hash() returns &[u8] directly - no crypto provider needed
+            let tree_hash = group.tree_hash().to_vec();
+
+            crate::debug_log!(
+                "[MLS-FFI] Tree hash at epoch {}: {} bytes",
+                epoch,
+                tree_hash.len()
+            );
+
+            Ok(TreeHashData { epoch, tree_hash })
+        })
+    }
+
+    /// Manually export epoch secret for a group
+    /// Call this after creating the conversation record in SQLCipher to ensure
+    /// the foreign key constraint is satisfied when storing the epoch secret
+    pub fn export_epoch_secret(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        crate::info_log!("[MLS-FFI] export_epoch_secret: Manually exporting epoch secret");
+        crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
+
+        let guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire read lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group_ref(&gid, |group, provider| {
+            let epoch = group.epoch().as_u64();
+            crate::debug_log!("[MLS-FFI] Exporting secret for epoch {}", epoch);
+
+            crate::async_runtime::block_on(
+                inner
+                    .epoch_secret_manager()
+                    .export_current_epoch_secret(group, provider),
+            )
+            .map_err(|e| {
+                crate::error_log!("[MLS-FFI] ❌ Failed to export epoch secret: {:?}", e);
+                MLSError::StorageFailed
+            })?;
+
+            crate::info_log!("[MLS-FFI] ✅ Successfully exported epoch {} secret", epoch);
+            Ok(())
+        })
+    }
+
+    pub fn process_commit(
+        &self,
+        group_id: Vec<u8>,
+        commit_data: Vec<u8>,
+    ) -> Result<ProcessCommitResult, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        // Export epoch secret before processing (may advance epoch)
+        let epoch_manager = inner.epoch_secret_manager().clone();
+
+        // Process commit as a message and extract all proposals (Update, Add, Remove)
+        let (update_proposals, add_proposals, remove_proposals) =
+            inner.with_group(&gid, |group, provider, _signer| {
+                let (mls_msg, _) =
+                    MlsMessageIn::tls_deserialize_bytes(&commit_data).map_err(|e| {
+                        crate::error_log!(
+                            "[MLS-FFI] ❌ process_commit: TLS deserialization failed: {:?}",
+                            e
+                        );
+                        MLSError::SerializationError
+                    })?;
+
+                let protocol_msg: ProtocolMessage = mls_msg.try_into().map_err(|e| {
+                    crate::error_log!(
+                        "[MLS-FFI] ❌ process_commit: ProtocolMessage conversion failed: {:?}",
+                        e
+                    );
+                    MLSError::CommitProcessingFailed
+                })?;
+
+                let processed = group.process_message(provider, protocol_msg).map_err(|e| {
+                    crate::error_log!(
+                        "[MLS-FFI] ❌ process_commit: OpenMLS process_message error: {:?}",
+                        e
+                    );
+                    MLSError::CommitProcessingFailed
+                })?;
+
+                match processed.into_content() {
+                    ProcessedMessageContent::StagedCommitMessage(staged) => {
+                        // Extract Update proposals
+                        let updates: Vec<UpdateProposalInfo> = staged
+                            .update_proposals()
+                            .filter_map(|queued_proposal| {
+                                let update_proposal = queued_proposal.update_proposal();
+                                let leaf_node = update_proposal.leaf_node();
+                                let new_credential = leaf_node.credential();
+
+                                // Extract leaf index from sender
+                                let leaf_index = match queued_proposal.sender() {
+                                    Sender::Member(leaf_index) => leaf_index.u32(),
+                                    _ => return None,
+                                };
+
+                                // Get old credential from current group state
+                                if let Some(old_member) =
+                                    group.members().find(|m| m.index.u32() == leaf_index)
+                                {
+                                    let old_cred_type =
+                                        format!("{:?}", old_member.credential.credential_type());
+                                    let old_identity =
+                                        old_member.credential.serialized_content().to_vec();
+
+                                    let new_cred_type =
+                                        format!("{:?}", new_credential.credential_type());
+                                    let new_identity = new_credential.serialized_content().to_vec();
+
+                                    Some(UpdateProposalInfo {
+                                        leaf_index,
+                                        old_credential: CredentialData {
+                                            credential_type: old_cred_type,
+                                            identity: old_identity,
+                                        },
+                                        new_credential: CredentialData {
+                                            credential_type: new_cred_type,
+                                            identity: new_identity,
+                                        },
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        // Extract Add proposals
+                        let adds: Vec<AddProposalInfo> = staged
+                            .add_proposals()
+                            .filter_map(|queued_proposal| {
+                                let add_proposal = queued_proposal.add_proposal();
+                                let key_package = add_proposal.key_package();
+                                let credential = key_package.leaf_node().credential();
+
+                                let cred_type = format!("{:?}", credential.credential_type());
+                                let identity = credential.serialized_content().to_vec();
+
+                                // Extract key package reference (hash of key package)
+                                let key_package_bytes =
+                                    key_package.tls_serialize_detached().ok()?;
+                                let key_package_ref = provider
+                                    .crypto()
+                                    .hash(group.ciphersuite().hash_algorithm(), &key_package_bytes)
+                                    .ok()?;
+
+                                Some(AddProposalInfo {
+                                    credential: CredentialData {
+                                        credential_type: cred_type,
+                                        identity,
+                                    },
+                                    key_package_ref,
+                                })
+                            })
+                            .collect();
+
+                        // Extract Remove proposals
+                        let removes: Vec<RemoveProposalInfo> = staged
+                            .remove_proposals()
+                            .map(|queued_proposal| {
+                                let remove_proposal = queued_proposal.remove_proposal();
+                                let removed_index = remove_proposal.removed().u32();
+
+                                RemoveProposalInfo { removed_index }
+                            })
+                            .collect();
+
+                        // CRITICAL: Auto-merge the staged commit to advance the epoch.
+                        // The StagedCommit is consumed here — if we don't merge it now, it's
+                        // dropped and the caller's merge_staged_commit/merge_pending_commit
+                        // will be a no-op (those only merge OWN pending commits, not incoming
+                        // staged commits from other members).
+                        if let Err(e) = crate::async_runtime::block_on(
+                            epoch_manager.export_current_epoch_secret(group, provider),
+                        ) {
+                            crate::warn_log!(
+                                "[MLS-FFI] ⚠️ process_commit: Failed to export epoch secret: {:?}",
+                                e
+                            );
+                        }
+
+                        let epoch_before = group.epoch().as_u64();
+                        group.merge_staged_commit(provider, *staged).map_err(|e| {
+                            crate::error_log!(
+                                "[MLS-FFI] ❌ process_commit: Failed to merge staged commit: {:?}",
+                                e
+                            );
+                            MLSError::MergeFailed
+                        })?;
+                        let epoch_after = group.epoch().as_u64();
+                        crate::info_log!(
+                            "[MLS-FFI] ✅ process_commit: merged staged commit, epoch {} -> {}",
+                            epoch_before,
+                            epoch_after
+                        );
+
+                        Ok((updates, adds, removes))
+                    }
+                    _ => Err(MLSError::InvalidCommit),
+                }
+            })?;
+
+        // Get post-merge epoch
+        let new_epoch =
+            inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))?;
+
+        // Flush database to persist the new epoch state
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ⚠️ process_commit: Failed to flush database: {:?}",
+                e
+            );
+            e
+        })?;
+        inner.maybe_truncate_checkpoint();
+
+        Ok(ProcessCommitResult {
+            new_epoch,
+            update_proposals,
+            add_proposals,
+            remove_proposals,
+        })
+    }
+
+    /// Clear pending commit for a group
+    /// This should be called when a commit is rejected by the delivery service
+    /// to clean up pending state in OpenMLS
+    pub fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group(&gid, |group, provider, _signer| {
+            group
+                .clear_pending_commit(provider.storage())
+                .map_err(|_| MLSError::OpenMLSError)?;
+            Ok(())
+        })
+    }
+
+    /// Store a proposal in the proposal queue after validation
+    /// The application should inspect the proposal before storing it
+    pub fn store_proposal(
+        &self,
+        group_id: Vec<u8>,
+        _proposal_ref: ProposalRef,
+    ) -> Result<(), MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group(&gid, |_group, _provider, _signer| {
+            // In OpenMLS, proposals are already stored when processed
+            // This function is a placeholder for explicit application control
+            // The proposal was stored during process_message call
+            // Application can maintain its own list of approved proposals
+            Ok(())
+        })
+    }
+
+    /// List all pending proposals for a group
+    pub fn list_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<ProposalRef>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group_ref(&gid, |group, provider| {
+            let proposal_refs: Vec<ProposalRef> = group
+                .pending_proposals()
+                .filter_map(|queued_proposal| {
+                    // Compute proposal reference by hashing the proposal
+                    // Since proposal_reference() is pub(crate), we compute our own identifier
+                    let proposal = queued_proposal.proposal();
+                    let proposal_bytes = proposal.tls_serialize_detached().ok()?;
+
+                    let proposal_ref_bytes = provider
+                        .crypto()
+                        .hash(group.ciphersuite().hash_algorithm(), &proposal_bytes)
+                        .ok()?;
+
+                    Some(ProposalRef {
+                        data: proposal_ref_bytes,
+                    })
+                })
+                .collect();
+
+            Ok(proposal_refs)
+        })
+    }
+
+    /// List all pending proposals for a group with details
+    pub fn get_pending_proposal_details(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Vec<PendingProposalDetail>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        inner.get_pending_proposal_details(&group_id)
+    }
+
+    /// Remove a proposal from the proposal queue
+    pub fn remove_proposal(
+        &self,
+        group_id: Vec<u8>,
+        proposal_ref: ProposalRef,
+    ) -> Result<(), MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group(&gid, |group, provider, _signer| {
+            // Remove proposal from the store
+            let proposal_reference =
+                openmls::prelude::hash_ref::ProposalRef::tls_deserialize_exact_bytes(
+                    &proposal_ref.data,
+                )
+                .map_err(|_| MLSError::OpenMLSError)?;
+            group
+                .remove_pending_proposal(provider.storage(), &proposal_reference)
+                .map_err(|_| MLSError::OpenMLSError)?;
+            Ok(())
+        })
+    }
+
+    /// Commit all pending proposals that have been validated and stored
+    pub fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group(&gid, |group, provider, signer| {
+            // Commit all pending proposals
+            let (commit_msg, _welcome, _group_info) = group
+                .commit_to_pending_proposals(provider, signer)
+                .map_err(|_| MLSError::OpenMLSError)?;
+
+            // Merge the pending commit
+            group
+                .merge_pending_commit(provider)
+                .map_err(|_| MLSError::OpenMLSError)?;
+
+            // Serialize the commit
+            let commit_data = commit_msg
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+
+            Ok(commit_data)
+        })
+    }
+
+    /// Merge a pending commit after validation
+    /// This should be called after the commit has been accepted by the delivery service
+    pub fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        // CRITICAL: Export epoch secret BEFORE merging commit
+        // This allows decrypting messages from the current epoch after the group advances
+        let epoch_manager = inner.epoch_secret_manager().clone();
+
+        inner.with_group(&gid, |group, provider, _signer| {
+            // Secret tree state logging BEFORE merge
+            let epoch_before = group.epoch().as_u64();
+            let member_count_before_merge = group.members().count();
+
+            crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - merge_pending_commit");
+            crate::debug_log!("[MLS-FFI]   Group: {}", hex::encode(&group_id));
+            crate::debug_log!("[MLS-FFI]   Epoch before: {}", epoch_before);
+            crate::debug_log!("[MLS-FFI]   Member count before: {}", member_count_before_merge);
+            crate::debug_log!("[MLS-FFI]   Operation type: MERGE_COMMIT");
+
+            crate::debug_log!("[MLS-FFI] merge_pending_commit: Exporting current epoch secret before advancing");
+
+            // Export current epoch secret before the commit advances the epoch
+            if let Err(e) = crate::async_runtime::block_on(
+                epoch_manager.export_current_epoch_secret(group, provider)
+            ) {
+                crate::warn_log!("[MLS-FFI] ⚠️ WARNING: Failed to export epoch secret: {:?}", e);
+                crate::debug_log!("[MLS-FFI]   This may cause decryption failures for delayed messages from current epoch");
+                // Continue with merge - epoch secret export is best-effort
+            }
+
+            group.merge_pending_commit(provider)
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] 🔐 SECRET TREE ERROR - merge failed: {:?}", e);
+                    MLSError::MergeFailed
+                })?;
+
+            // Secret tree state logging AFTER merge
+            let epoch_after = group.epoch().as_u64();
+            let member_count_after_merge = group.members().count();
+
+            crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - after merge");
+            crate::debug_log!("[MLS-FFI]   Epoch after: {}", epoch_after);
+            crate::debug_log!("[MLS-FFI]   Epoch change: {} -> {}", epoch_before, epoch_after);
+            crate::debug_log!("[MLS-FFI]   Member count after: {}", member_count_after_merge);
+
+            if epoch_after <= epoch_before {
+                crate::error_log!("[MLS-FFI] ❌ CRITICAL: Epoch did not advance! Before: {}, After: {}", epoch_before, epoch_after);
+            }
+
+            if member_count_before_merge != member_count_after_merge {
+                crate::debug_log!("[MLS-FFI]   Member count changed: {} -> {}", member_count_before_merge, member_count_after_merge);
+            }
+
+            crate::debug_log!("[MLS-FFI] merge_pending_commit: Advanced to epoch {}", epoch_after);
+            Ok(epoch_after)
+        })?;
+
+        // Cleanup old epoch secrets for forward secrecy
+        // We retain the last 5 epochs to handle delayed messages/reordering
+        let retention_epochs = 5u64;
+        if let Err(e) = crate::async_runtime::block_on(epoch_manager.cleanup_old_epochs(
+            gid.as_slice(),
+            inner.with_group_ref(&gid, |g, _| Ok(g.epoch().as_u64()))?,
+            retention_epochs,
+        )) {
+            crate::warn_log!("[MLS-FFI] ⚠️ Failed to cleanup old epochs: {:?}", e);
+            // Non-fatal - continue
+        }
+
+        // 🔒 CRITICAL: Force database flush after commit merge
+        // Epoch advancement creates new secret tree state that must be persisted
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ⚠️ WARNING: Failed to flush database after commit merge: {:?}",
+                e
+            );
+            e
+        })?;
+
+        // Signal-style budget checkpoint: keep WAL perpetually small
+        inner.maybe_truncate_checkpoint();
+        crate::debug_log!("[MLS-FFI] ✅ Database flushed after commit merge");
+
+        // Return the epoch (already captured from the with_group_variant closure)
+        inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))
+    }
+
+    /// Merge a staged commit after validation
+    /// This should be called after validating incoming commits from other members
+    pub fn merge_staged_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        // OpenMLS uses the same internal method for both pending and staged commits
+        self.merge_pending_commit(group_id)
+    }
+
+    /// Check if a group exists in local storage
+    /// - Parameters:
+    ///   - group_id: Group identifier to check
+    /// - Returns: true if group exists, false otherwise
+    pub fn group_exists(&self, group_id: Vec<u8>) -> bool {
+        let guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        match guard.as_ref() {
+            Some(inner) => inner.has_group(&group_id),
+            None => false, // Context is closed
+        }
+    }
+
+    /// Get the current member count of a group
+    ///
+    /// - Parameters:
+    ///   - group_id: Group identifier
+    /// - Returns: Number of members in the group
+    /// - Throws: MLSError if group not found
+    pub fn get_group_member_count(&self, group_id: Vec<u8>) -> Result<u32, MLSError> {
+        crate::debug_log!(
+            "[MLS-FFI] get_group_member_count: Starting for group {}",
+            hex::encode(&group_id)
+        );
+
+        let gid = GroupId::from_slice(&group_id);
+        let mut guard = self.inner.lock().map_err(|_| MLSError::InvalidInput {
+            message: "Failed to acquire lock".to_string(),
+        })?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        inner.with_group(&gid, |group, _provider, _signer| {
+            let member_count = group.members().count() as u32;
+            crate::debug_log!(
+                "[MLS-FFI] get_group_member_count: Group has {} members",
+                member_count
+            );
+            Ok(member_count)
+        })
+    }
+
+    /// Get detailed debug information about all group members
+    ///
+    /// Returns information about each member including their leaf index,
+    /// credential identity, and credential type. Useful for diagnosing
+    /// member duplication issues.
+    ///
+    /// - Parameters:
+    ///   - group_id: Group identifier
+    /// - Returns: GroupDebugInfo with all member details
+    /// - Throws: MLSError if group not found
+    pub fn debug_group_members(&self, group_id: Vec<u8>) -> Result<GroupDebugInfo, MLSError> {
+        crate::debug_log!(
+            "[MLS-FFI] 🔍 debug_group_members: Starting for group {}",
+            hex::encode(&group_id)
+        );
+
+        let gid = GroupId::from_slice(&group_id);
+        let mut guard = self.inner.lock().map_err(|_| MLSError::InvalidInput {
+            message: "Failed to acquire lock".to_string(),
+        })?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        inner.with_group(&gid, |group, _provider, _signer| {
+            let epoch = group.epoch().as_u64();
+            let total_members = group.members().count() as u32;
+
+            crate::debug_log!("[MLS-FFI] 🔍 Group epoch: {}", epoch);
+            crate::debug_log!("[MLS-FFI] 🔍 Total members: {}", total_members);
+
+            let mut members = Vec::new();
+            let mut identity_counts = std::collections::HashMap::new();
+
+            for (index, member) in group.members().enumerate() {
+                let credential = member.credential;
+                let identity = credential.serialized_content().to_vec();
+                let credential_type = format!("{:?}", credential.credential_type());
+                let leaf_index = member.index.u32();
+
+                // Track duplicates
+                let identity_hex = hex::encode(&identity);
+                *identity_counts.entry(identity_hex.clone()).or_insert(0) += 1;
+
+                crate::debug_log!(
+                    "[MLS-FFI] 🔍 Member {}: leaf_index={}, identity={} ({} bytes), type={}",
+                    index,
+                    leaf_index,
+                    truncate_str(&identity_hex, 16),
+                    identity.len(),
+                    credential_type
+                );
+
+                members.push(GroupMemberDebugInfo {
+                    leaf_index,
+                    credential_identity: identity,
+                    credential_type,
+                });
+            }
+
+            // Report duplicates
+            crate::debug_log!("[MLS-FFI] 🔍 Unique identities: {}", identity_counts.len());
+            for (identity, count) in identity_counts.iter() {
+                if *count > 1 {
+                    crate::warn_log!(
+                        "[MLS-FFI] ⚠️ DUPLICATE: Identity {} appears {} times!",
+                        truncate_str(identity, 16),
+                        count
+                    );
+                }
+            }
+
+            Ok(GroupDebugInfo {
+                group_id: group_id.clone(),
+                epoch,
+                total_members,
+                members,
+            })
+        })
+    }
+
+    /// Export a group's state for persistent storage
+    ///
+    /// Returns serialized bytes that can be stored in the keychain
+    /// and later restored with import_group_state.
+    ///
+    /// - Parameters:
+    ///   - group_id: Group identifier to export
+    /// - Returns: Serialized group state bytes
+    /// - Throws: MLSError if group not found or serialization fails
+    pub fn export_group_state(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        crate::debug_log!("[MLS-FFI] export_group_state: Starting");
+
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let state_bytes = inner.export_group_state(&group_id)?;
+
+        crate::debug_log!(
+            "[MLS-FFI] export_group_state: Complete, {} bytes",
+            state_bytes.len()
+        );
+        Ok(state_bytes)
+    }
+
+    /// Import a group's state from persistent storage
+    ///
+    /// Restores a previously exported group state. The group will be
+    /// available for all MLS operations after import.
+    ///
+    /// - Parameters:
+    ///   - state_bytes: Serialized group state from export_group_state
+    /// - Returns: Group ID of the imported group
+    /// - Throws: MLSError if deserialization fails
+    pub fn import_group_state(&self, state_bytes: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        crate::debug_log!(
+            "[MLS-FFI] import_group_state: Starting with {} bytes",
+            state_bytes.len()
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let group_id = inner.import_group_state(&state_bytes)?;
+
+        crate::debug_log!(
+            "[MLS-FFI] import_group_state: Complete, group ID: {}",
+            hex::encode(&group_id)
+        );
+        Ok(group_id)
+    }
+
+    // Note: serialize_storage and deserialize_storage methods removed
+    // With SqliteStorageProvider, persistence is automatic - no manual save/load needed
+    // For per-DID isolation, just create separate contexts with different storage paths
+
+    /// Get the number of key package bundles currently cached
+    ///
+    /// This provides a direct count of key package bundles available for
+    /// processing Welcome messages. A count of 0 indicates that Welcome
+    /// messages cannot be processed and bundles need to be created.
+    ///
+    /// - Returns: Number of cached key package bundles
+    /// - Throws: MLSError if context is not initialized
+    pub fn get_key_package_bundle_count(&self) -> Result<u64, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let count = inner.key_package_bundles().len() as u64;
+        crate::debug_log!(
+            "[MLS-FFI] get_key_package_bundle_count: {} bundles in cache",
+            count
+        );
+
+        Ok(count)
+    }
+
+    /// 🔍 DEBUG: List all key package hashes from manifest storage
+    ///
+    /// Returns hex-encoded hash references for all key packages stored in the manifest.
+    /// This is useful for diagnosing NoMatchingKeyPackage errors by comparing with
+    /// the hash used in a Welcome message.
+    ///
+    /// - Returns: Array of hex-encoded hash references
+    /// - Throws: MLSError if context is not initialized
+    pub fn debug_list_key_package_hashes(&self) -> Result<Vec<String>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let hashes: Vec<String> = inner
+            .key_package_bundles()
+            .keys()
+            .map(hex::encode)
+            .collect();
+
+        crate::info_log!(
+            "[MLS-FFI] 🔍 debug_list_key_package_hashes: Found {} hashes in manifest storage",
+            hashes.len()
+        );
+        for (i, hash) in hashes.iter().enumerate().take(10) {
+            crate::debug_log!("[MLS-FFI]   [{}] {}", i, hash);
+        }
+        if hashes.len() > 10 {
+            crate::debug_log!("[MLS-FFI]   ... and {} more", hashes.len() - 10);
+        }
+
+        Ok(hashes)
+    }
+
+    /// 🔍 DEBUG: Check if a specific key package hash exists in local manifest storage
+    ///
+    /// This checks the manifest storage (KeyPackageBundle cache) which is the source of truth
+    /// for which key packages this device can use to process Welcome messages.
+    ///
+    /// NOTE: This only checks the manifest, not OpenMLS internal storage. The manifest
+    /// is what we control and what should contain all bundles we've created.
+    ///
+    /// - Parameters:
+    ///   - hash_hex: Hex-encoded hash reference to search for (raw bytes, not TLS-encoded)
+    /// - Returns: true if found in manifest, false otherwise
+    /// - Throws: MLSError if context is not initialized or hex is invalid
+    pub fn debug_check_key_package_hash(&self, hash_hex: String) -> Result<bool, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let hash_bytes =
+            hex::decode(&hash_hex).map_err(|_| MLSError::invalid_input("Invalid hex string"))?;
+
+        // Check manifest storage (our source of truth for key package bundles)
+        let in_manifest = inner.key_package_bundles().contains_key(&hash_bytes);
+
+        crate::info_log!(
+            "[MLS-FFI] 🔍 debug_check_key_package_hash: {} -> in_manifest: {}",
+            &hash_hex[..32.min(hash_hex.len())],
+            in_manifest
+        );
+
+        Ok(in_manifest)
+    }
+
+    /// Delete consumed key package bundles from storage
+    ///
+    /// Removes specific key package bundles from both in-memory cache and persistent storage.
+    /// This is useful for cleaning up bundles that were consumed by the server but remain in local storage.
+    ///
+    /// - Parameters:
+    ///   - hash_refs: Array of hash references (as returned by create_key_package) to delete
+    /// - Returns: Number of bundles successfully deleted
+    /// - Throws: MLSError if storage operation fails
+    pub fn delete_key_package_bundles(&self, hash_refs: Vec<Vec<u8>>) -> Result<u64, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        crate::info_log!(
+            "[MLS-FFI] 🗑️ Deleting {} key package bundles",
+            hash_refs.len()
+        );
+
+        let mut deleted_count = 0u64;
+
+        // Get mutable access to in-memory bundles
+        let bundles = inner.key_package_bundles_mut();
+
+        // Delete from in-memory cache
+        for hash_ref in &hash_refs {
+            if bundles.remove(hash_ref).is_some() {
+                deleted_count += 1;
+                crate::debug_log!("[MLS-FFI]   ✅ Deleted bundle: {}", hex::encode(hash_ref));
+            } else {
+                crate::debug_log!(
+                    "[MLS-FFI]   ⚠️  Bundle not found in memory: {}",
+                    hex::encode(hash_ref)
+                );
+            }
+        }
+
+        crate::info_log!(
+            "[MLS-FFI] 📊 In-memory deletion: {} bundles removed, {} remain",
+            deleted_count,
+            bundles.len()
+        );
+
+        // Delete from persistent storage
+        let storage = &inner.manifest_storage;
+
+        // Read existing bundles map
+        let mut bundles_map: HashMap<String, String> = storage
+            .read_manifest("key_package_bundles")?
+            .unwrap_or_else(HashMap::new);
+
+        let initial_persistent_count = bundles_map.len();
+
+        // Remove bundles from persistent storage
+        for hash_ref in &hash_refs {
+            let hex_ref = hex::encode(hash_ref);
+            if bundles_map.remove(&hex_ref).is_some() {
+                crate::debug_log!(
+                    "[MLS-FFI]   ✅ Deleted from persistent storage: {}",
+                    hex_ref
+                );
+            }
+        }
+
+        // Write updated map back to storage
+        storage.write_manifest("key_package_bundles", &bundles_map)?;
+
+        // 🔒 CRITICAL FIX: Force database flush after bundle deletion
+        // Ensures deleted bundles are not restored from WAL after app restart
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ⚠️ WARNING: Failed to flush database after bundle deletion: {:?}",
+                e
+            );
+            e
+        })?;
+        crate::debug_log!("[MLS-FFI] ✅ Database flushed after bundle deletion");
+
+        let persistent_deleted = initial_persistent_count - bundles_map.len();
+        crate::info_log!(
+            "[MLS-FFI] 💾 Persistent storage: {} bundles removed, {} remain",
+            persistent_deleted,
+            bundles_map.len()
+        );
+
+        crate::info_log!(
+            "[MLS-FFI] ✅ Successfully deleted {} total bundles",
+            deleted_count
+        );
+
+        Ok(deleted_count)
+    }
+
+    /// Force flush all pending database writes to disk
+    ///
+    /// This executes a SQLite WAL checkpoint to ensure all pending writes are
+    /// durably persisted to the main database file. Call this after batch operations
+    /// like creating multiple key packages to ensure they survive app restart.
+    ///
+    /// - Returns: Nothing on success
+    /// - Throws: MLSError if flush fails
+    pub fn flush_storage(&self) -> Result<(), MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        crate::info_log!("[MLS-FFI] 💾 Manual storage flush requested");
+        inner.flush_database().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ❌ Failed to flush storage: {:?}", e);
+            e
+        })?;
+        crate::info_log!("[MLS-FFI] ✅ Storage flushed successfully");
+        Ok(())
+    }
+
+    /// Set the global MLS logger to receive Rust logs in Swift
+    ///
+    /// This allows forwarding internal MLS logs to OSLog or other Swift logging systems.
+    /// The logger instance will be used for all subsequent MLS operations.
+    ///
+    /// - Parameters:
+    ///   - logger: Logger implementation conforming to MLSLogger protocol
+    pub fn set_logger(&self, logger: Box<dyn MLSLogger>) {
+        crate::logging::set_logger(logger);
+    }
+
+    /// Compute the hash reference for a serialized KeyPackage
+    ///
+    /// Accepts either an MlsMessage-wrapped KeyPackage or raw KeyPackage bytes.
+    /// This is useful when you need to compute a hash from KeyPackage bytes received from the server.
+    ///
+    /// - Parameters:
+    ///   - key_package_bytes: Serialized KeyPackage data
+    /// - Returns: Hash reference bytes
+    /// - Throws: MLSError if deserialization or hashing fails
+    pub fn compute_key_package_hash(
+        &self,
+        key_package_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        use openmls::prelude::*;
+
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let crypto = inner.provider_crypto();
+
+        // Try MlsMessage-wrapped format first
+        if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+                let kp = kp_in
+                    .validate(crypto, ProtocolVersion::default())
+                    .map_err(|_| MLSError::InvalidKeyPackage)?;
+                return Ok(kp
+                    .hash_ref(crypto)
+                    .map_err(|_| MLSError::OpenMLSError)?
+                    .as_slice()
+                    .to_vec());
+            }
+        }
+
+        // Fallback: raw KeyPackage format
+        let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
+            .map_err(|_| MLSError::SerializationError)?;
+        let kp = kp_in
+            .validate(crypto, ProtocolVersion::default())
+            .map_err(|_| MLSError::InvalidKeyPackage)?;
+        Ok(kp
+            .hash_ref(crypto)
+            .map_err(|_| MLSError::OpenMLSError)?
+            .as_slice()
+            .to_vec())
+    }
+
+    /// Sign arbitrary bytes using the persistent MLS signer for an identity.
+    ///
+    /// This is used for declaration device proof-of-possession. The signature
+    /// key is the same key used in MLS credentials/key packages for `identity`.
+    pub fn sign_with_identity_key(
+        &self,
+        identity: String,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let signer = inner
+            .get_signer_for_identity(&identity)
+            .ok_or_else(|| MLSError::invalid_input("No signer registered for identity"))?;
+
+        signer.sign(&payload).map_err(|_| MLSError::OpenMLSError)
+    }
+
+    /// 🔒 FIX #2: Force database synchronization
+    ///
+    /// Forces a full WAL checkpoint to ensure all MLS state is durably persisted.
+    /// Call this after critical state transitions (Welcome processing, Commit merge)
+    /// to prevent SecretReuseError from incomplete persistence.
+    ///
+    /// - Returns: Ok(()) on success
+    /// - Throws: MLSError if flush fails
+    pub fn sync_database(&self) -> Result<(), MLSError> {
+        crate::info_log!("[MLS-FFI] sync_database: Forcing WAL checkpoint for durability");
+
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        inner.flush_database().map_err(|e| {
+            crate::error_log!("[MLS-FFI] sync_database: Failed to flush database: {:?}", e);
+            e
+        })?;
+
+        crate::info_log!("[MLS-FFI] sync_database: Complete - all state durably persisted");
+        Ok(())
+    }
+
+    /// 🔒 FIX #3: Validate GroupInfo format before upload
+    ///
+    /// Verifies that a GroupInfo blob can be successfully deserialized.
+    /// Call this before uploading to server to catch corruption early.
+    ///
+    /// The GroupInfo is serialized as an MlsMessageOut wrapper containing the actual
+    /// VerifiableGroupInfo. This function handles both the wrapped and unwrapped formats.
+    ///
+    /// - Parameters:
+    ///   - group_info_bytes: The serialized GroupInfo (MlsMessageOut wrapper)
+    /// - Returns: true if valid, false otherwise (with error logging)
+    pub fn validate_group_info_format(&self, group_info_bytes: Vec<u8>) -> bool {
+        crate::debug_log!(
+            "[MLS-FFI] validate_group_info_format: Checking {} bytes",
+            group_info_bytes.len()
+        );
+
+        // Basic size check
+        if group_info_bytes.len() < 100 {
+            crate::error_log!(
+                "[MLS-FFI] validate_group_info_format: FAILED - Too small ({} bytes, minimum 100)",
+                group_info_bytes.len()
+            );
+            return false;
+        }
+
+        // Check for base64 encoding issues (should be binary, not ASCII text)
+        let is_ascii_only = group_info_bytes
+            .iter()
+            .all(|&b| (0x20..=0x7E).contains(&b) || b == 0x0A || b == 0x0D);
+        if is_ascii_only && group_info_bytes.len() > 50 {
+            crate::error_log!("[MLS-FFI] validate_group_info_format: FAILED - Appears to be base64-encoded text, not binary MLS data");
+            return false;
+        }
+
+        // GroupInfo is serialized as MlsMessageOut (wrapper format)
+        // Try to deserialize as MlsMessageIn first (the input counterpart)
+        match MlsMessageIn::tls_deserialize(&mut &*group_info_bytes) {
+            Ok(mls_msg) => {
+                // Verify it's actually a GroupInfo message
+                match mls_msg.extract() {
+                    MlsMessageBodyIn::GroupInfo(_) => {
+                        crate::info_log!("[MLS-FFI] validate_group_info_format: SUCCESS - GroupInfo is valid (MlsMessage wrapper)");
+                        true
+                    }
+                    _ => {
+                        crate::error_log!("[MLS-FFI] validate_group_info_format: FAILED - MlsMessage is not GroupInfo type");
+                        false
+                    }
+                }
+            }
+            Err(e) => {
+                // Fallback: try raw VerifiableGroupInfo deserialization (older format)
+                crate::debug_log!("[MLS-FFI] validate_group_info_format: MlsMessage wrapper failed, trying raw format...");
+                match VerifiableGroupInfo::tls_deserialize(&mut &*group_info_bytes) {
+                    Ok(_) => {
+                        crate::info_log!("[MLS-FFI] validate_group_info_format: SUCCESS - GroupInfo is valid (raw format)");
+                        true
+                    }
+                    Err(e2) => {
+                        crate::error_log!(
+                            "[MLS-FFI] validate_group_info_format: FAILED - Deserialization error"
+                        );
+                        crate::error_log!("[MLS-FFI]   MlsMessage wrapper error: {:?}", e);
+                        crate::error_log!("[MLS-FFI]   Raw GroupInfo error: {:?}", e2);
+                        crate::error_log!(
+                            "[MLS-FFI]   First 16 bytes: {:02x?}",
+                            &group_info_bytes[..group_info_bytes.len().min(16)]
+                        );
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// 🔍 DIAGNOSTIC: Get detailed debug state for a group
+    ///
+    /// Returns diagnostic information about a group's current state including:
+    /// - Current epoch
+    /// - Member count
+    /// - Storage verification status
+    ///
+    /// This is useful for diagnosing SecretReuseError issues after app restart.
+    ///
+    /// - Parameters:
+    ///   - group_id: Group identifier
+    /// - Returns: JSON string with debug information
+    /// - Throws: MLSError if group not found
+    pub fn get_group_debug_state(&self, group_id: Vec<u8>) -> Result<String, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group_ref(&gid, |group, provider| {
+            let mut debug_info = HashMap::new();
+
+            // Basic state
+            debug_info.insert("group_id".to_string(), hex::encode(&group_id));
+            debug_info.insert("epoch".to_string(), group.epoch().as_u64().to_string());
+            debug_info.insert(
+                "member_count".to_string(),
+                group.members().count().to_string(),
+            );
+
+            // Verify storage round-trip
+            match MlsGroup::load(provider.storage(), &gid) {
+                Ok(Some(loaded)) => {
+                    debug_info.insert("storage_accessible".to_string(), "true".to_string());
+                    debug_info.insert(
+                        "storage_epoch".to_string(),
+                        loaded.epoch().as_u64().to_string(),
+                    );
+                    debug_info.insert(
+                        "storage_member_count".to_string(),
+                        loaded.members().count().to_string(),
+                    );
+
+                    let epoch_match = loaded.epoch() == group.epoch();
+                    debug_info.insert("epoch_matches_storage".to_string(), epoch_match.to_string());
+                }
+                Ok(None) => {
+                    debug_info.insert("storage_accessible".to_string(), "false".to_string());
+                    debug_info.insert(
+                        "error".to_string(),
+                        "Group not found in storage".to_string(),
+                    );
+                }
+                Err(e) => {
+                    debug_info.insert("storage_accessible".to_string(), "error".to_string());
+                    debug_info.insert("error".to_string(), format!("{:?}", e));
+                }
+            }
+
+            // Serialize as JSON
+            Ok(serde_json::to_string_pretty(&debug_info)
+                .unwrap_or_else(|_| "Failed to serialize debug info".to_string()))
+        })
+    }
+}
+
+// Free functions exported to UniFFI
+
+/// Set the global MLS logger to receive Rust logs in Swift
+/// This allows forwarding internal MLS logs to OSLog or other Swift logging systems
+#[uniffi::export]
+pub fn mls_set_logger(logger: Box<dyn MLSLogger>) {
+    crate::logging::set_logger(logger);
+}
+
+/// Compute the hash reference for a serialized KeyPackage
+/// Accepts either an MlsMessage-wrapped KeyPackage or raw KeyPackage bytes
+/// This is useful when you need to compute a hash from KeyPackage bytes received from the server
+#[uniffi::export]
+pub fn mls_compute_key_package_hash(key_package_bytes: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+    use openmls::prelude::*;
+    use openmls_libcrux_crypto::Provider as LibcruxProvider;
+
+    let provider = LibcruxProvider::default();
+
+    // Try MlsMessage-wrapped format first
+    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+            let kp = kp_in
+                .validate(provider.crypto(), ProtocolVersion::default())
+                .map_err(|_| MLSError::InvalidKeyPackage)?;
+            return Ok(kp
+                .hash_ref(provider.crypto())
+                .map_err(|_| MLSError::OpenMLSError)?
+                .as_slice()
+                .to_vec());
+        }
+    }
+
+    // Fallback: raw KeyPackage format
+    let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
+        .map_err(|_| MLSError::SerializationError)?;
+    let kp = kp_in
+        .validate(provider.crypto(), ProtocolVersion::default())
+        .map_err(|_| MLSError::InvalidKeyPackage)?;
+    Ok(kp
+        .hash_ref(provider.crypto())
+        .map_err(|_| MLSError::OpenMLSError)?
+        .as_slice()
+        .to_vec())
+}
+
+/// Extract the credential identity from a serialized KeyPackage
+/// This returns the identity string (e.g., "did:plc:xxx" or "did:plc:xxx#deviceUUID")
+/// embedded in the key package's leaf node credential.
+///
+/// This is useful for deduplicating key packages by device on the client side.
+#[uniffi::export]
+pub fn mls_extract_key_package_identity(key_package_bytes: Vec<u8>) -> Result<String, MLSError> {
+    use openmls::prelude::*;
+    use openmls_libcrux_crypto::Provider as LibcruxProvider;
+
+    let provider = LibcruxProvider::default();
+
+    // Try MlsMessage-wrapped format first
+    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+            let kp = kp_in
+                .validate(provider.crypto(), ProtocolVersion::default())
+                .map_err(|_| MLSError::InvalidKeyPackage)?;
+            let identity_bytes = kp.leaf_node().credential().serialized_content();
+            return String::from_utf8(identity_bytes.to_vec())
+                .map_err(|_| MLSError::invalid_input("Credential identity is not valid UTF-8"));
+        }
+    }
+
+    // Fallback: raw KeyPackage format
+    let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
+        .map_err(|_| MLSError::SerializationError)?;
+    let kp = kp_in
+        .validate(provider.crypto(), ProtocolVersion::default())
+        .map_err(|_| MLSError::InvalidKeyPackage)?;
+    let identity_bytes = kp.leaf_node().credential().serialized_content();
+    String::from_utf8(identity_bytes.to_vec())
+        .map_err(|_| MLSError::invalid_input("Credential identity is not valid UTF-8"))
+}
+
+/// Extract the MLS leaf signature public key from a serialized KeyPackage.
+///
+/// The returned key is the device key used to sign MLS leaf nodes/commits.
+#[uniffi::export]
+pub fn mls_extract_key_package_signature_public_key(
+    key_package_bytes: Vec<u8>,
+) -> Result<Vec<u8>, MLSError> {
+    use openmls::prelude::*;
+    use openmls_libcrux_crypto::Provider as LibcruxProvider;
+
+    let provider = LibcruxProvider::default();
+
+    // Try MlsMessage-wrapped format first
+    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+            let kp = kp_in
+                .validate(provider.crypto(), ProtocolVersion::default())
+                .map_err(|_| MLSError::InvalidKeyPackage)?;
+            return Ok(kp.leaf_node().signature_key().as_slice().to_vec());
+        }
+    }
+
+    // Fallback: raw KeyPackage format
+    let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
+        .map_err(|_| MLSError::SerializationError)?;
+    let kp = kp_in
+        .validate(provider.crypto(), ProtocolVersion::default())
+        .map_err(|_| MLSError::InvalidKeyPackage)?;
+    Ok(kp.leaf_node().signature_key().as_slice().to_vec())
+}
+
+/// Extract the MLS leaf signature algorithm from a serialized KeyPackage.
+///
+/// Returns a normalized lowercase algorithm label (e.g. "ed25519", "p256").
+#[uniffi::export]
+pub fn mls_extract_key_package_signature_algorithm(
+    key_package_bytes: Vec<u8>,
+) -> Result<String, MLSError> {
+    use openmls::prelude::*;
+    use openmls_libcrux_crypto::Provider as LibcruxProvider;
+
+    fn normalize_alg_label(ciphersuite_debug: &str) -> String {
+        let lower = ciphersuite_debug.to_lowercase();
+        if lower.contains("ed25519") {
+            "ed25519".to_string()
+        } else if lower.contains("p256") || lower.contains("secp256r1") || lower.contains("ecdsa") {
+            "p256".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    }
+
+    let provider = LibcruxProvider::default();
+
+    // Try MlsMessage-wrapped format first
+    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+            let kp = kp_in
+                .validate(provider.crypto(), ProtocolVersion::default())
+                .map_err(|_| MLSError::InvalidKeyPackage)?;
+            return Ok(normalize_alg_label(&format!("{:?}", kp.ciphersuite())));
+        }
+    }
+
+    // Fallback: raw KeyPackage format
+    let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
+        .map_err(|_| MLSError::SerializationError)?;
+    let kp = kp_in
+        .validate(provider.crypto(), ProtocolVersion::default())
+        .map_err(|_| MLSError::InvalidKeyPackage)?;
+    Ok(normalize_alg_label(&format!("{:?}", kp.ciphersuite())))
+}
+
+/// Generate a random Pre-Shared Key (PSK) for external commit authentication
+/// Returns 32 random bytes (256 bits) suitable for use as a PSK
+#[uniffi::export]
+pub fn mls_generate_psk() -> Result<Vec<u8>, MLSError> {
+    use openmls_libcrux_crypto::Provider as LibcruxProvider;
+    use openmls_traits::random::OpenMlsRand;
+
+    let provider = LibcruxProvider::default();
+    let bytes = provider
+        .rand()
+        .random_array::<32>()
+        .map_err(|_| MLSError::OpenMLSError)?;
+    Ok(bytes.to_vec())
+}
+
+/// Hash a Pre-Shared Key (PSK) using SHA256
+/// Returns a hex-encoded string (64 characters) that can be used as a PSK identifier
+#[uniffi::export]
+pub fn mls_hash_psk(psk: Vec<u8>) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(&psk);
+    let result = hasher.finalize();
+    hex::encode(result)
+}
+
+#[cfg(test)]
+mod padding_tests {
+    use super::*;
+
+    /// Build a fake MLS ciphertext of the given size starting with wire format byte 0x02.
+    /// Real MLS ciphertexts start with a wire format byte in 0x00..=0x04;
+    /// strip_padding requires this to recognise the padding envelope.
+    fn fake_mls_ciphertext(len: usize) -> Vec<u8> {
+        let mut ct = Vec::with_capacity(len);
+        if len > 0 {
+            ct.push(0x02); // valid MLS wire format byte
+            for i in 1..len {
+                ct.push((i % 256) as u8);
+            }
+        }
+        ct
+    }
+
+    #[test]
+    fn test_pad_strip_roundtrip_small() {
+        let original = fake_mls_ciphertext(11);
+        let (padded, size) = pad_ciphertext(&original);
+        assert_eq!(size as usize, padded.len());
+        assert!(padded.len() >= original.len() + 4); // 4-byte header
+        let stripped = strip_padding(&padded);
+        assert_eq!(stripped, original);
+    }
+
+    #[test]
+    fn test_pad_strip_roundtrip_various_sizes() {
+        // strip_padding requires data[4] (first byte of ciphertext) to be a
+        // valid MLS wire format byte (0x00..=0x04), so we use fake_mls_ciphertext.
+        for size in [1, 10, 100, 500, 1000, 2000, 4000, 8000, 16000] {
+            let original = fake_mls_ciphertext(size);
+            let (padded, padded_size) = pad_ciphertext(&original);
+            assert_eq!(padded_size as usize, padded.len());
+            let stripped = strip_padding(&padded);
+            assert_eq!(stripped, original, "Roundtrip failed for size {}", size);
+        }
+    }
+
+    #[test]
+    fn test_padding_bucket_sizes() {
+        // Verify padded output snaps to expected bucket boundaries
+        let ct = fake_mls_ciphertext(10);
+        let (padded, _) = pad_ciphertext(&ct);
+        assert_eq!(
+            padded.len(),
+            512,
+            "Small payload should snap to 512-byte bucket"
+        );
+
+        let ct = fake_mls_ciphertext(600);
+        let (padded, _) = pad_ciphertext(&ct);
+        assert_eq!(
+            padded.len(),
+            1024,
+            "~600-byte payload should snap to 1024-byte bucket"
+        );
+    }
+
+    #[test]
+    fn test_strip_padding_unpadded_data() {
+        // Data that was never padded should pass through unchanged
+        let data = b"just raw bytes without padding";
+        let stripped = strip_padding(data);
+        assert_eq!(stripped, data);
+    }
+
+    #[test]
+    fn test_strip_padding_mls_ciphertext() {
+        // MLS ciphertext starts with 0x00-0x04 wire format byte.
+        // If someone passes raw MLS ciphertext (not padded), strip_padding should NOT modify it.
+        let mut mls_ct = vec![0x00, 0x01, 0x02, 0x03]; // first 4 bytes read as length
+        mls_ct.extend_from_slice(&[0xAA; 100]);
+        let stripped = strip_padding(&mls_ct);
+        // claimed_len = 0x00010203 = 66051, which > data.len() - 4 = 100
+        // so strip_padding returns data as-is
+        assert_eq!(stripped, mls_ct);
+    }
+
+    #[test]
+    fn test_strip_padding_short_data() {
+        // Data shorter than 5 bytes should pass through unchanged
+        let data = b"hi";
+        let stripped = strip_padding(data);
+        assert_eq!(stripped, data);
+
+        let empty: &[u8] = b"";
+        let stripped = strip_padding(empty);
+        assert_eq!(stripped, empty);
+    }
+}

@@ -1,0 +1,512 @@
+use sha2::{Digest, Sha256};
+
+use super::api_client::MLSAPIClient;
+use super::credentials::CredentialStore;
+use super::error::{OrchestratorError, Result};
+use super::orchestrator::MLSOrchestrator;
+use super::storage::MLSStorageBackend;
+use super::types::*;
+
+impl<S, A, C> MLSOrchestrator<S, A, C>
+where
+    S: MLSStorageBackend + 'static,
+    A: MLSAPIClient + 'static,
+    C: CredentialStore + 'static,
+{
+    /// Create a new MLS group/conversation.
+    ///
+    /// 1. Creates MLS group locally via FFI
+    /// 2. Creates conversation on server (with optional initial members)
+    /// 3. Merges pending commit if members were added
+    /// 4. Publishes GroupInfo for external joins
+    pub async fn create_group(
+        &self,
+        name: &str,
+        initial_members: Option<&[String]>,
+        description: Option<&str>,
+    ) -> Result<ConversationView> {
+        self.check_shutdown().await?;
+        let user_did = self.require_user_did().await?;
+
+        tracing::info!(name, member_count = ?initial_members.map(|m| m.len()), "Creating MLS group");
+
+        // Filter out creator's DID from initial members
+        let filtered_members: Option<Vec<String>> = initial_members.map(|members| {
+            let self_did = user_did.to_lowercase();
+            members
+                .iter()
+                .filter(|m| m.to_lowercase() != self_did)
+                .cloned()
+                .collect()
+        });
+        let filtered_members_ref = filtered_members.as_deref();
+
+        // Create MLS group locally
+        let identity_bytes = user_did.as_bytes().to_vec();
+        let creation_result = self
+            .mls_context()
+            .create_group(identity_bytes, Some(self.config().group_config.clone()))?;
+        let group_id_hex = hex::encode(&creation_result.group_id);
+
+        tracing::info!(group_id = %group_id_hex, "Local MLS group created");
+
+        // Protect from background sync deletion
+        self.groups_being_created()
+            .lock()
+            .await
+            .insert(group_id_hex.clone());
+
+        // Ensure cleanup on any exit path
+        let gid_for_cleanup = group_id_hex.clone();
+        let groups_being_created = self.groups_being_created();
+        let _guard = scopeguard::guard((), move |_| {
+            // Note: synchronous cleanup - can't await here
+            // The lock will be cleaned up when the mutex is next acquired
+            let _ = (&groups_being_created, &gid_for_cleanup);
+        });
+
+        // Create local conversation record
+        self.storage()
+            .ensure_conversation_exists(&user_did, &group_id_hex, &group_id_hex)
+            .await?;
+
+        self.storage()
+            .update_join_info(&group_id_hex, &user_did, JoinMethod::Creator, 0)
+            .await?;
+
+        // Build metadata
+        let metadata = if !name.is_empty() || description.is_some() {
+            Some(ConversationMetadata {
+                name: if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                },
+                description: description.map(|d| d.to_string()),
+                avatar_url: None,
+            })
+        } else {
+            None
+        };
+
+        // Create conversation on server (without members first — members added via MLS add_members)
+        let result = self
+            .api_client()
+            .create_conversation(
+                &group_id_hex,
+                filtered_members_ref,
+                metadata.as_ref(),
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Server creation failed");
+                e
+            })?;
+
+        let mut convo = result.conversation.clone();
+
+        // Cache conversation
+        self.conversations()
+            .lock()
+            .await
+            .insert(group_id_hex.clone(), convo.clone());
+
+        // If initial members were provided, add them via proper MLS add_members
+        // This generates the commit + Welcome messages needed for them to join
+        if let Some(members) = filtered_members_ref {
+            if !members.is_empty() {
+                tracing::info!(
+                    count = members.len(),
+                    "Adding initial members via MLS add_members"
+                );
+
+                // Fetch key packages for the members
+                let member_dids: Vec<String> = members.to_vec();
+                let key_packages = self.api_client().get_key_packages(&member_dids).await?;
+
+                if key_packages.is_empty() {
+                    tracing::error!(
+                        dids = ?member_dids,
+                        "No key packages found for any member — they may not have X-Wing packages registered"
+                    );
+                    return Err(OrchestratorError::KeyPackageExhausted);
+                }
+
+                for kp in &key_packages {
+                    tracing::info!(
+                        did = %kp.did,
+                        cipher_suite = %kp.cipher_suite,
+                        bytes = kp.key_package_data.len(),
+                        "Fetched key package for member"
+                    );
+                }
+
+                let kp_data: Vec<crate::KeyPackageData> = key_packages
+                    .iter()
+                    .map(|kp| crate::KeyPackageData {
+                        data: kp.key_package_data.clone(),
+                    })
+                    .collect();
+
+                let add_result = self
+                    .mls_context()
+                    .add_members(creation_result.group_id.clone(), kp_data)
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "MLS add_members failed — key package validation or crypto error");
+                        e
+                    })?;
+
+                // Track own commit
+                {
+                    let hash = Sha256::digest(&add_result.commit_data);
+                    self.own_commits().lock().await.insert(hash.to_vec());
+                }
+
+                // Send commit + Welcome to server
+                let server_result = self
+                    .api_client()
+                    .add_members(
+                        &group_id_hex,
+                        &member_dids,
+                        &add_result.commit_data,
+                        Some(&add_result.welcome_data),
+                    )
+                    .await?;
+
+                if !server_result.success {
+                    if let Err(e) = self
+                        .mls_context()
+                        .clear_pending_commit(creation_result.group_id.clone())
+                    {
+                        tracing::warn!(error = %e, "Failed to clear pending commit after server rejection");
+                    }
+                    return Err(OrchestratorError::Api(
+                        "Server rejected initial member addition".into(),
+                    ));
+                }
+
+                // Best-effort receipt storage
+                if let Some(ref receipt) = server_result.receipt {
+                    if let Err(e) = self.storage().store_sequencer_receipt(receipt).await {
+                        tracing::warn!(error = %e, "Failed to store sequencer receipt");
+                    }
+                }
+
+                // Merge the pending commit to advance local epoch
+                let merged_epoch = self
+                    .mls_context()
+                    .merge_pending_commit(creation_result.group_id.clone())?;
+
+                // Update convo epoch
+                convo.epoch = merged_epoch;
+
+                tracing::info!(
+                    epoch = merged_epoch,
+                    "Initial members added, epoch advanced"
+                );
+            }
+        }
+
+        // Get epoch from FFI (authoritative)
+        let ffi_epoch = self
+            .mls_context()
+            .get_epoch(creation_result.group_id.clone())?;
+
+        // Update group state
+        let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
+        let state = GroupState {
+            group_id: group_id_hex.clone(),
+            conversation_id: group_id_hex.clone(),
+            epoch: ffi_epoch,
+            members,
+        };
+        self.group_states()
+            .lock()
+            .await
+            .insert(group_id_hex.clone(), state.clone());
+        self.storage().set_group_state(&state).await?;
+
+        // Mark conversation as active
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(group_id_hex.clone(), ConversationState::Active);
+
+        // Publish GroupInfo for external joins
+        let group_info = self
+            .mls_context()
+            .export_group_info(creation_result.group_id.clone(), user_did.into_bytes())?;
+        if let Err(e) = self
+            .api_client()
+            .publish_group_info(&group_id_hex, &group_info)
+            .await
+        {
+            tracing::warn!(error = %e, "Failed to publish GroupInfo (external joins won't work)");
+        }
+
+        // Remove from being-created set
+        self.groups_being_created()
+            .lock()
+            .await
+            .remove(&group_id_hex);
+
+        tracing::info!(group_id = %group_id_hex, epoch = ffi_epoch, "Group creation complete");
+        Ok(convo)
+    }
+
+    /// Join an existing group via a Welcome message.
+    pub async fn join_group(&self, welcome_data: &[u8]) -> Result<ConversationView> {
+        self.check_shutdown().await?;
+        let user_did = self.require_user_did().await?;
+
+        tracing::info!("Joining group from Welcome message");
+
+        let identity_bytes = user_did.as_bytes().to_vec();
+        let welcome_result = self.mls_context().process_welcome(
+            welcome_data.to_vec(),
+            identity_bytes,
+            Some(self.config().group_config.clone()),
+        )?;
+        let group_id_hex = hex::encode(&welcome_result.group_id);
+
+        tracing::debug!(group_id = %group_id_hex, "Processed Welcome message");
+
+        // Fetch conversation from server
+        let page = self.api_client().get_conversations(100, None).await?;
+        let convo = page
+            .conversations
+            .into_iter()
+            .find(|c| c.group_id == group_id_hex)
+            .ok_or_else(|| OrchestratorError::ConversationNotFound(group_id_hex.clone()))?;
+
+        // Cache
+        self.conversations()
+            .lock()
+            .await
+            .insert(group_id_hex.clone(), convo.clone());
+
+        let ffi_epoch = self
+            .mls_context()
+            .get_epoch(welcome_result.group_id.clone())?;
+
+        let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
+        let state = GroupState {
+            group_id: group_id_hex.clone(),
+            conversation_id: group_id_hex.clone(),
+            epoch: ffi_epoch,
+            members,
+        };
+        self.group_states()
+            .lock()
+            .await
+            .insert(group_id_hex.clone(), state.clone());
+        self.storage().set_group_state(&state).await?;
+        self.storage()
+            .ensure_conversation_exists(&user_did, &group_id_hex, &group_id_hex)
+            .await?;
+        self.storage()
+            .update_join_info(&group_id_hex, &user_did, JoinMethod::Welcome, ffi_epoch)
+            .await?;
+
+        Ok(convo)
+    }
+
+    /// Add members to an existing group.
+    pub async fn add_members(&self, group_id: &str, member_dids: &[String]) -> Result<()> {
+        self.check_shutdown().await?;
+        let user_did = self.require_user_did().await?;
+
+        tracing::info!(
+            group_id,
+            count = member_dids.len(),
+            "Adding members to group"
+        );
+
+        // Fetch key packages for the new members
+        let key_packages = self.api_client().get_key_packages(member_dids).await?;
+        let kp_data: Vec<crate::KeyPackageData> = key_packages
+            .iter()
+            .map(|kp| crate::KeyPackageData {
+                data: kp.key_package_data.clone(),
+            })
+            .collect();
+
+        let group_id_bytes = hex::decode(group_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+
+        let add_result = self
+            .mls_context()
+            .add_members(group_id_bytes.clone(), kp_data)?;
+
+        // Track own commit
+        {
+            let hash = Sha256::digest(&add_result.commit_data);
+            self.own_commits().lock().await.insert(hash.to_vec());
+        }
+
+        // Send to server
+        let server_result = self
+            .api_client()
+            .add_members(
+                group_id,
+                member_dids,
+                &add_result.commit_data,
+                Some(&add_result.welcome_data),
+            )
+            .await?;
+
+        if !server_result.success {
+            // Clear the pending commit so the group isn't stuck
+            if let Err(e) = self
+                .mls_context()
+                .clear_pending_commit(group_id_bytes.clone())
+            {
+                tracing::warn!(error = %e, group_id, "Failed to clear pending commit after server rejection");
+            }
+            return Err(OrchestratorError::MemberSyncFailed);
+        }
+
+        // Best-effort receipt storage
+        if let Some(ref receipt) = server_result.receipt {
+            if let Err(e) = self.storage().store_sequencer_receipt(receipt).await {
+                tracing::warn!(error = %e, group_id, "Failed to store sequencer receipt");
+            }
+        }
+
+        // Merge pending commit if server advanced epoch
+        let current_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+        if server_result.new_epoch > current_epoch {
+            let merged_epoch = self
+                .mls_context()
+                .merge_pending_commit(group_id_bytes.clone())?;
+
+            if let Some(gs) = self.group_states().lock().await.get_mut(group_id) {
+                gs.epoch = merged_epoch;
+                for did in member_dids {
+                    if !gs.members.contains(did) {
+                        gs.members.push(did.clone());
+                    }
+                }
+            }
+        }
+
+        // Publish updated GroupInfo
+        let group_info = self
+            .mls_context()
+            .export_group_info(group_id_bytes, user_did.into_bytes())?;
+        let _ = self
+            .api_client()
+            .publish_group_info(group_id, &group_info)
+            .await;
+
+        tracing::info!(group_id, "Members added successfully");
+        Ok(())
+    }
+
+    /// Remove members from a group.
+    pub async fn remove_members(&self, group_id: &str, member_dids: &[String]) -> Result<()> {
+        self.check_shutdown().await?;
+        let user_did = self.require_user_did().await?;
+
+        tracing::info!(
+            group_id,
+            count = member_dids.len(),
+            "Removing members from group"
+        );
+
+        let group_id_bytes = hex::decode(group_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+
+        // remove_members takes member identity bytes (DIDs as bytes)
+        let member_identities: Vec<Vec<u8>> = member_dids
+            .iter()
+            .map(|did| did.as_bytes().to_vec())
+            .collect();
+
+        let commit_data = self
+            .mls_context()
+            .remove_members(group_id_bytes.clone(), member_identities)?;
+
+        // Track own commit
+        {
+            let hash = Sha256::digest(&commit_data);
+            self.own_commits().lock().await.insert(hash.to_vec());
+        }
+
+        // Send to server
+        self.api_client()
+            .remove_members(group_id, member_dids, &commit_data)
+            .await?;
+
+        // Merge pending commit
+        let merged_epoch = self
+            .mls_context()
+            .merge_pending_commit(group_id_bytes.clone())?;
+
+        if let Some(gs) = self.group_states().lock().await.get_mut(group_id) {
+            gs.epoch = merged_epoch;
+            gs.members.retain(|m| !member_dids.contains(m));
+        }
+
+        // Publish updated GroupInfo
+        let group_info = self
+            .mls_context()
+            .export_group_info(group_id_bytes, user_did.into_bytes())?;
+        let _ = self
+            .api_client()
+            .publish_group_info(group_id, &group_info)
+            .await;
+
+        Ok(())
+    }
+
+    /// Leave a conversation.
+    pub async fn leave_group(&self, convo_id: &str) -> Result<()> {
+        self.check_shutdown().await?;
+        let _user_did = self.require_user_did().await?;
+
+        tracing::info!(convo_id, "Leaving conversation");
+
+        // Leave on server first
+        self.api_client().leave_conversation(convo_id).await?;
+
+        // Clean up locally
+        self.force_delete_local(convo_id).await;
+
+        Ok(())
+    }
+
+    /// Delete a conversation (admin action).
+    pub async fn delete_group(&self, convo_id: &str) -> Result<()> {
+        self.leave_group(convo_id).await
+    }
+
+    /// Force delete a conversation from local state only.
+    pub(crate) async fn force_delete_local(&self, convo_id: &str) {
+        let user_did = self.require_user_did().await.unwrap_or_default();
+
+        // Delete MLS group from FFI
+        if let Ok(group_id_bytes) = hex::decode(convo_id) {
+            if let Err(e) = self.mls_context().delete_group(group_id_bytes) {
+                tracing::warn!(error = %e, convo_id, "Failed to delete MLS group from FFI");
+            }
+        }
+
+        // Delete from storage
+        if let Err(e) = self
+            .storage()
+            .delete_conversations(&user_did, &[convo_id])
+            .await
+        {
+            tracing::warn!(error = %e, convo_id, "Failed to delete from storage");
+        }
+        let _ = self.storage().delete_group_state(convo_id).await;
+
+        // Remove from caches
+        self.conversations().lock().await.remove(convo_id);
+        self.group_states().lock().await.remove(convo_id);
+        self.conversation_states().lock().await.remove(convo_id);
+    }
+}
