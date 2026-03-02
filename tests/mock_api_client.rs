@@ -553,6 +553,43 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(())
     }
 
+    async fn send_message_with_id(
+        &self,
+        convo_id: &str,
+        ciphertext: &[u8],
+        _epoch: u64,
+        msg_id: &str,
+    ) -> Result<()> {
+        let mut guard = self.state.lock().unwrap();
+        check_fail(&mut guard.failures.fail_next_send, "injected send failure")?;
+
+        let did = self
+            .effective_did_from_guard(&guard)
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+
+        if !guard.conversations.contains_key(convo_id) {
+            return Err(OrchestratorError::ConversationNotFound(
+                convo_id.to_string(),
+            ));
+        }
+
+        let msg = StoredMessage {
+            id: msg_id.to_string(),
+            conversation_id: convo_id.to_string(),
+            sender_did: did,
+            ciphertext: ciphertext.to_vec(),
+            timestamp: Utc::now(),
+        };
+
+        guard
+            .messages
+            .entry(convo_id.to_string())
+            .or_default()
+            .push(msg);
+
+        Ok(())
+    }
+
     async fn get_messages(
         &self,
         convo_id: &str,

@@ -42,6 +42,8 @@ struct Inner {
     sync_cursors: HashMap<String, SyncCursor>,
     /// conversation_id -> Vec<StateTransition>
     state_transitions: HashMap<String, Vec<StateTransition>>,
+    /// Pending message IDs for self-echo dedup (survives simulated restart)
+    pending_messages: std::collections::HashSet<String>,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -366,6 +368,19 @@ impl MLSStorageBackend for MockStorage {
         let mut inner = self.inner.lock().unwrap();
         inner.group_states.remove(group_id);
         Ok(())
+    }
+
+    // -- Pending Messages (self-echo dedup) ────────────────────────────────
+
+    async fn store_pending_message(&self, _conversation_id: &str, message_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending_messages.insert(message_id.to_string());
+        Ok(())
+    }
+
+    async fn remove_pending_message(&self, message_id: &str) -> Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        Ok(inner.pending_messages.remove(message_id))
     }
 }
 

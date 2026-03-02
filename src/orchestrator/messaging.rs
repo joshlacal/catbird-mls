@@ -164,11 +164,24 @@ where
             }
         }
 
-        // Track as pending for dedup
+        // Track as pending for dedup (in-memory fast path)
         self.pending_messages()
             .lock()
             .await
             .insert(message_id.clone());
+
+        // Persist pending message for dedup across app restarts
+        if let Err(e) = self
+            .storage()
+            .store_pending_message(conversation_id, &message_id)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                message_id = %message_id,
+                "Failed to persist pending message for dedup"
+            );
+        }
 
         let mut message = Message {
             id: message_id,
@@ -276,10 +289,21 @@ where
         // Check if this is an own message that we already sent
         if is_own {
             if let Some(ref msg_id) = envelope.server_message_id {
+                // Fast path: in-memory pending_messages
                 if self.pending_messages().lock().await.remove(msg_id) {
+                    // Also clean up persistent entry
+                    let _ = self.storage().remove_pending_message(msg_id).await;
                     tracing::debug!(
                         message_id = %msg_id,
-                        "Received own message back from server, skipping"
+                        "Received own message back from server, skipping (in-memory)"
+                    );
+                    return Ok(None);
+                }
+                // Slow path: persistent storage (survives app restart)
+                if self.storage().remove_pending_message(msg_id).await.unwrap_or(false) {
+                    tracing::debug!(
+                        message_id = %msg_id,
+                        "Received own message back from server, skipping (persistent)"
                     );
                     return Ok(None);
                 }

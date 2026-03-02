@@ -92,6 +92,20 @@ pub trait MLSStorageBackend: Send + Sync {
     /// Delete group state.
     async fn delete_group_state(&self, group_id: &str) -> Result<()>;
 
+    // -- Pending Messages (self-echo dedup across restarts) --
+
+    /// Persist a pending message ID so self-echo dedup survives app restart.
+    /// Default no-op for backward compatibility with existing backends.
+    async fn store_pending_message(&self, _conversation_id: &str, _message_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove a pending message ID, returning true if it was present.
+    /// Used during self-echo dedup as fallback when in-memory sets are empty.
+    async fn remove_pending_message(&self, _message_id: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     // -- Sequencer Receipts --
 
     /// Store a sequencer receipt for a successful commit.

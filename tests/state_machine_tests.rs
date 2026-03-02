@@ -79,21 +79,19 @@ async fn test_send_message_basic() {
 // 2. Self-message echo dedup bug
 // ---------------------------------------------------------------------------
 
-/// BUG: pending_messages dedup uses locally-generated UUID but process_incoming
-/// checks against server_message_id — they never match.
+/// FIXED: Self-echo dedup now works across restarts via persistent pending_messages.
 ///
-/// After Alice sends a message, the server echoes it back. The own_commits
-/// ciphertext hash check (mechanism 1) catches it, but the pending_messages
-/// check (mechanism 2) is dead code.
+/// The mock now uses client-provided message IDs (send_message_with_id), and the
+/// orchestrator persists pending_messages to storage. After clearing the in-memory
+/// own_commits and pending_messages (simulating app restart), the persistent storage
+/// fallback in process_incoming correctly deduplicates the echo.
 ///
-/// This test verifies that when the own_commits hash is NOT available (e.g.
-/// simulating an app restart by clearing the set), the echo IS stored as a
-/// duplicate — confirming the bug.
+/// Three dedup layers:
+///   1. message_exists() — catches echoes when local storage has the message ID
+///   2. own_commits hash — in-memory fast path for ciphertext matching
+///   3. pending_messages — persistent fallback for self-echo after restart
 ///
-/// Ref: state-machine-messaging.md §3, messaging.rs:53-56 & 142-149
-///
-/// Expected fix: store the server_message_id (returned from send_message) in
-/// pending_messages instead of a local UUID, OR remove the broken mechanism.
+/// Ref: state-machine-messaging.md §3
 #[tokio::test(flavor = "multi_thread")]
 async fn test_self_message_echo() {
     let mut world = TestWorld::new();
@@ -110,33 +108,44 @@ async fn test_self_message_echo() {
         .expect("create_group failed");
     let group_id = &convo.group_id;
 
-    // Send a message (this inserts into own_commits AND pending_messages)
-    let sent = alice
+    // Send a message (inserts into own_commits, in-memory pending_messages, AND persistent storage)
+    let _sent = alice
         .orchestrator
         .send_message(group_id, "echo test")
         .await
         .expect("send_message failed");
 
-    // Clear own_commits to simulate the hash being unavailable
-    // (e.g., app restart — own_commits is in-memory only, orchestrator.rs:86)
+    // Clear BOTH in-memory caches to fully simulate app restart
+    // (own_commits and pending_messages are in-memory only)
     alice.orchestrator.own_commits().lock().await.clear();
+    alice.orchestrator.pending_messages().lock().await.clear();
 
-    // Now fetch messages from server — Alice's own message echoes back.
-    // The pending_messages check SHOULD catch it, but the bug means it won't.
+    // Fetch messages from server — Alice's own message echoes back.
+    // Dedup must still work via persistent pending_messages in storage.
     let (fetched, _cursor) = alice
         .orchestrator
         .fetch_messages(group_id, None, 100)
         .await
         .expect("fetch_messages failed");
 
-    // With the bug: fetched will contain the echo (duplicate).
-    // After fix: fetched should be empty (echo is deduped).
+    // Echo should be deduped — either by message_exists (local storage has the
+    // same ID) or by persistent pending_messages fallback.
     assert!(
         fetched.is_empty(),
-        "Own message echo should be deduped by pending_messages, \
-         but got {} messages — pending_messages check is broken",
+        "Own message echo should be deduped after restart simulation, \
+         but got {} messages — dedup is broken",
         fetched.len()
     );
+
+    // Verify no duplicate was stored: storage should still have exactly 1 message
+    let all_msgs = alice.storage.get_conversation_messages(group_id);
+    assert_eq!(
+        all_msgs.len(),
+        1,
+        "Should have exactly 1 message (original), got {}",
+        all_msgs.len()
+    );
+    assert_eq!(all_msgs[0].text, "echo test");
 }
 
 // ---------------------------------------------------------------------------
