@@ -1,21 +1,34 @@
+#[cfg(not(target_arch = "wasm32"))]
 mod api;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod client;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod client_bridge;
+#[cfg(not(target_arch = "wasm32"))]
 mod epoch_storage;
 mod error;
+pub mod group_metadata;
+#[cfg(not(target_arch = "wasm32"))]
 mod hybrid_storage;
+#[cfg(not(target_arch = "wasm32"))]
 mod keychain;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod logging;
+#[cfg(not(target_arch = "wasm32"))]
 mod mls_context;
 pub mod orchestrator;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod orchestrator_bridge;
 mod types;
 
 // ATProto serde helpers (standalone, no external dependency)
 pub mod atproto_bytes;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use api::*;
+pub use catbird_atproto as atproto;
 pub use error::*;
+#[cfg(not(target_arch = "wasm32"))]
 pub use keychain::*;
 pub use types::*;
 
@@ -29,6 +42,7 @@ pub use types::*;
 /// are using the same FFI binary. Log mismatches as errors.
 ///
 /// Format: "mls-ffi-{version}-{build_timestamp}"
+#[cfg(not(target_arch = "wasm32"))]
 #[uniffi::export]
 pub fn get_ffi_build_id() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -42,6 +56,7 @@ pub fn get_ffi_build_id() -> String {
 /// - Version from Cargo.toml
 /// - Build timestamp (if set during build)
 /// - SQLCipher pragma settings (for verification)
+#[cfg(not(target_arch = "wasm32"))]
 #[uniffi::export]
 pub fn get_ffi_build_info() -> String {
     let version = env!("CARGO_PKG_VERSION");
@@ -60,6 +75,7 @@ pub fn get_ffi_build_info() -> String {
 
 // Shared async runtime for FFI→async bridging
 // Used when synchronous FFI methods need to call async code
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod async_runtime {
     use once_cell::sync::Lazy;
     use tokio::runtime::Runtime;
@@ -90,4 +106,5 @@ pub(crate) mod async_runtime {
 }
 
 // UniFFI setup
+#[cfg(not(target_arch = "wasm32"))]
 uniffi::setup_scaffolding!();
