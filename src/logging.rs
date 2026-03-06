@@ -44,7 +44,8 @@ macro_rules! error_log {
     };
 }
 
-/// Internal function to send log messages to Swift (fire-and-forget)
+/// Internal function to send log messages to the platform logger (fire-and-forget)
+#[cfg(not(target_arch = "wasm32"))]
 pub fn log_message(level: &str, message: &str) {
     if let Ok(guard) = LOGGER.read() {
         if let Some(logger) = guard.as_ref() {
@@ -59,6 +60,19 @@ pub fn log_message(level: &str, message: &str) {
             });
         }
         // If no logger set, silently ignore (no-op on iOS without stderr)
+    }
+}
+
+/// On WASM, log directly to the browser console.
+#[cfg(target_arch = "wasm32")]
+pub fn log_message(level: &str, message: &str) {
+    let formatted: String = format!("[MLS-{level}] {message}");
+    let js_val: wasm_bindgen::JsValue = formatted.into();
+    match level {
+        "error" => web_sys::console::error_1(&js_val),
+        "warning" => web_sys::console::warn_1(&js_val),
+        "debug" => web_sys::console::debug_1(&js_val),
+        _ => web_sys::console::log_1(&js_val),
     }
 }
 
