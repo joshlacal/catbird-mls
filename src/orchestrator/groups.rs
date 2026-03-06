@@ -83,28 +83,13 @@ where
             .update_join_info(&group_id_hex, &user_did, JoinMethod::Creator, 0)
             .await?;
 
-        // Build metadata
-        let metadata = if !name.is_empty() || description.is_some() {
-            Some(ConversationMetadata {
-                name: if name.is_empty() {
-                    None
-                } else {
-                    Some(name.to_string())
-                },
-                description: description.map(|d| d.to_string()),
-                avatar_url: None,
-            })
-        } else {
-            None
-        };
-
-        // Create conversation on server (without members first — members added via MLS add_members)
+        // Create conversation on server (metadata is encrypted in MLS extensions, not sent as plaintext)
         let result = self
             .api_client()
             .create_conversation(
                 &group_id_hex,
                 filtered_members_ref,
-                metadata.as_ref(),
+                None,
                 None,
                 None,
             )
