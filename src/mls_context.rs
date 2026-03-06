@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::epoch_storage::EpochSecretManager;
 use crate::error::MLSError;
+use crate::group_metadata::{GroupMetadata, CATBIRD_METADATA_EXTENSION_TYPE};
 use sha2::{Digest, Sha256};
 
 fn map_sqlite_error(context: &str, error: &rusqlite::Error) -> MLSError {
@@ -869,6 +870,7 @@ impl MLSContext {
                 );
 
                 let mut loaded_count = 0;
+                let mut orphaned_ids: Vec<String> = Vec::new();
                 for hex_id in &group_id_list {
                     if let Ok(group_id_bytes) = hex::decode(hex_id) {
                         let group_id = openmls::prelude::GroupId::from_slice(&group_id_bytes);
@@ -926,6 +928,7 @@ impl MLSContext {
                             Ok(None) => {
                                 crate::error_log!("[MLS-CONTEXT] ⚠️ Group {} exists in manifest but not in OpenMLS storage", hex_id);
                                 crate::error_log!("[MLS-CONTEXT]   This indicates the manifest is out of sync with storage");
+                                orphaned_ids.push(hex_id.clone());
                             }
                             Err(e) => {
                                 crate::error_log!(
@@ -933,6 +936,7 @@ impl MLSContext {
                                     hex_id,
                                     e
                                 );
+                                orphaned_ids.push(hex_id.clone());
                             }
                         }
                     }
@@ -943,6 +947,17 @@ impl MLSContext {
                     loaded_count,
                     group_id_list.len()
                 );
+
+                if !orphaned_ids.is_empty() {
+                    crate::info_log!(
+                        "[MLS-CONTEXT] Cleaning {} orphaned manifest entries",
+                        orphaned_ids.len()
+                    );
+                    if let Ok(Some(mut group_ids)) = manifest_storage.read_manifest::<Vec<String>>("group_ids") {
+                        group_ids.retain(|id| !orphaned_ids.contains(id));
+                        let _ = manifest_storage.write_manifest("group_ids", &group_ids);
+                    }
+                }
             }
             None => {
                 crate::info_log!(
@@ -1308,17 +1323,18 @@ impl MLSContext {
         );
 
         // Persist
-        if let Err(e) = self.persist_group_id(&group_id) {
+        self.persist_group_id(&group_id).map_err(|e| {
             crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist group ID: {:?}", e);
-        }
+            MLSError::Internal(format!("Failed to persist group ID: {:?}", e))
+        })?;
 
         // Only persist signer mapping if we created a new key
         if is_new_key {
-            if let Err(e) =
-                self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())
-            {
-                crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist signer mapping: {:?}", e);
-            }
+            self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())
+                .map_err(|e| {
+                    crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist signer mapping: {:?}", e);
+                    MLSError::Internal(format!("Failed to persist signer mapping: {:?}", e))
+                })?;
             crate::debug_log!("[MLS-CONTEXT] Persisted new signer mapping for identity");
         } else {
             crate::debug_log!(
@@ -1584,17 +1600,18 @@ impl MLSContext {
         );
 
         // Persist
-        if let Err(e) = self.persist_group_id(&group_id) {
+        self.persist_group_id(&group_id).map_err(|e| {
             crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist group ID: {:?}", e);
-        }
+            MLSError::Internal(format!("Failed to persist group ID: {:?}", e))
+        })?;
 
         // Only persist signer mapping if we created a new key
         if is_new_key {
-            if let Err(e) =
-                self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())
-            {
-                crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist signer mapping: {:?}", e);
-            }
+            self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())
+                .map_err(|e| {
+                    crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist signer mapping: {:?}", e);
+                    MLSError::Internal(format!("Failed to persist signer mapping: {:?}", e))
+                })?;
             crate::debug_log!("[MLS-CONTEXT] Persisted new signer mapping for identity");
         } else {
             crate::debug_log!(
@@ -1760,17 +1777,20 @@ impl MLSContext {
         // Build group config with forward secrecy settings
         crate::debug_log!("[MLS-CONTEXT] Building group config...");
 
-        // Configure required capabilities to include ratchet tree extension
+        // Configure required capabilities to include ratchet tree and metadata extensions
         // This ensures Welcome messages include the ratchet tree for new members
         let capabilities = Capabilities::new(
-            None,                                // Default proposals
-            None,                                // Default credentials
-            Some(&[ExtensionType::RatchetTree]), // REQUIRED: Include ratchet tree in Welcome
-            None,                                // Default proposals (repeated)
-            None,                                // Default credential types
+            None, // Default proposals
+            None, // Default credentials
+            Some(&[
+                ExtensionType::RatchetTree,
+                ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE),
+            ]), // REQUIRED: Include ratchet tree + metadata in Welcome
+            None, // Default proposals (repeated)
+            None, // Default credential types
         );
 
-        let group_config = MlsGroupCreateConfig::builder()
+        let mut group_config_builder = MlsGroupCreateConfig::builder()
             .ciphersuite(Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519)
             .max_past_epochs(config.max_past_epochs as usize)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(
@@ -1779,8 +1799,25 @@ impl MLSContext {
             ))
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .capabilities(capabilities) // Set required capabilities
-            .use_ratchet_tree_extension(true) // CRITICAL: Include ratchet tree in Welcome messages
-            .build();
+            .use_ratchet_tree_extension(true); // CRITICAL: Include ratchet tree in Welcome messages
+
+        // Build group context extensions with metadata if name or description provided
+        if config.group_name.is_some() || config.group_description.is_some() {
+            let metadata = GroupMetadata::new(
+                config.group_name.clone(),
+                config.group_description.clone(),
+            );
+            if let Ok(extensions) = metadata.to_extensions() {
+                group_config_builder =
+                    group_config_builder.with_group_context_extensions(extensions);
+                crate::info_log!(
+                    "[MLS-CONTEXT] Group metadata set: name={:?}",
+                    config.group_name
+                );
+            }
+        }
+
+        let group_config = group_config_builder.build();
         crate::debug_log!(
             "[MLS-CONTEXT] Group config built with ratchet tree extension capability"
         );
@@ -1851,9 +1888,10 @@ impl MLSContext {
         crate::debug_log!("[MLS-CONTEXT] Group state stored");
 
         // Persist group ID to manifest
-        if let Err(e) = self.persist_group_id(&group_id) {
+        self.persist_group_id(&group_id).map_err(|e| {
             crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist group ID: {:?}", e);
-        }
+            MLSError::Internal(format!("Failed to persist group ID: {:?}", e))
+        })?;
 
         // Only register the signer if we created a new key (don't overwrite existing mappings)
         if is_new_key {
@@ -1864,11 +1902,11 @@ impl MLSContext {
             crate::debug_log!("[MLS-CONTEXT] Registered new signer for identity");
 
             // Persist signer mapping to manifest
-            if let Err(e) =
-                self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())
-            {
-                crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist signer mapping: {:?}", e);
-            }
+            self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())
+                .map_err(|e| {
+                    crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist signer mapping: {:?}", e);
+                    MLSError::Internal(format!("Failed to persist signer mapping: {:?}", e))
+                })?;
         } else {
             crate::debug_log!(
                 "[MLS-CONTEXT] Signer already registered for identity, not overwriting"
@@ -1951,19 +1989,20 @@ impl MLSContext {
         );
 
         // Persist group ID to manifest
-        if let Err(e) = self.persist_group_id(&group_id) {
+        self.persist_group_id(&group_id).map_err(|e| {
             crate::error_log!(
                 "[MLS-CONTEXT] ⚠️ Failed to persist group ID in add_group: {:?}",
                 e
             );
-        }
+            MLSError::Internal(format!("Failed to persist group ID in add_group: {:?}", e))
+        })?;
 
         Ok(())
     }
 
     /// Register a signer public key for an identity
     /// This must be called when creating key packages so the signer can be found when processing Welcome messages
-    pub fn register_signer(&mut self, identity: &str, signer_public_key: Vec<u8>) {
+    pub fn register_signer(&mut self, identity: &str, signer_public_key: Vec<u8>) -> Result<(), MLSError> {
         // Safeguard: Check if a signer already exists for this identity
         if let Some(existing_key) = self.signers_by_identity.get(identity.as_bytes()) {
             if existing_key == &signer_public_key {
@@ -1971,7 +2010,7 @@ impl MLSContext {
                     "[MLS-CONTEXT] Signer already registered for identity with same key: {}",
                     identity
                 );
-                return; // No need to re-register the same key
+                return Ok(()); // No need to re-register the same key
             } else {
                 crate::error_log!(
                     "[MLS-CONTEXT] ⚠️ WARNING: Attempting to overwrite existing signer for identity '{}'. Existing: {}, New: {}",
@@ -1988,12 +2027,16 @@ impl MLSContext {
         crate::debug_log!("[MLS-CONTEXT] Registered signer for identity: {}", identity);
 
         // Persist signer mapping to manifest
-        if let Err(e) = self.persist_signer_mapping(identity.as_bytes(), &signer_public_key) {
-            crate::error_log!(
-                "[MLS-CONTEXT] ⚠️ Failed to persist signer mapping in register_signer: {:?}",
-                e
-            );
-        }
+        self.persist_signer_mapping(identity.as_bytes(), &signer_public_key)
+            .map_err(|e| {
+                crate::error_log!(
+                    "[MLS-CONTEXT] ⚠️ Failed to persist signer mapping in register_signer: {:?}",
+                    e
+                );
+                MLSError::Internal(format!("Failed to persist signer mapping in register_signer: {:?}", e))
+            })?;
+
+        Ok(())
     }
 
     /// Get persistent signature keypair for an identity if it exists
@@ -2143,10 +2186,40 @@ impl MLSContext {
         self.groups.contains_key(group_id)
     }
 
-    /// Delete a group from the context
-    /// Returns true if the group was found and removed, false otherwise
+    /// Delete a group from the context, cleaning up all persistent storage.
+    /// Returns true if the group was found and removed, false otherwise.
     pub fn delete_group(&mut self, group_id: &[u8]) -> bool {
-        self.groups.remove(group_id).is_some()
+        let existed = self.groups.remove(group_id).is_some();
+        if !existed {
+            return false;
+        }
+
+        // Remove from OpenMLS storage (best-effort, matching discard_pending_external_join)
+        let gid = GroupId::from_slice(group_id);
+        let storage = self.provider.storage_mut();
+        let _ = storage.delete_group_state(&gid);
+        let _ = storage.delete_tree(&gid);
+        let _ = storage.delete_confirmation_tag(&gid);
+        let _ = storage.delete_interim_transcript_hash(&gid);
+        let _ = storage.delete_context(&gid);
+        let _ = storage.delete_message_secrets(&gid);
+        let _ = storage.delete_all_resumption_psk_secrets(&gid);
+        let _ = storage.delete_own_leaf_index(&gid);
+        let _ = storage.delete_group_epoch_secrets(&gid);
+        let _ = storage.delete_own_leaf_nodes(&gid);
+        let _ = storage.delete_group_config(&gid);
+
+        // Remove from manifest
+        if let Ok(Some(mut group_ids)) = self.manifest_storage.read_manifest::<Vec<String>>("group_ids") {
+            let hex_id = hex::encode(group_id);
+            group_ids.retain(|id| id != &hex_id);
+            let _ = self.manifest_storage.write_manifest("group_ids", &group_ids);
+        }
+
+        // Flush to ensure cleanup is persisted
+        let _ = self.flush_database();
+
+        true
     }
 
     /// Export a group's state for persistent storage

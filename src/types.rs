@@ -1,28 +1,28 @@
 // UniFFI Record types (structs passed across FFI)
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct KeyPackageData {
     pub data: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct GroupCreationResult {
     pub group_id: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct AddMembersResult {
     pub commit_data: Vec<u8>,
     pub welcome_data: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct EncryptResult {
     pub ciphertext: Vec<u8>,
     pub padded_size: u32,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct DecryptResult {
     pub plaintext: Vec<u8>,
     pub epoch: u64,
@@ -30,46 +30,47 @@ pub struct DecryptResult {
     pub sender_credential: CredentialData,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct ExternalCommitResult {
     pub commit_data: Vec<u8>,
     pub group_id: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct KeyPackageResult {
     pub key_package_data: Vec<u8>,
     pub hash_ref: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct WelcomeResult {
     pub group_id: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct ExportedSecret {
     pub secret: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct CommitResult {
     pub new_epoch: u64,
 }
 
-#[derive(uniffi::Record, Clone)]
+#[derive(Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct CredentialData {
     pub credential_type: String,
     pub identity: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct MemberCredential {
     pub credential: CredentialData,
     pub signature_key: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct StagedWelcomeInfo {
     pub group_id: Vec<u8>,
     pub sender_credential: CredentialData,
@@ -77,7 +78,7 @@ pub struct StagedWelcomeInfo {
     pub staged_welcome_id: String,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct StagedCommitInfo {
     pub group_id: Vec<u8>,
     pub sender_credential: CredentialData,
@@ -86,21 +87,21 @@ pub struct StagedCommitInfo {
     pub staged_commit_id: String,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct UpdateProposalInfo {
     pub leaf_index: u32,
     pub old_credential: CredentialData,
     pub new_credential: CredentialData,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct GroupMemberDebugInfo {
     pub leaf_index: u32,
     pub credential_identity: Vec<u8>,
     pub credential_type: String,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct GroupDebugInfo {
     pub group_id: Vec<u8>,
     pub epoch: u64,
@@ -110,30 +111,30 @@ pub struct GroupDebugInfo {
 
 // Proposal inspection types
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct ProposalRef {
     pub data: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct AddProposalInfo {
     pub credential: CredentialData,
     pub key_package_ref: Vec<u8>,
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct RemoveProposalInfo {
     pub removed_index: u32,
 }
 
-#[derive(uniffi::Enum)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
 pub enum ProposalInfo {
     Add { info: AddProposalInfo },
     Remove { info: RemoveProposalInfo },
     Update { info: UpdateProposalInfo },
 }
 
-#[derive(uniffi::Enum)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
 pub enum ProcessedContent {
     ApplicationMessage {
         plaintext: Vec<u8>,
@@ -148,7 +149,7 @@ pub enum ProcessedContent {
     },
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct ProcessCommitResult {
     pub new_epoch: u64,
     pub update_proposals: Vec<UpdateProposalInfo>,
@@ -156,7 +157,8 @@ pub struct ProcessCommitResult {
     pub remove_proposals: Vec<RemoveProposalInfo>,
 }
 
-#[derive(uniffi::Record, Clone)]
+#[derive(Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct GroupConfig {
     pub max_past_epochs: u32,
     pub out_of_order_tolerance: u32,
@@ -165,6 +167,10 @@ pub struct GroupConfig {
     /// Set to 0 to disable lifetime validation.
     /// Recommended: 86400 * 90 (90 days)
     pub max_leaf_lifetime_seconds: u64,
+    /// Optional group name (encrypted in MLS group context extension)
+    pub group_name: Option<String>,
+    /// Optional group description (encrypted in MLS group context extension)
+    pub group_description: Option<String>,
 }
 
 impl Default for GroupConfig {
@@ -174,12 +180,14 @@ impl Default for GroupConfig {
             out_of_order_tolerance: 10,
             maximum_forward_distance: 2000,
             max_leaf_lifetime_seconds: 86400 * 90, // 90 days
+            group_name: None,
+            group_description: None,
         }
     }
 }
 
 // Logger callback trait for Swift OSLog integration
-#[uniffi::export(callback_interface)]
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export(callback_interface))]
 #[async_trait::async_trait]
 pub trait MLSLogger: Send + Sync {
     /// Log a message from Rust to Swift's OSLog
@@ -190,7 +198,7 @@ pub trait MLSLogger: Send + Sync {
 
 // Epoch secret storage callback trait for Swift encrypted storage
 // Uses async callback interface for native Swift async/await integration
-#[uniffi::export(callback_interface)]
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export(callback_interface))]
 #[async_trait::async_trait]
 pub trait EpochSecretStorage: Send + Sync {
     /// Store epoch secret for a conversation
@@ -226,7 +234,7 @@ pub trait EpochSecretStorage: Send + Sync {
 
 /// Result type for proposal creation operations
 /// Contains the proposal message to send and a reference for tracking
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct ProposeResult {
     /// MlsMessageOut to send to server (serialized proposal)
     pub proposal_message: Vec<u8>,
@@ -237,7 +245,8 @@ pub struct ProposeResult {
 // Validation framework types for client-side MLS hardening
 
 /// Operation type for credential validation context
-#[derive(uniffi::Enum, Clone)]
+#[derive(Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
 pub enum OperationType {
     Join,
     Add,
@@ -247,7 +256,8 @@ pub enum OperationType {
 }
 
 /// Validation context passed to CredentialValidator
-#[derive(uniffi::Record, Clone)]
+#[derive(Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct ValidationContext {
     pub conversation_id: String,
     pub operation_type: OperationType,
@@ -255,7 +265,7 @@ pub struct ValidationContext {
 }
 
 /// Tree hash data for epoch state verification
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct TreeHashData {
     pub epoch: u64,
     pub tree_hash: Vec<u8>,
@@ -263,7 +273,7 @@ pub struct TreeHashData {
 
 /// Credential validator callback trait for Swift-side policy enforcement
 /// Allows the client to validate credentials before accepting group state changes
-#[uniffi::export(callback_interface)]
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export(callback_interface))]
 #[async_trait::async_trait]
 pub trait CredentialValidator: Send + Sync {
     /// Validate a credential in the context of a specific operation
@@ -280,7 +290,7 @@ pub trait CredentialValidator: Send + Sync {
 ///
 /// Implement this to define your application's authorization policy
 /// for external commits (outsiders requesting to join a group).
-#[uniffi::export(callback_interface)]
+#[cfg_attr(not(target_arch = "wasm32"), uniffi::export(callback_interface))]
 pub trait ExternalJoinAuthorizer: Send + Sync {
     /// Authorize an external join request.
     ///
@@ -299,7 +309,7 @@ pub trait ExternalJoinAuthorizer: Send + Sync {
     ) -> bool;
 }
 
-#[derive(uniffi::Record)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct PendingProposalDetail {
     /// Unique reference for this proposal
     pub proposal_ref: Vec<u8>,
