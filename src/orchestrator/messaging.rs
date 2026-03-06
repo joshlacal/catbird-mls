@@ -5,15 +5,17 @@ use std::collections::HashMap;
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
+use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
-impl<S, A, C> MLSOrchestrator<S, A, C>
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
     A: MLSAPIClient + 'static,
     C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
 {
     /// Send a text message to a conversation.
     ///
@@ -80,7 +82,7 @@ where
                 self.mls_context()
                     .encrypt_message(group_id_bytes.clone(), payload_bytes)?
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(OrchestratorError::from(e)),
         };
 
         // Track own commit for dedup
@@ -121,14 +123,16 @@ where
             )
             .await;
 
-        match &send_result {
-            Ok(()) => {
+        // Extract response on success, handle errors
+        let send_response = match send_result {
+            Ok(resp) => {
                 self.failover_tracker()
                     .lock()
                     .await
                     .record_success(conversation_id);
+                Some(resp)
             }
-            Err(OrchestratorError::Timeout(_)) => {
+            Err(OrchestratorError::Timeout(ref _msg)) => {
                 let mut tracker = self.failover_tracker().lock().await;
                 tracker.record_failure(conversation_id);
                 if tracker.should_failover(conversation_id) {
@@ -158,11 +162,32 @@ where
                 }
                 return Err(send_result.unwrap_err());
             }
+            Err(OrchestratorError::ServerError { status: 409, .. }) => {
+                // Epoch mismatch — surface to caller, do NOT force_rejoin here.
+                // External commits advance the epoch for all clients and cause an
+                // epoch inflation spiral when multiple clients are active.
+                // The caller (or the next sync cycle) should handle reconciliation.
+                tracing::warn!(
+                    conversation_id,
+                    local_epoch = epoch,
+                    "Epoch mismatch (409) — message send rejected by server"
+                );
+                return Err(OrchestratorError::EpochMismatch {
+                    local: epoch,
+                    remote: 0,
+                });
+            }
             Err(_) => {
-                // Business logic errors (epoch conflict, etc.) — don't track as sequencer failure
+                // Other errors — don't track as sequencer failure
                 return Err(send_result.unwrap_err());
             }
-        }
+        };
+
+        // Use server values when available, fall back to local
+        let (msg_epoch, msg_seq) = match &send_response {
+            Some(resp) => (resp.epoch, resp.seq),
+            None => (epoch, 0), // timeout case — best effort
+        };
 
         // Track as pending for dedup (in-memory fast path)
         self.pending_messages()
@@ -189,8 +214,8 @@ where
             sender_did: user_did,
             text: text.to_string(),
             timestamp: Utc::now(),
-            epoch,
-            sequence_number: 0, // Will be set by ordering module
+            epoch: msg_epoch,
+            sequence_number: msg_seq,
             is_own: true,
             delivery_status: None,
         };
@@ -276,7 +301,7 @@ where
                     conversation_id = %envelope.conversation_id,
                     "Decryption failed"
                 );
-                return Err(e.into());
+                return Err(OrchestratorError::from(e));
             }
         };
 
@@ -300,7 +325,12 @@ where
                     return Ok(None);
                 }
                 // Slow path: persistent storage (survives app restart)
-                if self.storage().remove_pending_message(msg_id).await.unwrap_or(false) {
+                if self
+                    .storage()
+                    .remove_pending_message(msg_id)
+                    .await
+                    .unwrap_or(false)
+                {
                     tracing::debug!(
                         message_id = %msg_id,
                         "Received own message back from server, skipping (persistent)"
@@ -323,9 +353,45 @@ where
                 if let Some(gs) = states.get_mut(&envelope.conversation_id) {
                     if decrypt_result.epoch > gs.epoch {
                         gs.epoch = decrypt_result.epoch;
+                        let state_clone = gs.clone();
+                        drop(states);
+                        if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                            tracing::warn!(
+                                error = %e,
+                                conversation_id = %envelope.conversation_id,
+                                "Failed to persist epoch after commit"
+                            );
+                        }
                     }
                 }
             }
+
+            // Refresh cached metadata after commit (may contain GroupContextExtensions update)
+            match self.get_group_metadata(&envelope.conversation_id) {
+                Ok(Some(meta)) => {
+                    let mut convos = self.conversations().lock().await;
+                    if let Some(convo) = convos.get_mut(&envelope.conversation_id) {
+                        convo.metadata = Some(super::types::ConversationMetadata {
+                            name: meta.name,
+                            description: meta.description,
+                            avatar_url: None,
+                        });
+                        tracing::debug!(
+                            conversation_id = %envelope.conversation_id,
+                            "Refreshed cached metadata after commit"
+                        );
+                    }
+                }
+                Ok(None) => {} // no metadata set
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        conversation_id = %envelope.conversation_id,
+                        "Failed to read metadata after commit"
+                    );
+                }
+            }
+
             return Ok(None);
         }
 
@@ -377,12 +443,21 @@ where
             delivery_status: None,
         };
 
-        // Update group state epoch if it advanced
+        // Update group state epoch if it advanced (and persist)
         {
             let mut states = self.group_states().lock().await;
             if let Some(gs) = states.get_mut(&envelope.conversation_id) {
                 if decrypt_result.epoch > gs.epoch {
                     gs.epoch = decrypt_result.epoch;
+                    let state_clone = gs.clone();
+                    drop(states);
+                    if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                        tracing::warn!(
+                            error = %e,
+                            conversation_id = %envelope.conversation_id,
+                            "Failed to persist epoch after app message"
+                        );
+                    }
                 }
             }
         }
