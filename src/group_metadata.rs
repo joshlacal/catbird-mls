@@ -76,9 +76,6 @@ impl GroupMetadata {
 // Encrypted metadata envelope
 // ---------------------------------------------------------------------------
 
-/// MLS exporter label for deriving the metadata encryption key.
-pub const METADATA_EXPORTER_LABEL: &str = "catbird/group-metadata/v1";
-
 /// Encrypted envelope stored in the MLS group context extension.
 /// The server sees only this structure (ciphertext), never plaintext metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,37 +107,21 @@ mod base64_bytes {
     }
 }
 
-/// Derive the metadata encryption key from the MLS group's exporter secret.
-/// Returns a 32-byte key for ChaCha20-Poly1305.
-pub fn derive_metadata_key<C: openmls_traits::crypto::OpenMlsCrypto>(
-    group: &MlsGroup,
-    crypto: &C,
-) -> Result<[u8; 32], String> {
-    let exported = group
-        .export_secret(crypto, METADATA_EXPORTER_LABEL, b"", 32)
-        .map_err(|e| format!("export_secret failed: {:?}", e))?;
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&exported);
-    Ok(key)
-}
-
-/// Encrypt plaintext GroupMetadata into an EncryptedMetadataEnvelope.
-pub fn encrypt_metadata<P: OpenMlsProvider>(
-    group: &MlsGroup,
-    provider: &P,
+/// Encrypt plaintext GroupMetadata with a pre-existing stable key (MEK).
+/// The key is a stable per-group metadata encryption key stored locally.
+pub fn encrypt_metadata_with_key(
+    key: &[u8; 32],
     metadata: &GroupMetadata,
+    rand: &impl OpenMlsRand,
 ) -> Result<EncryptedMetadataEnvelope, String> {
-    let key_bytes = derive_metadata_key(group, provider.crypto())?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&key_bytes)
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
         .map_err(|e| format!("cipher init: {:?}", e))?;
 
     let plaintext = metadata
         .to_extension_bytes()
         .map_err(|e| format!("serialize: {:?}", e))?;
 
-    // Generate random 12-byte nonce
-    let random_bytes = provider
-        .rand()
+    let random_bytes = rand
         .random_vec(12)
         .map_err(|e| format!("nonce generation: {:?}", e))?;
     let mut nonce_bytes = [0u8; 12];
@@ -151,18 +132,16 @@ pub fn encrypt_metadata<P: OpenMlsProvider>(
         .encrypt(nonce, plaintext.as_ref())
         .map_err(|e| format!("encrypt: {:?}", e))?;
 
-    let epoch = group.epoch().as_u64();
-
     Ok(EncryptedMetadataEnvelope {
         v: 1,
-        epoch,
+        epoch: 0, // not used for key derivation anymore
         nonce: nonce_bytes.to_vec(),
         ciphertext,
     })
 }
 
 /// Decrypt an EncryptedMetadataEnvelope back to GroupMetadata.
-/// `key` is the 32-byte ChaCha20-Poly1305 key (from derive_metadata_key).
+/// `key` is the 32-byte ChaCha20-Poly1305 metadata encryption key (MEK).
 pub fn decrypt_metadata(
     envelope: &EncryptedMetadataEnvelope,
     key: &[u8; 32],
@@ -177,48 +156,32 @@ pub fn decrypt_metadata(
         .map_err(|e| format!("deserialize: {:?}", e))
 }
 
-/// Try to decrypt metadata from group extensions using the current epoch's key.
-/// Returns None if no metadata extension is present or decryption fails.
-pub fn decrypt_metadata_from_group<P: OpenMlsProvider>(
+/// Try to read and decrypt metadata from group extensions using a pre-existing stable key.
+/// Falls back to plaintext format if no encrypted envelope found.
+pub fn decrypt_metadata_from_group_with_key(
     group: &MlsGroup,
-    provider: &P,
+    key: &[u8; 32],
 ) -> Option<GroupMetadata> {
     let ext_data = group
         .extensions()
         .unknown(CATBIRD_METADATA_EXTENSION_TYPE)?;
 
-    // Try to parse as encrypted envelope
-    let envelope: EncryptedMetadataEnvelope = match serde_json::from_slice(&ext_data.0) {
-        Ok(env) => env,
-        Err(e) => {
-            // Maybe it's old plaintext format -- try direct deserialization
-            crate::warn_log!(
-                "Metadata extension is not an encrypted envelope: {:?}",
-                e
-            );
-            return GroupMetadata::from_extension_bytes(&ext_data.0).ok();
-        }
-    };
-
-    // Derive key from current epoch and try to decrypt
-    match derive_metadata_key(group, provider.crypto()) {
-        Ok(key) => match decrypt_metadata(&envelope, &key) {
-            Ok(meta) => Some(meta),
+    // Try encrypted envelope first
+    if let Ok(envelope) = serde_json::from_slice::<EncryptedMetadataEnvelope>(&ext_data.0) {
+        match decrypt_metadata(&envelope, key) {
+            Ok(meta) => return Some(meta),
             Err(e) => {
-                crate::warn_log!(
-                    "Failed to decrypt metadata (epoch mismatch?): {:?}. Envelope epoch={}, current epoch={}",
-                    e,
-                    envelope.epoch,
-                    group.epoch().as_u64()
-                );
-                None
+                crate::warn_log!("Failed to decrypt metadata: {:?}", e);
             }
-        },
-        Err(e) => {
-            crate::warn_log!("Failed to derive metadata key: {:?}", e);
-            None
         }
     }
+
+    // Fallback to plaintext
+    GroupMetadata::from_extension_bytes(&ext_data.0)
+        .map_err(|e| {
+            crate::warn_log!("Failed to decode plaintext metadata: {:?}", e);
+        })
+        .ok()
 }
 
 /// Build Extensions from raw encrypted envelope bytes.

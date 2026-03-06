@@ -72,6 +72,9 @@ fn test_create_group_with_metadata() {
         .create_group(b"alice@example.com".to_vec(), Some(config))
         .unwrap();
 
+    // get_group_metadata returns JSON bytes via the FFI layer.
+    // At creation, metadata is plaintext; the MEK-based reader
+    // handles the plaintext fallback transparently.
     let meta_bytes = ctx.get_group_metadata(result.group_id.clone()).unwrap();
     assert!(!meta_bytes.is_empty(), "Metadata should be present");
 
@@ -94,7 +97,7 @@ fn test_create_group_without_metadata() {
 }
 
 #[test]
-fn test_update_group_metadata() {
+fn test_update_group_metadata_produces_commit() {
     let (ctx, _dir) = make_context();
 
     let config = GroupConfig {
@@ -116,13 +119,48 @@ fn test_update_group_metadata() {
             new_meta.to_extension_bytes().unwrap(),
         )
         .unwrap();
-    assert!(!commit_bytes.is_empty());
+    assert!(!commit_bytes.is_empty(), "Commit bytes should be produced");
+
+    // Before merge, the group is still at the old epoch with plaintext metadata
+    // from creation (the pending commit hasn't been applied yet).
+    let meta_bytes = ctx.get_group_metadata(result.group_id.clone()).unwrap();
+    assert!(!meta_bytes.is_empty(), "Original metadata should still be readable before merge");
+    let meta = GroupMetadata::from_extension_bytes(&meta_bytes).unwrap();
+    assert_eq!(meta.name.as_deref(), Some("Original"));
+}
+
+#[test]
+fn test_update_group_metadata_readable_after_merge() {
+    let (ctx, _dir) = make_context();
+
+    let config = GroupConfig {
+        group_name: Some("Original".to_string()),
+        ..Default::default()
+    };
+
+    let result = ctx
+        .create_group(b"alice@example.com".to_vec(), Some(config))
+        .unwrap();
+
+    let new_meta = GroupMetadata::new(
+        Some("Renamed Group".to_string()),
+        Some("New description".to_string()),
+    );
+    let _commit_bytes = ctx
+        .update_group_metadata(
+            result.group_id.clone(),
+            new_meta.to_extension_bytes().unwrap(),
+        )
+        .unwrap();
 
     // Merge the pending commit (simulating server ACK)
     ctx.merge_pending_commit(result.group_id.clone()).unwrap();
 
-    // Read updated metadata
+    // After merge the epoch has advanced, but the metadata was encrypted
+    // with the stable per-group MEK, so it remains readable.
     let meta_bytes = ctx.get_group_metadata(result.group_id).unwrap();
+    assert!(!meta_bytes.is_empty(), "Metadata should be readable after epoch advance");
+
     let meta = GroupMetadata::from_extension_bytes(&meta_bytes).unwrap();
     assert_eq!(meta.name.as_deref(), Some("Renamed Group"));
     assert_eq!(meta.description.as_deref(), Some("New description"));

@@ -497,6 +497,9 @@ pub struct MLSContext {
     // Per-context replay detection and sequencing
     pub(crate) processed_messages: HashMap<Vec<u8>, Vec<(u64, u32)>>,
     pub(crate) sequence_counters: HashMap<Vec<u8>, u64>,
+    /// Per-group metadata encryption keys (MEK): group_id -> 32-byte key.
+    /// Stable across epochs, persisted in manifest storage.
+    metadata_keys: HashMap<Vec<u8>, [u8; 32]>,
 }
 
 use openmls::group::MlsGroupJoinConfig;
@@ -966,6 +969,27 @@ impl MLSContext {
             }
         }
 
+        // Load metadata encryption keys (MEKs) for all known groups
+        let mut metadata_keys = HashMap::new();
+        for group_id in groups.keys() {
+            let hex_id = hex::encode(group_id);
+            let mek_key = format!("mek_{}", hex_id);
+            if let Ok(Some(hex_key)) = manifest_storage.read_manifest::<String>(&mek_key) {
+                if let Ok(key_bytes) = hex::decode(&hex_key) {
+                    if key_bytes.len() == 32 {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&key_bytes);
+                        metadata_keys.insert(group_id.clone(), key);
+                        crate::debug_log!("[MLS-CONTEXT] Loaded MEK for group {}", hex_id);
+                    }
+                }
+            }
+        }
+        crate::info_log!(
+            "[MLS-CONTEXT] Loaded {} metadata encryption keys",
+            metadata_keys.len()
+        );
+
         Ok(Self {
             provider,
             groups,              // Use the loaded groups
@@ -975,6 +999,7 @@ impl MLSContext {
             manifest_storage,
             processed_messages: HashMap::new(),
             sequence_counters: HashMap::new(),
+            metadata_keys,
         })
     }
 
@@ -1067,6 +1092,23 @@ impl MLSContext {
         );
 
         Ok(())
+    }
+
+    /// Store a metadata encryption key (MEK) for a group, persisting to manifest.
+    fn store_metadata_key(&mut self, group_id: &[u8], key: &[u8; 32]) {
+        let hex_id = hex::encode(group_id);
+        self.metadata_keys.insert(group_id.to_vec(), *key);
+        if let Err(e) = self
+            .manifest_storage
+            .write_manifest(&format!("mek_{}", hex_id), &hex::encode(key))
+        {
+            crate::error_log!("[MLS-CONTEXT] Failed to persist metadata key: {:?}", e);
+        }
+    }
+
+    /// Retrieve the metadata encryption key (MEK) for a group.
+    fn get_metadata_key(&self, group_id: &[u8]) -> Option<[u8; 32]> {
+        self.metadata_keys.get(group_id).copied()
     }
 
     pub fn export_group_info(
@@ -1923,6 +1965,22 @@ impl MLSContext {
             MLSError::Internal(format!("Failed to persist group ID: {:?}", e))
         })?;
 
+        // Generate and persist metadata encryption key (MEK) for this group
+        {
+            let key_bytes = self
+                .provider
+                .rand()
+                .random_vec(32)
+                .map_err(|e| MLSError::Internal(format!("MEK generation: {:?}", e)))?;
+            let mut mek = [0u8; 32];
+            mek.copy_from_slice(&key_bytes);
+            self.store_metadata_key(&group_id, &mek);
+            crate::debug_log!(
+                "[MLS-CONTEXT] Generated MEK for group {}",
+                hex::encode(&group_id)
+            );
+        }
+
         // Only register the signer if we created a new key (don't overwrite existing mappings)
         if is_new_key {
             self.signers_by_identity.insert(
@@ -2240,11 +2298,16 @@ impl MLSContext {
         let _ = storage.delete_group_config(&gid);
 
         // Remove from manifest
+        let hex_id = hex::encode(group_id);
         if let Ok(Some(mut group_ids)) = self.manifest_storage.read_manifest::<Vec<String>>("group_ids") {
-            let hex_id = hex::encode(group_id);
             group_ids.retain(|id| id != &hex_id);
             let _ = self.manifest_storage.write_manifest("group_ids", &group_ids);
         }
+
+        // Clean up metadata encryption key
+        self.metadata_keys.remove(group_id);
+        // Remove MEK from manifest (write empty string to clear, since manifest has no delete)
+        let _ = self.manifest_storage.write_manifest(&format!("mek_{}", hex_id), &"");
 
         // Flush to ensure cleanup is persisted
         let _ = self.flush_database();
@@ -2253,17 +2316,29 @@ impl MLSContext {
     }
 
     /// Read group metadata from the MLS group context extensions.
+    /// Uses the stable per-group metadata encryption key (MEK) if available,
+    /// with plaintext fallback for groups created before encryption support.
     pub fn get_group_metadata(
         &self,
         group_id: &[u8],
     ) -> Result<Option<GroupMetadata>, MLSError> {
         let gid = GroupId::from_slice(group_id);
+        let mek = self.get_metadata_key(group_id);
+
         self.with_group_ref(&gid, |group, _provider| {
-            Ok(GroupMetadata::from_group(group))
+            match mek {
+                Some(key) => Ok(crate::group_metadata::decrypt_metadata_from_group_with_key(group, &key)),
+                None => {
+                    // No MEK — try plaintext fallback
+                    Ok(crate::group_metadata::GroupMetadata::from_group(group))
+                }
+            }
         })
     }
 
     /// Update group metadata by proposing + committing a GroupContextExtensions change.
+    /// Encrypts the metadata with ChaCha20-Poly1305 using a stable per-group MEK
+    /// before storing it in the group context extension.
     /// Returns the commit message bytes that must be sent to the server.
     pub fn update_group_metadata(
         &mut self,
@@ -2272,14 +2347,35 @@ impl MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         let gid = GroupId::from_slice(group_id);
 
+        // Get or generate MEK
+        let mek = match self.get_metadata_key(group_id) {
+            Some(key) => key,
+            None => {
+                let key_bytes = self
+                    .provider
+                    .rand()
+                    .random_vec(32)
+                    .map_err(|e| MLSError::Internal(format!("MEK generation: {:?}", e)))?;
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&key_bytes);
+                self.store_metadata_key(group_id, &key);
+                key
+            }
+        };
+
         self.with_group(&gid, |group, provider, signer| {
-            // Clone existing extensions and add/replace the metadata extension.
+            // Encrypt metadata with stable per-group MEK
+            let envelope = crate::group_metadata::encrypt_metadata_with_key(
+                &mek, &metadata, provider.rand(),
+            )
+            .map_err(|e| MLSError::Internal(format!("encrypt metadata: {}", e)))?;
+            let envelope_bytes = serde_json::to_vec(&envelope)
+                .map_err(|e| MLSError::Internal(format!("serialize envelope: {}", e)))?;
+
+            // Clone existing extensions and add/replace the encrypted metadata extension.
             // update_group_context_extensions replaces ALL extensions, so we must
             // preserve any existing ones (e.g. RequiredCapabilities).
             let mut extensions = group.extensions().clone();
-            let meta_bytes = metadata.to_extension_bytes().map_err(|e| {
-                MLSError::Internal(format!("Failed to serialize metadata: {}", e))
-            })?;
 
             // Read existing RequiredCapabilities and merge our extension type
             let existing_rc = extensions.required_capabilities().cloned();
@@ -2318,7 +2414,7 @@ impl MLSContext {
             extensions
                 .add_or_replace(Extension::Unknown(
                     CATBIRD_METADATA_EXTENSION_TYPE,
-                    UnknownExtension(meta_bytes),
+                    UnknownExtension(envelope_bytes),
                 ))
                 .map_err(|e| {
                     MLSError::Internal(format!("Failed to add metadata extension: {:?}", e))
@@ -2344,7 +2440,7 @@ impl MLSContext {
                 })?;
 
             crate::info_log!(
-                "[MLS-CONTEXT] Group metadata update committed, {} bytes",
+                "[MLS-CONTEXT] Encrypted group metadata update committed, {} bytes",
                 commit_bytes.len()
             );
 
