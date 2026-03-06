@@ -14,6 +14,7 @@ use openmls_basic_credential::StorageId;
 
 use crate::error::MLSError;
 use crate::mls_context::MLSContext as MLSContextInner;
+use crate::orchestrator::mls_provider::MlsCryptoContext;
 use crate::types::*;
 
 use crate::keychain::KeychainAccess;
@@ -1024,7 +1025,7 @@ impl MLSContext {
 
         // Register the signer mapping
         let public_key = signer.public().to_vec();
-        inner.register_signer(&identity, public_key);
+        inner.register_signer(&identity, public_key)?;
 
         Ok(())
     }
@@ -2184,7 +2185,7 @@ impl MLSContext {
                 }
 
                 // Register the signer for this identity so it can be found later
-                inner.register_signer(&identity, signer_public_key.clone());
+                inner.register_signer(&identity, signer_public_key.clone())?;
                 crate::debug_log!("[CREATE-KEY-PACKAGE]   Registered signer mapping");
 
                 new_keys
@@ -2629,6 +2630,57 @@ impl MLSContext {
             crate::debug_log!("[MLS-FFI] Current epoch: {}", epoch);
             Ok(epoch)
         })
+    }
+
+    /// Read encrypted group metadata from MLS group context.
+    /// Returns JSON bytes of the metadata, or empty vec if none set.
+    pub fn get_group_metadata(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        crate::info_log!("[MLS-FFI] get_group_metadata: {}", hex::encode(&group_id));
+
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        match inner.get_group_metadata(&group_id)? {
+            Some(meta) => meta
+                .to_extension_bytes()
+                .map_err(|e| MLSError::Internal(format!("JSON serialize: {}", e))),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Update group metadata. Returns commit bytes to send to server.
+    pub fn update_group_metadata(
+        &self,
+        group_id: Vec<u8>,
+        metadata_json: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        crate::info_log!(
+            "[MLS-FFI] update_group_metadata: {}",
+            hex::encode(&group_id)
+        );
+
+        let metadata =
+            crate::group_metadata::GroupMetadata::from_extension_bytes(&metadata_json)
+                .map_err(|e| MLSError::invalid_input(format!("Invalid metadata JSON: {}", e)))?;
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let commit_bytes = inner.update_group_metadata(&group_id, metadata)?;
+
+        inner.flush_database().map_err(|e| {
+            crate::error_log!("[MLS-FFI] Failed to flush after metadata update: {:?}", e);
+            e
+        })?;
+        inner.maybe_truncate_checkpoint();
+
+        Ok(commit_bytes)
     }
 
     /// Get the tree hash for a group at its current epoch
@@ -3960,6 +4012,101 @@ pub fn mls_hash_psk(psk: Vec<u8>) -> String {
     hasher.update(&psk);
     let result = hasher.finalize();
     hex::encode(result)
+}
+
+// ---------------------------------------------------------------------------
+// MlsCryptoContext trait implementation — delegates directly to MLSContext methods
+// ---------------------------------------------------------------------------
+
+impl MlsCryptoContext for MLSContext {
+    fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
+        self.create_key_package(identity)
+    }
+
+    fn create_group(
+        &self,
+        identity: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        self.create_group(identity, config)
+    }
+
+    fn add_members(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+    ) -> Result<AddMembersResult, MLSError> {
+        self.add_members(group_id, key_packages)
+    }
+
+    fn remove_members(
+        &self,
+        group_id: Vec<u8>,
+        member_identities: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.remove_members(group_id, member_identities)
+    }
+
+    fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        self.merge_pending_commit(group_id)
+    }
+
+    fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        self.clear_pending_commit(group_id)
+    }
+
+    fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+        self.get_epoch(group_id)
+    }
+
+    fn export_group_info(
+        &self,
+        group_id: Vec<u8>,
+        signer_identity: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.export_group_info(group_id, signer_identity)
+    }
+
+    fn encrypt_message(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+    ) -> Result<EncryptResult, MLSError> {
+        self.encrypt_message(group_id, plaintext)
+    }
+
+    fn decrypt_message(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<DecryptResult, MLSError> {
+        self.decrypt_message(group_id, ciphertext)
+    }
+
+    fn create_external_commit(
+        &self,
+        group_info: Vec<u8>,
+        identity: Vec<u8>,
+    ) -> Result<ExternalCommitResult, MLSError> {
+        self.create_external_commit(group_info, identity)
+    }
+
+    fn discard_pending_external_join(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        self.discard_pending_external_join(group_id)
+    }
+
+    fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        self.delete_group(group_id)
+    }
+
+    fn process_welcome(
+        &self,
+        welcome_data: Vec<u8>,
+        identity: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<WelcomeResult, MLSError> {
+        self.process_welcome(welcome_data, identity, config)
+    }
 }
 
 #[cfg(test)]

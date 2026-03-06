@@ -2222,6 +2222,90 @@ impl MLSContext {
         true
     }
 
+    /// Read group metadata from the MLS group context extensions.
+    pub fn get_group_metadata(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Option<GroupMetadata>, MLSError> {
+        let gid = GroupId::from_slice(group_id);
+        self.with_group_ref(&gid, |group, _provider| {
+            Ok(GroupMetadata::from_group(group))
+        })
+    }
+
+    /// Update group metadata by proposing + committing a GroupContextExtensions change.
+    /// Returns the commit message bytes that must be sent to the server.
+    pub fn update_group_metadata(
+        &mut self,
+        group_id: &[u8],
+        metadata: GroupMetadata,
+    ) -> Result<Vec<u8>, MLSError> {
+        let gid = GroupId::from_slice(group_id);
+
+        self.with_group(&gid, |group, provider, signer| {
+            // Clone existing extensions and add/replace the metadata extension.
+            // update_group_context_extensions replaces ALL extensions, so we must
+            // preserve any existing ones (e.g. RequiredCapabilities).
+            let mut extensions = group.extensions().clone();
+            let meta_bytes = metadata.to_extension_bytes().map_err(|e| {
+                MLSError::Internal(format!("Failed to serialize metadata: {}", e))
+            })?;
+
+            // Ensure RequiredCapabilities includes the metadata extension type.
+            // Without this, OpenMLS rejects the proposal with
+            // ExtensionNotInRequiredCapabilities.
+            extensions
+                .add_or_replace(Extension::RequiredCapabilities(
+                    RequiredCapabilitiesExtension::new(
+                        &[ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE)],
+                        &[],
+                        &[],
+                    ),
+                ))
+                .map_err(|e| {
+                    MLSError::Internal(format!(
+                        "Failed to add required capabilities extension: {:?}",
+                        e
+                    ))
+                })?;
+
+            extensions
+                .add_or_replace(Extension::Unknown(
+                    CATBIRD_METADATA_EXTENSION_TYPE,
+                    UnknownExtension(meta_bytes),
+                ))
+                .map_err(|e| {
+                    MLSError::Internal(format!("Failed to add metadata extension: {:?}", e))
+                })?;
+
+            let (commit_msg, _welcome, _group_info) = group
+                .update_group_context_extensions(provider, extensions, signer)
+                .map_err(|e| {
+                    crate::error_log!(
+                        "[MLS-CONTEXT] Failed to update group context extensions: {:?}",
+                        e
+                    );
+                    MLSError::OpenMLS(format!("update_group_context_extensions: {:?}", e))
+                })?;
+
+            let commit_bytes =
+                TlsSerialize::tls_serialize_detached(&commit_msg).map_err(|e| {
+                    crate::error_log!(
+                        "[MLS-CONTEXT] Failed to serialize metadata commit: {:?}",
+                        e
+                    );
+                    MLSError::SerializationError
+                })?;
+
+            crate::info_log!(
+                "[MLS-CONTEXT] Group metadata update committed, {} bytes",
+                commit_bytes.len()
+            );
+
+            Ok(commit_bytes)
+        })
+    }
+
     /// Export a group's state for persistent storage
     ///
     /// Uses OpenMLS's built-in load/save mechanism.
