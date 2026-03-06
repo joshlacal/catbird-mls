@@ -3,12 +3,25 @@ use async_trait::async_trait;
 use super::error::Result;
 use super::types::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MLSAPIClientBounds: Send + Sync {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> MLSAPIClientBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait MLSAPIClientBounds {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MLSAPIClientBounds for T {}
+
 /// Platform-agnostic API client for communicating with the MLS delivery service.
 ///
 /// Implementations handle authentication, network transport, and serialization.
 /// On iOS this wraps the ATProtoClient/MLSAPIClient; on desktop it can use reqwest directly.
-#[async_trait]
-pub trait MLSAPIClient: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait MLSAPIClient: MLSAPIClientBounds {
     // -- Authentication --
 
     /// Check if the client is authenticated as the given DID.
@@ -59,7 +72,12 @@ pub trait MLSAPIClient: Send + Sync {
     // -- Messages --
 
     /// Send an encrypted MLS message to the delivery service.
-    async fn send_message(&self, convo_id: &str, ciphertext: &[u8], epoch: u64) -> Result<()>;
+    async fn send_message(
+        &self,
+        convo_id: &str,
+        ciphertext: &[u8],
+        epoch: u64,
+    ) -> Result<SendMessageResponse>;
 
     /// Send an encrypted MLS message with an explicit client-generated message ID.
     ///
@@ -71,7 +89,7 @@ pub trait MLSAPIClient: Send + Sync {
         ciphertext: &[u8],
         epoch: u64,
         msg_id: &str,
-    ) -> Result<()> {
+    ) -> Result<SendMessageResponse> {
         let _ = msg_id;
         self.send_message(convo_id, ciphertext, epoch).await
     }
@@ -166,6 +184,20 @@ pub trait MLSAPIClient: Send + Sync {
     ) -> Result<Vec<(String, DeliveryStatus)>> {
         let _ = (convo_id, message_ids);
         Ok(vec![])
+    }
+
+    /// Send a commit (e.g. metadata update) to the server.
+    ///
+    /// The `action` parameter describes the commit type (e.g. "updateMetadata").
+    /// Default implementation is a no-op for backends that don't support it yet.
+    async fn commit_group_change(
+        &self,
+        convo_id: &str,
+        commit_data: &[u8],
+        action: &str,
+    ) -> Result<()> {
+        let _ = (convo_id, commit_data, action);
+        Ok(())
     }
 
     /// Send an External Commit to the processExternalCommit endpoint.

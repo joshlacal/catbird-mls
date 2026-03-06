@@ -3,15 +3,17 @@ use sha2::{Digest, Sha256};
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
+use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
-impl<S, A, C> MLSOrchestrator<S, A, C>
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
     A: MLSAPIClient + 'static,
     C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
 {
     /// Create a new MLS group/conversation.
     ///
@@ -41,11 +43,18 @@ where
         });
         let filtered_members_ref = filtered_members.as_deref();
 
-        // Create MLS group locally
+        // Create MLS group locally — with encrypted metadata in group context
         let identity_bytes = user_did.as_bytes().to_vec();
+        let mut group_config = self.config().group_config.clone();
+        if !name.is_empty() {
+            group_config.group_name = Some(name.to_string());
+        }
+        if let Some(desc) = description {
+            group_config.group_description = Some(desc.to_string());
+        }
         let creation_result = self
             .mls_context()
-            .create_group(identity_bytes, Some(self.config().group_config.clone()))?;
+            .create_group(identity_bytes, Some(group_config))?;
         let group_id_hex = hex::encode(&creation_result.group_id);
 
         tracing::info!(group_id = %group_id_hex, "Local MLS group created");
@@ -382,11 +391,19 @@ where
                 .mls_context()
                 .merge_pending_commit(group_id_bytes.clone())?;
 
-            if let Some(gs) = self.group_states().lock().await.get_mut(group_id) {
-                gs.epoch = merged_epoch;
-                for did in member_dids {
-                    if !gs.members.contains(did) {
-                        gs.members.push(did.clone());
+            {
+                let mut states = self.group_states().lock().await;
+                if let Some(gs) = states.get_mut(group_id) {
+                    gs.epoch = merged_epoch;
+                    for did in member_dids {
+                        if !gs.members.contains(did) {
+                            gs.members.push(did.clone());
+                        }
+                    }
+                    let state_clone = gs.clone();
+                    drop(states);
+                    if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                        tracing::warn!(error = %e, group_id, "Failed to persist group state after add_members");
                     }
                 }
             }
@@ -396,10 +413,13 @@ where
         let group_info = self
             .mls_context()
             .export_group_info(group_id_bytes, user_did.into_bytes())?;
-        let _ = self
+        if let Err(e) = self
             .api_client()
             .publish_group_info(group_id, &group_info)
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, group_id, "Failed to publish GroupInfo (external joins may fail)");
+        }
 
         tracing::info!(group_id, "Members added successfully");
         Ok(())
@@ -445,19 +465,30 @@ where
             .mls_context()
             .merge_pending_commit(group_id_bytes.clone())?;
 
-        if let Some(gs) = self.group_states().lock().await.get_mut(group_id) {
-            gs.epoch = merged_epoch;
-            gs.members.retain(|m| !member_dids.contains(m));
+        {
+            let mut states = self.group_states().lock().await;
+            if let Some(gs) = states.get_mut(group_id) {
+                gs.epoch = merged_epoch;
+                gs.members.retain(|m| !member_dids.contains(m));
+                let state_clone = gs.clone();
+                drop(states);
+                if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                    tracing::warn!(error = %e, group_id, "Failed to persist group state after remove_members");
+                }
+            }
         }
 
         // Publish updated GroupInfo
         let group_info = self
             .mls_context()
             .export_group_info(group_id_bytes, user_did.into_bytes())?;
-        let _ = self
+        if let Err(e) = self
             .api_client()
             .publish_group_info(group_id, &group_info)
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, group_id, "Failed to publish GroupInfo (external joins may fail)");
+        }
 
         Ok(())
     }
@@ -481,6 +512,94 @@ where
     /// Delete a conversation (admin action).
     pub async fn delete_group(&self, convo_id: &str) -> Result<()> {
         self.leave_group(convo_id).await
+    }
+
+    /// Update encrypted group metadata (name, description, avatar_hash).
+    ///
+    /// Proposes a GroupContextExtensions commit, sends it to the server,
+    /// then merges the pending commit locally to advance the epoch.
+    pub async fn update_group_metadata(
+        &self,
+        conversation_id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+        avatar_hash: Option<&str>,
+    ) -> Result<()> {
+        self.check_shutdown().await?;
+        let user_did = self.require_user_did().await?;
+
+        let group_id = hex::decode(conversation_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+
+        let metadata = crate::group_metadata::GroupMetadata {
+            v: 1,
+            name: name.map(|s| s.to_string()),
+            description: description.map(|s| s.to_string()),
+            avatar_hash: avatar_hash.map(|s| s.to_string()),
+        };
+
+        let metadata_json = metadata
+            .to_extension_bytes()
+            .map_err(|e| OrchestratorError::Serialization(format!("Metadata serialize: {}", e)))?;
+
+        let commit_bytes = self
+            .mls_context()
+            .update_group_metadata(group_id.clone(), metadata_json)?;
+
+        // Send commit to server
+        self.api_client()
+            .commit_group_change(conversation_id, &commit_bytes, "updateMetadata")
+            .await?;
+
+        // Merge pending commit locally
+        let merged_epoch = self
+            .mls_context()
+            .merge_pending_commit(group_id.clone())?;
+
+        // Update group state cache
+        {
+            let mut states = self.group_states().lock().await;
+            if let Some(gs) = states.get_mut(conversation_id) {
+                gs.epoch = merged_epoch;
+                let state_clone = gs.clone();
+                drop(states);
+                if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                    tracing::warn!(error = %e, conversation_id, "Failed to persist group state after metadata update");
+                }
+            }
+        }
+
+        // Publish updated GroupInfo
+        let group_info = self
+            .mls_context()
+            .export_group_info(group_id, user_did.into_bytes())?;
+        if let Err(e) = self
+            .api_client()
+            .publish_group_info(conversation_id, &group_info)
+            .await
+        {
+            tracing::warn!(error = %e, conversation_id, "Failed to publish GroupInfo after metadata update");
+        }
+
+        tracing::info!(conversation_id, epoch = merged_epoch, "Group metadata updated");
+        Ok(())
+    }
+
+    /// Read decrypted group metadata from MLS group context.
+    pub fn get_group_metadata(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<crate::group_metadata::GroupMetadata>> {
+        let group_id = hex::decode(conversation_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+
+        let meta_bytes = self.mls_context().get_group_metadata(group_id)?;
+        if meta_bytes.is_empty() {
+            return Ok(None);
+        }
+        crate::group_metadata::GroupMetadata::from_extension_bytes(&meta_bytes)
+            .map(Some)
+            .map_err(|e| OrchestratorError::Serialization(format!("Metadata deserialize: {}", e)))
     }
 
     /// Force delete a conversation from local state only.

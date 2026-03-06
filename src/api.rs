@@ -4099,6 +4099,18 @@ impl MlsCryptoContext for MLSContext {
         self.delete_group(group_id)
     }
 
+    fn get_group_metadata(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.get_group_metadata(group_id)
+    }
+
+    fn update_group_metadata(
+        &self,
+        group_id: Vec<u8>,
+        metadata_json: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.update_group_metadata(group_id, metadata_json)
+    }
+
     fn process_welcome(
         &self,
         welcome_data: Vec<u8>,
