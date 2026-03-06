@@ -1280,6 +1280,20 @@ impl MLSContext {
                     e
                 ))
             })?
+            .leaf_node_parameters(
+                LeafNodeParameters::builder()
+                    .with_capabilities(Capabilities::new(
+                        None,
+                        None,
+                        Some(&[
+                            ExtensionType::RatchetTree,
+                            ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE),
+                        ]),
+                        None,
+                        None,
+                    ))
+                    .build(),
+            )
             .load_psks(self.provider.storage())
             .map_err(|e| {
                 crate::error_log!(
@@ -1548,6 +1562,20 @@ impl MLSContext {
                     e
                 ))
             })?
+            .leaf_node_parameters(
+                LeafNodeParameters::builder()
+                    .with_capabilities(Capabilities::new(
+                        None,
+                        None,
+                        Some(&[
+                            ExtensionType::RatchetTree,
+                            ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE),
+                        ]),
+                        None,
+                        None,
+                    ))
+                    .build(),
+            )
             .load_psks(self.provider.storage())
             .map_err(|e| {
                 crate::error_log!(
@@ -1807,14 +1835,16 @@ impl MLSContext {
                 config.group_name.clone(),
                 config.group_description.clone(),
             );
-            if let Ok(extensions) = metadata.to_extensions() {
-                group_config_builder =
-                    group_config_builder.with_group_context_extensions(extensions);
-                crate::info_log!(
-                    "[MLS-CONTEXT] Group metadata set: name={:?}",
-                    config.group_name
-                );
-            }
+            let extensions = metadata.to_extensions().map_err(|e| {
+                crate::error_log!("[MLS-CONTEXT] Failed to build group metadata extension: {:?}", e);
+                e
+            })?;
+            group_config_builder =
+                group_config_builder.with_group_context_extensions(extensions);
+            crate::info_log!(
+                "[MLS-CONTEXT] Group metadata set: name={:?}",
+                config.group_name
+            );
         }
 
         let group_config = group_config_builder.build();
@@ -2251,16 +2281,32 @@ impl MLSContext {
                 MLSError::Internal(format!("Failed to serialize metadata: {}", e))
             })?;
 
-            // Ensure RequiredCapabilities includes the metadata extension type.
-            // Without this, OpenMLS rejects the proposal with
-            // ExtensionNotInRequiredCapabilities.
+            // Read existing RequiredCapabilities and merge our extension type
+            let existing_rc = extensions.required_capabilities().cloned();
+            let mut ext_types: Vec<ExtensionType> = existing_rc
+                .as_ref()
+                .map(|rc| rc.extension_types().to_vec())
+                .unwrap_or_default();
+            if !ext_types.contains(&ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE)) {
+                ext_types.push(ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE));
+            }
+            // Ensure RatchetTree is always present
+            if !ext_types.contains(&ExtensionType::RatchetTree) {
+                ext_types.push(ExtensionType::RatchetTree);
+            }
+
+            let proposal_types = existing_rc
+                .as_ref()
+                .map(|rc| rc.proposal_types().to_vec())
+                .unwrap_or_default();
+            let credential_types = existing_rc
+                .as_ref()
+                .map(|rc| rc.credential_types().to_vec())
+                .unwrap_or_default();
+
             extensions
                 .add_or_replace(Extension::RequiredCapabilities(
-                    RequiredCapabilitiesExtension::new(
-                        &[ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE)],
-                        &[],
-                        &[],
-                    ),
+                    RequiredCapabilitiesExtension::new(&ext_types, &proposal_types, &credential_types),
                 ))
                 .map_err(|e| {
                     MLSError::Internal(format!(

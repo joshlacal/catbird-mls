@@ -61,7 +61,7 @@ impl GroupMetadata {
             .unknown(CATBIRD_METADATA_EXTENSION_TYPE)
             .and_then(|ext| {
                 Self::from_extension_bytes(&ext.0)
-                    .map_err(|e| tracing::warn!("Failed to decode GroupMetadata extension: {e}"))
+                    .map_err(|e| { crate::warn_log!("Failed to decode GroupMetadata extension: {:?}", e); })
                     .ok()
             })
     }
