@@ -184,17 +184,6 @@ pub fn decrypt_metadata_from_group_with_key(
         .ok()
 }
 
-/// Build Extensions from raw encrypted envelope bytes.
-pub(crate) fn encrypted_to_extensions(
-    envelope_bytes: &[u8],
-) -> Result<Extensions<GroupContext>, MLSError> {
-    Extensions::single(Extension::Unknown(
-        CATBIRD_METADATA_EXTENSION_TYPE,
-        UnknownExtension(envelope_bytes.to_vec()),
-    ))
-    .map_err(|e| MLSError::OpenMLS(format!("{:?}", e)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
