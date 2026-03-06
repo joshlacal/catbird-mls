@@ -2206,9 +2206,13 @@ impl MLSContext {
         let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 
         // CRITICAL: Key packages must advertise support for RatchetTree extension
-        // This must match the group config's use_ratchet_tree_extension setting
+        // AND the Catbird metadata extension (0xff00) so members can join groups
+        // that use encrypted group metadata in context extensions.
         let capabilities = Capabilities::builder()
-            .extensions(vec![ExtensionType::RatchetTree])
+            .extensions(vec![
+                ExtensionType::RatchetTree,
+                ExtensionType::Unknown(crate::group_metadata::CATBIRD_METADATA_EXTENSION_TYPE),
+            ])
             .build();
 
         let key_package_bundle = KeyPackage::builder()
