@@ -123,6 +123,7 @@ fn ffi_to_message(ffi: &crate::orchestrator_bridge::FFIMessage) -> Message {
             FFIDeliveryStatus::Pending => DeliveryStatus::Pending,
             FFIDeliveryStatus::LocalOnly => DeliveryStatus::LocalOnly,
         }),
+        payload_json: ffi.payload_json.clone(),
     }
 }
 
@@ -150,6 +151,7 @@ fn message_to_ffi(msg: &Message) -> crate::orchestrator_bridge::FFIMessage {
             DeliveryStatus::Pending => FFIDeliveryStatus::Pending,
             DeliveryStatus::LocalOnly => FFIDeliveryStatus::LocalOnly,
         }),
+        payload_json: msg.payload_json.clone(),
     }
 }
 
@@ -453,10 +455,16 @@ impl MLSAPIClient for ClientAPIAdapter {
         convo_id: &str,
         ciphertext: &[u8],
         epoch: u64,
-    ) -> crate::orchestrator::Result<()> {
+    ) -> crate::orchestrator::Result<crate::orchestrator::SendMessageResponse> {
         self.0
             .send_message(convo_id.to_string(), ciphertext.to_vec(), epoch)
-            .map_err(bridge_err)
+            .map_err(bridge_err)?;
+        // FFI callback doesn't return server response; return defaults.
+        Ok(crate::orchestrator::SendMessageResponse {
+            message_id: String::new(),
+            seq: 0,
+            epoch,
+        })
     }
 
     async fn get_messages(
@@ -691,8 +699,12 @@ impl CredentialStore for ClientCredentialAdapter {
 // Concrete type alias
 // ═══════════════════════════════════════════════════════════════════════════
 
-type ConcreteCatbirdClient =
-    CatbirdClient<ClientStorageAdapter, ClientAPIAdapter, ClientCredentialAdapter>;
+type ConcreteCatbirdClient = CatbirdClient<
+    ClientStorageAdapter,
+    ClientAPIAdapter,
+    ClientCredentialAdapter,
+    crate::MLSContext,
+>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UniFFI-exported CatbirdClientBridge
@@ -870,13 +882,13 @@ impl CatbirdClientBridge {
 
     // -- Read state --
 
-    /// Mark a conversation as read up to a specific message.
-    pub fn mark_read(
+    /// Update the read cursor for a conversation.
+    pub fn update_cursor(
         &self,
         conversation_id: String,
-        message_id: String,
+        cursor: String,
     ) -> Result<(), OrchestratorBridgeError> {
-        crate::async_runtime::block_on(self.inner.mark_read(&conversation_id, &message_id))
+        crate::async_runtime::block_on(self.inner.update_cursor(&conversation_id, &cursor))
             .map_err(OrchestratorBridgeError::from)
     }
 

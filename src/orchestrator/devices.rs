@@ -1,15 +1,17 @@
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
+use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
-impl<S, A, C> MLSOrchestrator<S, A, C>
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
     A: MLSAPIClient + 'static,
     C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
 {
     /// Ensure the current device is registered with the MLS service.
     ///
@@ -58,7 +60,7 @@ where
                 &device_uuid,
                 &get_device_name(),
                 &mls_did,
-                &kp_result.hash_ref,
+                &kp_result.signature_public_key,
                 std::slice::from_ref(&kp_result.key_package_data),
             )
             .await
@@ -83,7 +85,7 @@ where
             .store_device_uuid(&user_did, &device_uuid)
             .await?;
         self.credentials()
-            .store_signing_key(&user_did, &kp_result.hash_ref)
+            .store_signing_key(&user_did, &kp_result.signature_public_key)
             .await?;
 
         // Publish initial key packages
@@ -117,20 +119,25 @@ where
 
 /// Get a human-readable device name based on the platform.
 fn get_device_name() -> String {
-    #[cfg(target_os = "macos")]
+    #[cfg(target_arch = "wasm32")]
+    {
+        "Catbird Web".to_string()
+    }
+    #[cfg(all(target_os = "macos", not(target_arch = "wasm32")))]
     {
         format!("Catmos Desktop ({})", hostname())
     }
-    #[cfg(target_os = "ios")]
+    #[cfg(all(target_os = "ios", not(target_arch = "wasm32")))]
     {
         "Catbird iOS".to_string()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))]
     {
         format!("Catbird ({})", std::env::consts::OS)
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))

@@ -1,291 +1,273 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Build MLS FFI for Android and generate Kotlin bindings
-# This script builds for all Android architectures and packages into a Kotlin library
-
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-echo -e "${GREEN}Building MLS FFI for Android...${NC}"
+log_info() {
+  echo -e "${GREEN}$1${NC}"
+}
 
-# Check for Android NDK
-if [ -z "$ANDROID_NDK_HOME" ]; then
-    echo -e "${RED}Error: ANDROID_NDK_HOME not set${NC}"
-    echo "Please install Android NDK and set ANDROID_NDK_HOME"
-    echo "You can install via Android Studio or download from:"
-    echo "https://developer.android.com/ndk/downloads"
-    echo ""
-    echo "Example setup:"
-    echo "  export ANDROID_NDK_HOME=\$HOME/Library/Android/sdk/ndk/26.1.10909125"
-    echo "  export PATH=\$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin:\$PATH"
-    exit 1
-fi
+log_warn() {
+  echo -e "${YELLOW}$1${NC}"
+}
 
-echo -e "${GREEN}Found Android NDK: $ANDROID_NDK_HOME${NC}"
+log_error() {
+  echo -e "${RED}$1${NC}" >&2
+}
 
-# Android targets
-ANDROID_TARGETS=(
-    "aarch64-linux-android"   # ARM64
-    "armv7-linux-androideabi" # ARMv7
-    "i686-linux-android"      # x86
-    "x86_64-linux-android"    # x86_64
-)
+usage() {
+  cat <<'EOF'
+Build catbird-mls for Android and sync the generated UniFFI artifacts.
 
-# Check if targets are installed
-echo -e "${YELLOW}Checking Rust Android targets...${NC}"
-for target in "${ANDROID_TARGETS[@]}"; do
-    if ! rustup target list | grep -q "$target (installed)"; then
-        echo -e "${YELLOW}Installing $target...${NC}"
-        rustup target add "$target"
-    else
-        echo -e "${GREEN}✓ $target installed${NC}"
-    fi
+Usage:
+  ./build-android.sh [--android-module-dir <path>] [--output-dir <path>] [--no-sync-android-module]
+
+Options:
+  --android-module-dir <path>  Sync generated Kotlin + jniLibs into this Android module.
+  --output-dir <path>          Override the staging directory root (default: build/android).
+  --no-sync-android-module     Build and stage artifacts without syncing them into android/Catbird/mlsffi.
+  --help                       Show this help text.
+
+By default the script auto-detects the latest Android NDK in ~/Library/Android/sdk/ndk
+and, when present, syncs artifacts into ../android/Catbird/mlsffi.
+EOF
+}
+
+OUTPUT_ROOT="$SCRIPT_DIR/build/android"
+DEFAULT_ANDROID_MODULE_DIR="$SCRIPT_DIR/../android/Catbird/mlsffi"
+ANDROID_MODULE_DIR=""
+SYNC_TO_ANDROID_MODULE="auto"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --android-module-dir)
+      ANDROID_MODULE_DIR="$2"
+      SYNC_TO_ANDROID_MODULE="yes"
+      shift 2
+      ;;
+    --output-dir)
+      OUTPUT_ROOT="$2"
+      shift 2
+      ;;
+    --no-sync-android-module)
+      SYNC_TO_ANDROID_MODULE="no"
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      log_error "Unknown argument: $1"
+      usage
+      exit 1
+      ;;
+  esac
 done
 
-# Create output directories
-OUTPUT_DIR="$SCRIPT_DIR/build/android"
-KOTLIN_DIR="$OUTPUT_DIR/kotlin"
-JNI_DIR="$OUTPUT_DIR/jniLibs"
-
-mkdir -p "$KOTLIN_DIR"
-mkdir -p "$JNI_DIR"/{arm64-v8a,armeabi-v7a,x86,x86_64}
-
-# Build for each Android architecture
-echo -e "${GREEN}Building for Android architectures...${NC}"
-
-build_for_target() {
-    local target=$1
-    local jni_arch=$2
-
-    echo -e "${YELLOW}Building for $target...${NC}"
-
-    cargo build --release --target "$target"
-
-    # Copy the library to the appropriate JNI directory
-    local lib_name="libcatbird_mls.so"
-    local source_path="target/$target/release/$lib_name"
-    local dest_path="$JNI_DIR/$jni_arch/$lib_name"
-
-    if [ -f "$source_path" ]; then
-        cp "$source_path" "$dest_path"
-        echo -e "${GREEN}✓ Copied $lib_name to $jni_arch${NC}"
-    else
-        echo -e "${RED}Error: Library not found at $source_path${NC}"
-        exit 1
-    fi
-}
-
-# Build for each target
-build_for_target "aarch64-linux-android" "arm64-v8a"
-build_for_target "armv7-linux-androideabi" "armeabi-v7a"
-build_for_target "i686-linux-android" "x86"
-build_for_target "x86_64-linux-android" "x86_64"
-
-# Generate Kotlin bindings
-echo -e "${GREEN}Generating Kotlin bindings...${NC}"
-
-# Build the uniffi-bindgen tool
-cargo build --bin uniffi-bindgen
-
-# Generate Kotlin bindings
-./target/debug/uniffi-bindgen generate \
-    --library target/aarch64-linux-android/release/libcatbird_mls.so \
-    --language kotlin \
-    --out-dir "$KOTLIN_DIR"
-
-if [ $? -eq 0 ]; then
-    echo -e "${GREEN}✓ Kotlin bindings generated in $KOTLIN_DIR${NC}"
-else
-    echo -e "${RED}Error generating Kotlin bindings${NC}"
-    exit 1
+if [[ -z "$ANDROID_MODULE_DIR" && "$SYNC_TO_ANDROID_MODULE" != "no" && -d "$DEFAULT_ANDROID_MODULE_DIR" ]]; then
+  ANDROID_MODULE_DIR="$DEFAULT_ANDROID_MODULE_DIR"
 fi
 
-# Create package structure
-PACKAGE_DIR="$OUTPUT_DIR/mlsffi-kotlin"
-mkdir -p "$PACKAGE_DIR"
+resolve_ndk_dir() {
+  local direct_candidates=(
+    "${ANDROID_NDK_HOME:-}"
+    "${ANDROID_NDK_ROOT:-}"
+  )
+  local dir_candidates=(
+    "${ANDROID_HOME:-$HOME/Library/Android/sdk}/ndk"
+    "${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}/ndk"
+  )
 
-# Copy Kotlin files
-echo -e "${GREEN}Creating Kotlin package structure...${NC}"
-cp -r "$KOTLIN_DIR"/* "$PACKAGE_DIR/"
-cp -r "$JNI_DIR" "$PACKAGE_DIR/"
+  local candidate
+  for candidate in "${direct_candidates[@]}"; do
+    if [[ -n "$candidate" && -d "$candidate/toolchains/llvm/prebuilt" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
 
-# Create build.gradle.kts for the package
-cat > "$PACKAGE_DIR/build.gradle.kts" << 'EOF'
-plugins {
-    id("com.android.library")
-    kotlin("android")
+  for candidate in "${dir_candidates[@]}"; do
+    if [[ -d "$candidate" ]]; then
+      local latest
+      latest="$(find "$candidate" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+      if [[ -n "$latest" && -d "$latest/toolchains/llvm/prebuilt" ]]; then
+        printf '%s\n' "$latest"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
 }
 
-android {
-    namespace = "blue.catbird.mlsffi"
-    compileSdk = 34
+ANDROID_NDK_DIR="$(resolve_ndk_dir || true)"
+if [[ -z "$ANDROID_NDK_DIR" ]]; then
+  log_error "Unable to locate an Android NDK installation. Install the NDK via Android Studio or set ANDROID_NDK_HOME."
+  exit 1
+fi
 
-    defaultConfig {
-        minSdk = 26
-        targetSdk = 34
+TOOLCHAIN_DIR="$(find "$ANDROID_NDK_DIR/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d | sort | head -n 1)"
+if [[ -z "$TOOLCHAIN_DIR" ]]; then
+  log_error "Unable to locate the NDK LLVM toolchain under $ANDROID_NDK_DIR"
+  exit 1
+fi
 
-        consumerProguardFiles("consumer-rules.pro")
-    }
+export ANDROID_NDK_HOME="$ANDROID_NDK_DIR"
+export ANDROID_NDK_ROOT="$ANDROID_NDK_DIR"
+export PATH="$TOOLCHAIN_DIR/bin:$PATH"
 
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
-        }
-    }
+log_info "Building catbird-mls for Android"
+log_info "Using Android NDK: $ANDROID_NDK_DIR"
+log_info "Using LLVM toolchain: $TOOLCHAIN_DIR"
 
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
+ANDROID_TARGETS=(
+  "aarch64-linux-android"
+  "armv7-linux-androideabi"
+  "i686-linux-android"
+  "x86_64-linux-android"
+)
 
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+log_warn "Checking Rust Android targets..."
+for target in "${ANDROID_TARGETS[@]}"; do
+  if ! rustup target list | grep -q "$target (installed)"; then
+    log_warn "Installing $target..."
+    rustup target add "$target"
+  else
+    log_info "✓ $target installed"
+  fi
+done
 
-    sourceSets {
-        getByName("main") {
-            jniLibs.srcDirs("jniLibs")
-        }
-    }
-}
+STAGING_DIR="$OUTPUT_ROOT/mlsffi"
+KOTLIN_DIR="$STAGING_DIR/src/main/kotlin"
+JNI_DIR="$STAGING_DIR/src/main/jniLibs"
 
-dependencies {
-    implementation("net.java.dev.jna:jna:5.14.0@aar")
-}
-EOF
+find "$OUTPUT_ROOT" -mindepth 1 -maxdepth 1 -type d \
+  \( -name "kotlin" -o -name "jniLibs" -o -name "*-kotlin" \) \
+  -exec rm -rf {} +
+rm -rf "$STAGING_DIR"
+mkdir -p "$KOTLIN_DIR" \
+  "$JNI_DIR/arm64-v8a" \
+  "$JNI_DIR/armeabi-v7a" \
+  "$JNI_DIR/x86" \
+  "$JNI_DIR/x86_64"
 
-# Create AndroidManifest.xml
-mkdir -p "$PACKAGE_DIR/src/main"
-cat > "$PACKAGE_DIR/src/main/AndroidManifest.xml" << 'EOF'
+cat > "$STAGING_DIR/src/main/AndroidManifest.xml" <<'EOF'
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 </manifest>
 EOF
 
-# Move Kotlin source files to proper location
-mkdir -p "$PACKAGE_DIR/src/main/kotlin/blue/catbird/mlsffi"
-find "$PACKAGE_DIR" -maxdepth 1 -name "*.kt" -exec mv {} "$PACKAGE_DIR/src/main/kotlin/blue/catbird/mlsffi/" \;
+build_for_target() {
+  local target="$1"
+  local abi="$2"
+  local clang_triple="$3"
+  local normalized_target="${target//-/_}"
+  local upper_target
+  upper_target="$(printf '%s' "$normalized_target" | tr '[:lower:]' '[:upper:]')"
+  local linker="$TOOLCHAIN_DIR/bin/${clang_triple}-clang"
+  local cxx="$TOOLCHAIN_DIR/bin/${clang_triple}-clang++"
+  local ar="$TOOLCHAIN_DIR/bin/llvm-ar"
+  local ranlib="$TOOLCHAIN_DIR/bin/llvm-ranlib"
+  local source_path="target/$target/release/libcatbird_mls.so"
+  local dest_path="$JNI_DIR/$abi/libcatbird_mls.so"
 
-# Create README for the package
-cat > "$PACKAGE_DIR/README.md" << 'EOF'
-# MLS FFI Kotlin Bindings
+  if [[ ! -x "$linker" ]]; then
+    log_error "Expected linker not found: $linker"
+    exit 1
+  fi
 
-Kotlin bindings for the MLS (Messaging Layer Security) FFI library.
+  log_warn "Building for $target ($abi)..."
+  env \
+    "CC_${target}=$linker" \
+    "CC_${normalized_target}=$linker" \
+    "CXX_${target}=$cxx" \
+    "CXX_${normalized_target}=$cxx" \
+    "AR_${target}=$ar" \
+    "AR_${normalized_target}=$ar" \
+    "RANLIB_${target}=$ranlib" \
+    "RANLIB_${normalized_target}=$ranlib" \
+    "CARGO_TARGET_${upper_target}_LINKER=$linker" \
+    cargo build --release --target "$target"
 
-## Installation
+  if [[ ! -f "$source_path" ]]; then
+    log_error "Expected library not found: $source_path"
+    exit 1
+  fi
 
-### Option 1: Gradle (Local)
-
-1. Copy this `mlsffi-kotlin` directory to your Android project's root directory.
-
-2. In your `settings.gradle.kts`:
-```kotlin
-include(":mlsffi-kotlin")
-```
-
-3. In your app's `build.gradle.kts`:
-```kotlin
-dependencies {
-    implementation(project(":mlsffi-kotlin"))
+  cp "$source_path" "$dest_path"
+  log_info "✓ Copied $(basename "$source_path") to $abi"
 }
-```
 
-### Option 2: Manual JNI Libraries
+build_for_target "aarch64-linux-android" "arm64-v8a" "aarch64-linux-android21"
+build_for_target "armv7-linux-androideabi" "armeabi-v7a" "armv7a-linux-androideabi21"
+build_for_target "i686-linux-android" "x86" "i686-linux-android21"
+build_for_target "x86_64-linux-android" "x86_64" "x86_64-linux-android21"
 
-1. Copy the `jniLibs` directory to your app's `src/main/jniLibs/`
+log_warn "Generating Kotlin bindings..."
+cargo run --bin uniffi-bindgen -- generate \
+  --library target/aarch64-linux-android/release/libcatbird_mls.so \
+  --language kotlin \
+  --config uniffi.toml \
+  --out-dir "$KOTLIN_DIR"
 
-2. Add the generated Kotlin files to your project
+KOTLIN_BINDINGS_FILE="$KOTLIN_DIR/blue/catbird/mls/catbird_mls.kt"
+python3 - "$KOTLIN_BINDINGS_FILE" <<'PY'
+from pathlib import Path
+import sys
 
-3. Add JNA dependency:
-```kotlin
-dependencies {
-    implementation("net.java.dev.jna:jna:5.14.0@aar")
-}
-```
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = 'sealed class OrchestratorBridgeException: kotlin.Exception() {'
+start = text.find(marker)
+if start == -1:
+    raise SystemExit(f"missing marker in {path}")
+end_marker = '\n\n    companion object ErrorHandler'
+end = text.find(end_marker, start)
+if end == -1:
+    raise SystemExit(f"missing end marker in {path}")
+block = text[start:end]
+updated = block.replace('`message`', '`errorMessage`')
+text = text[:start] + updated + text[end:]
+text = text.replace('value.`message`', 'value.`errorMessage`')
+if text != path.read_text():
+    path.write_text(text)
+PY
+log_info "✓ Kotlin bindings generated under $KOTLIN_DIR"
+log_info "✓ Patched OrchestratorBridgeException.message field names for Kotlin compatibility"
 
-## Usage
+if [[ "$SYNC_TO_ANDROID_MODULE" == "yes" || ( "$SYNC_TO_ANDROID_MODULE" == "auto" && -n "$ANDROID_MODULE_DIR" ) ]]; then
+  if [[ -z "$ANDROID_MODULE_DIR" ]]; then
+    log_error "Sync requested, but no Android module directory was provided."
+    exit 1
+  fi
 
-```kotlin
-import blue.catbird.mlsffi.*
+  mkdir -p "$ANDROID_MODULE_DIR/src/main/kotlin" "$ANDROID_MODULE_DIR/src/main/jniLibs"
+  rsync -a --delete "$KOTLIN_DIR/" "$ANDROID_MODULE_DIR/src/main/kotlin/"
+  rsync -a --delete "$JNI_DIR/" "$ANDROID_MODULE_DIR/src/main/jniLibs/"
+  log_info "✓ Synced generated artifacts into $ANDROID_MODULE_DIR"
+else
+  log_warn "Skipped syncing into android/Catbird/mlsffi"
+fi
 
-// Initialize MLS context
-val context = mlsInit(databasePath = "/path/to/db.sqlite")
+cat <<EOF
 
-// Generate key package
-val keyPackage = mlsGenerateKeyPackage(
-    context = context,
-    userId = "user123",
-    identityKey = identityKeyBytes
-)
-
-// Create group
-val groupId = mlsCreateGroup(
-    context = context,
-    conversationId = "conv123"
-)
-
-// Add members
-mlsAddMembers(
-    context = context,
-    groupId = groupId,
-    keyPackages = listOf(keyPackage)
-)
-
-// Send message
-val ciphertext = mlsEncryptMessage(
-    context = context,
-    groupId = groupId,
-    message = "Hello from MLS!".toByteArray()
-)
-
-// Process incoming message
-val plaintext = mlsDecryptMessage(
-    context = context,
-    groupId = groupId,
-    ciphertext = ciphertext
-)
-```
-
-## Architecture Support
-
-This library includes native binaries for:
-- ARM64 (arm64-v8a) - 64-bit ARM devices
-- ARMv7 (armeabi-v7a) - 32-bit ARM devices
-- x86 - 32-bit x86 emulators
-- x86_64 - 64-bit x86 emulators
-
-## Requirements
-
-- Android API 26+ (Android 8.0 Oreo)
-- Kotlin 1.9+
-
-## License
-
-See parent project LICENSE
+═══════════════════════════════════════════════════════════
+✓ Android MLS artifacts are ready
+═══════════════════════════════════════════════════════════
+Staged artifacts: $STAGING_DIR
+Kotlin package:   blue.catbird.mls
+Native library:   libcatbird_mls.so
 EOF
 
-echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}✓ Build complete!${NC}"
-echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
-echo ""
-echo -e "Package location: ${YELLOW}$PACKAGE_DIR${NC}"
-echo ""
-echo "Next steps:"
-echo "1. Copy the mlsffi-kotlin directory to your Android project"
-echo "2. Add to settings.gradle.kts: include(':mlsffi-kotlin')"
-echo "3. Add to app dependencies: implementation(project(':mlsffi-kotlin'))"
-echo ""
-echo "Or publish to Maven:"
-echo "  cd $PACKAGE_DIR"
-echo "  ./gradlew publish"
+if [[ -n "$ANDROID_MODULE_DIR" && "$SYNC_TO_ANDROID_MODULE" != "no" ]]; then
+  cat <<EOF
+Synced module:    $ANDROID_MODULE_DIR
+EOF
+fi

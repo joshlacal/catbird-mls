@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
-use tokio::time::Instant;
-
-use crate::MLSContext;
+use web_time::Instant;
 
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
+use super::mls_provider::MlsCryptoContext;
 use super::recovery::{RecoveryTracker, SequencerFailoverTracker};
 use super::storage::MLSStorageBackend;
 use super::types::*;
@@ -38,7 +38,7 @@ pub struct OrchestratorConfig {
 impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
-            max_devices: 10,
+            max_devices: 20,
             target_key_package_count: 50,
             key_package_replenish_threshold: 10,
             sync_cooldown_seconds: 5,
@@ -53,19 +53,23 @@ impl Default for OrchestratorConfig {
 
 /// Platform-agnostic MLS orchestrator.
 ///
-/// Coordinates between the MLS FFI context, storage, API client, and credentials
+/// Coordinates between the MLS crypto context, storage, API client, and credentials
 /// to provide high-level MLS operations (create group, send message, sync, etc.).
 ///
-/// Generic over storage (S), API client (A), and credential store (C) to allow
-/// platform-specific implementations.
-pub struct MLSOrchestrator<S, A, C>
+/// Generic over:
+/// - `S`: Storage backend (IndexedDB on WASM, SQLite on native)
+/// - `A`: API client (fetch on WASM, reqwest on native)
+/// - `C`: Credential store (IndexedDB on WASM, keychain on native)
+/// - `M`: MLS crypto context (WasmMLSContext on WASM, MLSContext on native)
+pub struct MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend,
     A: MLSAPIClient,
     C: CredentialStore,
+    M: MlsCryptoContext,
 {
-    /// The low-level MLS FFI context.
-    mls_context: Arc<MLSContext>,
+    /// The low-level MLS crypto context.
+    mls_context: Arc<M>,
     /// Persistent storage backend.
     storage: Arc<S>,
     /// API client for server communication.
@@ -84,8 +88,8 @@ where
     conversation_states: Mutex<HashMap<ConversationId, ConversationState>>,
     /// Pending message IDs for deduplication.
     pending_messages: Mutex<HashSet<String>>,
-    /// Own commit hashes for self-commit detection.
-    own_commits: Mutex<HashSet<Vec<u8>>>,
+    /// Own commit hashes for self-commit detection (with insertion timestamp for TTL eviction).
+    own_commits: Mutex<HashMap<Vec<u8>, Instant>>,
     /// Groups currently being created (protect from sync deletion).
     groups_being_created: Mutex<HashSet<GroupId>>,
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
@@ -104,17 +108,20 @@ where
     recovery_tracker: Mutex<RecoveryTracker>,
     /// Tracks consecutive sequencer failures per conversation for failover.
     failover_tracker: Mutex<SequencerFailoverTracker>,
+    /// Per-conversation consecutive decrypt failure counts for divergence detection.
+    decrypt_fail_counts: Mutex<HashMap<String, u32>>,
 }
 
-impl<S, A, C> MLSOrchestrator<S, A, C>
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend,
     A: MLSAPIClient,
     C: CredentialStore,
+    M: MlsCryptoContext,
 {
     /// Create a new orchestrator instance.
     pub fn new(
-        mls_context: Arc<MLSContext>,
+        mls_context: Arc<M>,
         storage: Arc<S>,
         api_client: Arc<A>,
         credentials: Arc<C>,
@@ -135,16 +142,17 @@ where
             group_states: Mutex::new(HashMap::new()),
             conversation_states: Mutex::new(HashMap::new()),
             pending_messages: Mutex::new(HashSet::new()),
-            own_commits: Mutex::new(HashSet::new()),
+            own_commits: Mutex::new(HashMap::new()),
             groups_being_created: Mutex::new(HashSet::new()),
             rejoin_locks: Mutex::new(HashMap::new()),
             shutting_down: Mutex::new(false),
             sync_in_progress: Mutex::new(false),
             consecutive_sync_failures: Mutex::new(0),
             circuit_breaker_tripped_at: Mutex::new(None),
-            circuit_breaker_cooldown_secs: Mutex::new(0),
+            circuit_breaker_cooldown_secs: Mutex::new(5),
             recovery_tracker: Mutex::new(recovery_tracker),
             failover_tracker: Mutex::new(SequencerFailoverTracker::new()),
+            decrypt_fail_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -190,8 +198,8 @@ where
         }
     }
 
-    /// Access the MLS FFI context.
-    pub fn mls_context(&self) -> &Arc<MLSContext> {
+    /// Access the MLS crypto context.
+    pub fn mls_context(&self) -> &Arc<M> {
         &self.mls_context
     }
 
@@ -235,9 +243,31 @@ where
         &self.pending_messages
     }
 
-    /// Access the own commits set.
-    pub fn own_commits(&self) -> &Mutex<HashSet<Vec<u8>>> {
+    /// Access the own commits map.
+    pub fn own_commits(&self) -> &Mutex<HashMap<Vec<u8>, Instant>> {
         &self.own_commits
+    }
+
+    /// TTL for own-commit hashes: entries older than this are evicted.
+    const OWN_COMMIT_TTL: Duration = Duration::from_secs(60);
+
+    /// Evict own-commit entries older than `OWN_COMMIT_TTL`.
+    ///
+    /// Called before insertions to bound memory growth. Commits that haven't
+    /// been echoed back within 60 seconds are almost certainly orphaned.
+    pub(crate) async fn evict_stale_commits(&self) {
+        let now = Instant::now();
+        let mut commits = self.own_commits.lock().await;
+        let before = commits.len();
+        commits.retain(|_, ts| now.duration_since(*ts) < Self::OWN_COMMIT_TTL);
+        let evicted = before - commits.len();
+        if evicted > 0 {
+            tracing::debug!(
+                evicted,
+                remaining = commits.len(),
+                "Evicted stale own_commits"
+            );
+        }
     }
 
     /// Access the groups being created set.
@@ -282,5 +312,10 @@ where
     /// Access the sequencer failover tracker.
     pub fn failover_tracker(&self) -> &Mutex<SequencerFailoverTracker> {
         &self.failover_tracker
+    }
+
+    /// Access the per-conversation decrypt failure counts.
+    pub(crate) fn decrypt_fail_counts(&self) -> &Mutex<HashMap<String, u32>> {
+        &self.decrypt_fail_counts
     }
 }

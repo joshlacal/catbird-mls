@@ -2,6 +2,28 @@ use chrono::{DateTime, Utc};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+mod base64_bytes {
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// A DID (Decentralized Identifier) string, e.g. "did:plc:abc123"
 pub type DID = String;
 
@@ -70,6 +92,33 @@ pub struct Message {
     pub is_own: bool,
     /// Delivery status from federated DSes, if known.
     pub delivery_status: Option<DeliveryStatus>,
+    /// Full JSON payload for rich embeds. Raw UTF-8 fallback messages leave this empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload_json: Option<String>,
+}
+
+impl Message {
+    pub fn payload(&self) -> Option<MLSMessagePayload> {
+        self.payload_json
+            .as_ref()
+            .and_then(|json| serde_json::from_str::<MLSMessagePayload>(json).ok())
+    }
+
+    pub fn image_embed(&self) -> Option<MLSImageEmbed> {
+        self.payload().and_then(|payload| payload.image_embed())
+    }
+
+    pub fn has_displayable_body(&self) -> bool {
+        !self.text.trim().is_empty() || self.image_embed().is_some()
+    }
+}
+
+/// Response from the delivery service after sending a message.
+#[derive(Debug, Clone)]
+pub struct SendMessageResponse {
+    pub message_id: String,
+    pub seq: u64,
+    pub epoch: u64,
 }
 
 /// The state of an MLS group tracked locally.
@@ -205,6 +254,24 @@ pub struct IncomingEnvelope {
     pub server_message_id: Option<String>,
 }
 
+/// Encrypted reaction to a message (add or remove emoji).
+/// Matches the iOS `MLSReactionPayload` Codable struct.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MLSReactionPayload {
+    pub message_id: String,
+    pub emoji: String,
+    pub action: ReactionAction,
+}
+
+/// Whether a reaction is being added or removed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ReactionAction {
+    Add,
+    Remove,
+}
+
 /// MLS message payload format, matching the iOS Catbird app's MLSMessagePayload.
 ///
 /// All MLS application messages are JSON-encoded using this envelope so that
@@ -216,6 +283,10 @@ pub struct MLSMessagePayload {
     pub message_type: MLSMessageType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embed: Option<MLSEmbedData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reaction: Option<MLSReactionPayload>,
 }
 
 /// Message type discriminator, matching iOS MLSMessageType.
@@ -228,15 +299,131 @@ pub enum MLSMessageType {
     Typing,
     AdminRoster,
     AdminAction,
+    System,
+}
+
+/// Rich embed wrapper matching Catbird's wire format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MLSEmbedData {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub data: serde_json::Value,
+}
+
+impl MLSEmbedData {
+    pub fn image(image: MLSImageEmbed) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            kind: "image".to_string(),
+            data: serde_json::to_value(image)?,
+        })
+    }
+
+    pub fn as_image(&self) -> Option<MLSImageEmbed> {
+        if self.kind != "image" {
+            return None;
+        }
+        serde_json::from_value(self.data.clone()).ok()
+    }
+
+    pub fn audio(audio: MLSAudioEmbed) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            kind: "audio".to_string(),
+            data: serde_json::to_value(audio)?,
+        })
+    }
+
+    pub fn as_audio(&self) -> Option<MLSAudioEmbed> {
+        if self.kind != "audio" {
+            return None;
+        }
+        serde_json::from_value(self.data.clone()).ok()
+    }
+}
+
+/// First-class encrypted voice message attachment.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct MLSAudioEmbed {
+    pub blob_id: String,
+    #[serde(with = "base64_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "base64_bytes")]
+    pub iv: Vec<u8>,
+    pub sha256: String,
+    pub content_type: String,
+    pub size: u64,
+    pub duration_ms: u64,
+    pub waveform: Vec<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
+}
+
+/// First-class encrypted image attachment. Mirrors the iOS Codable layout.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct MLSImageEmbed {
+    pub blob_id: String,
+    #[serde(with = "base64_bytes")]
+    pub key: Vec<u8>,
+    #[serde(with = "base64_bytes")]
+    pub iv: Vec<u8>,
+    pub sha256: String,
+    pub content_type: String,
+    pub size: usize,
+    pub width: u32,
+    pub height: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alt_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blurhash: Option<String>,
 }
 
 impl MLSMessagePayload {
+    /// Create a system message payload (e.g., history boundary markers).
+    pub fn system(content_key: &str) -> Self {
+        Self {
+            version: 1,
+            message_type: MLSMessageType::System,
+            text: Some(content_key.to_string()),
+            embed: None,
+            reaction: None,
+        }
+    }
+
     /// Create a text message payload.
     pub fn text(content: &str) -> Self {
         Self {
             version: 1,
             message_type: MLSMessageType::Text,
             text: Some(content.to_string()),
+            embed: None,
+            reaction: None,
+        }
+    }
+
+    /// Create a text message with an embed payload.
+    pub fn text_with_embed(content: &str, embed: MLSEmbedData) -> Self {
+        Self {
+            version: 1,
+            message_type: MLSMessageType::Text,
+            text: Some(content.to_string()),
+            embed: Some(embed),
+            reaction: None,
+        }
+    }
+
+    /// Create a reaction payload (add or remove emoji on a message).
+    pub fn reaction(message_id: &str, emoji: &str, action: ReactionAction) -> Self {
+        Self {
+            version: 1,
+            message_type: MLSMessageType::Reaction,
+            text: None,
+            embed: None,
+            reaction: Some(MLSReactionPayload {
+                message_id: message_id.to_string(),
+                emoji: emoji.to_string(),
+                action,
+            }),
         }
     }
 
@@ -250,6 +437,45 @@ impl MLSMessagePayload {
         serde_json::from_slice(data)
     }
 
+    pub fn image_embed(&self) -> Option<MLSImageEmbed> {
+        self.embed.as_ref().and_then(MLSEmbedData::as_image)
+    }
+
+    pub fn audio_embed(&self) -> Option<MLSAudioEmbed> {
+        self.embed.as_ref().and_then(MLSEmbedData::as_audio)
+    }
+
+    pub fn display_text(&self) -> String {
+        if let Some(text) = &self.text {
+            if !text.is_empty() {
+                return text.clone();
+            }
+            // Empty text with image embed → return empty (image carries content)
+            if self.image_embed().is_some() || self.embed.is_none() {
+                return text.clone();
+            }
+        }
+        if self.audio_embed().is_some() {
+            return "🎤 Voice message".to_string();
+        }
+        if self.embed.is_some() {
+            return "[Attachment]".to_string();
+        }
+        String::new()
+    }
+
+    pub fn is_displayable(&self) -> bool {
+        match self.message_type {
+            MLSMessageType::Text => {
+                !self.display_text().trim().is_empty()
+                    || self.image_embed().is_some()
+                    || self.audio_embed().is_some()
+            }
+            MLSMessageType::System => true,
+            _ => false,
+        }
+    }
+
     /// Extract the display text from a payload, with fallback for raw UTF-8.
     pub fn extract_text(data: &[u8]) -> Option<String> {
         if data.is_empty() {
@@ -257,7 +483,7 @@ impl MLSMessagePayload {
         }
         // Try JSON payload first
         if let Ok(payload) = Self::decode(data) {
-            return payload.text;
+            return Some(payload.display_text());
         }
         // Fallback: treat as raw UTF-8 text (legacy / other clients)
         String::from_utf8(data.to_vec()).ok()
@@ -344,6 +570,7 @@ mod tests {
         assert_eq!(decoded.text.unwrap(), "test message");
         assert_eq!(decoded.version, 1);
         assert_eq!(decoded.message_type, MLSMessageType::Text);
+        assert!(decoded.embed.is_none());
     }
 
     #[test]
@@ -373,5 +600,83 @@ mod tests {
     #[test]
     fn extract_text_empty_payload() {
         assert_eq!(MLSMessagePayload::extract_text(&[]), None);
+    }
+
+    #[test]
+    fn image_embed_matches_ios_json_shape() {
+        let payload = MLSMessagePayload::text_with_embed(
+            "",
+            MLSEmbedData::image(MLSImageEmbed {
+                blob_id: "blob-123".to_string(),
+                key: vec![1, 2, 3, 4],
+                iv: vec![5, 6, 7, 8],
+                sha256: "deadbeef".to_string(),
+                content_type: "image/jpeg".to_string(),
+                size: 1234,
+                width: 640,
+                height: 480,
+                alt_text: Some("cat".to_string()),
+                blurhash: None,
+            })
+            .unwrap(),
+        );
+
+        let json = serde_json::to_string(&payload).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected: serde_json::Value = serde_json::from_str(
+            r#"{"version":1,"messageType":"text","text":"","embed":{"type":"image","data":{"blob_id":"blob-123","key":"AQIDBA==","iv":"BQYHCA==","sha256":"deadbeef","content_type":"image/jpeg","size":1234,"width":640,"height":480,"alt_text":"cat"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+
+        let decoded = MLSMessagePayload::decode(json.as_bytes()).unwrap();
+        let image = decoded.image_embed().unwrap();
+        assert_eq!(image.blob_id, "blob-123");
+        assert_eq!(image.key, vec![1, 2, 3, 4]);
+        assert_eq!(image.iv, vec![5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn audio_embed_roundtrip() {
+        let audio = MLSAudioEmbed {
+            blob_id: "audio-456".to_string(),
+            key: vec![10, 20, 30],
+            iv: vec![40, 50, 60],
+            sha256: "abc123".to_string(),
+            content_type: "audio/ogg; codecs=opus".to_string(),
+            size: 9876,
+            duration_ms: 3500,
+            waveform: vec![0.0, 0.5, 1.0, 0.3],
+            transcript: Some("Hello world".to_string()),
+        };
+
+        let payload =
+            MLSMessagePayload::text_with_embed("", MLSEmbedData::audio(audio.clone()).unwrap());
+
+        let bytes = payload.encode().unwrap();
+        let decoded = MLSMessagePayload::decode(&bytes).unwrap();
+        let decoded_audio = decoded.audio_embed().unwrap();
+        assert_eq!(decoded_audio.blob_id, "audio-456");
+        assert_eq!(decoded_audio.duration_ms, 3500);
+        assert_eq!(decoded_audio.waveform, vec![0.0, 0.5, 1.0, 0.3]);
+        assert_eq!(decoded_audio.transcript.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn audio_embed_display_text() {
+        let audio = MLSAudioEmbed {
+            blob_id: "a".to_string(),
+            key: vec![],
+            iv: vec![],
+            sha256: String::new(),
+            content_type: "audio/ogg; codecs=opus".to_string(),
+            size: 100,
+            duration_ms: 1000,
+            waveform: vec![],
+            transcript: None,
+        };
+        let payload = MLSMessagePayload::text_with_embed("", MLSEmbedData::audio(audio).unwrap());
+        assert_eq!(payload.display_text(), "🎤 Voice message");
+        assert!(payload.is_displayable());
     }
 }

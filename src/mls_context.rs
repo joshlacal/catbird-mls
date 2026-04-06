@@ -16,7 +16,52 @@ use std::sync::Arc;
 use crate::epoch_storage::EpochSecretManager;
 use crate::error::MLSError;
 use crate::group_metadata::{GroupMetadata, CATBIRD_METADATA_EXTENSION_TYPE};
+use crate::metadata;
+use openmls::component::ComponentData;
+use uuid::Uuid;
+
+/// Internal result from `MLSContext::create_group` carrying the group ID
+/// plus optional metadata artifacts for the caller to upload.
+pub(crate) struct CreateGroupInternalResult {
+    pub group_id: Vec<u8>,
+    /// Encrypted metadata v2 blob (nonce || ciphertext || tag).
+    pub encrypted_metadata_blob: Option<Vec<u8>>,
+    /// JSON-serialized `MetadataReference`.
+    pub metadata_reference_json: Option<Vec<u8>>,
+    /// UUIDv4 blob locator for the encrypted metadata blob.
+    pub metadata_blob_locator: Option<String>,
+}
 use sha2::{Digest, Sha256};
+
+fn metadata_extension_capabilities() -> [ExtensionType; 3] {
+    [
+        ExtensionType::RatchetTree,
+        ExtensionType::AppDataDictionary,
+        ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE),
+    ]
+}
+
+fn metadata_proposal_capabilities() -> [ProposalType; 1] {
+    [ProposalType::AppDataUpdate]
+}
+
+fn metadata_leaf_capabilities() -> Capabilities {
+    Capabilities::new(
+        None,
+        None,
+        Some(&metadata_extension_capabilities()),
+        Some(&metadata_proposal_capabilities()),
+        None,
+    )
+}
+
+fn metadata_required_capabilities_extension() -> RequiredCapabilitiesExtension {
+    RequiredCapabilitiesExtension::new(
+        &metadata_extension_capabilities(),
+        &metadata_proposal_capabilities(),
+        &[],
+    )
+}
 
 fn map_sqlite_error(context: &str, error: &rusqlite::Error) -> MLSError {
     match error {
@@ -215,6 +260,11 @@ impl ManifestStorage {
         Ok(())
     }
 
+    /// Get an interrupt handle for aborting in-flight SQLCipher operations.
+    pub(crate) fn get_interrupt_handle(&self) -> rusqlite::InterruptHandle {
+        self.conn.get_interrupt_handle()
+    }
+
     /// Force database flush to ensure all pending writes are committed to disk
     ///
     /// This executes a WAL checkpoint (if in WAL mode) and ensures durability.
@@ -235,12 +285,14 @@ impl ManifestStorage {
         Ok(())
     }
 
-    /// Budget-based TRUNCATE checkpoint (Signal's pattern)
+    /// Budget-based checkpoint (Signal's pattern)
     ///
-    /// Increments write counter and performs a TRUNCATE checkpoint when budget is reached.
-    /// TRUNCATE mode resets WAL to zero pages, keeping it perpetually small (~0 bytes).
-    /// This prevents the 0xdead10cc crash by ensuring WAL never grows large enough to
-    /// cause long checkpoint operations during iOS suspension.
+    /// Increments write counter and performs a checkpoint when budget is reached.
+    ///
+    /// CRITICAL (2026-03): In extension processes (NSE), use PASSIVE mode instead of
+    /// TRUNCATE. TRUNCATE requires exclusive WAL access — if the main app also has the
+    /// DB open, two concurrent TRUNCATE attempts corrupt the WAL. PASSIVE is non-blocking
+    /// and safe for cross-process use.
     ///
     /// Uses a short busy timeout (50ms) - if we can't checkpoint quickly, abort and retry
     /// sooner on the next write. This prevents blocking the caller.
@@ -249,29 +301,72 @@ impl ManifestStorage {
 
         // Checkpoint every CHECKPOINT_BUDGET writes (default 32, Signal's number)
         if count > 0 && count.is_multiple_of(CHECKPOINT_BUDGET) {
+            let pid = std::process::id();
+
             // Set short busy timeout for this checkpoint - don't block writers for long
             // If another connection is holding the lock, we'll just retry sooner
             if let Err(e) = self.conn.busy_timeout(std::time::Duration::from_millis(50)) {
                 crate::debug_log!(
-                    "[MANIFEST-STORAGE] ⚠️ Failed to set busy_timeout for checkpoint: {:?}",
+                    "[MANIFEST-STORAGE/pid={}] ⚠️ Failed to set busy_timeout for checkpoint: {:?}",
+                    pid,
                     e
                 );
                 return;
             }
 
-            // TRUNCATE checkpoint: copy WAL to main DB and truncate WAL to zero
-            match self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                Ok(_) => {
+            // Log WAL state before checkpoint for cross-process corruption diagnostics
+            match self
+                .conn
+                .query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                    let busy: i32 = row.get(0)?;
+                    let log: i32 = row.get(1)?;
+                    let checkpointed: i32 = row.get(2)?;
+                    Ok((busy, log, checkpointed))
+                }) {
+                Ok((busy, log, checkpointed)) => {
+                    crate::info_log!(
+                        "[MANIFEST-STORAGE/pid={}] 📊 PRE-checkpoint WAL: busy={} log={} checkpointed={} (write #{})",
+                        pid, busy, log, checkpointed, count
+                    );
+                }
+                Err(e) => {
                     crate::debug_log!(
-                        "[MANIFEST-STORAGE] ✅ Budget TRUNCATE checkpoint at write {} (budget {})",
+                        "[MANIFEST-STORAGE/pid={}] ⚠️ WAL probe failed: {:?}",
+                        pid,
+                        e
+                    );
+                }
+            }
+
+            // Determine checkpoint mode based on process type
+            // Extension processes (appex) must use PASSIVE to avoid WAL corruption
+            let is_extension = std::env::current_exe()
+                .map(|p| p.to_string_lossy().contains(".appex/"))
+                .unwrap_or(false);
+
+            let checkpoint_sql = if is_extension {
+                "PRAGMA wal_checkpoint(PASSIVE);"
+            } else {
+                "PRAGMA wal_checkpoint(TRUNCATE);"
+            };
+            let mode_name = if is_extension { "PASSIVE" } else { "TRUNCATE" };
+
+            match self.conn.execute_batch(checkpoint_sql) {
+                Ok(_) => {
+                    crate::info_log!(
+                        "[MANIFEST-STORAGE/pid={}] ✅ Budget {} checkpoint at write {} (budget {})",
+                        pid,
+                        mode_name,
                         count,
                         CHECKPOINT_BUDGET
                     );
                 }
                 Err(e) => {
                     // Checkpoint failed (likely contention) - this is okay, we'll retry sooner
-                    crate::debug_log!(
-                        "[MANIFEST-STORAGE] ⚠️ Budget checkpoint deferred at write {}: {:?}",
+                    crate::info_log!(
+                        "[MANIFEST-STORAGE/pid={}] ⚠️ Budget {} checkpoint deferred at write {}: {:?}",
+                        pid,
+                        mode_name,
                         count,
                         e
                     );
@@ -283,30 +378,52 @@ impl ManifestStorage {
         }
     }
 
-    /// Synchronous TRUNCATE checkpoint for app launch.
-    /// Called once at app startup to clear any WAL pages left from the previous session.
+    /// Synchronous checkpoint for app/extension launch.
+    /// Called once at startup to clear any WAL pages left from the previous session.
     /// Uses a 3s busy timeout (longer than normal) since this only runs once at launch.
+    ///
+    /// CRITICAL (2026-03): Extensions use PASSIVE mode to avoid WAL corruption from
+    /// concurrent TRUNCATE with the main app.
     pub(crate) fn launch_truncate_checkpoint(&self) -> Result<(), MLSError> {
+        let pid = std::process::id();
+        let is_extension = std::env::current_exe()
+            .map(|p| p.to_string_lossy().contains(".appex/"))
+            .unwrap_or(false);
+
         // Set longer busy timeout for launch checkpoint
         self.conn
             .busy_timeout(std::time::Duration::from_secs(3))
             .map_err(|e| {
                 crate::debug_log!(
-                    "[MANIFEST-STORAGE] ⚠️ Failed to set launch busy_timeout: {:?}",
+                    "[MANIFEST-STORAGE/pid={}] ⚠️ Failed to set launch busy_timeout: {:?}",
+                    pid,
                     e
                 );
                 map_sqlite_error("launch_checkpoint.busy_timeout", &e)
             })?;
 
-        // TRUNCATE checkpoint: copy all WAL pages to main DB and truncate WAL to zero
-        match self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+        // Extensions must use PASSIVE to avoid WAL corruption
+        let checkpoint_sql = if is_extension {
+            "PRAGMA wal_checkpoint(PASSIVE);"
+        } else {
+            "PRAGMA wal_checkpoint(TRUNCATE);"
+        };
+        let mode_name = if is_extension { "PASSIVE" } else { "TRUNCATE" };
+
+        match self.conn.execute_batch(checkpoint_sql) {
             Ok(_) => {
-                crate::info_log!("[MANIFEST-STORAGE] ✅ Launch TRUNCATE checkpoint completed");
+                crate::info_log!(
+                    "[MANIFEST-STORAGE/pid={}] ✅ Launch {} checkpoint completed",
+                    pid,
+                    mode_name
+                );
             }
             Err(e) => {
                 // SQLITE_BUSY is tolerable at launch - WAL will be checkpointed during normal operation
-                crate::debug_log!(
-                    "[MANIFEST-STORAGE] ⚠️ Launch checkpoint deferred (busy): {:?}",
+                crate::info_log!(
+                    "[MANIFEST-STORAGE/pid={}] ⚠️ Launch {} checkpoint deferred (busy): {:?}",
+                    pid,
+                    mode_name,
                     e
                 );
             }
@@ -450,11 +567,12 @@ pub struct SqliteLibcruxProvider {
 }
 
 impl SqliteLibcruxProvider {
-    pub fn new(storage: HybridStorageProvider<JsonCodec>) -> Self {
-        Self {
-            crypto: LibcruxCrypto::new().expect("Failed to initialize libcrux crypto provider"),
+    pub fn new(storage: HybridStorageProvider<JsonCodec>) -> Result<Self, MLSError> {
+        Ok(Self {
+            crypto: LibcruxCrypto::new()
+                .map_err(|e| MLSError::Internal(format!("Crypto init failed: {:?}", e)))?,
             storage,
-        }
+        })
     }
 
     pub fn storage_mut(&mut self) -> &mut HybridStorageProvider<JsonCodec> {
@@ -497,9 +615,6 @@ pub struct MLSContext {
     // Per-context replay detection and sequencing
     pub(crate) processed_messages: HashMap<Vec<u8>, Vec<(u64, u32)>>,
     pub(crate) sequence_counters: HashMap<Vec<u8>, u64>,
-    /// Per-group metadata encryption keys (MEK): group_id -> 32-byte key.
-    /// Stable across epochs, persisted in manifest storage.
-    metadata_keys: HashMap<Vec<u8>, [u8; 32]>,
 }
 
 use openmls::group::MlsGroupJoinConfig;
@@ -511,11 +626,14 @@ impl MLSContext {
     ///
     /// This creates a per-account SQLite database for MLS cryptographic state.
     /// For user content (transcripts), continue using SQLCipher separately.
+    /// Returns `(context, interrupt_handles)`. The interrupt handles are extracted from
+    /// the SQLCipher connections before they are consumed, so the caller can store them
+    /// outside any Mutex and call `sqlite3_interrupt()` from any thread.
     pub fn new(
         storage_path: String,
         encryption_key: String,
         keychain: Box<dyn KeychainAccess>,
-    ) -> Result<Self, MLSError> {
+    ) -> Result<(Self, Vec<rusqlite::InterruptHandle>), MLSError> {
         crate::info_log!(
             "[MLS-CONTEXT] Initializing per-DID SQLite storage: {}",
             storage_path
@@ -552,6 +670,11 @@ impl MLSContext {
             crate::error_log!("[MLS-CONTEXT] Failed to open SQLite database: {:?}", e);
             MLSError::invalid_input(format!("Failed to open SQLite database: {:?}", e))
         })?;
+
+        // Capture interrupt handle BEFORE the connection is consumed by SqliteStorageProvider.
+        // This allows aborting in-flight SQLCipher operations from another thread during
+        // iOS app suspension (0xdead10cc prevention).
+        let openmls_interrupt_handle = connection.get_interrupt_handle();
 
         // ═══════════════════════════════════════════════════════════════════════════
         // CRITICAL FIX: Disable SQLCipher memory security BEFORE setting the key
@@ -713,7 +836,7 @@ impl MLSContext {
 
         // Wrap in our custom provider
         let hybrid_storage = HybridStorageProvider::new(sqlite_storage, keychain);
-        let provider = SqliteLibcruxProvider::new(hybrid_storage);
+        let provider = SqliteLibcruxProvider::new(hybrid_storage)?;
 
         // Initialize manifest storage for application data
         let manifest_storage = ManifestStorage::new(path.clone(), &encryption_key)?;
@@ -956,7 +1079,9 @@ impl MLSContext {
                         "[MLS-CONTEXT] Cleaning {} orphaned manifest entries",
                         orphaned_ids.len()
                     );
-                    if let Ok(Some(mut group_ids)) = manifest_storage.read_manifest::<Vec<String>>("group_ids") {
+                    if let Ok(Some(mut group_ids)) =
+                        manifest_storage.read_manifest::<Vec<String>>("group_ids")
+                    {
                         group_ids.retain(|id| !orphaned_ids.contains(id));
                         let _ = manifest_storage.write_manifest("group_ids", &group_ids);
                     }
@@ -969,38 +1094,21 @@ impl MLSContext {
             }
         }
 
-        // Load metadata encryption keys (MEKs) for all known groups
-        let mut metadata_keys = HashMap::new();
-        for group_id in groups.keys() {
-            let hex_id = hex::encode(group_id);
-            let mek_key = format!("mek_{}", hex_id);
-            if let Ok(Some(hex_key)) = manifest_storage.read_manifest::<String>(&mek_key) {
-                if let Ok(key_bytes) = hex::decode(&hex_key) {
-                    if key_bytes.len() == 32 {
-                        let mut key = [0u8; 32];
-                        key.copy_from_slice(&key_bytes);
-                        metadata_keys.insert(group_id.clone(), key);
-                        crate::debug_log!("[MLS-CONTEXT] Loaded MEK for group {}", hex_id);
-                    }
-                }
-            }
-        }
-        crate::info_log!(
-            "[MLS-CONTEXT] Loaded {} metadata encryption keys",
-            metadata_keys.len()
-        );
+        let manifest_interrupt_handle = manifest_storage.get_interrupt_handle();
 
-        Ok(Self {
-            provider,
-            groups,              // Use the loaded groups
-            signers_by_identity, // Use the loaded signers
-            key_package_bundles, // Use the loaded bundles
-            epoch_secret_manager: Arc::new(EpochSecretManager::new()),
-            manifest_storage,
-            processed_messages: HashMap::new(),
-            sequence_counters: HashMap::new(),
-            metadata_keys,
-        })
+        Ok((
+            Self {
+                provider,
+                groups,              // Use the loaded groups
+                signers_by_identity, // Use the loaded signers
+                key_package_bundles, // Use the loaded bundles
+                epoch_secret_manager: Arc::new(EpochSecretManager::new()),
+                manifest_storage,
+                processed_messages: HashMap::new(),
+                sequence_counters: HashMap::new(),
+            },
+            vec![openmls_interrupt_handle, manifest_interrupt_handle],
+        ))
     }
 
     /// Force database flush to ensure all pending writes are persisted to disk
@@ -1094,23 +1202,6 @@ impl MLSContext {
         Ok(())
     }
 
-    /// Store a metadata encryption key (MEK) for a group, persisting to manifest.
-    fn store_metadata_key(&mut self, group_id: &[u8], key: &[u8; 32]) {
-        let hex_id = hex::encode(group_id);
-        self.metadata_keys.insert(group_id.to_vec(), *key);
-        if let Err(e) = self
-            .manifest_storage
-            .write_manifest(&format!("mek_{}", hex_id), &hex::encode(key))
-        {
-            crate::error_log!("[MLS-CONTEXT] Failed to persist metadata key: {:?}", e);
-        }
-    }
-
-    /// Retrieve the metadata encryption key (MEK) for a group.
-    fn get_metadata_key(&self, group_id: &[u8]) -> Option<[u8; 32]> {
-        self.metadata_keys.get(group_id).copied()
-    }
-
     pub fn export_group_info(
         &mut self,
         group_id: &[u8],
@@ -1147,7 +1238,7 @@ impl MLSContext {
         &mut self,
         group_info_bytes: &[u8],
         identity: &str,
-    ) -> Result<(Vec<u8>, Vec<u8>), MLSError> {
+    ) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>), MLSError> {
         crate::debug_log!(
             "[MLS-CONTEXT] create_external_commit: Starting for identity '{}'",
             identity
@@ -1324,16 +1415,7 @@ impl MLSContext {
             })?
             .leaf_node_parameters(
                 LeafNodeParameters::builder()
-                    .with_capabilities(Capabilities::new(
-                        None,
-                        None,
-                        Some(&[
-                            ExtensionType::RatchetTree,
-                            ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE),
-                        ]),
-                        None,
-                        None,
-                    ))
+                    .with_capabilities(metadata_leaf_capabilities())
                     .build(),
             )
             .load_psks(self.provider.storage())
@@ -1402,8 +1484,47 @@ impl MLSContext {
         let commit_bytes = TlsSerialize::tls_serialize_detached(&commit)
             .map_err(|_| MLSError::SerializationError)?;
 
+        // Export GroupInfo from the newly created group so it can be sent to the server
+        let exported_group_info = {
+            let gs = self.groups.get(&group_id);
+            match gs {
+                Some(gs) => {
+                    match gs.group.export_group_info(
+                        self.provider.crypto(),
+                        &signature_keys,
+                        true, // with ratchet tree
+                    ) {
+                        Ok(gi_out) => {
+                            match TlsSerialize::tls_serialize_detached(&gi_out) {
+                                Ok(bytes) => {
+                                    crate::debug_log!(
+                                        "[MLS-CONTEXT] Exported GroupInfo after external commit: {} bytes",
+                                        bytes.len()
+                                    );
+                                    Some(bytes)
+                                }
+                                Err(e) => {
+                                    crate::warn_log!(
+                                        "[MLS-CONTEXT] Failed to serialize exported GroupInfo: {:?}", e
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            crate::warn_log!(
+                                "[MLS-CONTEXT] Failed to export GroupInfo after external commit: {:?}", e
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+
         crate::debug_log!("[MLS-CONTEXT] create_external_commit: Complete");
-        Ok((commit_bytes, group_id))
+        Ok((commit_bytes, group_id, exported_group_info))
     }
 
     pub fn create_external_commit_with_psk(
@@ -1606,16 +1727,7 @@ impl MLSContext {
             })?
             .leaf_node_parameters(
                 LeafNodeParameters::builder()
-                    .with_capabilities(Capabilities::new(
-                        None,
-                        None,
-                        Some(&[
-                            ExtensionType::RatchetTree,
-                            ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE),
-                        ]),
-                        None,
-                        None,
-                    ))
+                    .with_capabilities(metadata_leaf_capabilities())
                     .build(),
             )
             .load_psks(self.provider.storage())
@@ -1798,7 +1910,7 @@ impl MLSContext {
         &mut self,
         identity: &str,
         config: crate::types::GroupConfig,
-    ) -> Result<Vec<u8>, MLSError> {
+    ) -> Result<CreateGroupInternalResult, MLSError> {
         crate::debug_log!(
             "[MLS-CONTEXT] create_group: Starting for identity '{}'",
             identity
@@ -1849,16 +1961,7 @@ impl MLSContext {
 
         // Configure required capabilities to include ratchet tree and metadata extensions
         // This ensures Welcome messages include the ratchet tree for new members
-        let capabilities = Capabilities::new(
-            None, // Default proposals
-            None, // Default credentials
-            Some(&[
-                ExtensionType::RatchetTree,
-                ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE),
-            ]), // REQUIRED: Include ratchet tree + metadata in Welcome
-            None, // Default proposals (repeated)
-            None, // Default credential types
-        );
+        let capabilities = metadata_leaf_capabilities();
 
         let mut group_config_builder = MlsGroupCreateConfig::builder()
             .ciphersuite(Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519)
@@ -1871,23 +1974,54 @@ impl MLSContext {
             .capabilities(capabilities) // Set required capabilities
             .use_ratchet_tree_extension(true); // CRITICAL: Include ratchet tree in Welcome messages
 
-        // Build group context extensions with metadata if name or description provided
-        if config.group_name.is_some() || config.group_description.is_some() {
-            let metadata = GroupMetadata::new(
-                config.group_name.clone(),
-                config.group_description.clone(),
-            );
-            let extensions = metadata.to_extensions().map_err(|e| {
-                crate::error_log!("[MLS-CONTEXT] Failed to build group metadata extension: {:?}", e);
-                e
+        let mut group_context_extensions = Extensions::<GroupContext>::empty();
+        group_context_extensions
+            .add(Extension::RequiredCapabilities(
+                metadata_required_capabilities_extension(),
+            ))
+            .map_err(|e| {
+                MLSError::Internal(format!(
+                    "Failed to add required capabilities extension: {:?}",
+                    e
+                ))
             })?;
-            group_config_builder =
-                group_config_builder.with_group_context_extensions(extensions);
+        group_context_extensions
+            .add(Extension::AppDataDictionary(
+                AppDataDictionaryExtension::default(),
+            ))
+            .map_err(|e| {
+                MLSError::Internal(format!(
+                    "Failed to add app data dictionary extension: {:?}",
+                    e
+                ))
+            })?;
+
+        if config.group_name.is_some() || config.group_description.is_some() {
+            let metadata =
+                GroupMetadata::new(config.group_name.clone(), config.group_description.clone());
+            let metadata_bytes = metadata.to_extension_bytes().map_err(|e| {
+                crate::error_log!(
+                    "[MLS-CONTEXT] Failed to build group metadata extension: {:?}",
+                    e
+                );
+                MLSError::Internal(format!("serialize metadata: {:?}", e))
+            })?;
+            group_context_extensions
+                .add(Extension::Unknown(
+                    CATBIRD_METADATA_EXTENSION_TYPE,
+                    UnknownExtension(metadata_bytes),
+                ))
+                .map_err(|e| {
+                    MLSError::Internal(format!("Failed to add metadata extension: {:?}", e))
+                })?;
             crate::info_log!(
                 "[MLS-CONTEXT] Group metadata set: name={:?}",
                 config.group_name
             );
         }
+
+        group_config_builder =
+            group_config_builder.with_group_context_extensions(group_context_extensions);
 
         let group_config = group_config_builder.build();
         crate::debug_log!(
@@ -1965,21 +2099,87 @@ impl MLSContext {
             MLSError::Internal(format!("Failed to persist group ID: {:?}", e))
         })?;
 
-        // Generate and persist metadata encryption key (MEK) for this group
-        {
-            let key_bytes = self
-                .provider
-                .rand()
-                .random_vec(32)
-                .map_err(|e| MLSError::Internal(format!("MEK generation: {:?}", e)))?;
-            let mut mek = [0u8; 32];
-            mek.copy_from_slice(&key_bytes);
-            self.store_metadata_key(&group_id, &mek);
-            crate::debug_log!(
-                "[MLS-CONTEXT] Generated MEK for group {}",
-                hex::encode(&group_id)
-            );
-        }
+        // MEK is NOT generated at group creation. Initial metadata is plaintext in the
+        // extension (only the creator is in the group at this point). The first call to
+        // update_group_metadata will derive the MEK from export_secret and encrypt.
+        // All members who process that commit will derive and cache the same MEK.
+
+        // ── Metadata: encrypt metadata using epoch-derived key ──────────
+        // For initial group creation we derive the key from the group's current
+        // epoch exporter (no StagedCommit involved — the group already exists).
+        let metadata_result = if config.group_name.is_some() || config.group_description.is_some() {
+            let group_state = self.groups.get(&group_id).ok_or_else(|| {
+                MLSError::Internal("Group just created but not found in groups map".to_string())
+            })?;
+            let group_ref = &group_state.group;
+            let epoch = group_ref.epoch().as_u64();
+
+            match metadata::derive_metadata_key_from_group(
+                group_ref,
+                self.provider.crypto(),
+                &group_id,
+                epoch,
+            ) {
+                Ok(metadata_key) => {
+                    let metadata_payload = metadata::GroupMetadataV1 {
+                        version: 1,
+                        title: config.group_name.clone().unwrap_or_default(),
+                        description: config.group_description.clone().unwrap_or_default(),
+                        avatar_blob_locator: None,
+                        avatar_content_type: None,
+                    };
+                    let metadata_version: u64 = 1;
+
+                    match metadata::encrypt_metadata_blob(
+                        &metadata_key,
+                        &group_id,
+                        epoch,
+                        metadata_version,
+                        &metadata_payload,
+                    ) {
+                        Ok(encrypted_blob) => {
+                            let blob_locator = Uuid::new_v4().to_string();
+                            let ciphertext_hash = metadata::hash_ciphertext(&encrypted_blob);
+                            let reference = metadata::build_metadata_reference(
+                                metadata_version,
+                                &blob_locator,
+                                &ciphertext_hash,
+                            );
+                            let reference_json = serde_json::to_vec(&reference).map_err(|e| {
+                                MLSError::Internal(format!(
+                                    "Failed to serialize MetadataReference: {:?}",
+                                    e
+                                ))
+                            })?;
+
+                            crate::info_log!(
+                                "[MLS-CONTEXT] ✅ Metadata encrypted for epoch {} (blob_locator={})",
+                                epoch,
+                                blob_locator,
+                            );
+
+                            Some((encrypted_blob, reference_json, blob_locator))
+                        }
+                        Err(e) => {
+                            crate::error_log!(
+                                "[MLS-CONTEXT] ⚠️ Failed to encrypt metadata: {:?} — group created without metadata blob",
+                                e
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::error_log!(
+                        "[MLS-CONTEXT] ⚠️ Failed to derive metadata key: {:?} — group created without metadata blob",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Only register the signer if we created a new key (don't overwrite existing mappings)
         if is_new_key {
@@ -2002,7 +2202,12 @@ impl MLSContext {
         }
 
         crate::debug_log!("[MLS-CONTEXT] create_group: Completed successfully");
-        Ok(group_id)
+        Ok(CreateGroupInternalResult {
+            group_id,
+            encrypted_metadata_blob: metadata_result.as_ref().map(|(blob, _, _)| blob.clone()),
+            metadata_reference_json: metadata_result.as_ref().map(|(_, json, _)| json.clone()),
+            metadata_blob_locator: metadata_result.map(|(_, _, loc)| loc),
+        })
     }
 
     pub fn add_group(&mut self, group: MlsGroup, identity: &str) -> Result<(), MLSError> {
@@ -2090,7 +2295,11 @@ impl MLSContext {
 
     /// Register a signer public key for an identity
     /// This must be called when creating key packages so the signer can be found when processing Welcome messages
-    pub fn register_signer(&mut self, identity: &str, signer_public_key: Vec<u8>) -> Result<(), MLSError> {
+    pub fn register_signer(
+        &mut self,
+        identity: &str,
+        signer_public_key: Vec<u8>,
+    ) -> Result<(), MLSError> {
         // Safeguard: Check if a signer already exists for this identity
         if let Some(existing_key) = self.signers_by_identity.get(identity.as_bytes()) {
             if existing_key == &signer_public_key {
@@ -2121,7 +2330,10 @@ impl MLSContext {
                     "[MLS-CONTEXT] ⚠️ Failed to persist signer mapping in register_signer: {:?}",
                     e
                 );
-                MLSError::Internal(format!("Failed to persist signer mapping in register_signer: {:?}", e))
+                MLSError::Internal(format!(
+                    "Failed to persist signer mapping in register_signer: {:?}",
+                    e
+                ))
             })?;
 
         Ok(())
@@ -2299,15 +2511,15 @@ impl MLSContext {
 
         // Remove from manifest
         let hex_id = hex::encode(group_id);
-        if let Ok(Some(mut group_ids)) = self.manifest_storage.read_manifest::<Vec<String>>("group_ids") {
+        if let Ok(Some(mut group_ids)) = self
+            .manifest_storage
+            .read_manifest::<Vec<String>>("group_ids")
+        {
             group_ids.retain(|id| id != &hex_id);
-            let _ = self.manifest_storage.write_manifest("group_ids", &group_ids);
+            let _ = self
+                .manifest_storage
+                .write_manifest("group_ids", &group_ids);
         }
-
-        // Clean up metadata encryption key
-        self.metadata_keys.remove(group_id);
-        // Remove MEK from manifest (write empty string to clear, since manifest has no delete)
-        let _ = self.manifest_storage.write_manifest(&format!("mek_{}", hex_id), &"");
 
         // Flush to ensure cleanup is persisted
         let _ = self.flush_database();
@@ -2315,30 +2527,19 @@ impl MLSContext {
         true
     }
 
-    /// Read group metadata from the MLS group context extensions.
-    /// Uses the stable per-group metadata encryption key (MEK) if available,
-    /// with plaintext fallback for groups created before encryption support.
-    pub fn get_group_metadata(
-        &self,
-        group_id: &[u8],
-    ) -> Result<Option<GroupMetadata>, MLSError> {
+    /// Read group metadata from the MLS group context extensions (plaintext).
+    /// Encrypted metadata is now handled by the metadata module via server-side blobs.
+    pub fn get_group_metadata(&self, group_id: &[u8]) -> Result<Option<GroupMetadata>, MLSError> {
         let gid = GroupId::from_slice(group_id);
-        let mek = self.get_metadata_key(group_id);
 
         self.with_group_ref(&gid, |group, _provider| {
-            match mek {
-                Some(key) => Ok(crate::group_metadata::decrypt_metadata_from_group_with_key(group, &key)),
-                None => {
-                    // No MEK — try plaintext fallback
-                    Ok(crate::group_metadata::GroupMetadata::from_group(group))
-                }
-            }
+            Ok(crate::group_metadata::GroupMetadata::from_group(group))
         })
     }
 
     /// Update group metadata by proposing + committing a GroupContextExtensions change.
-    /// Encrypts the metadata with ChaCha20-Poly1305 using a stable per-group MEK
-    /// before storing it in the group context extension.
+    /// Stores plaintext metadata in the 0xff00 extension. Encrypted metadata is now
+    /// handled separately by the metadata module via server-side blobs.
     /// Returns the commit message bytes that must be sent to the server.
     pub fn update_group_metadata(
         &mut self,
@@ -2347,32 +2548,12 @@ impl MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         let gid = GroupId::from_slice(group_id);
 
-        // Get or generate MEK
-        let mek = match self.get_metadata_key(group_id) {
-            Some(key) => key,
-            None => {
-                let key_bytes = self
-                    .provider
-                    .rand()
-                    .random_vec(32)
-                    .map_err(|e| MLSError::Internal(format!("MEK generation: {:?}", e)))?;
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&key_bytes);
-                self.store_metadata_key(group_id, &key);
-                key
-            }
-        };
-
         self.with_group(&gid, |group, provider, signer| {
-            // Encrypt metadata with stable per-group MEK
-            let envelope = crate::group_metadata::encrypt_metadata_with_key(
-                &mek, &metadata, provider.rand(),
-            )
-            .map_err(|e| MLSError::Internal(format!("encrypt metadata: {}", e)))?;
-            let envelope_bytes = serde_json::to_vec(&envelope)
-                .map_err(|e| MLSError::Internal(format!("serialize envelope: {}", e)))?;
+            let metadata_bytes = metadata
+                .to_extension_bytes()
+                .map_err(|e| MLSError::Internal(format!("serialize metadata: {}", e)))?;
 
-            // Clone existing extensions and add/replace the encrypted metadata extension.
+            // Clone existing extensions and add/replace the metadata extension.
             // update_group_context_extensions replaces ALL extensions, so we must
             // preserve any existing ones (e.g. RequiredCapabilities).
             let mut extensions = group.extensions().clone();
@@ -2386,15 +2567,21 @@ impl MLSContext {
             if !ext_types.contains(&ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE)) {
                 ext_types.push(ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE));
             }
+            if !ext_types.contains(&ExtensionType::AppDataDictionary) {
+                ext_types.push(ExtensionType::AppDataDictionary);
+            }
             // Ensure RatchetTree is always present
             if !ext_types.contains(&ExtensionType::RatchetTree) {
                 ext_types.push(ExtensionType::RatchetTree);
             }
 
-            let proposal_types = existing_rc
+            let mut proposal_types = existing_rc
                 .as_ref()
                 .map(|rc| rc.proposal_types().to_vec())
                 .unwrap_or_default();
+            if !proposal_types.contains(&ProposalType::AppDataUpdate) {
+                proposal_types.push(ProposalType::AppDataUpdate);
+            }
             let credential_types = existing_rc
                 .as_ref()
                 .map(|rc| rc.credential_types().to_vec())
@@ -2402,7 +2589,11 @@ impl MLSContext {
 
             extensions
                 .add_or_replace(Extension::RequiredCapabilities(
-                    RequiredCapabilitiesExtension::new(&ext_types, &proposal_types, &credential_types),
+                    RequiredCapabilitiesExtension::new(
+                        &ext_types,
+                        &proposal_types,
+                        &credential_types,
+                    ),
                 ))
                 .map_err(|e| {
                     MLSError::Internal(format!(
@@ -2414,33 +2605,74 @@ impl MLSContext {
             extensions
                 .add_or_replace(Extension::Unknown(
                     CATBIRD_METADATA_EXTENSION_TYPE,
-                    UnknownExtension(envelope_bytes),
+                    UnknownExtension(metadata_bytes),
                 ))
                 .map_err(|e| {
                     MLSError::Internal(format!("Failed to add metadata extension: {:?}", e))
                 })?;
 
-            let (commit_msg, _welcome, _group_info) = group
-                .update_group_context_extensions(provider, extensions, signer)
+            let planned_reference_json = metadata::planned_metadata_reference_json(
+                metadata::current_metadata_reference(group).as_ref(),
+                crate::group_metadata::GroupMetadata::from_group(group).is_some(),
+                true,
+            )
+            .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
+
+            let mut commit_builder = group
+                .commit_builder()
+                .propose_group_context_extensions(extensions)
                 .map_err(|e| {
                     crate::error_log!(
-                        "[MLS-CONTEXT] Failed to update group context extensions: {:?}",
+                        "[MLS-CONTEXT] Failed to propose group context extensions: {:?}",
                         e
                     );
-                    MLSError::OpenMLS(format!("update_group_context_extensions: {:?}", e))
+                    MLSError::OpenMLS(format!("propose_group_context_extensions: {:?}", e))
                 })?;
 
-            let commit_bytes =
-                TlsSerialize::tls_serialize_detached(&commit_msg).map_err(|e| {
-                    crate::error_log!(
-                        "[MLS-CONTEXT] Failed to serialize metadata commit: {:?}",
-                        e
-                    );
-                    MLSError::SerializationError
+            if let Some(ref_json) = planned_reference_json.clone() {
+                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json,
+                    ),
+                )));
+            }
+
+            let mut commit_stage = commit_builder.load_psks(provider.storage()).map_err(|e| {
+                crate::error_log!("[MLS-CONTEXT] Failed to load PSKs: {:?}", e);
+                MLSError::OpenMLS(format!("load_psks: {:?}", e))
+            })?;
+
+            if let Some(ref_json) = planned_reference_json {
+                let mut updater = commit_stage.app_data_dictionary_updater();
+                updater.set(ComponentData::from_parts(
+                    metadata::METADATA_REFERENCE_COMPONENT_ID,
+                    ref_json.into(),
+                ));
+                commit_stage.with_app_data_dictionary_updates(updater.changes());
+            }
+
+            let commit_bundle = commit_stage
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
+                .map_err(|e| {
+                    crate::error_log!("[MLS-CONTEXT] Failed to build metadata commit: {:?}", e);
+                    MLSError::OpenMLS(format!("build metadata commit: {:?}", e))
+                })?
+                .stage_commit(provider)
+                .map_err(|e| {
+                    crate::error_log!("[MLS-CONTEXT] Failed to stage metadata commit: {:?}", e);
+                    MLSError::OpenMLS(format!("stage metadata commit: {:?}", e))
                 })?;
+
+            let (commit_msg, _welcome, _group_info) = commit_bundle.into_contents();
+
+            let commit_bytes = TlsSerialize::tls_serialize_detached(&commit_msg).map_err(|e| {
+                crate::error_log!("[MLS-CONTEXT] Failed to serialize metadata commit: {:?}", e);
+                MLSError::SerializationError
+            })?;
 
             crate::info_log!(
-                "[MLS-CONTEXT] Encrypted group metadata update committed, {} bytes",
+                "[MLS-CONTEXT] Group metadata update committed, {} bytes",
                 commit_bytes.len()
             );
 
@@ -2588,13 +2820,50 @@ impl MLSContext {
                 indices_to_remove.len()
             );
 
-            // 2. Create remove commit via OpenMLS
-            let (commit, welcome_option, _group_info) = group
-                .remove_members(provider, signer, &indices_to_remove)
+            let planned_reference_json = metadata::planned_metadata_reference_json(
+                metadata::current_metadata_reference(group).as_ref(),
+                metadata::metadata_payload_from_group(group).is_some(),
+                false,
+            )
+            .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
+
+            let mut commit_builder = group.commit_builder().propose_removals(indices_to_remove);
+            if let Some(ref_json) = planned_reference_json.clone() {
+                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json,
+                    ),
+                )));
+            }
+
+            let mut commit_stage = commit_builder.load_psks(provider.storage()).map_err(|e| {
+                crate::error_log!("[MLS-CONTEXT] remove_members load_psks failed: {:?}", e);
+                MLSError::OpenMLS(format!("remove_members load_psks failed: {:?}", e))
+            })?;
+
+            if let Some(ref_json) = planned_reference_json {
+                let mut updater = commit_stage.app_data_dictionary_updater();
+                updater.set(ComponentData::from_parts(
+                    metadata::METADATA_REFERENCE_COMPONENT_ID,
+                    ref_json.into(),
+                ));
+                commit_stage.with_app_data_dictionary_updates(updater.changes());
+            }
+
+            let commit_bundle = commit_stage
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
                 .map_err(|e| {
-                    crate::error_log!("[MLS-CONTEXT] remove_members failed: {:?}", e);
-                    MLSError::OpenMLS(format!("remove_members failed: {:?}", e))
+                    crate::error_log!("[MLS-CONTEXT] remove_members build failed: {:?}", e);
+                    MLSError::OpenMLS(format!("remove_members build failed: {:?}", e))
+                })?
+                .stage_commit(provider)
+                .map_err(|e| {
+                    crate::error_log!("[MLS-CONTEXT] remove_members stage failed: {:?}", e);
+                    MLSError::OpenMLS(format!("remove_members stage failed: {:?}", e))
                 })?;
+
+            let (commit, welcome_option, _group_info) = commit_bundle.into_contents();
 
             // 3. DO NOT merge - send-then-merge pattern
             crate::debug_log!("[MLS-CONTEXT] Remove commit staged (NOT merged)");

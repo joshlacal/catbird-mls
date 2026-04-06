@@ -714,6 +714,29 @@ pub extern "C" fn mls_get_epoch(
     .unwrap_or(0) // Return 0 on panic
 }
 
+/// Get the confirmation tag of the group as bytes (TLS-serialized)
+#[no_mangle]
+pub extern "C" fn mls_get_confirmation_tag(
+    context_id: usize,
+    group_id: *const u8,
+    group_id_len: usize,
+) -> MLSResult {
+    // P0: Catch panics at FFI boundary
+    ffi_catch_unwind!({
+        let result: Result<Vec<u8>> = (|| {
+            validate_input_len(group_id_len, MAX_GROUP_ID_LEN, "group_id")?;
+            let context = get_context(context_id)?;
+            let gid = safe_slice(group_id, group_id_len, "group_id")?;
+            context.get_confirmation_tag(gid.to_vec())
+        })();
+
+        match result {
+            Ok(data) => MLSResult::ok(data),
+            Err(e) => MLSResult::err(e),
+        }
+    })
+}
+
 /// Process a commit message and update group state
 /// This is used for epoch synchronization - processing commits from other members
 /// to keep the local group state up-to-date with the server's current epoch.

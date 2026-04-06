@@ -23,6 +23,47 @@ where
     /// 2. Sends ciphertext to the delivery service
     /// 3. Stores the plaintext locally
     pub async fn send_message(&self, conversation_id: &str, text: &str) -> Result<Message> {
+        self.send_payload_message(conversation_id, MLSMessagePayload::text(text))
+            .await
+    }
+
+    /// Send a text message with a rich embed.
+    pub async fn send_message_with_embed(
+        &self,
+        conversation_id: &str,
+        text: &str,
+        embed: MLSEmbedData,
+    ) -> Result<Message> {
+        self.send_payload_message(
+            conversation_id,
+            MLSMessagePayload::text_with_embed(text, embed),
+        )
+        .await
+    }
+
+    /// Send an encrypted reaction (add or remove emoji) to a message.
+    ///
+    /// The reaction is encrypted as an MLS application message with
+    /// `messageType: "reaction"`, matching the iOS `sendEncryptedReaction` path.
+    pub async fn send_reaction(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+        emoji: &str,
+        action: ReactionAction,
+    ) -> Result<Message> {
+        self.send_payload_message(
+            conversation_id,
+            MLSMessagePayload::reaction(message_id, emoji, action),
+        )
+        .await
+    }
+
+    async fn send_payload_message(
+        &self,
+        conversation_id: &str,
+        payload: MLSMessagePayload,
+    ) -> Result<Message> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
@@ -31,11 +72,13 @@ where
         let group_id_bytes = hex::decode(conversation_id)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
-        // Encode as MLSMessagePayload JSON (interoperable with iOS Catbird)
-        let payload = MLSMessagePayload::text(text);
         let payload_bytes = payload.encode().map_err(|e| {
             OrchestratorError::InvalidInput(format!("Failed to encode message payload: {e}"))
         })?;
+        let payload_json = String::from_utf8(payload_bytes.clone()).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("Failed to stringify message payload: {e}"))
+        })?;
+        let display_text = payload.display_text();
 
         tracing::info!(
             conversation_id,
@@ -44,20 +87,40 @@ where
             "Encoded MLSMessagePayload for send"
         );
 
-        // Pre-send sync: catch up on any missed epoch-advancing commits
-        match self.fetch_messages(conversation_id, None, 50).await {
-            Ok((msgs, _)) => {
-                if !msgs.is_empty() {
-                    tracing::info!(
-                        conversation_id,
-                        count = msgs.len(),
-                        "Pre-send sync processed {} pending messages",
-                        msgs.len()
-                    );
+        // Pre-send sync: catch up on any missed epoch-advancing commits.
+        // Loop up to 3 rounds with cursor tracking to drain pending messages
+        // instead of only processing the first 50.
+        {
+            let mut cursor: Option<String> = None;
+            for round in 0..3u32 {
+                match self
+                    .fetch_messages(conversation_id, cursor.as_deref(), 50)
+                    .await
+                {
+                    Ok((msgs, next_cursor)) => {
+                        if !msgs.is_empty() {
+                            tracing::info!(
+                                conversation_id,
+                                round,
+                                count = msgs.len(),
+                                "Pre-send sync processed pending messages"
+                            );
+                        }
+                        if msgs.is_empty() || next_cursor.is_none() {
+                            break;
+                        }
+                        cursor = next_cursor;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            conversation_id,
+                            round,
+                            error = %e,
+                            "Pre-send sync failed, proceeding anyway"
+                        );
+                        break;
+                    }
                 }
-            }
-            Err(e) => {
-                tracing::warn!(conversation_id, error = %e, "Pre-send sync failed, proceeding anyway");
             }
         }
 
@@ -86,8 +149,12 @@ where
         };
 
         // Track own commit for dedup
+        self.evict_stale_commits().await;
         let commit_hash = sha2::Sha256::digest(&encrypt_result.ciphertext).to_vec();
-        self.own_commits().lock().await.insert(commit_hash);
+        self.own_commits()
+            .lock()
+            .await
+            .insert(commit_hash, web_time::Instant::now());
 
         // Get current epoch from MLS FFI (authoritative source).
         // The in-memory group_states cache can be stale or missing after
@@ -149,7 +216,10 @@ where
                                 "Failover succeeded, rejoining"
                             );
                             self.failover_tracker().lock().await.clear(conversation_id);
-                            let _ = self.force_rejoin(conversation_id).await;
+                            tracing::info!(
+                                conversation_id,
+                                "Failover complete — will sync on next cycle"
+                            );
                         }
                         Err(e) => {
                             tracing::error!(
@@ -212,12 +282,13 @@ where
             id: message_id,
             conversation_id: conversation_id.to_string(),
             sender_did: user_did,
-            text: text.to_string(),
+            text: display_text,
             timestamp: Utc::now(),
             epoch: msg_epoch,
             sequence_number: msg_seq,
             is_own: true,
             delivery_status: None,
+            payload_json: Some(payload_json),
         };
 
         let _ = self
@@ -251,7 +322,12 @@ where
 
         // Check if this is our own commit (self-commit detection)
         let commit_hash = sha2::Sha256::digest(&envelope.ciphertext).to_vec();
-        let is_own_commit = self.own_commits().lock().await.remove(&commit_hash);
+        let is_own_commit = self
+            .own_commits()
+            .lock()
+            .await
+            .remove(&commit_hash)
+            .is_some();
 
         if is_own_commit {
             tracing::debug!(
@@ -301,9 +377,33 @@ where
                     conversation_id = %envelope.conversation_id,
                     "Decryption failed"
                 );
+                // Track consecutive decrypt failures for divergence detection
+                {
+                    let mut counts = self.decrypt_fail_counts().lock().await;
+                    let count = counts.entry(envelope.conversation_id.clone()).or_insert(0);
+                    *count += 1;
+                    if *count >= 3 {
+                        tracing::error!(
+                            conversation_id = %envelope.conversation_id,
+                            failures = *count,
+                            "Consecutive decrypt failures — marking for rejoin"
+                        );
+                        let _ = self
+                            .storage()
+                            .mark_needs_rejoin(&envelope.conversation_id)
+                            .await;
+                        *count = 0;
+                    }
+                }
                 return Err(OrchestratorError::from(e));
             }
         };
+
+        // Reset consecutive decrypt failure counter on success
+        self.decrypt_fail_counts()
+            .lock()
+            .await
+            .remove(&envelope.conversation_id);
 
         // Extract sender DID from credential
         let sender_did = String::from_utf8(decrypt_result.sender_credential.identity.clone())
@@ -395,34 +495,52 @@ where
             return Ok(None);
         }
 
-        // Extract display text from payload (JSON envelope or raw UTF-8 fallback)
-        let plaintext = match MLSMessagePayload::extract_text(&decrypt_result.plaintext) {
-            Some(text) if text.trim().is_empty() => {
+        let (plaintext, payload_json) = match MLSMessagePayload::decode(&decrypt_result.plaintext) {
+            Ok(payload) => {
+                if !payload.is_displayable() {
+                    tracing::debug!(
+                        conversation_id = %envelope.conversation_id,
+                        epoch = decrypt_result.epoch,
+                        message_type = ?payload.message_type,
+                        "Ignoring non-displayable MLS payload"
+                    );
+                    return Ok(None);
+                }
+
+                let display_text = payload.display_text();
                 tracing::debug!(
                     conversation_id = %envelope.conversation_id,
-                    epoch = decrypt_result.epoch,
-                    "Ignoring empty text payload"
+                    text_len = display_text.len(),
+                    has_image = payload.image_embed().is_some(),
+                    "Decoded MLSMessagePayload"
                 );
-                return Ok(None);
+
+                (
+                    display_text,
+                    String::from_utf8(decrypt_result.plaintext.clone()).ok(),
+                )
             }
-            Some(text) => {
-                tracing::debug!(
-                    conversation_id = %envelope.conversation_id,
-                    text_len = text.len(),
-                    "Extracted text from MLSMessagePayload"
-                );
-                text
-            }
-            None => {
-                tracing::error!(
-                    conversation_id = %envelope.conversation_id,
-                    plaintext_len = decrypt_result.plaintext.len(),
-                    plaintext_preview = %String::from_utf8_lossy(&decrypt_result.plaintext[..decrypt_result.plaintext.len().min(200)]),
-                    "extract_text returned None for non-empty plaintext - PAYLOAD FORMAT ERROR"
-                );
-                return Err(OrchestratorError::InvalidInput(
-                    "Invalid message payload".into(),
-                ));
+            Err(_) => {
+                let text = String::from_utf8(decrypt_result.plaintext.clone()).map_err(|_| {
+                    tracing::error!(
+                        conversation_id = %envelope.conversation_id,
+                        plaintext_len = decrypt_result.plaintext.len(),
+                        plaintext_preview = %String::from_utf8_lossy(&decrypt_result.plaintext[..decrypt_result.plaintext.len().min(200)]),
+                        "Invalid non-UTF8 MLS message payload"
+                    );
+                    OrchestratorError::InvalidInput("Invalid message payload".into())
+                })?;
+
+                if text.trim().is_empty() {
+                    tracing::debug!(
+                        conversation_id = %envelope.conversation_id,
+                        epoch = decrypt_result.epoch,
+                        "Ignoring empty legacy text payload"
+                    );
+                    return Ok(None);
+                }
+
+                (text, None)
             }
         };
 
@@ -441,6 +559,7 @@ where
             sequence_number: decrypt_result.sequence_number,
             is_own,
             delivery_status: None,
+            payload_json,
         };
 
         // Update group state epoch if it advanced (and persist)

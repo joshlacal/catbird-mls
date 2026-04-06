@@ -522,7 +522,12 @@ impl MLSAPIClient for MockDeliveryService {
 
     // -- Messages ------------------------------------------------------------
 
-    async fn send_message(&self, convo_id: &str, ciphertext: &[u8], _epoch: u64) -> Result<()> {
+    async fn send_message(
+        &self,
+        convo_id: &str,
+        ciphertext: &[u8],
+        _epoch: u64,
+    ) -> Result<SendMessageResponse> {
         let mut guard = self.state.lock().unwrap();
         check_fail(&mut guard.failures.fail_next_send, "injected send failure")?;
 
@@ -536,8 +541,9 @@ impl MLSAPIClient for MockDeliveryService {
             ));
         }
 
+        let msg_id = Uuid::new_v4().to_string();
         let msg = StoredMessage {
-            id: Uuid::new_v4().to_string(),
+            id: msg_id.clone(),
             conversation_id: convo_id.to_string(),
             sender_did: did,
             ciphertext: ciphertext.to_vec(),
@@ -550,7 +556,11 @@ impl MLSAPIClient for MockDeliveryService {
             .or_default()
             .push(msg);
 
-        Ok(())
+        Ok(SendMessageResponse {
+            message_id: msg_id,
+            seq: 1,
+            epoch: _epoch,
+        })
     }
 
     async fn send_message_with_id(
@@ -559,7 +569,7 @@ impl MLSAPIClient for MockDeliveryService {
         ciphertext: &[u8],
         _epoch: u64,
         msg_id: &str,
-    ) -> Result<()> {
+    ) -> Result<SendMessageResponse> {
         let mut guard = self.state.lock().unwrap();
         check_fail(&mut guard.failures.fail_next_send, "injected send failure")?;
 
@@ -587,7 +597,11 @@ impl MLSAPIClient for MockDeliveryService {
             .or_default()
             .push(msg);
 
-        Ok(())
+        Ok(SendMessageResponse {
+            message_id: msg_id.to_string(),
+            seq: 1,
+            epoch: _epoch,
+        })
     }
 
     async fn get_messages(

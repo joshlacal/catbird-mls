@@ -12,6 +12,7 @@ use crate::orchestrator::error::OrchestratorError;
 use crate::orchestrator::orchestrator::MLSOrchestrator;
 use crate::orchestrator::storage::MLSStorageBackend;
 use crate::orchestrator::types::{ConversationView, MemberRole, Message};
+use crate::orchestrator::MlsCryptoContext;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Public types — NO MLS concepts exposed
@@ -127,27 +128,29 @@ fn message_to_chat_message(msg: &Message) -> ChatMessage {
 
 /// CatbirdClient wraps the MLSOrchestrator to provide conversations, messages,
 /// and events without exposing any MLS concepts (epochs, key packages, commits, etc.).
-pub struct CatbirdClient<S, A, C>
+pub struct CatbirdClient<S, A, C, M>
 where
     S: MLSStorageBackend + Send + Sync + 'static,
     A: MLSAPIClient + Send + Sync + 'static,
     C: CredentialStore + Send + Sync + 'static,
+    M: MlsCryptoContext + 'static,
 {
-    orchestrator: Arc<MLSOrchestrator<S, A, C>>,
+    orchestrator: Arc<MLSOrchestrator<S, A, C, M>>,
     event_tx: broadcast::Sender<ChatEvent>,
     user_did: String,
 }
 
-impl<S, A, C> CatbirdClient<S, A, C>
+impl<S, A, C, M> CatbirdClient<S, A, C, M>
 where
     S: MLSStorageBackend + Send + Sync + 'static,
     A: MLSAPIClient + Send + Sync + 'static,
     C: CredentialStore + Send + Sync + 'static,
+    M: MlsCryptoContext + 'static,
 {
     /// Create a new CatbirdClient wrapping an already-constructed orchestrator.
     ///
     /// The orchestrator should already be initialized for `user_did`.
-    pub fn new(user_did: String, orchestrator: Arc<MLSOrchestrator<S, A, C>>) -> Self {
+    pub fn new(user_did: String, orchestrator: Arc<MLSOrchestrator<S, A, C, M>>) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         Self {
             orchestrator,
@@ -155,7 +158,16 @@ where
             user_did,
         }
     }
+}
 
+/// Native-only factory that constructs a CatbirdClient with the concrete MLSContext.
+#[cfg(not(target_arch = "wasm32"))]
+impl<S, A, C> CatbirdClient<S, A, C, crate::api::MLSContext>
+where
+    S: MLSStorageBackend + Send + Sync + 'static,
+    A: MLSAPIClient + Send + Sync + 'static,
+    C: CredentialStore + Send + Sync + 'static,
+{
     /// Create and initialize a new CatbirdClient from raw components.
     ///
     /// Internally: creates orchestrator, initializes for the user, registers device,
@@ -190,7 +202,15 @@ where
             user_did,
         })
     }
+}
 
+impl<S, A, C, M> CatbirdClient<S, A, C, M>
+where
+    S: MLSStorageBackend + Send + Sync + 'static,
+    A: MLSAPIClient + Send + Sync + 'static,
+    C: CredentialStore + Send + Sync + 'static,
+    M: MlsCryptoContext + 'static,
+{
     /// List all conversations for the current user.
     pub async fn conversations(&self) -> Result<Vec<Conversation>, OrchestratorError> {
         let convos = self
@@ -346,11 +366,11 @@ where
         Ok(chat_messages)
     }
 
-    /// Mark a conversation as read up to a specific message.
-    pub async fn mark_read(
+    /// Update the read cursor for a conversation.
+    pub async fn update_cursor(
         &self,
         _conversation_id: &str,
-        _message_id: &str,
+        _cursor: &str,
     ) -> Result<(), OrchestratorError> {
         // TODO: Delegate to orchestrator cursor update when read receipts are implemented
         Ok(())
@@ -375,7 +395,7 @@ where
     }
 
     /// Access the underlying orchestrator (for advanced/escape-hatch use).
-    pub fn orchestrator(&self) -> &Arc<MLSOrchestrator<S, A, C>> {
+    pub fn orchestrator(&self) -> &Arc<MLSOrchestrator<S, A, C, M>> {
         &self.orchestrator
     }
 }

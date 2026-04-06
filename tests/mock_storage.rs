@@ -400,6 +400,7 @@ mod tests {
             sequence_number: seq,
             is_own: false,
             delivery_status: None,
+            payload_json: None,
         }
     }
 

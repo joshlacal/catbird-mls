@@ -124,7 +124,10 @@ fn test_update_group_metadata_produces_commit() {
     // Before merge, the group is still at the old epoch with plaintext metadata
     // from creation (the pending commit hasn't been applied yet).
     let meta_bytes = ctx.get_group_metadata(result.group_id.clone()).unwrap();
-    assert!(!meta_bytes.is_empty(), "Original metadata should still be readable before merge");
+    assert!(
+        !meta_bytes.is_empty(),
+        "Original metadata should still be readable before merge"
+    );
     let meta = GroupMetadata::from_extension_bytes(&meta_bytes).unwrap();
     assert_eq!(meta.name.as_deref(), Some("Original"));
 }
@@ -159,7 +162,10 @@ fn test_update_group_metadata_readable_after_merge() {
     // After merge the epoch has advanced, but the metadata was encrypted
     // with the stable per-group MEK, so it remains readable.
     let meta_bytes = ctx.get_group_metadata(result.group_id).unwrap();
-    assert!(!meta_bytes.is_empty(), "Metadata should be readable after epoch advance");
+    assert!(
+        !meta_bytes.is_empty(),
+        "Metadata should be readable after epoch advance"
+    );
 
     let meta = GroupMetadata::from_extension_bytes(&meta_bytes).unwrap();
     assert_eq!(meta.name.as_deref(), Some("Renamed Group"));

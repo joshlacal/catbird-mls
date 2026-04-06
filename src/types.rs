@@ -8,6 +8,15 @@ pub struct KeyPackageData {
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct GroupCreationResult {
     pub group_id: Vec<u8>,
+    /// Encrypted metadata blob (nonce || ciphertext || tag), if metadata was provided.
+    /// The caller should upload this to the server via `putGroupMetadataBlob`.
+    pub encrypted_metadata_blob: Option<Vec<u8>>,
+    /// JSON-serialized `MetadataReference` for the encrypted blob.
+    /// The caller should include this in the group state / send to the server.
+    pub metadata_reference_json: Option<Vec<u8>>,
+    /// The blob locator (UUIDv4) for the encrypted metadata blob.
+    /// Passed separately for convenience so the caller can use it as the upload key.
+    pub metadata_blob_locator: Option<String>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
@@ -34,12 +43,16 @@ pub struct DecryptResult {
 pub struct ExternalCommitResult {
     pub commit_data: Vec<u8>,
     pub group_id: Vec<u8>,
+    /// Exported GroupInfo after the external commit — send back to the server
+    /// so other clients can use it for future joins.
+    pub group_info: Option<Vec<u8>>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct KeyPackageResult {
     pub key_package_data: Vec<u8>,
     pub hash_ref: Vec<u8>,
+    pub signature_public_key: Vec<u8>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
@@ -55,6 +68,17 @@ pub struct ExportedSecret {
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct CommitResult {
     pub new_epoch: u64,
+}
+
+/// Result of merging a pending commit (sender-side).
+/// Includes metadata key material for the new epoch so the caller
+/// can re-encrypt and upload metadata blobs before or after merge.
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct MergePendingCommitResult {
+    pub new_epoch: u64,
+    /// Metadata key for the new epoch. Present when key derivation succeeds.
+    /// Sender uses this to re-encrypt metadata and upload the blob.
+    pub commit_metadata: Option<CommitMetadataInfo>,
 }
 
 #[derive(Clone)]
@@ -134,6 +158,39 @@ pub enum ProposalInfo {
     Update { info: UpdateProposalInfo },
 }
 
+/// Metadata key material derived from a commit's next-epoch exporter.
+///
+/// Returned alongside commit processing results so the caller (Swift/FFI layer)
+/// can fetch, decrypt, or re-encrypt metadata blobs without the Rust layer
+/// making any HTTP calls.
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct CommitMetadataInfo {
+    /// 32-byte ChaCha20-Poly1305 key derived from the new epoch's MLS exporter.
+    /// Use with `metadata::decrypt_metadata_blob` / `encrypt_metadata_blob`.
+    pub metadata_key: Vec<u8>,
+    /// The epoch this key is bound to (the post-commit epoch).
+    pub epoch: u64,
+    /// JSON-serialized `MetadataReference` from the group's AppDataDictionary,
+    /// if present for this epoch.
+    pub metadata_reference_json: Option<Vec<u8>>,
+}
+
+/// Current metadata key material for an already-joined group.
+///
+/// Used for bootstrapping metadata after a Welcome join or External Commit,
+/// where no `StagedCommit` is available. The key is derived from the group's
+/// current epoch exporter and can immediately decrypt the metadata blob.
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct CurrentMetadataInfo {
+    /// 32-byte ChaCha20-Poly1305 key for the group's current epoch.
+    pub metadata_key: Vec<u8>,
+    /// The epoch this key is bound to.
+    pub epoch: u64,
+    /// JSON-serialized `MetadataReference` from the group's AppDataDictionary,
+    /// if present for the current epoch.
+    pub metadata_reference_json: Option<Vec<u8>>,
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
 pub enum ProcessedContent {
     ApplicationMessage {
@@ -146,6 +203,9 @@ pub enum ProcessedContent {
     },
     StagedCommit {
         new_epoch: u64,
+        /// Metadata key for the new epoch. Present when key derivation succeeds.
+        /// Receiver uses this to fetch + decrypt the metadata blob from the server.
+        commit_metadata: Option<CommitMetadataInfo>,
     },
 }
 
@@ -155,6 +215,9 @@ pub struct ProcessCommitResult {
     pub update_proposals: Vec<UpdateProposalInfo>,
     pub add_proposals: Vec<AddProposalInfo>,
     pub remove_proposals: Vec<RemoveProposalInfo>,
+    /// Metadata key for the new epoch. Present when key derivation succeeds.
+    /// Receiver uses this to fetch + decrypt the metadata blob from the server.
+    pub commit_metadata: Option<CommitMetadataInfo>,
 }
 
 #[derive(Clone)]

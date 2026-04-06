@@ -1,39 +1,79 @@
-# Android Build Guide for MLS FFI
+# Android MLS Build Guide
 
-This guide explains how to build the MLS FFI library for Android and generate Kotlin bindings.
+`catbird-mls` is the canonical Android MLS source. The Rust crate owns the UniFFI surface, and the generated Kotlin/JNI artifacts are staged under `catbird-mls/build/android/mlsffi/` and synced into `android/Catbird/mlsffi/` for local Android builds.
+
+## Canonical regeneration paths
+
+### From the Rust crate
+
+```bash
+cd catbird-mls
+./build-android.sh
+```
+
+This is the primary workflow inside the monorepo. The script now:
+
+1. Auto-detects the latest installed Android NDK (or uses `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` if set)
+2. Cross-compiles `libcatbird_mls.so` for `arm64-v8a`, `armeabi-v7a`, `x86`, and `x86_64`
+3. Runs UniFFI with `uniffi.toml` so Kotlin stays in `blue.catbird.mls`
+4. Applies a deterministic Kotlin post-process for UniFFI exception variants whose Rust field name is `message`
+5. Deletes legacy top-level Android staging directories from previous workflows so only the canonical staged layout remains
+6. Stages the generated artifacts in `build/android/mlsffi/`
+7. Syncs `src/main/kotlin` and `src/main/jniLibs` into `../android/Catbird/mlsffi/` when that module exists
+
+### From the Android module
+
+```bash
+cd android/Catbird/mlsffi
+./regenerate.sh
+```
+
+That wrapper simply delegates back to `catbird-mls/build-android.sh --android-module-dir ...`, so there is still exactly one canonical generation path.
+
+## Output layout
+
+After a successful run:
+
+```text
+catbird-mls/build/android/mlsffi/
+└── src/
+    └── main/
+        ├── AndroidManifest.xml
+        ├── jniLibs/
+        │   ├── arm64-v8a/libcatbird_mls.so
+        │   ├── armeabi-v7a/libcatbird_mls.so
+        │   ├── x86/libcatbird_mls.so
+        │   └── x86_64/libcatbird_mls.so
+        └── kotlin/
+            └── blue/
+                └── catbird/
+                    └── mls/
+                        └── catbird_mls.kt
+```
+
+Those staged files are the exact artifacts copied into `android/Catbird/mlsffi/src/main/`.
+
+## Package and library names
+
+These values are the Android seam contract and should stay aligned:
+
+- Kotlin package: `blue.catbird.mls`
+- Android module: `android/Catbird/mlsffi`
+- Native library name: `libcatbird_mls.so`
+- UniFFI config source: `catbird-mls/uniffi.toml`
+- Kotlin compatibility patch: `build-android.sh` rewrites `OrchestratorBridgeException` constructor fields from ``message`` to ``errorMessage`` after generation so Kotlin 2 does not collide with `Throwable.message`
 
 ## Prerequisites
 
-### 1. Install Android NDK
+### Android NDK
 
-**Option A: Via Android Studio**
-1. Open Android Studio
-2. Go to `Tools > SDK Manager`
-3. Select `SDK Tools` tab
-4. Check `NDK (Side by side)` and click Apply
-5. Default location: `~/Library/Android/sdk/ndk/<version>/` (macOS)
+Install the NDK with Android Studio (`Tools > SDK Manager > SDK Tools > NDK (Side by side)`) or set `ANDROID_NDK_HOME` / `ANDROID_NDK_ROOT` to an existing install.
 
-**Option B: Direct Download**
-Download from: https://developer.android.com/ndk/downloads
+The build script no longer requires you to manually prepend the NDK toolchain to `PATH`; it does that itself.
 
-### 2. Set Environment Variables
+### Rust Android targets
 
-Add to your `~/.zshrc` or `~/.bash_profile`:
-
-```bash
-# Android NDK (adjust version as needed)
-export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/26.1.10909125
-export PATH=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin:$PATH
-```
-
-Then reload:
-```bash
-source ~/.zshrc  # or ~/.bash_profile
-```
-
-### 3. Configure Cargo for Android Cross-Compilation
-
-The build script will automatically add Android targets, but you can also add them manually:
+The script installs missing Rust targets automatically, but you can preinstall them if preferred:
 
 ```bash
 rustup target add aarch64-linux-android
@@ -42,225 +82,46 @@ rustup target add i686-linux-android
 rustup target add x86_64-linux-android
 ```
 
-### 4. Create Cargo Config (Optional but Recommended)
+## Validation
 
-Create `.cargo/config.toml` in the `mls-ffi` directory:
-
-```toml
-[target.aarch64-linux-android]
-linker = "aarch64-linux-android21-clang"
-
-[target.armv7-linux-androideabi]
-linker = "armv7a-linux-androideabi21-clang"
-
-[target.i686-linux-android]
-linker = "i686-linux-android21-clang"
-
-[target.x86_64-linux-android]
-linker = "x86_64-linux-android21-clang"
-```
-
-## Building
-
-### Quick Build
-
-Simply run:
+Build the Android wrapper module after regenerating artifacts:
 
 ```bash
-./build-android.sh
+cd android/Catbird
+export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+./gradlew :mlsffi:assembleDebug
 ```
 
-This will:
-1. ✅ Check and install Android Rust targets
-2. ✅ Build native libraries for all Android architectures
-3. ✅ Generate Kotlin bindings via UniFFI
-4. ✅ Create a complete Kotlin package structure
-5. ✅ Package everything in `build/android/mlsffi-kotlin/`
+If you specifically want the release variant:
 
-### Build Output Structure
-
-```
-build/android/mlsffi-kotlin/
-├── build.gradle.kts              # Gradle build configuration
-├── src/
-│   └── main/
-│       ├── AndroidManifest.xml
-│       └── kotlin/
-│           └── blue/
-│               └── catbird/
-│                   └── mlsffi/
-│                       └── *.kt  # Generated Kotlin bindings
-└── jniLibs/
-    ├── arm64-v8a/
-    │   └── libmls_ffi.so        # ARM64 native library
-    ├── armeabi-v7a/
-    │   └── libmls_ffi.so        # ARMv7 native library
-    ├── x86/
-    │   └── libmls_ffi.so        # x86 native library (emulator)
-    └── x86_64/
-        └── libmls_ffi.so        # x86_64 native library (emulator)
-```
-
-## Integration with Android Project
-
-### Method 1: Gradle Module (Recommended)
-
-1. Copy the `mlsffi-kotlin` directory to your Android project root:
-   ```bash
-   cp -r build/android/mlsffi-kotlin /path/to/your/android/project/
-   ```
-
-2. Add to `settings.gradle.kts`:
-   ```kotlin
-   include(":app", ":mlsffi-kotlin")
-   ```
-
-3. Add to your app's `build.gradle.kts`:
-   ```kotlin
-   dependencies {
-       implementation(project(":mlsffi-kotlin"))
-   }
-   ```
-
-4. Sync Gradle and you're ready to use!
-
-### Method 2: Manual Integration
-
-1. Copy JNI libraries to your app:
-   ```bash
-   cp -r build/android/mlsffi-kotlin/jniLibs/* app/src/main/jniLibs/
-   ```
-
-2. Copy Kotlin source files:
-   ```bash
-   cp -r build/android/mlsffi-kotlin/src/main/kotlin/* app/src/main/kotlin/
-   ```
-
-3. Add JNA dependency to `build.gradle.kts`:
-   ```kotlin
-   dependencies {
-       implementation("net.java.dev.jna:jna:5.14.0@aar")
-   }
-   ```
-
-## Usage Example
-
-```kotlin
-import blue.catbird.mlsffi.*
-
-class MLSManager(context: Context) {
-    private val mlsContext: Long
-
-    init {
-        // Initialize MLS with database path
-        val dbPath = File(context.filesDir, "mls.sqlite").absolutePath
-        mlsContext = mlsInit(databasePath = dbPath)
-    }
-
-    suspend fun createGroup(conversationId: String): String {
-        return withContext(Dispatchers.IO) {
-            mlsCreateGroup(
-                context = mlsContext,
-                conversationId = conversationId
-            )
-        }
-    }
-
-    suspend fun sendMessage(groupId: String, message: String): ByteArray {
-        return withContext(Dispatchers.IO) {
-            mlsEncryptMessage(
-                context = mlsContext,
-                groupId = groupId,
-                message = message.toByteArray()
-            )
-        }
-    }
-
-    suspend fun receiveMessage(groupId: String, ciphertext: ByteArray): String {
-        return withContext(Dispatchers.IO) {
-            val plaintext = mlsDecryptMessage(
-                context = mlsContext,
-                groupId = groupId,
-                ciphertext = ciphertext
-            )
-            String(plaintext)
-        }
-    }
-
-    fun cleanup() {
-        mlsDestroy(mlsContext)
-    }
-}
+```bash
+./gradlew :mlsffi:assembleRelease
 ```
 
 ## Troubleshooting
 
-### Error: ANDROID_NDK_HOME not set
+### `OrchestratorBridgeException` fails to compile because of `message`
 
-Make sure you've set the environment variable and reloaded your shell:
-```bash
-export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/26.1.10909125
-source ~/.zshrc
-```
+Kotlin 2 rejects generated exception subclasses that both declare a constructor property named `message` and inherit from `Throwable`. `build-android.sh` now patches that generated UniFFI block immediately after generation, so a fresh regeneration should remove those errors.
 
-### Error: linker not found
+### `arm-linux-androideabi-clang` not found
 
-Your NDK path might be wrong. Check:
-```bash
-ls $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/
-```
-
-You should see files like `aarch64-linux-android21-clang`.
-
-### Library not loading on device
-
-Make sure you've copied the JNI libraries to the correct architecture folder. Android will automatically select the right one based on the device.
-
-### Build fails with "undefined reference to..."
-
-This usually means a dependency issue. Try:
-```bash
-cargo clean
-./build-android.sh
-```
-
-## Regenerating Bindings Only
-
-If you only need to regenerate Kotlin bindings (without rebuilding Rust):
+`build-android.sh` now exports target-specific `CC_*`, `CXX_*`, `AR_*`, and `CARGO_TARGET_*_LINKER` values for each Android ABI. If you still see this error, confirm the detected NDK contains the LLVM toolchain:
 
 ```bash
-cargo build --bin uniffi-bindgen
-./target/debug/uniffi-bindgen generate \
-    --library target/aarch64-linux-android/release/libmls_ffi.so \
-    --language kotlin \
-    --out-dir build/android/kotlin
+ls "$HOME/Library/Android/sdk/ndk"/*/toolchains/llvm/prebuilt
 ```
 
-## Architecture Support
+### Need to stage artifacts without touching `android/Catbird/mlsffi`
 
-| Architecture | ABI            | Devices                          |
-|--------------|----------------|----------------------------------|
-| ARM64        | arm64-v8a      | Modern phones/tablets (2015+)    |
-| ARMv7        | armeabi-v7a    | Older phones/tablets             |
-| x86          | x86            | 32-bit emulators                 |
-| x86_64       | x86_64         | 64-bit emulators, Chromebooks    |
+```bash
+cd catbird-mls
+./build-android.sh --no-sync-android-module
+```
 
-## Performance Notes
+### Need to sync a different Android module path
 
-- **Release builds** are optimized with `-O` flag
-- Libraries are stripped of debug symbols for smaller size
-- ARM64 provides best performance on modern devices
-- Include only the architectures you need to reduce APK size
-
-## Next Steps
-
-1. **Testing**: Test on real devices and emulators
-2. **ProGuard**: Add ProGuard rules if using code shrinking
-3. **Publishing**: Consider publishing to Maven Central or JitPack
-4. **CI/CD**: Automate builds in GitHub Actions or similar
-
-## Additional Resources
-
-- [UniFFI Book](https://mozilla.github.io/uniffi-rs/)
-- [Android NDK Guide](https://developer.android.com/ndk/guides)
-- [Rust Android Targets](https://doc.rust-lang.org/rustc/platform-support.html)
+```bash
+cd catbird-mls
+./build-android.sh --android-module-dir /absolute/path/to/mlsffi
+```

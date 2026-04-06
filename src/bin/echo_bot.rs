@@ -13,8 +13,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use base64::Engine as _;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -323,11 +323,7 @@ impl MLSStorageBackend for BotStorage {
         before_sequence: Option<u64>,
     ) -> OrcResult<Vec<Message>> {
         let s = self.inner.lock().unwrap();
-        let msgs = s
-            .messages
-            .get(conversation_id)
-            .cloned()
-            .unwrap_or_default();
+        let msgs = s.messages.get(conversation_id).cloned().unwrap_or_default();
         let filtered: Vec<Message> = msgs
             .into_iter()
             .filter(|m| before_sequence.map_or(true, |seq| m.sequence_number < seq))
@@ -335,12 +331,7 @@ impl MLSStorageBackend for BotStorage {
         Ok(filtered.into_iter().rev().take(limit as usize).collect())
     }
     async fn message_exists(&self, message_id: &str) -> OrcResult<bool> {
-        Ok(self
-            .inner
-            .lock()
-            .unwrap()
-            .message_ids
-            .contains(message_id))
+        Ok(self.inner.lock().unwrap().message_ids.contains(message_id))
     }
     async fn get_sync_cursor(&self, user_did: &str) -> OrcResult<SyncCursor> {
         Ok(self
@@ -460,10 +451,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
 
         let body: serde_json::Value = resp
@@ -504,10 +492,12 @@ impl MLSAPIClient for HttpDSClient {
             });
         }
         if let Some(d) = commit_data {
-            body["commitData"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(d));
+            body["commitData"] =
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(d));
         }
         if let Some(d) = welcome_data {
-            body["welcomeData"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(d));
+            body["welcomeData"] =
+                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(d));
         }
 
         let resp = self
@@ -522,10 +512,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
 
         let val: serde_json::Value = resp
@@ -562,10 +549,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
         Ok(())
     }
@@ -597,10 +581,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
         let val: serde_json::Value = resp
             .json()
@@ -635,15 +616,17 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
         Ok(())
     }
 
-    async fn send_message(&self, convo_id: &str, ciphertext: &[u8], epoch: u64) -> OrcResult<()> {
+    async fn send_message(
+        &self,
+        convo_id: &str,
+        ciphertext: &[u8],
+        epoch: u64,
+    ) -> OrcResult<SendMessageResponse> {
         let body = serde_json::json!({
             "convoId": convo_id,
             "ciphertext": base64::engine::general_purpose::STANDARD.encode(ciphertext),
@@ -660,12 +643,28 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
-        Ok(())
+        // Parse server response: { message_id, seq, epoch, received_at }
+        #[derive(serde::Deserialize)]
+        struct ServerResp {
+            #[serde(default)]
+            message_id: String,
+            #[serde(default)]
+            seq: u64,
+            #[serde(default)]
+            epoch: u64,
+        }
+        let server_resp: ServerResp = resp.json().await.unwrap_or(ServerResp {
+            message_id: String::new(),
+            seq: 0,
+            epoch,
+        });
+        Ok(SendMessageResponse {
+            message_id: server_resp.message_id,
+            seq: server_resp.seq,
+            epoch: server_resp.epoch,
+        })
     }
 
     async fn get_messages(
@@ -693,10 +692,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
 
         let val: serde_json::Value = resp
@@ -739,10 +735,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
         Ok(())
     }
@@ -761,10 +754,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
 
         let val: serde_json::Value = resp
@@ -786,10 +776,7 @@ impl MLSAPIClient for HttpDSClient {
                     did,
                     key_package_data: data,
                     hash: kp["hash"].as_str().map(|s| s.to_string()),
-                    cipher_suite: kp["cipherSuite"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .to_string(),
+                    cipher_suite: kp["cipherSuite"].as_str().unwrap_or("unknown").to_string(),
                 })
             })
             .collect();
@@ -875,10 +862,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
 
         let val: serde_json::Value = resp
@@ -887,10 +871,7 @@ impl MLSAPIClient for HttpDSClient {
             .map_err(|e| OrchestratorError::Api(format!("registerDevice parse: {e}")))?;
 
         Ok(DeviceInfo {
-            device_id: val["deviceId"]
-                .as_str()
-                .unwrap_or(device_uuid)
-                .to_string(),
+            device_id: val["deviceId"].as_str().unwrap_or(device_uuid).to_string(),
             mls_did: mls_did.to_string(),
             device_uuid: device_uuid.to_string(),
             created_at: Some(Utc::now()),
@@ -912,7 +893,7 @@ impl MLSAPIClient for HttpDSClient {
         });
         let _resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mls.updateGroupInfo"))
+            .post(self.xrpc_url("blue.catbird.mlsChat.updateGroupInfo"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -924,7 +905,7 @@ impl MLSAPIClient for HttpDSClient {
     async fn get_group_info(&self, convo_id: &str) -> OrcResult<Vec<u8>> {
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.mls.getGroupInfo"))
+            .get(self.xrpc_url("blue.catbird.mlsChat.getGroupInfo"))
             .bearer_auth(&self.auth_token)
             .query(&[("convoId", convo_id)])
             .send()
@@ -934,10 +915,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
 
         let val: serde_json::Value = resp
@@ -979,6 +957,7 @@ impl MLSAPIClient for HttpDSClient {
         convo_id: &str,
         commit_data: &[u8],
         group_info: Option<&[u8]>,
+        confirmation_tag: Option<&str>,
     ) -> OrcResult<ProcessExternalCommitResult> {
         let mut body = serde_json::json!({
             "convoId": convo_id,
@@ -988,6 +967,9 @@ impl MLSAPIClient for HttpDSClient {
         if let Some(gi) = group_info {
             body["groupInfo"] =
                 serde_json::json!(base64::engine::general_purpose::STANDARD.encode(gi));
+        }
+        if let Some(tag) = confirmation_tag {
+            body["confirmationTag"] = serde_json::json!(tag);
         }
         let resp = self
             .client
@@ -1001,10 +983,7 @@ impl MLSAPIClient for HttpDSClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError {
-                status,
-                body,
-            });
+            return Err(OrchestratorError::ServerError { status, body });
         }
 
         let val: serde_json::Value = resp
@@ -1150,9 +1129,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
 
     // Initialize orchestrator
-    orchestrator.initialize(&args.bot_did).await.map_err(|e| {
-        format!("Failed to initialize orchestrator: {e}")
-    })?;
+    orchestrator
+        .initialize(&args.bot_did)
+        .await
+        .map_err(|e| format!("Failed to initialize orchestrator: {e}"))?;
 
     // Register device
     info!("Registering device with delivery service...");
@@ -1166,8 +1146,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     info!("Echo bot ready — polling for messages");
 
     // Track per-conversation message cursors
-    let cursors: Arc<Mutex<HashMap<String, Option<String>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let cursors: Arc<Mutex<HashMap<String, Option<String>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // Main poll loop
     let poll_interval = tokio::time::Duration::from_millis(args.poll_interval_ms);

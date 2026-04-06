@@ -11,7 +11,7 @@ use crate::orchestrator::{
     ConversationView, CreateConversationResult, CredentialStore, DeviceInfo, GroupState,
     IncomingEnvelope, JoinMethod, KeyPackageRef, KeyPackageStats, KeyPackageSyncResult,
     MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView, Message,
-    OrchestratorConfig, OrchestratorError, SyncCursor,
+    OrchestratorConfig, OrchestratorError, SendMessageResponse, SyncCursor,
 };
 
 use crate::api::MLSContext;
@@ -248,6 +248,7 @@ pub struct FFIMessage {
     pub sequence_number: u64,
     pub is_own: bool,
     pub delivery_status: Option<FFIDeliveryStatus>,
+    pub payload_json: Option<String>,
 }
 
 #[derive(uniffi::Enum, Clone)]
@@ -346,6 +347,19 @@ pub struct FFIOrchestratorConfig {
     pub max_rejoin_attempts: u32,
 }
 
+/// Result of preparing a voice message via the Rust Opus encoder.
+#[derive(uniffi::Record, Clone)]
+pub struct FFIVoicePrepareResult {
+    pub opus_data: Vec<u8>,
+    pub encrypted_blob: Vec<u8>,
+    pub key: Vec<u8>,
+    pub iv: Vec<u8>,
+    pub sha256: String,
+    pub duration_ms: u64,
+    pub waveform: Vec<f32>,
+    pub size: u64,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Error type for the bridge
 // ═══════════════════════════════════════════════════════════════════════════
@@ -374,6 +388,8 @@ pub enum OrchestratorBridgeError {
     RecoveryFailed { message: String },
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
+    #[error("Voice error: {message}")]
+    Voice { message: String },
 }
 
 impl From<OrchestratorError> for OrchestratorBridgeError {
@@ -499,6 +515,7 @@ fn ffi_to_message(ffi: &FFIMessage) -> Message {
         sequence_number: ffi.sequence_number,
         is_own: ffi.is_own,
         delivery_status: ffi.delivery_status.as_ref().map(ffi_to_delivery_status),
+        payload_json: ffi.payload_json.clone(),
     }
 }
 
@@ -513,6 +530,7 @@ fn message_to_ffi(msg: &Message) -> FFIMessage {
         sequence_number: msg.sequence_number,
         is_own: msg.is_own,
         delivery_status: msg.delivery_status.as_ref().map(delivery_status_to_ffi),
+        payload_json: msg.payload_json.clone(),
     }
 }
 
@@ -861,10 +879,17 @@ impl MLSAPIClient for APIAdapter {
         convo_id: &str,
         ciphertext: &[u8],
         epoch: u64,
-    ) -> crate::orchestrator::Result<()> {
+    ) -> crate::orchestrator::Result<SendMessageResponse> {
         self.0
             .send_message(convo_id.to_string(), ciphertext.to_vec(), epoch)
-            .map_err(bridge_err)
+            .map_err(bridge_err)?;
+        // FFI callback doesn't return server response; return defaults.
+        // The Swift side will be updated separately to propagate seq/epoch.
+        Ok(SendMessageResponse {
+            message_id: String::new(),
+            seq: 0,
+            epoch,
+        })
     }
 
     async fn get_messages(
@@ -1099,7 +1124,8 @@ impl CredentialStore for CredentialAdapter {
 // The main UniFFI-exported object
 // ═══════════════════════════════════════════════════════════════════════════
 
-type ConcreteOrchestrator = MLSOrchestrator<StorageAdapter, APIAdapter, CredentialAdapter>;
+type ConcreteOrchestrator =
+    MLSOrchestrator<StorageAdapter, APIAdapter, CredentialAdapter, MLSContext>;
 
 /// UniFFI-exported MLS Orchestrator object.
 ///
@@ -1226,6 +1252,84 @@ impl OrchestratorBridge {
         Ok(message_to_ffi(&msg))
     }
 
+    /// Encode PCM audio to Opus, extract waveform, encrypt blob.
+    /// Returns the encrypted data + metadata needed to upload and send.
+    pub fn prepare_voice_message(
+        &self,
+        pcm_path: String,
+        sample_rate: u32,
+    ) -> Result<FFIVoicePrepareResult, OrchestratorBridgeError> {
+        let result = crate::voice::prepare_voice_message(&pcm_path, sample_rate).map_err(|e| {
+            OrchestratorBridgeError::Voice {
+                message: e.to_string(),
+            }
+        })?;
+        Ok(FFIVoicePrepareResult {
+            opus_data: result.opus_data,
+            encrypted_blob: result.encrypted_blob,
+            key: result.key,
+            iv: result.iv,
+            sha256: result.sha256,
+            duration_ms: result.duration_ms,
+            waveform: result.waveform,
+            size: result.size,
+        })
+    }
+
+    /// Decode Opus-in-OGG back to 16-bit LE mono PCM at 48kHz.
+    /// iOS can't play OGG natively, so this decodes for AVAudioPlayer.
+    pub fn decode_opus_to_pcm(
+        &self,
+        opus_data: Vec<u8>,
+    ) -> Result<Vec<u8>, OrchestratorBridgeError> {
+        crate::voice::decode_opus_to_pcm(&opus_data).map_err(|e| OrchestratorBridgeError::Voice {
+            message: e.to_string(),
+        })
+    }
+
+    /// Send a voice message (audio embed) to a conversation.
+    /// Call prepare_voice_message first, upload the encrypted blob,
+    /// then call this with the blob_id from the upload.
+    pub fn send_voice_message(
+        &self,
+        conversation_id: String,
+        blob_id: String,
+        key: Vec<u8>,
+        iv: Vec<u8>,
+        sha256: String,
+        size: u64,
+        duration_ms: u64,
+        waveform: Vec<f32>,
+        transcript: Option<String>,
+    ) -> Result<FFIMessage, OrchestratorBridgeError> {
+        use crate::orchestrator::types::{MLSAudioEmbed, MLSEmbedData};
+
+        let audio_embed = MLSAudioEmbed {
+            blob_id,
+            key,
+            iv,
+            sha256,
+            content_type: "audio/ogg; codecs=opus".to_string(),
+            size,
+            duration_ms,
+            waveform,
+            transcript,
+        };
+
+        let embed = MLSEmbedData::audio(audio_embed).map_err(|e| {
+            OrchestratorBridgeError::InvalidInput {
+                message: format!("Failed to serialize audio embed: {e}"),
+            }
+        })?;
+
+        let msg = crate::async_runtime::block_on(self.inner.send_message_with_embed(
+            &conversation_id,
+            "",
+            embed,
+        ))?;
+        Ok(message_to_ffi(&msg))
+    }
+
     /// Process an incoming encrypted envelope.
     pub fn process_incoming(
         &self,
@@ -1344,4 +1448,42 @@ impl OrchestratorBridge {
 pub struct FFIFetchMessagesResult {
     pub messages: Vec<FFIMessage>,
     pub cursor: Option<String>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Free voice utility functions — no bridge instance needed
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Encode PCM audio to Opus, extract waveform, encrypt blob.
+/// This is a pure function — no bridge or MLS context needed.
+#[uniffi::export]
+pub fn ffi_prepare_voice_message(
+    pcm_path: String,
+    sample_rate: u32,
+) -> Result<FFIVoicePrepareResult, OrchestratorBridgeError> {
+    let result = crate::voice::prepare_voice_message(&pcm_path, sample_rate).map_err(|e| {
+        OrchestratorBridgeError::Voice {
+            message: e.to_string(),
+        }
+    })?;
+    Ok(FFIVoicePrepareResult {
+        opus_data: result.opus_data,
+        encrypted_blob: result.encrypted_blob,
+        key: result.key,
+        iv: result.iv,
+        sha256: result.sha256,
+        duration_ms: result.duration_ms,
+        waveform: result.waveform,
+        size: result.size,
+    })
+}
+
+/// Decode Opus-in-OGG back to 16-bit LE mono PCM at 48kHz.
+/// iOS can't play OGG natively, so this decodes for AVAudioPlayer.
+/// This is a pure function — no bridge or MLS context needed.
+#[uniffi::export]
+pub fn ffi_decode_opus_to_pcm(opus_data: Vec<u8>) -> Result<Vec<u8>, OrchestratorBridgeError> {
+    crate::voice::decode_opus_to_pcm(&opus_data).map_err(|e| OrchestratorBridgeError::Voice {
+        message: e.to_string(),
+    })
 }

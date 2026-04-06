@@ -1,12 +1,16 @@
 use base64::Engine as _;
+use openmls::component::ComponentData;
 use openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY;
 use openmls::messages::group_info::VerifiableGroupInfo;
+use openmls::messages::proposals_in::ProposalOrRefIn;
 use openmls::prelude::tls_codec::{Deserialize, Serialize};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
 use openmls_traits::storage::StorageProvider;
+use openmls_traits::{crypto::OpenMlsCrypto, OpenMlsProvider};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Import StorageId to wrap public keys for storage
@@ -74,6 +78,87 @@ fn pad_ciphertext(ciphertext: &[u8]) -> (Vec<u8>, u32) {
     (padded, bucket as u32)
 }
 
+fn current_metadata_reference_json(group: &MlsGroup) -> Option<Vec<u8>> {
+    crate::metadata::current_metadata_reference_json(group)
+}
+
+fn compute_app_data_updates(
+    group: &MlsGroup,
+    crypto: &impl OpenMlsCrypto,
+    committed_proposals: &[ProposalOrRefIn],
+) -> Result<Option<AppDataUpdates>, MLSError> {
+    let mut updater = group.app_data_dictionary_updater();
+    let mut saw_app_data_update = false;
+
+    for proposal_or_ref in committed_proposals.iter() {
+        let validated = proposal_or_ref
+            .clone()
+            .validate(crypto, group.ciphersuite(), ProtocolVersion::default())
+            .map_err(|e| MLSError::OpenMLS(format!("validate AppData proposal: {:?}", e)))?;
+
+        let proposal: Box<Proposal> = match validated {
+            ProposalOrRef::Proposal(proposal) => proposal,
+            ProposalOrRef::Reference(reference) => group
+                .proposal_store()
+                .proposals()
+                .find(|p| p.proposal_reference_ref() == &*reference)
+                .map(|p| Box::new(p.proposal().clone()))
+                .ok_or_else(|| MLSError::OpenMLS("AppData proposal reference missing".into()))?,
+        };
+
+        let Proposal::AppDataUpdate(app_data_update) = *proposal else {
+            continue;
+        };
+
+        saw_app_data_update = true;
+        match app_data_update.operation() {
+            AppDataUpdateOperation::Update(data) => updater.set(ComponentData::from_parts(
+                app_data_update.component_id(),
+                data.clone(),
+            )),
+            AppDataUpdateOperation::Remove => updater.remove(&app_data_update.component_id()),
+        }
+    }
+
+    Ok(if saw_app_data_update {
+        updater.changes()
+    } else {
+        None
+    })
+}
+
+fn process_protocol_message<Provider: OpenMlsProvider>(
+    group: &mut MlsGroup,
+    provider: &Provider,
+    protocol_msg: ProtocolMessage,
+    context: &str,
+) -> Result<ProcessedMessage, MLSError> {
+    let unverified_message = group
+        .unprotect_message(provider, protocol_msg)
+        .map_err(|e| {
+            crate::error_log!("[{}] Failed to unprotect message: {:?}", context, e);
+            MLSError::OpenMLS(format!("unprotect_message failed: {:?}", e))
+        })?;
+
+    let app_data_updates =
+        if let Some(committed_proposals) = unverified_message.committed_proposals() {
+            compute_app_data_updates(group, provider.crypto(), committed_proposals)?
+        } else {
+            None
+        };
+
+    group
+        .process_unverified_message_with_app_data_updates(
+            provider,
+            unverified_message,
+            app_data_updates,
+        )
+        .map_err(|e| {
+            crate::error_log!("[{}] Failed to process message: {:?}", context, e);
+            MLSError::OpenMLS(format!("process_message failed: {:?}", e))
+        })
+}
+
 /// MLS context wrapper for FFI
 ///
 /// Uses Mutex instead of RwLock because:
@@ -88,6 +173,15 @@ pub struct MLSContext {
     inner: Arc<Mutex<Option<MLSContextInner>>>,
     credential_validator: Arc<Mutex<Option<Arc<dyn CredentialValidator>>>>,
     external_join_authorizer: Arc<Mutex<Option<Arc<dyn ExternalJoinAuthorizer>>>>,
+    /// SQLCipher interrupt handles stored OUTSIDE the inner Mutex.
+    /// This allows calling sqlite3_interrupt() from any thread even when another thread
+    /// holds the Mutex for an in-flight FFI operation. Critical for 0xdead10cc prevention:
+    /// interrupting in-flight ops lets flush_and_prepare_close acquire the lock promptly.
+    interrupt_handles: Vec<rusqlite::InterruptHandle>,
+    /// Suspension flag stored OUTSIDE the Mutex for cheap atomic checks.
+    /// When true, long-running operations (key package creation, write_manifest)
+    /// should bail out early to release the Mutex and file locks before iOS suspends.
+    is_suspended: Arc<AtomicBool>,
 }
 
 impl Drop for MLSContext {
@@ -117,11 +211,14 @@ impl MLSContext {
         encryption_key: String,
         keychain: Box<dyn KeychainAccess>,
     ) -> Result<Arc<Self>, MLSError> {
-        let context = MLSContextInner::new(storage_path, encryption_key, keychain)?;
+        let (context, interrupt_handles) =
+            MLSContextInner::new(storage_path, encryption_key, keychain)?;
         Ok(Arc::new(Self {
             inner: Arc::new(Mutex::new(Some(context))),
             credential_validator: Arc::new(Mutex::new(None)),
             external_join_authorizer: Arc::new(Mutex::new(None)),
+            interrupt_handles,
+            is_suspended: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -151,22 +248,77 @@ impl MLSContext {
         Ok(())
     }
 
+    /// Interrupt all in-flight SQLCipher operations on this context.
+    ///
+    /// Safe to call from any thread — does NOT require the inner Mutex.
+    /// Causes any running sqlite3_step/sqlite3_exec to return SQLITE_INTERRUPT.
+    /// The interrupted operation will release the Mutex, allowing flush_and_prepare_close
+    /// to acquire it promptly.
+    ///
+    /// Call this BEFORE flush_and_prepare_close to avoid blocking on the Mutex
+    /// while an in-flight FFI operation holds it (which causes 0xdead10cc).
+    pub fn interrupt(&self) {
+        crate::info_log!(
+            "[MLS-FFI] interrupt: Sending sqlite3_interrupt to {} connection(s)",
+            self.interrupt_handles.len()
+        );
+        for handle in &self.interrupt_handles {
+            handle.interrupt();
+        }
+    }
+
+    /// Set the suspension flag. When true, long-running operations bail out early
+    /// to release the Mutex and file locks before iOS suspends the process.
+    /// Safe to call from any thread — uses atomic store.
+    pub fn set_suspended(&self, value: bool) {
+        self.is_suspended.store(value, Ordering::Release);
+    }
+
+    /// Check if suspension has been requested. Returns MLSError::ContextClosed if so.
+    fn check_suspended(&self) -> Result<(), MLSError> {
+        if self.is_suspended.load(Ordering::Acquire) {
+            Err(MLSError::ContextClosed)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Flush all pending database writes and CLOSE the database connections.
     ///
     /// CRITICAL FOR 0xdead10cc PREVENTION: This method MUST be called when iOS
     /// is transitioning to background/inactive state. It:
-    /// 1. Flushes all pending SQLite writes to disk
-    /// 2. Performs WAL checkpoint to consolidate data
-    /// 3. CLOSES all database connections by dropping the inner context
-    /// 4. Releases all file handles so iOS doesn't kill the app
+    /// 1. Interrupts any in-flight SQLCipher operations (unblocks the Mutex)
+    /// 2. Flushes all pending SQLite writes to disk
+    /// 3. Performs WAL checkpoint to consolidate data
+    /// 4. CLOSES all database connections by dropping the inner context
+    /// 5. Releases all file handles so iOS doesn't kill the app
     ///
     /// After calling this, the context is CLOSED and cannot be used for any operations.
     /// The Swift side must create a new context if MLS operations are needed again.
     pub fn flush_and_prepare_close(&self) -> Result<(), MLSError> {
+        let pid = std::process::id();
+        let is_extension = std::env::current_exe()
+            .map(|p| p.to_string_lossy().contains(".appex/"))
+            .unwrap_or(false);
+        let process_tag = if is_extension { "NSE" } else { "APP" };
+
         crate::info_log!(
-            "[MLS-FFI] flush_and_prepare_close: Starting graceful shutdown with database CLOSE"
+            "[MLS-FFI/{}/pid={}] flush_and_prepare_close: Starting graceful shutdown",
+            process_tag,
+            pid
         );
 
+        // Set suspension flag so in-flight operations bail out early at their next check point.
+        self.is_suspended.store(true, Ordering::Release);
+
+        // CRITICAL FIX: Interrupt first to abort any in-flight SQLCipher operations.
+        // Without this, if another thread holds self.inner.lock() during a long SQLCipher
+        // pread/pwrite, we'd block here until it completes — but iOS may kill us first
+        // with 0xdead10cc because the file locks are still held.
+        self.interrupt();
+
+        // Try to acquire the lock. After interrupt, the in-flight op should return
+        // SQLITE_INTERRUPT quickly, releasing the Mutex.
         let mut guard = self
             .inner
             .lock()
@@ -174,18 +326,30 @@ impl MLSContext {
 
         // Get the inner context (if it exists)
         if let Some(ref inner) = *guard {
-            // Flush the manifest storage (WAL checkpoint)
+            // Flush the manifest storage (WAL checkpoint - PASSIVE mode)
             let _ = inner.flush_database();
-            crate::info_log!("[MLS-FFI] flush_and_prepare_close: Database flushed");
+            crate::info_log!(
+                "[MLS-FFI/{}/pid={}] flush_and_prepare_close: Database flushed (PASSIVE)",
+                process_tag,
+                pid
+            );
         }
 
         // CRITICAL: Take and drop the inner context to CLOSE all database connections
         // This releases the SQLite file handles that cause 0xdead10cc
         let dropped = guard.take();
         if dropped.is_some() {
-            crate::info_log!("[MLS-FFI] flush_and_prepare_close: ✅ Inner context DROPPED - database connections CLOSED");
+            crate::info_log!(
+                "[MLS-FFI/{}/pid={}] flush_and_prepare_close: ✅ Inner context DROPPED - database connections CLOSED",
+                process_tag,
+                pid
+            );
         } else {
-            crate::info_log!("[MLS-FFI] flush_and_prepare_close: Inner context was already closed");
+            crate::info_log!(
+                "[MLS-FFI/{}/pid={}] flush_and_prepare_close: Inner context was already closed",
+                process_tag,
+                pid
+            );
         }
 
         Ok(())
@@ -271,6 +435,7 @@ impl MLSContext {
         group_info_bytes: Vec<u8>,
         identity_bytes: Vec<u8>,
     ) -> Result<ExternalCommitResult, MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -280,11 +445,13 @@ impl MLSContext {
         let identity = String::from_utf8(identity_bytes)
             .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
 
-        let (commit_data, group_id) = inner.create_external_commit(&group_info_bytes, &identity)?;
+        let (commit_data, group_id, group_info) =
+            inner.create_external_commit(&group_info_bytes, &identity)?;
 
         Ok(ExternalCommitResult {
             commit_data,
             group_id,
+            group_info,
         })
     }
 
@@ -294,6 +461,7 @@ impl MLSContext {
         identity_bytes: Vec<u8>,
         psk_bytes: Vec<u8>,
     ) -> Result<ExternalCommitResult, MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -309,6 +477,7 @@ impl MLSContext {
         Ok(ExternalCommitResult {
             commit_data,
             group_id,
+            group_info: None, // PSK path doesn't export GroupInfo yet
         })
     }
 
@@ -323,6 +492,7 @@ impl MLSContext {
     /// # Returns
     /// Ok(()) on success, error if group not found
     pub fn discard_pending_external_join(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        self.check_suspended()?;
         crate::info_log!("[MLS-FFI] discard_pending_external_join: Starting cleanup");
 
         let mut guard = self
@@ -342,6 +512,7 @@ impl MLSContext {
         identity_bytes: Vec<u8>,
         config: Option<GroupConfig>,
     ) -> Result<GroupCreationResult, MLSError> {
+        self.check_suspended()?;
         crate::info_log!("[MLS-FFI] create_group: Starting");
         crate::debug_log!("[MLS-FFI] Identity bytes: {} bytes", identity_bytes.len());
 
@@ -361,13 +532,14 @@ impl MLSContext {
         crate::debug_log!("[MLS-FFI] Group config - max_past_epochs: {}, out_of_order_tolerance: {}, maximum_forward_distance: {}",
             group_config.max_past_epochs, group_config.out_of_order_tolerance, group_config.maximum_forward_distance);
 
-        let group_id = inner.create_group(&identity, group_config)?;
+        let result = inner.create_group(&identity, group_config)?;
         crate::info_log!(
             "[MLS-FFI] Group created successfully, ID: {}",
-            hex::encode(&group_id)
+            hex::encode(&result.group_id)
         );
 
         // 🔒 CRITICAL: Force database flush after group creation
+        self.check_suspended()?;
         inner.flush_database().map_err(|e| {
             crate::error_log!(
                 "[MLS-FFI] ⚠️ WARNING: Failed to flush database after group creation: {:?}",
@@ -381,7 +553,10 @@ impl MLSContext {
         crate::debug_log!("[MLS-FFI] ✅ Database flushed after group creation");
 
         Ok(GroupCreationResult {
-            group_id: group_id.to_vec(),
+            group_id: result.group_id,
+            encrypted_metadata_blob: result.encrypted_metadata_blob,
+            metadata_reference_json: result.metadata_reference_json,
+            metadata_blob_locator: result.metadata_blob_locator,
         })
     }
 
@@ -391,7 +566,9 @@ impl MLSContext {
         identity_bytes: Vec<u8>,
         config: Option<GroupConfig>,
     ) -> Result<GroupCreationResult, MLSError> {
+        self.check_suspended()?;
         let inner = self.inner.clone();
+        let suspended = self.is_suspended.clone();
 
         tokio::task::spawn_blocking(move || {
             crate::info_log!("[MLS-FFI-ASYNC] create_group_async: Starting");
@@ -409,8 +586,11 @@ impl MLSContext {
                 .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
 
             let group_config = config.unwrap_or_default();
-            let group_id = inner_ctx.create_group(&identity, group_config)?;
+            let result = inner_ctx.create_group(&identity, group_config)?;
 
+            if suspended.load(Ordering::Acquire) {
+                return Err(MLSError::ContextClosed);
+            }
             inner_ctx.flush_database().map_err(|e| {
                 crate::error_log!("[MLS-FFI-ASYNC] ⚠️ Failed to flush database: {:?}", e);
                 e
@@ -421,11 +601,14 @@ impl MLSContext {
 
             crate::info_log!(
                 "[MLS-FFI-ASYNC] Group created successfully: {}",
-                hex::encode(&group_id)
+                hex::encode(&result.group_id)
             );
 
             Ok(GroupCreationResult {
-                group_id: group_id.to_vec(),
+                group_id: result.group_id,
+                encrypted_metadata_blob: result.encrypted_metadata_blob,
+                metadata_reference_json: result.metadata_reference_json,
+                metadata_blob_locator: result.metadata_blob_locator,
             })
         })
         .await
@@ -440,6 +623,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -640,13 +824,61 @@ impl MLSContext {
             crate::debug_log!("[MLS-FFI] 🔍 DEBUG: Member count BEFORE add_members: {}", member_count_before);
             crate::debug_log!("[MLS-FFI] 🔍 DEBUG: Adding {} key packages", kps.len());
 
-            let (commit, welcome, _group_info) = group
-                .add_members(provider, signer, &kps)
+            let planned_reference_json = crate::metadata::planned_metadata_reference_json(
+                crate::metadata::current_metadata_reference(group).as_ref(),
+                crate::metadata::metadata_payload_from_group(group).is_some(),
+                false,
+            )
+            .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
+
+            let mut commit_builder = group.commit_builder().propose_adds(kps.iter().cloned());
+            if let Some(ref_json) = planned_reference_json.clone() {
+                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json,
+                    ),
+                )));
+            }
+
+            let mut commit_stage = commit_builder
+                .load_psks(provider.storage())
                 .map_err(|e| {
-                    let msg = format!("{:?}", e);
-                    crate::error_log!("[MLS-FFI] ❌ add_members failed: {}", msg);
+                    let msg = format!("add_members load_psks failed: {:?}", e);
+                    crate::error_log!("[MLS-FFI] ❌ {}", msg);
                     MLSError::AddMembersFailed { message: msg }
                 })?;
+
+            if let Some(ref_json) = planned_reference_json {
+                let mut updater = commit_stage.app_data_dictionary_updater();
+                updater.set(ComponentData::from_parts(
+                    crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                    ref_json.into(),
+                ));
+                commit_stage.with_app_data_dictionary_updates(updater.changes());
+            }
+
+            let commit_bundle = commit_stage
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
+                .map_err(|e| {
+                    let msg = format!("add_members build failed: {:?}", e);
+                    crate::error_log!("[MLS-FFI] ❌ {}", msg);
+                    MLSError::AddMembersFailed { message: msg }
+                })?
+                .stage_commit(provider)
+                .map_err(|e| {
+                    let msg = format!("add_members stage failed: {:?}", e);
+                    crate::error_log!("[MLS-FFI] ❌ {}", msg);
+                    MLSError::AddMembersFailed { message: msg }
+                })?;
+
+            let (commit, welcome, _group_info) = commit_bundle.into_contents();
+            let welcome = welcome.ok_or_else(|| {
+                crate::error_log!("[MLS-FFI] ❌ add_members staged commit produced no Welcome");
+                MLSError::AddMembersFailed {
+                    message: "add_members staged commit produced no Welcome".to_string(),
+                }
+            })?;
 
             // 🔍 DEBUG: Verify member count unchanged (expected behavior - commit is staged)
             let member_count_after = group.members().count();
@@ -679,7 +911,9 @@ impl MLSContext {
             // Both commit and welcome should be serialized as MlsMessageOut
             crate::debug_log!("[MLS-FFI] 🔄 Serializing Welcome with MlsMessage wrapper");
 
-            let welcome_bytes = welcome
+            let welcome_message =
+                MlsMessageOut::from_welcome(welcome.clone(), ProtocolVersion::default());
+            let welcome_bytes = welcome_message
                 .tls_serialize_detached()
                 .map_err(|_| MLSError::SerializationError)?;
 
@@ -700,7 +934,7 @@ impl MLSContext {
 
             // 🔍 DEBUG: Log the actual hash_refs stored INSIDE the Welcome message
             // (these might differ from the computed ones above if something is wrong)
-            let welcome_inner = welcome.body();
+            let welcome_inner = welcome_message.body();
             if let MlsMessageBodyOut::Welcome(ref w) = welcome_inner {
                 crate::info_log!("[MLS-WELCOME-DEBUG] 🔍 Welcome message contains {} encrypted group secrets:", w.secrets().len());
                 for (idx, egs) in w.secrets().iter().enumerate() {
@@ -749,6 +983,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         member_identities: Vec<Vec<u8>>,
     ) -> Result<Vec<u8>, MLSError> {
+        self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] remove_members: Removing {} members from group {}",
             member_identities.len(),
@@ -796,6 +1031,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         key_package_data: Vec<u8>,
     ) -> Result<ProposeResult, MLSError> {
+        self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] propose_add_member: Creating add proposal for group {}",
             hex::encode(&group_id)
@@ -839,6 +1075,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         member_identity: Vec<u8>,
     ) -> Result<ProposeResult, MLSError> {
+        self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] propose_remove_member: Creating remove proposal for {}",
             String::from_utf8_lossy(&member_identity)
@@ -875,6 +1112,7 @@ impl MLSContext {
     /// # Returns
     /// ProposeResult containing proposal message to send and reference for tracking
     pub fn propose_self_update(&self, group_id: Vec<u8>) -> Result<ProposeResult, MLSError> {
+        self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] propose_self_update: Creating update proposal for group {}",
             hex::encode(&group_id)
@@ -906,6 +1144,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError> {
+        self.check_suspended()?;
         let inner = self.inner.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -948,17 +1187,70 @@ impl MLSContext {
 
             let (commit_data, welcome_data) =
                 inner_ctx.with_group(&gid, |group, provider, signer| {
-                    let (commit, welcome, _) =
-                        group.add_members(provider, signer, &kps).map_err(|e| {
-                            crate::error_log!("[MLS-ASYNC] ERROR: Failed to add members: {:?}", e);
+                    let planned_reference_json = crate::metadata::planned_metadata_reference_json(
+                        crate::metadata::current_metadata_reference(group).as_ref(),
+                        crate::metadata::metadata_payload_from_group(group).is_some(),
+                        false,
+                    )
+                    .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
+
+                    let mut commit_builder =
+                        group.commit_builder().propose_adds(kps.iter().cloned());
+                    if let Some(ref_json) = planned_reference_json.clone() {
+                        commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(
+                            Box::new(AppDataUpdateProposal::update(
+                                crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                                ref_json,
+                            )),
+                        ));
+                    }
+
+                    let mut commit_stage =
+                        commit_builder.load_psks(provider.storage()).map_err(|e| {
+                            crate::error_log!(
+                                "[MLS-ASYNC] ERROR: add_members load_psks failed: {:?}",
+                                e
+                            );
                             MLSError::OpenMLSError
                         })?;
+
+                    if let Some(ref_json) = planned_reference_json {
+                        let mut updater = commit_stage.app_data_dictionary_updater();
+                        updater.set(ComponentData::from_parts(
+                            crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                            ref_json.into(),
+                        ));
+                        commit_stage.with_app_data_dictionary_updates(updater.changes());
+                    }
+
+                    let commit_bundle = commit_stage
+                        .build(provider.rand(), provider.crypto(), signer, |_| true)
+                        .map_err(|e| {
+                            crate::error_log!(
+                                "[MLS-ASYNC] ERROR: add_members build failed: {:?}",
+                                e
+                            );
+                            MLSError::OpenMLSError
+                        })?
+                        .stage_commit(provider)
+                        .map_err(|e| {
+                            crate::error_log!(
+                                "[MLS-ASYNC] ERROR: add_members stage failed: {:?}",
+                                e
+                            );
+                            MLSError::OpenMLSError
+                        })?;
+
+                    let (commit, welcome, _) = commit_bundle.into_contents();
+                    let welcome = welcome.ok_or(MLSError::OpenMLSError)?;
 
                     let commit_bytes = commit
                         .tls_serialize_detached()
                         .map_err(|_| MLSError::SerializationError)?;
 
-                    let welcome_bytes = welcome
+                    let welcome_message =
+                        MlsMessageOut::from_welcome(welcome, ProtocolVersion::default());
+                    let welcome_bytes = welcome_message
                         .tls_serialize_detached()
                         .map_err(|_| MLSError::SerializationError)?;
 
@@ -1000,6 +1292,7 @@ impl MLSContext {
     /// Import an identity key pair from backup/recovery
     /// This restores the identity key into the current storage provider
     pub fn import_identity_key(&self, identity: String, key_data: Vec<u8>) -> Result<(), MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -1043,6 +1336,7 @@ impl MLSContext {
     /// # Note
     /// This uses the send-then-merge pattern - caller must merge after server ACK
     pub fn self_update(&self, group_id: Vec<u8>) -> Result<AddMembersResult, MLSError> {
+        self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] self_update: Starting for group {}",
             hex::encode(&group_id)
@@ -1059,16 +1353,55 @@ impl MLSContext {
         let commit_data = inner.with_group(&gid, |group, provider, signer| {
             crate::debug_log!("[MLS-FFI] Creating self-update commit at epoch {}", group.epoch().as_u64());
 
-            // Create self-update (refreshes own leaf node, forces epoch advancement)
-            let bundle = group
-                .self_update(provider, signer, LeafNodeParameters::builder().build())
+            let planned_reference_json = crate::metadata::planned_metadata_reference_json(
+                crate::metadata::current_metadata_reference(group).as_ref(),
+                crate::metadata::metadata_payload_from_group(group).is_some(),
+                false,
+            )
+            .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
+
+            let mut commit_builder = group
+                .commit_builder()
+                .force_self_update(true);
+
+            if let Some(ref_json) = planned_reference_json.clone() {
+                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json,
+                    ),
+                )));
+            }
+
+            let mut commit_stage = commit_builder
+                .load_psks(provider.storage())
                 .map_err(|e| {
-                    crate::error_log!("[MLS-FFI] ❌ self_update failed: {:?}", e);
+                    crate::error_log!("[MLS-FFI] ❌ self_update load_psks failed: {:?}", e);
                     MLSError::OpenMLSError
                 })?;
 
-            let commit = bundle.commit();
-            let welcome_option = bundle.welcome();
+            if let Some(ref_json) = planned_reference_json {
+                let mut updater = commit_stage.app_data_dictionary_updater();
+                updater.set(ComponentData::from_parts(
+                    crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                    ref_json.into(),
+                ));
+                commit_stage.with_app_data_dictionary_updates(updater.changes());
+            }
+
+            let commit_bundle = commit_stage
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] ❌ self_update build failed: {:?}", e);
+                    MLSError::OpenMLSError
+                })?
+                .stage_commit(provider)
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI] ❌ self_update stage failed: {:?}", e);
+                    MLSError::OpenMLSError
+                })?;
+
+            let (commit, welcome_option, _group_info) = commit_bundle.into_contents();
 
             // ✅ RATCHET DESYNC FIX: DO NOT merge commit here - use send-then-merge pattern
             crate::debug_log!("[MLS-FFI] ✅ Self-update commit created (NOT merged) - Swift layer will merge after server ACK");
@@ -1103,6 +1436,7 @@ impl MLSContext {
     /// Delete an MLS group from storage
     /// This should be called when a conversation is deleted or the user leaves
     pub fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -1129,6 +1463,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         plaintext: Vec<u8>,
     ) -> Result<EncryptResult, MLSError> {
+        self.check_suspended()?;
         crate::debug_log!("[MLS-FFI] encrypt_message: Starting");
         crate::debug_log!(
             "[MLS-FFI] Group ID: {} ({} bytes)",
@@ -1205,6 +1540,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         plaintext: Vec<u8>,
     ) -> Result<EncryptResult, MLSError> {
+        self.check_suspended()?;
         let inner = self.inner.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1268,6 +1604,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
+        self.check_suspended()?;
         // 🔍 DIAGNOSTIC: Thread tracking
         let thread_id = std::thread::current().id();
         let timestamp = std::time::SystemTime::now();
@@ -1397,16 +1734,13 @@ impl MLSContext {
             crate::debug_log!("[DECRYPT] 🔄 Calling OpenMLS process_message...");
             let process_start = std::time::SystemTime::now();
 
-            let processed = group
-                .process_message(provider, protocol_msg)
-                .map_err(|e| {
+            let processed =
+                process_protocol_message(group, provider, protocol_msg, "DECRYPT").map_err(|e| {
                     crate::error_log!("[DECRYPT] ❌ OpenMLS process_message FAILED!");
                     crate::error_log!("[DECRYPT]   Error: {:?}", e);
-                    crate::error_log!("[DECRYPT]   Error type: {}", std::any::type_name_of_val(&e));
                     crate::error_log!("[DECRYPT]   Message epoch: {}", message_epoch);
                     crate::error_log!("[DECRYPT]   Group epoch: {}", current_epoch);
 
-                    // Check if this is a SecretReuseError
                     let error_str = format!("{:?}", e);
                     if error_str.contains("SecretReuse") {
                         crate::error_log!("[DECRYPT] 🔴 SECRET REUSE ERROR DETECTED!");
@@ -1538,6 +1872,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
+        self.check_suspended()?;
         let inner = self.inner.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1600,13 +1935,15 @@ impl MLSContext {
                         );
                     }
 
-                    let processed = group.process_message(provider, protocol_msg).map_err(|e| {
-                        crate::error_log!(
-                            "[DECRYPT-ASYNC] ❌ OpenMLS process_message FAILED: {:?}",
-                            e
-                        );
-                        MLSError::DecryptionFailed
-                    })?;
+                    let processed =
+                        process_protocol_message(group, provider, protocol_msg, "DECRYPT-ASYNC")
+                            .map_err(|e| {
+                                crate::error_log!(
+                                    "[DECRYPT-ASYNC] ❌ OpenMLS process_message FAILED: {:?}",
+                                    e
+                                );
+                                MLSError::DecryptionFailed
+                            })?;
 
                     crate::debug_log!("[DECRYPT-ASYNC] ✅ Message processed successfully");
 
@@ -1661,6 +1998,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         message_data: Vec<u8>,
     ) -> Result<ProcessedContent, MLSError> {
+        self.check_suspended()?;
         crate::debug_log!("[MLS-FFI] process_message: Starting");
         crate::debug_log!(
             "[MLS-FFI] Group ID: {} ({} bytes)",
@@ -1692,7 +2030,7 @@ impl MLSContext {
             .map_err(|_| MLSError::ContextNotInitialized)?
             .clone();
 
-        inner.with_group(&gid, |group, provider, _signer| {
+        let result = inner.with_group(&gid, |group, provider, _signer| {
             crate::debug_log!("[MLS-FFI] Inside with_group closure for process_message");
 
             // Strip padding envelope before MLS deserialization
@@ -1766,17 +2104,13 @@ impl MLSContext {
             }
 
             crate::debug_log!("[MLS-FFI] Calling OpenMLS process_message...");
-            let processed = group
-                .process_message(provider, protocol_msg)
+            let processed = process_protocol_message(group, provider, protocol_msg, "MLS-FFI")
                 .map_err(|e| {
                     let error_details = format!("{:?}", e);
                     crate::error_log!("[MLS-FFI] ERROR: OpenMLS process_message failed!");
                     crate::error_log!("[MLS-FFI] ERROR: Error details: {}", error_details);
-                    crate::error_log!("[MLS-FFI] ERROR: Error type: {}", std::any::type_name_of_val(&e));
                     crate::error_log!("[MLS-FFI] ERROR: Current epoch: {:?}", group.epoch());
                     crate::error_log!("[MLS-FFI] 🔐 SECRET TREE ERROR - decryption failed");
-                    // CRITICAL FIX: Include error details so Swift can detect specific error types
-                    // (e.g., epoch mismatch, SecretTreeError, etc.)
                     MLSError::OpenMLS(format!("process_message failed: {}", error_details))
                 })?;
 
@@ -1897,7 +2231,6 @@ impl MLSContext {
                 },
                 ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
                     crate::debug_log!("[MLS-FFI] ExternalJoinProposalMessage received");
-                    // TODO: Implement authorization. Currently we can't easily extract credential from QueuedProposal for ExternalInit.
                     crate::warn_log!("[MLS-FFI] ⚠️ External join proposals not supported yet");
                     Err(MLSError::invalid_input("External join proposals not supported"))
                 },
@@ -1907,41 +2240,64 @@ impl MLSContext {
                     crate::info_log!("[MLS-FFI] 📦 Staged commit received for epoch transition to {}", new_epoch);
 
                     // CRITICAL FIX: Auto-merge staged commits from other members
-                    // Unlike pending commits (which we created), staged commits from other members
-                    // must be merged immediately to advance the epoch. The "send-then-merge" pattern
-                    // only applies to commits WE create, not commits we receive.
-                    //
-                    // The previous code returned without merging, leaving the group stuck at the old epoch
-                    // while other members advanced. This caused epoch mismatch errors for subsequent messages.
                     crate::info_log!("[MLS-FFI] 🔄 Auto-merging staged commit (incoming commit from another member)");
-                    
+
+                    // Metadata: derive the new epoch's metadata key from the staged
+                    // commit's exporter BEFORE merge consumes the StagedCommit.
+                    let metadata_key_bytes = match crate::metadata::derive_metadata_key(
+                        &staged,
+                        provider.crypto(),
+                        &group_id,
+                        new_epoch,
+                    ) {
+                        Ok(key) => {
+                            crate::info_log!("[MLS-FFI] 🔑 metadata key derived for epoch {}", new_epoch);
+                            Some(key.to_vec())
+                        }
+                        Err(e) => {
+                            crate::warn_log!("[MLS-FFI] ⚠️ metadata key derivation failed: {:?}", e);
+                            None
+                        }
+                    };
+
                     // Export current epoch secret before merging
                     if let Err(e) = crate::async_runtime::block_on(
                         epoch_manager.export_current_epoch_secret(group, provider)
                     ) {
                         crate::warn_log!("[MLS-FFI] ⚠️ Failed to export epoch secret before merge: {:?}", e);
                     }
-                    
+
                     let epoch_before = group.epoch().as_u64();
-                    
+
                     // Merge the staged commit to advance the epoch
                     group.merge_staged_commit(provider, *staged)
                         .map_err(|e| {
                             crate::error_log!("[MLS-FFI] ❌ Failed to merge staged commit: {:?}", e);
                             MLSError::MergeFailed
                         })?;
-                    
+
                     let epoch_after = group.epoch().as_u64();
                     crate::info_log!("[MLS-FFI] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
-                    
+                    let metadata_reference_json = current_metadata_reference_json(group);
+                    let metadata_info = metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
+                        metadata_key,
+                        epoch: epoch_after,
+                        metadata_reference_json,
+                    });
+
                     if epoch_after <= epoch_before {
                         crate::error_log!("[MLS-FFI] ❌ CRITICAL: Epoch did not advance after merge! Before: {}, After: {}", epoch_before, epoch_after);
                     }
 
-                    Ok(ProcessedContent::StagedCommit { new_epoch: epoch_after })
+                    Ok(ProcessedContent::StagedCommit {
+                        new_epoch: epoch_after,
+                        commit_metadata: metadata_info,
+                    })
                 },
             }
-        })
+        });
+
+        result
     }
 
     /// Async variant of process_message - offloads crypto work to avoid blocking
@@ -1950,6 +2306,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         message_data: Vec<u8>,
     ) -> Result<ProcessedContent, MLSError> {
+        self.check_suspended()?;
         let inner = self.inner.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -1968,7 +2325,7 @@ impl MLSContext {
             // Capture epoch manager for use inside the closure
             let epoch_manager = inner_ctx.epoch_secret_manager().clone();
 
-            inner_ctx.with_group(&gid, |group, provider, _signer| {
+            let result = inner_ctx.with_group(&gid, |group, provider, _signer| {
                 let epoch_before = group.epoch().as_u64();
                 crate::debug_log!("[MLS-FFI-ASYNC] 🔐 Current epoch: {}", epoch_before);
 
@@ -1997,12 +2354,16 @@ impl MLSContext {
                     )));
                 }
 
-                let processed = group
-                    .process_message(provider, protocol_msg)
-                    .map_err(|e| {
-                        crate::error_log!("[MLS-FFI-ASYNC] ERROR: process_message failed: {:?}", e);
-                        MLSError::DecryptionFailed
-                    })?;
+                let processed = process_protocol_message(
+                    group,
+                    provider,
+                    protocol_msg,
+                    "MLS-FFI-ASYNC",
+                )
+                .map_err(|e| {
+                    crate::error_log!("[MLS-FFI-ASYNC] ERROR: process_message failed: {:?}", e);
+                    MLSError::DecryptionFailed
+                })?;
 
                 let sender_credential = processed.credential();
                 let sender = CredentialData {
@@ -2084,32 +2445,60 @@ impl MLSContext {
                         Err(MLSError::invalid_input("External join proposals not supported"))
                     },
                     ProcessedMessageContent::StagedCommitMessage(staged) => {
-                        // CRITICAL FIX: Auto-merge staged commits from other members (same as sync variant)
                         crate::info_log!("[MLS-FFI-ASYNC] 📦 Staged commit received, auto-merging...");
-                        
+
+                        // Metadata: derive the new epoch's metadata key from the staged
+                        // commit's exporter BEFORE merge consumes the StagedCommit.
+                        let new_epoch = staged.group_context().epoch().as_u64();
+                        let metadata_key_bytes = match crate::metadata::derive_metadata_key(
+                            &staged,
+                            provider.crypto(),
+                            &group_id,
+                            new_epoch,
+                        ) {
+                            Ok(key) => {
+                                crate::info_log!("[MLS-FFI-ASYNC] 🔑 metadata key derived for epoch {}", new_epoch);
+                                Some(key.to_vec())
+                            }
+                            Err(e) => {
+                                crate::warn_log!("[MLS-FFI-ASYNC] ⚠️ metadata key derivation failed: {:?}", e);
+                                None
+                            }
+                        };
+
                         // Export current epoch secret before merging
                         if let Err(e) = crate::async_runtime::block_on(
                             epoch_manager.export_current_epoch_secret(group, provider)
                         ) {
                             crate::warn_log!("[MLS-FFI-ASYNC] ⚠️ Failed to export epoch secret before merge: {:?}", e);
                         }
-                        
+
                         let epoch_before = group.epoch().as_u64();
-                        
-                        // Merge the staged commit to advance the epoch
+
                         group.merge_staged_commit(provider, *staged)
                             .map_err(|e| {
                                 crate::error_log!("[MLS-FFI-ASYNC] ❌ Failed to merge staged commit: {:?}", e);
                                 MLSError::MergeFailed
                             })?;
-                        
+
                         let epoch_after = group.epoch().as_u64();
                         crate::info_log!("[MLS-FFI-ASYNC] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
-                        
-                        Ok(ProcessedContent::StagedCommit { new_epoch: epoch_after })
+                        let metadata_reference_json = current_metadata_reference_json(group);
+                        let metadata_info = metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
+                            metadata_key,
+                            epoch: epoch_after,
+                            metadata_reference_json,
+                        });
+
+                        Ok(ProcessedContent::StagedCommit {
+                            new_epoch: epoch_after,
+                            commit_metadata: metadata_info,
+                        })
                     },
                 }
-            })
+            });
+
+            result
         })
         .await
         .map_err(|e| {
@@ -2122,6 +2511,9 @@ impl MLSContext {
         &self,
         identity_bytes: Vec<u8>,
     ) -> Result<KeyPackageResult, MLSError> {
+        // Early bail-out if suspension is in progress (0xdead10cc prevention).
+        self.check_suspended()?;
+
         let mut guard = self
             .inner
             .lock()
@@ -2211,8 +2603,10 @@ impl MLSContext {
         let capabilities = Capabilities::builder()
             .extensions(vec![
                 ExtensionType::RatchetTree,
+                ExtensionType::AppDataDictionary,
                 ExtensionType::Unknown(crate::group_metadata::CATBIRD_METADATA_EXTENSION_TYPE),
             ])
+            .proposals(vec![ProposalType::AppDataUpdate])
             .build();
 
         let key_package_bundle = KeyPackage::builder()
@@ -2289,7 +2683,8 @@ impl MLSContext {
         // Add or update this bundle
         bundles_map.insert(hex_ref.clone(), bundle_b64);
 
-        // Write updated map back to storage
+        // Write updated map back to storage (bail if app is suspending — 0xdead10cc prevention)
+        self.check_suspended()?;
         storage.write_manifest("key_package_bundles", &bundles_map)?;
 
         crate::debug_log!(
@@ -2300,6 +2695,7 @@ impl MLSContext {
         // 🔒 CRITICAL FIX: Force database flush after key package bundle creation
         // Without this, SQLite WAL entries may not be checkpointed to the main database file,
         // causing NoMatchingKeyPackage errors after app restart when bundles are lost.
+        self.check_suspended()?;
         inner.flush_database().map_err(|e| {
             crate::error_log!(
                 "[MLS-FFI] ⚠️ WARNING: Failed to flush database after bundle creation: {:?}",
@@ -2314,6 +2710,7 @@ impl MLSContext {
         Ok(KeyPackageResult {
             key_package_data,
             hash_ref,
+            signature_public_key: signer_public_key,
         })
     }
 
@@ -2323,6 +2720,7 @@ impl MLSContext {
         identity_bytes: Vec<u8>,
         config: Option<GroupConfig>,
     ) -> Result<WelcomeResult, MLSError> {
+        self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] process_welcome: Starting with {} byte Welcome message",
             welcome_bytes.len()
@@ -2575,6 +2973,7 @@ impl MLSContext {
         // 🔒 CRITICAL FIX: Force database flush to ensure secret tree state is durably persisted
         // Without this, SQLite WAL entries may not be checkpointed to the main database file,
         // causing SecretReuseError after app restart when the group state is incomplete.
+        self.check_suspended()?;
         crate::info_log!("[MLS-FFI] process_welcome: Flushing database to ensure persistence...");
         inner.flush_database().map_err(|e| {
             crate::error_log!(
@@ -2636,6 +3035,39 @@ impl MLSContext {
         })
     }
 
+    /// Get the MLS confirmation tag for a group.
+    /// Returns the TLS-serialized confirmation tag bytes from storage.
+    pub fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        crate::debug_log!(
+            "[MLS-FFI] get_confirmation_tag: {}",
+            hex::encode(&group_id)
+        );
+
+        let guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group_ref(&gid, |_group, provider| {
+            let tag: Option<ConfirmationTag> = provider
+                .storage()
+                .confirmation_tag(&gid)
+                .map_err(|_| MLSError::StorageError)?;
+            match tag {
+                Some(t) => {
+                    let bytes = t.tls_serialize_detached()
+                        .map_err(|e| MLSError::Internal(format!("TLS serialize: {}", e)))?;
+                    crate::debug_log!("[MLS-FFI] Confirmation tag: {} bytes", bytes.len());
+                    Ok(bytes)
+                }
+                None => Err(MLSError::Internal("No confirmation tag found".to_string())),
+            }
+        })
+    }
+
     /// Read encrypted group metadata from MLS group context.
     /// Returns JSON bytes of the metadata, or empty vec if none set.
     pub fn get_group_metadata(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
@@ -2661,6 +3093,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         metadata_json: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError> {
+        self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] update_group_metadata: {}",
             hex::encode(&group_id)
@@ -2678,6 +3111,7 @@ impl MLSContext {
 
         let commit_bytes = inner.update_group_metadata(&group_id, metadata)?;
 
+        self.check_suspended()?;
         inner.flush_database().map_err(|e| {
             crate::error_log!("[MLS-FFI] Failed to flush after metadata update: {:?}", e);
             e
@@ -2720,6 +3154,7 @@ impl MLSContext {
     /// Call this after creating the conversation record in SQLCipher to ensure
     /// the foreign key constraint is satisfied when storing the epoch secret
     pub fn export_epoch_secret(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        self.check_suspended()?;
         crate::info_log!("[MLS-FFI] export_epoch_secret: Manually exporting epoch secret");
         crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
 
@@ -2750,11 +3185,81 @@ impl MLSContext {
         })
     }
 
+    /// Derive the current metadata key for an already-joined group.
+    ///
+    /// Call this immediately after joining a group via Welcome or External Commit
+    /// to bootstrap metadata decryption without waiting for a subsequent commit.
+    /// Returns `None` if the group is not found or key derivation fails.
+    pub fn get_current_metadata(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Option<CurrentMetadataInfo>, MLSError> {
+        let group_id_hex = hex::encode(&group_id);
+        crate::info_log!(
+            "[MLS-FFI] get_current_metadata: Deriving metadata key for group {}",
+            &group_id_hex[..std::cmp::min(16, group_id_hex.len())]
+        );
+
+        let guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        match inner.with_group_ref(&gid, |group, provider| {
+            let epoch = group.epoch().as_u64();
+            let metadata_reference_json = current_metadata_reference_json(group);
+            if metadata_reference_json.is_none() {
+                crate::info_log!(
+                    "[MLS-FFI] No metadata reference found in AppDataDictionary for epoch {} — returning key without reference",
+                    epoch
+                );
+            }
+
+            let key = crate::metadata::derive_metadata_key_from_group(
+                group,
+                provider.crypto(),
+                &group_id,
+                epoch,
+            )
+            .map_err(|e| {
+                crate::error_log!(
+                    "[MLS-FFI] ❌ Failed to derive metadata key at epoch {}: {:?}",
+                    epoch,
+                    e
+                );
+                MLSError::StorageFailed
+            })?;
+
+            crate::info_log!(
+                "[MLS-FFI] ✅ Derived metadata key for epoch {}",
+                epoch
+            );
+
+            Ok(Some(CurrentMetadataInfo {
+                metadata_key: key.to_vec(),
+                epoch,
+                metadata_reference_json,
+            }))
+        }) {
+            Ok(Some(info)) => Ok(Some(info)),
+            Ok(None) => Ok(None),
+            Err(MLSError::GroupNotFound { .. }) => {
+                crate::info_log!("[MLS-FFI] Group not found — returning None");
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn process_commit(
         &self,
         group_id: Vec<u8>,
         commit_data: Vec<u8>,
     ) -> Result<ProcessCommitResult, MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -2767,7 +3272,7 @@ impl MLSContext {
         let epoch_manager = inner.epoch_secret_manager().clone();
 
         // Process commit as a message and extract all proposals (Update, Add, Remove)
-        let (update_proposals, add_proposals, remove_proposals) =
+        let (update_proposals, add_proposals, remove_proposals, metadata_info) =
             inner.with_group(&gid, |group, provider, _signer| {
                 let (mls_msg, _) =
                     MlsMessageIn::tls_deserialize_bytes(&commit_data).map_err(|e| {
@@ -2786,7 +3291,13 @@ impl MLSContext {
                     MLSError::CommitProcessingFailed
                 })?;
 
-                let processed = group.process_message(provider, protocol_msg).map_err(|e| {
+                let processed = process_protocol_message(
+                    group,
+                    provider,
+                    protocol_msg,
+                    "PROCESS-COMMIT",
+                )
+                .map_err(|e| {
                     crate::error_log!(
                         "[MLS-FFI] ❌ process_commit: OpenMLS process_message error: {:?}",
                         e
@@ -2880,6 +3391,31 @@ impl MLSContext {
                             })
                             .collect();
 
+                        // Metadata: derive the new epoch's metadata key from the staged
+                        // commit's exporter BEFORE merge consumes the StagedCommit.
+                        let new_epoch_from_staged = staged.group_context().epoch().as_u64();
+                        let metadata_key_bytes = match crate::metadata::derive_metadata_key(
+                            &staged,
+                            provider.crypto(),
+                            &group_id,
+                            new_epoch_from_staged,
+                        ) {
+                            Ok(key) => {
+                                crate::info_log!(
+                                    "[MLS-FFI] 🔑 process_commit: metadata key derived for epoch {}",
+                                    new_epoch_from_staged
+                                );
+                                Some(key.to_vec())
+                            }
+                            Err(e) => {
+                                crate::warn_log!(
+                                    "[MLS-FFI] ⚠️ process_commit: metadata key derivation failed: {:?}",
+                                    e
+                                );
+                                None
+                            }
+                        };
+
                         // CRITICAL: Auto-merge the staged commit to advance the epoch.
                         // The StagedCommit is consumed here — if we don't merge it now, it's
                         // dropped and the caller's merge_staged_commit/merge_pending_commit
@@ -2908,8 +3444,15 @@ impl MLSContext {
                             epoch_before,
                             epoch_after
                         );
+                        let metadata_reference_json = current_metadata_reference_json(group);
+                        let metadata_derived =
+                            metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
+                                metadata_key,
+                                epoch: epoch_after,
+                                metadata_reference_json,
+                            });
 
-                        Ok((updates, adds, removes))
+                        Ok((updates, adds, removes, metadata_derived))
                     }
                     _ => Err(MLSError::InvalidCommit),
                 }
@@ -2920,6 +3463,7 @@ impl MLSContext {
             inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))?;
 
         // Flush database to persist the new epoch state
+        self.check_suspended()?;
         inner.flush_database().map_err(|e| {
             crate::error_log!(
                 "[MLS-FFI] ⚠️ process_commit: Failed to flush database: {:?}",
@@ -2934,6 +3478,7 @@ impl MLSContext {
             update_proposals,
             add_proposals,
             remove_proposals,
+            commit_metadata: metadata_info,
         })
     }
 
@@ -2941,6 +3486,7 @@ impl MLSContext {
     /// This should be called when a commit is rejected by the delivery service
     /// to clean up pending state in OpenMLS
     pub fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -2964,6 +3510,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         _proposal_ref: ProposalRef,
     ) -> Result<(), MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -3035,6 +3582,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         proposal_ref: ProposalRef,
     ) -> Result<(), MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -3059,6 +3607,7 @@ impl MLSContext {
 
     /// Commit all pending proposals that have been validated and stored
     pub fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -3068,10 +3617,43 @@ impl MLSContext {
         let gid = GroupId::from_slice(&group_id);
 
         inner.with_group(&gid, |group, provider, signer| {
-            // Commit all pending proposals
-            let (commit_msg, _welcome, _group_info) = group
-                .commit_to_pending_proposals(provider, signer)
+            let planned_reference_json = crate::metadata::planned_metadata_reference_json(
+                crate::metadata::current_metadata_reference(group).as_ref(),
+                crate::metadata::metadata_payload_from_group(group).is_some(),
+                false,
+            )
+            .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
+
+            let mut commit_builder = group.commit_builder().consume_proposal_store(true);
+            if let Some(ref_json) = planned_reference_json.clone() {
+                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json,
+                    ),
+                )));
+            }
+
+            let mut commit_stage = commit_builder
+                .load_psks(provider.storage())
                 .map_err(|_| MLSError::OpenMLSError)?;
+
+            if let Some(ref_json) = planned_reference_json {
+                let mut updater = commit_stage.app_data_dictionary_updater();
+                updater.set(ComponentData::from_parts(
+                    crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                    ref_json.into(),
+                ));
+                commit_stage.with_app_data_dictionary_updates(updater.changes());
+            }
+
+            let commit_bundle = commit_stage
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
+                .map_err(|_| MLSError::OpenMLSError)?
+                .stage_commit(provider)
+                .map_err(|_| MLSError::OpenMLSError)?;
+
+            let (commit_msg, _welcome, _group_info) = commit_bundle.into_contents();
 
             // Merge the pending commit
             group
@@ -3089,7 +3671,11 @@ impl MLSContext {
 
     /// Merge a pending commit after validation
     /// This should be called after the commit has been accepted by the delivery service
-    pub fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
+    pub fn merge_pending_commit(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<MergePendingCommitResult, MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -3151,12 +3737,52 @@ impl MLSContext {
             Ok(epoch_after)
         })?;
 
+        let (new_epoch, commit_metadata) = inner.with_group(&gid, |group, provider, _signer| {
+            let epoch = group.epoch().as_u64();
+
+            // Metadata (sender-side): derive the metadata key for the new epoch
+            // from the group's exporter after merge. The group is now at the new epoch,
+            // so export_secret gives the same key that receivers will derive from
+            // their staged commits.
+            let mut context = Vec::with_capacity(group_id.len() + 8);
+            context.extend_from_slice(&group_id);
+            context.extend_from_slice(&epoch.to_be_bytes());
+
+            let metadata_info = match group.export_secret(
+                provider.crypto(),
+                "blue.catbird/group-metadata/v1",
+                &context,
+                32,
+            ) {
+                Ok(secret) => {
+                    crate::info_log!(
+                        "[MLS-FFI] 🔑 merge_pending_commit: metadata key derived for epoch {}",
+                        epoch
+                    );
+                    Some(CommitMetadataInfo {
+                        metadata_key: secret,
+                        epoch,
+                        metadata_reference_json: current_metadata_reference_json(group),
+                    })
+                }
+                Err(e) => {
+                    crate::warn_log!(
+                        "[MLS-FFI] ⚠️ merge_pending_commit: metadata key derivation failed: {:?}",
+                        e
+                    );
+                    None
+                }
+            };
+
+            Ok((epoch, metadata_info))
+        })?;
+
         // Cleanup old epoch secrets for forward secrecy
         // We retain the last 5 epochs to handle delayed messages/reordering
         let retention_epochs = 5u64;
         if let Err(e) = crate::async_runtime::block_on(epoch_manager.cleanup_old_epochs(
             gid.as_slice(),
-            inner.with_group_ref(&gid, |g, _| Ok(g.epoch().as_u64()))?,
+            new_epoch,
             retention_epochs,
         )) {
             crate::warn_log!("[MLS-FFI] ⚠️ Failed to cleanup old epochs: {:?}", e);
@@ -3165,6 +3791,7 @@ impl MLSContext {
 
         // 🔒 CRITICAL: Force database flush after commit merge
         // Epoch advancement creates new secret tree state that must be persisted
+        self.check_suspended()?;
         inner.flush_database().map_err(|e| {
             crate::error_log!(
                 "[MLS-FFI] ⚠️ WARNING: Failed to flush database after commit merge: {:?}",
@@ -3177,15 +3804,17 @@ impl MLSContext {
         inner.maybe_truncate_checkpoint();
         crate::debug_log!("[MLS-FFI] ✅ Database flushed after commit merge");
 
-        // Return the epoch (already captured from the with_group_variant closure)
-        inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))
+        Ok(MergePendingCommitResult {
+            new_epoch,
+            commit_metadata,
+        })
     }
 
     /// Merge a staged commit after validation
     /// This should be called after validating incoming commits from other members
     pub fn merge_staged_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
         // OpenMLS uses the same internal method for both pending and staged commits
-        self.merge_pending_commit(group_id)
+        self.merge_pending_commit(group_id).map(|r| r.new_epoch)
     }
 
     /// Check if a group exists in local storage
@@ -3347,6 +3976,7 @@ impl MLSContext {
     /// - Returns: Group ID of the imported group
     /// - Throws: MLSError if deserialization fails
     pub fn import_group_state(&self, state_bytes: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.check_suspended()?;
         crate::debug_log!(
             "[MLS-FFI] import_group_state: Starting with {} bytes",
             state_bytes.len()
@@ -3474,6 +4104,7 @@ impl MLSContext {
     /// - Returns: Number of bundles successfully deleted
     /// - Throws: MLSError if storage operation fails
     pub fn delete_key_package_bundles(&self, hash_refs: Vec<Vec<u8>>) -> Result<u64, MLSError> {
+        self.check_suspended()?;
         let mut guard = self
             .inner
             .lock()
@@ -3530,11 +4161,13 @@ impl MLSContext {
             }
         }
 
-        // Write updated map back to storage
+        // Write updated map back to storage (bail if app is suspending — 0xdead10cc prevention)
+        self.check_suspended()?;
         storage.write_manifest("key_package_bundles", &bundles_map)?;
 
         // 🔒 CRITICAL FIX: Force database flush after bundle deletion
         // Ensures deleted bundles are not restored from WAL after app restart
+        self.check_suspended()?;
         inner.flush_database().map_err(|e| {
             crate::error_log!(
                 "[MLS-FFI] ⚠️ WARNING: Failed to flush database after bundle deletion: {:?}",
@@ -3568,6 +4201,7 @@ impl MLSContext {
     /// - Returns: Nothing on success
     /// - Throws: MLSError if flush fails
     pub fn flush_storage(&self) -> Result<(), MLSError> {
+        self.check_suspended()?;
         let guard = self
             .inner
             .lock()
@@ -3675,6 +4309,7 @@ impl MLSContext {
     /// - Returns: Ok(()) on success
     /// - Throws: MLSError if flush fails
     pub fn sync_database(&self) -> Result<(), MLSError> {
+        self.check_suspended()?;
         crate::info_log!("[MLS-FFI] sync_database: Forcing WAL checkpoint for durability");
 
         let guard = self
@@ -4052,7 +4687,7 @@ impl MlsCryptoContext for MLSContext {
     }
 
     fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
-        self.merge_pending_commit(group_id)
+        self.merge_pending_commit(group_id).map(|r| r.new_epoch)
     }
 
     fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
@@ -4061,6 +4696,10 @@ impl MlsCryptoContext for MLSContext {
 
     fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
         self.get_epoch(group_id)
+    }
+
+    fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.get_confirmation_tag(group_id)
     }
 
     fn export_group_info(
@@ -4123,6 +4762,111 @@ impl MlsCryptoContext for MLSContext {
     ) -> Result<WelcomeResult, MLSError> {
         self.process_welcome(welcome_data, identity, config)
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Metadata blob encryption / decryption (ChaCha20-Poly1305)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Encrypt a group metadata JSON blob using ChaCha20-Poly1305.
+///
+/// - `key`: 32-byte symmetric key derived from the MLS epoch exporter.
+/// - `group_id_hex`: Hex-encoded MLS group ID (used in AAD construction).
+/// - `epoch`: MLS epoch number (used in AAD construction).
+/// - `metadata_version`: Monotonic metadata version counter (used in AAD).
+/// - `metadata_json`: JSON-encoded `GroupMetadataV1` payload.
+///
+/// Returns the encrypted blob: `nonce (12) || ciphertext || tag (16)`.
+#[uniffi::export]
+pub fn mls_encrypt_metadata_blob(
+    key: Vec<u8>,
+    group_id_hex: String,
+    epoch: u64,
+    metadata_version: u64,
+    metadata_json: Vec<u8>,
+) -> Result<Vec<u8>, MLSError> {
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| MLSError::invalid_input("metadata key must be 32 bytes"))?;
+    let group_id =
+        hex::decode(&group_id_hex).map_err(|e| MLSError::invalid_input(format!("{e}")))?;
+    let metadata: crate::metadata::GroupMetadataV1 = serde_json::from_slice(&metadata_json)?;
+    crate::metadata::encrypt_metadata_blob(&key, &group_id, epoch, metadata_version, &metadata)
+        .map_err(|e| MLSError::Internal(format!("{e}")))
+}
+
+/// Decrypt a group metadata blob back into JSON.
+///
+/// - `key`: 32-byte symmetric key derived from the MLS epoch exporter.
+/// - `group_id_hex`: Hex-encoded MLS group ID (used in AAD construction).
+/// - `epoch`: MLS epoch number (used in AAD construction).
+/// - `metadata_version`: Monotonic metadata version counter (used in AAD).
+/// - `ciphertext`: Encrypted blob: `nonce (12) || ciphertext || tag (16)`.
+///
+/// Returns JSON-encoded `GroupMetadataV1`.
+#[uniffi::export]
+pub fn mls_decrypt_metadata_blob(
+    key: Vec<u8>,
+    group_id_hex: String,
+    epoch: u64,
+    metadata_version: u64,
+    ciphertext: Vec<u8>,
+) -> Result<Vec<u8>, MLSError> {
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| MLSError::invalid_input("metadata key must be 32 bytes"))?;
+    let group_id =
+        hex::decode(&group_id_hex).map_err(|e| MLSError::invalid_input(format!("{e}")))?;
+    let metadata = crate::metadata::decrypt_metadata_blob(
+        &key,
+        &group_id,
+        epoch,
+        metadata_version,
+        &ciphertext,
+    )
+    .map_err(|e| MLSError::Internal(format!("{e}")))?;
+    serde_json::to_vec(&metadata).map_err(MLSError::from)
+}
+
+/// Encrypt raw avatar image bytes using ChaCha20-Poly1305.
+///
+/// Uses domain-separated AAD (appends `b"avatar"`) to prevent confusion
+/// with metadata blobs encrypted under the same key.
+#[uniffi::export]
+pub fn mls_encrypt_avatar_blob(
+    key: Vec<u8>,
+    group_id_hex: String,
+    epoch: u64,
+    metadata_version: u64,
+    avatar_bytes: Vec<u8>,
+) -> Result<Vec<u8>, MLSError> {
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| MLSError::invalid_input("metadata key must be 32 bytes"))?;
+    let group_id =
+        hex::decode(&group_id_hex).map_err(|e| MLSError::invalid_input(format!("{e}")))?;
+    crate::metadata::encrypt_avatar_blob(&key, &group_id, epoch, metadata_version, &avatar_bytes)
+        .map_err(|e| MLSError::Internal(format!("{e}")))
+}
+
+/// Decrypt an avatar blob back into raw image bytes.
+///
+/// Uses domain-separated AAD (appends `b"avatar"`).
+#[uniffi::export]
+pub fn mls_decrypt_avatar_blob(
+    key: Vec<u8>,
+    group_id_hex: String,
+    epoch: u64,
+    metadata_version: u64,
+    ciphertext: Vec<u8>,
+) -> Result<Vec<u8>, MLSError> {
+    let key: [u8; 32] = key
+        .try_into()
+        .map_err(|_| MLSError::invalid_input("metadata key must be 32 bytes"))?;
+    let group_id =
+        hex::decode(&group_id_hex).map_err(|e| MLSError::invalid_input(format!("{e}")))?;
+    crate::metadata::decrypt_avatar_blob(&key, &group_id, epoch, metadata_version, &ciphertext)
+        .map_err(|e| MLSError::Internal(format!("{e}")))
 }
 
 #[cfg(test)]

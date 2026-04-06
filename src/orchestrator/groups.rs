@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use web_time::Instant;
 
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
@@ -65,34 +66,48 @@ where
             .await
             .insert(group_id_hex.clone());
 
-        // Ensure cleanup on any exit path
-        let gid_for_cleanup = group_id_hex.clone();
-        let groups_being_created = self.groups_being_created();
-        let _guard = scopeguard::guard((), move |_| {
-            // Note: synchronous cleanup - can't await here
-            // The lock will be cleaned up when the mutex is next acquired
-            let _ = (&groups_being_created, &gid_for_cleanup);
-        });
-
         // Create local conversation record
+        let create_result = self
+            .create_group_inner(&user_did, &group_id_hex, filtered_members_ref)
+            .await;
+
+        // On any failure, clean up the local MLS group and remove from being-created set
+        if create_result.is_err() {
+            tracing::warn!(group_id = %group_id_hex, "Cleaning up local MLS group after create_group failure");
+            self.force_delete_local(&group_id_hex).await;
+            self.groups_being_created()
+                .lock()
+                .await
+                .remove(&group_id_hex);
+            return create_result;
+        }
+
+        create_result
+    }
+
+    /// Inner implementation of create_group, separated so the outer method can
+    /// handle rollback on any error path.
+    async fn create_group_inner(
+        &self,
+        user_did: &str,
+        group_id_hex: &str,
+        filtered_members_ref: Option<&[String]>,
+    ) -> Result<ConversationView> {
+        let group_id_bytes = hex::decode(group_id_hex)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+
         self.storage()
-            .ensure_conversation_exists(&user_did, &group_id_hex, &group_id_hex)
+            .ensure_conversation_exists(user_did, group_id_hex, group_id_hex)
             .await?;
 
         self.storage()
-            .update_join_info(&group_id_hex, &user_did, JoinMethod::Creator, 0)
+            .update_join_info(group_id_hex, user_did, JoinMethod::Creator, 0)
             .await?;
 
         // Create conversation on server (metadata is encrypted in MLS extensions, not sent as plaintext)
         let result = self
             .api_client()
-            .create_conversation(
-                &group_id_hex,
-                filtered_members_ref,
-                None,
-                None,
-                None,
-            )
+            .create_conversation(group_id_hex, filtered_members_ref, None, None, None)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Server creation failed");
@@ -105,7 +120,7 @@ where
         self.conversations()
             .lock()
             .await
-            .insert(group_id_hex.clone(), convo.clone());
+            .insert(group_id_hex.to_string(), convo.clone());
 
         // If initial members were provided, add them via proper MLS add_members
         // This generates the commit + Welcome messages needed for them to join
@@ -146,7 +161,7 @@ where
 
                 let add_result = self
                     .mls_context()
-                    .add_members(creation_result.group_id.clone(), kp_data)
+                    .add_members(group_id_bytes.clone(), kp_data)
                     .map_err(|e| {
                         tracing::error!(error = %e, "MLS add_members failed — key package validation or crypto error");
                         e
@@ -154,15 +169,19 @@ where
 
                 // Track own commit
                 {
+                    self.evict_stale_commits().await;
                     let hash = Sha256::digest(&add_result.commit_data);
-                    self.own_commits().lock().await.insert(hash.to_vec());
+                    self.own_commits()
+                        .lock()
+                        .await
+                        .insert(hash.to_vec(), Instant::now());
                 }
 
                 // Send commit + Welcome to server
                 let server_result = self
                     .api_client()
                     .add_members(
-                        &group_id_hex,
+                        group_id_hex,
                         &member_dids,
                         &add_result.commit_data,
                         Some(&add_result.welcome_data),
@@ -172,7 +191,7 @@ where
                 if !server_result.success {
                     if let Err(e) = self
                         .mls_context()
-                        .clear_pending_commit(creation_result.group_id.clone())
+                        .clear_pending_commit(group_id_bytes.clone())
                     {
                         tracing::warn!(error = %e, "Failed to clear pending commit after server rejection");
                     }
@@ -191,7 +210,7 @@ where
                 // Merge the pending commit to advance local epoch
                 let merged_epoch = self
                     .mls_context()
-                    .merge_pending_commit(creation_result.group_id.clone())?;
+                    .merge_pending_commit(group_id_bytes.clone())?;
 
                 // Update convo epoch
                 convo.epoch = merged_epoch;
@@ -204,37 +223,35 @@ where
         }
 
         // Get epoch from FFI (authoritative)
-        let ffi_epoch = self
-            .mls_context()
-            .get_epoch(creation_result.group_id.clone())?;
+        let ffi_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
 
         // Update group state
         let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
         let state = GroupState {
-            group_id: group_id_hex.clone(),
-            conversation_id: group_id_hex.clone(),
+            group_id: group_id_hex.to_string(),
+            conversation_id: group_id_hex.to_string(),
             epoch: ffi_epoch,
             members,
         };
         self.group_states()
             .lock()
             .await
-            .insert(group_id_hex.clone(), state.clone());
+            .insert(group_id_hex.to_string(), state.clone());
         self.storage().set_group_state(&state).await?;
 
         // Mark conversation as active
         self.conversation_states()
             .lock()
             .await
-            .insert(group_id_hex.clone(), ConversationState::Active);
+            .insert(group_id_hex.to_string(), ConversationState::Active);
 
         // Publish GroupInfo for external joins
         let group_info = self
             .mls_context()
-            .export_group_info(creation_result.group_id.clone(), user_did.into_bytes())?;
+            .export_group_info(group_id_bytes, user_did.as_bytes().to_vec())?;
         if let Err(e) = self
             .api_client()
-            .publish_group_info(&group_id_hex, &group_info)
+            .publish_group_info(group_id_hex, &group_info)
             .await
         {
             tracing::warn!(error = %e, "Failed to publish GroupInfo (external joins won't work)");
@@ -244,7 +261,7 @@ where
         self.groups_being_created()
             .lock()
             .await
-            .remove(&group_id_hex);
+            .remove(group_id_hex);
 
         tracing::info!(group_id = %group_id_hex, epoch = ffi_epoch, "Group creation complete");
         Ok(convo)
@@ -304,6 +321,33 @@ where
             .update_join_info(&group_id_hex, &user_did, JoinMethod::Welcome, ffi_epoch)
             .await?;
 
+        // Insert history boundary marker for Welcome joins.
+        // On iOS, Swift inserts first — message_exists prevents duplicates.
+        let marker_id = format!("hb-{}-{}", group_id_hex, ffi_epoch);
+        if !self
+            .storage()
+            .message_exists(&marker_id)
+            .await
+            .unwrap_or(true)
+        {
+            let payload = MLSMessagePayload::system("history_boundary.new_member");
+            let marker = Message {
+                id: marker_id,
+                conversation_id: group_id_hex.clone(),
+                sender_did: user_did.clone(),
+                text: "history_boundary.new_member".to_string(),
+                timestamp: chrono::Utc::now(),
+                epoch: ffi_epoch,
+                sequence_number: 0,
+                is_own: true,
+                delivery_status: None,
+                payload_json: serde_json::to_string(&payload).ok(),
+            };
+            if let Err(e) = self.storage().store_message(&marker).await {
+                tracing::warn!(error = %e, "Failed to store history boundary marker");
+            }
+        }
+
         Ok(convo)
     }
 
@@ -336,8 +380,12 @@ where
 
         // Track own commit
         {
+            self.evict_stale_commits().await;
             let hash = Sha256::digest(&add_result.commit_data);
-            self.own_commits().lock().await.insert(hash.to_vec());
+            self.own_commits()
+                .lock()
+                .await
+                .insert(hash.to_vec(), Instant::now());
         }
 
         // Send to server
@@ -372,9 +420,25 @@ where
         // Merge pending commit if server advanced epoch
         let current_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         if server_result.new_epoch > current_epoch {
-            let merged_epoch = self
+            let merged_epoch = match self
                 .mls_context()
-                .merge_pending_commit(group_id_bytes.clone())?;
+                .merge_pending_commit(group_id_bytes.clone())
+            {
+                Ok(epoch) => epoch,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        group_id,
+                        server_epoch = server_result.new_epoch,
+                        local_epoch = current_epoch,
+                        "CRITICAL: merge_pending_commit failed after server accepted add_members commit — local state is behind server"
+                    );
+                    if let Err(storage_err) = self.storage().mark_needs_rejoin(group_id).await {
+                        tracing::warn!(error = %storage_err, group_id, "Failed to mark group for rejoin");
+                    }
+                    return Err(e.into());
+                }
+            };
 
             {
                 let mut states = self.group_states().lock().await;
@@ -389,6 +453,38 @@ where
                     drop(states);
                     if let Err(e) = self.storage().set_group_state(&state_clone).await {
                         tracing::warn!(error = %e, group_id, "Failed to persist group state after add_members");
+                    }
+                }
+            }
+        } else {
+            // Server reported success but epoch didn't advance (new_epoch == 0 or == current_epoch).
+            // Clear the pending commit so it doesn't leak and block future operations.
+            tracing::warn!(
+                group_id,
+                server_epoch = server_result.new_epoch,
+                local_epoch = current_epoch,
+                "Server accepted add_members but epoch did not advance — clearing pending commit"
+            );
+            if let Err(e) = self
+                .mls_context()
+                .clear_pending_commit(group_id_bytes.clone())
+            {
+                tracing::warn!(error = %e, group_id, "Failed to clear leaked pending commit after no-advance add_members");
+            }
+
+            // Still update the member list in group state
+            {
+                let mut states = self.group_states().lock().await;
+                if let Some(gs) = states.get_mut(group_id) {
+                    for did in member_dids {
+                        if !gs.members.contains(did) {
+                            gs.members.push(did.clone());
+                        }
+                    }
+                    let state_clone = gs.clone();
+                    drop(states);
+                    if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                        tracing::warn!(error = %e, group_id, "Failed to persist group state after no-advance add_members");
                     }
                 }
             }
@@ -436,8 +532,12 @@ where
 
         // Track own commit
         {
+            self.evict_stale_commits().await;
             let hash = Sha256::digest(&commit_data);
-            self.own_commits().lock().await.insert(hash.to_vec());
+            self.own_commits()
+                .lock()
+                .await
+                .insert(hash.to_vec(), Instant::now());
         }
 
         // Send to server
@@ -445,10 +545,25 @@ where
             .remove_members(group_id, member_dids, &commit_data)
             .await?;
 
-        // Merge pending commit
-        let merged_epoch = self
+        // Merge pending commit — server has already advanced the epoch, so if this
+        // fails the local state is behind the server and needs a rejoin.
+        let merged_epoch = match self
             .mls_context()
-            .merge_pending_commit(group_id_bytes.clone())?;
+            .merge_pending_commit(group_id_bytes.clone())
+        {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    group_id,
+                    "CRITICAL: merge_pending_commit failed after server accepted remove_members commit — local state is behind server"
+                );
+                if let Err(storage_err) = self.storage().mark_needs_rejoin(group_id).await {
+                    tracing::warn!(error = %storage_err, group_id, "Failed to mark group for rejoin");
+                }
+                return Err(e.into());
+            }
+        };
 
         {
             let mut states = self.group_states().lock().await;
@@ -532,14 +647,14 @@ where
             .update_group_metadata(group_id.clone(), metadata_json)?;
 
         // Send commit to server
+        // Note: confirmation_tag is None here because the pending commit hasn't been merged yet.
+        // The server extracts the tag from GroupInfo in the commit.
         self.api_client()
-            .commit_group_change(conversation_id, &commit_bytes, "updateMetadata")
+            .commit_group_change(conversation_id, &commit_bytes, "updateMetadata", None)
             .await?;
 
         // Merge pending commit locally
-        let merged_epoch = self
-            .mls_context()
-            .merge_pending_commit(group_id.clone())?;
+        let merged_epoch = self.mls_context().merge_pending_commit(group_id.clone())?;
 
         // Update group state cache
         {
@@ -566,7 +681,11 @@ where
             tracing::warn!(error = %e, conversation_id, "Failed to publish GroupInfo after metadata update");
         }
 
-        tracing::info!(conversation_id, epoch = merged_epoch, "Group metadata updated");
+        tracing::info!(
+            conversation_id,
+            epoch = merged_epoch,
+            "Group metadata updated"
+        );
         Ok(())
     }
 

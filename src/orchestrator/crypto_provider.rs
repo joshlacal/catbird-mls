@@ -40,6 +40,7 @@ pub struct CryptoDecryptResult {
 pub struct CryptoKeyPackageResult {
     pub key_package_data: Vec<u8>,
     pub hash_ref: Vec<u8>,
+    pub signature_public_key: Vec<u8>,
 }
 
 /// Result of an external commit (rejoin).
@@ -47,6 +48,7 @@ pub struct CryptoKeyPackageResult {
 pub struct CryptoExternalCommitResult {
     pub commit_data: Vec<u8>,
     pub group_id: Vec<u8>,
+    pub group_info: Option<Vec<u8>>,
 }
 
 /// Key package data for adding members.
@@ -89,6 +91,9 @@ pub trait MLSCryptoProvider: Send + Sync {
 
     /// Get the current epoch for a group.
     fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64>;
+
+    /// Get the TLS-serialized confirmation tag for a group.
+    fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>>;
 
     /// Process a Welcome message to join a group.
     fn process_welcome(

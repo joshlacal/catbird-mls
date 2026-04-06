@@ -70,7 +70,8 @@ impl KeychainAccess for InMemoryKeychain {
 pub struct TestClient {
     pub name: String,
     pub did: String,
-    pub orchestrator: MLSOrchestrator<MockStorage, MockDeliveryService, MockCredentials>,
+    pub orchestrator:
+        MLSOrchestrator<MockStorage, MockDeliveryService, MockCredentials, MLSContext>,
     pub storage: MockStorage,
     pub credentials: MockCredentials,
     /// Temp directory holding this client's MLS database; cleaned up on drop.

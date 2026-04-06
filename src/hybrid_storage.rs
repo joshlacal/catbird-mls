@@ -680,4 +680,43 @@ impl<C: Codec> StorageProvider<CURRENT_VERSION> for HybridStorageProvider<C> {
             .delete_psk(psk_id)
             .map_err(|_| MLSError::StorageError)
     }
+
+    // --- Application Export Tree (extensions-draft-08) ---
+
+    fn write_application_export_tree<
+        GroupId: traits::GroupId<CURRENT_VERSION>,
+        ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+        application_export_tree: &ApplicationExportTree,
+    ) -> Result<(), Self::Error> {
+        self.sqlite
+            .write_application_export_tree(group_id, application_export_tree)
+            .map_err(|_| MLSError::StorageError)
+    }
+
+    fn application_export_tree<
+        GroupId: traits::GroupId<CURRENT_VERSION>,
+        ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<ApplicationExportTree>, Self::Error> {
+        self.sqlite
+            .application_export_tree(group_id)
+            .map_err(|_| MLSError::StorageError)
+    }
+
+    fn delete_application_export_tree<
+        GroupId: traits::GroupId<CURRENT_VERSION>,
+        ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), Self::Error> {
+        self.sqlite
+            .delete_application_export_tree::<GroupId, ApplicationExportTree>(group_id)
+            .map_err(|_| MLSError::StorageError)
+    }
 }

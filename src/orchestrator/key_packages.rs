@@ -1,15 +1,17 @@
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::Result;
+use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
-impl<S, A, C> MLSOrchestrator<S, A, C>
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
     A: MLSAPIClient + 'static,
     C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
 {
     /// Publish a single key package to the server.
     ///
@@ -62,7 +64,13 @@ where
             return Ok(());
         }
 
-        let needed = self.config().target_key_package_count - stats.available;
+        let needed = self
+            .config()
+            .target_key_package_count
+            .saturating_sub(stats.available);
+        if needed == 0 {
+            return Ok(());
+        }
         tracing::info!(
             available = stats.available,
             needed,

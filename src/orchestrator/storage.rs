@@ -3,12 +3,25 @@ use async_trait::async_trait;
 use super::error::Result;
 use super::types::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MLSStorageBackendBounds: Send + Sync {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> MLSStorageBackendBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait MLSStorageBackendBounds {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> MLSStorageBackendBounds for T {}
+
 /// Platform-agnostic storage backend for MLS orchestration state.
 ///
 /// Implementations should persist data durably (e.g. SQLite, GRDB, Room).
 /// All methods are async to allow non-blocking I/O.
-#[async_trait]
-pub trait MLSStorageBackend: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait MLSStorageBackend: MLSStorageBackendBounds {
     // -- Conversations --
 
     /// Ensure a conversation record exists, creating it if needed.

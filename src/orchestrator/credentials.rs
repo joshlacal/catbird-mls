@@ -2,11 +2,24 @@ use async_trait::async_trait;
 
 use super::error::Result;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub trait CredentialStoreBounds: Send + Sync {}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send + Sync + ?Sized> CredentialStoreBounds for T {}
+
+#[cfg(target_arch = "wasm32")]
+pub trait CredentialStoreBounds {}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: ?Sized> CredentialStoreBounds for T {}
+
 /// Platform-agnostic credential/keychain access for MLS identity management.
 ///
 /// On iOS this wraps Keychain; on desktop it can use OS keyring or encrypted file.
-#[async_trait]
-pub trait CredentialStore: Send + Sync {
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+pub trait CredentialStore: CredentialStoreBounds {
     /// Store a signing key for a user DID.
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()>;
 

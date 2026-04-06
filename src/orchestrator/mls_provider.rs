@@ -46,6 +46,8 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError>;
 
+    fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
+
     fn export_group_info(
         &self,
         group_id: Vec<u8>,

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
+use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
@@ -69,11 +70,12 @@ impl Default for OrderingState {
     }
 }
 
-impl<S, A, C> MLSOrchestrator<S, A, C>
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
     A: MLSAPIClient + 'static,
     C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
 {
     // Ordering is handled at the message processing level in messaging.rs.
     // The OrderingState struct above can be embedded in the orchestrator

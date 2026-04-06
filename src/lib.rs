@@ -1,5 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
+pub mod blob_crypto;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
@@ -13,12 +14,14 @@ mod hybrid_storage;
 #[cfg(not(target_arch = "wasm32"))]
 mod keychain;
 pub mod logging;
+pub mod metadata;
 #[cfg(not(target_arch = "wasm32"))]
 mod mls_context;
 pub mod orchestrator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod orchestrator_bridge;
 mod types;
+pub mod voice;
 
 // ATProto serde helpers (standalone, no external dependency)
 pub mod atproto_bytes;

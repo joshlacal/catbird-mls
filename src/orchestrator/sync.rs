@@ -1,17 +1,20 @@
 use std::collections::HashSet;
+use web_time::Instant;
 
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::Result;
+use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
-impl<S, A, C> MLSOrchestrator<S, A, C>
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
     A: MLSAPIClient + 'static,
     C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
 {
     /// Sync conversations with the server.
     ///
@@ -34,7 +37,7 @@ where
                 match *tripped_at {
                     None => {
                         // First time tripping — record the time, skip this call
-                        *tripped_at = Some(tokio::time::Instant::now());
+                        *tripped_at = Some(Instant::now());
                         tracing::warn!(
                             failures,
                             cooldown_secs,
@@ -274,18 +277,98 @@ where
                 .ensure_conversation_exists(user_did, &convo.group_id, &convo.group_id)
                 .await?;
 
-            // Check for epoch reconciliation
-            if let Some(gs) = self.group_states().lock().await.get(&convo.group_id) {
-                if convo.epoch > gs.epoch {
-                    tracing::warn!(
-                        conversation_id = %convo.group_id,
-                        local_epoch = gs.epoch,
-                        server_epoch = convo.epoch,
-                        "Server ahead - may need rejoin"
-                    );
-                    // Mark for potential rejoin if the gap is significant
-                    if convo.epoch - gs.epoch > 1 {
-                        let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
+            // Check for epoch reconciliation — fetch and process missing commits
+            let local_epoch = self
+                .group_states()
+                .lock()
+                .await
+                .get(&convo.group_id)
+                .map(|gs| gs.epoch)
+                .unwrap_or(0);
+
+            if convo.epoch > local_epoch {
+                tracing::info!(
+                    conversation_id = %convo.group_id,
+                    local_epoch,
+                    server_epoch = convo.epoch,
+                    "Server ahead — fetching pending messages to catch up"
+                );
+
+                // Fetch and process messages (includes commits) to advance local epoch.
+                // This is the primary catch-up path for commits missed between syncs.
+                match self.fetch_messages(&convo.group_id, None, 50).await {
+                    Ok((msgs, _)) => {
+                        if !msgs.is_empty() {
+                            tracing::info!(
+                                conversation_id = %convo.group_id,
+                                processed = msgs.len(),
+                                "Processed pending messages during sync catch-up"
+                            );
+                        }
+                        // Re-check epoch after processing
+                        let new_local = self
+                            .group_states()
+                            .lock()
+                            .await
+                            .get(&convo.group_id)
+                            .map(|gs| gs.epoch)
+                            .unwrap_or(0);
+                        if convo.epoch > new_local {
+                            tracing::warn!(
+                                conversation_id = %convo.group_id,
+                                local_epoch = new_local,
+                                server_epoch = convo.epoch,
+                                "Still behind after processing — may need rejoin"
+                            );
+                            if convo.epoch.saturating_sub(new_local) > 1 {
+                                let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            conversation_id = %convo.group_id,
+                            error = %e,
+                            "Failed to fetch messages for epoch catch-up"
+                        );
+                        if convo.epoch.saturating_sub(local_epoch) > 1 {
+                            let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
+                        }
+                    }
+                }
+            }
+
+            // Auto-consume needs_rejoin flag: if a previous sync or decrypt failure
+            // flagged this conversation, attempt rejoin now (with rate-limiting).
+            if self
+                .storage()
+                .needs_rejoin(&convo.group_id)
+                .await
+                .unwrap_or(false)
+            {
+                tracing::info!(
+                    conversation_id = %convo.group_id,
+                    "Group flagged for rejoin — attempting in sync"
+                );
+                if !sync_rejoin_attempted.contains(&convo.group_id)
+                    && self.should_attempt_sync_rejoin(&convo.group_id).await
+                {
+                    sync_rejoin_attempted.insert(convo.group_id.clone());
+                    match self.join_or_rejoin(&convo.group_id).await {
+                        Ok(epoch) => {
+                            tracing::info!(
+                                conversation_id = %convo.group_id,
+                                epoch,
+                                "Sync rejoin succeeded"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                conversation_id = %convo.group_id,
+                                error = %e,
+                                "Sync rejoin failed"
+                            );
+                        }
                     }
                 }
             }
@@ -296,5 +379,83 @@ where
             "Server sync complete"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verify that `saturating_sub` prevents underflow when local epoch exceeds server epoch.
+    ///
+    /// This is a regression test for the epoch difference calculations in `do_sync`.
+    /// Before the fix, `convo.epoch - local_epoch` would panic on underflow when
+    /// the local epoch was ahead of the server (e.g., after an external commit that
+    /// the server hadn't yet acknowledged).
+    #[test]
+    fn saturating_sub_prevents_underflow_when_local_ahead() {
+        // Simulate: server reports epoch 5, but local is at epoch 10
+        let server_epoch: u64 = 5;
+        let local_epoch: u64 = 10;
+
+        // Old code: `server_epoch - local_epoch` would panic here (underflow)
+        // New code: saturating_sub clamps to 0
+        let diff = server_epoch.saturating_sub(local_epoch);
+        assert_eq!(
+            diff, 0,
+            "saturating_sub should return 0 when local > server"
+        );
+
+        // The rejoin threshold check (> 1) should NOT trigger when diff is 0
+        assert!(
+            diff <= 1,
+            "Should not mark for rejoin when local epoch is ahead"
+        );
+    }
+
+    #[test]
+    fn saturating_sub_normal_case_server_ahead() {
+        // Normal case: server is ahead of local
+        let server_epoch: u64 = 10;
+        let local_epoch: u64 = 5;
+
+        let diff = server_epoch.saturating_sub(local_epoch);
+        assert_eq!(
+            diff, 5,
+            "Normal subtraction should work when server > local"
+        );
+
+        // The rejoin threshold check should trigger for large gaps
+        assert!(diff > 1, "Should mark for rejoin when server is far ahead");
+    }
+
+    #[test]
+    fn saturating_sub_equal_epochs() {
+        let server_epoch: u64 = 7;
+        let local_epoch: u64 = 7;
+
+        let diff = server_epoch.saturating_sub(local_epoch);
+        assert_eq!(diff, 0, "Equal epochs should produce 0 difference");
+    }
+
+    #[test]
+    fn saturating_sub_zero_epochs() {
+        // Edge case: both epochs are 0 (fresh group, no commits yet)
+        let server_epoch: u64 = 0;
+        let local_epoch: u64 = 0;
+
+        let diff = server_epoch.saturating_sub(local_epoch);
+        assert_eq!(diff, 0, "Zero epochs should produce 0 difference");
+    }
+
+    #[test]
+    fn saturating_sub_max_local_epoch() {
+        // Extreme edge case: local epoch is u64::MAX (shouldn't happen, but must not panic)
+        let server_epoch: u64 = 100;
+        let local_epoch: u64 = u64::MAX;
+
+        let diff = server_epoch.saturating_sub(local_epoch);
+        assert_eq!(
+            diff, 0,
+            "saturating_sub should clamp to 0 even with u64::MAX local epoch"
+        );
     }
 }

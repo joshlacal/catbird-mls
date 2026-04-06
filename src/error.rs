@@ -2,8 +2,9 @@ use std::str::Utf8Error;
 use thiserror::Error;
 
 /// P2: Comprehensive error enum with detailed variants for better debugging
-#[derive(Error, Debug, uniffi::Error)]
-#[uniffi(flat_error)]
+#[derive(Error, Debug)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Error))]
+#[cfg_attr(not(target_arch = "wasm32"), uniffi(flat_error))]
 pub enum MLSError {
     #[error("Invalid input: {message}")]
     InvalidInput { message: String },
