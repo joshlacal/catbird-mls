@@ -173,6 +173,22 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         ))
     }
 
+    /// Report that recovery has been exhausted for a conversation.
+    ///
+    /// Called when the RecoveryTracker has maxed out External Commit attempts.
+    /// The server tracks failure reports and auto-resets when a quorum of
+    /// members report failure.
+    async fn report_recovery_failure(
+        &self,
+        convo_id: &str,
+        failure_type: &str,
+    ) -> Result<()> {
+        let _ = (convo_id, failure_type);
+        Err(crate::orchestrator::error::OrchestratorError::Api(
+            "report_recovery_failure not implemented".into(),
+        ))
+    }
+
     /// Fetch delivery status for messages in a conversation.
     ///
     /// Returns `(message_id, DeliveryStatus)` pairs. Default stub returns empty
@@ -189,26 +205,30 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// Send a commit (e.g. metadata update) to the server.
     ///
     /// The `action` parameter describes the commit type (e.g. "updateMetadata").
+    /// `confirmation_tag` is the base64-encoded MLS confirmation tag from the local group state.
     /// Default implementation is a no-op for backends that don't support it yet.
     async fn commit_group_change(
         &self,
         convo_id: &str,
         commit_data: &[u8],
         action: &str,
+        confirmation_tag: Option<&str>,
     ) -> Result<()> {
-        let _ = (convo_id, commit_data, action);
+        let _ = (convo_id, commit_data, action, confirmation_tag);
         Ok(())
     }
 
     /// Send an External Commit to the processExternalCommit endpoint.
     /// This is the correct endpoint for External Commits (NOT sendMessage).
+    /// `confirmation_tag` is the base64-encoded MLS confirmation tag from the new local group state.
     async fn process_external_commit(
         &self,
         convo_id: &str,
         commit_data: &[u8],
         group_info: Option<&[u8]>,
+        confirmation_tag: Option<&str>,
     ) -> Result<ProcessExternalCommitResult> {
-        let _ = (convo_id, commit_data, group_info);
+        let _ = (convo_id, commit_data, group_info, confirmation_tag);
         Err(crate::orchestrator::error::OrchestratorError::Api(
             "process_external_commit not implemented".into(),
         ))

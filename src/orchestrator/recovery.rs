@@ -1,9 +1,13 @@
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
+
+use base64::Engine;
 
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
+use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
@@ -12,18 +16,26 @@ use super::types::*;
 pub struct RecoveryTracker {
     /// Failed rejoin attempts per conversation.
     failed_rejoins: HashMap<String, (u32, Instant)>,
+    /// Last successful or attempted rejoin per conversation (regardless of outcome).
+    /// Used to enforce a hard minimum interval between any rejoin attempts,
+    /// preventing epoch inflation spirals even when attempts succeed.
+    last_rejoin_at: HashMap<String, Instant>,
     /// Maximum rejoin attempts before giving up.
     max_attempts: u32,
     /// Base cooldown duration for backoff.
     base_cooldown: Duration,
+    /// Hard minimum interval between rejoin attempts (successful or failed).
+    min_rejoin_interval: Duration,
 }
 
 impl RecoveryTracker {
     pub fn new(max_attempts: u32, base_cooldown: Duration) -> Self {
         Self {
             failed_rejoins: HashMap::new(),
+            last_rejoin_at: HashMap::new(),
             max_attempts,
             base_cooldown,
+            min_rejoin_interval: Duration::from_secs(30),
         }
     }
 
@@ -67,24 +79,40 @@ impl RecoveryTracker {
         }
     }
 
-    /// Whether a conversation should skip rejoin (max attempts or cooldown).
+    /// Whether a conversation should skip rejoin (max attempts, cooldown, or min interval).
     pub fn should_skip(&self, convo_id: &str) -> bool {
-        self.is_maxed_out(convo_id) || self.cooldown_remaining(convo_id).is_some()
+        if self.is_maxed_out(convo_id) || self.cooldown_remaining(convo_id).is_some() {
+            return true;
+        }
+        // Hard minimum interval: even successful rejoins can't happen faster than this
+        if let Some(last) = self.last_rejoin_at.get(convo_id) {
+            if last.elapsed() < self.min_rejoin_interval {
+                return true;
+            }
+        }
+        false
     }
 
     /// Record a failed rejoin attempt.
     pub fn record_failure(&mut self, convo_id: &str) {
+        let now = Instant::now();
         let entry = self
             .failed_rejoins
             .entry(convo_id.to_string())
-            .or_insert((0, Instant::now()));
+            .or_insert((0, now));
         entry.0 += 1;
-        entry.1 = Instant::now();
+        entry.1 = now;
+        self.last_rejoin_at.insert(convo_id.to_string(), now);
     }
 
-    /// Clear tracking on success.
+    /// Clear failure tracking on success.
+    /// Note: does NOT clear `last_rejoin_at` — the minimum interval still applies
+    /// to prevent rapid successive rejoins even when they succeed.
     pub fn clear(&mut self, convo_id: &str) {
         self.failed_rejoins.remove(convo_id);
+        // Record the current time as last rejoin so the min_rejoin_interval applies
+        self.last_rejoin_at
+            .insert(convo_id.to_string(), Instant::now());
     }
 }
 
@@ -200,11 +228,12 @@ impl SequencerFailoverTracker {
     }
 }
 
-impl<S, A, C> MLSOrchestrator<S, A, C>
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
     A: MLSAPIClient + 'static,
     C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
 {
     pub(crate) async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
         let rejoin_lock = self.rejoin_lock(convo_id).await;
@@ -238,8 +267,22 @@ where
             tracing::warn!(
                 convo_id,
                 max_attempts = self.config().max_rejoin_attempts,
-                "Rejoin suppressed: max attempts reached"
+                "Rejoin suppressed: max attempts reached, reporting recovery failure"
             );
+            // Drop lock before async call
+            drop(tracker);
+            // Report failure to server for quorum-based auto-reset
+            if let Err(e) = self
+                .api_client()
+                .report_recovery_failure(convo_id, "external_commit_exhausted")
+                .await
+            {
+                tracing::warn!(
+                    convo_id,
+                    error = %e,
+                    "Failed to report recovery failure to server"
+                );
+            }
             return Err(OrchestratorError::RecoveryFailed(format!(
                 "Rejoin suppressed for {convo_id}: max attempts reached"
             )));
@@ -255,6 +298,24 @@ where
                 "Rejoin suppressed for {convo_id}: cooldown active ({}s remaining)",
                 remaining.as_secs()
             )));
+        }
+
+        // Hard minimum interval between any rejoin attempts (even successful ones)
+        if let Some(last) = tracker.last_rejoin_at.get(convo_id) {
+            let elapsed = last.elapsed();
+            let min_interval = Duration::from_secs(30);
+            if elapsed < min_interval {
+                let remaining = min_interval - elapsed;
+                tracing::info!(
+                    convo_id,
+                    remaining_secs = remaining.as_secs(),
+                    "Rejoin suppressed: minimum interval not elapsed"
+                );
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "Rejoin suppressed for {convo_id}: minimum interval ({}s remaining)",
+                    remaining.as_secs()
+                )));
+            }
         }
 
         Ok(())
@@ -306,6 +367,13 @@ where
 
         let _new_group_id_hex = hex::encode(&ext_commit_result.group_id);
 
+        // Get confirmation tag from the new local group state
+        let tag_b64 = self
+            .mls_context()
+            .get_confirmation_tag(ext_commit_result.group_id.clone())
+            .map(|tag| base64::engine::general_purpose::STANDARD.encode(&tag))
+            .ok();
+
         // Send commit to server via the processExternalCommit endpoint
         // (NOT sendMessage — that endpoint validates padding/epoch/membership which don't apply)
         let ext_commit_server_result = match self
@@ -313,7 +381,8 @@ where
             .process_external_commit(
                 convo_id,
                 &ext_commit_result.commit_data,
-                None, // GroupInfo will be published separately below
+                ext_commit_result.group_info.as_deref(),
+                tag_b64.as_deref(),
             )
             .await
         {
@@ -344,25 +413,67 @@ where
                 OrchestratorError::RecoveryFailed(format!("Failed to merge external commit: {e}"))
             })?;
 
-        // Update group state
+        // Update group state (insert if missing, persist to storage)
         {
             let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.get_mut(convo_id) {
-                gs.epoch = merged;
+            let state = states
+                .entry(convo_id.to_string())
+                .or_insert_with(|| GroupState {
+                    group_id: convo_id.to_string(),
+                    conversation_id: convo_id.to_string(),
+                    epoch: 0,
+                    members: vec![],
+                });
+            state.epoch = merged;
+            let state_clone = state.clone();
+            drop(states);
+            if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                tracing::warn!(error = %e, convo_id, "Failed to persist group state after force rejoin");
             }
         }
 
         // Clear rejoin flag
         let _ = self.storage().clear_rejoin_flag(convo_id).await;
 
+        // Insert history boundary marker for device rejoin.
+        // On iOS, Swift inserts first with the correct content key — the message_exists
+        // check below prevents duplicates. On catmos/WASM, this is the only inserter.
+        let marker_id = format!("hb-{}-{}", convo_id, merged);
+        if !self
+            .storage()
+            .message_exists(&marker_id)
+            .await
+            .unwrap_or(true)
+        {
+            let payload = MLSMessagePayload::system("history_boundary.device_rejoined");
+            let marker = Message {
+                id: marker_id,
+                conversation_id: convo_id.to_string(),
+                sender_did: user_did.to_string(),
+                text: "history_boundary.device_rejoined".to_string(),
+                timestamp: chrono::Utc::now(),
+                epoch: merged,
+                sequence_number: 0,
+                is_own: true,
+                delivery_status: None,
+                payload_json: serde_json::to_string(&payload).ok(),
+            };
+            if let Err(e) = self.storage().store_message(&marker).await {
+                tracing::warn!(error = %e, convo_id, "Failed to store history boundary marker");
+            }
+        }
+
         // Publish updated GroupInfo
         let group_info = self
             .mls_context()
             .export_group_info(ext_commit_result.group_id, user_did.as_bytes().to_vec())?;
-        let _ = self
+        if let Err(e) = self
             .api_client()
             .publish_group_info(convo_id, &group_info)
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, convo_id, "Failed to publish GroupInfo (external joins may fail)");
+        }
 
         tracing::info!(convo_id, new_epoch = merged, "Force rejoin successful");
         Ok(())
@@ -474,14 +585,54 @@ where
                         // Update group state
                         {
                             let mut states = self.group_states().lock().await;
-                            if let Some(gs) = states.get_mut(convo_id) {
-                                gs.epoch = epoch;
+                            let state =
+                                states
+                                    .entry(convo_id.to_string())
+                                    .or_insert_with(|| GroupState {
+                                        group_id: convo_id.to_string(),
+                                        conversation_id: convo_id.to_string(),
+                                        epoch: 0,
+                                        members: vec![],
+                                    });
+                            state.epoch = epoch;
+                            let state_clone = state.clone();
+                            drop(states);
+                            if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                                tracing::warn!(error = %e, convo_id, "Failed to persist group state after Welcome join");
                             }
                         }
 
                         // Clear rejoin flag
                         let _ = self.storage().clear_rejoin_flag(convo_id).await;
                         self.clear_rejoin_failures(convo_id).await;
+
+                        // Insert history boundary marker for Welcome join.
+                        // On iOS, Swift inserts first — message_exists prevents duplicates.
+                        let marker_id = format!("hb-{}-{}", convo_id, epoch);
+                        if !self
+                            .storage()
+                            .message_exists(&marker_id)
+                            .await
+                            .unwrap_or(true)
+                        {
+                            let user_did_ref = &user_did;
+                            let payload = MLSMessagePayload::system("history_boundary.new_member");
+                            let marker = Message {
+                                id: marker_id,
+                                conversation_id: convo_id.to_string(),
+                                sender_did: user_did_ref.clone(),
+                                text: "history_boundary.new_member".to_string(),
+                                timestamp: chrono::Utc::now(),
+                                epoch,
+                                sequence_number: 0,
+                                is_own: true,
+                                delivery_status: None,
+                                payload_json: serde_json::to_string(&payload).ok(),
+                            };
+                            if let Err(e) = self.storage().store_message(&marker).await {
+                                tracing::warn!(error = %e, convo_id, "Failed to store history boundary marker");
+                            }
+                        }
 
                         tracing::info!(convo_id, epoch, "Successfully joined via Welcome");
                         return Ok(epoch);
@@ -570,9 +721,9 @@ where
         // 5. Process rejoins
         for convo_id in conversation_ids {
             if self.storage().needs_rejoin(convo_id).await.unwrap_or(false) {
-                match self.force_rejoin(convo_id).await {
-                    Ok(_) => {
-                        tracing::info!(convo_id = %convo_id, "Rejoin successful during recovery");
+                match self.join_or_rejoin(convo_id).await {
+                    Ok(epoch) => {
+                        tracing::info!(convo_id = %convo_id, epoch, "Rejoin successful during recovery");
                     }
                     Err(e) => {
                         tracing::error!(
