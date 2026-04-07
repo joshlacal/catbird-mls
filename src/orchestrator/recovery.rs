@@ -132,7 +132,6 @@ struct FailoverState {
     last_failure_at: Instant,
 }
 
-
 /// Tracks consecutive sequencer failures per conversation to detect when
 /// failover should be triggered.
 ///
@@ -236,7 +235,7 @@ impl GroupInfo404Tracker {
     pub fn is_tripped(&self, convo_id: &str) -> bool {
         self.counts
             .get(convo_id)
-            .map_or(false, |c| *c >= constants::GROUPINFO_404_CIRCUIT_BREAKER)
+            .is_some_and(|c| *c >= constants::GROUPINFO_404_CIRCUIT_BREAKER)
     }
 
     pub fn clear(&mut self, convo_id: &str) {
@@ -384,7 +383,10 @@ where
                     || err_str.contains("not found")
                     || err_str.contains("notfound");
                 if is_404 {
-                    self.groupinfo_404_tracker().lock().await.record_404(convo_id);
+                    self.groupinfo_404_tracker()
+                        .lock()
+                        .await
+                        .record_404(convo_id);
                 }
                 tracing::error!(error = %e, "Failed to fetch GroupInfo for rejoin");
                 return Err(OrchestratorError::RecoveryFailed(format!(
