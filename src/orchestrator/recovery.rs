@@ -220,6 +220,36 @@ impl SequencerFailoverTracker {
     }
 }
 
+/// Tracks consecutive GroupInfo 404 responses per conversation.
+/// After GROUPINFO_404_CIRCUIT_BREAKER (3) consecutive 404s, the circuit
+/// trips and External Commit attempts should be skipped for that conversation.
+pub struct GroupInfo404Tracker {
+    counts: HashMap<String, u32>,
+}
+
+impl GroupInfo404Tracker {
+    pub fn new() -> Self {
+        Self {
+            counts: HashMap::new(),
+        }
+    }
+
+    pub fn record_404(&mut self, convo_id: &str) {
+        let count = self.counts.entry(convo_id.to_string()).or_insert(0);
+        *count += 1;
+    }
+
+    pub fn is_tripped(&self, convo_id: &str) -> bool {
+        self.counts
+            .get(convo_id)
+            .map_or(false, |c| *c >= constants::GROUPINFO_404_CIRCUIT_BREAKER)
+    }
+
+    pub fn clear(&mut self, convo_id: &str) {
+        self.counts.remove(convo_id);
+    }
+}
+
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -331,20 +361,43 @@ where
     async fn force_rejoin_unlocked(&self, convo_id: &str, user_did: &str) -> Result<()> {
         tracing::info!(convo_id, "Attempting force rejoin via External Commit");
 
+        // Check GroupInfo 404 circuit breaker
+        {
+            let tracker = self.groupinfo_404_tracker().lock().await;
+            if tracker.is_tripped(convo_id) {
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "GroupInfo 404 circuit breaker tripped for {convo_id}"
+                )));
+            }
+        }
+
         // Delete old local group state
         if let Ok(group_id_bytes) = hex::decode(convo_id) {
             let _ = self.mls_context().delete_group(group_id_bytes);
         }
 
         // Fetch GroupInfo from server
-        let group_info = self
-            .api_client()
-            .get_group_info(convo_id)
-            .await
-            .map_err(|e| {
+        let group_info = match self.api_client().get_group_info(convo_id).await {
+            Ok(gi) => {
+                // Success: clear 404 counter
+                self.groupinfo_404_tracker().lock().await.clear(convo_id);
+                gi
+            }
+            Err(e) => {
+                // Check if this is a 404-like error
+                let err_str = e.to_string().to_lowercase();
+                let is_404 = err_str.contains("404")
+                    || err_str.contains("not found")
+                    || err_str.contains("notfound");
+                if is_404 {
+                    self.groupinfo_404_tracker().lock().await.record_404(convo_id);
+                }
                 tracing::error!(error = %e, "Failed to fetch GroupInfo for rejoin");
-                OrchestratorError::RecoveryFailed(format!("Failed to fetch GroupInfo: {e}"))
-            })?;
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "Failed to fetch GroupInfo: {e}"
+                )));
+            }
+        };
 
         // Create External Commit
         let identity_bytes = user_did.as_bytes().to_vec();

@@ -9,7 +9,7 @@ use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::mls_provider::MlsCryptoContext;
-use super::recovery::{RecoveryTracker, SequencerFailoverTracker};
+use super::recovery::{GroupInfo404Tracker, RecoveryTracker, SequencerFailoverTracker};
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
@@ -111,6 +111,8 @@ where
     failover_tracker: Mutex<SequencerFailoverTracker>,
     /// Per-conversation consecutive decrypt failure counts for divergence detection.
     decrypt_fail_counts: Mutex<HashMap<String, u32>>,
+    /// Tracks consecutive GroupInfo 404 responses per conversation (spec §8.3).
+    groupinfo_404_tracker: Mutex<GroupInfo404Tracker>,
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -151,6 +153,7 @@ where
             recovery_tracker: Mutex::new(recovery_tracker),
             failover_tracker: Mutex::new(SequencerFailoverTracker::new()),
             decrypt_fail_counts: Mutex::new(HashMap::new()),
+            groupinfo_404_tracker: Mutex::new(GroupInfo404Tracker::new()),
         }
     }
 
@@ -315,5 +318,10 @@ where
     /// Access the per-conversation decrypt failure counts.
     pub(crate) fn decrypt_fail_counts(&self) -> &Mutex<HashMap<String, u32>> {
         &self.decrypt_fail_counts
+    }
+
+    /// Access the GroupInfo 404 circuit breaker tracker.
+    pub(crate) fn groupinfo_404_tracker(&self) -> &Mutex<GroupInfo404Tracker> {
+        &self.groupinfo_404_tracker
     }
 }

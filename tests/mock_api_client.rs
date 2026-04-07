@@ -822,6 +822,7 @@ impl MLSAPIClient for MockDeliveryService {
         convo_id: &str,
         commit_data: &[u8],
         _group_info: Option<&[u8]>,
+        _confirmation_tag: Option<&str>,
     ) -> Result<ProcessExternalCommitResult> {
         let delay_ms = self.state.lock().unwrap().process_external_commit_delay_ms;
         if delay_ms > 0 {

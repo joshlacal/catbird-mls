@@ -1,4 +1,4 @@
-use catbird_mls::orchestrator::recovery::RecoveryTracker;
+use catbird_mls::orchestrator::recovery::{GroupInfo404Tracker, RecoveryTracker};
 use std::time::Duration;
 
 #[test]
@@ -21,6 +21,37 @@ fn test_backoff_beyond_max_uses_last() {
     // Beyond 3 attempts should use last backoff (10m)
     assert_eq!(tracker.cooldown_for_attempts(4), Duration::from_secs(600));
     assert_eq!(tracker.cooldown_for_attempts(10), Duration::from_secs(600));
+}
+
+#[test]
+fn test_groupinfo_404_circuit_breaker() {
+    let mut tracker = GroupInfo404Tracker::new();
+
+    // First two 404s: not tripped
+    tracker.record_404("convo-1");
+    assert!(!tracker.is_tripped("convo-1"));
+    tracker.record_404("convo-1");
+    assert!(!tracker.is_tripped("convo-1"));
+
+    // Third 404: tripped
+    tracker.record_404("convo-1");
+    assert!(tracker.is_tripped("convo-1"));
+
+    // Different conversation: not tripped
+    assert!(!tracker.is_tripped("convo-2"));
+}
+
+#[test]
+fn test_groupinfo_404_clears_on_success() {
+    let mut tracker = GroupInfo404Tracker::new();
+
+    tracker.record_404("convo-1");
+    tracker.record_404("convo-1");
+    tracker.clear("convo-1");
+
+    // After clearing, should not be tripped even after one more 404
+    tracker.record_404("convo-1");
+    assert!(!tracker.is_tripped("convo-1"));
 }
 
 #[test]
