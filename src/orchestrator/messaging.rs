@@ -3,6 +3,7 @@ use sha2::Digest;
 use std::collections::HashMap;
 
 use super::api_client::MLSAPIClient;
+use super::constants;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::mls_provider::MlsCryptoContext;
@@ -88,13 +89,13 @@ where
         );
 
         // Pre-send sync: catch up on any missed epoch-advancing commits.
-        // Loop up to 3 rounds with cursor tracking to drain pending messages
-        // instead of only processing the first 50.
+        // Loop up to SEND_SYNC_MAX_ROUNDS with cursor tracking to drain pending messages
+        // instead of only processing the first SEND_SYNC_BATCH_SIZE.
         {
             let mut cursor: Option<String> = None;
-            for round in 0..3u32 {
+            for round in 0..constants::SEND_SYNC_MAX_ROUNDS {
                 match self
-                    .fetch_messages(conversation_id, cursor.as_deref(), 50, None)
+                    .fetch_messages(conversation_id, cursor.as_deref(), constants::SEND_SYNC_BATCH_SIZE, None)
                     .await
                 {
                     Ok((msgs, next_cursor)) => {
@@ -382,7 +383,7 @@ where
                     let mut counts = self.decrypt_fail_counts().lock().await;
                     let count = counts.entry(envelope.conversation_id.clone()).or_insert(0);
                     *count += 1;
-                    if *count >= 3 {
+                    if *count >= constants::DECRYPTION_FAILURE_THRESHOLD {
                         tracing::error!(
                             conversation_id = %envelope.conversation_id,
                             failures = *count,

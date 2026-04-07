@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use web_time::Instant;
 
 use super::api_client::MLSAPIClient;
+use super::constants;
 use super::credentials::CredentialStore;
 use super::error::Result;
 use super::mls_provider::MlsCryptoContext;
@@ -94,7 +95,7 @@ where
                 *self.consecutive_sync_failures().lock().await = 0;
                 // Reset circuit breaker state on success
                 *self.circuit_breaker_tripped_at().lock().await = None;
-                *self.circuit_breaker_cooldown_secs().lock().await = 30;
+                *self.circuit_breaker_cooldown_secs().lock().await = constants::SYNC_CIRCUIT_BREAKER_BASE_SECS;
             }
             Err(e) => {
                 let mut failures = self.consecutive_sync_failures().lock().await;
@@ -102,7 +103,7 @@ where
                 // If we just re-tripped the breaker, apply exponential backoff
                 if *failures >= self.config().max_consecutive_sync_failures {
                     let mut cooldown = self.circuit_breaker_cooldown_secs().lock().await;
-                    *cooldown = (*cooldown * 2).min(300); // cap at 5 minutes
+                    *cooldown = (*cooldown * 2).min(constants::SYNC_CIRCUIT_BREAKER_MAX_SECS); // cap at 5 minutes
                 }
                 tracing::error!(
                     error = %e,

@@ -132,12 +132,6 @@ struct FailoverState {
     last_failure_at: Instant,
 }
 
-/// Minimum consecutive connection/timeout failures before failover is recommended.
-const FAILOVER_MIN_FAILURES: u32 = 3;
-
-/// Minimum wall-clock duration since the first failure before failover is recommended.
-/// Prevents triggering on brief transient blips.
-const FAILOVER_MIN_DURATION: Duration = Duration::from_secs(120);
 
 /// Tracks consecutive sequencer failures per conversation to detect when
 /// failover should be triggered.
@@ -194,8 +188,8 @@ impl SequencerFailoverTracker {
         let Some(state) = self.failures.get(convo_id) else {
             return false;
         };
-        state.consecutive_failures >= FAILOVER_MIN_FAILURES
-            && state.first_failure_at.elapsed() >= FAILOVER_MIN_DURATION
+        state.consecutive_failures >= constants::FAILOVER_MIN_FAILURES
+            && state.first_failure_at.elapsed() >= constants::FAILOVER_MIN_DURATION
     }
 
     /// Reset failure tracking after a successful failover.
