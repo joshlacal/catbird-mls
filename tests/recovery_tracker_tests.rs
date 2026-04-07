@@ -22,3 +22,17 @@ fn test_backoff_beyond_max_uses_last() {
     assert_eq!(tracker.cooldown_for_attempts(4), Duration::from_secs(600));
     assert_eq!(tracker.cooldown_for_attempts(10), Duration::from_secs(600));
 }
+
+#[test]
+fn test_min_rejoin_interval_is_global() {
+    let mut tracker = RecoveryTracker::new(3);
+
+    // Record a successful rejoin for conversation A
+    tracker.clear("convo-a");
+
+    // Conversation B should also be blocked by the global interval
+    assert!(
+        tracker.should_skip("convo-b"),
+        "Global MIN_REJOIN_INTERVAL should block different conversations"
+    );
+}

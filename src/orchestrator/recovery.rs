@@ -17,23 +17,20 @@ use super::types::*;
 pub struct RecoveryTracker {
     /// Failed rejoin attempts per conversation.
     failed_rejoins: HashMap<String, (u32, Instant)>,
-    /// Last successful or attempted rejoin per conversation (regardless of outcome).
-    /// Used to enforce a hard minimum interval between any rejoin attempts,
+    /// Last successful or attempted rejoin on ANY conversation (regardless of outcome).
+    /// Used to enforce a hard global minimum interval between any rejoin attempts,
     /// preventing epoch inflation spirals even when attempts succeed.
-    last_rejoin_at: HashMap<String, Instant>,
+    pub(crate) last_global_rejoin_at: Option<Instant>,
     /// Maximum rejoin attempts before giving up.
     max_attempts: u32,
-    /// Hard minimum interval between rejoin attempts (successful or failed).
-    min_rejoin_interval: Duration,
 }
 
 impl RecoveryTracker {
     pub fn new(max_attempts: u32) -> Self {
         Self {
             failed_rejoins: HashMap::new(),
-            last_rejoin_at: HashMap::new(),
+            last_global_rejoin_at: None,
             max_attempts,
-            min_rejoin_interval: Duration::from_secs(30),
         }
     }
 
@@ -80,9 +77,9 @@ impl RecoveryTracker {
         if self.is_maxed_out(convo_id) || self.cooldown_remaining(convo_id).is_some() {
             return true;
         }
-        // Hard minimum interval: even successful rejoins can't happen faster than this
-        if let Some(last) = self.last_rejoin_at.get(convo_id) {
-            if last.elapsed() < self.min_rejoin_interval {
+        // Global minimum interval: no rejoin on ANY conversation within MIN_REJOIN_INTERVAL
+        if let Some(last) = self.last_global_rejoin_at {
+            if last.elapsed() < constants::MIN_REJOIN_INTERVAL {
                 return true;
             }
         }
@@ -98,17 +95,16 @@ impl RecoveryTracker {
             .or_insert((0, now));
         entry.0 += 1;
         entry.1 = now;
-        self.last_rejoin_at.insert(convo_id.to_string(), now);
+        self.last_global_rejoin_at = Some(now);
     }
 
     /// Clear failure tracking on success.
-    /// Note: does NOT clear `last_rejoin_at` — the minimum interval still applies
+    /// Note: does NOT clear `last_global_rejoin_at` — the minimum interval still applies
     /// to prevent rapid successive rejoins even when they succeed.
     pub fn clear(&mut self, convo_id: &str) {
         self.failed_rejoins.remove(convo_id);
-        // Record the current time as last rejoin so the min_rejoin_interval applies
-        self.last_rejoin_at
-            .insert(convo_id.to_string(), Instant::now());
+        // Record the current time globally so the MIN_REJOIN_INTERVAL applies across all convos
+        self.last_global_rejoin_at = Some(Instant::now());
     }
 }
 
@@ -297,11 +293,10 @@ where
         }
 
         // Hard minimum interval between any rejoin attempts (even successful ones)
-        if let Some(last) = tracker.last_rejoin_at.get(convo_id) {
+        if let Some(last) = tracker.last_global_rejoin_at {
             let elapsed = last.elapsed();
-            let min_interval = Duration::from_secs(30);
-            if elapsed < min_interval {
-                let remaining = min_interval - elapsed;
+            if elapsed < constants::MIN_REJOIN_INTERVAL {
+                let remaining = constants::MIN_REJOIN_INTERVAL - elapsed;
                 tracing::info!(
                     convo_id,
                     remaining_secs = remaining.as_secs(),
