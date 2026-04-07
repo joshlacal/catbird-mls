@@ -88,14 +88,14 @@ where
             "Encoded MLSMessagePayload for send"
         );
 
-        // Pre-send sync: catch up on any missed epoch-advancing commits.
-        // Loop up to SEND_SYNC_MAX_ROUNDS with cursor tracking to drain pending messages
-        // instead of only processing the first SEND_SYNC_BATCH_SIZE.
+        // Pre-send sync: catch up on any missed epoch-advancing commits (spec §5.1 step 1).
+        // Fetch pending *commits* (not app messages) to advance the local epoch before
+        // encrypting, avoiding 409 epoch mismatches on send.
         {
             let mut cursor: Option<String> = None;
             for round in 0..constants::SEND_SYNC_MAX_ROUNDS {
                 match self
-                    .fetch_messages(conversation_id, cursor.as_deref(), constants::SEND_SYNC_BATCH_SIZE, None)
+                    .fetch_messages(conversation_id, cursor.as_deref(), constants::SEND_SYNC_BATCH_SIZE, Some("commit"))
                     .await
                 {
                     Ok((msgs, next_cursor)) => {
