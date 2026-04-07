@@ -94,7 +94,7 @@ where
             let mut cursor: Option<String> = None;
             for round in 0..3u32 {
                 match self
-                    .fetch_messages(conversation_id, cursor.as_deref(), 50)
+                    .fetch_messages(conversation_id, cursor.as_deref(), 50, None)
                     .await
                 {
                     Ok((msgs, next_cursor)) => {
@@ -588,17 +588,21 @@ where
     }
 
     /// Fetch and process new messages from the server for a conversation.
+    ///
+    /// `message_type` filters the fetch: `Some("commit")` for epoch catch-up,
+    /// `None` (all) for normal message polling.
     pub async fn fetch_messages(
         &self,
         conversation_id: &str,
         cursor: Option<&str>,
         limit: u32,
+        message_type: Option<&str>,
     ) -> Result<(Vec<Message>, Option<String>)> {
         self.check_shutdown().await?;
 
         let (envelopes, new_cursor) = self
             .api_client()
-            .get_messages(conversation_id, cursor, limit)
+            .get_messages(conversation_id, cursor, limit, message_type)
             .await?;
 
         let mut messages = Vec::new();

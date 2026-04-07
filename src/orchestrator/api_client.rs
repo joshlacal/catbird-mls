@@ -95,11 +95,16 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     }
 
     /// Fetch new messages for a conversation since a cursor.
+    ///
+    /// `message_type` filters the server response: `"all"`, `"app"`, or `"commit"`.
+    /// Pass `None` (or `Some("all")`) to fetch everything. Not all backends
+    /// support filtering — implementations that don't should ignore the parameter.
     async fn get_messages(
         &self,
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
+        message_type: Option<&str>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)>;
 
     // -- Key Packages --

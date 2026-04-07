@@ -897,7 +897,9 @@ impl MLSAPIClient for APIAdapter {
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
+        _message_type: Option<&str>,
     ) -> crate::orchestrator::Result<(Vec<IncomingEnvelope>, Option<String>)> {
+        // FFI callback doesn't support message_type filtering; ignore the parameter.
         self.0
             .get_messages(convo_id.to_string(), cursor.map(|s| s.to_string()), limit)
             .map(|ffi| {
@@ -1360,6 +1362,7 @@ impl OrchestratorBridge {
             &conversation_id,
             cursor.as_deref(),
             limit,
+            None,
         ))?;
         Ok(FFIFetchMessagesResult {
             messages: messages.iter().map(message_to_ffi).collect(),

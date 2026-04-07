@@ -609,6 +609,7 @@ impl MLSAPIClient for MockDeliveryService {
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
+        _message_type: Option<&str>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
         let mut guard = self.state.lock().unwrap();
         check_fail(
@@ -912,7 +913,7 @@ mod tests {
         svc.send_message("conv-1", b"hello", 0).await.unwrap();
         svc.send_message("conv-1", b"world", 0).await.unwrap();
 
-        let (msgs, cursor) = svc.get_messages("conv-1", None, 10).await.unwrap();
+        let (msgs, cursor) = svc.get_messages("conv-1", None, 10, None).await.unwrap();
         assert_eq!(msgs.len(), 2);
         assert!(cursor.is_none());
         assert_eq!(msgs[0].ciphertext, b"hello");
@@ -931,19 +932,19 @@ mod tests {
                 .unwrap();
         }
 
-        let (page1, cursor1) = svc.get_messages("conv-1", None, 2).await.unwrap();
+        let (page1, cursor1) = svc.get_messages("conv-1", None, 2, None).await.unwrap();
         assert_eq!(page1.len(), 2);
         assert!(cursor1.is_some());
 
         let (page2, cursor2) = svc
-            .get_messages("conv-1", cursor1.as_deref(), 2)
+            .get_messages("conv-1", cursor1.as_deref(), 2, None)
             .await
             .unwrap();
         assert_eq!(page2.len(), 2);
         assert!(cursor2.is_some());
 
         let (page3, cursor3) = svc
-            .get_messages("conv-1", cursor2.as_deref(), 2)
+            .get_messages("conv-1", cursor2.as_deref(), 2, None)
             .await
             .unwrap();
         assert_eq!(page3.len(), 1);

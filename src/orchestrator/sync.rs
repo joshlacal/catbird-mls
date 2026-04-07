@@ -296,7 +296,7 @@ where
 
                 // Fetch and process messages (includes commits) to advance local epoch.
                 // This is the primary catch-up path for commits missed between syncs.
-                match self.fetch_messages(&convo.group_id, None, 50).await {
+                match self.fetch_messages(&convo.group_id, None, 50, Some("commit")).await {
                     Ok((msgs, _)) => {
                         if !msgs.is_empty() {
                             tracing::info!(
@@ -318,22 +318,19 @@ where
                                 conversation_id = %convo.group_id,
                                 local_epoch = new_local,
                                 server_epoch = convo.epoch,
-                                "Still behind after processing — may need rejoin"
+                                "Still behind after processing — marking for rejoin"
                             );
-                            if convo.epoch.saturating_sub(new_local) > 1 {
-                                let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
-                            }
+                            let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
                         }
                     }
                     Err(e) => {
                         tracing::warn!(
                             conversation_id = %convo.group_id,
                             error = %e,
-                            "Failed to fetch messages for epoch catch-up"
+                            "Failed to fetch messages for epoch catch-up — marking for rejoin"
                         );
-                        if convo.epoch.saturating_sub(local_epoch) > 1 {
-                            let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
-                        }
+                        // Fetch failed — mark for rejoin regardless of gap size
+                        let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
                     }
                 }
             }
