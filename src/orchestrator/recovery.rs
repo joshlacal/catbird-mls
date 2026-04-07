@@ -5,6 +5,7 @@ use web_time::Instant;
 use base64::Engine;
 
 use super::api_client::MLSAPIClient;
+use super::constants;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::mls_provider::MlsCryptoContext;
@@ -22,37 +23,32 @@ pub struct RecoveryTracker {
     last_rejoin_at: HashMap<String, Instant>,
     /// Maximum rejoin attempts before giving up.
     max_attempts: u32,
-    /// Base cooldown duration for backoff.
-    base_cooldown: Duration,
     /// Hard minimum interval between rejoin attempts (successful or failed).
     min_rejoin_interval: Duration,
 }
 
 impl RecoveryTracker {
-    pub fn new(max_attempts: u32, base_cooldown: Duration) -> Self {
+    pub fn new(max_attempts: u32) -> Self {
         Self {
             failed_rejoins: HashMap::new(),
             last_rejoin_at: HashMap::new(),
             max_attempts,
-            base_cooldown,
             min_rejoin_interval: Duration::from_secs(30),
         }
     }
 
-    fn cooldown_for_attempts(&self, attempts: u32) -> Duration {
+    pub fn cooldown_for_attempts(&self, attempts: u32) -> Duration {
         if attempts == 0 {
             return Duration::from_secs(0);
         }
-
-        // Exponential backoff with a hard cap to avoid runaway delays.
-        let exponent = attempts.saturating_sub(1).min(10);
-        let multiplier = 1u64 << exponent;
-        let cooldown_secs = self
-            .base_cooldown
-            .as_secs()
-            .saturating_mul(multiplier)
-            .min(Duration::from_secs(3600).as_secs());
-        Duration::from_secs(cooldown_secs)
+        // Spec §10: REJOIN_BACKOFF = [30s, 2m, 10m] indexed by attempt (1-based)
+        let index = (attempts as usize).saturating_sub(1);
+        if index < constants::REJOIN_BACKOFF.len() {
+            constants::REJOIN_BACKOFF[index]
+        } else {
+            // Beyond defined backoff: use the last value
+            *constants::REJOIN_BACKOFF.last().unwrap()
+        }
     }
 
     /// Whether max attempts have been reached.

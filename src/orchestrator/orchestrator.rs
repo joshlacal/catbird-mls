@@ -128,10 +128,7 @@ where
         credentials: Arc<C>,
         config: OrchestratorConfig,
     ) -> Self {
-        let recovery_tracker = RecoveryTracker::new(
-            config.max_rejoin_attempts,
-            std::time::Duration::from_secs(config.rejoin_cooldown_seconds),
-        );
+        let recovery_tracker = RecoveryTracker::new(config.max_rejoin_attempts);
         Self {
             mls_context,
             storage,
