@@ -4,6 +4,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use web_time::Instant;
 
+use super::constants;
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
@@ -39,13 +40,13 @@ impl Default for OrchestratorConfig {
     fn default() -> Self {
         Self {
             max_devices: 20,
-            target_key_package_count: 50,
-            key_package_replenish_threshold: 10,
-            sync_cooldown_seconds: 5,
-            max_consecutive_sync_failures: 5,
-            sync_pause_duration_seconds: 60,
-            rejoin_cooldown_seconds: 60,
-            max_rejoin_attempts: 3,
+            target_key_package_count: constants::KEY_PACKAGE_TARGET,
+            key_package_replenish_threshold: constants::KEY_PACKAGE_LOW_THRESHOLD,
+            sync_cooldown_seconds: constants::SYNC_INTERVAL_SECS,
+            max_consecutive_sync_failures: constants::SYNC_CIRCUIT_BREAKER_THRESHOLD,
+            sync_pause_duration_seconds: constants::SYNC_CIRCUIT_BREAKER_BASE_SECS,
+            rejoin_cooldown_seconds: 0, // Not used — REJOIN_BACKOFF schedule replaces this
+            max_rejoin_attempts: constants::MAX_REJOIN_ATTEMPTS,
             group_config: crate::GroupConfig::default(),
         }
     }
@@ -149,7 +150,7 @@ where
             sync_in_progress: Mutex::new(false),
             consecutive_sync_failures: Mutex::new(0),
             circuit_breaker_tripped_at: Mutex::new(None),
-            circuit_breaker_cooldown_secs: Mutex::new(5),
+            circuit_breaker_cooldown_secs: Mutex::new(constants::SYNC_CIRCUIT_BREAKER_BASE_SECS),
             recovery_tracker: Mutex::new(recovery_tracker),
             failover_tracker: Mutex::new(SequencerFailoverTracker::new()),
             decrypt_fail_counts: Mutex::new(HashMap::new()),
