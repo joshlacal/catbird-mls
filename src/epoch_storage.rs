@@ -6,6 +6,7 @@
 // for retaining epoch secrets beyond OpenMLS's in-memory retention policy.
 
 use crate::error::MLSError;
+use crate::orchestrator::constants::SAFE_EXPORT_EPOCH_BLOB_KEY;
 use crate::types::EpochSecretStorage;
 use openmls::prelude::*;
 use std::sync::{Arc, RwLock};
@@ -37,10 +38,12 @@ impl EpochSecretManager {
     /// This should be called BEFORE processing a commit that advances the epoch.
     /// The exported secret allows decrypting messages from the current epoch
     /// even after the group has advanced to a new epoch.
-    pub async fn export_current_epoch_secret(
+    /// Uses safe_export_secret (Puncturable PRF) when available for intra-epoch
+    /// forward secrecy, falling back to export_secret for legacy groups.
+    pub async fn export_current_epoch_secret<Provider: OpenMlsProvider>(
         &self,
-        group: &MlsGroup,
-        provider: &impl OpenMlsProvider,
+        group: &mut MlsGroup,
+        provider: &Provider,
     ) -> Result<Vec<u8>, MLSError> {
         let group_id_hex = hex::encode(group.group_id().as_slice());
         let current_epoch = group.epoch().as_u64();
@@ -51,20 +54,38 @@ impl EpochSecretManager {
             current_epoch
         );
 
-        // Export the epoch secret using OpenMLS export_secret API
-        // This derives a secret from the current epoch's key schedule
-        let label = format!("epoch_secret_{}", current_epoch);
-        let context = group_id_hex.as_bytes();
-
-        let secret = group
-            .export_secret(provider.crypto(), &label, context, 32) // 32 bytes = 256 bits
-            .map_err(|e| {
-                crate::error_log!(
-                    "[EPOCH-STORAGE] ERROR: Failed to export epoch secret: {:?}",
+        // Try safe_export_secret first (Puncturable PRF, forward-secure within epoch).
+        // Falls back to export_secret for groups without application_export_tree.
+        let secret = match group.safe_export_secret(
+            provider.crypto(),
+            provider.storage(),
+            SAFE_EXPORT_EPOCH_BLOB_KEY,
+        ) {
+            Ok(s) => {
+                crate::info_log!(
+                    "[EPOCH-STORAGE] Used safe_export_secret (PPRF) for epoch {}",
+                    current_epoch
+                );
+                s
+            }
+            Err(e) => {
+                crate::info_log!(
+                    "[EPOCH-STORAGE] safe_export_secret unavailable ({:?}), falling back to export_secret",
                     e
                 );
-                MLSError::SecretExportFailed
-            })?;
+                let label = format!("epoch_secret_{}", current_epoch);
+                let context = group_id_hex.as_bytes();
+                group
+                    .export_secret(provider.crypto(), &label, context, 32)
+                    .map_err(|e| {
+                        crate::error_log!(
+                            "[EPOCH-STORAGE] ERROR: Failed to export epoch secret: {:?}",
+                            e
+                        );
+                        MLSError::SecretExportFailed
+                    })?
+            }
+        };
 
         crate::debug_log!(
             "[EPOCH-STORAGE] Exported {} bytes for epoch {}",

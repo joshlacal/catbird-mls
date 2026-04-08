@@ -2028,7 +2028,7 @@ impl MLSContext {
         );
 
         crate::debug_log!("[MLS-CONTEXT] Creating MLS group...");
-        let group = MlsGroup::new(
+        let mut group = MlsGroup::new(
             &self.provider,
             &signature_keys,
             &group_config,
@@ -2071,7 +2071,7 @@ impl MLSContext {
         // because we won't be able to decrypt our own messages if the epoch advances.
         crate::async_runtime::block_on(
             self.epoch_secret_manager
-                .export_current_epoch_secret(&group, &self.provider),
+                .export_current_epoch_secret(&mut group, &self.provider),
         )
         .map_err(|e| {
             crate::error_log!("[MLS-CONTEXT] ❌ Failed to export epoch secret: {:?}", e);
@@ -2107,15 +2107,15 @@ impl MLSContext {
         // For initial group creation we derive the key from the group's current
         // epoch exporter (no StagedCommit involved — the group already exists).
         let metadata_result = if config.group_name.is_some() || config.group_description.is_some() {
-            let group_state = self.groups.get(&group_id).ok_or_else(|| {
+            let group_state = self.groups.get_mut(&group_id).ok_or_else(|| {
                 MLSError::Internal("Group just created but not found in groups map".to_string())
             })?;
-            let group_ref = &group_state.group;
-            let epoch = group_ref.epoch().as_u64();
+            let epoch = group_state.group.epoch().as_u64();
 
             match metadata::derive_metadata_key_from_group(
-                group_ref,
+                &mut group_state.group,
                 self.provider.crypto(),
+                self.provider.storage(),
                 &group_id,
                 epoch,
             ) {

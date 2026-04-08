@@ -5,11 +5,13 @@
 //! blob on the server; a lightweight `MetadataReference` in the MLS group
 //! context points to the blob by locator and integrity hash.
 
+use crate::orchestrator::constants::SAFE_EXPORT_METADATA_KEY;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     ChaCha20Poly1305,
 };
 use openmls::prelude::*;
+use openmls::storage::StorageProvider;
 use openmls_traits::crypto::OpenMlsCrypto;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -206,17 +208,31 @@ pub fn derive_metadata_key(
 /// * `crypto` — an OpenMLS crypto provider
 /// * `group_id` — raw MLS group ID bytes
 /// * `epoch` — the current epoch of the group
-pub fn derive_metadata_key_from_group(
-    group: &MlsGroup,
-    crypto: &impl OpenMlsCrypto,
+pub fn derive_metadata_key_from_group<Crypto: OpenMlsCrypto, Storage: StorageProvider>(
+    group: &mut MlsGroup,
+    crypto: &Crypto,
+    storage: &Storage,
     group_id: &[u8],
     epoch: u64,
 ) -> Result<[u8; 32], MetadataError> {
-    let context = build_exporter_context(group_id, epoch);
-
-    let secret = group
-        .export_secret(crypto, EXPORTER_LABEL, &context, EXPORTER_KEY_LENGTH)
-        .map_err(|e| MetadataError::ExportSecret(format!("{e:?}")))?;
+    let secret = match group.safe_export_secret(crypto, storage, SAFE_EXPORT_METADATA_KEY) {
+        Ok(s) => {
+            crate::info_log!(
+                "[METADATA] Used safe_export_secret (PPRF) for metadata key, epoch {}",
+                epoch
+            );
+            s
+        }
+        Err(_) => {
+            crate::info_log!(
+                "[METADATA] safe_export_secret unavailable, falling back to export_secret for metadata key"
+            );
+            let context = build_exporter_context(group_id, epoch);
+            group
+                .export_secret(crypto, EXPORTER_LABEL, &context, EXPORTER_KEY_LENGTH)
+                .map_err(|e| MetadataError::ExportSecret(format!("{e:?}")))?
+        }
+    };
 
     let mut key = [0u8; 32];
     key.copy_from_slice(&secret);

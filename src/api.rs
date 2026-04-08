@@ -3025,7 +3025,7 @@ impl MLSContext {
         );
 
         crate::info_log!("[MLS-FFI] process_welcome: Calling StagedWelcome::new_from_welcome...");
-        let group = {
+        let mut group = {
             let provider = &inner.provider;
             StagedWelcome::new_from_welcome(
                 provider,
@@ -3084,7 +3084,7 @@ impl MLSContext {
             group.epoch().as_u64()
         );
         if let Err(e) = crate::async_runtime::block_on(
-            epoch_manager.export_current_epoch_secret(&group, &inner.provider),
+            epoch_manager.export_current_epoch_secret(&mut group, &inner.provider),
         ) {
             crate::warn_log!(
                 "[MLS-FFI] ⚠️ WARNING: Failed to export epoch secret after Welcome: {:?}",
@@ -3194,6 +3194,75 @@ impl MLSContext {
 
         Ok(ExportedSecret {
             secret: secret.to_vec(),
+        })
+    }
+
+    /// Export a secret using the Puncturable PRF tree (forward-secure within epoch).
+    ///
+    /// Falls back to `export_secret` with a deterministic label when the group
+    /// does not have an `application_export_tree` (legacy groups created before
+    /// extensions-draft-08).
+    pub fn safe_export_secret(
+        &self,
+        group_id: Vec<u8>,
+        component_id: u16,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group(&gid, |group, provider, _signer| {
+            match group.safe_export_secret(provider.crypto(), provider.storage(), component_id) {
+                Ok(secret) => Ok(secret),
+                Err(_) => {
+                    // Fallback: derive a deterministic label from the component ID
+                    let label = format!("catbird/safe-export/component/{}", component_id);
+                    let context = group_id.clone();
+                    group
+                        .export_secret(provider.crypto(), &label, &context, 32)
+                        .map_err(|_| MLSError::SecretExportFailed)
+                }
+            }
+        })
+    }
+
+    /// Export a secret from the pending commit's Puncturable PRF tree.
+    ///
+    /// Falls back to `export_secret` from the pending commit when the group
+    /// does not support safe export.
+    pub fn safe_export_secret_from_pending(
+        &self,
+        group_id: Vec<u8>,
+        component_id: u16,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group(&gid, |group, provider, _signer| {
+            match group.safe_export_secret_from_pending(
+                provider.crypto(),
+                provider.storage(),
+                component_id,
+            ) {
+                Ok(secret) => Ok(secret),
+                Err(_) => {
+                    // Fallback: derive a deterministic label from the component ID
+                    let label = format!("catbird/safe-export/component/{}", component_id);
+                    let context = group_id.clone();
+                    group
+                        .export_secret(provider.crypto(), &label, &context, 32)
+                        .map_err(|_| MLSError::SecretExportFailed)
+                }
+            }
         })
     }
 
@@ -3337,22 +3406,21 @@ impl MLSContext {
         crate::info_log!("[MLS-FFI] export_epoch_secret: Manually exporting epoch secret");
         crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
 
-        let guard = self.inner.lock().map_err(|e| {
+        let mut guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire read lock: {:?}", e);
             MLSError::ContextNotInitialized
         })?;
-        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
 
         let gid = GroupId::from_slice(&group_id);
+        let epoch_manager = inner.epoch_secret_manager().clone();
 
-        inner.with_group_ref(&gid, |group, provider| {
+        inner.with_group(&gid, |group, provider, _signer| {
             let epoch = group.epoch().as_u64();
             crate::debug_log!("[MLS-FFI] Exporting secret for epoch {}", epoch);
 
             crate::async_runtime::block_on(
-                inner
-                    .epoch_secret_manager()
-                    .export_current_epoch_secret(group, provider),
+                epoch_manager.export_current_epoch_secret(group, provider),
             )
             .map_err(|e| {
                 crate::error_log!("[MLS-FFI] ❌ Failed to export epoch secret: {:?}", e);
@@ -3379,15 +3447,15 @@ impl MLSContext {
             &group_id_hex[..std::cmp::min(16, group_id_hex.len())]
         );
 
-        let guard = self.inner.lock().map_err(|e| {
+        let mut guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
             MLSError::ContextNotInitialized
         })?;
-        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
 
         let gid = GroupId::from_slice(&group_id);
 
-        match inner.with_group_ref(&gid, |group, provider| {
+        match inner.with_group(&gid, |group, provider, _signer| {
             let epoch = group.epoch().as_u64();
             let metadata_reference_json = current_metadata_reference_json(group);
             if metadata_reference_json.is_none() {
@@ -3400,6 +3468,7 @@ impl MLSContext {
             let key = crate::metadata::derive_metadata_key_from_group(
                 group,
                 provider.crypto(),
+                provider.storage(),
                 &group_id,
                 epoch,
             )
@@ -3920,26 +3989,23 @@ impl MLSContext {
             let epoch = group.epoch().as_u64();
 
             // Metadata (sender-side): derive the metadata key for the new epoch
-            // from the group's exporter after merge. The group is now at the new epoch,
-            // so export_secret gives the same key that receivers will derive from
-            // their staged commits.
-            let mut context = Vec::with_capacity(group_id.len() + 8);
-            context.extend_from_slice(&group_id);
-            context.extend_from_slice(&epoch.to_be_bytes());
-
-            let metadata_info = match group.export_secret(
+            // from the group's exporter after merge. Uses safe_export_secret (PPRF)
+            // when available for intra-epoch forward secrecy, falling back to
+            // export_secret for legacy groups.
+            let metadata_info = match crate::metadata::derive_metadata_key_from_group(
+                group,
                 provider.crypto(),
-                "blue.catbird/group-metadata/v1",
-                &context,
-                32,
+                provider.storage(),
+                &group_id,
+                epoch,
             ) {
-                Ok(secret) => {
+                Ok(key) => {
                     crate::info_log!(
                         "[MLS-FFI] 🔑 merge_pending_commit: metadata key derived for epoch {}",
                         epoch
                     );
                     Some(CommitMetadataInfo {
-                        metadata_key: secret,
+                        metadata_key: key.to_vec(),
                         epoch,
                         metadata_reference_json: current_metadata_reference_json(group),
                     })
@@ -5021,6 +5087,22 @@ impl MlsCryptoContext for MLSContext {
             let wb = welcome.map(|w| w.tls_serialize_detached().unwrap_or_default());
             Ok((cb, wb))
         })
+    }
+
+    fn safe_export_secret(
+        &self,
+        group_id: Vec<u8>,
+        component_id: u16,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.safe_export_secret(group_id, component_id)
+    }
+
+    fn safe_export_secret_from_pending(
+        &self,
+        group_id: Vec<u8>,
+        component_id: u16,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.safe_export_secret_from_pending(group_id, component_id)
     }
 }
 
