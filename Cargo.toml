@@ -25,7 +25,7 @@ catbird-atproto = { path = "../catbird-atproto" }
 # - Group creation fails if GroupId already exists in storage
 # - join_by_external_commit deprecated → use external_commit_builder
 # - ProposalType, ExtensionType, CredentialType enums have Grease(u16) variant
-openmls = { version = "0.8", features = ["test-utils", "js", "extensions-draft-08"] }
+openmls = { version = "0.8", features = ["test-utils", "js", "extensions-draft-08", "fork-resolution"] }
 openmls_traits = { version = "0.5", features = ["extensions-draft-08"] }
 openmls_basic_credential = "0.5"
 openmls_libcrux_crypto = { version = "0.3", features = ["extensions-draft-08"] }
@@ -77,6 +77,8 @@ android = []
 browser = []
 # Echo bot testing binary — adds reqwest + clap + tracing-subscriber
 echo-bot = ["reqwest", "clap", "tracing-subscriber"]
+# Fork resolution via OpenMLS 0.8.1+ recover_fork_by_readding API.
+fork-resolution = []
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 openmls_sqlite_storage = { version = "0.2", features = ["extensions-draft-08"] }
