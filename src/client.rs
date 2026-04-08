@@ -322,6 +322,36 @@ where
         Ok(())
     }
 
+    /// Atomically swap participants in a single commit.
+    pub async fn swap_participants(
+        &self,
+        conversation_id: &str,
+        remove_dids: Vec<String>,
+        add_dids: Vec<String>,
+    ) -> Result<(), OrchestratorError> {
+        self.orchestrator
+            .swap_members(conversation_id, &remove_dids, &add_dids)
+            .await?;
+        for did in &remove_dids {
+            let _ = self.event_tx.send(ChatEvent::ParticipantLeft {
+                conversation_id: conversation_id.to_string(),
+                did: did.clone(),
+            });
+        }
+        for did in &add_dids {
+            let _ = self.event_tx.send(ChatEvent::ParticipantJoined {
+                conversation_id: conversation_id.to_string(),
+                participant: Participant {
+                    did: did.clone(),
+                    handle: None,
+                    display_name: None,
+                    role: "member".to_string(),
+                },
+            });
+        }
+        Ok(())
+    }
+
     /// Leave a conversation.
     pub async fn leave_conversation(&self, conversation_id: &str) -> Result<(), OrchestratorError> {
         self.orchestrator.leave_group(conversation_id).await

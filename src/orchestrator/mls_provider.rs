@@ -40,6 +40,19 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         member_identities: Vec<Vec<u8>>,
     ) -> Result<Vec<u8>, MLSError>;
 
+    /// Atomically swap members in a single commit: remove old and add new.
+    fn swap_members(
+        &self,
+        group_id: Vec<u8>,
+        remove_identities: Vec<Vec<u8>>,
+        add_key_packages: Vec<KeyPackageData>,
+    ) -> Result<AddMembersResult, MLSError> {
+        let _ = (group_id, remove_identities, add_key_packages);
+        Err(MLSError::Internal(
+            "swap_members not supported on this platform".to_string(),
+        ))
+    }
+
     fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError>;
 
     fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError>;
@@ -94,4 +107,16 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         identity: Vec<u8>,
         config: Option<GroupConfig>,
     ) -> Result<WelcomeResult, MLSError>;
+
+    /// Attempt fork resolution by removing and re-adding members.
+    /// Default returns OperationNotSupported.
+    fn recover_fork_by_readding(
+        &self,
+        _group_id: Vec<u8>,
+        _key_packages: Vec<Vec<u8>>,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "fork-resolution feature not available".to_string(),
+        })
+    }
 }

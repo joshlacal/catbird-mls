@@ -1240,6 +1240,21 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Atomically swap members in a single commit.
+    pub fn swap_members(
+        &self,
+        group_id: String,
+        remove_dids: Vec<String>,
+        add_dids: Vec<String>,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.swap_members(
+            &group_id,
+            &remove_dids,
+            &add_dids,
+        ))?;
+        Ok(())
+    }
+
     /// Leave a conversation.
     pub fn leave_group(&self, convo_id: String) -> Result<(), OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.leave_group(&convo_id))?;

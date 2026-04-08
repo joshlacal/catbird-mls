@@ -1015,6 +1015,149 @@ impl MLSContext {
         Ok(commit_data)
     }
 
+    /// Atomically swap members: remove old + add new in a single commit.
+    pub fn swap_members(
+        &self,
+        group_id: Vec<u8>,
+        remove_identities: Vec<Vec<u8>>,
+        add_key_packages: Vec<KeyPackageData>,
+    ) -> Result<AddMembersResult, MLSError> {
+        self.check_suspended()?;
+        crate::info_log!(
+            "[MLS-FFI] swap_members: {} removals + {} adds in group {}",
+            remove_identities.len(),
+            add_key_packages.len(),
+            hex::encode(&group_id)
+        );
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let kps: Vec<KeyPackage> = add_key_packages
+            .iter()
+            .enumerate()
+            .map(|(idx, kp_data)| {
+                if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
+                    match mls_msg.extract() {
+                        MlsMessageBodyIn::KeyPackage(kp_in) => {
+                            return kp_in
+                                .validate(inner.provider_crypto(), ProtocolVersion::default())
+                                .map_err(|e| {
+                                    crate::error_log!(
+                                        "[MLS-FFI] swap kp {} validate: {:?}",
+                                        idx,
+                                        e
+                                    );
+                                    MLSError::InvalidKeyPackage
+                                });
+                        }
+                        _ => {}
+                    }
+                }
+                let (kp_in, _) =
+                    KeyPackageIn::tls_deserialize_bytes(&kp_data.data).map_err(|e| {
+                        crate::error_log!("[MLS-FFI] swap kp {} deser: {:?}", idx, e);
+                        MLSError::SerializationError
+                    })?;
+                kp_in
+                    .validate(inner.provider_crypto(), ProtocolVersion::default())
+                    .map_err(|e| {
+                        crate::error_log!("[MLS-FFI] swap kp {} validate: {:?}", idx, e);
+                        MLSError::InvalidKeyPackage
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if kps.is_empty() {
+            return Err(MLSError::InvalidKeyPackage);
+        }
+
+        let kps: Vec<KeyPackage> = {
+            let mut seen = std::collections::HashSet::new();
+            kps.into_iter()
+                .filter(|kp| seen.insert(hex::encode(kp.leaf_node().signature_key().as_slice())))
+                .collect()
+        };
+        if kps.is_empty() {
+            return Err(MLSError::InvalidKeyPackage);
+        }
+
+        let gid = GroupId::from_slice(&group_id);
+        let (commit_data, welcome_data) = inner.with_group(&gid, |group, provider, signer| {
+            let mut indices = Vec::new();
+            for identity in &remove_identities {
+                for member in group.members() {
+                    if member.credential.serialized_content() == identity.as_slice() {
+                        indices.push(member.index);
+                        break;
+                    }
+                }
+            }
+            if indices.is_empty() {
+                return Err(MLSError::invalid_input("No members found to remove"));
+            }
+
+            let planned_ref = crate::metadata::planned_metadata_reference_json(
+                crate::metadata::current_metadata_reference(group).as_ref(),
+                crate::metadata::metadata_payload_from_group(group).is_some(),
+                false,
+            )
+            .map_err(|e| MLSError::Internal(format!("plan metadata ref: {:?}", e)))?;
+
+            let mut cb = group
+                .commit_builder()
+                .propose_removals(indices)
+                .propose_adds(kps.iter().cloned());
+            if let Some(ref_json) = planned_ref.clone() {
+                cb = cb.add_proposal(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json,
+                    ),
+                )));
+            }
+            let mut cs =
+                cb.load_psks(provider.storage())
+                    .map_err(|e| MLSError::AddMembersFailed {
+                        message: format!("swap load_psks: {:?}", e),
+                    })?;
+            if let Some(ref_json) = planned_ref {
+                let mut u = cs.app_data_dictionary_updater();
+                u.set(ComponentData::from_parts(
+                    crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                    ref_json.into(),
+                ));
+                cs.with_app_data_dictionary_updates(u.changes());
+            }
+            let bundle = cs
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
+                .map_err(|e| MLSError::AddMembersFailed {
+                    message: format!("swap build: {:?}", e),
+                })?
+                .stage_commit(provider)
+                .map_err(|e| MLSError::AddMembersFailed {
+                    message: format!("swap stage: {:?}", e),
+                })?;
+            let (commit, welcome, _) = bundle.into_contents();
+            let welcome = welcome.ok_or_else(|| MLSError::AddMembersFailed {
+                message: "swap: no Welcome".into(),
+            })?;
+            let cb = commit
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+            let wm = MlsMessageOut::from_welcome(welcome, ProtocolVersion::default());
+            let wb = wm
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+            Ok((cb, wb))
+        })?;
+        Ok(AddMembersResult {
+            commit_data,
+            welcome_data,
+        })
+    }
+
     /// Propose adding a member (does not commit)
     ///
     /// Creates a proposal that can be committed later with commit_pending_proposals.
@@ -1062,7 +1205,7 @@ impl MLSContext {
     /// Creates a proposal that can be committed later with commit_pending_proposals.
     ///
     /// # Arguments
-    /// * `group_id` - Group identifier  
+    /// * `group_id` - Group identifier
     /// * `member_identity` - DID bytes of member to remove
     ///
     /// # Returns
@@ -2071,7 +2214,7 @@ impl MLSContext {
                 // Distinguish between "future epoch" (might be a commit we need) vs "past epoch" (unrecoverable)
                 let msg_epoch = message_epoch.as_u64();
                 let cur_epoch = current_epoch.as_u64();
-                
+
                 if msg_epoch == cur_epoch + 1 {
                     // This could be an epoch-advancing Commit message we need to process
                     crate::warn_log!("[MLS-FFI] 📥 POTENTIAL EPOCH TRANSITION MESSAGE DETECTED!");
@@ -2164,7 +2307,7 @@ impl MLSContext {
                         })?;
 
                     crate::debug_log!("[MLS-FFI] Proposal ref computed: {}", hex::encode(&proposal_ref_bytes));
-                    
+
                     let proposal_info = match proposal {
                         Proposal::Add(add_proposal) => {
                             crate::debug_log!("[MLS-FFI] Add proposal detected");
@@ -2856,7 +2999,7 @@ impl MLSContext {
                 crate::error_log!("[MLS-FFI] ❌ ERROR: StagedWelcome::new_from_welcome failed!");
                 crate::error_log!("[MLS-FFI] ERROR: OpenMLS error details: {:?}", e);
                 crate::error_log!("[MLS-FFI] ERROR: Error type: {}", std::any::type_name_of_val(&e));
-                
+
                 // Map specific WelcomeError variants to corresponding MLSError types
                 match &e {
                     WelcomeError::NoMatchingKeyPackage => {
@@ -3038,10 +3181,7 @@ impl MLSContext {
     /// Get the MLS confirmation tag for a group.
     /// Returns the TLS-serialized confirmation tag bytes from storage.
     pub fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
-        crate::debug_log!(
-            "[MLS-FFI] get_confirmation_tag: {}",
-            hex::encode(&group_id)
-        );
+        crate::debug_log!("[MLS-FFI] get_confirmation_tag: {}", hex::encode(&group_id));
 
         let guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
@@ -3058,7 +3198,8 @@ impl MLSContext {
                 .map_err(|_| MLSError::StorageError)?;
             match tag {
                 Some(t) => {
-                    let bytes = t.tls_serialize_detached()
+                    let bytes = t
+                        .tls_serialize_detached()
                         .map_err(|e| MLSError::Internal(format!("TLS serialize: {}", e)))?;
                     crate::debug_log!("[MLS-FFI] Confirmation tag: {} bytes", bytes.len());
                     Ok(bytes)
@@ -4686,6 +4827,15 @@ impl MlsCryptoContext for MLSContext {
         self.remove_members(group_id, member_identities)
     }
 
+    fn swap_members(
+        &self,
+        group_id: Vec<u8>,
+        remove_identities: Vec<Vec<u8>>,
+        add_key_packages: Vec<KeyPackageData>,
+    ) -> Result<AddMembersResult, MLSError> {
+        self.swap_members(group_id, remove_identities, add_key_packages)
+    }
+
     fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
         self.merge_pending_commit(group_id).map(|r| r.new_epoch)
     }
@@ -4761,6 +4911,47 @@ impl MlsCryptoContext for MLSContext {
         config: Option<GroupConfig>,
     ) -> Result<WelcomeResult, MLSError> {
         self.process_welcome(welcome_data, identity, config)
+    }
+
+    /// Fork resolution via readd -- gated behind fork-resolution feature.
+    #[cfg(feature = "fork-resolution")]
+    fn recover_fork_by_readding(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<Vec<u8>>,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), MLSError> {
+        use openmls::prelude::*;
+        use tls_codec::Serialize as TlsSerialize;
+        crate::info_log!(
+            "[MLS-FFI] recover_fork_by_readding: group={}, kps={}",
+            hex::encode(&group_id),
+            key_packages.len()
+        );
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| MLSError::Internal(format!("Lock failed: {e}")))?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        inner.with_group_mut(&gid, |group, provider| {
+            let mut kps = Vec::new();
+            for kp_bytes in &key_packages {
+                let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
+                    .map_err(|_| MLSError::SerializationError)?;
+                let kp = kp_in
+                    .validate(provider.crypto(), ProtocolVersion::default())
+                    .map_err(|_| MLSError::InvalidKeyPackage)?;
+                kps.push(kp);
+            }
+            let (commit, welcome, _gi) = group
+                .recover_fork_by_readding(provider, &[], &kps)
+                .map_err(|e| MLSError::Internal(format!("Fork recovery failed: {e}")))?;
+            let cb = commit
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+            let wb = welcome.map(|w| w.tls_serialize_detached().unwrap_or_default());
+            Ok((cb, wb))
+        })
     }
 }
 

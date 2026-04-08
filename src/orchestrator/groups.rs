@@ -594,6 +594,119 @@ where
         Ok(())
     }
 
+    /// Atomically swap members: remove old devices + add new in one commit.
+    pub async fn swap_members(
+        &self,
+        group_id: &str,
+        remove_dids: &[String],
+        add_dids: &[String],
+    ) -> Result<()> {
+        self.check_shutdown().await?;
+        let user_did = self.require_user_did().await?;
+        tracing::info!(
+            group_id,
+            remove_count = remove_dids.len(),
+            add_count = add_dids.len(),
+            "swap_members"
+        );
+
+        let key_packages = self.api_client().get_key_packages(add_dids).await?;
+        let kp_data: Vec<crate::KeyPackageData> = key_packages
+            .iter()
+            .map(|kp| crate::KeyPackageData {
+                data: kp.key_package_data.clone(),
+            })
+            .collect();
+        let group_id_bytes = hex::decode(group_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        let remove_ids: Vec<Vec<u8>> = remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
+        let swap_result =
+            self.mls_context()
+                .swap_members(group_id_bytes.clone(), remove_ids, kp_data)?;
+
+        {
+            self.evict_stale_commits().await;
+            let hash = Sha256::digest(&swap_result.commit_data);
+            self.own_commits()
+                .lock()
+                .await
+                .insert(hash.to_vec(), Instant::now());
+        }
+
+        let server_result = self
+            .api_client()
+            .add_members(
+                group_id,
+                add_dids,
+                &swap_result.commit_data,
+                Some(&swap_result.welcome_data),
+            )
+            .await;
+
+        match server_result {
+            Ok(result) => {
+                if !result.success {
+                    let _ = self
+                        .mls_context()
+                        .clear_pending_commit(group_id_bytes.clone());
+                    return Err(OrchestratorError::MemberSyncFailed);
+                }
+                if let Some(ref receipt) = result.receipt {
+                    let _ = self.storage().store_sequencer_receipt(receipt).await;
+                }
+                let current_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+                if result.new_epoch > current_epoch {
+                    let merged_epoch = match self
+                        .mls_context()
+                        .merge_pending_commit(group_id_bytes.clone())
+                    {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::error!(error = %e, group_id, "merge failed after swap_members");
+                            let _ = self.storage().mark_needs_rejoin(group_id).await;
+                            return Err(e.into());
+                        }
+                    };
+                    {
+                        let mut states = self.group_states().lock().await;
+                        if let Some(gs) = states.get_mut(group_id) {
+                            gs.epoch = merged_epoch;
+                            gs.members.retain(|m| !remove_dids.contains(m));
+                            for did in add_dids {
+                                if !gs.members.contains(did) {
+                                    gs.members.push(did.clone());
+                                }
+                            }
+                            let sc = gs.clone();
+                            drop(states);
+                            let _ = self.storage().set_group_state(&sc).await;
+                        }
+                    }
+                } else {
+                    let _ = self
+                        .mls_context()
+                        .clear_pending_commit(group_id_bytes.clone());
+                }
+            }
+            Err(e) => {
+                let _ = self
+                    .mls_context()
+                    .clear_pending_commit(group_id_bytes.clone());
+                return Err(e);
+            }
+        }
+
+        let group_info = self
+            .mls_context()
+            .export_group_info(group_id_bytes, user_did.into_bytes())?;
+        let _ = self
+            .api_client()
+            .publish_group_info(group_id, &group_info)
+            .await;
+        tracing::info!(group_id, "swap_members complete");
+        Ok(())
+    }
+
     /// Leave a conversation.
     pub async fn leave_group(&self, convo_id: &str) -> Result<()> {
         self.check_shutdown().await?;

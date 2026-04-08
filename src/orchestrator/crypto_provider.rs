@@ -117,6 +117,19 @@ pub trait MLSCryptoProvider: Send + Sync {
         member_identities: Vec<Vec<u8>>,
     ) -> Result<Vec<u8>>;
 
+    /// Atomically swap members in a single commit.
+    fn swap_members(
+        &self,
+        group_id: Vec<u8>,
+        remove_identities: Vec<Vec<u8>>,
+        add_key_packages: Vec<CryptoKeyPackageData>,
+    ) -> Result<CryptoAddMembersResult> {
+        let _ = (group_id, remove_identities, add_key_packages);
+        Err(super::error::OrchestratorError::Internal(
+            "swap_members not supported on this platform".into(),
+        ))
+    }
+
     /// Merge a pending commit (after server confirms).
     fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64>;
 
@@ -160,3 +173,4 @@ pub trait MLSCryptoProvider: Send + Sync {
         identity: Vec<u8>,
     ) -> Result<CryptoKeyPackageResult>;
 }
+
