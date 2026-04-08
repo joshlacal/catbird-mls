@@ -1494,23 +1494,22 @@ impl MLSContext {
                         &signature_keys,
                         true, // with ratchet tree
                     ) {
-                        Ok(gi_out) => {
-                            match TlsSerialize::tls_serialize_detached(&gi_out) {
-                                Ok(bytes) => {
-                                    crate::debug_log!(
+                        Ok(gi_out) => match TlsSerialize::tls_serialize_detached(&gi_out) {
+                            Ok(bytes) => {
+                                crate::debug_log!(
                                         "[MLS-CONTEXT] Exported GroupInfo after external commit: {} bytes",
                                         bytes.len()
                                     );
-                                    Some(bytes)
-                                }
-                                Err(e) => {
-                                    crate::warn_log!(
-                                        "[MLS-CONTEXT] Failed to serialize exported GroupInfo: {:?}", e
-                                    );
-                                    None
-                                }
+                                Some(bytes)
                             }
-                        }
+                            Err(e) => {
+                                crate::warn_log!(
+                                    "[MLS-CONTEXT] Failed to serialize exported GroupInfo: {:?}",
+                                    e
+                                );
+                                None
+                            }
+                        },
                         Err(e) => {
                             crate::warn_log!(
                                 "[MLS-CONTEXT] Failed to export GroupInfo after external commit: {:?}", e

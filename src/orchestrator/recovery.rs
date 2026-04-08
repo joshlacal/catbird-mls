@@ -250,6 +250,133 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    pub(crate) async fn attempt_fork_readd(&self, convo_id: &str) -> Result<()> {
+        let user_did = self.require_user_did().await?;
+        let lock = self.rejoin_lock(convo_id).await;
+        let _g = match lock.try_lock() {
+            Ok(g) => g,
+            Err(_) => {
+                return Ok(());
+            }
+        };
+        let ok = {
+            let fds = self
+                .fork_detection_states()
+                .lock()
+                .map_err(|_| OrchestratorError::RecoveryFailed("lock".into()))?;
+            fds.get(convo_id)
+                .is_some_and(|s| s.readd_attempts < constants::FORK_READD_MAX_ATTEMPTS)
+        };
+        if !ok {
+            return Ok(());
+        }
+        {
+            let mut fds = self
+                .fork_detection_states()
+                .lock()
+                .map_err(|_| OrchestratorError::RecoveryFailed("lock".into()))?;
+            if let Some(s) = fds.get_mut(convo_id) {
+                s.readd_attempts += 1;
+            }
+        }
+        let gid =
+            hex::decode(convo_id).map_err(|_| OrchestratorError::InvalidInput("bad hex".into()))?;
+        let mems: Vec<String> = {
+            let st = self.group_states().lock().await;
+            st.get(convo_id)
+                .map(|g| g.members.clone())
+                .unwrap_or_default()
+        };
+        if mems.is_empty() {
+            self.escalate_fork_to_rejoin(convo_id).await;
+            return Err(OrchestratorError::RecoveryFailed("no members".into()));
+        }
+        let kp_refs = match self.api_client().get_key_packages(&mems).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(OrchestratorError::RecoveryFailed(format!("{e}")));
+            }
+        };
+        let kps: Vec<Vec<u8>> = kp_refs.iter().map(|r| r.key_package_data.clone()).collect();
+        let (commit, _) = match self
+            .mls_context()
+            .recover_fork_by_readding(gid.clone(), kps)
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(OrchestratorError::RecoveryFailed(format!("{e}")));
+            }
+        };
+        let tag = self
+            .mls_context()
+            .get_confirmation_tag(gid.clone())
+            .map(|t| base64::engine::general_purpose::STANDARD.encode(&t))
+            .ok();
+        if let Err(e) = self
+            .api_client()
+            .commit_group_change(convo_id, &commit, "forkReadd", tag.as_deref())
+            .await
+        {
+            let _ = self.mls_context().clear_pending_commit(gid);
+            self.escalate_fork_to_rejoin(convo_id).await;
+            return Err(OrchestratorError::RecoveryFailed(format!("{e}")));
+        }
+        match self.mls_context().merge_pending_commit(gid.clone()) {
+            Ok(ep) => {
+                {
+                    let mut st = self.group_states().lock().await;
+                    if let Some(gs) = st.get_mut(convo_id) {
+                        gs.epoch = ep;
+                        let sc = gs.clone();
+                        drop(st);
+                        let _ = self.storage().set_group_state(&sc).await;
+                    }
+                }
+                {
+                    let mut fds = self
+                        .fork_detection_states()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    fds.remove(convo_id);
+                }
+                self.decrypt_fail_counts().lock().await.remove(convo_id);
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .insert(convo_id.to_string(), ConversationState::Active);
+                if let Ok(gi) = self
+                    .mls_context()
+                    .export_group_info(gid, user_did.as_bytes().to_vec())
+                {
+                    let _ = self.api_client().publish_group_info(convo_id, &gi).await;
+                }
+                tracing::info!(convo_id, "Fork readd succeeded");
+                Ok(())
+            }
+            Err(e) => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                Err(OrchestratorError::RecoveryFailed(format!("{e}")))
+            }
+        }
+    }
+    async fn escalate_fork_to_rejoin(&self, convo_id: &str) {
+        {
+            let mut fds = self
+                .fork_detection_states()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            fds.remove(convo_id);
+        }
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
+        let _ = self.storage().mark_needs_rejoin(convo_id).await;
+        tracing::info!(convo_id, "Fork escalated to NeedsRejoin");
+    }
+
     pub(crate) async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
         let rejoin_lock = self.rejoin_lock(convo_id).await;
         let lock_guard = match rejoin_lock.try_lock() {

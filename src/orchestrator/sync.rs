@@ -95,7 +95,8 @@ where
                 *self.consecutive_sync_failures().lock().await = 0;
                 // Reset circuit breaker state on success
                 *self.circuit_breaker_tripped_at().lock().await = None;
-                *self.circuit_breaker_cooldown_secs().lock().await = constants::SYNC_CIRCUIT_BREAKER_BASE_SECS;
+                *self.circuit_breaker_cooldown_secs().lock().await =
+                    constants::SYNC_CIRCUIT_BREAKER_BASE_SECS;
             }
             Err(e) => {
                 let mut failures = self.consecutive_sync_failures().lock().await;
@@ -103,7 +104,8 @@ where
                 // If we just re-tripped the breaker, apply exponential backoff
                 if *failures >= self.config().max_consecutive_sync_failures {
                     let mut cooldown = self.circuit_breaker_cooldown_secs().lock().await;
-                    *cooldown = (*cooldown * 2).min(constants::SYNC_CIRCUIT_BREAKER_MAX_SECS); // cap at 5 minutes
+                    *cooldown = (*cooldown * 2).min(constants::SYNC_CIRCUIT_BREAKER_MAX_SECS);
+                    // cap at 5 minutes
                 }
                 tracing::error!(
                     error = %e,
@@ -297,7 +299,10 @@ where
 
                 // Fetch and process messages (includes commits) to advance local epoch.
                 // This is the primary catch-up path for commits missed between syncs.
-                match self.fetch_messages(&convo.group_id, None, 50, Some("commit")).await {
+                match self
+                    .fetch_messages(&convo.group_id, None, 50, Some("commit"))
+                    .await
+                {
                     Ok((msgs, _)) => {
                         if !msgs.is_empty() {
                             tracing::info!(

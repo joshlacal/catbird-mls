@@ -244,6 +244,7 @@ impl MLSStorageBackend for ClientStorageAdapter {
         let state_str = match state {
             ConversationState::Initializing => "initializing",
             ConversationState::Active => "active",
+            ConversationState::ForkDetected => "fork_detected",
             ConversationState::NeedsRejoin => "needs_rejoin",
             ConversationState::Failed => "failed",
         };

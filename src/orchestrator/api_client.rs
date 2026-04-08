@@ -183,11 +183,7 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// Called when the RecoveryTracker has maxed out External Commit attempts.
     /// The server tracks failure reports and auto-resets when a quorum of
     /// members report failure.
-    async fn report_recovery_failure(
-        &self,
-        convo_id: &str,
-        failure_type: &str,
-    ) -> Result<()> {
+    async fn report_recovery_failure(&self, convo_id: &str, failure_type: &str) -> Result<()> {
         let _ = (convo_id, failure_type);
         Err(crate::orchestrator::error::OrchestratorError::Api(
             "report_recovery_failure not implemented".into(),

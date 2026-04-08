@@ -519,22 +519,67 @@ where
                     conversation_id = %envelope.conversation_id,
                     "Decryption failed"
                 );
-                // Track consecutive decrypt failures for divergence detection
+                // Track consecutive decrypt failures for fork detection + divergence recovery
                 {
                     let mut counts = self.decrypt_fail_counts().lock().await;
                     let count = counts.entry(envelope.conversation_id.clone()).or_insert(0);
                     *count += 1;
                     if *count >= constants::DECRYPTION_FAILURE_THRESHOLD {
-                        tracing::error!(
-                            conversation_id = %envelope.conversation_id,
-                            failures = *count,
-                            "Consecutive decrypt failures — marking for rejoin"
-                        );
-                        let _ = self
-                            .storage()
-                            .mark_needs_rejoin(&envelope.conversation_id)
-                            .await;
-                        *count = 0;
+                        let fa = self
+                            .fork_detection_states()
+                            .lock()
+                            .ok()
+                            .and_then(|fds| fds.get(&envelope.conversation_id).cloned())
+                            .is_some_and(|s| s.readd_attempts < constants::FORK_READD_MAX_ATTEMPTS);
+                        if fa {
+                            tracing::info!(conversation_id = %envelope.conversation_id, "Fork readd in-flight, deferring");
+                        } else {
+                            tracing::error!(conversation_id = %envelope.conversation_id, failures = *count, "Marking for rejoin");
+                            if let Ok(mut fds) = self.fork_detection_states().lock() {
+                                fds.remove(&envelope.conversation_id);
+                            }
+                            self.conversation_states().lock().await.insert(
+                                envelope.conversation_id.clone(),
+                                ConversationState::NeedsRejoin,
+                            );
+                            let _ = self
+                                .storage()
+                                .mark_needs_rejoin(&envelope.conversation_id)
+                                .await;
+                            *count = 0;
+                        }
+                    } else if *count == constants::FORK_DETECTION_THRESHOLD {
+                        let cs = self
+                            .conversation_states()
+                            .lock()
+                            .await
+                            .get(&envelope.conversation_id)
+                            .copied()
+                            .unwrap_or(ConversationState::Active);
+                        if cs == ConversationState::Active {
+                            let ep = self
+                                .mls_context()
+                                .get_epoch(group_id_bytes.clone())
+                                .unwrap_or(0);
+                            tracing::info!(conversation_id = %envelope.conversation_id, epoch = ep, "Fork threshold -- readd");
+                            self.conversation_states().lock().await.insert(
+                                envelope.conversation_id.clone(),
+                                ConversationState::ForkDetected,
+                            );
+                            if let Ok(mut fds) = self.fork_detection_states().lock() {
+                                fds.insert(
+                                    envelope.conversation_id.clone(),
+                                    ForkDetectionState {
+                                        detected_at_epoch: ep,
+                                        readd_attempts: 0,
+                                    },
+                                );
+                            }
+                            let cid = envelope.conversation_id.clone();
+                            drop(counts);
+                            let _ = self.attempt_fork_readd(&cid).await;
+                            return Err(OrchestratorError::from(e));
+                        }
                     }
                 }
                 return Err(OrchestratorError::from(e));
@@ -546,6 +591,20 @@ where
             .lock()
             .await
             .remove(&envelope.conversation_id);
+        {
+            let was = self
+                .fork_detection_states()
+                .lock()
+                .ok()
+                .and_then(|mut fds| fds.remove(&envelope.conversation_id))
+                .is_some();
+            if was {
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .insert(envelope.conversation_id.clone(), ConversationState::Active);
+            }
+        }
 
         // Extract sender DID from credential
         let sender_did = String::from_utf8(decrypt_result.sender_credential.identity.clone())

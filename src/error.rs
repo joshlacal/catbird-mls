@@ -126,6 +126,9 @@ pub enum MLSError {
     /// Panic occurred (caught at FFI boundary)
     #[error("Internal panic: {0}")]
     Panic(String),
+
+    #[error("Operation not supported: {reason}")]
+    OperationNotSupported { reason: String },
 }
 
 impl MLSError {

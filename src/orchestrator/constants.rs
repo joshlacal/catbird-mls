@@ -12,6 +12,9 @@ pub const MAX_REJOIN_ATTEMPTS: u32 = 3;
 pub const GROUPINFO_404_CIRCUIT_BREAKER: u32 = 3;
 pub const MIN_REJOIN_INTERVAL: Duration = Duration::from_secs(30);
 
+pub const FORK_DETECTION_THRESHOLD: u32 = 2;
+pub const FORK_READD_MAX_ATTEMPTS: u32 = 1;
+
 // §10 Own-Commit TTL
 pub const OWN_COMMIT_TTL: Duration = Duration::from_secs(300);
 

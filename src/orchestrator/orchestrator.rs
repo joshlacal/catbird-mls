@@ -112,6 +112,7 @@ where
     decrypt_fail_counts: Mutex<HashMap<String, u32>>,
     /// Tracks consecutive GroupInfo 404 responses per conversation (spec §8.3).
     groupinfo_404_tracker: Mutex<GroupInfo404Tracker>,
+    fork_detection_states: std::sync::Mutex<HashMap<String, ForkDetectionState>>,
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -153,6 +154,7 @@ where
             failover_tracker: Mutex::new(SequencerFailoverTracker::new()),
             decrypt_fail_counts: Mutex::new(HashMap::new()),
             groupinfo_404_tracker: Mutex::new(GroupInfo404Tracker::new()),
+            fork_detection_states: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -177,6 +179,9 @@ where
         self.pending_messages.lock().await.clear();
         self.own_commits.lock().await.clear();
         self.rejoin_locks.lock().await.clear();
+        if let Ok(mut fds) = self.fork_detection_states.lock() {
+            fds.clear();
+        }
         *self.user_did.lock().await = None;
     }
 
@@ -319,5 +324,11 @@ where
     /// Access the GroupInfo 404 circuit breaker tracker.
     pub(crate) fn groupinfo_404_tracker(&self) -> &Mutex<GroupInfo404Tracker> {
         &self.groupinfo_404_tracker
+    }
+
+    pub(crate) fn fork_detection_states(
+        &self,
+    ) -> &std::sync::Mutex<HashMap<String, ForkDetectionState>> {
+        &self.fork_detection_states
     }
 }

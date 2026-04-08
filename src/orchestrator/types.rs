@@ -154,8 +154,15 @@ pub struct DeviceInfo {
 pub enum ConversationState {
     Initializing,
     Active,
+    ForkDetected,
     NeedsRejoin,
     Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForkDetectionState {
+    pub detected_at_epoch: u64,
+    pub readd_attempts: u32,
 }
 
 /// How the local user joined a conversation.

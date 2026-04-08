@@ -30,6 +30,7 @@ pub(crate) fn conversation_state_to_string(state: ConversationState) -> String {
     match state {
         ConversationState::Initializing => "initializing",
         ConversationState::Active => "active",
+            ConversationState::ForkDetected => "fork_detected",
         ConversationState::NeedsRejoin => "needs_rejoin",
         ConversationState::Failed => "failed",
     }

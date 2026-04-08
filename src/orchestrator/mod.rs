@@ -1,5 +1,5 @@
-pub mod constants;
 pub mod api_client;
+pub mod constants;
 pub mod credentials;
 pub mod devices;
 pub mod error;
@@ -15,8 +15,8 @@ pub mod sync;
 pub mod types;
 
 // Re-exports for convenience
-pub use constants::*;
 pub use api_client::MLSAPIClient;
+pub use constants::*;
 pub use credentials::CredentialStore;
 pub use error::{OrchestratorError, Result};
 pub use mls_provider::MlsCryptoContext;
