@@ -12,6 +12,9 @@ pub const MAX_REJOIN_ATTEMPTS: u32 = 3;
 pub const GROUPINFO_404_CIRCUIT_BREAKER: u32 = 3;
 pub const MIN_REJOIN_INTERVAL: Duration = Duration::from_secs(30);
 
+// §10 Own-Commit TTL
+pub const OWN_COMMIT_TTL: Duration = Duration::from_secs(300);
+
 // §10 Send Recovery
 pub const SEND_SYNC_BATCH_SIZE: u32 = 50;
 pub const SEND_SYNC_MAX_ROUNDS: u32 = 3;
@@ -30,8 +33,8 @@ pub const KEY_PACKAGE_CHECK_INTERVAL_SECS: u64 = 300;
 // §10 Rejoin Backoff — indexed by attempt number (0-based)
 pub const REJOIN_BACKOFF: [Duration; 3] = [
     Duration::from_secs(30),
-    Duration::from_secs(120),  // 2 minutes
-    Duration::from_secs(600),  // 10 minutes
+    Duration::from_secs(120), // 2 minutes
+    Duration::from_secs(600), // 10 minutes
 ];
 
 // §8.8 Sequencer Failover

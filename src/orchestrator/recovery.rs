@@ -364,12 +364,8 @@ where
             }
         }
 
-        // Delete old local group state
-        if let Ok(group_id_bytes) = hex::decode(convo_id) {
-            let _ = self.mls_context().delete_group(group_id_bytes);
-        }
-
-        // Fetch GroupInfo from server
+        // Fetch GroupInfo from server FIRST — only delete local state after success
+        // (spec: preserve local state if fetch fails so we can still decrypt)
         let group_info = match self.api_client().get_group_info(convo_id).await {
             Ok(gi) => {
                 // Success: clear 404 counter
@@ -395,15 +391,46 @@ where
             }
         };
 
+        // GroupInfo fetched successfully — now delete old local group state
+        if let Ok(group_id_bytes) = hex::decode(convo_id) {
+            let _ = self.mls_context().delete_group(group_id_bytes);
+        }
+
         // Create External Commit
         let identity_bytes = user_did.as_bytes().to_vec();
-        let ext_commit_result = self
+        let ext_commit_result = match self
             .mls_context()
             .create_external_commit(group_info, identity_bytes)
-            .map_err(|e| {
+        {
+            Ok(result) => result,
+            Err(e) => {
+                let err = OrchestratorError::RecoveryFailed(format!("External Commit failed: {e}"));
+                // Remote data errors (malformed GroupInfo) are unrecoverable —
+                // don't burn retries or delete local state further.
+                if err.is_remote_data_error() {
+                    tracing::error!(
+                        convo_id,
+                        error = %e,
+                        "External Commit failed due to malformed remote data — marking unrecoverable"
+                    );
+                    // Transition to Failed state without incrementing failure counter
+                    if let Err(report_err) = self
+                        .api_client()
+                        .report_recovery_failure(convo_id, "remote_data_error")
+                        .await
+                    {
+                        tracing::warn!(
+                            convo_id,
+                            error = %report_err,
+                            "Failed to report remote data recovery failure"
+                        );
+                    }
+                    return Err(err);
+                }
                 tracing::error!(error = %e, "External Commit creation failed");
-                OrchestratorError::RecoveryFailed(format!("External Commit failed: {e}"))
-            })?;
+                return Err(err);
+            }
+        };
 
         // group_id_hex used below when updating group state
 
@@ -505,6 +532,49 @@ where
             }
         }
 
+        // Seed lastSyncedSeq: fetch the latest message to get the current
+        // server sequence number so the next sync cycle doesn't re-process
+        // the entire backlog (spec: seed cursor after External Commit rejoin).
+        match self
+            .api_client()
+            .get_messages(convo_id, None, 1, None)
+            .await
+        {
+            Ok((_msgs, new_cursor)) => {
+                if let Some(cursor_val) = new_cursor {
+                    let user_did_for_cursor = user_did.to_string();
+                    let sync_cursor = SyncCursor {
+                        conversations_cursor: None,
+                        messages_cursor: Some(cursor_val.clone()),
+                    };
+                    if let Err(e) = self
+                        .storage()
+                        .set_sync_cursor(&user_did_for_cursor, &sync_cursor)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            convo_id,
+                            "Failed to seed sync cursor after rejoin"
+                        );
+                    } else {
+                        tracing::info!(
+                            convo_id,
+                            cursor = %cursor_val,
+                            "Seeded sync cursor after External Commit rejoin"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    convo_id,
+                    "Failed to fetch latest seq for sync cursor seeding"
+                );
+            }
+        }
+
         // Publish updated GroupInfo
         let group_info = self
             .mls_context()
@@ -557,9 +627,28 @@ where
                 self.clear_rejoin_failures(convo_id).await;
                 Ok(())
             }
-            Err(err) => {
+            Err(ref err) if err.is_rate_limited() => {
+                // 429 Too Many Requests: don't burn a rejoin attempt slot.
+                // Just return the error so the caller can retry later.
+                tracing::warn!(
+                    convo_id,
+                    "Force rejoin got 429 — not counting as failed attempt"
+                );
+                result
+            }
+            Err(ref err) if err.is_remote_data_error() => {
+                // Remote data errors are already handled in force_rejoin_unlocked
+                // (reported to server, marked unrecoverable). Don't record as
+                // normal failure — the error is on the server side.
+                tracing::warn!(
+                    convo_id,
+                    "Force rejoin failed due to remote data error — not counting as attempt"
+                );
+                result
+            }
+            Err(_) => {
                 self.record_rejoin_failure(convo_id).await;
-                Err(err)
+                result
             }
         }
     }
@@ -591,8 +680,8 @@ where
             }
         };
 
-        self.enforce_rejoin_backoff(convo_id).await?;
-
+        // Welcome should be tried unconditionally — backoff only applies to
+        // External Commit fallback (spec: Welcome is the preferred join path).
         tracing::info!(
             convo_id,
             "Attempting to join group (Welcome first, External Commit fallback)"
@@ -709,7 +798,8 @@ where
             }
         }
 
-        // Step 2: Fall back to External Commit
+        // Step 2: Fall back to External Commit (backoff applies here, not to Welcome)
+        self.enforce_rejoin_backoff(convo_id).await?;
         let rejoin_result = self.force_rejoin_unlocked(convo_id, &user_did).await;
         match rejoin_result {
             Ok(()) => {

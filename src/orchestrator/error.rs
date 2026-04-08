@@ -67,4 +67,23 @@ pub enum OrchestratorError {
     SyncPaused,
 }
 
+impl OrchestratorError {
+    /// Whether this error indicates corrupted/malformed remote data that will
+    /// never succeed on retry. Used by recovery to avoid burning rejoin
+    /// attempts on permanently bad GroupInfo blobs.
+    pub fn is_remote_data_error(&self) -> bool {
+        let msg = self.to_string().to_lowercase();
+        msg.contains("invalidvectorlength")
+            || msg.contains("endofstream")
+            || msg.contains("truncated")
+            || msg.contains("malformed")
+            || msg.contains("deseriali")
+    }
+
+    /// Whether this error represents a 429 Too Many Requests response.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, OrchestratorError::ServerError { status: 429, .. })
+    }
+}
+
 pub type Result<T> = std::result::Result<T, OrchestratorError>;

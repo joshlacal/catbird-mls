@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Mutex;
 use web_time::Instant;
 
-use super::constants;
 use super::api_client::MLSAPIClient;
+use super::constants;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::mls_provider::MlsCryptoContext;
@@ -249,18 +248,15 @@ where
         &self.own_commits
     }
 
-    /// TTL for own-commit hashes: entries older than this are evicted.
-    const OWN_COMMIT_TTL: Duration = Duration::from_secs(60);
-
     /// Evict own-commit entries older than `OWN_COMMIT_TTL`.
     ///
     /// Called before insertions to bound memory growth. Commits that haven't
-    /// been echoed back within 60 seconds are almost certainly orphaned.
+    /// been echoed back within 300 seconds are almost certainly orphaned.
     pub(crate) async fn evict_stale_commits(&self) {
         let now = Instant::now();
         let mut commits = self.own_commits.lock().await;
         let before = commits.len();
-        commits.retain(|_, ts| now.duration_since(*ts) < Self::OWN_COMMIT_TTL);
+        commits.retain(|_, ts| now.duration_since(*ts) < constants::OWN_COMMIT_TTL);
         let evicted = before - commits.len();
         if evicted > 0 {
             tracing::debug!(

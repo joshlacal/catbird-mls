@@ -95,7 +95,12 @@ where
             let mut cursor: Option<String> = None;
             for round in 0..constants::SEND_SYNC_MAX_ROUNDS {
                 match self
-                    .fetch_messages(conversation_id, cursor.as_deref(), constants::SEND_SYNC_BATCH_SIZE, Some("commit"))
+                    .fetch_messages(
+                        conversation_id,
+                        cursor.as_deref(),
+                        constants::SEND_SYNC_BATCH_SIZE,
+                        Some("commit"),
+                    )
                     .await
                 {
                     Ok((msgs, next_cursor)) => {
@@ -144,7 +149,7 @@ where
                 })?;
                 // Retry encryption after joining
                 self.mls_context()
-                    .encrypt_message(group_id_bytes.clone(), payload_bytes)?
+                    .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())?
             }
             Err(e) => return Err(OrchestratorError::from(e)),
         };
@@ -233,20 +238,156 @@ where
                 }
                 return Err(send_result.unwrap_err());
             }
-            Err(OrchestratorError::ServerError { status: 409, .. }) => {
-                // Epoch mismatch — surface to caller, do NOT force_rejoin here.
-                // External commits advance the epoch for all clients and cause an
-                // epoch inflation spiral when multiple clients are active.
-                // The caller (or the next sync cycle) should handle reconciliation.
+            Err(OrchestratorError::ServerError {
+                status: 409,
+                ref body,
+            }) => {
+                // Approach B: lightweight sync + single retry on 409 (epoch mismatch).
+                // NO External Commit — only catch up on pending commits and re-encrypt.
+                let remote = serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v["serverEpoch"].as_u64())
+                    .unwrap_or(0);
                 tracing::warn!(
                     conversation_id,
                     local_epoch = epoch,
-                    "Epoch mismatch (409) — message send rejected by server"
+                    remote_epoch = remote,
+                    "Epoch mismatch (409) — attempting Approach B lightweight sync"
                 );
-                return Err(OrchestratorError::EpochMismatch {
-                    local: epoch,
-                    remote: 0,
-                });
+
+                // Lightweight sync: fetch pending commits to advance local epoch
+                let mut any_processed = false;
+                let mut all_failed = true;
+                {
+                    let mut cursor: Option<String> = None;
+                    for round in 0..constants::SEND_SYNC_MAX_ROUNDS {
+                        match self
+                            .fetch_messages(
+                                conversation_id,
+                                cursor.as_deref(),
+                                constants::SEND_SYNC_BATCH_SIZE,
+                                Some("commit"),
+                            )
+                            .await
+                        {
+                            Ok((msgs, next_cursor)) => {
+                                if !msgs.is_empty() {
+                                    any_processed = true;
+                                    all_failed = false;
+                                    tracing::info!(
+                                        conversation_id,
+                                        round,
+                                        count = msgs.len(),
+                                        "409 recovery: processed pending commits"
+                                    );
+                                } else if !any_processed {
+                                    // Empty batch on first round — nothing to catch up on
+                                    all_failed = false;
+                                }
+                                if msgs.is_empty() || next_cursor.is_none() {
+                                    break;
+                                }
+                                cursor = next_cursor;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    conversation_id,
+                                    round,
+                                    error = %e,
+                                    "409 recovery: sync round failed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if all_failed {
+                    // All commit processing failed (WrongEpoch on all) — flag NEEDS_REJOIN
+                    tracing::error!(
+                        conversation_id,
+                        "409 recovery: all commits failed to process — flagging NEEDS_REJOIN"
+                    );
+                    let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                    return Err(OrchestratorError::EpochMismatch {
+                        local: epoch,
+                        remote,
+                    });
+                }
+
+                // Re-encrypt with updated epoch and retry ONCE
+                let retry_epoch = match self.mls_context().get_epoch(group_id_bytes.clone()) {
+                    Ok(e) => e,
+                    Err(_) => {
+                        let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                        return Err(OrchestratorError::EpochMismatch {
+                            local: epoch,
+                            remote,
+                        });
+                    }
+                };
+
+                let retry_encrypt = match self
+                    .mls_context()
+                    .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::error!(
+                            conversation_id,
+                            error = %e,
+                            "409 recovery: re-encryption failed — flagging NEEDS_REJOIN"
+                        );
+                        let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                        return Err(OrchestratorError::from(e));
+                    }
+                };
+
+                // Track the new commit for dedup
+                let retry_commit_hash = sha2::Sha256::digest(&retry_encrypt.ciphertext).to_vec();
+                self.own_commits()
+                    .lock()
+                    .await
+                    .insert(retry_commit_hash, web_time::Instant::now());
+
+                match self
+                    .api_client()
+                    .send_message_with_id(
+                        conversation_id,
+                        &retry_encrypt.ciphertext,
+                        retry_epoch,
+                        &message_id,
+                    )
+                    .await
+                {
+                    Ok(resp) => {
+                        self.failover_tracker()
+                            .lock()
+                            .await
+                            .record_success(conversation_id);
+                        tracing::info!(
+                            conversation_id,
+                            retry_epoch,
+                            "409 recovery: retry succeeded after lightweight sync"
+                        );
+                        Some(resp)
+                    }
+                    Err(OrchestratorError::ServerError { status: 409, .. }) => {
+                        // Second 409: flag conversation NEEDS_REJOIN, return error
+                        tracing::error!(
+                            conversation_id,
+                            "409 recovery: second 409 after sync — flagging NEEDS_REJOIN"
+                        );
+                        let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                        return Err(OrchestratorError::EpochMismatch {
+                            local: retry_epoch,
+                            remote,
+                        });
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
             }
             Err(_) => {
                 // Other errors — don't track as sequencer failure
