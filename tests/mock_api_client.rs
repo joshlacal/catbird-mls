@@ -407,6 +407,7 @@ impl MLSAPIClient for MockDeliveryService {
 
         let view = ConversationView {
             group_id: group_id.to_string(),
+            conversation_id: group_id.to_string(),
             epoch: 1,
             members: member_views,
             metadata: metadata.cloned(),

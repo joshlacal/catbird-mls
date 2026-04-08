@@ -223,6 +223,7 @@ impl MLSStorageBackend for BotStorage {
             .entry(conversation_id.to_string())
             .or_insert_with(|| ConversationView {
                 group_id: group_id.to_string(),
+                conversation_id: conversation_id.to_string(),
                 epoch: 0,
                 members: vec![],
                 metadata: None,
@@ -522,6 +523,7 @@ impl MLSAPIClient for HttpDSClient {
 
         let convo = parse_convo_view(&val["convo"]).unwrap_or(ConversationView {
             group_id: group_id.to_string(),
+            conversation_id: group_id.to_string(),
             epoch: 0,
             members: vec![],
             metadata: None,
@@ -1028,8 +1030,14 @@ fn parse_convo_view(val: &serde_json::Value) -> Option<ConversationView> {
         })
         .collect();
 
+    let conversation_id = val["conversationId"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
+
     Some(ConversationView {
         group_id,
+        conversation_id,
         epoch: val["epoch"].as_u64().unwrap_or(0),
         members,
         metadata: None,

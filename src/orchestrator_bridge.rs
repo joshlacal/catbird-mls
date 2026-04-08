@@ -228,6 +228,8 @@ pub struct FFIMemberView {
 #[derive(uniffi::Record, Clone)]
 pub struct FFIConversationView {
     pub group_id: String,
+    /// Stable conversation identifier (survives group resets).
+    pub conversation_id: String,
     pub epoch: u64,
     pub members: Vec<FFIMemberView>,
     pub name: Option<String>,
@@ -443,6 +445,7 @@ struct CredentialAdapter(Arc<dyn OrchestratorCredentialCallback>);
 fn convo_view_to_ffi(cv: &ConversationView) -> FFIConversationView {
     FFIConversationView {
         group_id: cv.group_id.clone(),
+        conversation_id: cv.conversation_id.clone(),
         epoch: cv.epoch,
         members: cv
             .members
@@ -466,6 +469,7 @@ fn convo_view_to_ffi(cv: &ConversationView) -> FFIConversationView {
 fn ffi_to_convo_view(ffi: &FFIConversationView) -> ConversationView {
     ConversationView {
         group_id: ffi.group_id.clone(),
+        conversation_id: ffi.conversation_id.clone(),
         epoch: ffi.epoch,
         members: ffi
             .members

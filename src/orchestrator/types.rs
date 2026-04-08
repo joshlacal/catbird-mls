@@ -30,13 +30,16 @@ pub type DID = String;
 /// Hex-encoded group ID
 pub type GroupId = String;
 
-/// Hex-encoded conversation ID (same as GroupId in current implementation)
+/// Stable conversation identifier (survives group resets).
 pub type ConversationId = String;
 
 /// A view of an MLS conversation, mirroring the server's ConvoView.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationView {
     pub group_id: GroupId,
+    /// Stable conversation identifier (survives group resets).
+    /// May differ from `group_id` after a group reset.
+    pub conversation_id: ConversationId,
     pub epoch: u64,
     pub members: Vec<MemberView>,
     pub metadata: Option<ConversationMetadata>,

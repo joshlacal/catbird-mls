@@ -257,7 +257,7 @@ where
 
                 let state = GroupState {
                     group_id: convo.group_id.clone(),
-                    conversation_id: convo.group_id.clone(),
+                    conversation_id: convo.conversation_id.clone(),
                     epoch,
                     members,
                 };
@@ -275,7 +275,7 @@ where
 
             // Ensure conversation record exists in storage
             self.storage()
-                .ensure_conversation_exists(user_did, &convo.group_id, &convo.group_id)
+                .ensure_conversation_exists(user_did, &convo.conversation_id, &convo.group_id)
                 .await?;
 
             // Check for epoch reconciliation — fetch and process missing commits

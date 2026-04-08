@@ -61,6 +61,7 @@ fn bridge_err(e: OrchestratorBridgeError) -> crate::orchestrator::error::Orchest
 fn ffi_to_convo_view(ffi: &crate::orchestrator_bridge::FFIConversationView) -> ConversationView {
     ConversationView {
         group_id: ffi.group_id.clone(),
+        conversation_id: ffi.conversation_id.clone(),
         epoch: ffi.epoch,
         members: ffi
             .members

@@ -96,14 +96,6 @@ where
         let group_id_bytes = hex::decode(group_id_hex)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
-        self.storage()
-            .ensure_conversation_exists(user_did, group_id_hex, group_id_hex)
-            .await?;
-
-        self.storage()
-            .update_join_info(group_id_hex, user_did, JoinMethod::Creator, 0)
-            .await?;
-
         // Create conversation on server (metadata is encrypted in MLS extensions, not sent as plaintext)
         let result = self
             .api_client()
@@ -115,6 +107,15 @@ where
             })?;
 
         let mut convo = result.conversation.clone();
+        let conversation_id = &convo.conversation_id;
+
+        self.storage()
+            .ensure_conversation_exists(user_did, conversation_id, group_id_hex)
+            .await?;
+
+        self.storage()
+            .update_join_info(conversation_id, user_did, JoinMethod::Creator, 0)
+            .await?;
 
         // Cache conversation
         self.conversations()
@@ -229,7 +230,7 @@ where
         let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
         let state = GroupState {
             group_id: group_id_hex.to_string(),
-            conversation_id: group_id_hex.to_string(),
+            conversation_id: convo.conversation_id.clone(),
             epoch: ffi_epoch,
             members,
         };
@@ -305,7 +306,7 @@ where
         let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
         let state = GroupState {
             group_id: group_id_hex.clone(),
-            conversation_id: group_id_hex.clone(),
+            conversation_id: convo.conversation_id.clone(),
             epoch: ffi_epoch,
             members,
         };
@@ -315,7 +316,7 @@ where
             .insert(group_id_hex.clone(), state.clone());
         self.storage().set_group_state(&state).await?;
         self.storage()
-            .ensure_conversation_exists(&user_did, &group_id_hex, &group_id_hex)
+            .ensure_conversation_exists(&user_did, &convo.conversation_id, &group_id_hex)
             .await?;
         self.storage()
             .update_join_info(&group_id_hex, &user_did, JoinMethod::Welcome, ffi_epoch)

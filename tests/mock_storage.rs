@@ -171,6 +171,7 @@ impl MLSStorageBackend for MockStorage {
                 join_epoch: None,
                 view: ConversationView {
                     group_id: group_id.to_string(),
+                    conversation_id: conversation_id.to_string(),
                     epoch: 0,
                     members: vec![],
                     metadata: None,

@@ -405,7 +405,7 @@ where
                 OrchestratorError::RecoveryFailed(format!("External Commit failed: {e}"))
             })?;
 
-        let _new_group_id_hex = hex::encode(&ext_commit_result.group_id);
+        // group_id_hex used below when updating group state
 
         // Get confirmation tag from the new local group state
         let tag_b64 = self
@@ -454,16 +454,18 @@ where
             })?;
 
         // Update group state (insert if missing, persist to storage)
+        let new_group_id_hex = hex::encode(&ext_commit_result.group_id);
         {
             let mut states = self.group_states().lock().await;
             let state = states
                 .entry(convo_id.to_string())
                 .or_insert_with(|| GroupState {
-                    group_id: convo_id.to_string(),
+                    group_id: new_group_id_hex.clone(),
                     conversation_id: convo_id.to_string(),
                     epoch: 0,
                     members: vec![],
                 });
+            state.group_id = new_group_id_hex;
             state.epoch = merged;
             let state_clone = state.clone();
             drop(states);
@@ -623,17 +625,19 @@ where
                             .unwrap_or(0);
 
                         // Update group state
+                        let welcome_group_id_hex = hex::encode(&result.group_id);
                         {
                             let mut states = self.group_states().lock().await;
                             let state =
                                 states
                                     .entry(convo_id.to_string())
                                     .or_insert_with(|| GroupState {
-                                        group_id: convo_id.to_string(),
+                                        group_id: welcome_group_id_hex.clone(),
                                         conversation_id: convo_id.to_string(),
                                         epoch: 0,
                                         members: vec![],
                                     });
+                            state.group_id = welcome_group_id_hex;
                             state.epoch = epoch;
                             let state_clone = state.clone();
                             drop(states);
