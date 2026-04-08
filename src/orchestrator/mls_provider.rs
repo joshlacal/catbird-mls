@@ -108,6 +108,21 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         config: Option<GroupConfig>,
     ) -> Result<WelcomeResult, MLSError>;
 
+    /// Clean up epoch secrets older than the retention window for a group.
+    ///
+    /// After every epoch advance, call this to delete secrets beyond the
+    /// retention window, enforcing forward secrecy and bounding storage.
+    /// Default no-op for platforms that don't manage epoch secrets at
+    /// the crypto context layer.
+    fn cleanup_epoch_secrets(
+        &self,
+        _group_id: Vec<u8>,
+        _current_epoch: u64,
+        _retention_epochs: u64,
+    ) -> Result<(), MLSError> {
+        Ok(())
+    }
+
     /// Attempt fork resolution by removing and re-adding members.
     /// Default returns OperationNotSupported.
     fn recover_fork_by_readding(
@@ -117,6 +132,34 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "fork-resolution feature not available".to_string(),
+        })
+    }
+
+    /// Export a secret using the Puncturable PRF tree (forward-secure within epoch).
+    ///
+    /// Falls back to `export_secret` with a deterministic label derived from the
+    /// component ID when the group lacks an `application_export_tree`.
+    /// Default implementation always falls back (platforms override for PPRF).
+    fn safe_export_secret(
+        &self,
+        _group_id: Vec<u8>,
+        _component_id: u16,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "safe_export_secret not available on this platform".to_string(),
+        })
+    }
+
+    /// Export a secret from the pending commit's Puncturable PRF tree.
+    ///
+    /// Default implementation returns OperationNotSupported.
+    fn safe_export_secret_from_pending(
+        &self,
+        _group_id: Vec<u8>,
+        _component_id: u16,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "safe_export_secret_from_pending not available on this platform".to_string(),
         })
     }
 }

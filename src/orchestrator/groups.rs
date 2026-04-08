@@ -216,6 +216,10 @@ where
                 // Update convo epoch
                 convo.epoch = merged_epoch;
 
+                // Cleanup old epoch secrets after initial member add
+                self.cleanup_epoch_secrets_if_needed(group_id_hex, merged_epoch)
+                    .await;
+
                 tracing::info!(
                     epoch = merged_epoch,
                     "Initial members added, epoch advanced"
@@ -441,6 +445,10 @@ where
                 }
             };
 
+            // Cleanup old epoch secrets after add_members epoch advance
+            self.cleanup_epoch_secrets_if_needed(group_id, merged_epoch)
+                .await;
+
             {
                 let mut states = self.group_states().lock().await;
                 if let Some(gs) = states.get_mut(group_id) {
@@ -566,6 +574,10 @@ where
             }
         };
 
+        // Cleanup old epoch secrets after remove_members epoch advance
+        self.cleanup_epoch_secrets_if_needed(group_id, merged_epoch)
+            .await;
+
         {
             let mut states = self.group_states().lock().await;
             if let Some(gs) = states.get_mut(group_id) {
@@ -667,6 +679,10 @@ where
                             return Err(e.into());
                         }
                     };
+                    // Cleanup old epoch secrets after swap_members epoch advance
+                    self.cleanup_epoch_secrets_if_needed(group_id, merged_epoch)
+                        .await;
+
                     {
                         let mut states = self.group_states().lock().await;
                         if let Some(gs) = states.get_mut(group_id) {
@@ -769,6 +785,10 @@ where
 
         // Merge pending commit locally
         let merged_epoch = self.mls_context().merge_pending_commit(group_id.clone())?;
+
+        // Cleanup old epoch secrets after metadata update epoch advance
+        self.cleanup_epoch_secrets_if_needed(conversation_id, merged_epoch)
+            .await;
 
         // Update group state cache
         {

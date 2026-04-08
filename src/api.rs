@@ -1954,6 +1954,18 @@ impl MLSContext {
                     let epoch_after = group.epoch().as_u64();
                     crate::info_log!("[DECRYPT] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
 
+                    // Cleanup old epoch secrets after incoming commit advances the epoch
+                    let retention_epochs = 5u64;
+                    if let Err(e) = crate::async_runtime::block_on(
+                        epoch_manager.cleanup_old_epochs(
+                            group.group_id().as_slice(),
+                            epoch_after,
+                            retention_epochs,
+                        )
+                    ) {
+                        crate::warn_log!("[DECRYPT] ⚠️ Failed to cleanup old epochs after staged commit merge: {:?}", e);
+                    }
+
                     Ok((vec![], epoch_after, sender_credential))
                 },
             }
@@ -2421,6 +2433,19 @@ impl MLSContext {
 
                     let epoch_after = group.epoch().as_u64();
                     crate::info_log!("[MLS-FFI] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
+
+                    // Cleanup old epoch secrets after incoming commit advances the epoch
+                    let retention_epochs = 5u64;
+                    if let Err(e) = crate::async_runtime::block_on(
+                        epoch_manager.cleanup_old_epochs(
+                            group.group_id().as_slice(),
+                            epoch_after,
+                            retention_epochs,
+                        )
+                    ) {
+                        crate::warn_log!("[MLS-FFI] ⚠️ Failed to cleanup old epochs after staged commit merge: {:?}", e);
+                    }
+
                     let metadata_reference_json = current_metadata_reference_json(group);
                     let metadata_info = metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
                         metadata_key,
@@ -2626,6 +2651,19 @@ impl MLSContext {
 
                         let epoch_after = group.epoch().as_u64();
                         crate::info_log!("[MLS-FFI-ASYNC] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
+
+                        // Cleanup old epoch secrets after incoming commit advances the epoch
+                        let retention_epochs = 5u64;
+                        if let Err(e) = crate::async_runtime::block_on(
+                            epoch_manager.cleanup_old_epochs(
+                                group.group_id().as_slice(),
+                                epoch_after,
+                                retention_epochs,
+                            )
+                        ) {
+                            crate::warn_log!("[MLS-FFI-ASYNC] ⚠️ Failed to cleanup old epochs after staged commit merge: {:?}", e);
+                        }
+
                         let metadata_reference_json = current_metadata_reference_json(group);
                         let metadata_info = metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
                             metadata_key,
@@ -4911,6 +4949,37 @@ impl MlsCryptoContext for MLSContext {
         config: Option<GroupConfig>,
     ) -> Result<WelcomeResult, MLSError> {
         self.process_welcome(welcome_data, identity, config)
+    }
+
+    fn cleanup_epoch_secrets(
+        &self,
+        group_id: Vec<u8>,
+        current_epoch: u64,
+        retention_epochs: u64,
+    ) -> Result<(), MLSError> {
+        if current_epoch <= retention_epochs {
+            return Ok(());
+        }
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let epoch_manager = inner.epoch_secret_manager().clone();
+        drop(guard);
+
+        if let Err(e) = crate::async_runtime::block_on(epoch_manager.cleanup_old_epochs(
+            &group_id,
+            current_epoch,
+            retention_epochs,
+        )) {
+            crate::warn_log!(
+                "[MLS-FFI] cleanup_epoch_secrets: failed for group {}: {:?}",
+                hex::encode(&group_id),
+                e
+            );
+        }
+        Ok(())
     }
 
     /// Fork resolution via readd -- gated behind fork-resolution feature.

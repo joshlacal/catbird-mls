@@ -136,4 +136,19 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     ) -> Result<Vec<SequencerReceipt>> {
         Ok(vec![])
     }
+
+    // -- Epoch Secret Cleanup --
+
+    /// Clean up platform-side epoch data older than the retention window.
+    ///
+    /// Platform storage implementations (iOS GRDB, catmos SQLite) can override
+    /// this to delete epoch-related records from their own tables.
+    /// Default no-op for backward compatibility.
+    async fn cleanup_old_epoch_data(
+        &self,
+        _conversation_id: &str,
+        _retain_from_epoch: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
 }

@@ -667,6 +667,10 @@ where
                 }
             }
 
+            // Cleanup old epoch secrets after commit advances the epoch
+            self.cleanup_epoch_secrets_if_needed(&envelope.conversation_id, decrypt_result.epoch)
+                .await;
+
             // Refresh cached metadata after commit (may contain GroupContextExtensions update)
             match self.get_group_metadata(&envelope.conversation_id) {
                 Ok(Some(meta)) => {

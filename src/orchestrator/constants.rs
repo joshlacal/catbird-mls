@@ -40,6 +40,15 @@ pub const REJOIN_BACKOFF: [Duration; 3] = [
     Duration::from_secs(600), // 10 minutes
 ];
 
+// §10 Epoch Secret Retention
+pub const MAX_PAST_EPOCHS_TO_RETAIN: u64 = 5;
+
 // §8.8 Sequencer Failover
 pub const FAILOVER_MIN_FAILURES: u32 = 3;
 pub const FAILOVER_MIN_DURATION: Duration = Duration::from_secs(120);
+
+// §Safe Export — Puncturable PRF component IDs (extensions-draft-08)
+/// Component ID for epoch blob decryption key (forward-secure within epochs).
+pub const SAFE_EXPORT_EPOCH_BLOB_KEY: u16 = 0;
+/// Component ID for group metadata encryption key (forward-secure within epochs).
+pub const SAFE_EXPORT_METADATA_KEY: u16 = 1;

@@ -325,6 +325,9 @@ where
         }
         match self.mls_context().merge_pending_commit(gid.clone()) {
             Ok(ep) => {
+                // Cleanup old epoch secrets after fork readd
+                self.cleanup_epoch_secrets_if_needed(convo_id, ep).await;
+
                 {
                     let mut st = self.group_states().lock().await;
                     if let Some(gs) = st.get_mut(convo_id) {
@@ -606,6 +609,9 @@ where
             .map_err(|e| {
                 OrchestratorError::RecoveryFailed(format!("Failed to merge external commit: {e}"))
             })?;
+
+        // Cleanup old epoch secrets after External Commit rejoin
+        self.cleanup_epoch_secrets_if_needed(convo_id, merged).await;
 
         // Update group state (insert if missing, persist to storage)
         let new_group_id_hex = hex::encode(&ext_commit_result.group_id);

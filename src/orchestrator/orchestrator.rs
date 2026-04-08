@@ -331,4 +331,60 @@ where
     ) -> &std::sync::Mutex<HashMap<String, ForkDetectionState>> {
         &self.fork_detection_states
     }
+
+    /// Clean up old epoch secrets after an epoch advance.
+    ///
+    /// Retains the last `MAX_PAST_EPOCHS_TO_RETAIN` epochs and deletes
+    /// everything older. Cleans up both the MLS crypto layer (via
+    /// `MlsCryptoContext`) and the platform storage layer (via
+    /// `MLSStorageBackend`). Non-fatal: logs warnings on failure.
+    pub(crate) async fn cleanup_epoch_secrets_if_needed(
+        &self,
+        conversation_id: &str,
+        current_epoch: u64,
+    ) {
+        let retention = constants::MAX_PAST_EPOCHS_TO_RETAIN;
+        if current_epoch <= retention {
+            return;
+        }
+        let cutoff_epoch = current_epoch - retention;
+
+        // Clean up via MLS crypto context (EpochSecretManager)
+        if let Ok(group_id_bytes) = hex::decode(conversation_id) {
+            if let Err(e) =
+                self.mls_context()
+                    .cleanup_epoch_secrets(group_id_bytes, current_epoch, retention)
+            {
+                tracing::warn!(
+                    error = %e,
+                    conversation_id,
+                    current_epoch,
+                    "Failed to cleanup epoch secrets via MLS context"
+                );
+            }
+        }
+
+        // Clean up via platform storage backend
+        if let Err(e) = self
+            .storage()
+            .cleanup_old_epoch_data(conversation_id, cutoff_epoch)
+            .await
+        {
+            tracing::warn!(
+                error = %e,
+                conversation_id,
+                cutoff_epoch,
+                "Failed to cleanup old epoch data in storage backend"
+            );
+        }
+
+        tracing::debug!(
+            conversation_id,
+            current_epoch,
+            cutoff_epoch,
+            "Cleaned up epoch secrets: retained from epoch {} to {}",
+            cutoff_epoch,
+            current_epoch,
+        );
+    }
 }
