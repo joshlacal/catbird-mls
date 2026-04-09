@@ -341,6 +341,43 @@ where
                 }
             }
 
+            // Commit any pending proposals (e.g. self-remove from departing members).
+            if let Ok(gid_bytes) = hex::decode(&convo.group_id) {
+                match self.mls_context().commit_pending_proposals(gid_bytes) {
+                    Ok(commit_bytes) => {
+                        tracing::info!(
+                            conversation_id = %convo.group_id,
+                            commit_len = commit_bytes.len(),
+                            "Committed pending proposals during sync"
+                        );
+                        if let Err(e) = self
+                            .api_client()
+                            .commit_group_change(
+                                &convo.group_id,
+                                &commit_bytes,
+                                "commitPendingProposals",
+                                None,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                conversation_id = %convo.group_id,
+                                "Failed to send pending proposals commit to server"
+                            );
+                        }
+                    }
+                    Err(crate::MLSError::InvalidInput { .. }) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            conversation_id = %convo.group_id,
+                            "Failed to commit pending proposals during sync"
+                        );
+                    }
+                }
+            }
+
             // Auto-consume needs_rejoin flag: if a previous sync or decrypt failure
             // flagged this conversation, attempt rejoin now (with rate-limiting).
             if self

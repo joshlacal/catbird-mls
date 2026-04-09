@@ -162,4 +162,10 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
             reason: "safe_export_secret_from_pending not available on this platform".to_string(),
         })
     }
+
+    /// Propose self-removal from a group.
+    fn propose_self_remove(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
+
+    /// Commit all pending proposals for a group and return the commit bytes.
+    fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
 }

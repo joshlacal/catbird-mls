@@ -1601,6 +1601,49 @@ impl MLSContext {
         }
     }
 
+    /// Propose self-removal from a group.
+    ///
+    /// Groups use PURE_CIPHERTEXT_WIRE_FORMAT_POLICY, so SelfRemove proposals
+    /// (always PublicMessage) are rejected. Uses leave_group() instead which
+    /// creates a Remove proposal as PrivateMessage.
+    pub fn propose_self_remove(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.check_suspended()?;
+        let group_id_hex = hex::encode(&group_id);
+        crate::info_log!(
+            "[MLS-FFI] propose_self_remove: Starting for group {}",
+            group_id_hex
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        let proposal_bytes = inner.with_group(&gid, |group, provider, signer| {
+            let proposal_msg = group.leave_group(provider, signer).map_err(|e| {
+                crate::error_log!("[MLS-FFI] propose_self_remove: leave_group failed: {:?}", e);
+                MLSError::OpenMLS(format!("leave_group failed: {:?}", e))
+            })?;
+
+            let bytes = proposal_msg
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+
+            crate::info_log!(
+                "[MLS-FFI] propose_self_remove: Created proposal ({} bytes) at epoch {}",
+                bytes.len(),
+                group.epoch().as_u64()
+            );
+
+            Ok(bytes)
+        })?;
+
+        Ok(proposal_bytes)
+    }
+
     pub fn encrypt_message(
         &self,
         group_id: Vec<u8>,
@@ -5103,6 +5146,14 @@ impl MlsCryptoContext for MLSContext {
         component_id: u16,
     ) -> Result<Vec<u8>, MLSError> {
         self.safe_export_secret_from_pending(group_id, component_id)
+    }
+
+    fn propose_self_remove(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        MLSContext::propose_self_remove(self, group_id)
+    }
+
+    fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        MLSContext::commit_pending_proposals(self, group_id)
     }
 }
 

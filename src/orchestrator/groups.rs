@@ -744,6 +744,115 @@ where
         self.leave_group(convo_id).await
     }
 
+    /// Leave a group via self-remove: propose own removal, send to group, then
+    /// notify the server and clean up locally.
+    pub async fn leave_via_self_remove(&self, convo_id: &str) -> Result<()> {
+        self.check_shutdown().await?;
+        let _user_did = self.require_user_did().await?;
+
+        tracing::info!(convo_id, "Leaving group via self-remove proposal");
+
+        let group_id_bytes = hex::decode(convo_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+
+        let proposal_bytes = self.mls_context().propose_self_remove(group_id_bytes)?;
+
+        let epoch = self
+            .group_states()
+            .lock()
+            .await
+            .get(convo_id)
+            .map(|gs| gs.epoch)
+            .unwrap_or(0);
+
+        let message_id = uuid::Uuid::new_v4().to_string();
+        if let Err(e) = self
+            .api_client()
+            .send_message_with_id(convo_id, &proposal_bytes, epoch, &message_id)
+            .await
+        {
+            tracing::warn!(error = %e, convo_id, "Self-remove proposal send failed, falling back");
+            self.api_client().leave_conversation(convo_id).await?;
+            self.force_delete_local(convo_id).await;
+            return Ok(());
+        }
+
+        if let Err(e) = self.api_client().leave_conversation(convo_id).await {
+            tracing::warn!(error = %e, convo_id, "Server-side leave failed (non-fatal)");
+        }
+
+        self.force_delete_local(convo_id).await;
+        tracing::info!(convo_id, "Left group via self-remove proposal");
+        Ok(())
+    }
+
+    /// Commit pending self-remove proposals for a group.
+    pub async fn commit_self_remove_proposals(&self, convo_id: &str) -> Result<()> {
+        self.check_shutdown().await?;
+        let user_did = self.require_user_did().await?;
+
+        tracing::info!(convo_id, "Committing pending self-remove proposals");
+
+        let group_id_bytes = hex::decode(convo_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+
+        let commit_bytes = match self
+            .mls_context()
+            .commit_pending_proposals(group_id_bytes.clone())
+        {
+            Ok(bytes) => bytes,
+            Err(crate::MLSError::InvalidInput { .. }) => {
+                tracing::debug!(convo_id, "No pending proposals to commit");
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        {
+            self.evict_stale_commits().await;
+            let hash = Sha256::digest(&commit_bytes);
+            self.own_commits()
+                .lock()
+                .await
+                .insert(hash.to_vec(), Instant::now());
+        }
+
+        self.api_client()
+            .commit_group_change(convo_id, &commit_bytes, "commitSelfRemove", None)
+            .await?;
+
+        let new_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+        {
+            let mut states = self.group_states().lock().await;
+            if let Some(gs) = states.get_mut(convo_id) {
+                gs.epoch = new_epoch;
+                let state_clone = gs.clone();
+                drop(states);
+                if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                    tracing::warn!(error = %e, convo_id, "Failed to persist group state");
+                }
+            }
+        }
+
+        let group_info = self
+            .mls_context()
+            .export_group_info(group_id_bytes, user_did.into_bytes())?;
+        if let Err(e) = self
+            .api_client()
+            .publish_group_info(convo_id, &group_info)
+            .await
+        {
+            tracing::warn!(error = %e, convo_id, "Failed to publish GroupInfo");
+        }
+
+        tracing::info!(
+            convo_id,
+            epoch = new_epoch,
+            "Self-remove proposals committed"
+        );
+        Ok(())
+    }
+
     /// Update encrypted group metadata (name, description, avatar_hash).
     ///
     /// Proposes a GroupContextExtensions commit, sends it to the server,
