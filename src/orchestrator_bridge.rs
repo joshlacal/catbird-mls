@@ -186,6 +186,18 @@ pub trait OrchestratorAPICallback: Send + Sync {
     ) -> Result<(), OrchestratorBridgeError>;
 
     fn get_group_info(&self, convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError>;
+
+    /// Fetch a pending Welcome message for a conversation.
+    ///
+    /// Platform impls should call the `blue.catbird.mlsChat.getGroupState`
+    /// lexicon with `include: "welcome"` and return the raw Welcome bytes.
+    ///
+    /// If no Welcome is available for this device (consumed, expired, or
+    /// never issued), return `OrchestratorBridgeError::ServerError` with
+    /// status 404 (or 410 for an explicitly expired Welcome). The
+    /// orchestrator uses the status code to distinguish "Welcome gone,
+    /// fall back to External Commit" from "transport error".
+    fn get_welcome(&self, convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError>;
 }
 
 /// Credential store callback interface for Swift/Kotlin.
@@ -392,6 +404,11 @@ pub enum OrchestratorBridgeError {
     InvalidInput { message: String },
     #[error("Voice error: {message}")]
     Voice { message: String },
+    /// Server returned a structured HTTP error. Used by Welcome / GroupInfo
+    /// fetch paths so the orchestrator can distinguish 404/410 ("no data
+    /// available for this device") from transport-level failures.
+    #[error("Server error: status={status}, body={body}")]
+    ServerError { status: u16, body: String },
 }
 
 impl From<OrchestratorError> for OrchestratorBridgeError {
@@ -419,6 +436,9 @@ impl From<OrchestratorError> for OrchestratorBridgeError {
             }
             OrchestratorError::InvalidInput(s) => {
                 OrchestratorBridgeError::InvalidInput { message: s }
+            }
+            OrchestratorError::ServerError { status, body } => {
+                OrchestratorBridgeError::ServerError { status, body }
             }
             other => OrchestratorBridgeError::Api {
                 message: other.to_string(),
@@ -587,6 +607,9 @@ fn bridge_err(e: OrchestratorBridgeError) -> OrchestratorError {
         OrchestratorBridgeError::Credential { message } => OrchestratorError::Credential(message),
         OrchestratorBridgeError::NotAuthenticated => OrchestratorError::NotAuthenticated,
         OrchestratorBridgeError::ShuttingDown => OrchestratorError::ShuttingDown,
+        OrchestratorBridgeError::ServerError { status, body } => {
+            OrchestratorError::ServerError { status, body }
+        }
         other => OrchestratorError::Api(other.to_string()),
     }
 }
@@ -1051,6 +1074,12 @@ impl MLSAPIClient for APIAdapter {
     async fn get_group_info(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
         self.0
             .get_group_info(convo_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
+        self.0
+            .get_welcome(convo_id.to_string())
             .map_err(bridge_err)
     }
 }
