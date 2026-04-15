@@ -120,8 +120,10 @@ where
 
     /// Internal sync implementation.
     async fn do_sync(&self, user_did: &str, _full_sync: bool) -> Result<()> {
+        crate::info_log!("[sync] do_sync start user_did={}", user_did);
         // Validate we're still the active account
         if !self.api_client().is_authenticated_as(user_did).await {
+            crate::info_log!("[sync] do_sync ABORT: not authenticated as {}", user_did);
             tracing::info!("Account not active, skipping sync");
             return Ok(());
         }
@@ -147,6 +149,10 @@ where
             }
         }
 
+        crate::info_log!(
+            "[sync] fetched {} convos from server (before member filter)",
+            all_convos.len()
+        );
         // Filter stale conversations (user no longer a member)
         let normalized_did = user_did.to_lowercase();
         let mut stale_ids = Vec::new();
@@ -156,10 +162,23 @@ where
                 .iter()
                 .any(|m| m.did.to_lowercase() == normalized_did);
             if !is_member {
+                let member_list: Vec<String> =
+                    convo.members.iter().map(|m| m.did.clone()).collect();
+                crate::info_log!(
+                    "[sync] convo={} filtered OUT: user_did={} not in members={:?}",
+                    convo.group_id,
+                    normalized_did,
+                    member_list
+                );
                 stale_ids.push(convo.group_id.clone());
             }
             is_member
         });
+        crate::info_log!(
+            "[sync] {} convos remain after member filter ({} filtered out)",
+            all_convos.len(),
+            stale_ids.len()
+        );
 
         // Clean up stale conversations
         if !stale_ids.is_empty() {
@@ -220,36 +239,65 @@ where
                 .await
                 .contains_key(&convo.group_id);
 
+            crate::info_log!(
+                "[sync] convo={} has_state_record={} ffi_has_group={}",
+                convo.group_id,
+                has_state_record,
+                ffi_has_group
+            );
+
             if has_state_record && !ffi_has_group {
                 tracing::warn!(
                     conversation_id = %convo.group_id,
                     "Persisted GroupState exists but MLS context has no group — \
                      stale state, falling through to join_or_rejoin"
                 );
+                crate::info_log!(
+                    "[sync] convo={} stale state detected, entering init path",
+                    convo.group_id
+                );
             }
 
             // Initialize group state if missing OR if the persisted record is stale.
             if !has_state_record || !ffi_has_group {
+                crate::info_log!("[sync] convo={} entering init block", convo.group_id);
                 let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
 
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
                 let epoch = if let Ok(gid_bytes) = hex::decode(&convo.group_id) {
                     match self.mls_context().get_epoch(gid_bytes) {
                         Ok(e) => e,
-                        Err(_) => {
+                        Err(e) => {
+                            crate::info_log!(
+                                "[sync] convo={} FFI get_epoch Err: {}",
+                                convo.group_id,
+                                e
+                            );
                             if !sync_rejoin_attempted.insert(convo.group_id.clone()) {
+                                crate::info_log!(
+                                    "[sync] convo={} SKIP: duplicate in cycle",
+                                    convo.group_id
+                                );
                                 tracing::debug!(
                                     conversation_id = %convo.group_id,
                                     "Skipping duplicate sync-triggered join/rejoin in same cycle"
                                 );
                                 convo.epoch
                             } else if !self.should_attempt_sync_rejoin(&convo.group_id).await {
+                                crate::info_log!(
+                                    "[sync] convo={} SKIP: eligibility gate rejected",
+                                    convo.group_id
+                                );
                                 tracing::debug!(
                                     conversation_id = %convo.group_id,
                                     "Skipping sync-triggered join/rejoin due to eligibility gate"
                                 );
                                 convo.epoch
                             } else {
+                                crate::info_log!(
+                                    "[sync] convo={} CALLING join_or_rejoin",
+                                    convo.group_id
+                                );
                                 // Group not in FFI — try Welcome first, fall back to External Commit
                                 tracing::info!(
                                     conversation_id = %convo.group_id,
