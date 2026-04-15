@@ -199,14 +199,37 @@ where
                 .await
                 .insert(convo.group_id.clone(), convo.clone());
 
-            // Initialize group state if missing
-            if self
+            // Detect a stale persisted GroupState: the orchestrator has a
+            // record for this convo, but the local MLS context does NOT have
+            // the group. This happens when a prior sync attempted to join,
+            // failed silently (e.g. an unimplemented FFI callback), and
+            // persisted GroupState anyway with the server epoch as a
+            // placeholder. From then on, every sync took the "update members"
+            // branch and never retried the join — so the device stayed
+            // permanently unable to encrypt or decrypt for this convo.
+            //
+            // Self-heal by treating the persisted state as missing so the
+            // init block below re-runs `join_or_rejoin`.
+            let ffi_has_group = match hex::decode(&convo.group_id) {
+                Ok(gid_bytes) => self.mls_context().get_epoch(gid_bytes).is_ok(),
+                Err(_) => false,
+            };
+            let has_state_record = self
                 .group_states()
                 .lock()
                 .await
-                .get(&convo.group_id)
-                .is_none()
-            {
+                .contains_key(&convo.group_id);
+
+            if has_state_record && !ffi_has_group {
+                tracing::warn!(
+                    conversation_id = %convo.group_id,
+                    "Persisted GroupState exists but MLS context has no group — \
+                     stale state, falling through to join_or_rejoin"
+                );
+            }
+
+            // Initialize group state if missing OR if the persisted record is stale.
+            if !has_state_record || !ffi_has_group {
                 let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
 
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
