@@ -11,7 +11,8 @@ use crate::orchestrator::{
     ConversationView, CreateConversationResult, CredentialStore, DeviceInfo, GroupState,
     IncomingEnvelope, JoinMethod, KeyPackageRef, KeyPackageStats, KeyPackageSyncResult,
     MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView, Message,
-    OrchestratorConfig, OrchestratorError, SendMessageResponse, SyncCursor,
+    OrchestratorConfig, OrchestratorError, ProcessExternalCommitResult, SendMessageResponse,
+    SyncCursor,
 };
 
 use crate::api::MLSContext;
@@ -198,6 +199,26 @@ pub trait OrchestratorAPICallback: Send + Sync {
     /// orchestrator uses the status code to distinguish "Welcome gone,
     /// fall back to External Commit" from "transport error".
     fn get_welcome(&self, convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError>;
+
+    /// Submit an External Commit to join/rejoin a conversation.
+    ///
+    /// Platform impls should POST to `blue.catbird.mlsChat.commitGroupChange`
+    /// with `action = "externalCommit"`, the commit bytes, optional
+    /// post-commit GroupInfo, and the base64-encoded MLS confirmation tag
+    /// from the new local group state. Return the server's new epoch and
+    /// `rejoinedAt` timestamp.
+    ///
+    /// On 409 (epoch race), return `ServerError { status: 409 }` — the
+    /// orchestrator treats this as a retryable failure without burning a
+    /// recovery attempt slot. On 429, return `ServerError { status: 429 }`
+    /// so the orchestrator can treat it as rate-limited (not a real failure).
+    fn process_external_commit(
+        &self,
+        convo_id: String,
+        commit_data: Vec<u8>,
+        group_info: Option<Vec<u8>>,
+        confirmation_tag: Option<String>,
+    ) -> Result<FFIProcessExternalCommitResult, OrchestratorBridgeError>;
 }
 
 /// Credential store callback interface for Swift/Kotlin.
@@ -304,6 +325,12 @@ pub struct FFICreateConversationResult {
 pub struct FFIAddMembersResult {
     pub success: bool,
     pub new_epoch: u64,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FFIProcessExternalCommitResult {
+    pub epoch: u64,
+    pub rejoined_at: String,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1081,6 +1108,29 @@ impl MLSAPIClient for APIAdapter {
         self.0
             .get_welcome(convo_id.to_string())
             .map_err(bridge_err)
+    }
+
+    async fn process_external_commit(
+        &self,
+        convo_id: &str,
+        commit_data: &[u8],
+        group_info: Option<&[u8]>,
+        confirmation_tag: Option<&str>,
+    ) -> crate::orchestrator::Result<ProcessExternalCommitResult> {
+        let result = self
+            .0
+            .process_external_commit(
+                convo_id.to_string(),
+                commit_data.to_vec(),
+                group_info.map(|b| b.to_vec()),
+                confirmation_tag.map(|s| s.to_string()),
+            )
+            .map_err(bridge_err)?;
+        Ok(ProcessExternalCommitResult {
+            epoch: result.epoch,
+            rejoined_at: result.rejoined_at,
+            receipt: None,
+        })
     }
 }
 
