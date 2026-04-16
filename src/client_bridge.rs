@@ -625,6 +625,35 @@ impl MLSAPIClient for ClientAPIAdapter {
             .get_group_info(convo_id.to_string())
             .map_err(bridge_err)
     }
+
+    async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
+        self.0
+            .get_welcome(convo_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn process_external_commit(
+        &self,
+        convo_id: &str,
+        commit_data: &[u8],
+        group_info: Option<&[u8]>,
+        confirmation_tag: Option<&str>,
+    ) -> crate::orchestrator::Result<crate::orchestrator::ProcessExternalCommitResult> {
+        let result = self
+            .0
+            .process_external_commit(
+                convo_id.to_string(),
+                commit_data.to_vec(),
+                group_info.map(|b| b.to_vec()),
+                confirmation_tag.map(|s| s.to_string()),
+            )
+            .map_err(bridge_err)?;
+        Ok(crate::orchestrator::ProcessExternalCommitResult {
+            epoch: result.epoch,
+            rejoined_at: result.rejoined_at,
+            receipt: None,
+        })
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
