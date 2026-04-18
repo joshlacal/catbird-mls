@@ -557,9 +557,21 @@ where
             }
         };
 
-        // GroupInfo fetched successfully — now delete old local group state
-        if let Ok(group_id_bytes) = hex::decode(convo_id) {
-            let _ = self.mls_context().delete_group(group_id_bytes);
+        // GroupInfo fetched successfully — now delete old local group state.
+        // Prefer the currently-bound group id from `group_states` so that
+        // post-reset conversations (convo_id != group_id_hex) delete the
+        // *old* local group rather than whatever hex::decode(convo_id)
+        // happens to produce. Fall back to the convo_id bytes for never-
+        // reset groups where the two are identical.
+        let old_group_id_bytes: Option<Vec<u8>> = {
+            let states = self.group_states().lock().await;
+            states
+                .get(convo_id)
+                .and_then(|gs| hex::decode(&gs.group_id).ok())
+        }
+        .or_else(|| hex::decode(convo_id).ok());
+        if let Some(bytes) = old_group_id_bytes {
+            let _ = self.mls_context().delete_group(bytes);
         }
 
         // Create External Commit
@@ -1046,6 +1058,210 @@ where
 
         tracing::info!("Silent recovery complete");
         Ok(())
+    }
+
+    /// Handle a server-initiated group reset (spec §8.5 Phase 1 / §8.6).
+    ///
+    /// Called by the platform SSE/WS layer when it receives a `GroupResetEvent`
+    /// for a conversation the server has auto-reset (quorum of members reported
+    /// `UNRECOVERABLE_LOCAL`). The flow:
+    ///
+    /// 1. Transition the conversation to `ResetPending { new_group_id,
+    ///    reset_generation, notified_at_ms }` and persist it so the payload
+    ///    survives orchestrator restart.
+    /// 2. Delete the old local MLS group (looked up via `group_states` so we
+    ///    drop the *pre-reset* group, not whatever `hex::decode(convo_id)`
+    ///    happens to yield).
+    /// 3. Reset the per-conversation `RecoveryTracker` counter to 0 — this is
+    ///    a fresh start from the server, not a continuation of a client-side
+    ///    retry loop. A previously exhausted conversation becomes eligible
+    ///    for a new attempt immediately. The global `MIN_REJOIN_INTERVAL`
+    ///    still applies (epoch-inflation guard).
+    /// 4. Update `group_states[convo_id].group_id = new_group_id_hex` so the
+    ///    subsequent `join_or_rejoin` fetches GroupInfo / Welcome for the
+    ///    *new* group.
+    /// 5. Call `join_or_rejoin(convo_id)` (Welcome first, ExternalCommit
+    ///    fallback — ADR-001 levels 1-3).
+    /// 6. On success: mark `Active`, clear the persisted RESET_PENDING payload.
+    ///    On failure: leave in `NeedsRejoin` so the normal deferred-recovery
+    ///    loop can retry.
+    ///
+    /// `new_group_id` is the raw bytes of the new MLS group id (not hex).
+    pub async fn handle_group_reset(
+        &self,
+        convo_id: &str,
+        new_group_id: Vec<u8>,
+        reset_generation: i32,
+    ) -> Result<()> {
+        self.check_shutdown().await?;
+        let new_group_id_hex = hex::encode(&new_group_id);
+        let notified_at_ms = chrono::Utc::now().timestamp_millis();
+
+        tracing::info!(
+            convo_id,
+            new_group_id = %new_group_id_hex,
+            reset_generation,
+            "Handling server-initiated GroupReset"
+        );
+
+        // 1. Transition to ResetPending + persist the payload.
+        {
+            let mut states = self.conversation_states().lock().await;
+            states.insert(
+                convo_id.to_string(),
+                ConversationState::ResetPending {
+                    new_group_id: new_group_id_hex.clone(),
+                    reset_generation,
+                    notified_at_ms,
+                },
+            );
+        }
+        if let Err(e) = self
+            .storage()
+            .set_conversation_state(convo_id, ConversationState::ResetPending {
+                new_group_id: new_group_id_hex.clone(),
+                reset_generation,
+                notified_at_ms,
+            })
+            .await
+        {
+            tracing::warn!(
+                convo_id,
+                error = %e,
+                "Failed to persist ResetPending state"
+            );
+        }
+        if let Err(e) = self
+            .storage()
+            .mark_reset_pending(
+                convo_id,
+                &new_group_id_hex,
+                reset_generation,
+                notified_at_ms,
+            )
+            .await
+        {
+            tracing::warn!(
+                convo_id,
+                error = %e,
+                "Failed to persist ResetPending payload via mark_reset_pending"
+            );
+        }
+
+        // 2. Delete the old local MLS group. Prefer group_states lookup; fall
+        // back to hex::decode(convo_id) for never-reset groups.
+        let old_group_id_bytes: Option<Vec<u8>> = {
+            let states = self.group_states().lock().await;
+            states
+                .get(convo_id)
+                .and_then(|gs| hex::decode(&gs.group_id).ok())
+        }
+        .or_else(|| hex::decode(convo_id).ok());
+        if let Some(bytes) = old_group_id_bytes {
+            if let Err(e) = self.mls_context().delete_group(bytes) {
+                // Non-fatal: the group may already be gone if a previous reset
+                // attempt partially completed.
+                tracing::warn!(
+                    convo_id,
+                    error = %e,
+                    "delete_group for pre-reset group failed (non-fatal)"
+                );
+            }
+        }
+
+        // 3. Clear any in-flight rejoin bookkeeping — server reset is a fresh
+        // start, not a continuation of our attempt counter.
+        {
+            let mut tracker = self.recovery_tracker().lock().await;
+            tracker.clear(convo_id);
+        }
+        self.groupinfo_404_tracker().lock().await.clear(convo_id);
+
+        // 4. Update group_states to point at the new group id so that any
+        // group-id-derived lookups (including the one inside
+        // force_rejoin_unlocked) see the new target.
+        {
+            let mut states = self.group_states().lock().await;
+            let entry = states.entry(convo_id.to_string()).or_insert_with(|| GroupState {
+                group_id: new_group_id_hex.clone(),
+                conversation_id: convo_id.to_string(),
+                epoch: 0,
+                members: vec![],
+            });
+            entry.group_id = new_group_id_hex.clone();
+            entry.epoch = 0;
+            let snap = entry.clone();
+            drop(states);
+            if let Err(e) = self.storage().set_group_state(&snap).await {
+                tracing::warn!(
+                    convo_id,
+                    error = %e,
+                    "Failed to persist group state rebinding on reset"
+                );
+            }
+        }
+
+        // 5. Schedule Phase 1 recovery: Welcome first, External Commit fallback.
+        // join_or_rejoin uses the api_client with the stable convo_id; the
+        // server is now serving Welcome/GroupInfo for the *new* group, so no
+        // extra plumbing is needed.
+        match self.join_or_rejoin(convo_id).await {
+            Ok(epoch) => {
+                // 6. Success: mark Active, clear persisted ResetPending flag.
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .insert(convo_id.to_string(), ConversationState::Active);
+                if let Err(e) = self
+                    .storage()
+                    .set_conversation_state(convo_id, ConversationState::Active)
+                    .await
+                {
+                    tracing::warn!(
+                        convo_id,
+                        error = %e,
+                        "Failed to persist Active state after reset adoption"
+                    );
+                }
+                if let Err(e) = self.storage().clear_reset_pending(convo_id).await {
+                    tracing::warn!(
+                        convo_id,
+                        error = %e,
+                        "Failed to clear reset_pending flag after success"
+                    );
+                }
+                tracing::info!(
+                    convo_id,
+                    epoch,
+                    new_group_id = %new_group_id_hex,
+                    reset_generation,
+                    "Group reset adopted successfully"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Adoption failed. Fall back to NeedsRejoin so the standard
+                // deferred-recovery loop retries (subject to the MIN_REJOIN
+                // interval + per-attempt backoff). We keep the mark_reset_pending
+                // payload persisted so a future restart can re-enter Phase 1.
+                tracing::error!(
+                    convo_id,
+                    error = %e,
+                    new_group_id = %new_group_id_hex,
+                    "Reset adoption failed — transitioning to NeedsRejoin"
+                );
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
+                let _ = self
+                    .storage()
+                    .set_conversation_state(convo_id, ConversationState::NeedsRejoin)
+                    .await;
+                let _ = self.storage().mark_needs_rejoin(convo_id).await;
+                Err(e)
+            }
+        }
     }
 
     /// Check desync severity between local and server key packages.
