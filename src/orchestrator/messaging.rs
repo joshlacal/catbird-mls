@@ -554,7 +554,7 @@ where
                             .lock()
                             .await
                             .get(&envelope.conversation_id)
-                            .copied()
+                            .cloned()
                             .unwrap_or(ConversationState::Active);
                         if cs == ConversationState::Active {
                             let ep = self

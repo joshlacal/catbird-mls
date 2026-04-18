@@ -121,7 +121,10 @@ impl MockStorage {
     #[allow(dead_code)]
     pub fn get_current_state(&self, conversation_id: &str) -> Option<ConversationState> {
         let inner = self.inner.lock().unwrap();
-        inner.conversations.get(conversation_id).map(|c| c.state)
+        inner
+            .conversations
+            .get(conversation_id)
+            .map(|c| c.state.clone())
     }
 
     /// Whether a group state exists for the given group_id.
@@ -238,10 +241,13 @@ impl MLSStorageBackend for MockStorage {
         state: ConversationState,
     ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let prev = inner.conversations.get(conversation_id).map(|c| c.state);
+        let prev = inner
+            .conversations
+            .get(conversation_id)
+            .map(|c| c.state.clone());
 
         if let Some(record) = inner.conversations.get_mut(conversation_id) {
-            record.state = state;
+            record.state = state.clone();
         }
 
         inner

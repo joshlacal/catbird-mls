@@ -70,6 +70,36 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     /// Clear the rejoin flag for a conversation.
     async fn clear_rejoin_flag(&self, conversation_id: &str) -> Result<()>;
 
+    /// Persist a server-initiated RESET_PENDING transition (spec §8.6).
+    ///
+    /// `new_group_id_hex` is the hex-encoded group id the server handed down
+    /// via `GroupResetEvent`. `reset_generation` is the monotonic reset
+    /// counter. `notified_at_ms` is when the event was observed locally
+    /// (Unix epoch ms).
+    ///
+    /// The orchestrator uses `set_conversation_state` to flip the tag to
+    /// `reset_pending` and this method to persist the payload so that, after
+    /// orchestrator restart, the platform layer can rehydrate a
+    /// `ConversationState::ResetPending { .. }` and resume Phase 1 recovery.
+    ///
+    /// Default no-op for backward compatibility; platforms should override
+    /// before relying on RESET_PENDING persistence.
+    async fn mark_reset_pending(
+        &self,
+        _conversation_id: &str,
+        _new_group_id_hex: &str,
+        _reset_generation: i32,
+        _notified_at_ms: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear any persisted RESET_PENDING payload for a conversation (called
+    /// after successful adoption of the new group).
+    async fn clear_reset_pending(&self, _conversation_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     // -- Messages --
 
     /// Store a decrypted message.

@@ -150,13 +150,52 @@ pub struct DeviceInfo {
 }
 
 /// State of a conversation from the orchestrator's perspective.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// This is the Rust-orchestrator internal enum; it is *not* the 7-state
+/// client-layer machine from spec §8.1. See `CLAUDE.md` ("Layering: Rust 5
+/// states vs spec 7 states") for the mapping.
+///
+/// `ResetPending` is carried here (rather than derived on the platform side)
+/// so the orchestrator's Phase-1 recovery path (spec §8.5) can schedule the
+/// External Commit against the *new* group id handed down by the server's
+/// `GroupResetEvent`. It must survive orchestrator restart — platform
+/// storage backends should persist the payload (hex-encoded group id +
+/// reset_generation + millis-since-epoch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationState {
     Initializing,
     Active,
     ForkDetected,
     NeedsRejoin,
+    /// The server has reset the group (quorum-based auto-reset, spec §8.6).
+    /// The orchestrator must delete local MLS state and join the new group.
+    ResetPending {
+        /// The new MLS group id handed down by the server, hex-encoded.
+        /// After successful adoption, `group_states[convo_id].group_id`
+        /// becomes this value.
+        new_group_id: String,
+        /// Server reset generation counter (monotonic per conversation).
+        reset_generation: i32,
+        /// When the GroupResetEvent was observed locally, as Unix
+        /// milliseconds. Stored as i64 (rather than SystemTime) so the
+        /// wire format is portable across platforms and wasm32.
+        notified_at_ms: i64,
+    },
     Failed,
+}
+
+impl ConversationState {
+    /// Short string tag used for logs, FFI bridges, and storage keys.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            ConversationState::Initializing => "initializing",
+            ConversationState::Active => "active",
+            ConversationState::ForkDetected => "fork_detected",
+            ConversationState::NeedsRejoin => "needs_rejoin",
+            ConversationState::ResetPending { .. } => "reset_pending",
+            ConversationState::Failed => "failed",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -241,15 +241,10 @@ impl MLSStorageBackend for ClientStorageAdapter {
         conversation_id: &str,
         state: ConversationState,
     ) -> crate::orchestrator::Result<()> {
-        let state_str = match state {
-            ConversationState::Initializing => "initializing",
-            ConversationState::Active => "active",
-            ConversationState::ForkDetected => "fork_detected",
-            ConversationState::NeedsRejoin => "needs_rejoin",
-            ConversationState::Failed => "failed",
-        };
+        // ResetPending's payload is persisted separately via set_group_state;
+        // the client callback only carries the tag.
         self.0
-            .set_conversation_state(conversation_id.to_string(), state_str.to_string())
+            .set_conversation_state(conversation_id.to_string(), state.tag().to_string())
             .map_err(bridge_err)
     }
 

@@ -27,14 +27,7 @@ pub(crate) fn join_method_to_string(jm: JoinMethod) -> String {
 }
 
 pub(crate) fn conversation_state_to_string(state: ConversationState) -> String {
-    match state {
-        ConversationState::Initializing => "initializing",
-        ConversationState::Active => "active",
-            ConversationState::ForkDetected => "fork_detected",
-        ConversationState::NeedsRejoin => "needs_rejoin",
-        ConversationState::Failed => "failed",
-    }
-    .to_string()
+    state.tag().to_string()
 }
 
 pub(crate) fn ffi_to_message(ffi: &FFIMessage) -> Message {
