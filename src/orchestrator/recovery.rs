@@ -1118,11 +1118,14 @@ where
         }
         if let Err(e) = self
             .storage()
-            .set_conversation_state(convo_id, ConversationState::ResetPending {
-                new_group_id: new_group_id_hex.clone(),
-                reset_generation,
-                notified_at_ms,
-            })
+            .set_conversation_state(
+                convo_id,
+                ConversationState::ResetPending {
+                    new_group_id: new_group_id_hex.clone(),
+                    reset_generation,
+                    notified_at_ms,
+                },
+            )
             .await
         {
             tracing::warn!(
@@ -1182,12 +1185,14 @@ where
         // force_rejoin_unlocked) see the new target.
         {
             let mut states = self.group_states().lock().await;
-            let entry = states.entry(convo_id.to_string()).or_insert_with(|| GroupState {
-                group_id: new_group_id_hex.clone(),
-                conversation_id: convo_id.to_string(),
-                epoch: 0,
-                members: vec![],
-            });
+            let entry = states
+                .entry(convo_id.to_string())
+                .or_insert_with(|| GroupState {
+                    group_id: new_group_id_hex.clone(),
+                    conversation_id: convo_id.to_string(),
+                    epoch: 0,
+                    members: vec![],
+                });
             entry.group_id = new_group_id_hex.clone();
             entry.epoch = 0;
             let snap = entry.clone();

@@ -622,9 +622,7 @@ impl MLSAPIClient for ClientAPIAdapter {
     }
 
     async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
-        self.0
-            .get_welcome(convo_id.to_string())
-            .map_err(bridge_err)
+        self.0.get_welcome(convo_id.to_string()).map_err(bridge_err)
     }
 
     async fn process_external_commit(

@@ -265,10 +265,7 @@ where
 
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
                 let epoch = if let Ok(gid_bytes) = hex::decode(&convo.group_id) {
-                    crate::info_log!(
-                        "[sync] convo={} pre-get_epoch call",
-                        convo.group_id
-                    );
+                    crate::info_log!("[sync] convo={} pre-get_epoch call", convo.group_id);
                     match self.mls_context().get_epoch(gid_bytes) {
                         Ok(e) => {
                             crate::info_log!(
