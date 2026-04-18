@@ -3359,6 +3359,28 @@ impl MLSContext {
         })
     }
 
+    /// Return the RFC 9420 §8.7 `epoch_authenticator` for the group's current
+    /// epoch. Used to bind quorum-reset reports (spec §8.6 / ADR-002) so that a
+    /// stale client can't forge a vote for an epoch it never observed.
+    pub fn epoch_authenticator(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        crate::debug_log!("[MLS-FFI] epoch_authenticator: {}", hex::encode(&group_id));
+
+        let guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group_ref(&gid, |group, _provider| {
+            let auth = group.epoch_authenticator();
+            let bytes = auth.as_slice().to_vec();
+            crate::debug_log!("[MLS-FFI] epoch_authenticator: {} bytes", bytes.len());
+            Ok(bytes)
+        })
+    }
+
     /// Read encrypted group metadata from MLS group context.
     /// Returns JSON bytes of the metadata, or empty vec if none set.
     pub fn get_group_metadata(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
@@ -4997,6 +5019,10 @@ impl MlsCryptoContext for MLSContext {
 
     fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         self.get_confirmation_tag(group_id)
+    }
+
+    fn epoch_authenticator(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.epoch_authenticator(group_id)
     }
 
     fn export_group_info(

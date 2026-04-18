@@ -416,10 +416,19 @@ where
             );
             // Drop lock before async call
             drop(tracker);
-            // Report failure to server for quorum-based auto-reset
+            // Report failure to server for quorum-based auto-reset. Bind the
+            // report to the local epoch_authenticator (ADR-002 / §8.6) so
+            // stale clients can't forge quorum votes. `None` retains pre-A7
+            // behavior; servers that accept the hint will reject mismatched
+            // authenticators.
+            let authenticator = self.epoch_authenticator_hex(convo_id);
             if let Err(e) = self
                 .api_client()
-                .report_recovery_failure(convo_id, "external_commit_exhausted")
+                .report_recovery_failure(
+                    convo_id,
+                    "external_commit_exhausted",
+                    authenticator.as_deref(),
+                )
                 .await
             {
                 tracing::warn!(
@@ -479,6 +488,33 @@ where
     fn local_group_epoch(&self, convo_id: &str) -> Option<u64> {
         let group_id_bytes = hex::decode(convo_id).ok()?;
         self.mls_context().get_epoch(group_id_bytes).ok()
+    }
+
+    /// Best-effort helper that returns the hex-encoded epoch_authenticator for
+    /// the group currently bound to `convo_id`.
+    ///
+    /// Walks the orchestrator's `group_states` cache first so that post-reset
+    /// conversations (where `convo_id != group_id_hex`) resolve correctly;
+    /// falls back to `hex::decode(convo_id)` for never-reset groups.
+    /// Returns `None` if the context can't produce an authenticator (platform
+    /// default stub, missing group, or remote-data error) so the caller can
+    /// pass the original pre-A7 `None` payload.
+    pub(crate) fn epoch_authenticator_hex(&self, convo_id: &str) -> Option<String> {
+        let group_id_bytes = {
+            if let Ok(states) = self.group_states().try_lock() {
+                states
+                    .get(convo_id)
+                    .and_then(|gs| hex::decode(&gs.group_id).ok())
+            } else {
+                None
+            }
+        }
+        .or_else(|| hex::decode(convo_id).ok())?;
+
+        self.mls_context()
+            .epoch_authenticator(group_id_bytes)
+            .ok()
+            .map(hex::encode)
     }
 
     async fn force_rejoin_unlocked(&self, convo_id: &str, user_did: &str) -> Result<()> {
@@ -544,9 +580,14 @@ where
                         "External Commit failed due to malformed remote data — marking unrecoverable"
                     );
                     // Transition to Failed state without incrementing failure counter
+                    let authenticator = self.epoch_authenticator_hex(convo_id);
                     if let Err(report_err) = self
                         .api_client()
-                        .report_recovery_failure(convo_id, "remote_data_error")
+                        .report_recovery_failure(
+                            convo_id,
+                            "remote_data_error",
+                            authenticator.as_deref(),
+                        )
                         .await
                     {
                         tracing::warn!(

@@ -183,8 +183,23 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// Called when the RecoveryTracker has maxed out External Commit attempts.
     /// The server tracks failure reports and auto-resets when a quorum of
     /// members report failure.
-    async fn report_recovery_failure(&self, convo_id: &str, failure_type: &str) -> Result<()> {
-        let _ = (convo_id, failure_type);
+    ///
+    /// Per ADR-002 / spec §8.6 the server binds a quorum report to the local
+    /// `epoch_authenticator` (RFC 9420 §8.7) so that a stale client can't
+    /// forge a quorum vote for an epoch it never observed. `epoch_authenticator`
+    /// is the hex-encoded authenticator for the local epoch when the report
+    /// was raised.
+    ///
+    /// `None` preserves pre-A7 behavior so platforms can soft-ship before
+    /// servers enforce the binding. Once A7 lands on the server, clients MUST
+    /// pass `Some(hex)`.
+    async fn report_recovery_failure(
+        &self,
+        convo_id: &str,
+        failure_type: &str,
+        epoch_authenticator: Option<&str>,
+    ) -> Result<()> {
+        let _ = (convo_id, failure_type, epoch_authenticator);
         Err(crate::orchestrator::error::OrchestratorError::Api(
             "report_recovery_failure not implemented".into(),
         ))

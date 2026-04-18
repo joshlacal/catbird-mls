@@ -61,6 +61,18 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
 
+    /// Return the RFC 9420 §8.7 `epoch_authenticator` for the group's current
+    /// epoch. Platforms bind quorum-reset reports (§8.6) to this value so a
+    /// stale client can't forge votes for an epoch it never observed.
+    ///
+    /// Default returns `OperationNotSupported` so existing platforms continue
+    /// to compile until they wire up the OpenMLS exposure.
+    fn epoch_authenticator(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "epoch_authenticator not available on this platform".to_string(),
+        })
+    }
+
     fn export_group_info(
         &self,
         group_id: Vec<u8>,
