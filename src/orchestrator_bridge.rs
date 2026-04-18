@@ -65,6 +65,33 @@ pub trait OrchestratorStorageCallback: Send + Sync {
         state: String,
     ) -> Result<(), OrchestratorBridgeError>;
 
+    /// Persist the `RESET_PENDING` payload for a server-initiated group reset.
+    ///
+    /// Called from `MLSOrchestrator::handle_group_reset` before any local MLS
+    /// state mutation, so the platform can recover the pending-reset target on
+    /// restart (spec §8.5 Phase 1 / ADR-001 level 3).
+    ///
+    /// - `conversation_id`: stable conversation id.
+    /// - `new_group_id_hex`: hex-encoded new MLS group id advertised by the DS.
+    /// - `reset_generation`: monotonic reset counter from the DS.
+    /// - `notified_at_ms`: Unix millis when the notification was observed.
+    ///
+    /// The Rust trait (`MLSStorageBackend::mark_reset_pending`) provides a
+    /// no-op default; platforms that haven't adopted the payload may keep the
+    /// generated callback stub empty and the behavior is unchanged.
+    fn mark_reset_pending(
+        &self,
+        conversation_id: String,
+        new_group_id_hex: String,
+        reset_generation: i32,
+        notified_at_ms: i64,
+    ) -> Result<(), OrchestratorBridgeError>;
+
+    /// Clear any persisted `RESET_PENDING` payload after the conversation has
+    /// successfully adopted the new group.
+    fn clear_reset_pending(&self, conversation_id: String)
+        -> Result<(), OrchestratorBridgeError>;
+
     fn mark_needs_rejoin(&self, conversation_id: String) -> Result<(), OrchestratorBridgeError>;
     fn needs_rejoin(&self, conversation_id: String) -> Result<bool, OrchestratorBridgeError>;
     fn clear_rejoin_flag(&self, conversation_id: String) -> Result<(), OrchestratorBridgeError>;
@@ -219,6 +246,32 @@ pub trait OrchestratorAPICallback: Send + Sync {
         group_info: Option<Vec<u8>>,
         confirmation_tag: Option<String>,
     ) -> Result<FFIProcessExternalCommitResult, OrchestratorBridgeError>;
+
+    /// Report that recovery has been exhausted for a conversation.
+    ///
+    /// Called by the orchestrator's `RecoveryTracker` when a conversation has
+    /// hit `MAX_REJOIN_ATTEMPTS` external-commit failures (S1.1 of the §8
+    /// recovery pyramid). The platform impl should POST to
+    /// `blue.catbird.mlsChat.reportRecoveryFailure` so the server can
+    /// accumulate quorum reports and trigger an automatic group reset (S2)
+    /// per ADR-002 §6.
+    ///
+    /// `failure_type` is one of `"external_commit_exhausted"`,
+    /// `"remote_data_error"`, or future variants.
+    ///
+    /// `epoch_authenticator` is the hex-encoded local epoch authenticator
+    /// (RFC 9420 §8.7) when present — binds the report to a specific epoch
+    /// so stale clients can't forge quorum votes. `None` is accepted by
+    /// pre-A7 servers; once A7 ships, servers MAY require it.
+    ///
+    /// Errors should be returned (not swallowed); the orchestrator logs but
+    /// does not retry, since the local state is already terminal.
+    fn report_recovery_failure(
+        &self,
+        convo_id: String,
+        failure_type: String,
+        epoch_authenticator: Option<String>,
+    ) -> Result<(), OrchestratorBridgeError>;
 }
 
 /// Credential store callback interface for Swift/Kotlin.
@@ -718,12 +771,39 @@ impl MLSStorageBackend for StorageAdapter {
         conversation_id: &str,
         state: ConversationState,
     ) -> crate::orchestrator::Result<()> {
-        // NOTE: the UniFFI bridge currently only carries the state *tag* across
-        // the boundary. The `ResetPending` payload (new_group_id, reset_generation,
-        // notified_at_ms) is handled through `set_group_state` and a future
-        // `mark_reset_pending` callback; see `handle_group_reset` for the full flow.
+        // The UniFFI bridge carries only the state *tag* across the boundary.
+        // For the `ResetPending` variant the full payload (new_group_id,
+        // reset_generation, notified_at_ms) is forwarded separately via
+        // `mark_reset_pending`; `handle_group_reset` in `recovery.rs` is the
+        // call site that invokes both in sequence.
         self.0
             .set_conversation_state(conversation_id.to_string(), state.tag().to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn mark_reset_pending(
+        &self,
+        conversation_id: &str,
+        new_group_id_hex: &str,
+        reset_generation: i32,
+        notified_at_ms: i64,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .mark_reset_pending(
+                conversation_id.to_string(),
+                new_group_id_hex.to_string(),
+                reset_generation,
+                notified_at_ms,
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn clear_reset_pending(
+        &self,
+        conversation_id: &str,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .clear_reset_pending(conversation_id.to_string())
             .map_err(bridge_err)
     }
 
@@ -1126,6 +1206,21 @@ impl MLSAPIClient for APIAdapter {
             rejoined_at: result.rejoined_at,
             receipt: None,
         })
+    }
+
+    async fn report_recovery_failure(
+        &self,
+        convo_id: &str,
+        failure_type: &str,
+        epoch_authenticator: Option<&str>,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .report_recovery_failure(
+                convo_id.to_string(),
+                failure_type.to_string(),
+                epoch_authenticator.map(|s| s.to_string()),
+            )
+            .map_err(bridge_err)
     }
 }
 
@@ -1538,6 +1633,60 @@ impl OrchestratorBridge {
     ) -> Result<(), OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.perform_silent_recovery(&conversation_ids))?;
         Ok(())
+    }
+
+    /// Handle a server-initiated group reset (`GroupResetEvent` delivered via
+    /// SSE/WS from the DS).
+    ///
+    /// The orchestrator transitions the conversation to `RESET_PENDING`,
+    /// persists the payload via `mark_reset_pending`, deletes the old local
+    /// MLS group, clears per-conversation recovery trackers, rebinds the group
+    /// id, then attempts `join_or_rejoin` (Welcome → ExternalCommit).
+    ///
+    /// - `convo_id`: stable conversation id.
+    /// - `new_group_id_hex`: hex-encoded new MLS group id advertised by the DS.
+    /// - `reset_generation`: monotonic reset counter from the DS.
+    ///
+    /// Spec §8.5 Phase 1 / ADR-001 levels 1–3. Platforms should call this on
+    /// every incoming `GroupResetEvent`.
+    pub fn handle_group_reset(
+        &self,
+        convo_id: String,
+        new_group_id_hex: String,
+        reset_generation: i32,
+    ) -> Result<(), OrchestratorBridgeError> {
+        let new_group_id = hex::decode(&new_group_id_hex).map_err(|e| {
+            OrchestratorBridgeError::InvalidInput {
+                message: format!("new_group_id_hex is not valid hex: {e}"),
+            }
+        })?;
+        crate::async_runtime::block_on(self.inner.handle_group_reset(
+            &convo_id,
+            new_group_id,
+            reset_generation,
+        ))?;
+        Ok(())
+    }
+
+    /// Return the RFC 9420 §8.7 `epoch_authenticator` for a group's current
+    /// epoch.
+    ///
+    /// Platforms hex-encode this value when calling
+    /// `OrchestratorAPICallback::report_recovery_failure` so that quorum-reset
+    /// reports (spec §8.6 / ADR-002) are bound to a specific epoch. Returns
+    /// the raw authenticator bytes.
+    pub fn epoch_authenticator(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Vec<u8>, OrchestratorBridgeError> {
+        // MLSOrchestrator<S,A,C,M>::mls_context() exposes the underlying
+        // MlsCryptoContext impl; for the UniFFI bridge this is MLSContext.
+        self.inner
+            .mls_context()
+            .epoch_authenticator(group_id)
+            .map_err(|e| OrchestratorBridgeError::Mls {
+                message: e.to_string(),
+            })
     }
 }
 
