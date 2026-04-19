@@ -517,6 +517,23 @@ where
                         e
                     })?
             }
+            Err(e) if e.is_wrong_epoch() => {
+                // WrongEpoch is the NORMAL outcome for:
+                //   - commits from BEFORE our external-commit join (history we never had keys for)
+                //   - replayed/duplicate commits we already applied locally
+                //   - messages from epochs we've already advanced past
+                // None of these indicate a fork or corrupt local state. Counting them as
+                // "decrypt failures" hits DECRYPTION_FAILURE_THRESHOLD (3) on active groups,
+                // which marks the convo for rejoin, which calls `force_rejoin_unlocked` —
+                // that deletes the local group, external-commits to a new epoch, and breaks
+                // every other device's `sendMessage` with 409s. The entire epoch-inflation
+                // spiral starts with this classification. Skip silently.
+                tracing::debug!(
+                    conversation_id = %envelope.conversation_id,
+                    "Skipping message: WrongEpoch (out-of-band epoch, not a fork)"
+                );
+                return Ok(None);
+            }
             Err(e) => {
                 tracing::error!(
                     error = %e,

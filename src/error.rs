@@ -183,4 +183,18 @@ impl MLSError {
             message: msg.into(),
         }
     }
+
+    /// Whether this error is an OpenMLS `ValidationError(WrongEpoch)` — i.e. the
+    /// ciphertext belongs to an MLS epoch we cannot decrypt (typically a commit
+    /// from before our external-commit join, a stale replay, or a message from
+    /// an epoch we've already advanced past). These are NORMAL during sync
+    /// catch-up and MUST NOT count as "decrypt failures" for fork-detection or
+    /// rejoin purposes — treating them as failures destroys local group state
+    /// and causes send-break spirals.
+    pub fn is_wrong_epoch(&self) -> bool {
+        match self {
+            Self::OpenMLS(msg) => msg.contains("WrongEpoch"),
+            _ => false,
+        }
+    }
 }
