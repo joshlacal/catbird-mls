@@ -675,6 +675,8 @@ impl MLSAPIClient for HttpDSClient {
         cursor: Option<&str>,
         limit: u32,
         message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
     ) -> OrcResult<(Vec<IncomingEnvelope>, Option<String>)> {
         let mut params = vec![
             ("convoId", convo_id.to_string()),
@@ -685,6 +687,12 @@ impl MLSAPIClient for HttpDSClient {
         }
         if let Some(mt) = message_type {
             params.push(("type", mt.to_string()));
+        }
+        if let Some(fe) = from_epoch {
+            params.push(("fromEpoch", fe.to_string()));
+        }
+        if let Some(te) = to_epoch {
+            params.push(("toEpoch", te.to_string()));
         }
         let resp = self
             .client
@@ -1191,7 +1199,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     };
 
                     match orchestrator
-                        .fetch_messages(convo_id, cursor.as_deref(), 50, None)
+                        .fetch_messages(convo_id, cursor.as_deref(), 50, None, None, None)
                         .await
                     {
                         Ok((messages, new_cursor)) => {

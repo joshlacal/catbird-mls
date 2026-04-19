@@ -723,7 +723,7 @@ where
         // the entire backlog (spec: seed cursor after External Commit rejoin).
         match self
             .api_client()
-            .get_messages(convo_id, None, 1, None)
+            .get_messages(convo_id, None, 1, None, None, None)
             .await
         {
             Ok((_msgs, new_cursor)) => {

@@ -99,12 +99,21 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// `message_type` filters the server response: `"all"`, `"app"`, or `"commit"`.
     /// Pass `None` (or `Some("all")`) to fetch everything. Not all backends
     /// support filtering — implementations that don't should ignore the parameter.
+    ///
+    /// `from_epoch` / `to_epoch` are inclusive bounds matching the
+    /// `blue.catbird.mlsChat.getMessages` lexicon. When `message_type =
+    /// Some("commit")` and the caller knows its local and the server epoch,
+    /// supplying a narrow range avoids the server's default "oldest 50 commits"
+    /// behavior which leaves lagging clients permanently stuck on busy groups.
+    /// Backends that don't honor the bounds should ignore them.
     async fn get_messages(
         &self,
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
         message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)>;
 
     // -- Key Packages --

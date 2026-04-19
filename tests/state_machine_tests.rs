@@ -124,7 +124,7 @@ async fn test_self_message_echo() {
     // Dedup must still work via persistent pending_messages in storage.
     let (fetched, _cursor) = alice
         .orchestrator
-        .fetch_messages(group_id, None, 100, None)
+        .fetch_messages(group_id, None, 100, None, None, None)
         .await
         .expect("fetch_messages failed");
 
@@ -202,7 +202,7 @@ async fn test_commit_messages_advance_epoch() {
     // Fetch messages from server — should include the external commit
     let (fetched, _) = alice
         .orchestrator
-        .fetch_messages(group_id, None, 100, None)
+        .fetch_messages(group_id, None, 100, None, None, None)
         .await
         .expect("fetch_messages failed");
 

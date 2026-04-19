@@ -168,11 +168,22 @@ pub trait OrchestratorAPICallback: Send + Sync {
         epoch: u64,
     ) -> Result<(), OrchestratorBridgeError>;
 
+    /// Fetch encrypted envelopes for a conversation.
+    ///
+    /// `message_type` / `from_epoch` / `to_epoch` mirror the
+    /// `blue.catbird.mlsChat.getMessages` lexicon params. Pass-through to the
+    /// server URL — platform implementations should forward them untouched.
+    /// `from_epoch` and `to_epoch` are inclusive epoch bounds; supplying them
+    /// (especially with `message_type = Some("commit")`) keeps epoch catch-up
+    /// from being stranded on groups with more than 50 lifetime commits.
     fn get_messages(
         &self,
         convo_id: String,
         cursor: Option<String>,
         limit: u32,
+        message_type: Option<String>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
     ) -> Result<FFIMessagesPage, OrchestratorBridgeError>;
 
     fn publish_key_package(
@@ -1029,11 +1040,19 @@ impl MLSAPIClient for APIAdapter {
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
-        _message_type: Option<&str>,
+        message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
     ) -> crate::orchestrator::Result<(Vec<IncomingEnvelope>, Option<String>)> {
-        // FFI callback doesn't support message_type filtering; ignore the parameter.
         self.0
-            .get_messages(convo_id.to_string(), cursor.map(|s| s.to_string()), limit)
+            .get_messages(
+                convo_id.to_string(),
+                cursor.map(|s| s.to_string()),
+                limit,
+                message_type.map(|s| s.to_string()),
+                from_epoch,
+                to_epoch,
+            )
             .map(|ffi| {
                 let envelopes = ffi
                     .envelopes
@@ -1551,6 +1570,8 @@ impl OrchestratorBridge {
             &conversation_id,
             cursor.as_deref(),
             limit,
+            None,
+            None,
             None,
         ))?;
         Ok(FFIFetchMessagesResult {

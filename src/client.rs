@@ -378,7 +378,7 @@ where
     ) -> Result<Vec<ChatMessage>, OrchestratorError> {
         let (messages, _new_cursor) = self
             .orchestrator
-            .fetch_messages(conversation_id, cursor, limit, None)
+            .fetch_messages(conversation_id, cursor, limit, None, None, None)
             .await?;
 
         let chat_messages: Vec<ChatMessage> =

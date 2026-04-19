@@ -100,6 +100,8 @@ where
                         cursor.as_deref(),
                         constants::SEND_SYNC_BATCH_SIZE,
                         Some("commit"),
+                        None,
+                        None,
                     )
                     .await
                 {
@@ -267,6 +269,8 @@ where
                                 cursor.as_deref(),
                                 constants::SEND_SYNC_BATCH_SIZE,
                                 Some("commit"),
+                                None,
+                                None,
                             )
                             .await
                         {
@@ -796,18 +800,30 @@ where
     ///
     /// `message_type` filters the fetch: `Some("commit")` for epoch catch-up,
     /// `None` (all) for normal message polling.
+    /// `from_epoch` / `to_epoch` are inclusive bounds (spec: `blue.catbird.mlsChat.getMessages`).
+    /// Pass `None` for both when a range isn't known; the server then falls back
+    /// to its default window (0..=current_epoch).
     pub async fn fetch_messages(
         &self,
         conversation_id: &str,
         cursor: Option<&str>,
         limit: u32,
         message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
     ) -> Result<(Vec<Message>, Option<String>)> {
         self.check_shutdown().await?;
 
         let (envelopes, new_cursor) = self
             .api_client()
-            .get_messages(conversation_id, cursor, limit, message_type)
+            .get_messages(
+                conversation_id,
+                cursor,
+                limit,
+                message_type,
+                from_epoch,
+                to_epoch,
+            )
             .await?;
 
         let mut messages = Vec::new();

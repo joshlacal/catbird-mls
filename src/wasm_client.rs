@@ -206,7 +206,7 @@ where
     ) -> Result<Vec<WasmChatMessage>, OrchestratorError> {
         let (messages, _cursor) = self
             .orchestrator
-            .fetch_messages(conversation_id, cursor, limit, None)
+            .fetch_messages(conversation_id, cursor, limit, None, None, None)
             .await?;
         Ok(messages.iter().map(message_to_wasm_chat_message).collect())
     }

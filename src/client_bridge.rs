@@ -469,11 +469,19 @@ impl MLSAPIClient for ClientAPIAdapter {
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
-        _message_type: Option<&str>,
+        message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
     ) -> crate::orchestrator::Result<(Vec<IncomingEnvelope>, Option<String>)> {
-        // FFI callback doesn't support message_type filtering; ignore the parameter.
         self.0
-            .get_messages(convo_id.to_string(), cursor.map(|s| s.to_string()), limit)
+            .get_messages(
+                convo_id.to_string(),
+                cursor.map(|s| s.to_string()),
+                limit,
+                message_type.map(|s| s.to_string()),
+                from_epoch,
+                to_epoch,
+            )
             .map(|ffi| {
                 let envelopes = ffi
                     .envelopes
