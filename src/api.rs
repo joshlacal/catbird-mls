@@ -3930,6 +3930,18 @@ impl MLSContext {
         let gid = GroupId::from_slice(&group_id);
 
         inner.with_group(&gid, |group, provider, signer| {
+            // Android H4 drift regression guard: this function is
+            // `commit_pending_proposals`. If the proposal store is empty there
+            // is nothing to commit — returning early prevents building an
+            // empty/metadata-only commit that advances the local epoch while
+            // the server rejects the no-op, causing a ~1-epoch-per-sync-tick
+            // drift that breaks sendMessage with TreeStateDiverged 409s.
+            // Both callers (orchestrator/sync.rs, groups.rs::commit_self_remove_proposals)
+            // already handle `InvalidInput` as "nothing to commit".
+            if group.pending_proposals().next().is_none() {
+                return Err(MLSError::invalid_input("No pending proposals to commit"));
+            }
+
             let planned_reference_json = crate::metadata::planned_metadata_reference_json(
                 crate::metadata::current_metadata_reference(group).as_ref(),
                 crate::metadata::metadata_payload_from_group(group).is_some(),

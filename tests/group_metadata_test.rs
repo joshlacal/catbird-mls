@@ -171,3 +171,72 @@ fn test_update_group_metadata_readable_after_merge() {
     assert_eq!(meta.name.as_deref(), Some("Renamed Group"));
     assert_eq!(meta.description.as_deref(), Some("New description"));
 }
+
+/// Regression for Android H4 epoch drift: `commit_pending_proposals` must not
+/// build a commit when the proposal store is empty. Previously it unconditionally
+/// created an empty (or metadata-only) commit every sync tick, advancing the
+/// local epoch by 1 while the server rejected the no-op → 17+ epoch drift per
+/// hour on 1:1 conversations, breaking sendMessage with TreeStateDiverged 409s.
+#[test]
+fn test_commit_pending_proposals_is_noop_when_nothing_pending_1to1() {
+    let (ctx, _dir) = make_context();
+
+    // Simulate a 1:1 conversation (no metadata).
+    let result = ctx
+        .create_group(b"alice@example.com".to_vec(), None)
+        .unwrap();
+
+    let epoch_before = ctx.get_epoch(result.group_id.clone()).unwrap();
+
+    match ctx.commit_pending_proposals(result.group_id.clone()) {
+        Ok(_) => panic!(
+            "commit_pending_proposals must not produce a commit when the store is empty \
+             — this is the Android H4 drift bug"
+        ),
+        Err(MLSError::InvalidInput { .. }) => {}
+        Err(e) => panic!("expected InvalidInput, got {:?}", e),
+    }
+
+    let epoch_after = ctx.get_epoch(result.group_id).unwrap();
+    assert_eq!(
+        epoch_before, epoch_after,
+        "epoch must NOT advance when there is nothing to commit (was {} -> {})",
+        epoch_before, epoch_after
+    );
+}
+
+/// Same guarantee for groups that have metadata. Previously the
+/// `planned_metadata_reference_json(..., metadata_changed=false)` path minted a
+/// fresh UUID locator even when no metadata actually changed, causing the
+/// same drift on named groups.
+#[test]
+fn test_commit_pending_proposals_is_noop_when_nothing_pending_named_group() {
+    let (ctx, _dir) = make_context();
+
+    let config = GroupConfig {
+        group_name: Some("My Group".to_string()),
+        group_description: Some("desc".to_string()),
+        ..Default::default()
+    };
+    let result = ctx
+        .create_group(b"alice@example.com".to_vec(), Some(config))
+        .unwrap();
+
+    let epoch_before = ctx.get_epoch(result.group_id.clone()).unwrap();
+
+    match ctx.commit_pending_proposals(result.group_id.clone()) {
+        Ok(_) => panic!(
+            "commit_pending_proposals must not advance epoch for a named group with \
+             no pending proposals (metadata_changed=false)"
+        ),
+        Err(MLSError::InvalidInput { .. }) => {}
+        Err(e) => panic!("expected InvalidInput, got {:?}", e),
+    }
+
+    let epoch_after = ctx.get_epoch(result.group_id).unwrap();
+    assert_eq!(
+        epoch_before, epoch_after,
+        "epoch must NOT advance for named group with no real proposals (was {} -> {})",
+        epoch_before, epoch_after
+    );
+}
