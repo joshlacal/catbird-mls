@@ -17,6 +17,11 @@ use super::types::*;
 pub struct RecoveryTracker {
     /// Failed rejoin attempts per conversation.
     failed_rejoins: HashMap<String, (u32, Instant)>,
+    /// Last successful rejoin per conversation. Used to gate sync-triggered
+    /// rejoins via `SUCCESSFUL_REJOIN_COOLDOWN` — prevents epoch-inflation
+    /// spirals where a device successfully external-commits, loses local MLS
+    /// state, and re-rejoins on every sync cycle.
+    successful_rejoins: HashMap<String, Instant>,
     /// Last successful or attempted rejoin on ANY conversation (regardless of outcome).
     /// Used to enforce a hard global minimum interval between any rejoin attempts,
     /// preventing epoch inflation spirals even when attempts succeed.
@@ -29,6 +34,7 @@ impl RecoveryTracker {
     pub fn new(max_attempts: u32) -> Self {
         Self {
             failed_rejoins: HashMap::new(),
+            successful_rejoins: HashMap::new(),
             last_global_rejoin_at: None,
             max_attempts,
         }
@@ -100,11 +106,28 @@ impl RecoveryTracker {
 
     /// Clear failure tracking on success.
     /// Note: does NOT clear `last_global_rejoin_at` — the minimum interval still applies
-    /// to prevent rapid successive rejoins even when they succeed.
+    /// to prevent rapid successive rejoins even when they succeed. Also records
+    /// per-convo success time so sync-triggered rejoins are suppressed for
+    /// `SUCCESSFUL_REJOIN_COOLDOWN` on this conversation.
     pub fn clear(&mut self, convo_id: &str) {
+        let now = Instant::now();
         self.failed_rejoins.remove(convo_id);
+        self.successful_rejoins.insert(convo_id.to_string(), now);
         // Record the current time globally so the MIN_REJOIN_INTERVAL applies across all convos
-        self.last_global_rejoin_at = Some(Instant::now());
+        self.last_global_rejoin_at = Some(now);
+    }
+
+    /// Remaining cooldown imposed by a recent SUCCESSFUL rejoin on this
+    /// conversation. Applies to sync-triggered rejoins only (see
+    /// `should_attempt_sync_rejoin`). `None` means no cooldown active.
+    pub fn success_cooldown_remaining(&self, convo_id: &str) -> Option<Duration> {
+        let last = self.successful_rejoins.get(convo_id)?;
+        let elapsed = last.elapsed();
+        if elapsed >= constants::SUCCESSFUL_REJOIN_COOLDOWN {
+            None
+        } else {
+            Some(constants::SUCCESSFUL_REJOIN_COOLDOWN - elapsed)
+        }
     }
 }
 
@@ -393,6 +416,28 @@ where
             }
         };
         drop(lock_guard);
+
+        // Epoch-inflation spiral guard: if we SUCCESSFULLY rejoined this
+        // conversation recently and sync still thinks we need to rejoin
+        // (e.g. `ffi_has_group=false`), something is dropping our MLS state
+        // after a successful external commit. Each re-rejoin advances the
+        // server epoch, 409-ing every other device's `sendMessage`. Suppress
+        // sync-path rejoins until the cooldown elapses. Decrypt-triggered
+        // rejoins in `process_incoming_message` still go through — those have
+        // a real incoming message and a real epoch gap to close.
+        if let Some(remaining) = self
+            .recovery_tracker()
+            .lock()
+            .await
+            .success_cooldown_remaining(convo_id)
+        {
+            tracing::info!(
+                convo_id,
+                remaining_secs = remaining.as_secs(),
+                "Skipping sync-triggered join/rejoin: recently succeeded (spiral protection)"
+            );
+            return false;
+        }
 
         if let Err(err) = self.enforce_rejoin_backoff(convo_id).await {
             tracing::debug!(
@@ -1287,5 +1332,59 @@ where
         }
 
         Ok(DesyncSeverity::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_records_success_time_so_cooldown_applies() {
+        let mut t = RecoveryTracker::new(3);
+        // No prior success → no cooldown
+        assert!(t.success_cooldown_remaining("convo-a").is_none());
+
+        t.clear("convo-a");
+
+        // Just-cleared → cooldown active, within configured window
+        let remaining = t
+            .success_cooldown_remaining("convo-a")
+            .expect("cooldown should be active immediately after clear");
+        assert!(
+            remaining <= constants::SUCCESSFUL_REJOIN_COOLDOWN,
+            "remaining ({remaining:?}) must not exceed configured cooldown"
+        );
+    }
+
+    #[test]
+    fn success_cooldown_is_per_convo() {
+        let mut t = RecoveryTracker::new(3);
+        t.clear("convo-a");
+        // Different convo — no cooldown
+        assert!(t.success_cooldown_remaining("convo-b").is_none());
+        // Same convo — cooldown active
+        assert!(t.success_cooldown_remaining("convo-a").is_some());
+    }
+
+    #[test]
+    fn clear_also_updates_global_interval_and_removes_failures() {
+        let mut t = RecoveryTracker::new(3);
+        t.record_failure("convo-a");
+        assert_eq!(
+            t.failed_rejoins.get("convo-a").map(|(n, _)| *n),
+            Some(1),
+            "record_failure should insert failure count"
+        );
+
+        t.clear("convo-a");
+        assert!(
+            t.failed_rejoins.get("convo-a").is_none(),
+            "clear must remove failure tracking for the convo"
+        );
+        assert!(
+            t.last_global_rejoin_at.is_some(),
+            "clear must bump last_global_rejoin_at so MIN_REJOIN_INTERVAL applies"
+        );
     }
 }

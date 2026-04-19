@@ -12,6 +12,16 @@ pub const MAX_REJOIN_ATTEMPTS: u32 = 3;
 pub const GROUPINFO_404_CIRCUIT_BREAKER: u32 = 3;
 pub const MIN_REJOIN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Suppress sync-triggered rejoin attempts on a conversation for this duration
+/// after a SUCCESSFUL external-commit rejoin. Prevents spirals where a client
+/// successfully rejoins, then loses local MLS state (merge persistence bug,
+/// SQLCipher transaction rollback, etc.), then sync re-detects `ffi_has_group=false`
+/// and rejoins again — each rejoin advances the group epoch, 409-ing every
+/// other device's `sendMessage`. Decrypt-triggered rejoins (via
+/// `messaging.rs::process_incoming_message` → `join_or_rejoin`) are NOT gated
+/// by this, so a legitimate epoch gap on an incoming message still recovers.
+pub const SUCCESSFUL_REJOIN_COOLDOWN: Duration = Duration::from_secs(300);
+
 pub const FORK_DETECTION_THRESHOLD: u32 = 2;
 pub const FORK_READD_MAX_ATTEMPTS: u32 = 1;
 
