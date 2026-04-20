@@ -91,6 +91,39 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError>;
 
+    /// Merge an incoming `StagedCommit` that was previously staged by
+    /// `decrypt_message` (task #33 receiver-side three-phase commit).
+    ///
+    /// Returns the new (post-merge) epoch. Called by the orchestrator's
+    /// HTTP-sync path after it has validated a commit against recovery
+    /// policy and is ready to advance the local MLS epoch.
+    ///
+    /// Default no-op returns `target_epoch` unchanged — platforms that do
+    /// not stage incoming commits (e.g. auto-merge implementations) can
+    /// safely inherit this and still satisfy the orchestrator contract.
+    fn merge_incoming_commit(
+        &self,
+        _group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<u64, MLSError> {
+        Ok(target_epoch)
+    }
+
+    /// Discard an incoming `StagedCommit` that was previously staged by
+    /// `decrypt_message` without advancing the local epoch.
+    ///
+    /// Called by the orchestrator when recovery policy decides the staged
+    /// commit should not be applied (e.g. a fork/reset is being initiated).
+    ///
+    /// Default no-op for platforms that do not stage incoming commits.
+    fn discard_incoming_commit(
+        &self,
+        _group_id: Vec<u8>,
+        _target_epoch: u64,
+    ) -> Result<(), MLSError> {
+        Ok(())
+    }
+
     fn create_external_commit(
         &self,
         group_info: Vec<u8>,

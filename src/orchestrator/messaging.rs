@@ -655,8 +655,68 @@ where
             tracing::debug!(
                 conversation_id = %envelope.conversation_id,
                 epoch = decrypt_result.epoch,
-                "Processed commit message (epoch advanced)"
+                "Processed commit message (epoch staged — merging)"
             );
+
+            // Task #58: `decrypt_message` stages the incoming commit in
+            // `pending_incoming_merges` but does NOT merge it into the local
+            // MLS group. The orchestrator's HTTP-sync path (this function,
+            // reached from `fetch_messages` and `sync_with_server`) must
+            // explicitly call `merge_incoming_commit` to advance the local
+            // epoch; otherwise subsequent sends/decrypts see stale epoch and
+            // trigger cascading 409/WrongEpoch errors.
+            //
+            // Platforms consuming WebSocket push (iOS) already perform the
+            // merge themselves; this closes the gap for orchestrator-driven
+            // sync (catmos Tauri, catmos-cli, catbird-mls-web, Android).
+            match self
+                .mls_context()
+                .merge_incoming_commit(group_id_bytes.clone(), decrypt_result.epoch)
+            {
+                Ok(merged_epoch) => {
+                    tracing::info!(
+                        conversation_id = %envelope.conversation_id,
+                        target_epoch = decrypt_result.epoch,
+                        merged_epoch,
+                        "Merged incoming staged commit"
+                    );
+                }
+                Err(e) => {
+                    // Merge failure: the staged commit was popped from
+                    // `pending_incoming_merges` by the FFI layer (see
+                    // `merge_incoming_commit` in api.rs). The local MLS state
+                    // is now behind the commit we just saw on the wire — mark
+                    // the conversation for rejoin so the next sync cycle
+                    // recovers via the deferred External Commit path.
+                    //
+                    // NOTE: we do NOT call `discard_incoming_commit` here —
+                    // `merge_incoming_commit` already consumed the staged
+                    // entry on its way to the failure, and double-discarding
+                    // is a no-op anyway.
+                    tracing::error!(
+                        error = %e,
+                        conversation_id = %envelope.conversation_id,
+                        target_epoch = decrypt_result.epoch,
+                        "Failed to merge incoming staged commit — marking for rejoin"
+                    );
+                    if let Err(storage_err) = self
+                        .storage()
+                        .mark_needs_rejoin(&envelope.conversation_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            error = %storage_err,
+                            conversation_id = %envelope.conversation_id,
+                            "Failed to persist rejoin flag after merge_incoming_commit failure"
+                        );
+                    }
+                    // Don't return an error — the commit has been processed
+                    // to the extent we can, and surfacing an error here would
+                    // propagate out of `fetch_messages` and abort downstream
+                    // message processing for messages we CAN still decrypt.
+                }
+            }
+
             // Still update cached group state epoch
             {
                 let mut states = self.group_states().lock().await;

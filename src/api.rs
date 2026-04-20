@@ -5383,6 +5383,18 @@ impl MlsCryptoContext for MLSContext {
         self.decrypt_message(group_id, ciphertext)
     }
 
+    fn merge_incoming_commit(&self, group_id: Vec<u8>, target_epoch: u64) -> Result<u64, MLSError> {
+        self.merge_incoming_commit(group_id, target_epoch)
+    }
+
+    fn discard_incoming_commit(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<(), MLSError> {
+        self.discard_incoming_commit(group_id, target_epoch)
+    }
+
     fn create_external_commit(
         &self,
         group_info: Vec<u8>,
