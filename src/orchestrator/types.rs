@@ -336,9 +336,17 @@ pub struct MLSMessagePayload {
     pub embed: Option<MLSEmbedData>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reaction: Option<MLSReactionPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_ack: Option<MLSDeliveryAckPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_request: Option<MLSRecoveryRequestPayload>,
 }
 
 /// Message type discriminator, matching iOS MLSMessageType.
+///
+/// The `Unknown` variant is a forward-compat catch-all for message types
+/// a newer client may send. Such payloads are never displayable and must
+/// never round-trip as raw JSON into a `Message.text`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum MLSMessageType {
@@ -349,6 +357,29 @@ pub enum MLSMessageType {
     AdminRoster,
     AdminAction,
     System,
+    DeliveryAck,
+    RecoveryRequest,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Delivery acknowledgement — emitted after a device successfully decrypts
+/// a message. Matches the iOS `MLSDeliveryAckPayload` Codable struct.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MLSDeliveryAckPayload {
+    pub message_id: String,
+}
+
+/// Message-level recovery request — emitted when a recipient device fails to
+/// decrypt or missed a specific message. Distinct from MLS group recovery
+/// (epoch/tree divergence). Matches iOS `MLSMessageRecoveryRequestPayload`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MLSRecoveryRequestPayload {
+    pub message_id: String,
+    pub epoch: i64,
+    pub sequence_number: i64,
 }
 
 /// Rich embed wrapper matching Catbird's wire format.
@@ -436,6 +467,8 @@ impl MLSMessagePayload {
             text: Some(content_key.to_string()),
             embed: None,
             reaction: None,
+            delivery_ack: None,
+            recovery_request: None,
         }
     }
 
@@ -447,6 +480,8 @@ impl MLSMessagePayload {
             text: Some(content.to_string()),
             embed: None,
             reaction: None,
+            delivery_ack: None,
+            recovery_request: None,
         }
     }
 
@@ -458,6 +493,8 @@ impl MLSMessagePayload {
             text: Some(content.to_string()),
             embed: Some(embed),
             reaction: None,
+            delivery_ack: None,
+            recovery_request: None,
         }
     }
 
@@ -473,6 +510,8 @@ impl MLSMessagePayload {
                 emoji: emoji.to_string(),
                 action,
             }),
+            delivery_ack: None,
+            recovery_request: None,
         }
     }
 
@@ -521,7 +560,15 @@ impl MLSMessagePayload {
                     || self.audio_embed().is_some()
             }
             MLSMessageType::System => true,
-            _ => false,
+            // Control/meta message types are never rendered to the user.
+            MLSMessageType::Reaction
+            | MLSMessageType::ReadReceipt
+            | MLSMessageType::Typing
+            | MLSMessageType::AdminRoster
+            | MLSMessageType::AdminAction
+            | MLSMessageType::DeliveryAck
+            | MLSMessageType::RecoveryRequest
+            | MLSMessageType::Unknown => false,
         }
     }
 
@@ -709,6 +756,42 @@ mod tests {
         assert_eq!(decoded_audio.duration_ms, 3500);
         assert_eq!(decoded_audio.waveform, vec![0.0, 0.5, 1.0, 0.3]);
         assert_eq!(decoded_audio.transcript.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn delivery_ack_decodes_without_falling_through() {
+        // iOS emits {"version":1,"messageType":"deliveryAck","deliveryAck":{"messageId":"..."}}
+        // Rust must decode this as MLSMessageType::DeliveryAck, not fall through the
+        // `Err(_)` branch in messaging.rs and stringify it as raw JSON into Message.text.
+        let json = r#"{"version":1,"messageType":"deliveryAck","deliveryAck":{"messageId":"abc-123"}}"#;
+        let decoded = MLSMessagePayload::decode(json.as_bytes()).expect("must decode");
+        assert_eq!(decoded.message_type, MLSMessageType::DeliveryAck);
+        assert!(!decoded.is_displayable());
+        let ack = decoded.delivery_ack.expect("ack payload present");
+        assert_eq!(ack.message_id, "abc-123");
+    }
+
+    #[test]
+    fn recovery_request_decodes_without_falling_through() {
+        let json = r#"{"version":1,"messageType":"recoveryRequest","recoveryRequest":{"messageId":"msg-1","epoch":42,"sequenceNumber":7}}"#;
+        let decoded = MLSMessagePayload::decode(json.as_bytes()).expect("must decode");
+        assert_eq!(decoded.message_type, MLSMessageType::RecoveryRequest);
+        assert!(!decoded.is_displayable());
+        let req = decoded.recovery_request.expect("recovery payload present");
+        assert_eq!(req.message_id, "msg-1");
+        assert_eq!(req.epoch, 42);
+        assert_eq!(req.sequence_number, 7);
+    }
+
+    #[test]
+    fn unknown_message_type_falls_through_to_catch_all() {
+        // A future client emits a brand-new messageType we don't know about.
+        // Serde must accept it via #[serde(other)] and is_displayable() must
+        // return false so the orchestrator drops it instead of echoing raw JSON.
+        let json = r#"{"version":1,"messageType":"brandNewFutureType","text":"should not render"}"#;
+        let decoded = MLSMessagePayload::decode(json.as_bytes()).expect("must decode");
+        assert_eq!(decoded.message_type, MLSMessageType::Unknown);
+        assert!(!decoded.is_displayable());
     }
 
     #[test]

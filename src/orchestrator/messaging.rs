@@ -746,7 +746,33 @@ where
                     String::from_utf8(decrypt_result.plaintext.clone()).ok(),
                 )
             }
-            Err(_) => {
+            Err(decode_err) => {
+                // If the plaintext looks like a JSON envelope that we failed
+                // to decode, it is almost certainly a newer `MLSMessagePayload`
+                // variant this build doesn't understand (iOS added
+                // `deliveryAck` and `recoveryRequest`; future types will
+                // follow). Drop it with a warning — NEVER stringify raw JSON
+                // into `Message.text`, which is what previously caused
+                // Android/Tauri/WASM UIs to render raw
+                // `{"messageType":"deliveryAck",...}` blobs.
+                let first_non_ws = decrypt_result
+                    .plaintext
+                    .iter()
+                    .find(|b| !b.is_ascii_whitespace())
+                    .copied();
+                if first_non_ws == Some(b'{') {
+                    tracing::warn!(
+                        conversation_id = %envelope.conversation_id,
+                        epoch = decrypt_result.epoch,
+                        len = decrypt_result.plaintext.len(),
+                        error = %decode_err,
+                        "Dropping MLS message: JSON envelope did not match MLSMessagePayload schema"
+                    );
+                    return Ok(None);
+                }
+
+                // UTF-8 fallback remains ONLY for genuine legacy non-JSON
+                // plaintext bytes emitted by older clients.
                 let text = String::from_utf8(decrypt_result.plaintext.clone()).map_err(|_| {
                     tracing::error!(
                         conversation_id = %envelope.conversation_id,
