@@ -182,6 +182,25 @@ pub struct MLSContext {
     /// When true, long-running operations (key package creation, write_manifest)
     /// should bail out early to release the Mutex and file locks before iOS suspends.
     is_suspended: Arc<AtomicBool>,
+    /// Pending incoming `StagedCommit`s awaiting platform confirmation (task #33).
+    ///
+    /// When `process_message`/`decrypt_message`/`process_message_async`/`process_commit`
+    /// receive a `StagedCommitMessage` from another member, the commit is **staged** here
+    /// (keyed by `(group_id, target_epoch)`) instead of being auto-merged. The receiving
+    /// platform is responsible for:
+    ///   - calling [`merge_incoming_commit`] once it has validated the commit and is
+    ///     ready to advance the local epoch, OR
+    ///   - calling [`discard_incoming_commit`] to drop the staged commit without merging.
+    ///
+    /// This preserves RFC 9420 §14 intent: receiver state must not advance until the
+    /// caller confirms. The legacy auto-merge path is still available via
+    /// [`process_message_legacy_automerge`] during the cross-platform migration.
+    ///
+    /// **Duplicate delivery policy:** if a staged commit already exists for the same
+    /// `(group_id, target_epoch)` when a new one arrives (duplicate/retransmit), the
+    /// new entry **overwrites** the prior one and a warning is logged. This is
+    /// idempotent: OpenMLS produces the same StagedCommit for the same wire message.
+    pending_incoming_merges: Arc<Mutex<HashMap<(Vec<u8>, u64), Box<StagedCommit>>>>,
 }
 
 impl Drop for MLSContext {
@@ -219,6 +238,7 @@ impl MLSContext {
             external_join_authorizer: Arc::new(Mutex::new(None)),
             interrupt_handles,
             is_suspended: Arc::new(AtomicBool::new(false)),
+            pending_incoming_merges: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 
@@ -1893,7 +1913,7 @@ impl MLSContext {
             );
         }
 
-        let (plaintext, epoch, sender_credential) = inner.with_group(&gid, |group, provider, _signer| {
+        let (plaintext, epoch, sender_credential, staged_commit_opt): (Vec<u8>, u64, CredentialData, Option<Box<StagedCommit>>) = inner.with_group(&gid, |group, provider, _signer| {
             // 🔍 DIAGNOSTIC: Get current epoch and estimated generation BEFORE processing
             let current_epoch = group.epoch().as_u64();
             crate::info_log!("[DECRYPT] 📊 PRE-PROCESSING STATE:");
@@ -1965,54 +1985,57 @@ impl MLSContext {
                     if !bytes.is_empty() {
                         crate::debug_log!("[DECRYPT] Plaintext preview: {:?}", String::from_utf8_lossy(&bytes[..bytes.len().min(200)]));
                     }
-                    Ok((bytes, message_epoch, sender_credential))
+                    Ok((bytes, message_epoch, sender_credential, None))
                 },
                 ProcessedMessageContent::ProposalMessage(prop) => {
                     crate::debug_log!("[DECRYPT] ProposalMessage received: {:?}", std::any::type_name_of_val(&prop));
-                    Ok((vec![], message_epoch, sender_credential))
+                    Ok((vec![], message_epoch, sender_credential, None))
                 },
                 ProcessedMessageContent::ExternalJoinProposalMessage(ext) => {
                     crate::debug_log!("[DECRYPT] ExternalJoinProposalMessage received: {:?}", std::any::type_name_of_val(&ext));
-                    Ok((vec![], message_epoch, sender_credential))
+                    Ok((vec![], message_epoch, sender_credential, None))
                 },
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
-                    crate::info_log!("[DECRYPT] StagedCommitMessage received - auto-merging to advance epoch");
+                    // Task #33: stage the incoming commit instead of auto-merging.
+                    // Platform must explicitly call `merge_incoming_commit(group_id, target_epoch)`
+                    // to advance the epoch (or `discard_incoming_commit` to abandon).
+                    let target_epoch = staged.group_context().epoch().as_u64();
+                    crate::info_log!(
+                        "[DECRYPT] StagedCommitMessage received - STAGING for explicit merge (target epoch {})",
+                        target_epoch
+                    );
 
-                    // Export current epoch secret before merging
+                    // Export current epoch secret now (forward-secrecy window includes pre-merge epoch)
                     if let Err(e) = crate::async_runtime::block_on(
                         epoch_manager.export_current_epoch_secret(group, provider)
                     ) {
-                        crate::warn_log!("[DECRYPT] ⚠️ Failed to export epoch secret before merge: {:?}", e);
+                        crate::warn_log!("[DECRYPT] ⚠️ Failed to export epoch secret before staging: {:?}", e);
                     }
 
-                    let epoch_before = group.epoch().as_u64();
-
-                    // Merge the staged commit to advance the epoch
-                    group.merge_staged_commit(provider, *staged)
-                        .map_err(|e| {
-                            crate::error_log!("[DECRYPT] ❌ Failed to merge staged commit: {:?}", e);
-                            MLSError::MergeFailed
-                        })?;
-
-                    let epoch_after = group.epoch().as_u64();
-                    crate::info_log!("[DECRYPT] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
-
-                    // Cleanup old epoch secrets after incoming commit advances the epoch
-                    let retention_epochs = 5u64;
-                    if let Err(e) = crate::async_runtime::block_on(
-                        epoch_manager.cleanup_old_epochs(
-                            group.group_id().as_slice(),
-                            epoch_after,
-                            retention_epochs,
-                        )
-                    ) {
-                        crate::warn_log!("[DECRYPT] ⚠️ Failed to cleanup old epochs after staged commit merge: {:?}", e);
-                    }
-
-                    Ok((vec![], epoch_after, sender_credential))
+                    // Return the staged commit in the 4th tuple slot; the caller (decrypt_message)
+                    // will stash it in `pending_incoming_merges` keyed by (group_id, target_epoch).
+                    Ok((vec![], target_epoch, sender_credential, Some(staged)))
                 },
             }
         })?;
+
+        // Task #33: if an incoming StagedCommit was produced, stash it for explicit confirmation.
+        // Overwrites any prior pending entry for the same (group_id, epoch) — OpenMLS produces
+        // deterministic StagedCommits for the same wire message, so overwrite is idempotent.
+        if let Some(staged) = staged_commit_opt {
+            let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
+                crate::error_log!("[DECRYPT] ❌ pending_incoming_merges mutex poisoned");
+                MLSError::ContextNotInitialized
+            })?;
+            let key = (group_id.clone(), epoch);
+            if pending.insert(key, staged).is_some() {
+                crate::warn_log!(
+                    "[DECRYPT] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
+                    hex::encode(&group_id),
+                    epoch
+                );
+            }
+        }
 
         let total_duration = timestamp.elapsed().unwrap_or_default();
         crate::debug_log!(
@@ -2072,6 +2095,9 @@ impl MLSContext {
     ) -> Result<DecryptResult, MLSError> {
         self.check_suspended()?;
         let inner = self.inner.clone();
+        // Task #33: also carry the pending-merges map so we can stash incoming StagedCommits
+        // from the worker thread.
+        let pending_incoming_merges = self.pending_incoming_merges.clone();
 
         tokio::task::spawn_blocking(move || {
             let thread_id = std::thread::current().id();
@@ -2103,8 +2129,12 @@ impl MLSContext {
 
             let gid = GroupId::from_slice(&group_id);
 
-            let (plaintext, epoch, sender_credential) =
-                inner_ctx.with_group(&gid, |group, provider, _signer| {
+            let (plaintext, epoch, sender_credential, staged_commit_opt): (
+                Vec<u8>,
+                u64,
+                CredentialData,
+                Option<Box<StagedCommit>>,
+            ) = inner_ctx.with_group(&gid, |group, provider, _signer| {
                     let current_epoch = group.epoch().as_u64();
                     crate::info_log!("[DECRYPT-ASYNC] 📊 PRE-PROCESSING STATE:");
                     crate::info_log!("[DECRYPT-ASYNC]   Group: {}", hex::encode(&group_id));
@@ -2154,17 +2184,28 @@ impl MLSContext {
 
                     match processed.into_content() {
                         ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                            Ok((app_msg.into_bytes(), message_epoch, sender_credential))
+                            Ok((app_msg.into_bytes(), message_epoch, sender_credential, None))
                         }
                         ProcessedMessageContent::ProposalMessage(_)
-                        | ProcessedMessageContent::ExternalJoinProposalMessage(_)
-                        | ProcessedMessageContent::StagedCommitMessage(_) => {
-                            Ok((vec![], message_epoch, sender_credential))
+                        | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                            Ok((vec![], message_epoch, sender_credential, None))
+                        }
+                        ProcessedMessageContent::StagedCommitMessage(staged) => {
+                            // Task #33: stage incoming commits for caller-driven merge.
+                            // Prior behavior silently dropped the StagedCommit; now we return it
+                            // and the caller stashes it in `pending_incoming_merges`.
+                            let target_epoch = staged.group_context().epoch().as_u64();
+                            crate::info_log!(
+                                "[DECRYPT-ASYNC] StagedCommitMessage received - STAGING for explicit merge (target epoch {})",
+                                target_epoch
+                            );
+                            Ok((vec![], target_epoch, sender_credential, Some(staged)))
                         }
                     }
                 })?;
 
-            // Increment and get sequence number for this group (using per-context storage)
+            // Increment and get sequence number for this group (using per-context storage).
+            // Do this while we still hold `inner_ctx`.
             let sequence_number = {
                 let counter = inner_ctx
                     .sequence_counters
@@ -2173,6 +2214,26 @@ impl MLSContext {
                 *counter += 1;
                 *counter
             };
+
+            // Release the inner lock before touching `pending_incoming_merges` — avoid
+            // holding two locks at once.
+            drop(guard);
+
+            // Task #33: stash incoming StagedCommit for explicit platform confirmation.
+            if let Some(staged) = staged_commit_opt {
+                let mut pending = pending_incoming_merges.lock().map_err(|_| {
+                    crate::error_log!("[DECRYPT-ASYNC] ❌ pending_incoming_merges mutex poisoned");
+                    MLSError::ContextNotInitialized
+                })?;
+                let key = (group_id.clone(), epoch);
+                if pending.insert(key, staged).is_some() {
+                    crate::warn_log!(
+                        "[DECRYPT-ASYNC] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
+                        hex::encode(&group_id),
+                        epoch
+                    );
+                }
+            }
 
             let total_duration = timestamp.elapsed().unwrap_or_default();
             crate::debug_log!("[DECRYPT-ASYNC] Completed in {:?}", total_duration);
@@ -2228,7 +2289,7 @@ impl MLSContext {
             .map_err(|_| MLSError::ContextNotInitialized)?
             .clone();
 
-        let result = inner.with_group(&gid, |group, provider, _signer| {
+        let result: Result<(ProcessedContent, Option<Box<StagedCommit>>), MLSError> = inner.with_group(&gid, |group, provider, _signer| {
             crate::debug_log!("[MLS-FFI] Inside with_group closure for process_message");
 
             // Strip padding envelope before MLS deserialization
@@ -2336,10 +2397,10 @@ impl MLSContext {
                     let plaintext = app_msg.into_bytes();
                     crate::debug_log!("[MLS-FFI] ApplicationMessage processed: {} bytes", plaintext.len());
 
-                    Ok(ProcessedContent::ApplicationMessage {
+                    Ok((ProcessedContent::ApplicationMessage {
                         plaintext,
                         sender,
-                    })
+                    }, None))
                 },
                 ProcessedMessageContent::ProposalMessage(proposal_msg) => {
                     crate::debug_log!("[MLS-FFI] ProposalMessage received, processing...");
@@ -2420,12 +2481,12 @@ impl MLSContext {
                     };
 
                     crate::debug_log!("[MLS-FFI] Proposal processed successfully");
-                    Ok(ProcessedContent::Proposal {
+                    Ok((ProcessedContent::Proposal {
                         proposal: proposal_info,
                         proposal_ref: ProposalRef {
                             data: proposal_ref_bytes,
                         },
-                    })
+                    }, None))
                 },
                 ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
                     crate::debug_log!("[MLS-FFI] ExternalJoinProposalMessage received");
@@ -2433,23 +2494,29 @@ impl MLSContext {
                     Err(MLSError::invalid_input("External join proposals not supported"))
                 },
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
-                    crate::debug_log!("[MLS-FFI] StagedCommitMessage received, processing...");
-                    let new_epoch = staged.group_context().epoch().as_u64();
-                    crate::info_log!("[MLS-FFI] 📦 Staged commit received for epoch transition to {}", new_epoch);
-
-                    // CRITICAL FIX: Auto-merge staged commits from other members
-                    crate::info_log!("[MLS-FFI] 🔄 Auto-merging staged commit (incoming commit from another member)");
+                    // Task #33: stage the incoming commit instead of auto-merging.
+                    // Platform must explicitly call `merge_incoming_commit(group_id, target_epoch)`
+                    // to advance the epoch (or `discard_incoming_commit` to abandon).
+                    //
+                    // NOTE on wire-format semantics change: `ProcessedContent::StagedCommit::new_epoch`
+                    // used to mean "group is now at this epoch" (post-merge). After this refactor it
+                    // means "group will be at this epoch once the platform calls merge_incoming_commit".
+                    // Downstream (iOS/Android/catmos) must be updated.
+                    let target_epoch = staged.group_context().epoch().as_u64();
+                    crate::info_log!("[MLS-FFI] 📦 Staged commit received for epoch transition to {} — STAGING for explicit merge", target_epoch);
 
                     // Metadata: derive the new epoch's metadata key from the staged
-                    // commit's exporter BEFORE merge consumes the StagedCommit.
+                    // commit's exporter BEFORE the staged commit is moved into the tuple.
+                    // The platform needs this in the event payload so it can unwrap the new
+                    // epoch's metadata blob without having to redo the exporter derivation.
                     let metadata_key_bytes = match crate::metadata::derive_metadata_key(
                         &staged,
                         provider.crypto(),
                         &group_id,
-                        new_epoch,
+                        target_epoch,
                     ) {
                         Ok(key) => {
-                            crate::info_log!("[MLS-FFI] 🔑 metadata key derived for epoch {}", new_epoch);
+                            crate::info_log!("[MLS-FFI] 🔑 metadata key derived for epoch {}", target_epoch);
                             Some(key.to_vec())
                         }
                         Err(e) => {
@@ -2458,57 +2525,67 @@ impl MLSContext {
                         }
                     };
 
-                    // Export current epoch secret before merging
+                    // Export current (pre-merge) epoch secret now — the forward-secrecy
+                    // window covers the pre-merge epoch, and once we stage + release the
+                    // lock, the next caller could in principle mutate the group before
+                    // merge happens. Export here, while we still hold the group mutably.
                     if let Err(e) = crate::async_runtime::block_on(
                         epoch_manager.export_current_epoch_secret(group, provider)
                     ) {
-                        crate::warn_log!("[MLS-FFI] ⚠️ Failed to export epoch secret before merge: {:?}", e);
+                        crate::warn_log!("[MLS-FFI] ⚠️ Failed to export epoch secret before staging: {:?}", e);
                     }
 
-                    let epoch_before = group.epoch().as_u64();
-
-                    // Merge the staged commit to advance the epoch
-                    group.merge_staged_commit(provider, *staged)
-                        .map_err(|e| {
-                            crate::error_log!("[MLS-FFI] ❌ Failed to merge staged commit: {:?}", e);
-                            MLSError::MergeFailed
-                        })?;
-
-                    let epoch_after = group.epoch().as_u64();
-                    crate::info_log!("[MLS-FFI] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
-
-                    // Cleanup old epoch secrets after incoming commit advances the epoch
-                    let retention_epochs = 5u64;
-                    if let Err(e) = crate::async_runtime::block_on(
-                        epoch_manager.cleanup_old_epochs(
-                            group.group_id().as_slice(),
-                            epoch_after,
-                            retention_epochs,
-                        )
-                    ) {
-                        crate::warn_log!("[MLS-FFI] ⚠️ Failed to cleanup old epochs after staged commit merge: {:?}", e);
-                    }
-
+                    // NB: metadata_reference_json reflects the *pre-merge* group context.
+                    // We persist it here so the platform can reconcile after merge. It will be
+                    // recomputed post-merge inside `merge_incoming_commit` if needed.
                     let metadata_reference_json = current_metadata_reference_json(group);
                     let metadata_info = metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
                         metadata_key,
-                        epoch: epoch_after,
+                        epoch: target_epoch,
                         metadata_reference_json,
                     });
 
-                    if epoch_after <= epoch_before {
-                        crate::error_log!("[MLS-FFI] ❌ CRITICAL: Epoch did not advance after merge! Before: {}, After: {}", epoch_before, epoch_after);
-                    }
-
-                    Ok(ProcessedContent::StagedCommit {
-                        new_epoch: epoch_after,
+                    Ok((ProcessedContent::StagedCommit {
+                        new_epoch: target_epoch,
                         commit_metadata: metadata_info,
-                    })
+                    }, Some(staged)))
                 },
             }
         });
 
-        result
+        // Task #33: if an incoming StagedCommit was produced, stash it for explicit confirmation.
+        // Overwrites any prior pending entry for the same (group_id, epoch) — OpenMLS produces
+        // deterministic StagedCommits for the same wire message, so overwrite is idempotent.
+        let processed = match result {
+            Ok((content, staged_opt)) => {
+                if let Some(staged) = staged_opt {
+                    // target_epoch is available as `new_epoch` on the StagedCommit variant.
+                    let target_epoch = match &content {
+                        ProcessedContent::StagedCommit { new_epoch, .. } => *new_epoch,
+                        _ => {
+                            crate::error_log!("[MLS-FFI] ❌ invariant violation: non-StagedCommit content paired with Some(staged)");
+                            return Err(MLSError::ContextNotInitialized);
+                        }
+                    };
+                    let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
+                        crate::error_log!("[MLS-FFI] ❌ pending_incoming_merges mutex poisoned");
+                        MLSError::ContextNotInitialized
+                    })?;
+                    let key = (group_id.clone(), target_epoch);
+                    if pending.insert(key, staged).is_some() {
+                        crate::warn_log!(
+                            "[MLS-FFI] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
+                            hex::encode(&group_id),
+                            target_epoch
+                        );
+                    }
+                }
+                content
+            }
+            Err(e) => return Err(e),
+        };
+
+        Ok(processed)
     }
 
     /// Async variant of process_message - offloads crypto work to avoid blocking
@@ -2519,6 +2596,8 @@ impl MLSContext {
     ) -> Result<ProcessedContent, MLSError> {
         self.check_suspended()?;
         let inner = self.inner.clone();
+        // Task #33: carry the pending-merges map into the worker thread.
+        let pending_incoming_merges = self.pending_incoming_merges.clone();
 
         tokio::task::spawn_blocking(move || {
             crate::debug_log!("[MLS-FFI-ASYNC] process_message_async: Starting");
@@ -2536,7 +2615,7 @@ impl MLSContext {
             // Capture epoch manager for use inside the closure
             let epoch_manager = inner_ctx.epoch_secret_manager().clone();
 
-            let result = inner_ctx.with_group(&gid, |group, provider, _signer| {
+            let result: Result<(ProcessedContent, Option<Box<StagedCommit>>), MLSError> = inner_ctx.with_group(&gid, |group, provider, _signer| {
                 let epoch_before = group.epoch().as_u64();
                 crate::debug_log!("[MLS-FFI-ASYNC] 🔐 Current epoch: {}", epoch_before);
 
@@ -2585,7 +2664,7 @@ impl MLSContext {
                 match processed.into_content() {
                     ProcessedMessageContent::ApplicationMessage(app_msg) => {
                         let plaintext = app_msg.into_bytes();
-                        Ok(ProcessedContent::ApplicationMessage { plaintext, sender })
+                        Ok((ProcessedContent::ApplicationMessage { plaintext, sender }, None))
                     },
                     ProcessedMessageContent::ProposalMessage(proposal_msg) => {
                         let proposal = proposal_msg.proposal();
@@ -2645,30 +2724,36 @@ impl MLSContext {
                             }
                         };
 
-                        Ok(ProcessedContent::Proposal {
+                        Ok((ProcessedContent::Proposal {
                             proposal: proposal_info,
                             proposal_ref: ProposalRef {
                                 data: proposal_ref_bytes,
                             },
-                        })
+                        }, None))
                     },
                     ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
                         Err(MLSError::invalid_input("External join proposals not supported"))
                     },
                     ProcessedMessageContent::StagedCommitMessage(staged) => {
-                        crate::info_log!("[MLS-FFI-ASYNC] 📦 Staged commit received, auto-merging...");
+                        // Task #33: stage the incoming commit for caller-driven merge.
+                        // Semantics change: `new_epoch` here = "group will be at this epoch
+                        // AFTER the platform calls merge_incoming_commit", not "group is now
+                        // at this epoch."
+                        let target_epoch = staged.group_context().epoch().as_u64();
+                        crate::info_log!(
+                            "[MLS-FFI-ASYNC] 📦 Staged commit received — STAGING for explicit merge (target epoch {})",
+                            target_epoch
+                        );
 
-                        // Metadata: derive the new epoch's metadata key from the staged
-                        // commit's exporter BEFORE merge consumes the StagedCommit.
-                        let new_epoch = staged.group_context().epoch().as_u64();
+                        // Metadata: derive the new epoch's metadata key BEFORE staged is moved.
                         let metadata_key_bytes = match crate::metadata::derive_metadata_key(
                             &staged,
                             provider.crypto(),
                             &group_id,
-                            new_epoch,
+                            target_epoch,
                         ) {
                             Ok(key) => {
-                                crate::info_log!("[MLS-FFI-ASYNC] 🔑 metadata key derived for epoch {}", new_epoch);
+                                crate::info_log!("[MLS-FFI-ASYNC] 🔑 metadata key derived for epoch {}", target_epoch);
                                 Some(key.to_vec())
                             }
                             Err(e) => {
@@ -2677,52 +2762,60 @@ impl MLSContext {
                             }
                         };
 
-                        // Export current epoch secret before merging
+                        // Export the pre-merge epoch secret now (forward-secrecy window).
+                        // Post-merge cleanup moves into `merge_incoming_commit`.
                         if let Err(e) = crate::async_runtime::block_on(
                             epoch_manager.export_current_epoch_secret(group, provider)
                         ) {
-                            crate::warn_log!("[MLS-FFI-ASYNC] ⚠️ Failed to export epoch secret before merge: {:?}", e);
-                        }
-
-                        let epoch_before = group.epoch().as_u64();
-
-                        group.merge_staged_commit(provider, *staged)
-                            .map_err(|e| {
-                                crate::error_log!("[MLS-FFI-ASYNC] ❌ Failed to merge staged commit: {:?}", e);
-                                MLSError::MergeFailed
-                            })?;
-
-                        let epoch_after = group.epoch().as_u64();
-                        crate::info_log!("[MLS-FFI-ASYNC] ✅ Staged commit merged: epoch {} -> {}", epoch_before, epoch_after);
-
-                        // Cleanup old epoch secrets after incoming commit advances the epoch
-                        let retention_epochs = 5u64;
-                        if let Err(e) = crate::async_runtime::block_on(
-                            epoch_manager.cleanup_old_epochs(
-                                group.group_id().as_slice(),
-                                epoch_after,
-                                retention_epochs,
-                            )
-                        ) {
-                            crate::warn_log!("[MLS-FFI-ASYNC] ⚠️ Failed to cleanup old epochs after staged commit merge: {:?}", e);
+                            crate::warn_log!("[MLS-FFI-ASYNC] ⚠️ Failed to export epoch secret before staging: {:?}", e);
                         }
 
                         let metadata_reference_json = current_metadata_reference_json(group);
                         let metadata_info = metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
                             metadata_key,
-                            epoch: epoch_after,
+                            epoch: target_epoch,
                             metadata_reference_json,
                         });
 
-                        Ok(ProcessedContent::StagedCommit {
-                            new_epoch: epoch_after,
+                        Ok((ProcessedContent::StagedCommit {
+                            new_epoch: target_epoch,
                             commit_metadata: metadata_info,
-                        })
+                        }, Some(staged)))
                     },
                 }
             });
 
-            result
+            // Release the inner lock before touching `pending_incoming_merges`.
+            drop(guard);
+
+            // Task #33: stash incoming StagedCommit for explicit platform confirmation.
+            match result {
+                Ok((content, staged_opt)) => {
+                    if let Some(staged) = staged_opt {
+                        let target_epoch = match &content {
+                            ProcessedContent::StagedCommit { new_epoch, .. } => *new_epoch,
+                            _ => {
+                                crate::error_log!("[MLS-FFI-ASYNC] ❌ invariant violation: non-StagedCommit content paired with Some(staged)");
+                                return Err(MLSError::ContextNotInitialized);
+                            }
+                        };
+                        let mut pending = pending_incoming_merges.lock().map_err(|_| {
+                            crate::error_log!("[MLS-FFI-ASYNC] ❌ pending_incoming_merges mutex poisoned");
+                            MLSError::ContextNotInitialized
+                        })?;
+                        let key = (group_id.clone(), target_epoch);
+                        if pending.insert(key, staged).is_some() {
+                            crate::warn_log!(
+                                "[MLS-FFI-ASYNC] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
+                                hex::encode(&group_id),
+                                target_epoch
+                            );
+                        }
+                    }
+                    Ok(content)
+                }
+                Err(e) => Err(e),
+            }
         })
         .await
         .map_err(|e| {
@@ -3584,9 +3677,25 @@ impl MLSContext {
         // Export epoch secret before processing (may advance epoch)
         let epoch_manager = inner.epoch_secret_manager().clone();
 
-        // Process commit as a message and extract all proposals (Update, Add, Remove)
-        let (update_proposals, add_proposals, remove_proposals, metadata_info) =
-            inner.with_group(&gid, |group, provider, _signer| {
+        // Task #33: stage-instead-of-merge. The closure now returns the proposals + metadata
+        // derived from the StagedCommit, plus the StagedCommit itself as `Some(staged)` for
+        // the caller to stash in `pending_incoming_merges`. Platform must explicitly call
+        // `merge_incoming_commit(group_id, target_epoch)` to advance the epoch.
+        let (
+            update_proposals,
+            add_proposals,
+            remove_proposals,
+            metadata_info,
+            target_epoch,
+            staged_commit_opt,
+        ): (
+            Vec<UpdateProposalInfo>,
+            Vec<AddProposalInfo>,
+            Vec<RemoveProposalInfo>,
+            Option<CommitMetadataInfo>,
+            u64,
+            Option<Box<StagedCommit>>,
+        ) = inner.with_group(&gid, |group, provider, _signer| {
                 let (mls_msg, _) =
                     MlsMessageIn::tls_deserialize_bytes(&commit_data).map_err(|e| {
                         crate::error_log!(
@@ -3705,18 +3814,18 @@ impl MLSContext {
                             .collect();
 
                         // Metadata: derive the new epoch's metadata key from the staged
-                        // commit's exporter BEFORE merge consumes the StagedCommit.
-                        let new_epoch_from_staged = staged.group_context().epoch().as_u64();
+                        // commit's exporter BEFORE `staged` is moved into the tuple.
+                        let target_epoch = staged.group_context().epoch().as_u64();
                         let metadata_key_bytes = match crate::metadata::derive_metadata_key(
                             &staged,
                             provider.crypto(),
                             &group_id,
-                            new_epoch_from_staged,
+                            target_epoch,
                         ) {
                             Ok(key) => {
                                 crate::info_log!(
                                     "[MLS-FFI] 🔑 process_commit: metadata key derived for epoch {}",
-                                    new_epoch_from_staged
+                                    target_epoch
                                 );
                                 Some(key.to_vec())
                             }
@@ -3729,11 +3838,9 @@ impl MLSContext {
                             }
                         };
 
-                        // CRITICAL: Auto-merge the staged commit to advance the epoch.
-                        // The StagedCommit is consumed here — if we don't merge it now, it's
-                        // dropped and the caller's merge_staged_commit/merge_pending_commit
-                        // will be a no-op (those only merge OWN pending commits, not incoming
-                        // staged commits from other members).
+                        // Task #33: export the pre-merge epoch secret now (forward-secrecy
+                        // window). Merge itself is deferred to `merge_incoming_commit` —
+                        // which also runs post-merge `cleanup_old_epochs`.
                         if let Err(e) = crate::async_runtime::block_on(
                             epoch_manager.export_current_epoch_secret(group, provider),
                         ) {
@@ -3743,39 +3850,33 @@ impl MLSContext {
                             );
                         }
 
-                        let epoch_before = group.epoch().as_u64();
-                        group.merge_staged_commit(provider, *staged).map_err(|e| {
-                            crate::error_log!(
-                                "[MLS-FFI] ❌ process_commit: Failed to merge staged commit: {:?}",
-                                e
-                            );
-                            MLSError::MergeFailed
-                        })?;
-                        let epoch_after = group.epoch().as_u64();
-                        crate::info_log!(
-                            "[MLS-FFI] ✅ process_commit: merged staged commit, epoch {} -> {}",
-                            epoch_before,
-                            epoch_after
-                        );
                         let metadata_reference_json = current_metadata_reference_json(group);
                         let metadata_derived =
                             metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
                                 metadata_key,
-                                epoch: epoch_after,
+                                epoch: target_epoch,
                                 metadata_reference_json,
                             });
 
-                        Ok((updates, adds, removes, metadata_derived))
+                        crate::info_log!(
+                            "[MLS-FFI] 📦 process_commit: STAGING commit for explicit merge (target epoch {})",
+                            target_epoch
+                        );
+
+                        Ok((updates, adds, removes, metadata_derived, target_epoch, Some(staged)))
                     }
                     _ => Err(MLSError::InvalidCommit),
                 }
             })?;
 
-        // Get post-merge epoch
-        let new_epoch =
-            inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))?;
+        // NB: `new_epoch` in the returned `ProcessCommitResult` now reflects the
+        // **target epoch** of the staged commit (the epoch the group will be at
+        // AFTER the platform calls `merge_incoming_commit`), not the current group
+        // epoch. This is a wire-semantics change vs. the prior auto-merge path.
+        let new_epoch = target_epoch;
 
-        // Flush database to persist the new epoch state
+        // Flush database (no epoch advance yet, but persists staging-related writes
+        // from process_protocol_message — proposal stores, etc.)
         self.check_suspended()?;
         inner.flush_database().map_err(|e| {
             crate::error_log!(
@@ -3785,6 +3886,28 @@ impl MLSContext {
             e
         })?;
         inner.maybe_truncate_checkpoint();
+
+        // Task #33: stash staged commit for explicit platform confirmation.
+        // We release the `guard` (inner lock) first — `pending_incoming_merges` is a
+        // separate mutex and we don't want to hold both.
+        drop(guard);
+
+        if let Some(staged) = staged_commit_opt {
+            let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
+                crate::error_log!(
+                    "[MLS-FFI] ❌ process_commit: pending_incoming_merges mutex poisoned"
+                );
+                MLSError::ContextNotInitialized
+            })?;
+            let key = (group_id.clone(), target_epoch);
+            if pending.insert(key, staged).is_some() {
+                crate::warn_log!(
+                    "[MLS-FFI] ⚠️ process_commit: Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
+                    hex::encode(&group_id),
+                    target_epoch
+                );
+            }
+        }
 
         Ok(ProcessCommitResult {
             new_epoch,
@@ -4137,6 +4260,205 @@ impl MLSContext {
     pub fn merge_staged_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
         // OpenMLS uses the same internal method for both pending and staged commits
         self.merge_pending_commit(group_id).map(|r| r.new_epoch)
+    }
+
+    /// Task #33: merge an incoming `StagedCommit` that was previously staged by
+    /// `process_message` / `process_message_async` / `decrypt_message` /
+    /// `decrypt_message_async` / `process_commit`.
+    ///
+    /// This is the caller-driven confirmation step that replaces the previous
+    /// auto-merge behavior. The platform must call this once it has:
+    ///   - Validated the incoming commit against its recovery/sync policy
+    ///   - Persisted any pre-merge state it needs (ordering, ack state, etc.)
+    ///
+    /// Returns the new (post-merge) epoch.
+    ///
+    /// Errors:
+    ///   - `MLSError::invalid_input` if no staged commit exists for
+    ///     `(group_id, target_epoch)` — the entry was never staged, or
+    ///     `discard_incoming_commit` already cleared it.
+    ///   - `MLSError::MergeFailed` if OpenMLS `merge_staged_commit` fails; the
+    ///     StagedCommit is dropped (caller must re-fetch from the DS if recovery
+    ///     is needed). This matches the pre-refactor behavior where a failed
+    ///     merge left no resumable state.
+    pub fn merge_incoming_commit(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<u64, MLSError> {
+        self.check_suspended()?;
+
+        // Pop the staged commit under the pending-map lock, then release
+        // before touching the inner MLS context — never hold both at once.
+        let staged = {
+            let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
+                crate::error_log!("[MLS-FFI] ❌ merge_incoming_commit: pending_incoming_merges mutex poisoned");
+                MLSError::ContextNotInitialized
+            })?;
+            pending.remove(&(group_id.clone(), target_epoch))
+        }
+        .ok_or_else(|| {
+            crate::warn_log!(
+                "[MLS-FFI] ⚠️ merge_incoming_commit: no pending staged commit for group {} epoch {}",
+                hex::encode(&group_id),
+                target_epoch
+            );
+            MLSError::invalid_input(format!(
+                "no pending staged commit for epoch {} (not staged, or already discarded)",
+                target_epoch
+            ))
+        })?;
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        let epoch_manager = inner.epoch_secret_manager().clone();
+
+        let new_epoch = inner.with_group(&gid, |group, provider, _signer| {
+            let epoch_before = group.epoch().as_u64();
+            group.merge_staged_commit(provider, *staged).map_err(|e| {
+                crate::error_log!(
+                    "[MLS-FFI] ❌ merge_incoming_commit: merge_staged_commit failed: {:?}",
+                    e
+                );
+                MLSError::MergeFailed
+            })?;
+            let epoch_after = group.epoch().as_u64();
+
+            crate::info_log!(
+                "[MLS-FFI] ✅ merge_incoming_commit: merged staged commit for group {}, epoch {} -> {}",
+                hex::encode(&group_id),
+                epoch_before,
+                epoch_after
+            );
+
+            if epoch_after <= epoch_before {
+                crate::error_log!(
+                    "[MLS-FFI] ❌ CRITICAL: merge_incoming_commit did not advance epoch! {} -> {}",
+                    epoch_before,
+                    epoch_after
+                );
+            }
+
+            // Cleanup old epoch secrets after incoming commit advances the epoch.
+            // This was previously done in the auto-merge path; we move it here so
+            // the retention policy still runs when the platform confirms the merge.
+            let retention_epochs = 5u64;
+            if let Err(e) = crate::async_runtime::block_on(
+                epoch_manager.cleanup_old_epochs(
+                    group.group_id().as_slice(),
+                    epoch_after,
+                    retention_epochs,
+                ),
+            ) {
+                crate::warn_log!(
+                    "[MLS-FFI] ⚠️ merge_incoming_commit: cleanup_old_epochs failed: {:?}",
+                    e
+                );
+            }
+
+            Ok(epoch_after)
+        })?;
+
+        // Persist merge result.
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ⚠️ merge_incoming_commit: Failed to flush database: {:?}",
+                e
+            );
+            e
+        })?;
+        inner.maybe_truncate_checkpoint();
+
+        Ok(new_epoch)
+    }
+
+    /// Task #33: discard an incoming `StagedCommit` that was previously staged,
+    /// without advancing the local epoch.
+    ///
+    /// Use this when the platform decides (e.g. via recovery policy) that the
+    /// staged commit should not be applied — for instance if a fork/reset has
+    /// been observed and the platform is about to initiate a rejoin.
+    ///
+    /// OpenMLS's own storage is **not** modified by this call. Only the
+    /// in-memory staging handle is dropped. Any OpenMLS-side bookkeeping for
+    /// the staged commit (proposal queue, etc.) is unaffected; the staged
+    /// commit will be garbage collected via the normal epoch-advance path.
+    ///
+    /// Idempotent: no-op if no entry exists for `(group_id, target_epoch)`.
+    pub fn discard_incoming_commit(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
+            crate::error_log!(
+                "[MLS-FFI] ❌ discard_incoming_commit: pending_incoming_merges mutex poisoned"
+            );
+            MLSError::ContextNotInitialized
+        })?;
+        if pending.remove(&(group_id.clone(), target_epoch)).is_some() {
+            crate::info_log!(
+                "[MLS-FFI] 🗑️ discard_incoming_commit: dropped staged commit for group {} epoch {}",
+                hex::encode(&group_id),
+                target_epoch
+            );
+        } else {
+            crate::debug_log!(
+                "[MLS-FFI] discard_incoming_commit: no staged commit to drop for group {} epoch {} (already merged, discarded, or never staged)",
+                hex::encode(&group_id),
+                target_epoch
+            );
+        }
+        Ok(())
+    }
+
+    /// Task #33 (transitional): wrapper that runs `process_message` and
+    /// immediately merges any incoming staged commit, preserving the
+    /// pre-refactor auto-merge behavior.
+    ///
+    /// **DEPRECATED.** This exists only for platforms (iOS, Android, catmos)
+    /// that have not yet migrated to the explicit stage/merge contract.
+    /// New code should call `process_message` + (`merge_incoming_commit` or
+    /// `discard_incoming_commit`).
+    ///
+    /// Logs a warning on every invocation — see server logs for migration
+    /// progress.
+    pub fn process_message_legacy_automerge(
+        &self,
+        group_id: Vec<u8>,
+        message_data: Vec<u8>,
+    ) -> Result<ProcessedContent, MLSError> {
+        crate::warn_log!(
+            "[MLS-FFI] ⚠️ DEPRECATED: process_message_legacy_automerge called for group {} — migrate the caller to explicit process_message + merge_incoming_commit",
+            hex::encode(&group_id)
+        );
+
+        let processed = self.process_message(group_id.clone(), message_data)?;
+
+        // Only StagedCommit results need the auto-merge step. Application/Proposal
+        // results didn't stage anything and we simply return them unchanged.
+        if let ProcessedContent::StagedCommit {
+            new_epoch: target_epoch,
+            ..
+        } = &processed
+        {
+            let target_epoch = *target_epoch;
+            // Best-effort: if merge fails, return the error. The staging was already
+            // consumed by process_message, so the caller cannot retry.
+            let merged_epoch = self.merge_incoming_commit(group_id.clone(), target_epoch)?;
+            crate::info_log!(
+                "[MLS-FFI] process_message_legacy_automerge: merged group {} to epoch {}",
+                hex::encode(&group_id),
+                merged_epoch
+            );
+        }
+
+        Ok(processed)
     }
 
     /// Check if a group exists in local storage
