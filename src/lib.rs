@@ -21,6 +21,8 @@ pub mod orchestrator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod orchestrator_bridge;
 mod types;
+// Voice depends on audiopus which has no wasm32 sysroot.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod voice;
 
 // ATProto serde helpers (standalone, no external dependency)

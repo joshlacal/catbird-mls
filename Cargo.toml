@@ -53,10 +53,7 @@ scopeguard = "1.2"
 tracing = "0.1"
 rand = "0.8"
 
-# Voice message processing
-audiopus = { version = "0.3.0-rc.0" }
-audiopus_sys = { version = "0.2", features = ["static"] }
-ogg = "0.9"
+# Voice message processing (non-wasm only — audiopus_sys's opus C lib has no wasm32 sysroot)
 
 # Optional: echo-bot binary
 reqwest = { version = "0.12", features = ["json"], optional = true }
@@ -84,11 +81,17 @@ fork-resolution = []
 openmls_sqlite_storage = { version = "0.2", features = ["extensions-draft-08"] }
 rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
+audiopus = { version = "0.3.0-rc.0" }
+audiopus_sys = { version = "0.2", features = ["static"] }
+ogg = "0.9"
 
 [target.'cfg(all(target_os = "android", not(target_arch = "wasm32")))'.dependencies]
 openmls_sqlite_storage = { version = "0.2", features = ["extensions-draft-08"] }
 rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
+audiopus = { version = "0.3.0-rc.0" }
+audiopus_sys = { version = "0.2", features = ["static"] }
+ogg = "0.9"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1", features = ["sync"] }
