@@ -438,6 +438,18 @@ where
                         local_epoch = current_epoch,
                         "CRITICAL: merge_pending_commit failed after server accepted add_members commit — local state is behind server"
                     );
+                    // Clear the now-stale pending commit so future encrypts on this
+                    // group don't hit OpenMLS's "pending commit exists" assertion.
+                    // Without this, the group is stuck "can't send" until restart.
+                    if let Err(clear_err) =
+                        self.mls_context().clear_pending_commit(group_id_bytes.clone())
+                    {
+                        tracing::warn!(
+                            error = %clear_err,
+                            group_id,
+                            "Failed to clear stale pending commit after add_members merge failure"
+                        );
+                    }
                     if let Err(storage_err) = self.storage().mark_needs_rejoin(group_id).await {
                         tracing::warn!(error = %storage_err, group_id, "Failed to mark group for rejoin");
                     }
@@ -567,6 +579,17 @@ where
                     group_id,
                     "CRITICAL: merge_pending_commit failed after server accepted remove_members commit — local state is behind server"
                 );
+                // Clear the now-stale pending commit so future encrypts on this
+                // group don't hit OpenMLS's "pending commit exists" assertion.
+                if let Err(clear_err) =
+                    self.mls_context().clear_pending_commit(group_id_bytes.clone())
+                {
+                    tracing::warn!(
+                        error = %clear_err,
+                        group_id,
+                        "Failed to clear stale pending commit after remove_members merge failure"
+                    );
+                }
                 if let Err(storage_err) = self.storage().mark_needs_rejoin(group_id).await {
                     tracing::warn!(error = %storage_err, group_id, "Failed to mark group for rejoin");
                 }
@@ -675,6 +698,19 @@ where
                         Ok(e) => e,
                         Err(e) => {
                             tracing::error!(error = %e, group_id, "merge failed after swap_members");
+                            // Clear the now-stale pending commit so future encrypts
+                            // on this group don't hit OpenMLS's "pending commit exists"
+                            // assertion.
+                            if let Err(clear_err) = self
+                                .mls_context()
+                                .clear_pending_commit(group_id_bytes.clone())
+                            {
+                                tracing::warn!(
+                                    error = %clear_err,
+                                    group_id,
+                                    "Failed to clear stale pending commit after swap_members merge failure"
+                                );
+                            }
                             let _ = self.storage().mark_needs_rejoin(group_id).await;
                             return Err(e.into());
                         }
