@@ -10,6 +10,7 @@ pub mod mls_provider;
 pub mod orchestrator;
 pub mod ordering;
 pub mod recovery;
+pub mod staged_commit;
 pub mod storage;
 pub mod sync;
 pub mod types;

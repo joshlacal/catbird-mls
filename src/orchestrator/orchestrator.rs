@@ -113,6 +113,48 @@ where
     /// Tracks consecutive GroupInfo 404 responses per conversation (spec §8.3).
     groupinfo_404_tracker: Mutex<GroupInfo404Tracker>,
     fork_detection_states: std::sync::Mutex<HashMap<String, ForkDetectionState>>,
+    /// Staged-but-not-yet-confirmed commits, keyed by group id (MLS only
+    /// allows one pending commit per group). See the three-phase
+    /// `stage_commit` / `confirm_commit` / `discard_pending` API.
+    pending_staged_commits: Mutex<HashMap<GroupId, PendingCommitMeta>>,
+    /// Monotonic counter used to generate handle nonces.
+    staged_commit_nonce: Mutex<u64>,
+}
+
+/// Internal bookkeeping for a staged commit.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingCommitMeta {
+    /// Nonce that must match the handle passed to `confirm_commit` or
+    /// `discard_pending`.
+    pub nonce: u64,
+    /// The epoch that `stage_commit` captured before constructing the
+    /// pending commit. Used to fence `server_epoch` against echoes that
+    /// reference a completely different epoch.
+    pub source_epoch: u64,
+    /// The epoch the group will advance to on confirm. Equals
+    /// `source_epoch + 1` by MLS construction.
+    pub target_epoch: u64,
+    /// The kind of commit — used to update the in-memory group state on
+    /// confirm (e.g. append/remove DIDs from the member list).
+    pub kind: StagedCommitKindSummary,
+}
+
+/// Lightweight summary of what kind of commit was staged. Carried separately
+/// from `CommitKind` so the heavy key-package / extension payloads don't live
+/// in the pending map.
+#[derive(Debug, Clone)]
+pub(crate) enum StagedCommitKindSummary {
+    AddMembers {
+        member_dids: Vec<String>,
+    },
+    RemoveMembers {
+        member_dids: Vec<String>,
+    },
+    SwapMembers {
+        remove_dids: Vec<String>,
+        add_dids: Vec<String>,
+    },
+    UpdateMetadata,
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -155,6 +197,8 @@ where
             decrypt_fail_counts: Mutex::new(HashMap::new()),
             groupinfo_404_tracker: Mutex::new(GroupInfo404Tracker::new()),
             fork_detection_states: std::sync::Mutex::new(HashMap::new()),
+            pending_staged_commits: Mutex::new(HashMap::new()),
+            staged_commit_nonce: Mutex::new(0),
         }
     }
 
@@ -182,6 +226,7 @@ where
         if let Ok(mut fds) = self.fork_detection_states.lock() {
             fds.clear();
         }
+        self.pending_staged_commits.lock().await.clear();
         *self.user_did.lock().await = None;
     }
 
@@ -330,6 +375,21 @@ where
         &self,
     ) -> &std::sync::Mutex<HashMap<String, ForkDetectionState>> {
         &self.fork_detection_states
+    }
+
+    /// Access the pending-staged-commits map (task #44).
+    pub(crate) fn pending_staged_commits(&self) -> &Mutex<HashMap<GroupId, PendingCommitMeta>> {
+        &self.pending_staged_commits
+    }
+
+    /// Allocate a fresh nonce for a staged commit handle. Wraps at `u64::MAX`
+    /// — practically unreachable, but the map is keyed by group id anyway so
+    /// a collision would still require the same group to produce `u64::MAX`
+    /// staged commits in one process lifetime.
+    pub(crate) async fn next_staged_commit_nonce(&self) -> u64 {
+        let mut guard = self.staged_commit_nonce.lock().await;
+        *guard = guard.wrapping_add(1);
+        *guard
     }
 
     /// Clean up old epoch secrets after an epoch advance.

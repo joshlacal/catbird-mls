@@ -357,9 +357,13 @@ where
     }
 
     /// Add members to an existing group.
+    ///
+    /// Backward-compatible wrapper around the three-phase `stage_commit` /
+    /// `confirm_commit` / `discard_pending` API added in task #44. Platforms
+    /// can migrate to the new API incrementally; this wrapper will remain
+    /// until all clients have moved over.
     pub async fn add_members(&self, group_id: &str, member_dids: &[String]) -> Result<()> {
         self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
 
         tracing::info!(
             group_id,
@@ -367,7 +371,7 @@ where
             "Adding members to group"
         );
 
-        // Fetch key packages for the new members
+        // Fetch key packages for the new members.
         let key_packages = self.api_client().get_key_packages(member_dids).await?;
         let kp_data: Vec<crate::KeyPackageData> = key_packages
             .iter()
@@ -376,151 +380,95 @@ where
             })
             .collect();
 
-        let group_id_bytes = hex::decode(group_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        // Stage the commit via the new API.
+        let plan = self
+            .stage_commit(
+                group_id,
+                CommitKind::AddMembers {
+                    member_dids: member_dids.to_vec(),
+                    key_packages: kp_data,
+                },
+            )
+            .await?;
 
-        let add_result = self
-            .mls_context()
-            .add_members(group_id_bytes.clone(), kp_data)?;
-
-        // Track own commit
-        {
-            self.evict_stale_commits().await;
-            let hash = Sha256::digest(&add_result.commit_data);
-            self.own_commits()
-                .lock()
-                .await
-                .insert(hash.to_vec(), Instant::now());
-        }
-
-        // Send to server
+        // Ship commit + Welcome to the DS.
         let server_result = self
             .api_client()
             .add_members(
                 group_id,
                 member_dids,
-                &add_result.commit_data,
-                Some(&add_result.welcome_data),
+                &plan.commit_bytes,
+                plan.welcome_bytes.as_deref(),
             )
-            .await?;
+            .await;
 
-        if !server_result.success {
-            // Clear the pending commit so the group isn't stuck
-            if let Err(e) = self
-                .mls_context()
-                .clear_pending_commit(group_id_bytes.clone())
-            {
-                tracing::warn!(error = %e, group_id, "Failed to clear pending commit after server rejection");
-            }
-            return Err(OrchestratorError::MemberSyncFailed);
-        }
+        match server_result {
+            Ok(result) => {
+                if !result.success {
+                    let _ = self.discard_pending(plan.handle).await;
+                    return Err(OrchestratorError::MemberSyncFailed);
+                }
 
-        // Best-effort receipt storage
-        if let Some(ref receipt) = server_result.receipt {
-            if let Err(e) = self.storage().store_sequencer_receipt(receipt).await {
-                tracing::warn!(error = %e, group_id, "Failed to store sequencer receipt");
-            }
-        }
+                // Best-effort receipt storage.
+                if let Some(ref receipt) = result.receipt {
+                    if let Err(e) = self.storage().store_sequencer_receipt(receipt).await {
+                        tracing::warn!(error = %e, group_id, "Failed to store sequencer receipt");
+                    }
+                }
 
-        // Merge pending commit if server advanced epoch
-        let current_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
-        if server_result.new_epoch > current_epoch {
-            let merged_epoch = match self
-                .mls_context()
-                .merge_pending_commit(group_id_bytes.clone())
-            {
-                Ok(epoch) => epoch,
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
+                // Confirm — but only if the server actually advanced the
+                // epoch. Some legacy server paths accept the commit without
+                // advancing (returning `new_epoch == 0` or the old epoch);
+                // in that case the local pending commit must be discarded,
+                // not merged.
+                let current_epoch =
+                    self.mls_context()
+                        .get_epoch(hex::decode(group_id).map_err(|_| {
+                            OrchestratorError::InvalidInput("Invalid hex group ID".into())
+                        })?)?;
+
+                if result.new_epoch > current_epoch {
+                    // Pass the skip sentinel — we've already validated the
+                    // server's epoch advanced, and the server's raw new_epoch
+                    // isn't necessarily `source_epoch + 1` in every legacy
+                    // path (e.g. if it reflects a merged-history epoch from
+                    // the DS). The wrapper consciously trades fencing
+                    // strictness for backward compatibility; new platform
+                    // code calling `confirm_commit` directly should pass the
+                    // real epoch for proper fencing.
+                    self.confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
+                        .await?;
+                } else {
+                    tracing::warn!(
                         group_id,
-                        server_epoch = server_result.new_epoch,
+                        server_epoch = result.new_epoch,
                         local_epoch = current_epoch,
-                        "CRITICAL: merge_pending_commit failed after server accepted add_members commit — local state is behind server"
+                        "Server accepted add_members but epoch did not advance — discarding pending commit"
                     );
-                    // Clear the now-stale pending commit so future encrypts on this
-                    // group don't hit OpenMLS's "pending commit exists" assertion.
-                    // Without this, the group is stuck "can't send" until restart.
-                    if let Err(clear_err) =
-                        self.mls_context().clear_pending_commit(group_id_bytes.clone())
-                    {
-                        tracing::warn!(
-                            error = %clear_err,
-                            group_id,
-                            "Failed to clear stale pending commit after add_members merge failure"
-                        );
-                    }
-                    if let Err(storage_err) = self.storage().mark_needs_rejoin(group_id).await {
-                        tracing::warn!(error = %storage_err, group_id, "Failed to mark group for rejoin");
-                    }
-                    return Err(e.into());
-                }
-            };
+                    let _ = self.discard_pending(plan.handle).await;
 
-            // Cleanup old epoch secrets after add_members epoch advance
-            self.cleanup_epoch_secrets_if_needed(group_id, merged_epoch)
-                .await;
-
-            {
-                let mut states = self.group_states().lock().await;
-                if let Some(gs) = states.get_mut(group_id) {
-                    gs.epoch = merged_epoch;
-                    for did in member_dids {
-                        if !gs.members.contains(did) {
-                            gs.members.push(did.clone());
+                    // Still update the member list in group state for
+                    // backward compatibility — legacy callers rely on the
+                    // members appearing even when the epoch didn't move.
+                    let mut states = self.group_states().lock().await;
+                    if let Some(gs) = states.get_mut(group_id) {
+                        for did in member_dids {
+                            if !gs.members.contains(did) {
+                                gs.members.push(did.clone());
+                            }
+                        }
+                        let state_clone = gs.clone();
+                        drop(states);
+                        if let Err(e) = self.storage().set_group_state(&state_clone).await {
+                            tracing::warn!(error = %e, group_id, "Failed to persist group state after no-advance add_members");
                         }
                     }
-                    let state_clone = gs.clone();
-                    drop(states);
-                    if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                        tracing::warn!(error = %e, group_id, "Failed to persist group state after add_members");
-                    }
                 }
             }
-        } else {
-            // Server reported success but epoch didn't advance (new_epoch == 0 or == current_epoch).
-            // Clear the pending commit so it doesn't leak and block future operations.
-            tracing::warn!(
-                group_id,
-                server_epoch = server_result.new_epoch,
-                local_epoch = current_epoch,
-                "Server accepted add_members but epoch did not advance — clearing pending commit"
-            );
-            if let Err(e) = self
-                .mls_context()
-                .clear_pending_commit(group_id_bytes.clone())
-            {
-                tracing::warn!(error = %e, group_id, "Failed to clear leaked pending commit after no-advance add_members");
+            Err(e) => {
+                let _ = self.discard_pending(plan.handle).await;
+                return Err(e);
             }
-
-            // Still update the member list in group state
-            {
-                let mut states = self.group_states().lock().await;
-                if let Some(gs) = states.get_mut(group_id) {
-                    for did in member_dids {
-                        if !gs.members.contains(did) {
-                            gs.members.push(did.clone());
-                        }
-                    }
-                    let state_clone = gs.clone();
-                    drop(states);
-                    if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                        tracing::warn!(error = %e, group_id, "Failed to persist group state after no-advance add_members");
-                    }
-                }
-            }
-        }
-
-        // Publish updated GroupInfo
-        let group_info = self
-            .mls_context()
-            .export_group_info(group_id_bytes, user_did.into_bytes())?;
-        if let Err(e) = self
-            .api_client()
-            .publish_group_info(group_id, &group_info)
-            .await
-        {
-            tracing::warn!(error = %e, group_id, "Failed to publish GroupInfo (external joins may fail)");
         }
 
         tracing::info!(group_id, "Members added successfully");
@@ -528,9 +476,11 @@ where
     }
 
     /// Remove members from a group.
+    ///
+    /// Backward-compatible wrapper around the three-phase `stage_commit` /
+    /// `confirm_commit` / `discard_pending` API added in task #44.
     pub async fn remove_members(&self, group_id: &str, member_dids: &[String]) -> Result<()> {
         self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
 
         tracing::info!(
             group_id,
@@ -538,98 +488,38 @@ where
             "Removing members from group"
         );
 
-        let group_id_bytes = hex::decode(group_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
-
-        // remove_members takes member identity bytes (DIDs as bytes)
-        let member_identities: Vec<Vec<u8>> = member_dids
-            .iter()
-            .map(|did| did.as_bytes().to_vec())
-            .collect();
-
-        let commit_data = self
-            .mls_context()
-            .remove_members(group_id_bytes.clone(), member_identities)?;
-
-        // Track own commit
-        {
-            self.evict_stale_commits().await;
-            let hash = Sha256::digest(&commit_data);
-            self.own_commits()
-                .lock()
-                .await
-                .insert(hash.to_vec(), Instant::now());
-        }
-
-        // Send to server
-        self.api_client()
-            .remove_members(group_id, member_dids, &commit_data)
+        let plan = self
+            .stage_commit(
+                group_id,
+                CommitKind::RemoveMembers {
+                    member_dids: member_dids.to_vec(),
+                },
+            )
             .await?;
 
-        // Merge pending commit — server has already advanced the epoch, so if this
-        // fails the local state is behind the server and needs a rejoin.
-        let merged_epoch = match self
-            .mls_context()
-            .merge_pending_commit(group_id_bytes.clone())
-        {
-            Ok(epoch) => epoch,
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    group_id,
-                    "CRITICAL: merge_pending_commit failed after server accepted remove_members commit — local state is behind server"
-                );
-                // Clear the now-stale pending commit so future encrypts on this
-                // group don't hit OpenMLS's "pending commit exists" assertion.
-                if let Err(clear_err) =
-                    self.mls_context().clear_pending_commit(group_id_bytes.clone())
-                {
-                    tracing::warn!(
-                        error = %clear_err,
-                        group_id,
-                        "Failed to clear stale pending commit after remove_members merge failure"
-                    );
-                }
-                if let Err(storage_err) = self.storage().mark_needs_rejoin(group_id).await {
-                    tracing::warn!(error = %storage_err, group_id, "Failed to mark group for rejoin");
-                }
-                return Err(e.into());
-            }
-        };
-
-        // Cleanup old epoch secrets after remove_members epoch advance
-        self.cleanup_epoch_secrets_if_needed(group_id, merged_epoch)
-            .await;
-
-        {
-            let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.get_mut(group_id) {
-                gs.epoch = merged_epoch;
-                gs.members.retain(|m| !member_dids.contains(m));
-                let state_clone = gs.clone();
-                drop(states);
-                if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                    tracing::warn!(error = %e, group_id, "Failed to persist group state after remove_members");
-                }
-            }
-        }
-
-        // Publish updated GroupInfo
-        let group_info = self
-            .mls_context()
-            .export_group_info(group_id_bytes, user_did.into_bytes())?;
-        if let Err(e) = self
+        match self
             .api_client()
-            .publish_group_info(group_id, &group_info)
+            .remove_members(group_id, member_dids, &plan.commit_bytes)
             .await
         {
-            tracing::warn!(error = %e, group_id, "Failed to publish GroupInfo (external joins may fail)");
+            Ok(()) => {
+                // `api_client.remove_members` returns `()` — no server
+                // epoch to fence against. Pass the skip sentinel.
+                self.confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
+                    .await?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.discard_pending(plan.handle).await;
+                Err(e)
+            }
         }
-
-        Ok(())
     }
 
     /// Atomically swap members: remove old devices + add new in one commit.
+    ///
+    /// Backward-compatible wrapper around the three-phase `stage_commit` /
+    /// `confirm_commit` / `discard_pending` API added in task #44.
     pub async fn swap_members(
         &self,
         group_id: &str,
@@ -637,7 +527,6 @@ where
         add_dids: &[String],
     ) -> Result<()> {
         self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
         tracing::info!(
             group_id,
             remove_count = remove_dids.len(),
@@ -652,111 +541,56 @@ where
                 data: kp.key_package_data.clone(),
             })
             .collect();
-        let group_id_bytes = hex::decode(group_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
-        let remove_ids: Vec<Vec<u8>> = remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
-        let swap_result =
-            self.mls_context()
-                .swap_members(group_id_bytes.clone(), remove_ids, kp_data)?;
 
-        {
-            self.evict_stale_commits().await;
-            let hash = Sha256::digest(&swap_result.commit_data);
-            self.own_commits()
-                .lock()
-                .await
-                .insert(hash.to_vec(), Instant::now());
-        }
+        let plan = self
+            .stage_commit(
+                group_id,
+                CommitKind::SwapMembers {
+                    remove_dids: remove_dids.to_vec(),
+                    add_dids: add_dids.to_vec(),
+                    add_key_packages: kp_data,
+                },
+            )
+            .await?;
 
         let server_result = self
             .api_client()
             .add_members(
                 group_id,
                 add_dids,
-                &swap_result.commit_data,
-                Some(&swap_result.welcome_data),
+                &plan.commit_bytes,
+                plan.welcome_bytes.as_deref(),
             )
             .await;
 
         match server_result {
             Ok(result) => {
                 if !result.success {
-                    let _ = self
-                        .mls_context()
-                        .clear_pending_commit(group_id_bytes.clone());
+                    let _ = self.discard_pending(plan.handle).await;
                     return Err(OrchestratorError::MemberSyncFailed);
                 }
                 if let Some(ref receipt) = result.receipt {
                     let _ = self.storage().store_sequencer_receipt(receipt).await;
                 }
-                let current_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+                let current_epoch =
+                    self.mls_context()
+                        .get_epoch(hex::decode(group_id).map_err(|_| {
+                            OrchestratorError::InvalidInput("Invalid hex group ID".into())
+                        })?)?;
                 if result.new_epoch > current_epoch {
-                    let merged_epoch = match self
-                        .mls_context()
-                        .merge_pending_commit(group_id_bytes.clone())
-                    {
-                        Ok(e) => e,
-                        Err(e) => {
-                            tracing::error!(error = %e, group_id, "merge failed after swap_members");
-                            // Clear the now-stale pending commit so future encrypts
-                            // on this group don't hit OpenMLS's "pending commit exists"
-                            // assertion.
-                            if let Err(clear_err) = self
-                                .mls_context()
-                                .clear_pending_commit(group_id_bytes.clone())
-                            {
-                                tracing::warn!(
-                                    error = %clear_err,
-                                    group_id,
-                                    "Failed to clear stale pending commit after swap_members merge failure"
-                                );
-                            }
-                            let _ = self.storage().mark_needs_rejoin(group_id).await;
-                            return Err(e.into());
-                        }
-                    };
-                    // Cleanup old epoch secrets after swap_members epoch advance
-                    self.cleanup_epoch_secrets_if_needed(group_id, merged_epoch)
-                        .await;
-
-                    {
-                        let mut states = self.group_states().lock().await;
-                        if let Some(gs) = states.get_mut(group_id) {
-                            gs.epoch = merged_epoch;
-                            gs.members.retain(|m| !remove_dids.contains(m));
-                            for did in add_dids {
-                                if !gs.members.contains(did) {
-                                    gs.members.push(did.clone());
-                                }
-                            }
-                            let sc = gs.clone();
-                            drop(states);
-                            let _ = self.storage().set_group_state(&sc).await;
-                        }
-                    }
+                    self.confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
+                        .await?;
                 } else {
-                    let _ = self
-                        .mls_context()
-                        .clear_pending_commit(group_id_bytes.clone());
+                    let _ = self.discard_pending(plan.handle).await;
                 }
+                tracing::info!(group_id, "swap_members complete");
+                Ok(())
             }
             Err(e) => {
-                let _ = self
-                    .mls_context()
-                    .clear_pending_commit(group_id_bytes.clone());
-                return Err(e);
+                let _ = self.discard_pending(plan.handle).await;
+                Err(e)
             }
         }
-
-        let group_info = self
-            .mls_context()
-            .export_group_info(group_id_bytes, user_did.into_bytes())?;
-        let _ = self
-            .api_client()
-            .publish_group_info(group_id, &group_info)
-            .await;
-        tracing::info!(group_id, "swap_members complete");
-        Ok(())
     }
 
     /// Leave a conversation.
@@ -891,8 +725,10 @@ where
 
     /// Update encrypted group metadata (name, description, avatar_hash).
     ///
+    /// Backward-compatible wrapper around the three-phase `stage_commit` /
+    /// `confirm_commit` / `discard_pending` API added in task #44.
     /// Proposes a GroupContextExtensions commit, sends it to the server,
-    /// then merges the pending commit locally to advance the epoch.
+    /// then confirms the pending commit locally to advance the epoch.
     pub async fn update_group_metadata(
         &self,
         conversation_id: &str,
@@ -901,10 +737,6 @@ where
         avatar_hash: Option<&str>,
     ) -> Result<()> {
         self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
-
-        let group_id = hex::decode(conversation_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
         let metadata = crate::group_metadata::GroupMetadata {
             v: 1,
@@ -917,55 +749,41 @@ where
             .to_extension_bytes()
             .map_err(|e| OrchestratorError::Serialization(format!("Metadata serialize: {}", e)))?;
 
-        let commit_bytes = self
-            .mls_context()
-            .update_group_metadata(group_id.clone(), metadata_json)?;
-
-        // Send commit to server
-        // Note: confirmation_tag is None here because the pending commit hasn't been merged yet.
-        // The server extracts the tag from GroupInfo in the commit.
-        self.api_client()
-            .commit_group_change(conversation_id, &commit_bytes, "updateMetadata", None)
+        let plan = self
+            .stage_commit(
+                conversation_id,
+                CommitKind::UpdateMetadata {
+                    group_info_extension: metadata_json,
+                },
+            )
             .await?;
 
-        // Merge pending commit locally
-        let merged_epoch = self.mls_context().merge_pending_commit(group_id.clone())?;
-
-        // Cleanup old epoch secrets after metadata update epoch advance
-        self.cleanup_epoch_secrets_if_needed(conversation_id, merged_epoch)
-            .await;
-
-        // Update group state cache
-        {
-            let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.get_mut(conversation_id) {
-                gs.epoch = merged_epoch;
-                let state_clone = gs.clone();
-                drop(states);
-                if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                    tracing::warn!(error = %e, conversation_id, "Failed to persist group state after metadata update");
-                }
-            }
-        }
-
-        // Publish updated GroupInfo
-        let group_info = self
-            .mls_context()
-            .export_group_info(group_id, user_did.into_bytes())?;
-        if let Err(e) = self
+        // Send commit to server. `commit_group_change` is the legacy metadata
+        // path; `confirmation_tag` is None here because the pending commit
+        // hasn't been merged yet — the server extracts the tag from
+        // GroupInfo in the commit.
+        match self
             .api_client()
-            .publish_group_info(conversation_id, &group_info)
+            .commit_group_change(conversation_id, &plan.commit_bytes, "updateMetadata", None)
             .await
         {
-            tracing::warn!(error = %e, conversation_id, "Failed to publish GroupInfo after metadata update");
-        }
+            Ok(()) => {
+                let confirmed = self
+                    .confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
+                    .await?;
 
-        tracing::info!(
-            conversation_id,
-            epoch = merged_epoch,
-            "Group metadata updated"
-        );
-        Ok(())
+                tracing::info!(
+                    conversation_id,
+                    epoch = confirmed.new_epoch,
+                    "Group metadata updated"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.discard_pending(plan.handle).await;
+                Err(e)
+            }
+        }
     }
 
     /// Read decrypted group metadata from MLS group context.

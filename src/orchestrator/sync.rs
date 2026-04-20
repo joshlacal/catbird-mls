@@ -383,8 +383,7 @@ where
                 // server returns the commits we actually need. Without bounds the server
                 // falls back to "oldest 50 commits in [0, current_epoch]", which on busy
                 // groups (>50 lifetime commits) strands lagging clients permanently.
-                let from_epoch =
-                    Some((local_epoch.saturating_add(1)).min(u32::MAX as u64) as u32);
+                let from_epoch = Some((local_epoch.saturating_add(1)).min(u32::MAX as u64) as u32);
                 let to_epoch = Some(convo.epoch.min(u32::MAX as u64) as u32);
                 match self
                     .fetch_messages(

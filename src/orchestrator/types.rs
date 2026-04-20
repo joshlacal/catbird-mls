@@ -212,6 +212,96 @@ pub enum JoinMethod {
     ExternalCommit,
 }
 
+// ---------------------------------------------------------------------------
+// Sender-side three-phase commit API (task #44)
+//
+// These types describe the orchestrator-side `stage_commit` / `confirm_commit`
+// / `discard_pending` surface. The existing atomic `add_members` /
+// `remove_members` / `swap_members` / `update_group_metadata` methods are
+// preserved as thin wrappers that call this API internally — platforms
+// migrate at their own pace.
+// ---------------------------------------------------------------------------
+
+/// The kind of commit to stage. Each variant corresponds to an existing atomic
+/// method; the data carried is exactly what that method needs to construct a
+/// pending commit via `MlsCryptoContext`.
+#[derive(Debug, Clone)]
+pub enum CommitKind {
+    /// Add new members from their key packages.
+    AddMembers {
+        member_dids: Vec<DID>,
+        key_packages: Vec<crate::KeyPackageData>,
+    },
+    /// Remove members by their DID (converted to identity bytes internally).
+    RemoveMembers { member_dids: Vec<DID> },
+    /// Atomically swap membership in a single commit: remove the listed DIDs
+    /// and add new members from key packages.
+    SwapMembers {
+        remove_dids: Vec<DID>,
+        add_dids: Vec<DID>,
+        add_key_packages: Vec<crate::KeyPackageData>,
+    },
+    /// GroupContextExtensions commit that updates the encrypted metadata blob
+    /// (name / description / avatar hash, serialized as JSON).
+    UpdateMetadata { group_info_extension: Vec<u8> },
+}
+
+/// Opaque handle returned by `stage_commit`. Carries the group id and a
+/// per-orchestrator monotonic nonce so that stale handles (e.g. already
+/// confirmed or discarded) are rejected cleanly instead of silently operating
+/// on an unrelated pending commit that happens to land in the same group slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedCommitHandle {
+    /// Hex-encoded group ID (same wire shape as everywhere else in the
+    /// orchestrator).
+    pub group_id: GroupId,
+    /// Nonce uniquely identifying this staged commit. Platforms treat it as
+    /// opaque.
+    pub nonce: u64,
+}
+
+/// Plan returned from `stage_commit`. Contains everything a platform needs to
+/// send the commit to the delivery service before calling `confirm_commit`.
+#[derive(Debug, Clone)]
+pub struct CommitPlan {
+    /// Handle to pass back to `confirm_commit` or `discard_pending`.
+    pub handle: StagedCommitHandle,
+    /// Serialized MLS commit message — send this to the DS.
+    pub commit_bytes: Vec<u8>,
+    /// Serialized MLS Welcome message, if any. Populated for `AddMembers`
+    /// and `SwapMembers` (only when new members were added); `None`
+    /// otherwise.
+    pub welcome_bytes: Option<Vec<u8>>,
+    /// Exported GroupInfo for the *pre-merge* group state. Platforms can
+    /// cache it or forward it in the same request — the orchestrator will
+    /// re-export and publish the post-merge GroupInfo after confirm.
+    pub group_info: Vec<u8>,
+    /// Epoch before the commit is merged (i.e. the current local epoch
+    /// when staging).
+    pub source_epoch: u64,
+    /// Epoch the group will advance to once the commit is confirmed. By
+    /// MLS construction this is `source_epoch + 1`.
+    pub target_epoch: u64,
+}
+
+/// Summary returned from `confirm_commit` after the pending commit is merged
+/// locally.
+#[derive(Debug, Clone)]
+pub struct ConfirmedCommit {
+    /// Post-merge epoch (authoritative, read back from MLS).
+    pub new_epoch: u64,
+    /// Derived metadata key for the new epoch, if the platform's
+    /// `MlsCryptoContext` exposes one. The current trait's
+    /// `merge_pending_commit` returns a bare `u64`; this field is wired for
+    /// future extension and is always `None` today. Kept as part of the
+    /// public surface so platforms don't need to re-bind when the metadata
+    /// plumbing lands.
+    pub metadata_key: Option<Vec<u8>>,
+    /// JSON-serialized `MetadataReference` from the group's AppDataDictionary,
+    /// if present for the new epoch. See comment on `metadata_key`.
+    pub metadata_reference: Option<String>,
+}
+
 /// Result from processing an external commit on the server.
 #[derive(Debug, Clone)]
 pub struct ProcessExternalCommitResult {
@@ -763,7 +853,8 @@ mod tests {
         // iOS emits {"version":1,"messageType":"deliveryAck","deliveryAck":{"messageId":"..."}}
         // Rust must decode this as MLSMessageType::DeliveryAck, not fall through the
         // `Err(_)` branch in messaging.rs and stringify it as raw JSON into Message.text.
-        let json = r#"{"version":1,"messageType":"deliveryAck","deliveryAck":{"messageId":"abc-123"}}"#;
+        let json =
+            r#"{"version":1,"messageType":"deliveryAck","deliveryAck":{"messageId":"abc-123"}}"#;
         let decoded = MLSMessagePayload::decode(json.as_bytes()).expect("must decode");
         assert_eq!(decoded.message_type, MLSMessageType::DeliveryAck);
         assert!(!decoded.is_displayable());

@@ -89,8 +89,7 @@ pub trait OrchestratorStorageCallback: Send + Sync {
 
     /// Clear any persisted `RESET_PENDING` payload after the conversation has
     /// successfully adopted the new group.
-    fn clear_reset_pending(&self, conversation_id: String)
-        -> Result<(), OrchestratorBridgeError>;
+    fn clear_reset_pending(&self, conversation_id: String) -> Result<(), OrchestratorBridgeError>;
 
     fn mark_needs_rejoin(&self, conversation_id: String) -> Result<(), OrchestratorBridgeError>;
     fn needs_rejoin(&self, conversation_id: String) -> Result<bool, OrchestratorBridgeError>;
@@ -452,6 +451,61 @@ pub struct FFIOrchestratorConfig {
     pub max_rejoin_attempts: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Sender-side three-phase commit API surface (task #44)
+// ---------------------------------------------------------------------------
+
+/// Opaque handle returned by `stage_commit`. Carries the group id and a
+/// per-orchestrator monotonic nonce so stale handles are rejected cleanly.
+#[derive(uniffi::Record, Clone)]
+pub struct FFIStagedCommitHandle {
+    pub group_id: String,
+    pub nonce: u64,
+}
+
+/// The kind of commit to stage. Each variant corresponds to an existing
+/// atomic method on `OrchestratorBridge`.
+#[derive(uniffi::Enum, Clone)]
+pub enum FFICommitKind {
+    /// Add new members. `key_packages` are the serialized key-package bytes
+    /// the platform has already fetched from the DS for the given DIDs.
+    AddMembers {
+        member_dids: Vec<String>,
+        key_packages: Vec<Vec<u8>>,
+    },
+    /// Remove members by DID (converted to identity bytes internally).
+    RemoveMembers { member_dids: Vec<String> },
+    /// Atomically swap membership: remove the listed DIDs and add new
+    /// members from key packages, in a single commit.
+    SwapMembers {
+        remove_dids: Vec<String>,
+        add_dids: Vec<String>,
+        add_key_packages: Vec<Vec<u8>>,
+    },
+    /// GroupContextExtensions commit that updates the encrypted metadata
+    /// blob. `group_info_extension` is the serialized `GroupMetadata` JSON.
+    UpdateMetadata { group_info_extension: Vec<u8> },
+}
+
+/// Plan returned from `stage_commit` — ship this to the DS, then confirm.
+#[derive(uniffi::Record, Clone)]
+pub struct FFICommitPlan {
+    pub handle: FFIStagedCommitHandle,
+    pub commit_bytes: Vec<u8>,
+    pub welcome_bytes: Option<Vec<u8>>,
+    pub group_info: Vec<u8>,
+    pub source_epoch: u64,
+    pub target_epoch: u64,
+}
+
+/// Summary returned from `confirm_commit`.
+#[derive(uniffi::Record, Clone)]
+pub struct FFIConfirmedCommit {
+    pub new_epoch: u64,
+    pub metadata_key: Option<Vec<u8>>,
+    pub metadata_reference: Option<String>,
+}
+
 /// Result of preparing a voice message via the Rust Opus encoder.
 #[derive(uniffi::Record, Clone)]
 pub struct FFIVoicePrepareResult {
@@ -691,6 +745,65 @@ fn join_method_to_string(jm: JoinMethod) -> String {
     }
 }
 
+// -- Sender-side three-phase commit API (task #44) conversions --
+
+fn ffi_commit_kind_to_internal(kind: FFICommitKind) -> crate::orchestrator::types::CommitKind {
+    use crate::orchestrator::types::CommitKind;
+    match kind {
+        FFICommitKind::AddMembers {
+            member_dids,
+            key_packages,
+        } => CommitKind::AddMembers {
+            member_dids,
+            key_packages: key_packages
+                .into_iter()
+                .map(|data| crate::KeyPackageData { data })
+                .collect(),
+        },
+        FFICommitKind::RemoveMembers { member_dids } => CommitKind::RemoveMembers { member_dids },
+        FFICommitKind::SwapMembers {
+            remove_dids,
+            add_dids,
+            add_key_packages,
+        } => CommitKind::SwapMembers {
+            remove_dids,
+            add_dids,
+            add_key_packages: add_key_packages
+                .into_iter()
+                .map(|data| crate::KeyPackageData { data })
+                .collect(),
+        },
+        FFICommitKind::UpdateMetadata {
+            group_info_extension,
+        } => CommitKind::UpdateMetadata {
+            group_info_extension,
+        },
+    }
+}
+
+fn commit_plan_to_ffi(plan: &crate::orchestrator::types::CommitPlan) -> FFICommitPlan {
+    FFICommitPlan {
+        handle: FFIStagedCommitHandle {
+            group_id: plan.handle.group_id.clone(),
+            nonce: plan.handle.nonce,
+        },
+        commit_bytes: plan.commit_bytes.clone(),
+        welcome_bytes: plan.welcome_bytes.clone(),
+        group_info: plan.group_info.clone(),
+        source_epoch: plan.source_epoch,
+        target_epoch: plan.target_epoch,
+    }
+}
+
+fn ffi_staged_handle_to_internal(
+    handle: FFIStagedCommitHandle,
+) -> crate::orchestrator::types::StagedCommitHandle {
+    crate::orchestrator::types::StagedCommitHandle {
+        group_id: handle.group_id,
+        nonce: handle.nonce,
+    }
+}
+
 fn bridge_err(e: OrchestratorBridgeError) -> OrchestratorError {
     match e {
         OrchestratorBridgeError::Storage { message } => OrchestratorError::Storage(message),
@@ -809,10 +922,7 @@ impl MLSStorageBackend for StorageAdapter {
             .map_err(bridge_err)
     }
 
-    async fn clear_reset_pending(
-        &self,
-        conversation_id: &str,
-    ) -> crate::orchestrator::Result<()> {
+    async fn clear_reset_pending(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
         self.0
             .clear_reset_pending(conversation_id.to_string())
             .map_err(bridge_err)
@@ -1441,6 +1551,59 @@ impl OrchestratorBridge {
             &remove_dids,
             &add_dids,
         ))?;
+        Ok(())
+    }
+
+    // -- Sender-side three-phase commit API (task #44) --
+    //
+    // Additive surface for platforms that need to inspect / batch / retry
+    // commits before confirming them locally. The existing `add_members` /
+    // `remove_members` / `swap_members` / `update_group_metadata` methods
+    // above are backward-compatible wrappers around the same API; platforms
+    // can migrate to the three-phase API incrementally.
+
+    /// Stage a commit without sending or merging it. Returns a plan; call
+    /// [`confirm_commit`](Self::confirm_commit) on DS success or
+    /// [`discard_pending`](Self::discard_pending) on failure.
+    pub fn stage_commit(
+        &self,
+        conversation_id: String,
+        kind: FFICommitKind,
+    ) -> Result<FFICommitPlan, OrchestratorBridgeError> {
+        let kind = ffi_commit_kind_to_internal(kind);
+        let plan = crate::async_runtime::block_on(self.inner.stage_commit(&conversation_id, kind))?;
+        Ok(commit_plan_to_ffi(&plan))
+    }
+
+    /// Confirm a previously staged commit: merges it locally, advances the
+    /// epoch, publishes updated GroupInfo. Pass `server_epoch = 0` to skip
+    /// the fence (for API paths that don't echo an epoch).
+    pub fn confirm_commit(
+        &self,
+        handle: FFIStagedCommitHandle,
+        server_epoch: u64,
+    ) -> Result<FFIConfirmedCommit, OrchestratorBridgeError> {
+        let confirmed = crate::async_runtime::block_on(
+            self.inner
+                .confirm_commit(ffi_staged_handle_to_internal(handle), server_epoch),
+        )?;
+        Ok(FFIConfirmedCommit {
+            new_epoch: confirmed.new_epoch,
+            metadata_key: confirmed.metadata_key,
+            metadata_reference: confirmed.metadata_reference,
+        })
+    }
+
+    /// Discard a staged commit without advancing the epoch. Clears the
+    /// pending commit in the MLS crypto context.
+    pub fn discard_pending(
+        &self,
+        handle: FFIStagedCommitHandle,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(
+            self.inner
+                .discard_pending(ffi_staged_handle_to_internal(handle)),
+        )?;
         Ok(())
     }
 

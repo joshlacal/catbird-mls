@@ -1421,16 +1421,23 @@ mod tests {
     #[test]
     fn wrong_epoch_error_classified_correctly() {
         use crate::MLSError;
-        let we = MLSError::OpenMLS(
-            "unprotect_message failed: ValidationError(WrongEpoch)".into(),
+        let we = MLSError::OpenMLS("unprotect_message failed: ValidationError(WrongEpoch)".into());
+        assert!(
+            we.is_wrong_epoch(),
+            "ValidationError(WrongEpoch) must classify"
         );
-        assert!(we.is_wrong_epoch(), "ValidationError(WrongEpoch) must classify");
 
         let other = MLSError::OpenMLS("some other openmls error".into());
-        assert!(!other.is_wrong_epoch(), "non-WrongEpoch OpenMLS must not classify");
+        assert!(
+            !other.is_wrong_epoch(),
+            "non-WrongEpoch OpenMLS must not classify"
+        );
 
         let decrypt = MLSError::DecryptionFailed;
-        assert!(!decrypt.is_wrong_epoch(), "non-OpenMLS variants must not classify");
+        assert!(
+            !decrypt.is_wrong_epoch(),
+            "non-OpenMLS variants must not classify"
+        );
     }
 
     #[test]

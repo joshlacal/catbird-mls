@@ -1,5 +1,6 @@
 // UniFFI Record types (structs passed across FFI)
 
+#[derive(Debug, Clone)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct KeyPackageData {
     pub data: Vec<u8>,
