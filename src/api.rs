@@ -10,7 +10,7 @@ use openmls_traits::signatures::Signer;
 use openmls_traits::storage::StorageProvider;
 use openmls_traits::{crypto::OpenMlsCrypto, OpenMlsProvider};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Import StorageId to wrap public keys for storage
@@ -201,6 +201,40 @@ pub struct MLSContext {
     /// new entry **overwrites** the prior one and a warning is logged. This is
     /// idempotent: OpenMLS produces the same StagedCommit for the same wire message.
     pending_incoming_merges: Arc<Mutex<HashMap<(Vec<u8>, u64), Box<StagedCommit>>>>,
+    /// Staged-but-not-yet-confirmed **outgoing** commits produced by
+    /// [`MLSContext::stage_commit`] (task #62). Keyed by hex group id — MLS
+    /// allows at most one pending commit per group, so a second stage call
+    /// on the same group is rejected until the caller confirms or discards
+    /// the existing handle.
+    ///
+    /// This mirrors `MLSOrchestrator::pending_staged_commits` so that
+    /// platforms calling MLSContext directly (iOS MLSClient, catmos-cli)
+    /// can use the same three-phase semantics without adopting the
+    /// orchestrator. The two registries are **independent**: confirming a
+    /// commit through one path does not affect the other's bookkeeping.
+    /// This is safe because a single group is only ever driven by one of
+    /// the two paths in a given client (iOS/catmos-cli use MLSContext
+    /// directly; Android/Tauri/web use OrchestratorBridge).
+    pending_outgoing_commits: Arc<Mutex<HashMap<String, PendingOutgoingCommitMeta>>>,
+    /// Monotonic nonce for outgoing staged-commit handles.
+    staged_commit_nonce: Arc<AtomicU64>,
+}
+
+/// Internal bookkeeping for an MLSContext-level staged outgoing commit.
+///
+/// Mirrors `crate::orchestrator::orchestrator::PendingCommitMeta` but is
+/// scoped to MLSContext; we duplicate the type rather than share across the
+/// FFI/orchestrator boundary so that std / tokio mutex choices and async
+/// contexts don't bleed across layers (task #62).
+#[derive(Debug, Clone)]
+struct PendingOutgoingCommitMeta {
+    /// Nonce that must match the handle passed to `confirm_commit` or
+    /// `discard_pending`.
+    nonce: u64,
+    /// Epoch captured before the commit was constructed.
+    source_epoch: u64,
+    /// Epoch the group will advance to on confirm (`source_epoch + 1`).
+    target_epoch: u64,
 }
 
 impl Drop for MLSContext {
@@ -239,6 +273,8 @@ impl MLSContext {
             interrupt_handles,
             is_suspended: Arc::new(AtomicBool::new(false)),
             pending_incoming_merges: Arc::new(Mutex::new(HashMap::new())),
+            pending_outgoing_commits: Arc::new(Mutex::new(HashMap::new())),
+            staged_commit_nonce: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -5113,6 +5149,333 @@ impl MLSContext {
             Ok(serde_json::to_string_pretty(&debug_info)
                 .unwrap_or_else(|_| "Failed to serialize debug info".to_string()))
         })
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Sender-side three-phase commit API on MLSContext (task #62)
+//
+// Mirrors the `MLSOrchestrator::{stage_commit, confirm_commit, discard_pending}`
+// surface for platforms that call MLSContext directly (iOS MLSClient,
+// catmos-cli) instead of going through OrchestratorBridge. The registry is
+// duplicated from the orchestrator rather than shared: MLSContext and
+// MLSOrchestrator are used by disjoint platform populations, so a per-layer
+// registry keeps the std-mutex / tokio-mutex boundary clean and avoids
+// coupling the orchestrator's async pending map to the FFI's sync pending
+// map. See `PendingOutgoingCommitMeta` doc for the full rationale.
+//
+// Post-commit bookkeeping (storage writes, GroupInfo publish, group-state
+// cache update, epoch-secret cleanup) is deliberately NOT performed here:
+// those are orchestrator-level concerns, and iOS/catmos-cli own equivalent
+// plumbing at the platform layer.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Sentinel the caller passes when it has no meaningful server epoch to
+/// fence against (mirror of `SKIP_SERVER_EPOCH_FENCE` on the orchestrator
+/// side). When `server_epoch == SKIP_SERVER_EPOCH_FENCE`, `confirm_commit`
+/// skips the fence check.
+#[uniffi::export]
+pub fn mls_skip_server_epoch_fence() -> u64 {
+    SKIP_SERVER_EPOCH_FENCE
+}
+
+/// Value of [`mls_skip_server_epoch_fence`] exposed as a Rust constant for
+/// in-crate callers.
+pub const SKIP_SERVER_EPOCH_FENCE: u64 = 0;
+
+#[uniffi::export]
+impl MLSContext {
+    /// Stage a commit without sending it to the delivery service or merging
+    /// it locally. Returns a [`crate::orchestrator_bridge::FFICommitPlan`]
+    /// the caller ships to the DS; the caller then passes the embedded
+    /// handle back to [`confirm_commit`](Self::confirm_commit) on success or
+    /// [`discard_pending`](Self::discard_pending) on failure.
+    ///
+    /// `signer_identity_bytes` is the UTF-8 DID of the caller — used to
+    /// export GroupInfo for the pre-merge group state (identical shape to
+    /// [`MLSContext::export_group_info`]).
+    ///
+    /// Only one pending commit may exist per group at a time (OpenMLS
+    /// constraint). Staging a second commit while one is already pending
+    /// returns `MLSError::InvalidInput`.
+    pub fn stage_commit(
+        &self,
+        conversation_id: String,
+        kind: crate::orchestrator_bridge::FFICommitKind,
+        signer_identity_bytes: Vec<u8>,
+    ) -> Result<crate::orchestrator_bridge::FFICommitPlan, MLSError> {
+        use crate::orchestrator_bridge::{FFICommitKind, FFICommitPlan, FFIStagedCommitHandle};
+
+        let group_id_bytes = hex::decode(&conversation_id)
+            .map_err(|_| MLSError::invalid_input("Invalid hex group ID"))?;
+
+        // OpenMLS allows at most one pending commit per group. Refuse to
+        // stage another while one is already tracked.
+        {
+            let pending = self
+                .pending_outgoing_commits
+                .lock()
+                .map_err(|_| MLSError::ContextNotInitialized)?;
+            if pending.contains_key(&conversation_id) {
+                return Err(MLSError::invalid_input(format!(
+                    "A staged commit already exists for conversation {}; confirm or discard it before staging another",
+                    conversation_id
+                )));
+            }
+        }
+
+        let source_epoch = self.get_epoch(group_id_bytes.clone())?;
+
+        let (commit_bytes, welcome_bytes) = match kind {
+            FFICommitKind::AddMembers {
+                member_dids: _,
+                key_packages,
+            } => {
+                let kp_data: Vec<KeyPackageData> = key_packages
+                    .into_iter()
+                    .map(|data| KeyPackageData { data })
+                    .collect();
+                let add_result = self.add_members(group_id_bytes.clone(), kp_data)?;
+                (add_result.commit_data, Some(add_result.welcome_data))
+            }
+            FFICommitKind::RemoveMembers { member_dids } => {
+                let member_identities: Vec<Vec<u8>> = member_dids
+                    .iter()
+                    .map(|did| did.as_bytes().to_vec())
+                    .collect();
+                let commit = self.remove_members(group_id_bytes.clone(), member_identities)?;
+                (commit, None)
+            }
+            FFICommitKind::SwapMembers {
+                remove_dids,
+                add_dids: _,
+                add_key_packages,
+            } => {
+                let remove_ids: Vec<Vec<u8>> =
+                    remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
+                let kp_data: Vec<KeyPackageData> = add_key_packages
+                    .into_iter()
+                    .map(|data| KeyPackageData { data })
+                    .collect();
+                let swap_result = self.swap_members(group_id_bytes.clone(), remove_ids, kp_data)?;
+                (swap_result.commit_data, Some(swap_result.welcome_data))
+            }
+            FFICommitKind::UpdateMetadata {
+                group_info_extension,
+            } => {
+                let commit =
+                    self.update_group_metadata(group_id_bytes.clone(), group_info_extension)?;
+                (commit, None)
+            }
+        };
+
+        // Export GroupInfo from the pre-merge group state. OpenMLS will
+        // re-export after merge; platforms that batch operations may want
+        // to ship this pre-merge blob alongside the commit.
+        let group_info = self.export_group_info(group_id_bytes.clone(), signer_identity_bytes)?;
+
+        let nonce = self
+            .staged_commit_nonce
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let target_epoch = source_epoch.saturating_add(1);
+
+        self.pending_outgoing_commits
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?
+            .insert(
+                conversation_id.clone(),
+                PendingOutgoingCommitMeta {
+                    nonce,
+                    source_epoch,
+                    target_epoch,
+                },
+            );
+
+        crate::debug_log!(
+            "[MLS-FFI] stage_commit: conversation_id={}, nonce={}, source_epoch={}, target_epoch={}",
+            conversation_id,
+            nonce,
+            source_epoch,
+            target_epoch
+        );
+
+        Ok(FFICommitPlan {
+            handle: FFIStagedCommitHandle {
+                group_id: conversation_id,
+                nonce,
+            },
+            commit_bytes,
+            welcome_bytes,
+            group_info,
+            source_epoch,
+            target_epoch,
+        })
+    }
+
+    /// Confirm a previously staged commit: merge it locally, advance the
+    /// epoch, and remove the handle from the pending map.
+    ///
+    /// `server_epoch` is used to fence against confirm calls that reference
+    /// a different epoch than the one the DS actually accepted. Pass the
+    /// value returned by [`mls_skip_server_epoch_fence`] for API paths that
+    /// don't echo an epoch; non-sentinel values must equal the plan's
+    /// `target_epoch`, otherwise the staged commit is left in place and
+    /// `MLSError::EpochMismatch` is returned so the caller can choose to
+    /// `discard_pending` and re-sync.
+    ///
+    /// Post-merge bookkeeping (storage writes, GroupInfo publish,
+    /// group-state cache update, epoch-secret cleanup) is the caller's
+    /// responsibility — see the module-level comment for rationale.
+    pub fn confirm_commit(
+        &self,
+        handle: crate::orchestrator_bridge::FFIStagedCommitHandle,
+        server_epoch: u64,
+    ) -> Result<crate::orchestrator_bridge::FFIConfirmedCommit, MLSError> {
+        use crate::orchestrator_bridge::FFIConfirmedCommit;
+
+        // Validate and pop the pending entry atomically to prevent a second
+        // `confirm_commit` (or concurrent `discard_pending`) from operating
+        // on the same handle.
+        let meta = {
+            let mut pending = self
+                .pending_outgoing_commits
+                .lock()
+                .map_err(|_| MLSError::ContextNotInitialized)?;
+            match pending.get(&handle.group_id) {
+                Some(existing) if existing.nonce == handle.nonce => {
+                    pending.remove(&handle.group_id).expect("just matched")
+                }
+                Some(_) => {
+                    return Err(MLSError::invalid_input(format!(
+                        "Staged commit handle nonce mismatch for conversation {} (already confirmed or superseded)",
+                        handle.group_id
+                    )));
+                }
+                None => {
+                    return Err(MLSError::invalid_input(format!(
+                        "No staged commit found for conversation {} (already confirmed or discarded)",
+                        handle.group_id
+                    )));
+                }
+            }
+        };
+
+        // Server epoch fence. Skipped when caller passes the sentinel.
+        if server_epoch != SKIP_SERVER_EPOCH_FENCE && server_epoch != meta.target_epoch {
+            // Re-insert so the caller can still `discard_pending` to clean
+            // the OpenMLS-side state.
+            self.pending_outgoing_commits
+                .lock()
+                .map_err(|_| MLSError::ContextNotInitialized)?
+                .insert(handle.group_id.clone(), meta.clone());
+            return Err(MLSError::EpochMismatch {
+                local: meta.target_epoch,
+                remote: server_epoch,
+            });
+        }
+
+        let group_id_bytes = hex::decode(&handle.group_id)
+            .map_err(|_| MLSError::invalid_input("Invalid hex group ID"))?;
+
+        // Merge the pending commit. If this fails the local state is behind
+        // the server — clear the stale pending commit so future sends don't
+        // hit OpenMLS's "pending commit exists" assertion, and surface the
+        // error. Platform-layer code owns marking the conversation for
+        // rejoin (the orchestrator does `storage.mark_needs_rejoin(...)`
+        // here; MLSContext has no storage reference).
+        let new_epoch = match self.merge_pending_commit(group_id_bytes.clone()) {
+            Ok(result) => result.new_epoch,
+            Err(e) => {
+                crate::error_log!(
+                    "[MLS-FFI] confirm_commit: merge_pending_commit failed for conversation={}, target_epoch={}: {:?}",
+                    handle.group_id,
+                    meta.target_epoch,
+                    e
+                );
+                if let Err(clear_err) = self.clear_pending_commit(group_id_bytes) {
+                    crate::warn_log!(
+                        "[MLS-FFI] confirm_commit: failed to clear stale pending commit for conversation={}: {:?}",
+                        handle.group_id,
+                        clear_err
+                    );
+                }
+                return Err(e);
+            }
+        };
+
+        crate::debug_log!(
+            "[MLS-FFI] confirm_commit: conversation_id={}, new_epoch={}",
+            handle.group_id,
+            new_epoch
+        );
+
+        Ok(FFIConfirmedCommit {
+            new_epoch,
+            // Metadata key / reference plumbing is reserved for a future
+            // trait extension on `MlsCryptoContext`. See the same field on
+            // the orchestrator-side `ConfirmedCommit`.
+            metadata_key: None,
+            metadata_reference: None,
+        })
+    }
+
+    /// Discard a previously staged commit without advancing the epoch.
+    /// Clears the OpenMLS pending commit (so future sends can construct a
+    /// new one) and removes the handle from the pending map.
+    ///
+    /// Calling `discard_pending` on an unknown or already-consumed handle
+    /// returns `MLSError::InvalidInput`.
+    pub fn discard_pending(
+        &self,
+        handle: crate::orchestrator_bridge::FFIStagedCommitHandle,
+    ) -> Result<(), MLSError> {
+        let removed = {
+            let mut pending = self
+                .pending_outgoing_commits
+                .lock()
+                .map_err(|_| MLSError::ContextNotInitialized)?;
+            match pending.get(&handle.group_id) {
+                Some(existing) if existing.nonce == handle.nonce => {
+                    pending.remove(&handle.group_id)
+                }
+                Some(_) => {
+                    return Err(MLSError::invalid_input(format!(
+                        "Staged commit handle nonce mismatch for conversation {} (already discarded or confirmed)",
+                        handle.group_id
+                    )));
+                }
+                None => {
+                    return Err(MLSError::invalid_input(format!(
+                        "No staged commit found for conversation {} (already discarded or confirmed)",
+                        handle.group_id
+                    )));
+                }
+            }
+        };
+
+        // Tell MLS to forget the pending commit so future operations can
+        // construct new ones. If hex-decode or the crypto layer fails we
+        // still consider the discard "succeeded" from the caller's
+        // perspective — the handle is gone from the pending map.
+        if let Ok(group_id_bytes) = hex::decode(&handle.group_id) {
+            if let Err(e) = self.clear_pending_commit(group_id_bytes) {
+                crate::warn_log!(
+                    "[MLS-FFI] discard_pending: clear_pending_commit failed for conversation={}: {:?}",
+                    handle.group_id,
+                    e
+                );
+            }
+        }
+
+        crate::debug_log!(
+            "[MLS-FFI] discard_pending: conversation_id={}, nonce={}, source_epoch={}",
+            handle.group_id,
+            handle.nonce,
+            removed.as_ref().map(|m| m.source_epoch).unwrap_or(0)
+        );
+
+        Ok(())
     }
 }
 

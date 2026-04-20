@@ -129,6 +129,14 @@ pub enum MLSError {
 
     #[error("Operation not supported: {reason}")]
     OperationNotSupported { reason: String },
+
+    /// Fencing mismatch between the epoch the server advanced to and the
+    /// epoch the locally-staged commit would produce. Returned by
+    /// `confirm_commit` when `server_epoch` does not equal the plan's
+    /// `target_epoch` (and is not [`crate::SKIP_SERVER_EPOCH_FENCE`]). The
+    /// caller must discard the staged commit and re-sync before retrying.
+    #[error("Epoch mismatch: local={local}, remote={remote}")]
+    EpochMismatch { local: u64, remote: u64 },
 }
 
 impl MLSError {
