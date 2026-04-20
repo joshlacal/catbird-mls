@@ -74,7 +74,15 @@ pub struct SyncRequest {
     pub full_sync: bool,
 }
 
-/// Recover a conversation that needs rejoin/rebuild.
+/// Report that a conversation has reached an unrecoverable local state and
+/// ask the server-side recovery pyramid to take over.
+///
+/// Task #49: previously implied "rejoin the conversation via External Commit".
+/// That implementation was the back-door that undermined Task #43's removal of
+/// client-initiated External Commits (the root cause of production epoch
+/// inflation). The request is now a pure escalation signal — the client does
+/// not touch local MLS state; the server (mls-ds) decides whether to issue a
+/// `GroupResetEvent` via the A7 reset pyramid.
 #[derive(Debug, Clone)]
 pub struct RecoveryRequest {
     pub conversation_id: String,
@@ -144,12 +152,22 @@ pub trait HighLevelMessagingContract {
 }
 
 /// Sync and recovery contract.
+///
+/// Task #49: `recover_conversation` no longer performs a client-initiated
+/// External Commit rejoin. It escalates to the server-side A7 reset pyramid
+/// via `report_unrecoverable_local`. See [`RecoveryRequest`].
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait HighLevelSyncRecoveryContract {
     type Error;
 
     async fn sync(&self, request: SyncRequest) -> Result<(), Self::Error>;
+
+    /// Escalate an unrecoverable local state to the server (A7 reset
+    /// pyramid). Does not create External Commits; does not touch local MLS
+    /// state. Returns `Ok(())` even on best-effort report-call failures —
+    /// the client has already given up locally, so failing the report call
+    /// serves no recovery purpose.
     async fn recover_conversation(&self, request: RecoveryRequest) -> Result<(), Self::Error>;
 }
 

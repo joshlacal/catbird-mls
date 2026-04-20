@@ -239,14 +239,13 @@ where
         self.orchestrator.sync_with_server(full_sync).await
     }
 
-    // Task #43: demoted to `pub(crate)` along with the native client variant.
-    // External Commit rejoin is no longer a platform-callable action.
-    pub(crate) async fn rejoin_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Result<(), OrchestratorError> {
-        self.orchestrator.force_rejoin(conversation_id).await
-    }
+    // Task #43 / #49: client-initiated External Commit rejoin (`force_rejoin`)
+    // is no longer reachable from any facade method. The previous transitional
+    // `pub(crate) rejoin_conversation` shim was deleted to close the
+    // `HighLevelSyncRecoveryContract` back-door — platforms observing
+    // unrecoverable local state must call `report_unrecoverable_local` on the
+    // orchestrator (exposed via `recover_conversation` in the trait impl
+    // below) so the server-side A7 reset pyramid can take over.
 
     /// Update the read cursor for a conversation.
     pub async fn update_cursor(
@@ -424,7 +423,20 @@ where
     }
 
     async fn recover_conversation(&self, request: RecoveryRequest) -> Result<(), Self::Error> {
-        WasmCatbirdClient::rejoin_conversation(self, &request.conversation_id).await
+        // Task #49: previously delegated to `rejoin_conversation` ->
+        // `orchestrator.force_rejoin`, which was a back-door around the Task
+        // #43 removal of client-initiated External Commit rejoin. Client-
+        // initiated External Commits are the root cause of production epoch
+        // inflation (epochs observed at 800+), so this contract now escalates
+        // to the server via `report_unrecoverable_local`. The mls-ds A7 reset
+        // pyramid is responsible for recovering the conversation.
+        self.orchestrator
+            .report_unrecoverable_local(
+                &request.conversation_id,
+                "client-requested recovery via HighLevelSyncRecoveryContract",
+            )
+            .await;
+        Ok(())
     }
 }
 

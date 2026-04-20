@@ -528,7 +528,9 @@ except OrchestratorBridgeError.NotAuthenticated:
     # Re-authenticate
     pass
 except OrchestratorBridgeError.EpochMismatch as e:
-    mls.rejoin_conversation(conversation_id=id)
+    # Task #43 / #49: client-initiated External Commit rejoin is no longer
+    # exposed. Escalate to the server-side A7 reset pyramid instead.
+    mls.report_unrecoverable_local(convo_id=id, reason="epoch-mismatch")
 except OrchestratorBridgeError as e:
     print(f"MLS error: {e}")
 ```
@@ -809,9 +811,8 @@ Low-level key-value storage for the MLS context's internal secrets (separate fro
 | Method | Description |
 |--------|-------------|
 | `sync(full_sync)` | Sync conversations and messages with server. `full_sync=true` re-fetches everything. |
-| `rejoin_conversation(conversation_id)` | Force rejoin via External Commit (epoch desync recovery). |
+| `report_unrecoverable_local(convo_id, reason)` | Escalate local unrecoverable state to the server-side A7 reset pyramid. Replaces the removed `rejoin_conversation` / `force_rejoin` surface (Task #43 / #49). |
 | `join_group(welcome_data)` | Join a group via Welcome message bytes. |
-| `force_rejoin(convo_id)` | Low-level rejoin via orchestrator. |
 | `perform_silent_recovery(conversation_ids)` | Batch recovery across multiple conversations. |
 
 ### MLS Escape Hatch

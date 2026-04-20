@@ -866,18 +866,22 @@ where
     /// 3. Sends the commit to the server
     /// 4. Merges the pending external join
     ///
-    /// Task #43: **Not part of the public API.** External Commits driven by a
-    /// client whenever it observes desync are the root cause of production
-    /// epoch inflation (observed epochs 800+). Recovery belongs to the
-    /// server's A7 reset pyramid now. This method is hidden from rustdoc and
-    /// removed from UniFFI exports; it remains accessible at Rust visibility
-    /// `pub` strictly so that:
+    /// Task #43 / #49: **Not part of the public API.** External Commits
+    /// driven by a client whenever it observes desync are the root cause of
+    /// production epoch inflation (observed epochs 800+). Recovery belongs to
+    /// the server's A7 reset pyramid now. This method is hidden from rustdoc
+    /// and removed from UniFFI exports; it remains accessible at Rust
+    /// visibility `pub` strictly so that:
     ///   - the legitimate `join_or_rejoin` deferred-recovery caller in this file
     ///     works across the impl boundary
-    ///   - the transitional `rejoin_conversation` on `CatbirdClient`/`WasmClient`
-    ///     (both demoted to `pub(crate)`) keeps compiling
     ///   - `tests/state_machine_tests.rs` (integration tests documenting
     ///     internal recovery semantics) can still exercise it
+    ///
+    /// Task #49 deleted the transitional `rejoin_conversation` shim on
+    /// `CatbirdClient`/`WasmClient` and rewired
+    /// `HighLevelSyncRecoveryContract::recover_conversation` to call
+    /// `report_unrecoverable_local` instead — closing the back-door that
+    /// undermined Task #43's surface reduction.
     ///
     /// **No new callers.** Prefer `report_unrecoverable_local` for any
     /// client-observed unrecoverable state.

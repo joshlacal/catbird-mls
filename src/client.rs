@@ -406,21 +406,13 @@ where
         Ok(())
     }
 
-    /// Force rejoin a conversation (recovery path).
-    ///
-    /// Task #43: demoted to `pub(crate)`. External Commit rejoin is no longer
-    /// a platform-callable action — client-initiated External Commits were the
-    /// root cause of production epoch inflation. Server-mediated recovery via
-    /// the A7 reset pyramid is the current path; this method remains
-    /// `pub(crate)` (currently unused but kept for parity with `WasmClient`
-    /// during the transition).
-    #[allow(dead_code)]
-    pub(crate) async fn rejoin_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Result<(), OrchestratorError> {
-        self.orchestrator.force_rejoin(conversation_id).await
-    }
+    // Task #43 / #49: the `rejoin_conversation` shim (which called
+    // `orchestrator.force_rejoin`) was deleted. Client-initiated External
+    // Commits were the root cause of production epoch inflation (epochs
+    // observed at 800+). Server-mediated recovery via the A7 reset pyramid is
+    // the current path; platforms observing unrecoverable local state should
+    // call `orchestrator.report_unrecoverable_local(convo_id, reason)`
+    // instead.
 
     /// Shut down the client, releasing resources.
     pub async fn shutdown(&self) {
