@@ -132,26 +132,26 @@ where
             }
         }
 
-        // Encrypt via MLS (auto-join if group not found locally)
+        // Encrypt via MLS.
+        //
+        // Task #43: `send` no longer self-heals via `join_or_rejoin` when the group
+        // is missing locally. Auto-External-Commits on send were a major source of
+        // production epoch inflation (hot path, runs on every send failure). Instead
+        // we surface `NotJoined` to the caller; the platform decides whether to
+        // trigger recovery (Welcome replay, S1 reset request, UI prompt, etc.).
         let encrypt_result = match self
             .mls_context()
             .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())
         {
             Ok(r) => r,
             Err(crate::MLSError::GroupNotFound { .. }) => {
-                // Group exists on server but not locally — try Welcome first, External Commit fallback
-                tracing::info!(
+                tracing::warn!(
                     conversation_id,
-                    "Group not found locally, joining (Welcome first)"
+                    "send_payload_message: group not found locally; NOT auto-rejoining (task #43). Caller must handle."
                 );
-                self.join_or_rejoin(conversation_id).await.map_err(|e| {
-                    OrchestratorError::GroupNotFound(format!(
-                        "Auto-join failed for {conversation_id}: {e}"
-                    ))
-                })?;
-                // Retry encryption after joining
-                self.mls_context()
-                    .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())?
+                return Err(OrchestratorError::NotJoined {
+                    convo_id: conversation_id.to_string(),
+                });
             }
             Err(e) => return Err(OrchestratorError::from(e)),
         };
@@ -486,36 +486,24 @@ where
         let group_id_bytes = hex::decode(&envelope.conversation_id)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
-        // Decrypt via MLS FFI (auto-join if group not found locally)
+        // Decrypt via MLS FFI.
+        //
+        // Task #43: `process_incoming` no longer auto-External-Commits when the
+        // group is missing locally. Silently skip such messages — the server will
+        // re-deliver on the next normal sync, or the platform will see the
+        // conversation appear via Welcome/group-reset recovery and re-fetch. This
+        // eliminates the hot-path External Commit spiral.
         let decrypt_result = match self
             .mls_context()
             .decrypt_message(group_id_bytes.clone(), envelope.ciphertext.clone())
         {
             Ok(r) => r,
             Err(crate::MLSError::GroupNotFound { .. }) => {
-                tracing::info!(
-                    conversation_id = %envelope.conversation_id,
-                    "Group not found locally for decrypt, joining (Welcome first)"
+                tracing::debug!(
+                    convo_id = %envelope.conversation_id,
+                    "process_incoming: group not found locally, skipping; platform will pick up via sync",
                 );
-                self.join_or_rejoin(&envelope.conversation_id)
-                    .await
-                    .map_err(|e| {
-                        OrchestratorError::GroupNotFound(format!(
-                            "Auto-join failed for {}: {e}",
-                            envelope.conversation_id
-                        ))
-                    })?;
-                // Retry decryption after joining
-                self.mls_context()
-                    .decrypt_message(group_id_bytes.clone(), envelope.ciphertext.clone())
-                    .map_err(|e| {
-                        tracing::error!(
-                            error = %e,
-                            conversation_id = %envelope.conversation_id,
-                            "Decryption failed after auto-join"
-                        );
-                        e
-                    })?
+                return Ok(None);
             }
             Err(e) if e.is_wrong_epoch() => {
                 // WrongEpoch is the NORMAL outcome for:

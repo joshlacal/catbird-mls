@@ -65,6 +65,15 @@ pub enum OrchestratorError {
 
     #[error("Sync paused: circuit breaker tripped after consecutive failures")]
     SyncPaused,
+
+    /// The caller tried to send/receive in a conversation whose group is not
+    /// joined locally. Callers must handle this explicitly (e.g. invoke
+    /// `MLSOrchestrator::report_unrecoverable_local` to escalate server
+    /// recovery, or replay the Welcome on the next sync). The orchestrator
+    /// no longer auto-rejoins via External Commit on the hot send/decrypt
+    /// paths — see task #43.
+    #[error("Group not joined locally for conversation {convo_id}")]
+    NotJoined { convo_id: String },
 }
 
 impl OrchestratorError {

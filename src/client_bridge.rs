@@ -904,15 +904,11 @@ impl CatbirdClientBridge {
     }
 
     // -- Recovery --
-
-    /// Force rejoin a conversation (recovery from epoch desync).
-    pub fn rejoin_conversation(
-        &self,
-        conversation_id: String,
-    ) -> Result<(), OrchestratorBridgeError> {
-        crate::async_runtime::block_on(self.inner.rejoin_conversation(&conversation_id))
-            .map_err(OrchestratorBridgeError::from)
-    }
+    //
+    // Task #43: `rejoin_conversation` was removed from the UniFFI surface. External
+    // Commit rejoin is no longer a platform-callable action. Platforms observing
+    // unrecoverable local state should call `report_unrecoverable_local(convo_id,
+    // reason)` (on `MLSOrchestrator`) so the A7 server-reset pyramid can take over.
 
     // -- Read state --
 

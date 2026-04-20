@@ -1640,10 +1640,26 @@ impl OrchestratorBridge {
     }
 
     // -- Recovery --
+    //
+    // Task #43: `force_rejoin` is no longer exposed to platforms. Creating External
+    // Commits from the client is the single biggest cause of epoch inflation
+    // (observed epochs of 800+ in production). Recovery is now the server's job
+    // via the A7 reset pyramid. Platforms that observe unrecoverable local state
+    // should call `report_unrecoverable_local(convo_id, reason)` below.
 
-    /// Force rejoin a conversation via External Commit.
-    pub fn force_rejoin(&self, convo_id: String) -> Result<(), OrchestratorBridgeError> {
-        crate::async_runtime::block_on(self.inner.force_rejoin(&convo_id))?;
+    /// Task #43: report unrecoverable local state to the server so the A7 reset
+    /// pyramid can take over (the server will eventually issue a GroupResetEvent
+    /// to move all members to a new group).
+    ///
+    /// This does **not** touch local MLS state or create External Commits. It's
+    /// a pure notification. Callback errors on the `report_recovery_failure`
+    /// path are logged and swallowed internally.
+    pub fn report_unrecoverable_local(
+        &self,
+        convo_id: String,
+        reason: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.report_unrecoverable_local(&convo_id, &reason));
         Ok(())
     }
 
@@ -1676,11 +1692,10 @@ impl OrchestratorBridge {
         new_group_id_hex: String,
         reset_generation: i32,
     ) -> Result<(), OrchestratorBridgeError> {
-        let new_group_id = hex::decode(&new_group_id_hex).map_err(|e| {
-            OrchestratorBridgeError::InvalidInput {
+        let new_group_id =
+            hex::decode(&new_group_id_hex).map_err(|e| OrchestratorBridgeError::InvalidInput {
                 message: format!("new_group_id_hex is not valid hex: {e}"),
-            }
-        })?;
+            })?;
         crate::async_runtime::block_on(self.inner.handle_group_reset(
             &convo_id,
             new_group_id,

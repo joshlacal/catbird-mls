@@ -482,13 +482,23 @@ impl CatbirdMls {
             .map_err(OrchestratorBridgeError::from)
     }
 
-    /// Force rejoin a conversation via External Commit (recovery from epoch desync).
-    pub fn rejoin_conversation(
+    // Task #43: `rejoin_conversation` and `force_rejoin` are no longer exposed on
+    // the UniFFI surface. Client-initiated External Commits were the root cause of
+    // production epoch inflation (epochs observed at 800+). Recovery moves to the
+    // server via the A7 reset pyramid.
+
+    /// Task #43: report unrecoverable local state to the server so the A7 reset
+    /// pyramid can take over. Does not create External Commits.
+    pub fn report_unrecoverable_local(
         &self,
-        conversation_id: String,
+        convo_id: String,
+        reason: String,
     ) -> Result<(), OrchestratorBridgeError> {
-        crate::async_runtime::block_on(self.client.rejoin_conversation(&conversation_id))
-            .map_err(OrchestratorBridgeError::from)
+        let orchestrator = self.client.orchestrator();
+        crate::async_runtime::block_on(
+            orchestrator.report_unrecoverable_local(&convo_id, &reason),
+        );
+        Ok(())
     }
 
     /// Join a group via Welcome message (orchestrator).
@@ -499,13 +509,6 @@ impl CatbirdMls {
         let orchestrator = self.client.orchestrator();
         let convo = crate::async_runtime::block_on(orchestrator.join_group(&welcome_data))?;
         Ok(convo_view_to_ffi(&convo))
-    }
-
-    /// Force rejoin via orchestrator (low-level recovery).
-    pub fn force_rejoin(&self, convo_id: String) -> Result<(), OrchestratorBridgeError> {
-        let orchestrator = self.client.orchestrator();
-        crate::async_runtime::block_on(orchestrator.force_rejoin(&convo_id))?;
-        Ok(())
     }
 
     /// Perform full silent recovery on multiple conversations.

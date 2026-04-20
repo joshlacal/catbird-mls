@@ -239,7 +239,9 @@ where
         self.orchestrator.sync_with_server(full_sync).await
     }
 
-    pub async fn rejoin_conversation(
+    // Task #43: demoted to `pub(crate)` along with the native client variant.
+    // External Commit rejoin is no longer a platform-callable action.
+    pub(crate) async fn rejoin_conversation(
         &self,
         conversation_id: &str,
     ) -> Result<(), OrchestratorError> {

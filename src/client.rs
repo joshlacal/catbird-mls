@@ -407,7 +407,15 @@ where
     }
 
     /// Force rejoin a conversation (recovery path).
-    pub async fn rejoin_conversation(
+    ///
+    /// Task #43: demoted to `pub(crate)`. External Commit rejoin is no longer
+    /// a platform-callable action — client-initiated External Commits were the
+    /// root cause of production epoch inflation. Server-mediated recovery via
+    /// the A7 reset pyramid is the current path; this method remains
+    /// `pub(crate)` (currently unused but kept for parity with `WasmClient`
+    /// during the transition).
+    #[allow(dead_code)]
+    pub(crate) async fn rejoin_conversation(
         &self,
         conversation_id: &str,
     ) -> Result<(), OrchestratorError> {

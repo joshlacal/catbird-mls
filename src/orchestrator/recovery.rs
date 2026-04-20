@@ -827,10 +827,61 @@ where
     /// This is the recovery path when the local MLS state is desynced
     /// from the server (epoch mismatch, decryption failures, etc.).
     ///
+    /// Task #43: Report to the server that the local client has reached an
+    /// unrecoverable state for `convo_id` (e.g. missing group, fork detected,
+    /// decryption permanently failing). This is the public escalation path that
+    /// replaces client-initiated External Commits.
+    ///
+    /// The server (mls-ds) handles this via the A7 reset pyramid: it will
+    /// eventually issue a `GroupResetEvent` to move all clients to a new group.
+    ///
+    /// This method does **not** touch local MLS state and does **not** create
+    /// External Commits. It's a pure report call. Any callback errors from
+    /// `api_client().report_recovery_failure` are logged and swallowed — the
+    /// whole point is that the client has already given up locally, so failing
+    /// the report call serves no recovery purpose.
+    pub async fn report_unrecoverable_local(&self, convo_id: &str, reason: &str) {
+        let authenticator = self.epoch_authenticator_hex(convo_id);
+        tracing::warn!(
+            convo_id,
+            reason,
+            has_authenticator = authenticator.is_some(),
+            "Reporting unrecoverable-local state to server (A7 reset path)",
+        );
+        if let Err(e) = self
+            .api_client()
+            .report_recovery_failure(convo_id, reason, authenticator.as_deref())
+            .await
+        {
+            tracing::warn!(
+                convo_id,
+                error = %e,
+                "report_unrecoverable_local: API call failed (best-effort, swallowed)",
+            );
+        }
+    }
+
     /// 1. Fetches GroupInfo from server
     /// 2. Creates an External Commit
     /// 3. Sends the commit to the server
     /// 4. Merges the pending external join
+    ///
+    /// Task #43: **Not part of the public API.** External Commits driven by a
+    /// client whenever it observes desync are the root cause of production
+    /// epoch inflation (observed epochs 800+). Recovery belongs to the
+    /// server's A7 reset pyramid now. This method is hidden from rustdoc and
+    /// removed from UniFFI exports; it remains accessible at Rust visibility
+    /// `pub` strictly so that:
+    ///   - the legitimate `join_or_rejoin` deferred-recovery caller in this file
+    ///     works across the impl boundary
+    ///   - the transitional `rejoin_conversation` on `CatbirdClient`/`WasmClient`
+    ///     (both demoted to `pub(crate)`) keeps compiling
+    ///   - `tests/state_machine_tests.rs` (integration tests documenting
+    ///     internal recovery semantics) can still exercise it
+    ///
+    /// **No new callers.** Prefer `report_unrecoverable_local` for any
+    /// client-observed unrecoverable state.
+    #[doc(hidden)]
     pub async fn force_rejoin(&self, convo_id: &str) -> Result<()> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
