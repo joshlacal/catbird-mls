@@ -93,6 +93,13 @@ struct MockState {
     /// Artificial delay for process_external_commit (used by concurrency tests).
     process_external_commit_delay_ms: u64,
 
+    /// Pending Welcomes per (conversation_id, recipient_did). Delivered FIFO by
+    /// `get_welcome` for the currently-authenticated DID. A single Welcome blob
+    /// from `add_members` or `create_conversation` typically targets multiple
+    /// recipients (the newly added members); we fan it out by storing one copy
+    /// per recipient DID.
+    welcomes: HashMap<(String, String), Vec<Vec<u8>>>,
+
     /// Failure injection flags.
     failures: FailureFlags,
 }
@@ -423,6 +430,36 @@ impl MLSAPIClient for MockDeliveryService {
         guard.conversations.insert(group_id.to_string(), stored);
         guard.messages.entry(group_id.to_string()).or_default();
 
+        // Fan out the Welcome (if provided) to each initial member so they can
+        // later pull it via `get_welcome`. Also store the commit as a message
+        // so existing members (not relevant at creation time, but kept for
+        // symmetry with `add_members`) can observe the epoch-advancing commit.
+        if let Some(w) = welcome_data {
+            if let Some(extra) = initial_members {
+                for recipient in extra {
+                    guard
+                        .welcomes
+                        .entry((group_id.to_string(), recipient.clone()))
+                        .or_default()
+                        .push(w.to_vec());
+                }
+            }
+        }
+        if let Some(c) = commit_data {
+            let msg = StoredMessage {
+                id: Uuid::new_v4().to_string(),
+                conversation_id: group_id.to_string(),
+                sender_did: did.clone(),
+                ciphertext: c.to_vec(),
+                timestamp: Utc::now(),
+            };
+            guard
+                .messages
+                .entry(group_id.to_string())
+                .or_default()
+                .push(msg);
+        }
+
         Ok(CreateConversationResult {
             conversation: view,
             commit_data: commit_data.map(|d| d.to_vec()),
@@ -449,8 +486,8 @@ impl MLSAPIClient for MockDeliveryService {
         &self,
         convo_id: &str,
         member_dids: &[String],
-        _commit_data: &[u8],
-        _welcome_data: Option<&[u8]>,
+        commit_data: &[u8],
+        welcome_data: Option<&[u8]>,
     ) -> Result<AddMembersServerResult> {
         let mut guard = self.state.lock().unwrap();
         check_fail(
@@ -472,6 +509,10 @@ impl MLSAPIClient for MockDeliveryService {
             });
         }
 
+        let sender_did = self
+            .effective_did_from_guard(&guard)
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+
         let convo = guard
             .conversations
             .get_mut(convo_id)
@@ -488,6 +529,36 @@ impl MLSAPIClient for MockDeliveryService {
         }
         convo.view.epoch += 1;
         let new_epoch = convo.view.epoch;
+
+        // Distribute the commit to all members by storing it in the message
+        // log — a real DS fans the commit out to every member so they can
+        // advance their local MLS epoch. `process_incoming` on the sender
+        // side deduplicates via the `own_commits` SHA-256 set.
+        let commit_msg = StoredMessage {
+            id: Uuid::new_v4().to_string(),
+            conversation_id: convo_id.to_string(),
+            sender_did: sender_did.clone(),
+            ciphertext: commit_data.to_vec(),
+            timestamp: Utc::now(),
+        };
+        guard
+            .messages
+            .entry(convo_id.to_string())
+            .or_default()
+            .push(commit_msg);
+
+        // Fan out the Welcome (if provided) to each newly added member. A real
+        // DS delivers Welcomes out-of-band; we queue them per (convo_id, DID)
+        // and `get_welcome` pops the next one for the authenticated DID.
+        if let Some(w) = welcome_data {
+            for did in member_dids {
+                guard
+                    .welcomes
+                    .entry((convo_id.to_string(), did.clone()))
+                    .or_default()
+                    .push(w.to_vec());
+            }
+        }
 
         Ok(AddMembersServerResult {
             success: true,
@@ -813,8 +884,22 @@ impl MLSAPIClient for MockDeliveryService {
             .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))
     }
 
-    async fn get_welcome(&self, _convo_id: &str) -> Result<Vec<u8>> {
-        Err(OrchestratorError::ServerError {
+    async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
+        let mut guard = self.state.lock().unwrap();
+        let did = self
+            .effective_did_from_guard(&guard)
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+
+        let key = (convo_id.to_string(), did.clone());
+        let welcome = guard.welcomes.get_mut(&key).and_then(|q| {
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
+        });
+
+        welcome.ok_or(OrchestratorError::ServerError {
             status: 404,
             body: "welcome not available".to_string(),
         })

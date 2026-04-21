@@ -17,6 +17,7 @@ mod e2e_harness;
 
 // Re-use the TestWorld / TestClient infrastructure from e2e_harness.
 use catbird_mls::orchestrator::error::{OrchestratorError, Result as OrcResult};
+use catbird_mls::orchestrator::MLSAPIClient;
 use e2e_harness::TestWorld;
 
 // ---------------------------------------------------------------------------
@@ -152,79 +153,141 @@ async fn test_self_message_echo() {
 // 3. Commit messages don't advance epoch
 // ---------------------------------------------------------------------------
 
-/// BUG: decrypt_message() does NOT merge staged commits. When a commit
-/// arrives via process_incoming (which uses decrypt_message, not
-/// process_message), the group epoch stays stale.
+/// REGRESSION TEST FOR TASK #58:
+/// `decrypt_message` stages an incoming commit in `pending_incoming_merges` but
+/// does NOT merge it into the local MLS group. Callers of the orchestrator's
+/// HTTP-sync path (`process_incoming`, reached from `fetch_messages` and
+/// `sync_with_server`) must explicitly call `merge_incoming_commit` to advance
+/// the local epoch. Task #58 wired that call into the commit branch at
+/// `messaging.rs:672-718`.
 ///
-/// Scenario: Alice creates a group and sends a commit (via force_rejoin which
-/// advances the epoch). When the commit message echoes back through
-/// process_incoming → decrypt_message, the epoch should advance but doesn't
-/// because decrypt_message returns commits as empty plaintext without merging.
+/// Scenario (multi-client, exercises the fixed branch):
+///   1. Alice creates a group with Bob as an initial member (epoch 1 on both).
+///   2. Bob joins via the Welcome the mock fanned out to him.
+///   3. Carol registers so Bob can fetch her key package.
+///   4. Bob adds Carol — produces a commit at epoch 2 on Bob's side; the mock
+///      stores the commit ciphertext as a message in the conversation so other
+///      members (Alice) will see it.
+///   5. Alice's `fetch_messages` pulls Bob's commit; `process_incoming` calls
+///      `decrypt_message` (stages the commit) and then — thanks to #58 —
+///      `merge_incoming_commit` (merges it into Alice's MLS group).
 ///
-/// Ref: state-machine-messaging.md §6, api.rs:1227-1230
+/// Assertion target: `mls_context.get_epoch(group_id)` — the AUTHORITATIVE
+/// local MLS epoch, NOT the cached `group_states.epoch`. The cached value is
+/// written directly by the `messaging.rs:722-736` block after a successful
+/// stage, so it advances even without the #58 merge call; asserting on the
+/// cache would make this test pass with or without the fix.
 ///
-/// Expected fix: decrypt_message() should merge StagedCommitMessage, or the
-/// orchestrator should call process_message() instead.
+/// Without the #58 fix: `decrypt_message` stages the commit but never merges
+/// it. Alice's authoritative MLS epoch stays at 1, even though the cached
+/// `group_states.epoch` advances to 2. The assertion below therefore FAILS,
+/// proving the test exercises the fixed path.
+///
+/// Ref: commit 3cc27ec, state-machine-messaging.md §6.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_commit_messages_advance_epoch() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.add_client("Carol").await;
 
+    // Registering a device publishes an initial batch of key packages.
     let _a = world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+    let _c = world.register_device("Carol").await.unwrap();
 
+    // ----- Step 1: Alice creates the group with Bob as an initial member.
+    // `create_group_inner` runs `mls_context.add_members(bob_kp)`, ships the
+    // commit + Welcome to the mock server, and merges Alice's pending commit
+    // locally. Alice ends at epoch 1.
     let alice = world.client("Alice");
-
-    // Alice creates a group
     let convo = alice
         .orchestrator
-        .create_group("Epoch Test", None, None)
+        .create_group("Epoch Test", Some(&[bob_did.clone()]), None)
         .await
-        .expect("create_group failed");
-    let group_id = &convo.group_id;
+        .expect("alice create_group failed");
+    let group_id = convo.group_id.clone();
+    let group_id_bytes = hex::decode(&group_id).expect("invalid group id hex");
 
-    let epoch_before = alice
+    let alice_epoch_after_create = alice
         .orchestrator
-        .group_states()
-        .lock()
-        .await
-        .get(group_id)
-        .map(|gs| gs.epoch)
-        .unwrap_or(0);
+        .mls_context()
+        .get_epoch(group_id_bytes.clone())
+        .expect("alice get_epoch after create failed");
+    assert_eq!(
+        alice_epoch_after_create, 1,
+        "Alice's MLS epoch should be 1 after creating the group with Bob",
+    );
 
-    // Alice force-rejoins (creates an External Commit that advances the epoch).
-    // The commit is sent to the server and should echo back.
-    alice
+    // ----- Step 2: Bob joins via the Welcome fanned out by the mock.
+    let bob = world.client("Bob");
+    let bob_welcome = bob
         .orchestrator
-        .force_rejoin(group_id)
+        .api_client()
+        .get_welcome(&group_id)
         .await
-        .expect("force_rejoin failed");
-
-    // Fetch messages from server — should include the external commit
-    let (fetched, _) = alice
+        .expect("bob get_welcome failed");
+    let bob_convo = bob
         .orchestrator
-        .fetch_messages(group_id, None, 100, None, None, None)
+        .join_group(&bob_welcome)
         .await
-        .expect("fetch_messages failed");
-
-    // Check if epoch advanced in group_states after processing the commit
-    let epoch_after = alice
+        .expect("bob join_group failed");
+    assert_eq!(bob_convo.group_id, group_id);
+    let bob_epoch_after_join = bob
         .orchestrator
-        .group_states()
-        .lock()
-        .await
-        .get(group_id)
-        .map(|gs| gs.epoch)
-        .unwrap_or(0);
+        .mls_context()
+        .get_epoch(group_id_bytes.clone())
+        .expect("bob get_epoch after join failed");
+    assert_eq!(
+        bob_epoch_after_join, 1,
+        "Bob's MLS epoch should be 1 after joining via Welcome",
+    );
 
-    // The force_rejoin itself advances the epoch (via merge_pending_commit),
-    // but when the commit echoes back through fetch_messages → process_incoming
-    // → decrypt_message, it should be recognized and NOT cause issues.
-    // The fundamental bug is that decrypt_message doesn't merge StagedCommitMessage.
-    assert!(
-        epoch_after > epoch_before,
-        "Epoch should have advanced after processing the commit, \
-         but stayed at {} (decrypt_message doesn't merge staged commits)",
-        epoch_after
+    // ----- Step 3: Bob commits `add_members(Carol)`. Bob's local MLS epoch
+    // advances to 2; the mock stores Bob's commit ciphertext as a message in
+    // the conversation, which Alice's next `fetch_messages` will pull.
+    let carol_did = world.client("Carol").did.clone();
+    bob.orchestrator
+        .add_members(&group_id, &[carol_did])
+        .await
+        .expect("bob add_members(carol) failed");
+    let bob_epoch_after_add = bob
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id_bytes.clone())
+        .expect("bob get_epoch after add_members failed");
+    assert_eq!(
+        bob_epoch_after_add, 2,
+        "Bob's MLS epoch should be 2 after adding Carol",
+    );
+
+    // ----- Step 4: Alice syncs. Her `process_incoming` hits the commit branch
+    // at `messaging.rs:653`, decrypts the staged commit, and — with the #58
+    // fix — calls `merge_incoming_commit` to advance her authoritative MLS
+    // epoch from 1 to 2. Without the fix, `decrypt_message` stages the commit
+    // but never merges it; the cached `group_states.epoch` still advances (via
+    // the block at `messaging.rs:722-736`), but `mls_context.get_epoch`
+    // remains at 1, which is what we assert on below.
+    let alice = world.client("Alice");
+    let (_fetched, _cursor) = alice
+        .orchestrator
+        .fetch_messages(&group_id, None, 100, None, None, None)
+        .await
+        .expect("alice fetch_messages failed");
+
+    let alice_epoch_after_sync = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id_bytes)
+        .expect("alice get_epoch after sync failed");
+
+    assert_eq!(
+        alice_epoch_after_sync, 2,
+        "Alice's AUTHORITATIVE MLS epoch must advance to 2 after processing \
+         Bob's incoming commit. Got {alice_epoch_after_sync}. This fails when \
+         `process_incoming`'s commit branch stages the commit without calling \
+         `merge_incoming_commit` — the exact gap task #58 (commit 3cc27ec) \
+         closed.",
     );
 }
 
