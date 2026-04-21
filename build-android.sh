@@ -223,20 +223,43 @@ from pathlib import Path
 import sys
 
 path = Path(sys.argv[1])
-text = path.read_text()
-marker = 'sealed class OrchestratorBridgeException: kotlin.Exception() {'
-start = text.find(marker)
-if start == -1:
-    raise SystemExit(f"missing marker in {path}")
-end_marker = '\n\n    companion object ErrorHandler'
-end = text.find(end_marker, start)
-if end == -1:
-    raise SystemExit(f"missing end marker in {path}")
-block = text[start:end]
-updated = block.replace('`message`', '`errorMessage`')
-text = text[:start] + updated + text[end:]
-text = text.replace('value.`message`', 'value.`errorMessage`')
-if text != path.read_text():
+original = path.read_text()
+text = original
+
+# Rename `message` → `errorMessage` ONLY inside OrchestratorBridgeException's
+# sealed class body AND its FfiConverter. Do NOT apply globally — other
+# exception types (e.g. MlsCommitException) legitimately own a `message`
+# field and their converters reference `value.`message``; a global rewrite
+# corrupts them (the field stays `message` but the converter references
+# `errorMessage`, which won't compile).
+
+def rescope(text, head, tail):
+    """Replace `message` → `errorMessage` inside [head..tail] only."""
+    start = text.find(head)
+    if start == -1:
+        raise SystemExit(f"missing head marker: {head!r}")
+    end = text.find(tail, start)
+    if end == -1:
+        raise SystemExit(f"missing tail marker after {head!r}: {tail!r}")
+    block = text[start:end]
+    updated = block.replace('`message`', '`errorMessage`')
+    return text[:start] + updated + text[end:]
+
+# Block 1: the sealed class body (ends where ErrorHandler companion object begins).
+text = rescope(
+    text,
+    'sealed class OrchestratorBridgeException: kotlin.Exception() {',
+    '\n\n    companion object ErrorHandler',
+)
+
+# Block 2: the FfiConverter for OrchestratorBridgeError (separate top-level object).
+text = rescope(
+    text,
+    'public object FfiConverterTypeOrchestratorBridgeError',
+    '\npublic object ',
+)
+
+if text != original:
     path.write_text(text)
 PY
 log_info "✓ Kotlin bindings generated under $KOTLIN_DIR"
