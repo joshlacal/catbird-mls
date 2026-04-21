@@ -5203,7 +5203,7 @@ impl MLSContext {
         conversation_id: String,
         kind: crate::orchestrator_bridge::FFICommitKind,
         signer_identity_bytes: Vec<u8>,
-    ) -> Result<crate::orchestrator_bridge::FFICommitPlan, MLSError> {
+    ) -> Result<crate::orchestrator_bridge::FFICommitPlan, crate::MLSCommitError> {
         use crate::orchestrator_bridge::{FFICommitKind, FFICommitPlan, FFIStagedCommitHandle};
 
         let group_id_bytes = hex::decode(&conversation_id)
@@ -5220,7 +5220,8 @@ impl MLSContext {
                 return Err(MLSError::invalid_input(format!(
                     "A staged commit already exists for conversation {}; confirm or discard it before staging another",
                     conversation_id
-                )));
+                ))
+                .into());
             }
         }
 
@@ -5331,7 +5332,7 @@ impl MLSContext {
         &self,
         handle: crate::orchestrator_bridge::FFIStagedCommitHandle,
         server_epoch: u64,
-    ) -> Result<crate::orchestrator_bridge::FFIConfirmedCommit, MLSError> {
+    ) -> Result<crate::orchestrator_bridge::FFIConfirmedCommit, crate::MLSCommitError> {
         use crate::orchestrator_bridge::FFIConfirmedCommit;
 
         // Validate and pop the pending entry atomically to prevent a second
@@ -5350,13 +5351,15 @@ impl MLSContext {
                     return Err(MLSError::invalid_input(format!(
                         "Staged commit handle nonce mismatch for conversation {} (already confirmed or superseded)",
                         handle.group_id
-                    )));
+                    ))
+                    .into());
                 }
                 None => {
                     return Err(MLSError::invalid_input(format!(
                         "No staged commit found for conversation {} (already confirmed or discarded)",
                         handle.group_id
-                    )));
+                    ))
+                    .into());
                 }
             }
         };
@@ -5369,7 +5372,7 @@ impl MLSContext {
                 .lock()
                 .map_err(|_| MLSError::ContextNotInitialized)?
                 .insert(handle.group_id.clone(), meta.clone());
-            return Err(MLSError::EpochMismatch {
+            return Err(crate::MLSCommitError::EpochMismatch {
                 local: meta.target_epoch,
                 remote: server_epoch,
             });
@@ -5400,7 +5403,7 @@ impl MLSContext {
                         clear_err
                     );
                 }
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -5429,7 +5432,7 @@ impl MLSContext {
     pub fn discard_pending(
         &self,
         handle: crate::orchestrator_bridge::FFIStagedCommitHandle,
-    ) -> Result<(), MLSError> {
+    ) -> Result<(), crate::MLSCommitError> {
         let removed = {
             let mut pending = self
                 .pending_outgoing_commits
@@ -5443,13 +5446,15 @@ impl MLSContext {
                     return Err(MLSError::invalid_input(format!(
                         "Staged commit handle nonce mismatch for conversation {} (already discarded or confirmed)",
                         handle.group_id
-                    )));
+                    ))
+                    .into());
                 }
                 None => {
                     return Err(MLSError::invalid_input(format!(
                         "No staged commit found for conversation {} (already discarded or confirmed)",
                         handle.group_id
-                    )));
+                    ))
+                    .into());
                 }
             }
         };

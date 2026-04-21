@@ -206,3 +206,51 @@ impl MLSError {
         }
     }
 }
+
+/// Dedicated error type for the sender-side three-phase commit surface on
+/// [`crate::api::MLSContext`] (`stage_commit`, `confirm_commit`,
+/// `discard_pending`).
+///
+/// [`MLSError`] itself is annotated with `#[uniffi(flat_error)]`, which
+/// collapses every variant to `{ message: String }` across the UniFFI
+/// boundary. That made `EpochMismatch { local, remote }` — the one
+/// `MLSError` variant whose structured fields callers actually need to
+/// branch on — unreachable from Swift/Kotlin without string parsing.
+///
+/// Rather than unflatten `MLSError` (which has variants carrying
+/// `Utf8Error`, `serde_json::Error`, and `&'static str` that aren't
+/// UniFFI-representable), this narrower type is used only by the
+/// three-phase commit methods so iOS and catmos-cli can pattern-match on
+/// the structured [`MLSCommitError::EpochMismatch`] variant. See
+/// `docs/TODO.md` task #63.
+#[derive(Error, Debug, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Error))]
+pub enum MLSCommitError {
+    /// Fencing mismatch between the epoch the server advanced to and the
+    /// epoch the locally-staged commit would produce. Returned by
+    /// `MLSContext::confirm_commit` when `server_epoch` does not equal
+    /// the plan's `target_epoch` (and is not
+    /// `crate::api::SKIP_SERVER_EPOCH_FENCE`). The caller must discard
+    /// the staged commit and re-sync before retrying.
+    #[error("Epoch mismatch: local={local}, remote={remote}")]
+    EpochMismatch { local: u64, remote: u64 },
+
+    /// Catch-all wrapping any other [`MLSError`] the underlying OpenMLS
+    /// call can surface. The `message` field is the `Display` form of
+    /// the original error.
+    #[error("{message}")]
+    Generic { message: String },
+}
+
+impl From<MLSError> for MLSCommitError {
+    fn from(e: MLSError) -> Self {
+        match e {
+            MLSError::EpochMismatch { local, remote } => {
+                MLSCommitError::EpochMismatch { local, remote }
+            }
+            other => MLSCommitError::Generic {
+                message: other.to_string(),
+            },
+        }
+    }
+}
