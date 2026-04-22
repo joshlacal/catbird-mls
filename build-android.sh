@@ -226,18 +226,26 @@ path = Path(sys.argv[1])
 original = path.read_text()
 text = original
 
-# Rename `message` → `errorMessage` ONLY inside OrchestratorBridgeException's
-# sealed class body AND its FfiConverter. Do NOT apply globally — other
-# exception types (e.g. MlsCommitException) legitimately own a `message`
-# field and their converters reference `value.`message``; a global rewrite
-# corrupts them (the field stays `message` but the converter references
-# `errorMessage`, which won't compile).
+# Why this script exists:
+# uniffi generates `class Generic(val `message`: String)` + an
+# `override val message` getter on the same class. That's a Kotlin name
+# collision — the constructor param declares a property `message`, the
+# override declares another, and Throwable already has `message`. To make
+# it compile we rename the constructor property from `message` to
+# `errorMessage`, then update the converter to match.
+#
+# This collision hits every sealed-exception Generic variant. We need to
+# patch BOTH the class body AND the FfiConverter for each exception type.
+# A pure-global replace is wrong: classes whose Generic variant has NO
+# override-getter collision (hypothetical) would get renamed needlessly.
+# Scoped per-exception replace is the robust path.
 
 def rescope(text, head, tail):
-    """Replace `message` → `errorMessage` inside [head..tail] only."""
+    """Replace `message` → `errorMessage` inside [head..tail) only. Returns new text."""
     start = text.find(head)
     if start == -1:
-        raise SystemExit(f"missing head marker: {head!r}")
+        # Not all exception types may be present in every regen — silently skip.
+        return text
     end = text.find(tail, start)
     if end == -1:
         raise SystemExit(f"missing tail marker after {head!r}: {tail!r}")
@@ -245,19 +253,28 @@ def rescope(text, head, tail):
     updated = block.replace('`message`', '`errorMessage`')
     return text[:start] + updated + text[end:]
 
-# Block 1: the sealed class body (ends where ErrorHandler companion object begins).
-text = rescope(
-    text,
-    'sealed class OrchestratorBridgeException: kotlin.Exception() {',
-    '\n\n    companion object ErrorHandler',
-)
+# Apply to each sealed-exception class and its converter. Order matters —
+# do the class body first (bounded by companion object), then the
+# FfiConverterTypeXxxError (bounded by the next top-level `public object `).
+targets = [
+    # (class_head_marker, class_tail_marker, converter_head_marker, converter_tail_marker)
+    (
+        'sealed class OrchestratorBridgeException: kotlin.Exception() {',
+        '\n\n    companion object ErrorHandler',
+        'public object FfiConverterTypeOrchestratorBridgeError',
+        '\npublic object ',
+    ),
+    (
+        'sealed class MlsCommitException: kotlin.Exception() {',
+        '\n\n    companion object ErrorHandler',
+        'public object FfiConverterTypeMLSCommitError',
+        '\npublic object ',
+    ),
+]
 
-# Block 2: the FfiConverter for OrchestratorBridgeError (separate top-level object).
-text = rescope(
-    text,
-    'public object FfiConverterTypeOrchestratorBridgeError',
-    '\npublic object ',
-)
+for class_head, class_tail, conv_head, conv_tail in targets:
+    text = rescope(text, class_head, class_tail)
+    text = rescope(text, conv_head, conv_tail)
 
 if text != original:
     path.write_text(text)
