@@ -36,8 +36,8 @@ pub enum MLSError {
     #[error("Secret export failed")]
     SecretExportFailed,
 
-    #[error("Commit processing failed")]
-    CommitProcessingFailed,
+    #[error("Commit processing failed: {message}")]
+    CommitProcessingFailed { message: String },
 
     #[error("Invalid commit")]
     InvalidCommit,
@@ -192,6 +192,12 @@ impl MLSError {
         }
     }
 
+    pub fn commit_processing_failed(msg: impl Into<String>) -> Self {
+        Self::CommitProcessingFailed {
+            message: msg.into(),
+        }
+    }
+
     /// Whether this error is an OpenMLS `ValidationError(WrongEpoch)` — i.e. the
     /// ciphertext belongs to an MLS epoch we cannot decrypt (typically a commit
     /// from before our external-commit join, a stale replay, or a message from
@@ -202,6 +208,7 @@ impl MLSError {
     pub fn is_wrong_epoch(&self) -> bool {
         match self {
             Self::OpenMLS(msg) => msg.contains("WrongEpoch"),
+            Self::CommitProcessingFailed { message } => message.contains("WrongEpoch"),
             _ => false,
         }
     }

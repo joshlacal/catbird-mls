@@ -3746,7 +3746,9 @@ impl MLSContext {
                         "[MLS-FFI] ❌ process_commit: ProtocolMessage conversion failed: {:?}",
                         e
                     );
-                    MLSError::CommitProcessingFailed
+                    MLSError::commit_processing_failed(format!(
+                        "ProtocolMessage conversion failed: {e:?}"
+                    ))
                 })?;
 
                 let processed = process_protocol_message(
@@ -3760,7 +3762,7 @@ impl MLSContext {
                         "[MLS-FFI] ❌ process_commit: OpenMLS process_message error: {:?}",
                         e
                     );
-                    MLSError::CommitProcessingFailed
+                    MLSError::commit_processing_failed(format!("OpenMLS: {e:?}"))
                 })?;
 
                 match processed.into_content() {
