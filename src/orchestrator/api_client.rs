@@ -202,13 +202,24 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// `None` preserves pre-A7 behavior so platforms can soft-ship before
     /// servers enforce the binding. Once A7 lands on the server, clients MUST
     /// pass `Some(hex)`.
+    ///
+    /// `failure_mode` (ADR-008 D1, spec §8.6.1): one of `"local_state_loss"`
+    /// or `"group_state_unrecoverable"`. Distinguishes "this client lost
+    /// local state" (Mode A — should self-heal via §6.6 / §8.4 External
+    /// Commit + self-Remove, NOT count toward quorum auto-reset) from "the
+    /// group itself is unrecoverable for the network" (Mode B — only this
+    /// counts toward quorum). `None` preserves pre-D1 behavior; servers
+    /// without D1 enforcement count any valid vote regardless. Once D1 is
+    /// enforced, omitted `failure_mode` is treated as `local_state_loss`
+    /// (conservative).
     async fn report_recovery_failure(
         &self,
         convo_id: &str,
         failure_type: &str,
         epoch_authenticator: Option<&str>,
+        failure_mode: Option<&str>,
     ) -> Result<()> {
-        let _ = (convo_id, failure_type, epoch_authenticator);
+        let _ = (convo_id, failure_type, epoch_authenticator, failure_mode);
         Err(crate::orchestrator::error::OrchestratorError::Api(
             "report_recovery_failure not implemented".into(),
         ))

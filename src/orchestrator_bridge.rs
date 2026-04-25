@@ -274,6 +274,12 @@ pub trait OrchestratorAPICallback: Send + Sync {
     /// so stale clients can't forge quorum votes. `None` is accepted by
     /// pre-A7 servers; once A7 ships, servers MAY require it.
     ///
+    /// `failure_mode` (ADR-008 D1, spec §8.6.1): one of `"local_state_loss"`
+    /// or `"group_state_unrecoverable"`. Mode A reports SHOULD NOT count
+    /// toward server-side quorum auto-reset (clients should self-heal
+    /// instead); Mode B reports indicate the group itself is unrecoverable
+    /// and SHOULD count. Optional during interim deployment.
+    ///
     /// Errors should be returned (not swallowed); the orchestrator logs but
     /// does not retry, since the local state is already terminal.
     fn report_recovery_failure(
@@ -281,6 +287,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
         convo_id: String,
         failure_type: String,
         epoch_authenticator: Option<String>,
+        failure_mode: Option<String>,
     ) -> Result<(), OrchestratorBridgeError>;
 }
 
@@ -1342,12 +1349,14 @@ impl MLSAPIClient for APIAdapter {
         convo_id: &str,
         failure_type: &str,
         epoch_authenticator: Option<&str>,
+        failure_mode: Option<&str>,
     ) -> crate::orchestrator::Result<()> {
         self.0
             .report_recovery_failure(
                 convo_id.to_string(),
                 failure_type.to_string(),
                 epoch_authenticator.map(|s| s.to_string()),
+                failure_mode.map(|s| s.to_string()),
             )
             .map_err(bridge_err)
     }

@@ -208,8 +208,51 @@ where
         *self.user_did.lock().await = Some(user_did.to_string());
         *self.shutting_down.lock().await = false;
 
-        // Load cached group states from storage
-        // (conversations will be populated on first sync)
+        // Rehydrate persisted conversation state (spec §8.2 / §8.5 Phase 1).
+        // Conversations themselves are populated from server data on first
+        // sync; we only need to recover the persisted state tag + payload
+        // (`ResetPending { new_group_id, reset_generation, notified_at_ms }`,
+        // `NeedsRejoin`, etc.) so deferred recovery can pick up where it
+        // left off across app restart. Backends that don't override
+        // `get_conversation_state` will return `None` here and the in-memory
+        // map starts empty — same behavior as before this hook existed.
+        match self.storage.list_conversations(user_did).await {
+            Ok(convos) => {
+                let mut states = self.conversation_states.lock().await;
+                for convo in &convos {
+                    match self
+                        .storage
+                        .get_conversation_state(&convo.conversation_id)
+                        .await
+                    {
+                        Ok(Some(state)) => {
+                            tracing::debug!(
+                                convo_id = %convo.conversation_id,
+                                state = state.tag(),
+                                "Rehydrated conversation state from storage"
+                            );
+                            states.insert(convo.conversation_id.clone(), state);
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                convo_id = %convo.conversation_id,
+                                error = ?e,
+                                "Failed to rehydrate conversation state"
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "Failed to list conversations during init; \
+                     conversation_states starts empty"
+                );
+            }
+        }
+
         Ok(())
     }
 

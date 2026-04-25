@@ -466,6 +466,13 @@ where
             // stale clients can't forge quorum votes. `None` retains pre-A7
             // behavior; servers that accept the hint will reject mismatched
             // authenticators.
+            //
+            // ADR-008 D1 (spec §8.6.1): classify as `local_state_loss`. By
+            // the time we reach `external_commit_exhausted`, malformed
+            // GroupInfo (Mode B) has already short-circuited via
+            // `is_remote_data_error` below; remaining failures are typically
+            // network / OpenMLS storage issues that should self-heal via
+            // §6.6 / §8.4 instead of triggering a global reset.
             let authenticator = self.epoch_authenticator_hex(convo_id);
             if let Err(e) = self
                 .api_client()
@@ -473,6 +480,7 @@ where
                     convo_id,
                     "external_commit_exhausted",
                     authenticator.as_deref(),
+                    Some("local_state_loss"),
                 )
                 .await
             {
@@ -636,7 +644,11 @@ where
                         error = %e,
                         "External Commit failed due to malformed remote data — marking unrecoverable"
                     );
-                    // Transition to Failed state without incrementing failure counter
+                    // Transition to Failed state without incrementing failure counter.
+                    // ADR-008 D1: classify as `group_state_unrecoverable` —
+                    // a `remote_data_error` is by definition Mode B (the
+                    // server-side ratchet/GroupInfo is malformed), so this
+                    // report SHOULD count toward server-side quorum auto-reset.
                     let authenticator = self.epoch_authenticator_hex(convo_id);
                     if let Err(report_err) = self
                         .api_client()
@@ -644,6 +656,7 @@ where
                             convo_id,
                             "remote_data_error",
                             authenticator.as_deref(),
+                            Some("group_state_unrecoverable"),
                         )
                         .await
                     {
@@ -842,15 +855,23 @@ where
     /// the report call serves no recovery purpose.
     pub async fn report_unrecoverable_local(&self, convo_id: &str, reason: &str) {
         let authenticator = self.epoch_authenticator_hex(convo_id);
+        // ADR-008 D1 (spec §8.6.1): default classification by failureType.
+        // Callers with richer context can use a more specific path below.
+        let failure_mode = match reason {
+            "remote_data_error" => Some("group_state_unrecoverable"),
+            "external_commit_exhausted" => Some("local_state_loss"),
+            _ => None,
+        };
         tracing::warn!(
             convo_id,
             reason,
+            failure_mode = ?failure_mode,
             has_authenticator = authenticator.is_some(),
             "Reporting unrecoverable-local state to server (A7 reset path)",
         );
         if let Err(e) = self
             .api_client()
-            .report_recovery_failure(convo_id, reason, authenticator.as_deref())
+            .report_recovery_failure(convo_id, reason, authenticator.as_deref(), failure_mode)
             .await
         {
             tracing::warn!(

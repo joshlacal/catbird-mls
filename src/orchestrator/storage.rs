@@ -61,6 +61,25 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         state: ConversationState,
     ) -> Result<()>;
 
+    /// Read the persisted conversation state, if any.
+    ///
+    /// Used during orchestrator startup to rehydrate the in-memory
+    /// `conversation_states` map so server-driven RESET_PENDING transitions
+    /// (and any other persisted state) survive process restart.
+    ///
+    /// For `ResetPending`, implementations MUST reconstruct the full payload
+    /// (`new_group_id`, `reset_generation`, `notified_at_ms`) from the
+    /// columns written by `mark_reset_pending`.
+    ///
+    /// Default returns `Ok(None)` for backward compatibility; backends that
+    /// persist state should override.
+    async fn get_conversation_state(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<ConversationState>> {
+        Ok(None)
+    }
+
     /// Mark a conversation as needing rejoin.
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> Result<()>;
 
