@@ -1184,7 +1184,7 @@ where
                 // bootstrap. The 30s MIN_REJOIN_INTERVAL + per-convo backoff
                 // already throttle the loop; with ≤8-device groups the
                 // first-responder race resolves within one or two sync
-                // cycles (one winner, others see ConvoAlreadyExists 409 →
+                // cycles (one winner, others see AlreadyBootstrapped 409 →
                 // Welcome on the next pass).
                 if let Some(payload) = self.reset_pending_payload(convo_id).await {
                     tracing::info!(
@@ -1572,12 +1572,16 @@ where
 
     /// First-responder bootstrap (spec §8.5 Phase 1).
     ///
-    /// Builds a local MLS group at the predetermined `new_group_id` and
-    /// submits it via `createConvo`. The server's primary-key idempotency
-    /// on `(group_id)` plus the `ConvoAlreadyExists` 409 (lexicon task #16,
-    /// distinguishing a different-DID race-loser from an in-window
-    /// idempotent retry) lets the loser detect "someone else won" and
-    /// drop their pre-bootstrap MLS group cleanly.
+    /// Builds a local MLS group at the predetermined `new_group_id`,
+    /// exports its `GroupInfo`, and submits via `bootstrapResetGroup`
+    /// (mls-ds task #17). The server holds an empty post-reset row at
+    /// `(id=originalConvoId, group_id=newGroupId, group_info IS NULL)`
+    /// from the auto-reset that emitted the `groupResetEvent`; the
+    /// endpoint UPDATEs that row in place, so race losers see HTTP 409
+    /// `AlreadyBootstrapped` and drop their pre-bootstrap MLS group
+    /// cleanly. (Pre-task #18 this used `createConvo`, which would
+    /// orphan the post-reset row by INSERTing a new row at id=newGroupId —
+    /// see ios-impl flag on task #13.)
     ///
     /// Race-loser semantics: do NOT clear `reset_pending` — the deferred-
     /// recovery loop will retry Welcome on the next sync cycle and pick
@@ -1625,33 +1629,56 @@ where
         let identity_bytes = user_did.as_bytes().to_vec();
         let group_config = self.config().group_config.clone();
         let _creation_result = self.mls_context().create_group_with_id(
-            identity_bytes,
+            identity_bytes.clone(),
             new_group_id_bytes.clone(),
             Some(group_config),
         )?;
 
-        // 2. Submit to server. Filter creator's DID from initial members
-        // (server already records the caller as a member implicitly).
-        let self_did_lower = user_did.to_lowercase();
-        let initial_members: Vec<String> = roster
-            .iter()
-            .filter(|m| m.to_lowercase() != self_did_lower)
-            .cloned()
-            .collect();
-        let initial_members_ref = if initial_members.is_empty() {
-            None
-        } else {
-            Some(initial_members.as_slice())
+        // 2. Export GroupInfo from the freshly-created group — required by
+        // bootstrapResetGroup's lexicon `groupInfo` field. On failure, drop
+        // the local pre-bootstrap group so the next deferred-recovery cycle
+        // starts clean (keep `reset_pending` so the loop retries).
+        let group_info = match self
+            .mls_context()
+            .export_group_info(new_group_id_bytes.clone(), identity_bytes.clone())
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    convo_id,
+                    error = %e,
+                    "first-responder bootstrap: export_group_info failed; dropping local pre-bootstrap group"
+                );
+                let _ = self.mls_context().delete_group(new_group_id_bytes);
+                return Err(OrchestratorError::Mls(e));
+            }
         };
 
+        // 3. Submit to server via bootstrapResetGroup (NOT createConvo —
+        // post-reset rows have id=originalConvoId, group_id=newGroupId, so
+        // createConvo would orphan the row by inserting a new id=newGroupId
+        // row. bootstrapResetGroup UPDATEs the existing post-reset row in
+        // place. Per spec §8.5 / mls-ds task #17.) Members roster is
+        // diagnostic-only on the server (lexicon docs); the persisted
+        // members table preserved across reset is authoritative — we ship
+        // the FULL roster including the caller, matching the catmos-cli
+        // precedent at recovery_ops::bootstrap_reset_group.
+        //
+        // TODO: cipher_suite isn't tracked on ResetPendingPayload or
+        // ConversationView yet. Use the catmos default to match the
+        // existing create_conversation hardcoding (catmos
+        // src-tauri/src/api_client.rs:776). When per-convo cipher_suite
+        // plumbing lands, swap to derive from convo state.
+        let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
         let result = self
             .api_client()
-            .create_conversation(
+            .bootstrap_reset_group(
+                convo_id,
                 &payload.new_group_id,
-                initial_members_ref,
-                None, // metadata: encrypted in MLS GroupContext extensions
-                None, // commit_data: bootstrap is the genesis commit
-                None, // welcome_data: race-winners broadcast Welcome separately
+                cipher_suite,
+                &group_info,
+                &roster,
+                None, // welcome_message: race-winner publishes Welcomes via the standard add-members commit path; not bootstrapped inline
             )
             .await;
 
@@ -1679,12 +1706,12 @@ where
                     .unwrap_or(0);
                 Ok(epoch)
             }
-            Err(err) if err.is_create_convo_race_loss() => {
+            Err(err) if err.is_bootstrap_already_bootstrapped() => {
                 tracing::info!(
                     convo_id,
                     new_group_id = %payload.new_group_id,
                     reset_generation = payload.reset_generation,
-                    "first-responder bootstrap race lost (ConvoAlreadyExists) — dropping local pre-bootstrap group"
+                    "first-responder bootstrap race lost (AlreadyBootstrapped) — dropping local pre-bootstrap group"
                 );
                 if let Err(e) = self.mls_context().delete_group(new_group_id_bytes) {
                     tracing::warn!(
@@ -1704,7 +1731,7 @@ where
                 tracing::warn!(
                     convo_id,
                     error = %err,
-                    "first-responder bootstrap createConvo failed; dropping local group, will retry"
+                    "first-responder bootstrap bootstrapResetGroup failed; dropping local group, will retry"
                 );
                 if let Err(e) = self.mls_context().delete_group(new_group_id_bytes) {
                     tracing::warn!(

@@ -126,11 +126,12 @@ fn create_group_without_id_still_uses_random_openmls_default() {
 fn create_group_with_id_two_calls_at_same_id_are_rejected_by_storage() {
     // Sanity check: OpenMLS storage can't hold two groups at the same id in
     // the same MLSContext. This isn't the production race-loss path (the
-    // server's createConvo returns 409 ConvoAlreadyExists BEFORE we'd hit
-    // local storage on subsequent attempts), but it documents that local
-    // storage is also collision-safe — race losers should always
-    // `delete_group(predetermined)` after seeing the 409, never assume the
-    // local entry was magically cleaned up.
+    // server's bootstrapResetGroup returns 409 AlreadyBootstrapped BEFORE
+    // we'd hit local storage on subsequent attempts — see mls-ds task #17 /
+    // catbird-mls task #18), but it documents that local storage is also
+    // collision-safe — race losers should always `delete_group(predetermined)`
+    // after seeing the 409, never assume the local entry was magically
+    // cleaned up.
     let (ctx, _dir) = make_context();
 
     let predetermined = vec![0xff; 32];

@@ -94,23 +94,30 @@ impl OrchestratorError {
         matches!(self, OrchestratorError::ServerError { status: 429, .. })
     }
 
-    /// Whether this error represents a `createConvo` race-loss: the server
-    /// returned 409 with the `ConvoAlreadyExists` lexicon error code,
-    /// meaning a different DID won the first-responder bootstrap race for
-    /// the same `groupId`. Race losers MUST discard their local pre-bootstrap
-    /// MLS group and fall back to receiving the Welcome from the winner —
-    /// they MUST NOT clear `reset_pending` (the deferred-recovery loop will
-    /// retry Welcome on the next pass).
+    /// Whether this error represents a first-responder bootstrap race-loss:
+    /// the server returned 409 with either lexicon code that signals
+    /// "another caller won the race for this groupId/convoId":
+    /// - `ConvoAlreadyExists` (legacy `createConvo` shape, retained for
+    ///   backward compat during the createConvo→bootstrapResetGroup migration)
+    /// - `AlreadyBootstrapped` (new `bootstrapResetGroup` shape, post task #17)
     ///
-    /// Per `mls-ds/lexicon/blue/catbird/mlsChat/blue.catbird.mlsChat.createConvo.json`
-    /// (task #16, Phase 1).
-    pub fn is_create_convo_race_loss(&self) -> bool {
+    /// Race losers MUST discard their local pre-bootstrap MLS group and
+    /// fall back to receiving the Welcome from the winner — they MUST NOT
+    /// clear `reset_pending` (the deferred-recovery loop will retry Welcome
+    /// on the next pass).
+    pub fn is_bootstrap_already_bootstrapped(&self) -> bool {
         match self {
             OrchestratorError::ServerError { status: 409, body } => {
-                body.contains("ConvoAlreadyExists")
+                body.contains("ConvoAlreadyExists") || body.contains("AlreadyBootstrapped")
             }
             _ => false,
         }
+    }
+
+    /// Backward-compat alias. New code should call `is_bootstrap_already_bootstrapped`.
+    #[deprecated(note = "use is_bootstrap_already_bootstrapped — same semantics, broader name")]
+    pub fn is_create_convo_race_loss(&self) -> bool {
+        self.is_bootstrap_already_bootstrapped()
     }
 }
 
@@ -121,52 +128,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_create_convo_race_loss_matches_409_with_lexicon_code() {
-        // The shape mls-ds returns when a race-loser hits createConvo with
-        // a groupId someone else already claimed (lexicon task #16):
-        // HTTP 409 with `{"error":"ConvoAlreadyExists","message":"..."}`.
+    fn is_bootstrap_already_bootstrapped_matches_legacy_convo_already_exists() {
+        // Pre-task-#18 shape that mls-ds returned when a race-loser hit
+        // createConvo with a groupId someone else already claimed (lexicon
+        // task #16): HTTP 409 with `{"error":"ConvoAlreadyExists","message":"..."}`.
+        // Retained so any client that still receives the legacy code keeps
+        // classifying correctly during the migration.
         let err = OrchestratorError::ServerError {
             status: 409,
             body: r#"{"error":"ConvoAlreadyExists","message":"caller lost first-responder race"}"#
                 .to_string(),
         };
         assert!(
-            err.is_create_convo_race_loss(),
+            err.is_bootstrap_already_bootstrapped(),
             "409 with ConvoAlreadyExists in body must classify as race loss"
         );
     }
 
     #[test]
-    fn is_create_convo_race_loss_rejects_other_409s() {
-        // 409 with a different lexicon code (e.g. AlreadyMember) must NOT
-        // be treated as a bootstrap race loss.
+    fn is_bootstrap_already_bootstrapped_matches_new_bootstrap_already_bootstrapped() {
+        // The new shape mls-ds returns from `bootstrapResetGroup` (task #17)
+        // when another caller already populated the post-reset row's
+        // group_info: HTTP 409 with `{"error":"AlreadyBootstrapped",...}`.
+        let err = OrchestratorError::ServerError {
+            status: 409,
+            body: r#"{"error":"AlreadyBootstrapped","message":"caller lost first-responder race"}"#
+                .to_string(),
+        };
+        assert!(
+            err.is_bootstrap_already_bootstrapped(),
+            "409 with AlreadyBootstrapped in body must classify as race loss"
+        );
+    }
+
+    #[test]
+    fn is_bootstrap_already_bootstrapped_rejects_other_409s() {
+        // 409 with a different lexicon code (e.g. AlreadyMember,
+        // BootstrapTargetNotFound) must NOT be treated as a bootstrap race
+        // loss — those are legitimate failures the caller must surface.
         let err = OrchestratorError::ServerError {
             status: 409,
             body: r#"{"error":"AlreadyMember","message":"..."}"#.to_string(),
         };
         assert!(
-            !err.is_create_convo_race_loss(),
-            "409 with non-ConvoAlreadyExists code must not classify"
+            !err.is_bootstrap_already_bootstrapped(),
+            "409 with unrelated lexicon code must not classify"
+        );
+
+        let err = OrchestratorError::ServerError {
+            status: 409,
+            body: r#"{"error":"BootstrapTargetNotFound","message":"..."}"#.to_string(),
+        };
+        assert!(
+            !err.is_bootstrap_already_bootstrapped(),
+            "409 with sibling bootstrap error must not classify as race loss"
         );
     }
 
     #[test]
-    fn is_create_convo_race_loss_rejects_other_statuses() {
+    fn is_bootstrap_already_bootstrapped_rejects_other_statuses() {
         // Same body, wrong status: must not classify.
         let err = OrchestratorError::ServerError {
             status: 500,
-            body: r#"{"error":"ConvoAlreadyExists"}"#.to_string(),
+            body: r#"{"error":"AlreadyBootstrapped"}"#.to_string(),
         };
         assert!(
-            !err.is_create_convo_race_loss(),
+            !err.is_bootstrap_already_bootstrapped(),
             "non-409 statuses must not classify even with matching body"
         );
 
         // Network error: must not classify.
         let err = OrchestratorError::Api("connection refused".into());
         assert!(
-            !err.is_create_convo_race_loss(),
+            !err.is_bootstrap_already_bootstrapped(),
             "non-ServerError variants must not classify"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn is_create_convo_race_loss_alias_still_works() {
+        // The deprecated alias must remain semantically identical so any
+        // out-of-tree code that still calls it continues to work during the
+        // migration.
+        let err = OrchestratorError::ServerError {
+            status: 409,
+            body: r#"{"error":"AlreadyBootstrapped"}"#.to_string(),
+        };
+        assert!(err.is_create_convo_race_loss());
+        assert_eq!(
+            err.is_create_convo_race_loss(),
+            err.is_bootstrap_already_bootstrapped()
         );
     }
 }

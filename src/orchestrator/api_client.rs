@@ -49,6 +49,38 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         welcome_data: Option<&[u8]>,
     ) -> Result<CreateConversationResult>;
 
+    /// Bootstrap a post-auto-reset conversation by populating the existing
+    /// row's emptied MLS state in place. Use this from
+    /// `try_first_responder_bootstrap` rather than `create_conversation` —
+    /// the latter would orphan the post-reset row (id=originalConvoId,
+    /// group_id=newGroupId) by inserting a new conversations row keyed on
+    /// the new groupId. Per spec §8.5 / mls-ds task #17.
+    ///
+    /// Default implementation fails loudly so any backend that hasn't wired
+    /// this up surfaces the missing impl instead of silently falling back to
+    /// the orphaning `create_conversation` path.
+    async fn bootstrap_reset_group(
+        &self,
+        original_convo_id: &str,
+        new_group_id: &str,
+        cipher_suite: &str,
+        group_info: &[u8],
+        members: &[String],
+        welcome_message: Option<&[u8]>,
+    ) -> Result<CreateConversationResult> {
+        let _ = (
+            original_convo_id,
+            new_group_id,
+            cipher_suite,
+            group_info,
+            members,
+            welcome_message,
+        );
+        Err(crate::orchestrator::error::OrchestratorError::Api(
+            "bootstrap_reset_group not implemented".into(),
+        ))
+    }
+
     /// Leave a conversation on the server.
     async fn leave_conversation(&self, convo_id: &str) -> Result<()>;
 
