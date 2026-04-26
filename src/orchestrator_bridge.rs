@@ -1868,7 +1868,43 @@ impl OrchestratorBridge {
             hex::decode(&new_group_id_hex).map_err(|e| OrchestratorBridgeError::InvalidInput {
                 message: format!("new_group_id_hex is not valid hex: {e}"),
             })?;
+        #[allow(deprecated)]
         crate::async_runtime::block_on(self.inner.handle_group_reset(
+            &convo_id,
+            new_group_id,
+            reset_generation,
+        ))?;
+        Ok(())
+    }
+
+    /// Persist a `groupResetEvent` WITHOUT performing inline recovery
+    /// (spec §8.5 Phase 1, ADR-008 D2 deferred-recovery invariant).
+    ///
+    /// Platforms whose event/SSE/WS handler must not run External Commits
+    /// inline (catmos, BIRDaemon, and Phase 3 iOS/Android event paths)
+    /// should call this from the event handler. The deferred-recovery
+    /// loop driven by `MLSOrchestrator::sync_with_server` will pick the
+    /// conversation up via the `needs_rejoin` flag set here, then route
+    /// it through `join_or_rejoin` — which now includes a first-responder
+    /// bootstrap step gated on `ConversationState::ResetPending`.
+    ///
+    /// New code should prefer this over `handle_group_reset`. The legacy
+    /// composite `handle_group_reset` is retained as a deprecated alias
+    /// for backward compatibility (it now calls `record_group_reset`
+    /// followed by an inline `join_or_rejoin` — same observable behavior
+    /// as before, but the inline `join_or_rejoin` is the part that
+    /// violates the "no External Commits in event handlers" invariant).
+    pub fn record_group_reset(
+        &self,
+        convo_id: String,
+        new_group_id_hex: String,
+        reset_generation: i32,
+    ) -> Result<(), OrchestratorBridgeError> {
+        let new_group_id =
+            hex::decode(&new_group_id_hex).map_err(|e| OrchestratorBridgeError::InvalidInput {
+                message: format!("new_group_id_hex is not valid hex: {e}"),
+            })?;
+        crate::async_runtime::block_on(self.inner.record_group_reset(
             &convo_id,
             new_group_id,
             reset_generation,

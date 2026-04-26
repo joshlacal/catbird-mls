@@ -28,6 +28,34 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         config: Option<GroupConfig>,
     ) -> Result<GroupCreationResult, MLSError>;
 
+    /// Create a new MLS group at a **predetermined** group_id (RFC 9420 §11
+    /// `MlsGroup::new_with_group_id`). Used by the first-responder bootstrap
+    /// path (spec §8.5 / Phase 1) where every member needs to land on the
+    /// same `groupId` published by the server's `groupResetEvent`. Random
+    /// group_id (the default `create_group` path) cannot satisfy that
+    /// contract — different bootstrap candidates would produce different
+    /// local groups.
+    ///
+    /// `group_id` is the raw bytes of the target MLS group identifier
+    /// (NOT hex-encoded). Callers that have a hex string from the
+    /// `groupResetEvent.newGroupId` must `hex::decode` before calling.
+    ///
+    /// Default returns `OperationNotSupported` so existing platforms
+    /// (Swift/Kotlin UniFFI callback impls) continue to compile until they
+    /// wire up the OpenMLS exposure. Native `MLSContext` and the WASM
+    /// crypto context implement this directly.
+    fn create_group_with_id(
+        &self,
+        identity: Vec<u8>,
+        group_id: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        let _ = (identity, group_id, config);
+        Err(MLSError::OperationNotSupported {
+            reason: "create_group_with_id not available on this platform".to_string(),
+        })
+    }
+
     fn add_members(
         &self,
         group_id: Vec<u8>,

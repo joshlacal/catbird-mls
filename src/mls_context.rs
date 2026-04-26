@@ -1910,9 +1910,38 @@ impl MLSContext {
         identity: &str,
         config: crate::types::GroupConfig,
     ) -> Result<CreateGroupInternalResult, MLSError> {
+        self.create_group_internal(identity, None, config)
+    }
+
+    /// Create a group at a predetermined `group_id` (spec §8.5 first-responder
+    /// bootstrap). All bootstrap candidates targeting the same `groupResetEvent.newGroupId`
+    /// land on the same MLS GroupId — so Welcome recipients of the race winner
+    /// can deserialize against the expected group identifier.
+    ///
+    /// `group_id` is the raw bytes (NOT hex-encoded).
+    pub fn create_group_with_id(
+        &mut self,
+        identity: &str,
+        group_id: Vec<u8>,
+        config: crate::types::GroupConfig,
+    ) -> Result<CreateGroupInternalResult, MLSError> {
+        self.create_group_internal(identity, Some(group_id), config)
+    }
+
+    fn create_group_internal(
+        &mut self,
+        identity: &str,
+        predetermined_group_id: Option<Vec<u8>>,
+        config: crate::types::GroupConfig,
+    ) -> Result<CreateGroupInternalResult, MLSError> {
         crate::debug_log!(
-            "[MLS-CONTEXT] create_group: Starting for identity '{}'",
-            identity
+            "[MLS-CONTEXT] create_group: Starting for identity '{}'{}",
+            identity,
+            if predetermined_group_id.is_some() {
+                " with predetermined group_id"
+            } else {
+                ""
+            }
         );
 
         let credential = Credential::new(CredentialType::Basic, identity.as_bytes().to_vec());
@@ -2028,15 +2057,32 @@ impl MLSContext {
         );
 
         crate::debug_log!("[MLS-CONTEXT] Creating MLS group...");
-        let mut group = MlsGroup::new(
-            &self.provider,
-            &signature_keys,
-            &group_config,
-            CredentialWithKey {
-                credential,
-                signature_key: signature_keys.public().into(),
-            },
-        )
+        let credential_with_key = CredentialWithKey {
+            credential,
+            signature_key: signature_keys.public().into(),
+        };
+        let mut group = match predetermined_group_id {
+            Some(ref id_bytes) => {
+                crate::debug_log!(
+                    "[MLS-CONTEXT] Using predetermined group_id ({} bytes) via MlsGroup::new_with_group_id",
+                    id_bytes.len()
+                );
+                let openmls_group_id = openmls::prelude::GroupId::from_slice(id_bytes);
+                MlsGroup::new_with_group_id(
+                    &self.provider,
+                    &signature_keys,
+                    &group_config,
+                    openmls_group_id,
+                    credential_with_key,
+                )
+            }
+            None => MlsGroup::new(
+                &self.provider,
+                &signature_keys,
+                &group_config,
+                credential_with_key,
+            ),
+        }
         .map_err(|e| {
             crate::debug_log!("[MLS-CONTEXT] ERROR: Failed to create MLS group: {:?}", e);
             MLSError::OpenMLSError

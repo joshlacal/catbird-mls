@@ -568,8 +568,39 @@ impl MLSContext {
         identity_bytes: Vec<u8>,
         config: Option<GroupConfig>,
     ) -> Result<GroupCreationResult, MLSError> {
+        self.create_group_dispatch(identity_bytes, None, config)
+    }
+
+    /// FFI/native entry point for creating a group at a predetermined `group_id`
+    /// (spec §8.5 first-responder bootstrap). `group_id` is the raw bytes of
+    /// the target MLS group identifier (NOT hex-encoded). All bootstrap
+    /// candidates targeting the same `groupResetEvent.newGroupId` MUST land on
+    /// the same MLS GroupId so the race winner's Welcome can deserialize for
+    /// every recipient.
+    pub fn create_group_with_id(
+        &self,
+        identity_bytes: Vec<u8>,
+        group_id: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        self.create_group_dispatch(identity_bytes, Some(group_id), config)
+    }
+
+    fn create_group_dispatch(
+        &self,
+        identity_bytes: Vec<u8>,
+        predetermined_group_id: Option<Vec<u8>>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
         self.check_suspended()?;
-        crate::info_log!("[MLS-FFI] create_group: Starting");
+        crate::info_log!(
+            "[MLS-FFI] create_group: Starting{}",
+            if predetermined_group_id.is_some() {
+                " (predetermined group_id)"
+            } else {
+                ""
+            }
+        );
         crate::debug_log!("[MLS-FFI] Identity bytes: {} bytes", identity_bytes.len());
 
         let mut guard = self.inner.lock().map_err(|e| {
@@ -588,7 +619,10 @@ impl MLSContext {
         crate::debug_log!("[MLS-FFI] Group config - max_past_epochs: {}, out_of_order_tolerance: {}, maximum_forward_distance: {}",
             group_config.max_past_epochs, group_config.out_of_order_tolerance, group_config.maximum_forward_distance);
 
-        let result = inner.create_group(&identity, group_config)?;
+        let result = match predetermined_group_id {
+            Some(id) => inner.create_group_with_id(&identity, id, group_config)?,
+            None => inner.create_group(&identity, group_config)?,
+        };
         crate::info_log!(
             "[MLS-FFI] Group created successfully, ID: {}",
             hex::encode(&result.group_id)
@@ -5682,6 +5716,15 @@ impl MlsCryptoContext for MLSContext {
         config: Option<GroupConfig>,
     ) -> Result<GroupCreationResult, MLSError> {
         self.create_group(identity, config)
+    }
+
+    fn create_group_with_id(
+        &self,
+        identity: Vec<u8>,
+        group_id: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<GroupCreationResult, MLSError> {
+        self.create_group_with_id(identity, group_id, config)
     }
 
     fn add_members(

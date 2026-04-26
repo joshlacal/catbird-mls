@@ -13,6 +13,19 @@ use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
+/// Snapshot of a conversation's `ResetPending` payload for use inside the
+/// recovery loop. Mirrors the variant on `ConversationState::ResetPending`
+/// without dragging the full enum into call sites that only need to inspect
+/// "are we mid-reset and what's the new id?". Read via
+/// `MLSOrchestrator::reset_pending_payload`.
+#[derive(Debug, Clone)]
+pub(crate) struct ResetPendingPayload {
+    pub new_group_id: String,
+    pub reset_generation: i32,
+    #[allow(dead_code)]
+    pub notified_at_ms: i64,
+}
+
 /// Tracks recovery state per conversation.
 pub struct RecoveryTracker {
     /// Failed rejoin attempts per conversation.
@@ -52,6 +65,16 @@ impl RecoveryTracker {
             // Beyond defined backoff: use the last value
             *constants::REJOIN_BACKOFF.last().unwrap()
         }
+    }
+
+    /// Number of consecutive failed rejoin attempts recorded for this convo.
+    /// Returns 0 if the convo has no failure record (cleared after success or
+    /// never attempted). Used for diagnostic logging at the eligibility gate.
+    pub fn failed_attempts(&self, convo_id: &str) -> u32 {
+        self.failed_rejoins
+            .get(convo_id)
+            .map(|(n, _)| *n)
+            .unwrap_or(0)
     }
 
     /// Whether max attempts have been reached.
@@ -412,6 +435,10 @@ where
                     convo_id,
                     "Skipping sync-triggered join/rejoin: attempt already in-flight"
                 );
+                crate::info_log!(
+                    "[gate] convo={} REJECT: attempt already in-flight (rejoin_lock held)",
+                    convo_id
+                );
                 return false;
             }
         };
@@ -436,6 +463,11 @@ where
                 remaining_secs = remaining.as_secs(),
                 "Skipping sync-triggered join/rejoin: recently succeeded (spiral protection)"
             );
+            crate::info_log!(
+                "[gate] convo={} REJECT: success cooldown ({}s remaining, spiral protection)",
+                convo_id,
+                remaining.as_secs()
+            );
             return false;
         }
 
@@ -445,8 +477,15 @@ where
                 error = %err,
                 "Skipping sync-triggered join/rejoin: recovery backoff active"
             );
+            crate::info_log!(
+                "[gate] convo={} REJECT: backoff active ({})",
+                convo_id,
+                err
+            );
             return false;
         }
+
+        crate::info_log!("[gate] convo={} ACCEPT: proceeding with rejoin", convo_id);
 
         true
     }
@@ -458,6 +497,11 @@ where
                 convo_id,
                 max_attempts = self.config().max_rejoin_attempts,
                 "Rejoin suppressed: max attempts reached, reporting recovery failure"
+            );
+            crate::info_log!(
+                "[gate] convo={} REJECT: max attempts ({}) reached, reporting recovery failure",
+                convo_id,
+                self.config().max_rejoin_attempts
             );
             // Drop lock before async call
             drop(tracker);
@@ -501,6 +545,12 @@ where
                 remaining_secs = remaining.as_secs(),
                 "Rejoin suppressed: cooldown active"
             );
+            crate::info_log!(
+                "[gate] convo={} REJECT: per-convo backoff active ({}s remaining, after {} failures)",
+                convo_id,
+                remaining.as_secs(),
+                tracker.failed_attempts(convo_id)
+            );
             return Err(OrchestratorError::RecoveryFailed(format!(
                 "Rejoin suppressed for {convo_id}: cooldown active ({}s remaining)",
                 remaining.as_secs()
@@ -516,6 +566,11 @@ where
                     convo_id,
                     remaining_secs = remaining.as_secs(),
                     "Rejoin suppressed: minimum interval not elapsed"
+                );
+                crate::info_log!(
+                    "[gate] convo={} REJECT: global MIN_REJOIN_INTERVAL ({}s remaining)",
+                    convo_id,
+                    remaining.as_secs()
                 );
                 return Err(OrchestratorError::RecoveryFailed(format!(
                     "Rejoin suppressed for {convo_id}: minimum interval ({}s remaining)",
@@ -1111,10 +1166,53 @@ where
         match rejoin_result {
             Ok(()) => {
                 self.clear_rejoin_failures(convo_id).await;
-                Ok(self.local_group_epoch(convo_id).unwrap_or(0))
+                return Ok(self.local_group_epoch(convo_id).unwrap_or(0));
             }
             Err(err) => {
                 self.record_rejoin_failure(convo_id).await;
+                // Step 3: First-responder bootstrap (spec §8.5 Phase 1).
+                //
+                // Reachable only when BOTH Welcome and ExternalCommit failed
+                // AND the conversation is in `ResetPending` — i.e. the server
+                // has issued a `groupResetEvent`, the new group is empty
+                // (no Welcome, no GroupInfo published yet), and someone needs
+                // to bootstrap. We're a candidate.
+                //
+                // Gating strictly on `ResetPending` — NOT on the failure
+                // shape — is deliberate: never-joined conversations also
+                // produce "no Welcome + no GroupInfo" but must not trigger
+                // bootstrap. The 30s MIN_REJOIN_INTERVAL + per-convo backoff
+                // already throttle the loop; with ≤8-device groups the
+                // first-responder race resolves within one or two sync
+                // cycles (one winner, others see ConvoAlreadyExists 409 →
+                // Welcome on the next pass).
+                if let Some(payload) = self.reset_pending_payload(convo_id).await {
+                    tracing::info!(
+                        convo_id,
+                        new_group_id = %payload.new_group_id,
+                        reset_generation = payload.reset_generation,
+                        "join_or_rejoin: Welcome+ECommit unavailable, attempting first-responder bootstrap"
+                    );
+                    match self
+                        .try_first_responder_bootstrap(convo_id, &payload, &user_did)
+                        .await
+                    {
+                        Ok(epoch) => {
+                            self.clear_rejoin_failures(convo_id).await;
+                            return Ok(epoch);
+                        }
+                        Err(boot_err) => {
+                            tracing::warn!(
+                                convo_id,
+                                bootstrap_error = %boot_err,
+                                fallthrough_error = %err,
+                                "First-responder bootstrap failed; returning original rejoin error"
+                            );
+                            // Fall through to the original error so the
+                            // deferred-recovery loop applies normal backoff.
+                        }
+                    }
+                }
                 Err(err)
             }
         }
@@ -1181,12 +1279,21 @@ where
         Ok(())
     }
 
-    /// Handle a server-initiated group reset (spec §8.5 Phase 1 / §8.6).
+    /// Persist a server-initiated GroupReset event WITHOUT performing any
+    /// network recovery (spec §8.5 Phase 1 / §8.6).
     ///
-    /// Called by the platform SSE/WS layer when it receives a `GroupResetEvent`
-    /// for a conversation the server has auto-reset (quorum of members reported
-    /// `UNRECOVERABLE_LOCAL`). The flow:
+    /// Called by the platform SSE/WS event handler when a `groupResetEvent`
+    /// arrives. Splits the persist-only steps out of the legacy
+    /// `handle_group_reset` so event handlers don't trigger an inline
+    /// External Commit (catmos's `websocket.rs:494` enforces "External Commits
+    /// only in deferred recovery, never inline in event handlers" — see the
+    /// April 2026 epoch-inflation incident class). The deferred-recovery
+    /// sync loop subsequently picks the conversation up via the
+    /// `needs_rejoin` flag and routes through `join_or_rejoin`, which now
+    /// includes a first-responder bootstrap step gated on
+    /// `ConversationState::ResetPending`.
     ///
+    /// Steps:
     /// 1. Transition the conversation to `ResetPending { new_group_id,
     ///    reset_generation, notified_at_ms }` and persist it so the payload
     ///    survives orchestrator restart.
@@ -1195,20 +1302,13 @@ where
     ///    happens to yield).
     /// 3. Reset the per-conversation `RecoveryTracker` counter to 0 — this is
     ///    a fresh start from the server, not a continuation of a client-side
-    ///    retry loop. A previously exhausted conversation becomes eligible
-    ///    for a new attempt immediately. The global `MIN_REJOIN_INTERVAL`
-    ///    still applies (epoch-inflation guard).
-    /// 4. Update `group_states[convo_id].group_id = new_group_id_hex` so the
-    ///    subsequent `join_or_rejoin` fetches GroupInfo / Welcome for the
-    ///    *new* group.
-    /// 5. Call `join_or_rejoin(convo_id)` (Welcome first, ExternalCommit
-    ///    fallback — ADR-001 levels 1-3).
-    /// 6. On success: mark `Active`, clear the persisted RESET_PENDING payload.
-    ///    On failure: leave in `NeedsRejoin` so the normal deferred-recovery
-    ///    loop can retry.
+    ///    retry loop.
+    /// 4. Update `group_states[convo_id].group_id = new_group_id_hex` and
+    ///    `mark_needs_rejoin` so the next sync-loop pass routes this convo
+    ///    through `join_or_rejoin` (Welcome → ExternalCommit → bootstrap).
     ///
     /// `new_group_id` is the raw bytes of the new MLS group id (not hex).
-    pub async fn handle_group_reset(
+    pub async fn record_group_reset(
         &self,
         convo_id: &str,
         new_group_id: Vec<u8>,
@@ -1222,7 +1322,7 @@ where
             convo_id,
             new_group_id = %new_group_id_hex,
             reset_generation,
-            "Handling server-initiated GroupReset"
+            "Recording server-initiated GroupReset (deferred adoption)"
         );
 
         // 1. Transition to ResetPending + persist the payload.
@@ -1303,7 +1403,9 @@ where
 
         // 4. Update group_states to point at the new group id so that any
         // group-id-derived lookups (including the one inside
-        // force_rejoin_unlocked) see the new target.
+        // force_rejoin_unlocked) see the new target. Also flag `needs_rejoin`
+        // so the deferred-recovery loop in `sync_with_server` picks the
+        // conversation up on the next pass.
         {
             let mut states = self.group_states().lock().await;
             let entry = states
@@ -1326,14 +1428,48 @@ where
                 );
             }
         }
+        if let Err(e) = self.storage().mark_needs_rejoin(convo_id).await {
+            tracing::warn!(
+                convo_id,
+                error = %e,
+                "Failed to set needs_rejoin flag after group reset"
+            );
+        }
 
-        // 5. Schedule Phase 1 recovery: Welcome first, External Commit fallback.
-        // join_or_rejoin uses the api_client with the stable convo_id; the
-        // server is now serving Welcome/GroupInfo for the *new* group, so no
-        // extra plumbing is needed.
+        Ok(())
+    }
+
+    /// Handle a server-initiated group reset (spec §8.5 Phase 1 / §8.6).
+    ///
+    /// **Deprecated:** prefer `record_group_reset` from event handlers and
+    /// let the deferred-recovery sync loop drive `join_or_rejoin`. This
+    /// composite method runs the network step inline, which violates the
+    /// "External Commits only in deferred recovery" invariant that
+    /// orchestrator-using clients (catmos, WASM, BIRDaemon) rely on to
+    /// avoid the epoch-inflation class of bug observed in March 2026
+    /// (see `project_handle_group_reset_design_gaps.md` session note).
+    ///
+    /// Retained as a thin alias so out-of-tree callers that already
+    /// invoked `handle_group_reset(...)` keep compiling. New code should
+    /// call `record_group_reset(...)` from the WS/SSE handler and rely
+    /// on the next `sync_with_server` cycle to invoke `join_or_rejoin`
+    /// (which now includes the first-responder bootstrap branch).
+    #[deprecated(
+        since = "0.2.0",
+        note = "Call `record_group_reset` from event handlers; deferred-recovery loop will drive `join_or_rejoin` (which now includes first-responder bootstrap). See spec §8.5 Phase 1."
+    )]
+    pub async fn handle_group_reset(
+        &self,
+        convo_id: &str,
+        new_group_id: Vec<u8>,
+        reset_generation: i32,
+    ) -> Result<()> {
+        let new_group_id_hex = hex::encode(&new_group_id);
+        self.record_group_reset(convo_id, new_group_id, reset_generation)
+            .await?;
+
         match self.join_or_rejoin(convo_id).await {
             Ok(epoch) => {
-                // 6. Success: mark Active, clear persisted ResetPending flag.
                 self.conversation_states()
                     .lock()
                     .await
@@ -1361,15 +1497,11 @@ where
                     epoch,
                     new_group_id = %new_group_id_hex,
                     reset_generation,
-                    "Group reset adopted successfully"
+                    "Group reset adopted successfully (legacy inline path)"
                 );
                 Ok(())
             }
             Err(e) => {
-                // Adoption failed. Fall back to NeedsRejoin so the standard
-                // deferred-recovery loop retries (subject to the MIN_REJOIN
-                // interval + per-attempt backoff). We keep the mark_reset_pending
-                // payload persisted so a future restart can re-enter Phase 1.
                 tracing::error!(
                     convo_id,
                     error = %e,
@@ -1386,6 +1518,228 @@ where
                     .await;
                 let _ = self.storage().mark_needs_rejoin(convo_id).await;
                 Err(e)
+            }
+        }
+    }
+
+    /// Snapshot of the `ResetPending` payload for a conversation, or `None`
+    /// if the conversation is not in that state. Used by `join_or_rejoin`'s
+    /// bootstrap gate.
+    ///
+    /// Reads the in-memory `conversation_states` map first, then falls back
+    /// to storage. The fallback covers two production scenarios:
+    ///
+    /// 1. **Cold-start race.** `MLSOrchestrator::initialize` rehydrates
+    ///    persisted state into the in-memory map at startup, but a
+    ///    `groupResetEvent` arriving during that window can land in storage
+    ///    before the in-memory map is rehydrated.
+    /// 2. **Platform WS/SSE handlers that persist without updating the
+    ///    in-memory map.** catmos's `websocket.rs` writes
+    ///    `set_conversation_state(ResetPending{..})` + `mark_reset_pending`
+    ///    on a `groupResetEvent` but cannot reach into the orchestrator's
+    ///    `conversation_states` mutex (workspace-internal surface). Storage
+    ///    fallback closes the gap without forcing every platform to migrate
+    ///    to `record_group_reset` simultaneously.
+    pub(crate) async fn reset_pending_payload(&self, convo_id: &str) -> Option<ResetPendingPayload> {
+        {
+            let states = self.conversation_states().lock().await;
+            if let Some(ConversationState::ResetPending {
+                new_group_id,
+                reset_generation,
+                notified_at_ms,
+            }) = states.get(convo_id)
+            {
+                return Some(ResetPendingPayload {
+                    new_group_id: new_group_id.clone(),
+                    reset_generation: *reset_generation,
+                    notified_at_ms: *notified_at_ms,
+                });
+            }
+        }
+        match self.storage().get_conversation_state(convo_id).await {
+            Ok(Some(ConversationState::ResetPending {
+                new_group_id,
+                reset_generation,
+                notified_at_ms,
+            })) => Some(ResetPendingPayload {
+                new_group_id,
+                reset_generation,
+                notified_at_ms,
+            }),
+            _ => None,
+        }
+    }
+
+    /// First-responder bootstrap (spec §8.5 Phase 1).
+    ///
+    /// Builds a local MLS group at the predetermined `new_group_id` and
+    /// submits it via `createConvo`. The server's primary-key idempotency
+    /// on `(group_id)` plus the `ConvoAlreadyExists` 409 (lexicon task #16,
+    /// distinguishing a different-DID race-loser from an in-window
+    /// idempotent retry) lets the loser detect "someone else won" and
+    /// drop their pre-bootstrap MLS group cleanly.
+    ///
+    /// Race-loser semantics: do NOT clear `reset_pending` — the deferred-
+    /// recovery loop will retry Welcome on the next sync cycle and pick
+    /// up the winner's published Welcome.
+    ///
+    /// Race-winner semantics: clear `reset_pending`, transition to Active.
+    ///
+    /// Roster source: `group_states[convo_id].members` is unreliable post-
+    /// reset (the server clears membership rosters atomically with the
+    /// reset transaction), so we fetch fresh via `get_conversations`
+    /// pagination per Phase 0 Q3. Spec design accepts this network cost
+    /// because bootstrap is rare (post-quorum-reset only).
+    async fn try_first_responder_bootstrap(
+        &self,
+        convo_id: &str,
+        payload: &ResetPendingPayload,
+        user_did: &str,
+    ) -> Result<u64> {
+        let new_group_id_bytes = hex::decode(&payload.new_group_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!(
+                "ResetPending.new_group_id is not valid hex ({}): {e}",
+                payload.new_group_id
+            ))
+        })?;
+
+        // Fetch fresh roster — post-reset, the server clears the membership
+        // table atomically with the reset transaction (per Phase 0 Q3 / Q2
+        // findings). Cached `group_states[convo_id].members` would be the
+        // pre-reset roster.
+        let roster = self.fetch_roster_for_convo(convo_id).await?;
+        if roster.is_empty() {
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "Cannot bootstrap convo {convo_id}: server roster is empty"
+            )));
+        }
+
+        tracing::info!(
+            convo_id,
+            new_group_id = %payload.new_group_id,
+            roster_size = roster.len(),
+            "first-responder bootstrap: creating local MLS group at predetermined id"
+        );
+
+        // 1. Create local MLS group AT the predetermined id.
+        let identity_bytes = user_did.as_bytes().to_vec();
+        let group_config = self.config().group_config.clone();
+        let _creation_result = self.mls_context().create_group_with_id(
+            identity_bytes,
+            new_group_id_bytes.clone(),
+            Some(group_config),
+        )?;
+
+        // 2. Submit to server. Filter creator's DID from initial members
+        // (server already records the caller as a member implicitly).
+        let self_did_lower = user_did.to_lowercase();
+        let initial_members: Vec<String> = roster
+            .iter()
+            .filter(|m| m.to_lowercase() != self_did_lower)
+            .cloned()
+            .collect();
+        let initial_members_ref = if initial_members.is_empty() {
+            None
+        } else {
+            Some(initial_members.as_slice())
+        };
+
+        let result = self
+            .api_client()
+            .create_conversation(
+                &payload.new_group_id,
+                initial_members_ref,
+                None, // metadata: encrypted in MLS GroupContext extensions
+                None, // commit_data: bootstrap is the genesis commit
+                None, // welcome_data: race-winners broadcast Welcome separately
+            )
+            .await;
+
+        match result {
+            Ok(_create_result) => {
+                tracing::info!(
+                    convo_id,
+                    new_group_id = %payload.new_group_id,
+                    reset_generation = payload.reset_generation,
+                    "first-responder bootstrap won — clearing reset_pending"
+                );
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .insert(convo_id.to_string(), ConversationState::Active);
+                let _ = self
+                    .storage()
+                    .set_conversation_state(convo_id, ConversationState::Active)
+                    .await;
+                let _ = self.storage().clear_reset_pending(convo_id).await;
+                let _ = self.storage().clear_rejoin_flag(convo_id).await;
+                let epoch = self
+                    .mls_context()
+                    .get_epoch(new_group_id_bytes)
+                    .unwrap_or(0);
+                Ok(epoch)
+            }
+            Err(err) if err.is_create_convo_race_loss() => {
+                tracing::info!(
+                    convo_id,
+                    new_group_id = %payload.new_group_id,
+                    reset_generation = payload.reset_generation,
+                    "first-responder bootstrap race lost (ConvoAlreadyExists) — dropping local pre-bootstrap group"
+                );
+                if let Err(e) = self.mls_context().delete_group(new_group_id_bytes) {
+                    tracing::warn!(
+                        convo_id,
+                        error = %e,
+                        "delete_group for race-lost bootstrap failed (non-fatal)"
+                    );
+                }
+                // Do NOT clear reset_pending — the deferred-recovery loop will
+                // retry Welcome on the next sync cycle and pick up the
+                // winner's published Welcome.
+                Err(err)
+            }
+            Err(err) => {
+                // Other error (network, auth, etc.) — drop the local group so
+                // the next bootstrap attempt starts clean. Keep reset_pending.
+                tracing::warn!(
+                    convo_id,
+                    error = %err,
+                    "first-responder bootstrap createConvo failed; dropping local group, will retry"
+                );
+                if let Err(e) = self.mls_context().delete_group(new_group_id_bytes) {
+                    tracing::warn!(
+                        convo_id,
+                        error = %e,
+                        "delete_group for failed bootstrap failed (non-fatal)"
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Page through `get_conversations` to find the roster for a single
+    /// conversation. Phase 0 Q3 confirms `groupResetEvent` does NOT carry
+    /// a roster, and the cached `group_states` membership is wiped by the
+    /// server's reset transaction. Bootstrap rarity (post-quorum-reset
+    /// only) makes the network cost acceptable.
+    async fn fetch_roster_for_convo(&self, convo_id: &str) -> Result<Vec<String>> {
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = self
+                .api_client()
+                .get_conversations(50, cursor.as_deref())
+                .await?;
+            for cv in &page.conversations {
+                if cv.conversation_id == convo_id {
+                    return Ok(cv.members.iter().map(|m| m.did.clone()).collect());
+                }
+            }
+            cursor = page.cursor;
+            if cursor.is_none() {
+                return Err(OrchestratorError::ConversationNotFound(format!(
+                    "Server did not return convo {convo_id} in pagination — cannot bootstrap"
+                )));
             }
         }
     }
