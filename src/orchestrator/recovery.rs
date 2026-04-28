@@ -477,11 +477,7 @@ where
                 error = %err,
                 "Skipping sync-triggered join/rejoin: recovery backoff active"
             );
-            crate::info_log!(
-                "[gate] convo={} REJECT: backoff active ({})",
-                convo_id,
-                err
-            );
+            crate::info_log!("[gate] convo={} REJECT: backoff active ({})", convo_id, err);
             return false;
         }
 
@@ -1316,14 +1312,180 @@ where
     ) -> Result<()> {
         self.check_shutdown().await?;
         let new_group_id_hex = hex::encode(&new_group_id);
-        let notified_at_ms = chrono::Utc::now().timestamp_millis();
-
         tracing::info!(
             convo_id,
             new_group_id = %new_group_id_hex,
             reset_generation,
             "Recording server-initiated GroupReset (deferred adoption)"
         );
+        self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation)
+            .await
+    }
+
+    /// Phase 2.5 (`docs/plans/phase-2-5-indirect-funneling.md` §3, §5 Stage 1):
+    /// record an indirect-trigger `resetRequestedEvent` from the DS where the
+    /// server has NOT minted a new MLS group id and is asking subscribed
+    /// clients to elect a first responder.
+    ///
+    /// The `resetRequestedEvent` lexicon (parallel agent's scope) carries:
+    /// - `cryptoSessionId` (prior session id, now in `reset_requested` server-side),
+    /// - `generation` (monotonic per conversation; `i32` here to match the
+    ///   existing `reset_generation` field — see `storage.rs:106`),
+    /// - `trigger` (`quorumVote | systemSweep | inlineCommit409 |
+    ///   inlineGroupInfo404 | adminRequest`),
+    /// - `requestEventId` (deterministic dedup key — see plan §3 idempotency
+    ///   scheme: `req-quorum:..`, `req-sweep:..`, `req-inline-409:..`,
+    ///   `req-inline-404:..`),
+    /// - `expectedNewMlsGroupId` (`Option<String>`; usually `None`, set only
+    ///   when an admin or legacy direct flow knows the target id).
+    ///
+    /// Resolution policy in this client:
+    ///
+    /// **Idempotency** is by current state: if the conversation is already
+    /// `ResetPending { reset_generation: g, .. }` and the incoming
+    /// `reset_generation` matches `g`, return `Ok(())` without doing duplicate
+    /// work. The same `request_event_id` arriving twice through different SSE
+    /// reconnects (or replayed via `event_stream` cursor) collapses to a single
+    /// persisted reset_pending row + single bootstrap attempt. We don't carry
+    /// `request_event_id` into `ResetPending` itself — the conversation state
+    /// only needs the new group id and generation, and the payload should not
+    /// keep growing per Phase 2.5 — but we do log it for observability.
+    ///
+    /// **Eager group_id resolution.** When `expected_new_mls_group_id` is
+    /// `None`, we generate a fresh random UUIDv4-style hex id and persist it
+    /// into `ResetPending.new_group_id`. This is cleaner than threading
+    /// `Option<String>` through `ConversationState::ResetPending`,
+    /// `try_first_responder_bootstrap`, and every storage backend's
+    /// `mark_reset_pending` schema. The MLS-protocol-visible behavior is
+    /// identical: clients race-bootstrap with their own pre-generated id, the
+    /// server's `crypto_sessions UNIQUE (conversation_id, generation)`
+    /// chokepoint constraint serializes the winner, race losers see HTTP 409
+    /// `AlreadyBootstrapped` and drop their pre-bootstrap MLS group cleanly
+    /// (see the existing logic at `try_first_responder_bootstrap` race-loser
+    /// branch). The client-generated id never appears on the wire until
+    /// `bootstrap_reset_group` submits it, so this is functionally equivalent
+    /// to bootstrap-time generation.
+    ///
+    /// When `expected_new_mls_group_id` is `Some(g)`, we use `g` directly —
+    /// matching the legacy `record_group_reset` behavior (admin-driven reset,
+    /// plan §5 Stage 1 Catbird/Android dual-path period).
+    ///
+    /// `trigger` is logged (and surfaced in structured logs) but not parsed
+    /// into an internal enum — the lexicon owns the canonical string set, and
+    /// keeping this layer string-typed avoids cross-repo enum drift. The
+    /// security boundary (only quorum/sweep/inline triggers may pass `None`,
+    /// admin must always pass `Some`) is enforced by the server (plan §7 R1
+    /// mitigation 1: `request_crypto_session_reset_tx` debug assertion) — not
+    /// here. Clients receive whatever the server sent.
+    ///
+    /// Wires into the same internal `persist_reset_pending_state` helper as
+    /// `record_group_reset`, so the resulting in-memory state, storage rows,
+    /// and `needs_rejoin` flag are identical to the legacy path. The deferred-
+    /// recovery loop in `sync_with_server` then picks up the conversation and
+    /// drives `join_or_rejoin`, which already includes the first-responder
+    /// bootstrap branch gated on `ResetPending` (see `recovery.rs:1173-1215`).
+    pub async fn record_reset_requested(
+        &self,
+        convo_id: &str,
+        crypto_session_id: &str,
+        reset_generation: i32,
+        trigger: &str,
+        request_event_id: &str,
+        expected_new_mls_group_id: Option<String>,
+    ) -> Result<()> {
+        self.check_shutdown().await?;
+
+        // Idempotency check: if we're already in ResetPending at this
+        // generation, drop the duplicate.
+        if let Some(existing) = self.reset_pending_payload(convo_id).await {
+            if existing.reset_generation == reset_generation {
+                tracing::info!(
+                    convo_id,
+                    crypto_session_id,
+                    reset_generation,
+                    trigger,
+                    request_event_id,
+                    existing_new_group_id = %existing.new_group_id,
+                    "resetRequestedEvent: already in ResetPending at this generation, idempotent no-op"
+                );
+                return Ok(());
+            }
+            // Different generation arriving — fall through and overwrite.
+            // Higher generation supersedes; lower would be a stale replay but
+            // we still re-persist (the server is authoritative).
+            tracing::info!(
+                convo_id,
+                crypto_session_id,
+                old_reset_generation = existing.reset_generation,
+                new_reset_generation = reset_generation,
+                trigger,
+                request_event_id,
+                "resetRequestedEvent: superseding existing ResetPending at different generation"
+            );
+        }
+
+        // Resolve new_group_id eagerly. When the server hands us one (admin
+        // path / legacy direct flow), use it; otherwise mint a fresh
+        // UUIDv4-style 32-hex-char id locally for our race-bootstrap candidate.
+        let new_group_id_hex = match expected_new_mls_group_id {
+            Some(hex_id) if !hex_id.is_empty() => {
+                tracing::info!(
+                    convo_id,
+                    crypto_session_id,
+                    reset_generation,
+                    trigger,
+                    request_event_id,
+                    new_group_id = %hex_id,
+                    "resetRequestedEvent: server-supplied expected_new_mls_group_id, using it directly"
+                );
+                hex_id
+            }
+            _ => {
+                let minted = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+                tracing::info!(
+                    convo_id,
+                    crypto_session_id,
+                    reset_generation,
+                    trigger,
+                    request_event_id,
+                    new_group_id = %minted,
+                    "resetRequestedEvent: no expected_new_mls_group_id from server, minting client-side candidate for first-responder bootstrap"
+                );
+                minted
+            }
+        };
+
+        self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation)
+            .await
+    }
+
+    /// Internal helper shared by `record_group_reset` (legacy direct path) and
+    /// `record_reset_requested` (Phase 2.5 indirect path).
+    ///
+    /// Steps mirror the original `record_group_reset` body — extracted so the
+    /// two public entry points produce identical in-memory + storage state
+    /// without code duplication.
+    ///
+    /// Steps:
+    /// 1. Transition the conversation to `ResetPending { new_group_id,
+    ///    reset_generation, notified_at_ms }` and persist it so the payload
+    ///    survives orchestrator restart.
+    /// 2. Delete the old local MLS group (looked up via `group_states` so we
+    ///    drop the *pre-reset* group, not whatever `hex::decode(convo_id)`
+    ///    happens to yield).
+    /// 3. Reset the per-conversation `RecoveryTracker` counter to 0 — this is
+    ///    a fresh start from the server, not a continuation of a client-side
+    ///    retry loop.
+    /// 4. Update `group_states[convo_id].group_id = new_group_id_hex` and
+    ///    `mark_needs_rejoin` so the next sync-loop pass routes this convo
+    ///    through `join_or_rejoin` (Welcome → ExternalCommit → bootstrap).
+    async fn persist_reset_pending_state(
+        &self,
+        convo_id: &str,
+        new_group_id_hex: &str,
+        reset_generation: i32,
+    ) -> Result<()> {
+        let notified_at_ms = chrono::Utc::now().timestamp_millis();
 
         // 1. Transition to ResetPending + persist the payload.
         {
@@ -1331,7 +1493,7 @@ where
             states.insert(
                 convo_id.to_string(),
                 ConversationState::ResetPending {
-                    new_group_id: new_group_id_hex.clone(),
+                    new_group_id: new_group_id_hex.to_string(),
                     reset_generation,
                     notified_at_ms,
                 },
@@ -1342,7 +1504,7 @@ where
             .set_conversation_state(
                 convo_id,
                 ConversationState::ResetPending {
-                    new_group_id: new_group_id_hex.clone(),
+                    new_group_id: new_group_id_hex.to_string(),
                     reset_generation,
                     notified_at_ms,
                 },
@@ -1357,12 +1519,7 @@ where
         }
         if let Err(e) = self
             .storage()
-            .mark_reset_pending(
-                convo_id,
-                &new_group_id_hex,
-                reset_generation,
-                notified_at_ms,
-            )
+            .mark_reset_pending(convo_id, new_group_id_hex, reset_generation, notified_at_ms)
             .await
         {
             tracing::warn!(
@@ -1411,12 +1568,12 @@ where
             let entry = states
                 .entry(convo_id.to_string())
                 .or_insert_with(|| GroupState {
-                    group_id: new_group_id_hex.clone(),
+                    group_id: new_group_id_hex.to_string(),
                     conversation_id: convo_id.to_string(),
                     epoch: 0,
                     members: vec![],
                 });
-            entry.group_id = new_group_id_hex.clone();
+            entry.group_id = new_group_id_hex.to_string();
             entry.epoch = 0;
             let snap = entry.clone();
             drop(states);
@@ -1540,7 +1697,10 @@ where
     ///    `conversation_states` mutex (workspace-internal surface). Storage
     ///    fallback closes the gap without forcing every platform to migrate
     ///    to `record_group_reset` simultaneously.
-    pub(crate) async fn reset_pending_payload(&self, convo_id: &str) -> Option<ResetPendingPayload> {
+    pub(crate) async fn reset_pending_payload(
+        &self,
+        convo_id: &str,
+    ) -> Option<ResetPendingPayload> {
         {
             let states = self.conversation_states().lock().await;
             if let Some(ConversationState::ResetPending {
