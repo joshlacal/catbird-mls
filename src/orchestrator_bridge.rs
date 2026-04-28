@@ -1912,6 +1912,73 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Persist a Phase 2.5 `resetRequestedEvent` from the DS — the indirect-
+    /// trigger SSE event where the server has NOT minted a new MLS group id
+    /// and is asking subscribed clients to elect a first responder
+    /// (`docs/plans/phase-2-5-indirect-funneling.md` §3, §5 Stage 1).
+    ///
+    /// Same deferred-recovery contract as `record_group_reset`: this writes
+    /// `RESET_PENDING` state + payload, deletes the old local MLS group,
+    /// clears recovery counters, and flips `needs_rejoin` so the next
+    /// `MLSOrchestrator::sync_with_server` cycle drives `join_or_rejoin`,
+    /// which already includes the first-responder bootstrap branch
+    /// (`recovery.rs:1173-1215`). NO inline External Commit — preserves the
+    /// "no External Commits in event handlers" invariant that orchestrator-
+    /// using clients (catmos, BIRDaemon, WASM) rely on to avoid the
+    /// epoch-inflation class of bug observed in March 2026.
+    ///
+    /// - `convo_id`: stable conversation id.
+    /// - `crypto_session_id`: prior session id, now in `reset_requested`
+    ///   server-side (lexicon `cryptoSessionId`).
+    /// - `reset_generation`: monotonic per conversation (lexicon `generation`,
+    ///   `i32` here to match the existing `reset_generation` field).
+    /// - `trigger`: `quorumVote | systemSweep | inlineCommit409 |
+    ///   inlineGroupInfo404 | adminRequest` (lexicon-owned set; logged here).
+    /// - `request_event_id`: deterministic dedup key from the server (plan
+    ///   §3 idempotency scheme).
+    /// - `expected_new_mls_group_id_hex`: usually `None` (indirect triggers
+    ///   never mint client-visible material per Phase 2.5 §1 locked decision);
+    ///   admin path may pass `Some(hex_id)`. When `None`, this function mints
+    ///   a fresh local UUIDv4-style 32-hex-char id for the client's race-
+    ///   bootstrap candidate; the server's `crypto_sessions UNIQUE
+    ///   (conversation_id, generation)` chokepoint constraint serializes the
+    ///   winner, race losers see HTTP 409 `AlreadyBootstrapped` and drop
+    ///   their pre-bootstrap MLS group cleanly.
+    ///
+    /// Idempotency: if the conversation is already `RESET_PENDING` at the
+    /// same `reset_generation`, the call is a no-op (logged at INFO with the
+    /// `request_event_id` for audit).
+    pub fn record_reset_requested(
+        &self,
+        convo_id: String,
+        crypto_session_id: String,
+        reset_generation: i32,
+        trigger: String,
+        request_event_id: String,
+        expected_new_mls_group_id_hex: Option<String>,
+    ) -> Result<(), OrchestratorBridgeError> {
+        // Validate hex up-front when present so a malformed id surfaces as
+        // `InvalidInput` rather than silently round-tripping into storage.
+        if let Some(ref hex_id) = expected_new_mls_group_id_hex {
+            if !hex_id.is_empty() {
+                if let Err(e) = hex::decode(hex_id) {
+                    return Err(OrchestratorBridgeError::InvalidInput {
+                        message: format!("expected_new_mls_group_id_hex is not valid hex: {e}"),
+                    });
+                }
+            }
+        }
+        crate::async_runtime::block_on(self.inner.record_reset_requested(
+            &convo_id,
+            &crypto_session_id,
+            reset_generation,
+            &trigger,
+            &request_event_id,
+            expected_new_mls_group_id_hex,
+        ))?;
+        Ok(())
+    }
+
     /// Return the RFC 9420 §8.7 `epoch_authenticator` for a group's current
     /// epoch.
     ///

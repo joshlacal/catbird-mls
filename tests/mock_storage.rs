@@ -29,6 +29,14 @@ struct ConversationRecord {
     view: ConversationView,
 }
 
+/// Persisted RESET_PENDING payload as `mark_reset_pending` would write it.
+#[derive(Debug, Clone)]
+pub struct PersistedResetPending {
+    pub new_group_id_hex: String,
+    pub reset_generation: i32,
+    pub notified_at_ms: i64,
+}
+
 /// Shared inner state behind `Arc<Mutex<...>>`.
 #[derive(Debug, Default)]
 struct Inner {
@@ -44,6 +52,12 @@ struct Inner {
     state_transitions: HashMap<String, Vec<StateTransition>>,
     /// Pending message IDs for self-echo dedup (survives simulated restart)
     pending_messages: std::collections::HashSet<String>,
+    /// conversation_id -> persisted RESET_PENDING payload (mirrors real
+    /// platform storage's `mark_reset_pending`/`clear_reset_pending` columns).
+    reset_pending: HashMap<String, PersistedResetPending>,
+    /// Number of times `mark_reset_pending` has been called per conversation.
+    /// Used by idempotency tests to assert duplicate calls collapse.
+    mark_reset_pending_calls: HashMap<String, u32>,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -147,6 +161,36 @@ impl MockStorage {
             .values()
             .map(|v| v.len())
             .sum()
+    }
+
+    /// Returns the persisted RESET_PENDING payload for a conversation, if
+    /// any. Mirrors what a real platform storage backend would round-trip
+    /// through its `mark_reset_pending`/`get_conversation_state` columns.
+    #[allow(dead_code)]
+    pub fn get_persisted_reset_pending(
+        &self,
+        conversation_id: &str,
+    ) -> Option<PersistedResetPending> {
+        self.inner
+            .lock()
+            .unwrap()
+            .reset_pending
+            .get(conversation_id)
+            .cloned()
+    }
+
+    /// Returns the number of times `mark_reset_pending` has been invoked for
+    /// a conversation. Used by idempotency tests to assert duplicate calls
+    /// to `record_reset_requested` collapse rather than re-persist.
+    #[allow(dead_code)]
+    pub fn mark_reset_pending_call_count(&self, conversation_id: &str) -> u32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .mark_reset_pending_calls
+            .get(conversation_id)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -285,6 +329,66 @@ impl MLSStorageBackend for MockStorage {
             record.needs_rejoin = false;
         }
         Ok(())
+    }
+
+    // ── Reset-pending payload (overrides default no-ops) ─────────────────
+    //
+    // Real platform storage backends (iOS GRDB, catmos SQLite) persist these
+    // payload columns so a `groupResetEvent` or Phase 2.5 `resetRequestedEvent`
+    // observed before orchestrator restart still drives recovery on resume
+    // (see `storage.rs` doc on `mark_reset_pending`). The mock has to do the
+    // same, otherwise the simulated-restart test silently passes against
+    // empty state.
+
+    async fn mark_reset_pending(
+        &self,
+        conversation_id: &str,
+        new_group_id_hex: &str,
+        reset_generation: i32,
+        notified_at_ms: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reset_pending.insert(
+            conversation_id.to_string(),
+            PersistedResetPending {
+                new_group_id_hex: new_group_id_hex.to_string(),
+                reset_generation,
+                notified_at_ms,
+            },
+        );
+        *inner
+            .mark_reset_pending_calls
+            .entry(conversation_id.to_string())
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
+    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.reset_pending.remove(conversation_id);
+        Ok(())
+    }
+
+    async fn get_conversation_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationState>> {
+        let inner = self.inner.lock().unwrap();
+        // Prefer the explicit reset_pending row when present so the rehydrated
+        // state carries the payload regardless of whether
+        // `set_conversation_state` was also called (matches the iOS/GRDB
+        // backend, which reconstructs the enum from per-column data).
+        if let Some(payload) = inner.reset_pending.get(conversation_id) {
+            return Ok(Some(ConversationState::ResetPending {
+                new_group_id: payload.new_group_id_hex.clone(),
+                reset_generation: payload.reset_generation,
+                notified_at_ms: payload.notified_at_ms,
+            }));
+        }
+        Ok(inner
+            .conversations
+            .get(conversation_id)
+            .map(|c| c.state.clone()))
     }
 
     // ── Messages ─────────────────────────────────────────────────────────
