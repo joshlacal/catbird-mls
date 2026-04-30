@@ -3564,6 +3564,11 @@ impl MLSContext {
     }
 
     /// Update group metadata. Returns commit bytes to send to server.
+    ///
+    /// DEPRECATED — produces a no-op for plaintext under the metadata cutover
+    /// (Phase A removed the 0xff00 write). New callers should use
+    /// `update_group_metadata_encrypted` which atomically returns the
+    /// encrypted blob, locator, version, and final MetadataReference.
     pub fn update_group_metadata(
         &self,
         group_id: Vec<u8>,
@@ -3571,7 +3576,7 @@ impl MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         self.check_suspended()?;
         crate::info_log!(
-            "[MLS-FFI] update_group_metadata: {}",
+            "[MLS-FFI] update_group_metadata (deprecated, no-op for plaintext): {}",
             hex::encode(&group_id)
         );
 
@@ -3595,6 +3600,68 @@ impl MLSContext {
         inner.maybe_truncate_checkpoint();
 
         Ok(commit_bytes)
+    }
+
+    /// Atomic encrypted metadata update (Phase A.2).
+    ///
+    /// Stages the GroupContextExtensions commit + derives the post-commit
+    /// metadata key from the staged commit's exporter + encrypts a fresh
+    /// `GroupMetadataV1` payload, all in one call. Returns everything the
+    /// caller needs to upload + send + merge:
+    /// - `commit_bytes` → send to DS via `commitGroupChange`/`updateConvo`
+    /// - `metadata_blob_ciphertext` → upload via `putGroupMetadataBlob` with
+    ///   `metadata_blob_locator` and `metadata_version`
+    /// - `metadata_reference_json` → cache locally (final reference, real hash)
+    ///
+    /// After server ACK, caller invokes `merge_pending_commit(group_id)` to
+    /// apply the commit locally; joiners on the new epoch read the
+    /// MetadataReference from AppDataDictionary 0x8001 and bootstrap the
+    /// blob via `getGroupMetadataBlob`.
+    pub fn update_group_metadata_encrypted(
+        &self,
+        group_id: Vec<u8>,
+        title: Option<String>,
+        description: Option<String>,
+        avatar_blob_locator: Option<String>,
+        avatar_content_type: Option<String>,
+    ) -> Result<UpdateGroupMetadataResultFfi, MLSError> {
+        self.check_suspended()?;
+        crate::info_log!(
+            "[MLS-FFI] update_group_metadata_encrypted: {}",
+            hex::encode(&group_id)
+        );
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let result = inner.update_group_metadata_encrypted(
+            &group_id,
+            title,
+            description,
+            avatar_blob_locator,
+            avatar_content_type,
+        )?;
+
+        self.check_suspended()?;
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] Failed to flush after encrypted metadata update: {:?}",
+                e
+            );
+            e
+        })?;
+        inner.maybe_truncate_checkpoint();
+
+        Ok(UpdateGroupMetadataResultFfi {
+            commit_bytes: result.commit_bytes,
+            metadata_blob_ciphertext: result.metadata_blob_ciphertext,
+            metadata_reference_json: result.metadata_reference_json,
+            metadata_version: result.metadata_version,
+            metadata_blob_locator: result.metadata_blob_locator,
+        })
     }
 
     /// Get the tree hash for a group at its current epoch

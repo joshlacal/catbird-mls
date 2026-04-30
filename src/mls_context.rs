@@ -31,6 +31,31 @@ pub(crate) struct CreateGroupInternalResult {
     /// UUIDv4 blob locator for the encrypted metadata blob.
     pub metadata_blob_locator: Option<String>,
 }
+
+/// Atomic result from `MLSContext::update_group_metadata_encrypted`. Caller:
+///   1. Sends `commit_bytes` to the DS (server processes the commit, advancing the group epoch).
+///   2. Uploads `metadata_blob_ciphertext` via `putGroupMetadataBlob` with `metadata_blob_locator`.
+///   3. Calls `merge_pending_commit(group_id)` after server ACK to apply locally.
+///   4. Stores `metadata_reference_json` (the FINAL reference, with real ciphertext hash) in
+///      its local conversation cache.
+///
+/// The MetadataReference embedded in the commit itself carries a placeholder ciphertext hash
+/// (the hash must be known at commit-staging time, but the ciphertext doesn't exist until after
+/// staging — the staged commit's exporter is what derives the encryption key). AEAD provides
+/// integrity on the blob; the reference's hash field is informational.
+#[derive(Debug, Clone)]
+pub struct UpdateGroupMetadataResult {
+    /// TLS-serialized commit message to send to the DS.
+    pub commit_bytes: Vec<u8>,
+    /// Encrypted `GroupMetadataV1` blob (`nonce || ciphertext || tag`).
+    pub metadata_blob_ciphertext: Vec<u8>,
+    /// JSON-serialized `MetadataReference` (with real ciphertext hash) for the caller's local cache.
+    pub metadata_reference_json: Vec<u8>,
+    /// Monotonic counter (per conversation) for this metadata revision.
+    pub metadata_version: u64,
+    /// UUIDv4 locator the caller uses with `putGroupMetadataBlob`.
+    pub metadata_blob_locator: String,
+}
 use sha2::{Digest, Sha256};
 
 // Plaintext 0xff00 extension is retired (MLS metadata cutover).
@@ -2728,6 +2753,213 @@ impl MLSContext {
             );
 
             Ok(commit_bytes)
+        })
+    }
+
+    /// Atomic encrypted metadata update (Phase A.2).
+    ///
+    /// Stages a GroupContextExtensions commit that updates the
+    /// `MetadataReference` in AppDataDictionary 0x8001, derives the
+    /// post-commit metadata key from the staged commit's exporter, and
+    /// encrypts a fresh `GroupMetadataV1` payload. Returns everything
+    /// the caller needs: the commit bytes, the encrypted blob, the
+    /// blob locator, the new metadata version, and the final
+    /// MetadataReference JSON (with the real ciphertext hash) for the
+    /// caller's local cache.
+    ///
+    /// Caller orchestration:
+    ///   1. Send `commit_bytes` to the DS.
+    ///   2. Upload `metadata_blob_ciphertext` via `putGroupMetadataBlob`
+    ///      with `metadata_blob_locator`.
+    ///   3. After server ACK, call `merge_pending_commit(group_id)` to
+    ///      apply the commit locally.
+    ///   4. Store `metadata_reference_json` in the conversation cache.
+    ///
+    /// Empty `title` and `description` are encoded as empty strings in
+    /// the encrypted payload (callers can treat empty as "unset").
+    pub fn update_group_metadata_encrypted(
+        &mut self,
+        group_id: &[u8],
+        title: Option<String>,
+        description: Option<String>,
+        avatar_blob_locator: Option<String>,
+        avatar_content_type: Option<String>,
+    ) -> Result<UpdateGroupMetadataResult, MLSError> {
+        let gid = GroupId::from_slice(group_id);
+
+        self.with_group(&gid, |group, provider, signer| {
+            // 1. Compute next metadata version + fresh blob locator.
+            let current_ref = metadata::current_metadata_reference(group);
+            let had_metadata = current_ref.is_some();
+            let next_version = metadata::next_metadata_version(
+                current_ref.as_ref(),
+                had_metadata,
+                true,
+            )
+            .unwrap_or(1);
+            let new_locator = Uuid::new_v4().to_string().to_lowercase();
+
+            // 2. Build placeholder MetadataReference (empty ciphertext_hash).
+            //    The hash is filled in for the *caller's local* reference but
+            //    NOT the one embedded in the commit — see fn doc above.
+            let placeholder_ref = metadata::build_metadata_reference(
+                next_version,
+                &new_locator,
+                &[],
+            );
+            let placeholder_ref_json = serde_json::to_vec(&placeholder_ref).map_err(|e| {
+                MLSError::Internal(format!("serialize placeholder reference: {:?}", e))
+            })?;
+
+            // 3. Build the GroupContextExtensions update (drop legacy 0xff00 from
+            //    RequiredCapabilities, ensure AppData/RatchetTree are listed).
+            let mut extensions = group.extensions().clone();
+            let existing_rc = extensions.required_capabilities().cloned();
+            let mut ext_types: Vec<ExtensionType> = existing_rc
+                .as_ref()
+                .map(|rc| {
+                    rc.extension_types()
+                        .iter()
+                        .copied()
+                        .filter(|t| {
+                            !matches!(t, ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !ext_types.contains(&ExtensionType::AppDataDictionary) {
+                ext_types.push(ExtensionType::AppDataDictionary);
+            }
+            if !ext_types.contains(&ExtensionType::RatchetTree) {
+                ext_types.push(ExtensionType::RatchetTree);
+            }
+            let mut proposal_types = existing_rc
+                .as_ref()
+                .map(|rc| rc.proposal_types().to_vec())
+                .unwrap_or_default();
+            if !proposal_types.contains(&ProposalType::AppDataUpdate) {
+                proposal_types.push(ProposalType::AppDataUpdate);
+            }
+            let credential_types = existing_rc
+                .as_ref()
+                .map(|rc| rc.credential_types().to_vec())
+                .unwrap_or_default();
+            extensions
+                .add_or_replace(Extension::RequiredCapabilities(
+                    RequiredCapabilitiesExtension::new(
+                        &ext_types,
+                        &proposal_types,
+                        &credential_types,
+                    ),
+                ))
+                .map_err(|e| {
+                    MLSError::Internal(format!(
+                        "Failed to add required capabilities: {:?}",
+                        e
+                    ))
+                })?;
+            if extensions.unknown(CATBIRD_METADATA_EXTENSION_TYPE).is_some() {
+                let _ = extensions.add_or_replace(Extension::Unknown(
+                    CATBIRD_METADATA_EXTENSION_TYPE,
+                    UnknownExtension(Vec::new()),
+                ));
+            }
+
+            // 4. Stage the commit with the placeholder reference.
+            let commit_builder = group
+                .commit_builder()
+                .propose_group_context_extensions(extensions)
+                .map_err(|e| {
+                    MLSError::OpenMLS(format!("propose_group_context_extensions: {:?}", e))
+                })?
+                .add_proposal(Proposal::AppDataUpdate(Box::new(
+                    AppDataUpdateProposal::update(
+                        metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        placeholder_ref_json.clone(),
+                    ),
+                )));
+
+            let mut commit_stage = commit_builder
+                .load_psks(provider.storage())
+                .map_err(|e| MLSError::OpenMLS(format!("load_psks: {:?}", e)))?;
+
+            let mut updater = commit_stage.app_data_dictionary_updater();
+            updater.set(ComponentData::from_parts(
+                metadata::METADATA_REFERENCE_COMPONENT_ID,
+                placeholder_ref_json.into(),
+            ));
+            commit_stage.with_app_data_dictionary_updates(updater.changes());
+
+            let commit_bundle = commit_stage
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
+                .map_err(|e| MLSError::OpenMLS(format!("build commit: {:?}", e)))?
+                .stage_commit(provider)
+                .map_err(|e| MLSError::OpenMLS(format!("stage commit: {:?}", e)))?;
+
+            let (commit_msg, _welcome, _group_info) = commit_bundle.into_contents();
+            let commit_bytes = TlsSerialize::tls_serialize_detached(&commit_msg)
+                .map_err(|_| MLSError::SerializationError)?;
+
+            // 5. Derive the post-commit metadata key from the now-pending staged commit.
+            let next_epoch = group.epoch().as_u64() + 1;
+            let pending = group.pending_commit().ok_or_else(|| {
+                MLSError::Internal(
+                    "no pending commit after stage_commit — internal invariant violated".into(),
+                )
+            })?;
+            let metadata_key = metadata::derive_metadata_key(
+                pending,
+                provider.crypto(),
+                group_id,
+                next_epoch,
+            )
+            .map_err(|e| MLSError::Internal(format!("derive metadata key: {:?}", e)))?;
+
+            // 6. Build payload + encrypt.
+            let payload = metadata::GroupMetadataV1 {
+                version: 1,
+                title: title.unwrap_or_default(),
+                description: description.unwrap_or_default(),
+                avatar_blob_locator,
+                avatar_content_type,
+            };
+            let ciphertext = metadata::encrypt_metadata_blob(
+                &metadata_key,
+                group_id,
+                next_epoch,
+                next_version,
+                &payload,
+            )
+            .map_err(|e| MLSError::Internal(format!("encrypt metadata: {:?}", e)))?;
+
+            // 7. Build the FINAL reference (with real ciphertext hash) for the
+            //    caller's local cache. The reference embedded in the commit
+            //    keeps the placeholder hash; the ciphertext hash is
+            //    informational on the wire (AEAD authenticates the payload).
+            let real_hash = metadata::hash_ciphertext(&ciphertext);
+            let final_ref = metadata::build_metadata_reference(
+                next_version,
+                &new_locator,
+                &real_hash,
+            );
+            let final_ref_json = serde_json::to_vec(&final_ref).map_err(|e| {
+                MLSError::Internal(format!("serialize final reference: {:?}", e))
+            })?;
+
+            crate::info_log!(
+                "[MLS-CONTEXT] update_group_metadata_encrypted committed (epoch→{}, version={}, locator={})",
+                next_epoch,
+                next_version,
+                new_locator
+            );
+
+            Ok(UpdateGroupMetadataResult {
+                commit_bytes,
+                metadata_blob_ciphertext: ciphertext,
+                metadata_reference_json: final_ref_json,
+                metadata_version: next_version,
+                metadata_blob_locator: new_locator,
+            })
         })
     }
 

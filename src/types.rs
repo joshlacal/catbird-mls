@@ -26,6 +26,31 @@ pub struct AddMembersResult {
     pub welcome_data: Vec<u8>,
 }
 
+/// FFI surface for `MLSContext::update_group_metadata_encrypted` (Phase A.2).
+///
+/// All five fields are mandatory. The caller must:
+///   1. Send `commit_bytes` to the DS (e.g. via `commitGroupChange`).
+///   2. Upload `metadata_blob_ciphertext` via `putGroupMetadataBlob` with
+///      `metadata_blob_locator` and `metadata_version` query params.
+///   3. After server ACK, call `merge_pending_commit(group_id)` to apply
+///      the commit locally.
+///   4. Cache `metadata_reference_json` (the FINAL reference with real hash)
+///      in the local conversation row.
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct UpdateGroupMetadataResultFfi {
+    /// TLS-serialized commit message to send to the DS.
+    pub commit_bytes: Vec<u8>,
+    /// Encrypted `GroupMetadataV1` blob (`nonce || ciphertext || tag`).
+    pub metadata_blob_ciphertext: Vec<u8>,
+    /// JSON-serialized `MetadataReference` (with real ciphertext hash) for local cache.
+    pub metadata_reference_json: Vec<u8>,
+    /// Monotonic counter (per conversation) for this metadata revision.
+    pub metadata_version: u64,
+    /// UUIDv4 locator the caller uses with `putGroupMetadataBlob`.
+    pub metadata_blob_locator: String,
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct EncryptResult {
     pub ciphertext: Vec<u8>,
