@@ -301,4 +301,40 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
             "process_external_commit not implemented".into(),
         ))
     }
+
+    /// Upload an encrypted metadata blob to the DS via
+    /// `blue.catbird.mlsChat.putGroupMetadataBlob`.
+    ///
+    /// `kind` is `"metadata"` or `"avatar"`. `metadata_version` is the
+    /// monotonic counter from the corresponding `MetadataReference`.
+    /// `reset_generation` (if known) scopes the blob to the current
+    /// MLS group generation so post-reset bootstrapping clients can
+    /// find the correct blob via `getGroupMetadataBlob?convoId&resetGeneration`.
+    ///
+    /// Default implementation fails so any backend that hasn't wired the
+    /// encrypted metadata path surfaces the missing impl instead of
+    /// silently dropping the blob.
+    async fn put_group_metadata_blob(
+        &self,
+        convo_id: &str,
+        group_id_hex: &str,
+        blob_locator: &str,
+        ciphertext: &[u8],
+        kind: &str,
+        metadata_version: u64,
+        reset_generation: Option<i32>,
+    ) -> Result<()> {
+        let _ = (
+            convo_id,
+            group_id_hex,
+            blob_locator,
+            ciphertext,
+            kind,
+            metadata_version,
+            reset_generation,
+        );
+        Err(crate::orchestrator::error::OrchestratorError::Api(
+            "put_group_metadata_blob not implemented".into(),
+        ))
+    }
 }

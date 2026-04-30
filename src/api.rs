@@ -5903,6 +5903,23 @@ impl MlsCryptoContext for MLSContext {
         self.update_group_metadata(group_id, metadata_json)
     }
 
+    fn update_group_metadata_encrypted(
+        &self,
+        group_id: Vec<u8>,
+        title: Option<String>,
+        description: Option<String>,
+        avatar_blob_locator: Option<String>,
+        avatar_content_type: Option<String>,
+    ) -> Result<UpdateGroupMetadataResultFfi, MLSError> {
+        self.update_group_metadata_encrypted(
+            group_id,
+            title,
+            description,
+            avatar_blob_locator,
+            avatar_content_type,
+        )
+    }
+
     fn process_welcome(
         &self,
         welcome_data: Vec<u8>,

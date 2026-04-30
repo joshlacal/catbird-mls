@@ -174,6 +174,37 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         metadata_json: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError>;
 
+    /// Atomic encrypted metadata update (Phase A.2).
+    ///
+    /// Stages a GroupContextExtensions commit, derives the post-commit
+    /// metadata key from the staged commit's exporter, and encrypts a
+    /// fresh `GroupMetadataV1` payload. Returns the commit bytes, the
+    /// encrypted blob, the blob locator, the new metadata version, and
+    /// the FINAL `MetadataReference` JSON for the caller's local cache.
+    ///
+    /// Default impl returns `Err(NotImplemented)` so any backend that
+    /// hasn't wired the encrypted path surfaces the missing impl.
+    fn update_group_metadata_encrypted(
+        &self,
+        group_id: Vec<u8>,
+        title: Option<String>,
+        description: Option<String>,
+        avatar_blob_locator: Option<String>,
+        avatar_content_type: Option<String>,
+    ) -> Result<crate::types::UpdateGroupMetadataResultFfi, MLSError> {
+        let _ = (
+            group_id,
+            title,
+            description,
+            avatar_blob_locator,
+            avatar_content_type,
+        );
+        Err(MLSError::Internal(
+            "MlsCryptoContext::update_group_metadata_encrypted is not implemented for this backend"
+                .into(),
+        ))
+    }
+
     fn process_welcome(
         &self,
         welcome_data: Vec<u8>,

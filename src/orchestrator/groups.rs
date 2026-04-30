@@ -729,6 +729,12 @@ where
     /// `confirm_commit` / `discard_pending` API added in task #44.
     /// Proposes a GroupContextExtensions commit, sends it to the server,
     /// then confirms the pending commit locally to advance the epoch.
+    ///
+    /// DEPRECATED — under the metadata cutover this no longer writes any
+    /// plaintext metadata to the MLS group context, and does NOT upload an
+    /// encrypted blob either. Callers who want a rename to actually
+    /// propagate to other clients must use
+    /// [`Self::update_group_metadata_encrypted`].
     pub async fn update_group_metadata(
         &self,
         conversation_id: &str,
@@ -748,6 +754,13 @@ where
         let metadata_json = metadata
             .to_extension_bytes()
             .map_err(|e| OrchestratorError::Serialization(format!("Metadata serialize: {}", e)))?;
+
+        tracing::warn!(
+            conversation_id,
+            "[orchestrator] update_group_metadata is DEPRECATED post metadata cutover; \
+             no encrypted blob will be uploaded — rename will NOT propagate. \
+             Migrate caller to update_group_metadata_encrypted."
+        );
 
         let plan = self
             .stage_commit(
@@ -784,6 +797,95 @@ where
                 Err(e)
             }
         }
+    }
+
+    /// Atomic encrypted metadata update (Phase A.2).
+    ///
+    /// Uses [`MlsCryptoContext::update_group_metadata_encrypted`] — staged
+    /// commit + post-commit-epoch key derivation + ChaCha20-Poly1305
+    /// encryption all in one shot — then uploads the encrypted blob via
+    /// [`MLSAPIClient::put_group_metadata_blob`] and the commit via
+    /// [`MLSAPIClient::commit_group_change`], finally merging the pending
+    /// commit locally to advance the epoch.
+    ///
+    /// On any error, the pending commit is discarded so the local group
+    /// state stays at the pre-update epoch.
+    pub async fn update_group_metadata_encrypted(
+        &self,
+        conversation_id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        avatar_blob_locator: Option<&str>,
+        avatar_content_type: Option<&str>,
+    ) -> Result<()> {
+        self.check_shutdown().await?;
+
+        let group_id_hex = self
+            .group_id_hex_for_conversation(conversation_id)
+            .await
+            .unwrap_or_else(|| conversation_id.to_string());
+        let group_id_bytes = hex::decode(&group_id_hex).map_err(|_| {
+            OrchestratorError::InvalidInput("Invalid hex group ID for metadata update".into())
+        })?;
+
+        // 1. Stage commit + encrypt + assemble artifacts in one FFI call.
+        let result = self.mls_context().update_group_metadata_encrypted(
+            group_id_bytes.clone(),
+            title.map(|s| s.to_string()),
+            description.map(|s| s.to_string()),
+            avatar_blob_locator.map(|s| s.to_string()),
+            avatar_content_type.map(|s| s.to_string()),
+        )?;
+
+        // 2. Upload the encrypted blob first; if this fails we must discard the
+        //    pending commit so the local epoch doesn't advance into a state
+        //    other clients can't reach (no blob → can't decrypt metadata).
+        if let Err(e) = self
+            .api_client()
+            .put_group_metadata_blob(
+                conversation_id,
+                &group_id_hex,
+                &result.metadata_blob_locator,
+                &result.metadata_blob_ciphertext,
+                "metadata",
+                result.metadata_version,
+                None,
+            )
+            .await
+        {
+            let _ = self.mls_context().clear_pending_commit(group_id_bytes);
+            return Err(e);
+        }
+
+        // 3. Submit the commit. Same discard logic on failure.
+        if let Err(e) = self
+            .api_client()
+            .commit_group_change(
+                conversation_id,
+                &result.commit_bytes,
+                "updateMetadata",
+                None,
+            )
+            .await
+        {
+            let _ = self.mls_context().clear_pending_commit(group_id_bytes);
+            return Err(e);
+        }
+
+        // 4. Merge locally (advances epoch and applies the new
+        //    MetadataReference in AppDataDictionary).
+        let merge_epoch = self
+            .mls_context()
+            .merge_pending_commit(group_id_bytes)?;
+
+        tracing::info!(
+            conversation_id,
+            new_epoch = merge_epoch,
+            metadata_version = result.metadata_version,
+            blob_locator = %result.metadata_blob_locator,
+            "Group metadata updated (encrypted)"
+        );
+        Ok(())
     }
 
     /// Read decrypted group metadata from MLS group context.
