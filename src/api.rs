@@ -916,7 +916,7 @@ impl MLSContext {
 
             let planned_reference_json = crate::metadata::planned_metadata_reference_json(
                 crate::metadata::current_metadata_reference(group).as_ref(),
-                crate::metadata::metadata_payload_from_group(group).is_some(),
+                false /* post-Phase-A: legacy 0xff00 path retired */,
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
@@ -1190,7 +1190,7 @@ impl MLSContext {
 
             let planned_ref = crate::metadata::planned_metadata_reference_json(
                 crate::metadata::current_metadata_reference(group).as_ref(),
-                crate::metadata::metadata_payload_from_group(group).is_some(),
+                false /* post-Phase-A: legacy 0xff00 path retired */,
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata ref: {:?}", e)))?;
@@ -1422,7 +1422,7 @@ impl MLSContext {
                 inner_ctx.with_group(&gid, |group, provider, signer| {
                     let planned_reference_json = crate::metadata::planned_metadata_reference_json(
                         crate::metadata::current_metadata_reference(group).as_ref(),
-                        crate::metadata::metadata_payload_from_group(group).is_some(),
+                        false /* post-Phase-A: legacy 0xff00 path retired */,
                         false,
                     )
                     .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
@@ -1588,7 +1588,7 @@ impl MLSContext {
 
             let planned_reference_json = crate::metadata::planned_metadata_reference_json(
                 crate::metadata::current_metadata_reference(group).as_ref(),
-                crate::metadata::metadata_payload_from_group(group).is_some(),
+                false /* post-Phase-A: legacy 0xff00 path retired */,
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
@@ -2991,7 +2991,7 @@ impl MLSContext {
             .extensions(vec![
                 ExtensionType::RatchetTree,
                 ExtensionType::AppDataDictionary,
-                ExtensionType::Unknown(crate::group_metadata::CATBIRD_METADATA_EXTENSION_TYPE),
+                ExtensionType::Unknown(crate::metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE),
             ])
             .proposals(vec![ProposalType::AppDataUpdate])
             .build();
@@ -3544,31 +3544,16 @@ impl MLSContext {
         })
     }
 
-    /// Read encrypted group metadata from MLS group context.
-    /// Returns JSON bytes of the metadata, or empty vec if none set.
-    pub fn get_group_metadata(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
-        crate::info_log!("[MLS-FFI] get_group_metadata: {}", hex::encode(&group_id));
-
-        let guard = self
-            .inner
-            .lock()
-            .map_err(|_| MLSError::ContextNotInitialized)?;
-        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
-
-        match inner.get_group_metadata(&group_id)? {
-            Some(meta) => meta
-                .to_extension_bytes()
-                .map_err(|e| MLSError::Internal(format!("JSON serialize: {}", e))),
-            None => Ok(Vec::new()),
-        }
-    }
-
     /// Update group metadata. Returns commit bytes to send to server.
     ///
-    /// DEPRECATED — produces a no-op for plaintext under the metadata cutover
-    /// (Phase A removed the 0xff00 write). New callers should use
-    /// `update_group_metadata_encrypted` which atomically returns the
-    /// encrypted blob, locator, version, and final MetadataReference.
+    /// Used by the orchestrator's `CommitKind::UpdateMetadata` stage_commit
+    /// dispatch (iOS three-phase rename path). The `metadata_json` is the
+    /// legacy `GroupMetadataPayload` shape; its contents are NOT written
+    /// into the MLS group context (Phase A retired 0xff00). The caller
+    /// re-encrypts the metadata blob post-merge using the new epoch's
+    /// metadata key (iOS `reWrapMetadataAfterMerge`). Direct callers
+    /// wanting an atomic encrypted update should use
+    /// `update_group_metadata_encrypted` (Phase A.2).
     pub fn update_group_metadata(
         &self,
         group_id: Vec<u8>,
@@ -3576,13 +3561,9 @@ impl MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         self.check_suspended()?;
         crate::info_log!(
-            "[MLS-FFI] update_group_metadata (deprecated, no-op for plaintext): {}",
+            "[MLS-FFI] update_group_metadata (legacy stage_commit dispatch): {}",
             hex::encode(&group_id)
         );
-
-        let metadata =
-            crate::group_metadata::GroupMetadata::from_extension_bytes(&metadata_json)
-                .map_err(|e| MLSError::invalid_input(format!("Invalid metadata JSON: {}", e)))?;
 
         let mut guard = self
             .inner
@@ -3590,7 +3571,7 @@ impl MLSContext {
             .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
 
-        let commit_bytes = inner.update_group_metadata(&group_id, metadata)?;
+        let commit_bytes = inner.update_group_metadata(&group_id, metadata_json)?;
 
         self.check_suspended()?;
         inner.flush_database().map_err(|e| {
@@ -4206,7 +4187,7 @@ impl MLSContext {
 
             let planned_reference_json = crate::metadata::planned_metadata_reference_json(
                 crate::metadata::current_metadata_reference(group).as_ref(),
-                crate::metadata::metadata_payload_from_group(group).is_some(),
+                false /* post-Phase-A: legacy 0xff00 path retired */,
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
@@ -5889,10 +5870,6 @@ impl MlsCryptoContext for MLSContext {
 
     fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
         self.delete_group(group_id)
-    }
-
-    fn get_group_metadata(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
-        self.get_group_metadata(group_id)
     }
 
     fn update_group_metadata(

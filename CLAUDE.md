@@ -95,8 +95,7 @@ All source is in `src/`. Single crate, no workspace.
 | `mls_context.rs` | `MLSContext` inner impl — SQLCipher connection + `MlsGroup` HashMap. All OpenMLS calls. |
 | `epoch_storage.rs` | `EpochSecretManager` — exports/stores epoch secrets for forward secrecy |
 | `hybrid_storage.rs` | `HybridStorageProvider` — wraps `openmls_sqlite_storage` + keychain (currently unused) |
-| `group_metadata.rs` | DEPRECATED. Old plaintext 0xff00 GroupContext extension (never actually encrypted). Retained for one release as a migration helper for legacy groups; deleted in Phase F of the cutover. New code must use `metadata.rs`. |
-| `metadata.rs` | Encrypted group metadata. Per-epoch ChaCha20-Poly1305 keyed by the MLS exporter; `GroupMetadataV1` blob stored on the DS, `MetadataReference` pointer in AppDataDictionary component `0x8001`. |
+| `metadata.rs` | Encrypted group metadata. Per-epoch ChaCha20-Poly1305 keyed by the MLS exporter; `GroupMetadataV1` blob stored on the DS, `MetadataReference` pointer in AppDataDictionary component `0x8001`. The retired plaintext `0xff00` extension type ID is exported as `RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE` for the legacy-cleanup logic in `mls_context.rs` (filters it out of `RequiredCapabilities` on commits to old groups). The struct that used to wrap that extension was deleted in Phase F. |
 
 ### Client Facades
 

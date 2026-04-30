@@ -723,82 +723,6 @@ where
         Ok(())
     }
 
-    /// Update encrypted group metadata (name, description, avatar_hash).
-    ///
-    /// Backward-compatible wrapper around the three-phase `stage_commit` /
-    /// `confirm_commit` / `discard_pending` API added in task #44.
-    /// Proposes a GroupContextExtensions commit, sends it to the server,
-    /// then confirms the pending commit locally to advance the epoch.
-    ///
-    /// DEPRECATED — under the metadata cutover this no longer writes any
-    /// plaintext metadata to the MLS group context, and does NOT upload an
-    /// encrypted blob either. Callers who want a rename to actually
-    /// propagate to other clients must use
-    /// [`Self::update_group_metadata_encrypted`].
-    pub async fn update_group_metadata(
-        &self,
-        conversation_id: &str,
-        name: Option<&str>,
-        description: Option<&str>,
-        avatar_hash: Option<&str>,
-    ) -> Result<()> {
-        self.check_shutdown().await?;
-
-        let metadata = crate::group_metadata::GroupMetadata {
-            v: 1,
-            name: name.map(|s| s.to_string()),
-            description: description.map(|s| s.to_string()),
-            avatar_hash: avatar_hash.map(|s| s.to_string()),
-        };
-
-        let metadata_json = metadata
-            .to_extension_bytes()
-            .map_err(|e| OrchestratorError::Serialization(format!("Metadata serialize: {}", e)))?;
-
-        tracing::warn!(
-            conversation_id,
-            "[orchestrator] update_group_metadata is DEPRECATED post metadata cutover; \
-             no encrypted blob will be uploaded — rename will NOT propagate. \
-             Migrate caller to update_group_metadata_encrypted."
-        );
-
-        let plan = self
-            .stage_commit(
-                conversation_id,
-                CommitKind::UpdateMetadata {
-                    group_info_extension: metadata_json,
-                },
-            )
-            .await?;
-
-        // Send commit to server. `commit_group_change` is the legacy metadata
-        // path; `confirmation_tag` is None here because the pending commit
-        // hasn't been merged yet — the server extracts the tag from
-        // GroupInfo in the commit.
-        match self
-            .api_client()
-            .commit_group_change(conversation_id, &plan.commit_bytes, "updateMetadata", None)
-            .await
-        {
-            Ok(()) => {
-                let confirmed = self
-                    .confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
-                    .await?;
-
-                tracing::info!(
-                    conversation_id,
-                    epoch = confirmed.new_epoch,
-                    "Group metadata updated"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                let _ = self.discard_pending(plan.handle).await;
-                Err(e)
-            }
-        }
-    }
-
     /// Atomic encrypted metadata update (Phase A.2).
     ///
     /// Uses [`MlsCryptoContext::update_group_metadata_encrypted`] — staged
@@ -886,23 +810,6 @@ where
             "Group metadata updated (encrypted)"
         );
         Ok(())
-    }
-
-    /// Read decrypted group metadata from MLS group context.
-    pub fn get_group_metadata(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Option<crate::group_metadata::GroupMetadata>> {
-        let group_id = hex::decode(conversation_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
-
-        let meta_bytes = self.mls_context().get_group_metadata(group_id)?;
-        if meta_bytes.is_empty() {
-            return Ok(None);
-        }
-        crate::group_metadata::GroupMetadata::from_extension_bytes(&meta_bytes)
-            .map(Some)
-            .map_err(|e| OrchestratorError::Serialization(format!("Metadata deserialize: {}", e)))
     }
 
     /// Force delete a conversation from local state only.

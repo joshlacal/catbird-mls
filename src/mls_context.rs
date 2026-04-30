@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use crate::epoch_storage::EpochSecretManager;
 use crate::error::MLSError;
-use crate::group_metadata::{GroupMetadata, CATBIRD_METADATA_EXTENSION_TYPE};
 use crate::metadata;
 use openmls::component::ComponentData;
 use uuid::Uuid;
@@ -2585,35 +2584,33 @@ impl MLSContext {
         true
     }
 
-    /// Read group metadata from the MLS group context extensions (plaintext).
-    /// Encrypted metadata is now handled by the metadata module via server-side blobs.
-    pub fn get_group_metadata(&self, group_id: &[u8]) -> Result<Option<GroupMetadata>, MLSError> {
-        let gid = GroupId::from_slice(group_id);
-
-        self.with_group_ref(&gid, |group, _provider| {
-            Ok(crate::group_metadata::GroupMetadata::from_group(group))
-        })
-    }
-
-    /// Stage a metadata-update commit. After the encrypted-only cutover, this
-    /// only updates the `MetadataReference` in AppDataDictionary 0x8001 and
-    /// (defensively) prunes any stale `0xff00` plaintext extension and
-    /// `0xff00` RequiredCapabilities entry from groups created by older
-    /// builds. The `metadata` parameter is retained so existing callers
-    /// keep compiling, but its title/description are NOT written into the
-    /// MLS group context — the encrypted-blob path is authoritative. The
-    /// actual blob ciphertext + locator are produced and uploaded separately
-    /// by the platform layer.
+    /// Stage a metadata-update commit using the legacy `metadata_json` shape
+    /// expected by `CommitKind::UpdateMetadata` (orchestrator stage_commit
+    /// dispatch). The JSON is decoded for legacy compat but its contents are
+    /// NOT written into the MLS group context — Phase A retired the 0xff00
+    /// plaintext extension. This commit:
+    ///
+    ///   * advances the `MetadataReference` in AppDataDictionary 0x8001 with
+    ///     a fresh placeholder (the platform layer re-encrypts the blob
+    ///     post-merge using the new epoch's exporter — see iOS
+    ///     `reWrapMetadataAfterMerge`),
+    ///   * (defensively) filters any stale 0xff00 entry out of
+    ///     `RequiredCapabilities` and replaces a leftover 0xff00 extension
+    ///     payload with empty bytes for groups created by older builds.
+    ///
     /// Returns the commit message bytes that must be sent to the server.
+    /// Direct callers wanting the encrypted blob + locator + version + final
+    /// MetadataReference in one shot should use
+    /// [`Self::update_group_metadata_encrypted`] (Phase A.2 atomic FFI).
     pub fn update_group_metadata(
         &mut self,
         group_id: &[u8],
-        metadata: GroupMetadata,
+        metadata_json: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError> {
         let gid = GroupId::from_slice(group_id);
-        // Touch the parameter so callers compile; field contents are
-        // intentionally unused — see fn doc above.
-        let _ = (&metadata.name, &metadata.description);
+        // The legacy `GroupMetadataPayload` JSON is parsed for forward
+        // compat but its contents are intentionally unused — see fn doc.
+        let _ = metadata_json;
 
         self.with_group(&gid, |group, provider, signer| {
             // Clone existing extensions; we must preserve any not-our-business
@@ -2630,7 +2627,7 @@ impl MLSContext {
                         .iter()
                         .copied()
                         .filter(|t| {
-                            !matches!(t, ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE))
+                            !matches!(t, ExtensionType::Unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE))
                         })
                         .collect()
                 })
@@ -2677,11 +2674,11 @@ impl MLSContext {
             // on builds that ignore 0xff00, the leftover empty extension is
             // harmless dead weight.
             if extensions
-                .unknown(CATBIRD_METADATA_EXTENSION_TYPE)
+                .unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE)
                 .is_some()
             {
                 let _ = extensions.add_or_replace(Extension::Unknown(
-                    CATBIRD_METADATA_EXTENSION_TYPE,
+                    metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE,
                     UnknownExtension(Vec::new()),
                 ));
             }
@@ -2822,7 +2819,7 @@ impl MLSContext {
                         .iter()
                         .copied()
                         .filter(|t| {
-                            !matches!(t, ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE))
+                            !matches!(t, ExtensionType::Unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE))
                         })
                         .collect()
                 })
@@ -2858,9 +2855,9 @@ impl MLSContext {
                         e
                     ))
                 })?;
-            if extensions.unknown(CATBIRD_METADATA_EXTENSION_TYPE).is_some() {
+            if extensions.unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE).is_some() {
                 let _ = extensions.add_or_replace(Extension::Unknown(
-                    CATBIRD_METADATA_EXTENSION_TYPE,
+                    metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE,
                     UnknownExtension(Vec::new()),
                 ));
             }
@@ -3105,7 +3102,7 @@ impl MLSContext {
 
             let planned_reference_json = metadata::planned_metadata_reference_json(
                 metadata::current_metadata_reference(group).as_ref(),
-                metadata::metadata_payload_from_group(group).is_some(),
+                false /* post-Phase-A: legacy 0xff00 path retired */,
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;

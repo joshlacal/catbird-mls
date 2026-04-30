@@ -83,6 +83,18 @@ pub struct GroupMetadataV1 {
 const EXPORTER_LABEL: &str = "blue.catbird/group-metadata/v1";
 /// Private AppDataDictionary component ID used to store `MetadataReference`.
 pub const METADATA_REFERENCE_COMPONENT_ID: u16 = 0x8001;
+
+/// Retired plaintext GroupContext extension type ID (Phase A cutover).
+///
+/// Held only for the legacy-cleanup logic that still needs to:
+///   * filter `0xff00` out of `RequiredCapabilities` on commits to old groups
+///   * replace any leftover `0xff00` extension payload with empty bytes
+///
+/// New groups never advertise this extension type; encrypted metadata
+/// lives at `METADATA_REFERENCE_COMPONENT_ID` (0x8001) in the
+/// AppDataDictionary instead.
+pub const RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE: u16 = 0xff00;
+
 const EXPORTER_KEY_LENGTH: usize = 32;
 /// ChaCha20-Poly1305 nonce size in bytes.
 const NONCE_SIZE: usize = 12;
@@ -110,18 +122,9 @@ pub fn current_metadata_reference(group: &MlsGroup) -> Option<MetadataReference>
     serde_json::from_slice(&json).ok()
 }
 
-/// Build the plaintext metadata payload that should be re-encrypted for the
-/// next epoch, based on the current group-context metadata extension.
-pub fn metadata_payload_from_group(group: &MlsGroup) -> Option<GroupMetadataV1> {
-    let metadata = crate::group_metadata::GroupMetadata::from_group(group)?;
-    Some(GroupMetadataV1 {
-        version: 1,
-        title: metadata.name.unwrap_or_default(),
-        description: metadata.description.unwrap_or_default(),
-        avatar_blob_locator: None,
-        avatar_content_type: None,
-    })
-}
+// `metadata_payload_from_group` (legacy 0xff00 → encrypted-blob lift helper)
+// removed in Phase F. After the metadata cutover + DB wipe, no group carries
+// the retired plaintext extension; the lift was only useful during migration.
 
 /// Compute the metadata version that should be used for the next epoch.
 pub fn next_metadata_version(

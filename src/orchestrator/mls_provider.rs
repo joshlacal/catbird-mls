@@ -162,12 +162,14 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError>;
 
-    /// Read encrypted group metadata from MLS group context extensions.
-    /// Returns JSON bytes of the metadata, or empty vec if none set.
-    fn get_group_metadata(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
-
-    /// Update group metadata by proposing + committing a GroupContextExtensions change.
-    /// Returns the commit message bytes that must be sent to the server.
+    /// Update group metadata by proposing + committing a GroupContextExtensions
+    /// change. Returns the commit message bytes that must be sent to the server.
+    ///
+    /// Used by `CommitKind::UpdateMetadata` stage_commit dispatch (iOS
+    /// three-phase rename path). The `metadata_json` carries a legacy
+    /// `GroupMetadataPayload` for compat but its contents are NOT written
+    /// into the MLS group context — title / description / avatar live in
+    /// encrypted `GroupMetadataV1` blobs (see `update_group_metadata_encrypted`).
     fn update_group_metadata(
         &self,
         group_id: Vec<u8>,

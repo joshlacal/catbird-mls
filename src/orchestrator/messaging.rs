@@ -740,31 +740,14 @@ where
             self.cleanup_epoch_secrets_if_needed(&envelope.conversation_id, decrypt_result.epoch)
                 .await;
 
-            // Refresh cached metadata after commit (may contain GroupContextExtensions update)
-            match self.get_group_metadata(&envelope.conversation_id) {
-                Ok(Some(meta)) => {
-                    let mut convos = self.conversations().lock().await;
-                    if let Some(convo) = convos.get_mut(&envelope.conversation_id) {
-                        convo.metadata = Some(super::types::ConversationMetadata {
-                            name: meta.name,
-                            description: meta.description,
-                            avatar_url: None,
-                        });
-                        tracing::debug!(
-                            conversation_id = %envelope.conversation_id,
-                            "Refreshed cached metadata after commit"
-                        );
-                    }
-                }
-                Ok(None) => {} // no metadata set
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        conversation_id = %envelope.conversation_id,
-                        "Failed to read metadata after commit"
-                    );
-                }
-            }
+            // Phase F: legacy plaintext metadata refresh-after-commit removed.
+            // Under the cutover, group metadata is encrypted (see metadata.rs)
+            // and refreshed on the receive side via the platform-specific
+            // bootstrap path (catmos `bootstrap_group_metadata`, catmos-cli
+            // equivalent, iOS `MLSConversationManager+Metadata.swift`,
+            // Android `MLSGroupMetadataResolver.kt`, web
+            // `wasm_bootstrap_group_metadata`). The orchestrator no longer
+            // peeks at MLS state for plaintext metadata after commit merge.
 
             return Ok(None);
         }

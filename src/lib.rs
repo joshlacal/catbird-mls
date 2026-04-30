@@ -8,7 +8,6 @@ pub mod client_bridge;
 #[cfg(not(target_arch = "wasm32"))]
 mod epoch_storage;
 mod error;
-pub mod group_metadata;
 #[cfg(not(target_arch = "wasm32"))]
 mod hybrid_storage;
 #[cfg(not(target_arch = "wasm32"))]
