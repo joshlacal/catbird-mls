@@ -806,9 +806,13 @@ where
     /// Force delete a conversation from local state only.
     pub(crate) async fn force_delete_local(&self, convo_id: &str) {
         let user_did = self.require_user_did().await.unwrap_or_default();
+        let group_id_hex = self.group_id_hex_for_conversation(convo_id).await;
 
         // Delete MLS group from FFI
-        if let Ok(group_id_bytes) = hex::decode(convo_id) {
+        if let Some(group_id_bytes) = group_id_hex
+            .as_deref()
+            .and_then(|group_id| hex::decode(group_id).ok())
+        {
             if let Err(e) = self.mls_context().delete_group(group_id_bytes) {
                 tracing::warn!(error = %e, convo_id, "Failed to delete MLS group from FFI");
             }
@@ -823,10 +827,31 @@ where
             tracing::warn!(error = %e, convo_id, "Failed to delete from storage");
         }
         let _ = self.storage().delete_group_state(convo_id).await;
+        if let Some(group_id) = group_id_hex
+            .as_deref()
+            .filter(|group_id| *group_id != convo_id)
+        {
+            let _ = self.storage().delete_group_state(group_id).await;
+        }
 
         // Remove from caches
         self.conversations().lock().await.remove(convo_id);
-        self.group_states().lock().await.remove(convo_id);
+        if let Some(group_id) = group_id_hex
+            .as_deref()
+            .filter(|group_id| *group_id != convo_id)
+        {
+            self.conversations().lock().await.remove(group_id);
+        }
+        {
+            let mut states = self.group_states().lock().await;
+            states.remove(convo_id);
+            if let Some(group_id) = group_id_hex
+                .as_deref()
+                .filter(|group_id| *group_id != convo_id)
+            {
+                states.remove(group_id);
+            }
+        }
         self.conversation_states().lock().await.remove(convo_id);
     }
 }

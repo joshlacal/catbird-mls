@@ -755,6 +755,66 @@ async fn test_sync_rejoin_skips_when_attempt_in_flight() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Stable Conversation ID Rejoin Test", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id = convo.group_id.clone();
+    let conversation_id = format!("convo-{group_id}");
+
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&group_id, &conversation_id);
+
+    let group_id_bytes = hex::decode(&group_id).expect("invalid group id hex");
+    alice
+        .orchestrator
+        .mls_context()
+        .delete_group(group_id_bytes.clone())
+        .expect("delete_group failed");
+
+    let result = alice.orchestrator.sync_with_server(false).await;
+    assert!(result.is_ok(), "sync failed: {:?}", result.err());
+
+    assert_eq!(
+        world
+            .delivery_service()
+            .get_group_info_call_count(&conversation_id),
+        1,
+        "sync rejoin should fetch GroupInfo by stable conversation ID"
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .get_group_info_call_count(&group_id),
+        0,
+        "sync rejoin must not fetch GroupInfo by mutable MLS group ID"
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        1,
+        "External Commit should be submitted against the stable conversation ID"
+    );
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes)
+            .is_ok(),
+        "External Commit should restore local MLS state for the original group ID"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;

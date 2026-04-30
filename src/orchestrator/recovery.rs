@@ -589,8 +589,68 @@ where
             .record_failure(convo_id);
     }
 
-    fn local_group_epoch(&self, convo_id: &str) -> Option<u64> {
-        let group_id_bytes = hex::decode(convo_id).ok()?;
+    fn cached_group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
+        let states = self.group_states().try_lock().ok()?;
+        states
+            .get(convo_id)
+            .map(|gs| gs.group_id.clone())
+            .or_else(|| {
+                states
+                    .values()
+                    .find(|gs| gs.conversation_id == convo_id)
+                    .map(|gs| gs.group_id.clone())
+            })
+    }
+
+    pub(crate) async fn group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
+        {
+            let states = self.group_states().lock().await;
+            if let Some(group_id) = states.get(convo_id).map(|gs| gs.group_id.clone()) {
+                return Some(group_id);
+            }
+            if let Some(group_id) = states
+                .values()
+                .find(|gs| gs.conversation_id == convo_id)
+                .map(|gs| gs.group_id.clone())
+            {
+                return Some(group_id);
+            }
+        }
+
+        {
+            let conversations = self.conversations().lock().await;
+            if let Some(group_id) = conversations.get(convo_id).map(|c| c.group_id.clone()) {
+                return Some(group_id);
+            }
+            if let Some(group_id) = conversations
+                .values()
+                .find(|c| c.conversation_id == convo_id)
+                .map(|c| c.group_id.clone())
+            {
+                return Some(group_id);
+            }
+        }
+
+        if let Ok(user_did) = self.require_user_did().await {
+            if let Ok(Some(convo)) = self.storage().get_conversation(&user_did, convo_id).await {
+                return Some(convo.group_id);
+            }
+        }
+
+        if hex::decode(convo_id).is_ok() {
+            Some(convo_id.to_string())
+        } else {
+            None
+        }
+    }
+
+    pub(crate) async fn group_id_bytes_for_conversation(&self, convo_id: &str) -> Option<Vec<u8>> {
+        let group_id_hex = self.group_id_hex_for_conversation(convo_id).await?;
+        hex::decode(group_id_hex).ok()
+    }
+
+    async fn local_group_epoch(&self, convo_id: &str) -> Option<u64> {
+        let group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await?;
         self.mls_context().get_epoch(group_id_bytes).ok()
     }
 
@@ -604,16 +664,10 @@ where
     /// default stub, missing group, or remote-data error) so the caller can
     /// pass the original pre-A7 `None` payload.
     pub(crate) fn epoch_authenticator_hex(&self, convo_id: &str) -> Option<String> {
-        let group_id_bytes = {
-            if let Ok(states) = self.group_states().try_lock() {
-                states
-                    .get(convo_id)
-                    .and_then(|gs| hex::decode(&gs.group_id).ok())
-            } else {
-                None
-            }
-        }
-        .or_else(|| hex::decode(convo_id).ok())?;
+        let group_id_bytes = self
+            .cached_group_id_hex_for_conversation(convo_id)
+            .and_then(|group_id| hex::decode(group_id).ok())
+            .or_else(|| hex::decode(convo_id).ok())?;
 
         self.mls_context()
             .epoch_authenticator(group_id_bytes)
@@ -667,13 +721,7 @@ where
         // *old* local group rather than whatever hex::decode(convo_id)
         // happens to produce. Fall back to the convo_id bytes for never-
         // reset groups where the two are identical.
-        let old_group_id_bytes: Option<Vec<u8>> = {
-            let states = self.group_states().lock().await;
-            states
-                .get(convo_id)
-                .and_then(|gs| hex::decode(&gs.group_id).ok())
-        }
-        .or_else(|| hex::decode(convo_id).ok());
+        let old_group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await;
         if let Some(bytes) = old_group_id_bytes {
             let _ = self.mls_context().delete_group(bytes);
         }
@@ -949,6 +997,10 @@ where
     ///   - `tests/state_machine_tests.rs` (integration tests documenting
     ///     internal recovery semantics) can still exercise it
     ///
+    /// `convo_id` is the stable server conversation id. It is not the mutable
+    /// MLS group id; local MLS operations resolve the current group id from
+    /// conversation state before touching the crypto context.
+    ///
     /// Task #49 deleted the transitional `rejoin_conversation` shim on
     /// `CatbirdClient`/`WasmClient` and rewired
     /// `HighLevelSyncRecoveryContract::recover_conversation` to call
@@ -967,7 +1019,7 @@ where
             Err(_) => {
                 tracing::info!(convo_id, "Force rejoin already in-flight, waiting");
                 let _wait_guard = rejoin_lock.lock().await;
-                return if self.local_group_epoch(convo_id).is_some() {
+                return if self.local_group_epoch(convo_id).await.is_some() {
                     Ok(())
                 } else {
                     Err(OrchestratorError::RecoveryFailed(format!(
@@ -1021,6 +1073,10 @@ where
     /// 1. Try fetching Welcome message from server
     /// 2. If Welcome found → process it to join the group
     /// 3. If Welcome unavailable (404/410) → fall back to External Commit
+    ///
+    /// `convo_id` is the stable server conversation id. It is not the mutable
+    /// MLS group id; server calls and recovery gates are keyed by this stable
+    /// id, while local MLS context calls resolve the current group id first.
     pub async fn join_or_rejoin(&self, convo_id: &str) -> Result<u64> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
@@ -1030,7 +1086,7 @@ where
             Err(_) => {
                 tracing::info!(convo_id, "Join/rejoin already in-flight, waiting");
                 let _wait_guard = rejoin_lock.lock().await;
-                return self.local_group_epoch(convo_id).ok_or_else(|| {
+                return self.local_group_epoch(convo_id).await.ok_or_else(|| {
                     OrchestratorError::RecoveryFailed(format!(
                         "Concurrent join/rejoin did not restore group {convo_id}"
                     ))
@@ -1162,7 +1218,7 @@ where
         match rejoin_result {
             Ok(()) => {
                 self.clear_rejoin_failures(convo_id).await;
-                return Ok(self.local_group_epoch(convo_id).unwrap_or(0));
+                return Ok(self.local_group_epoch(convo_id).await.unwrap_or(0));
             }
             Err(err) => {
                 self.record_rejoin_failure(convo_id).await;
@@ -1531,13 +1587,7 @@ where
 
         // 2. Delete the old local MLS group. Prefer group_states lookup; fall
         // back to hex::decode(convo_id) for never-reset groups.
-        let old_group_id_bytes: Option<Vec<u8>> = {
-            let states = self.group_states().lock().await;
-            states
-                .get(convo_id)
-                .and_then(|gs| hex::decode(&gs.group_id).ok())
-        }
-        .or_else(|| hex::decode(convo_id).ok());
+        let old_group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await;
         if let Some(bytes) = old_group_id_bytes {
             if let Err(e) = self.mls_context().delete_group(bytes) {
                 // Non-fatal: the group may already be gone if a previous reset
