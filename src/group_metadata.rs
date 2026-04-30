@@ -1,3 +1,21 @@
+//! DEPRECATED: plaintext `0xff00` GroupContext extension is being removed.
+//!
+//! Group metadata (title, description, avatar) is now ENCRYPTED end-to-end
+//! via [`crate::metadata`]. Each group derives a per-epoch key from the MLS
+//! exporter, encrypts a `GroupMetadataV1` blob with ChaCha20-Poly1305, and
+//! stores only an opaque `MetadataReference` (locator + integrity hash) in
+//! the MLS group context (AppDataDictionary component `0x8001`). The
+//! delivery service holds the ciphertext as an opaque blob via
+//! `blue.catbird.mlsChat.{getGroupMetadataBlob,putGroupMetadataBlob}` and
+//! never sees plaintext.
+//!
+//! This module is retained for one release for migration tooling
+//! (`metadata_payload_from_group` re-uses [`GroupMetadata::from_group`] to
+//! lift legacy plaintext metadata into the new encrypted blob the first time
+//! a group is touched after upgrade). It will be deleted in Phase F of the
+//! cutover. **Do not call any function in this file from new code.**
+#![allow(deprecated)]
+
 use crate::error::MLSError;
 use openmls::prelude::*;
 use serde::{Deserialize, Serialize};

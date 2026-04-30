@@ -58,13 +58,22 @@ fn make_context() -> (Arc<MLSContext>, std::path::PathBuf) {
     (ctx, dir)
 }
 
+// MLS metadata cutover (Phase A): plaintext 0xff00 GroupContext extension is
+// retired. `create_group` no longer writes a plaintext extension when
+// `group_name` / `group_description` are set; `update_group_metadata` no
+// longer writes one either, and prunes any leftover entry from groups
+// created by older builds. Title / description / avatar live exclusively in
+// encrypted `GroupMetadataV1` blobs; the MLS group context only carries an
+// opaque `MetadataReference` at AppDataDictionary component 0x8001 (see
+// `src/metadata.rs` and its dedicated tests).
+
 #[test]
-fn test_create_group_with_metadata() {
+fn create_group_with_name_does_not_write_plaintext_0xff00() {
     let (ctx, _dir) = make_context();
 
     let config = GroupConfig {
-        group_name: Some("My Group".to_string()),
-        group_description: Some("A test group".to_string()),
+        group_name: Some("Engineering".to_string()),
+        group_description: Some("desc".to_string()),
         ..Default::default()
     };
 
@@ -72,16 +81,14 @@ fn test_create_group_with_metadata() {
         .create_group(b"alice@example.com".to_vec(), Some(config))
         .unwrap();
 
-    // get_group_metadata returns JSON bytes via the FFI layer.
-    // At creation, metadata is plaintext; the MEK-based reader
-    // handles the plaintext fallback transparently.
-    let meta_bytes = ctx.get_group_metadata(result.group_id.clone()).unwrap();
-    assert!(!meta_bytes.is_empty(), "Metadata should be present");
-
-    let meta = GroupMetadata::from_extension_bytes(&meta_bytes).unwrap();
-    assert_eq!(meta.name.as_deref(), Some("My Group"));
-    assert_eq!(meta.description.as_deref(), Some("A test group"));
-    assert!(meta.avatar_hash.is_none());
+    // The plaintext 0xff00 reader must observe nothing: encrypted-only
+    // path is authoritative now.
+    let meta_bytes = ctx.get_group_metadata(result.group_id).unwrap();
+    assert!(
+        meta_bytes.is_empty(),
+        "create_group must not write plaintext 0xff00 extension; got {} bytes",
+        meta_bytes.len()
+    );
 }
 
 #[test]
@@ -97,79 +104,39 @@ fn test_create_group_without_metadata() {
 }
 
 #[test]
-fn test_update_group_metadata_produces_commit() {
+fn update_group_metadata_produces_commit_without_plaintext() {
     let (ctx, _dir) = make_context();
 
     let config = GroupConfig {
         group_name: Some("Original".to_string()),
         ..Default::default()
     };
-
     let result = ctx
         .create_group(b"alice@example.com".to_vec(), Some(config))
         .unwrap();
 
-    let new_meta = GroupMetadata::new(
-        Some("Renamed Group".to_string()),
-        Some("New description".to_string()),
+    // The `metadata` parameter is retained for source-compat with existing
+    // callers, but its title/description are intentionally not written
+    // into the MLS group context. The commit must still be produced — it
+    // advances the AppDataDictionary `MetadataReference` so joiners pick
+    // up the new encrypted blob locator.
+    let payload = GroupMetadata::new(
+        Some("Renamed".to_string()),
+        Some("New".to_string()),
     );
     let commit_bytes = ctx
-        .update_group_metadata(
-            result.group_id.clone(),
-            new_meta.to_extension_bytes().unwrap(),
-        )
+        .update_group_metadata(result.group_id.clone(), payload.to_extension_bytes().unwrap())
         .unwrap();
-    assert!(!commit_bytes.is_empty(), "Commit bytes should be produced");
+    assert!(!commit_bytes.is_empty(), "commit bytes should be produced");
 
-    // Before merge, the group is still at the old epoch with plaintext metadata
-    // from creation (the pending commit hasn't been applied yet).
-    let meta_bytes = ctx.get_group_metadata(result.group_id.clone()).unwrap();
-    assert!(
-        !meta_bytes.is_empty(),
-        "Original metadata should still be readable before merge"
-    );
-    let meta = GroupMetadata::from_extension_bytes(&meta_bytes).unwrap();
-    assert_eq!(meta.name.as_deref(), Some("Original"));
-}
+    // Pre-merge: still no plaintext.
+    let pre = ctx.get_group_metadata(result.group_id.clone()).unwrap();
+    assert!(pre.is_empty(), "pre-merge plaintext 0xff00 must be absent");
 
-#[test]
-fn test_update_group_metadata_readable_after_merge() {
-    let (ctx, _dir) = make_context();
-
-    let config = GroupConfig {
-        group_name: Some("Original".to_string()),
-        ..Default::default()
-    };
-
-    let result = ctx
-        .create_group(b"alice@example.com".to_vec(), Some(config))
-        .unwrap();
-
-    let new_meta = GroupMetadata::new(
-        Some("Renamed Group".to_string()),
-        Some("New description".to_string()),
-    );
-    let _commit_bytes = ctx
-        .update_group_metadata(
-            result.group_id.clone(),
-            new_meta.to_extension_bytes().unwrap(),
-        )
-        .unwrap();
-
-    // Merge the pending commit (simulating server ACK)
+    // Post-merge: still no plaintext.
     ctx.merge_pending_commit(result.group_id.clone()).unwrap();
-
-    // After merge the epoch has advanced, but the metadata was encrypted
-    // with the stable per-group MEK, so it remains readable.
-    let meta_bytes = ctx.get_group_metadata(result.group_id).unwrap();
-    assert!(
-        !meta_bytes.is_empty(),
-        "Metadata should be readable after epoch advance"
-    );
-
-    let meta = GroupMetadata::from_extension_bytes(&meta_bytes).unwrap();
-    assert_eq!(meta.name.as_deref(), Some("Renamed Group"));
-    assert_eq!(meta.description.as_deref(), Some("New description"));
+    let post = ctx.get_group_metadata(result.group_id).unwrap();
+    assert!(post.is_empty(), "post-merge plaintext 0xff00 must be absent");
 }
 
 /// Regression for Android H4 epoch drift: `commit_pending_proposals` must not

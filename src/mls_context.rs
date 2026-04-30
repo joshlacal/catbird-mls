@@ -33,11 +33,14 @@ pub(crate) struct CreateGroupInternalResult {
 }
 use sha2::{Digest, Sha256};
 
-fn metadata_extension_capabilities() -> [ExtensionType; 3] {
+// Plaintext 0xff00 extension is retired (MLS metadata cutover).
+// Only RatchetTree + AppDataDictionary are required; AppDataDictionary
+// holds the encrypted-blob `MetadataReference` at component 0x8001
+// (see `metadata.rs`). New groups never advertise 0xff00.
+fn metadata_extension_capabilities() -> [ExtensionType; 2] {
     [
         ExtensionType::RatchetTree,
         ExtensionType::AppDataDictionary,
-        ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE),
     ]
 }
 
@@ -2024,29 +2027,14 @@ impl MLSContext {
                 ))
             })?;
 
-        if config.group_name.is_some() || config.group_description.is_some() {
-            let metadata =
-                GroupMetadata::new(config.group_name.clone(), config.group_description.clone());
-            let metadata_bytes = metadata.to_extension_bytes().map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] Failed to build group metadata extension: {:?}",
-                    e
-                );
-                MLSError::Internal(format!("serialize metadata: {:?}", e))
-            })?;
-            group_context_extensions
-                .add(Extension::Unknown(
-                    CATBIRD_METADATA_EXTENSION_TYPE,
-                    UnknownExtension(metadata_bytes),
-                ))
-                .map_err(|e| {
-                    MLSError::Internal(format!("Failed to add metadata extension: {:?}", e))
-                })?;
-            crate::info_log!(
-                "[MLS-CONTEXT] Group metadata set: name={:?}",
-                config.group_name
-            );
-        }
+        // Plaintext 0xff00 extension is retired (MLS metadata cutover).
+        // Group title / description / avatar are set after creation by
+        // encrypting `GroupMetadataV1` with a key derived from the new
+        // group's epoch exporter and uploading the blob via
+        // `putGroupMetadataBlob`. The MLS group itself only carries the
+        // encrypted-blob `MetadataReference` at AppDataDictionary
+        // component 0x8001 (see `metadata.rs`).
+        let _ = (&config.group_name, &config.group_description);
 
         group_config_builder =
             group_config_builder.with_group_context_extensions(group_context_extensions);
@@ -2582,9 +2570,15 @@ impl MLSContext {
         })
     }
 
-    /// Update group metadata by proposing + committing a GroupContextExtensions change.
-    /// Stores plaintext metadata in the 0xff00 extension. Encrypted metadata is now
-    /// handled separately by the metadata module via server-side blobs.
+    /// Stage a metadata-update commit. After the encrypted-only cutover, this
+    /// only updates the `MetadataReference` in AppDataDictionary 0x8001 and
+    /// (defensively) prunes any stale `0xff00` plaintext extension and
+    /// `0xff00` RequiredCapabilities entry from groups created by older
+    /// builds. The `metadata` parameter is retained so existing callers
+    /// keep compiling, but its title/description are NOT written into the
+    /// MLS group context — the encrypted-blob path is authoritative. The
+    /// actual blob ciphertext + locator are produced and uploaded separately
+    /// by the platform layer.
     /// Returns the commit message bytes that must be sent to the server.
     pub fn update_group_metadata(
         &mut self,
@@ -2592,30 +2586,33 @@ impl MLSContext {
         metadata: GroupMetadata,
     ) -> Result<Vec<u8>, MLSError> {
         let gid = GroupId::from_slice(group_id);
+        // Touch the parameter so callers compile; field contents are
+        // intentionally unused — see fn doc above.
+        let _ = (&metadata.name, &metadata.description);
 
         self.with_group(&gid, |group, provider, signer| {
-            let metadata_bytes = metadata
-                .to_extension_bytes()
-                .map_err(|e| MLSError::Internal(format!("serialize metadata: {}", e)))?;
-
-            // Clone existing extensions and add/replace the metadata extension.
-            // update_group_context_extensions replaces ALL extensions, so we must
-            // preserve any existing ones (e.g. RequiredCapabilities).
+            // Clone existing extensions; we must preserve any not-our-business
+            // extensions (e.g. RequiredCapabilities for AppData/RatchetTree).
             let mut extensions = group.extensions().clone();
 
-            // Read existing RequiredCapabilities and merge our extension type
+            // Rebuild RequiredCapabilities WITHOUT the retired 0xff00. Groups
+            // created by older builds may still list it; this commit drops it.
             let existing_rc = extensions.required_capabilities().cloned();
             let mut ext_types: Vec<ExtensionType> = existing_rc
                 .as_ref()
-                .map(|rc| rc.extension_types().to_vec())
+                .map(|rc| {
+                    rc.extension_types()
+                        .iter()
+                        .copied()
+                        .filter(|t| {
+                            !matches!(t, ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE))
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
-            if !ext_types.contains(&ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE)) {
-                ext_types.push(ExtensionType::Unknown(CATBIRD_METADATA_EXTENSION_TYPE));
-            }
             if !ext_types.contains(&ExtensionType::AppDataDictionary) {
                 ext_types.push(ExtensionType::AppDataDictionary);
             }
-            // Ensure RatchetTree is always present
             if !ext_types.contains(&ExtensionType::RatchetTree) {
                 ext_types.push(ExtensionType::RatchetTree);
             }
@@ -2647,18 +2644,27 @@ impl MLSContext {
                     ))
                 })?;
 
-            extensions
-                .add_or_replace(Extension::Unknown(
+            // Drop any pre-existing plaintext 0xff00 extension from a legacy
+            // group. New groups never carry it. We can't ALTER the existing
+            // extension, but we can replace it with an empty payload — the
+            // group then advertises no plaintext metadata. Even this is only
+            // load-bearing during the migration window; once all members are
+            // on builds that ignore 0xff00, the leftover empty extension is
+            // harmless dead weight.
+            if extensions
+                .unknown(CATBIRD_METADATA_EXTENSION_TYPE)
+                .is_some()
+            {
+                let _ = extensions.add_or_replace(Extension::Unknown(
                     CATBIRD_METADATA_EXTENSION_TYPE,
-                    UnknownExtension(metadata_bytes),
-                ))
-                .map_err(|e| {
-                    MLSError::Internal(format!("Failed to add metadata extension: {:?}", e))
-                })?;
+                    UnknownExtension(Vec::new()),
+                ));
+            }
 
+            // Always advance the encrypted MetadataReference for this commit.
             let planned_reference_json = metadata::planned_metadata_reference_json(
                 metadata::current_metadata_reference(group).as_ref(),
-                crate::group_metadata::GroupMetadata::from_group(group).is_some(),
+                metadata::current_metadata_reference(group).is_some(),
                 true,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
