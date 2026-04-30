@@ -222,6 +222,50 @@ impl MockDeliveryService {
         self.state.lock().unwrap().failures.reject_next_add_members = true;
     }
 
+    /// Test helper: change the stable conversation ID while preserving the
+    /// MLS group ID inside the conversation view.
+    pub fn rekey_conversation_for_test(&self, old_convo_id: &str, new_convo_id: &str) {
+        if old_convo_id == new_convo_id {
+            return;
+        }
+
+        let mut guard = self.state.lock().unwrap();
+
+        let mut stored = guard
+            .conversations
+            .remove(old_convo_id)
+            .unwrap_or_else(|| panic!("conversation {old_convo_id} not found"));
+        stored.view.conversation_id = new_convo_id.to_string();
+        guard.conversations.insert(new_convo_id.to_string(), stored);
+
+        if let Some(mut messages) = guard.messages.remove(old_convo_id) {
+            for message in &mut messages {
+                message.conversation_id = new_convo_id.to_string();
+            }
+            guard.messages.insert(new_convo_id.to_string(), messages);
+        }
+
+        if let Some(group_info) = guard.group_infos.remove(old_convo_id) {
+            guard
+                .group_infos
+                .insert(new_convo_id.to_string(), group_info);
+        }
+
+        let welcome_keys: Vec<(String, String)> = guard
+            .welcomes
+            .keys()
+            .filter(|(convo_id, _)| convo_id == old_convo_id)
+            .cloned()
+            .collect();
+        for (convo_id, did) in welcome_keys {
+            if let Some(welcomes) = guard.welcomes.remove(&(convo_id, did.clone())) {
+                guard
+                    .welcomes
+                    .insert((new_convo_id.to_string(), did), welcomes);
+            }
+        }
+    }
+
     // -- introspection --------------------------------------------------------
 
     /// Number of messages stored for a conversation.

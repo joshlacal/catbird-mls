@@ -165,12 +165,13 @@ where
                 let member_list: Vec<String> =
                     convo.members.iter().map(|m| m.did.clone()).collect();
                 crate::info_log!(
-                    "[sync] convo={} filtered OUT: user_did={} not in members={:?}",
+                    "[sync] convo={} group={} filtered OUT: user_did={} not in members={:?}",
+                    convo.conversation_id,
                     convo.group_id,
                     normalized_did,
                     member_list
                 );
-                stale_ids.push(convo.group_id.clone());
+                stale_ids.push(convo.conversation_id.clone());
             }
             is_member
         });
@@ -192,7 +193,10 @@ where
         let creating = self.groups_being_created().lock().await.clone();
 
         // Reconcile: find local conversations not on server
-        let server_ids: HashSet<&str> = all_convos.iter().map(|c| c.group_id.as_str()).collect();
+        let server_ids: HashSet<&str> = all_convos
+            .iter()
+            .map(|c| c.conversation_id.as_str())
+            .collect();
         let local_ids: Vec<String> = self.conversations().lock().await.keys().cloned().collect();
 
         for local_id in &local_ids {
@@ -213,10 +217,13 @@ where
                 break;
             }
 
+            let conversation_id = convo.conversation_id.as_str();
+            let group_id = convo.group_id.as_str();
+
             self.conversations()
                 .lock()
                 .await
-                .insert(convo.group_id.clone(), convo.clone());
+                .insert(conversation_id.to_string(), convo.clone());
 
             // Detect a stale persisted GroupState: the orchestrator has a
             // record for this convo, but the local MLS context does NOT have
@@ -229,92 +236,112 @@ where
             //
             // Self-heal by treating the persisted state as missing so the
             // init block below re-runs `join_or_rejoin`.
-            let ffi_has_group = match hex::decode(&convo.group_id) {
+            let ffi_has_group = match hex::decode(group_id) {
                 Ok(gid_bytes) => self.mls_context().get_epoch(gid_bytes).is_ok(),
                 Err(_) => false,
             };
-            let has_state_record = self
-                .group_states()
-                .lock()
-                .await
-                .contains_key(&convo.group_id);
+            let has_state_record = {
+                let states = self.group_states().lock().await;
+                states.contains_key(conversation_id)
+                    || states
+                        .values()
+                        .any(|gs| gs.conversation_id == conversation_id || gs.group_id == group_id)
+            };
 
             crate::info_log!(
-                "[sync] convo={} has_state_record={} ffi_has_group={}",
-                convo.group_id,
+                "[sync] convo={} group={} has_state_record={} ffi_has_group={}",
+                conversation_id,
+                group_id,
                 has_state_record,
                 ffi_has_group
             );
 
             if has_state_record && !ffi_has_group {
                 tracing::warn!(
-                    conversation_id = %convo.group_id,
+                    conversation_id = %conversation_id,
+                    group_id = %group_id,
                     "Persisted GroupState exists but MLS context has no group — \
                      stale state, falling through to join_or_rejoin"
                 );
                 crate::info_log!(
-                    "[sync] convo={} stale state detected, entering init path",
-                    convo.group_id
+                    "[sync] convo={} group={} stale state detected, entering init path",
+                    conversation_id,
+                    group_id
                 );
             }
 
             // Initialize group state if missing OR if the persisted record is stale.
             if !has_state_record || !ffi_has_group {
-                crate::info_log!("[sync] convo={} entering init block", convo.group_id);
+                crate::info_log!(
+                    "[sync] convo={} group={} entering init block",
+                    conversation_id,
+                    group_id
+                );
                 let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
 
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
-                let epoch = if let Ok(gid_bytes) = hex::decode(&convo.group_id) {
-                    crate::info_log!("[sync] convo={} pre-get_epoch call", convo.group_id);
+                let epoch = if let Ok(gid_bytes) = hex::decode(group_id) {
+                    crate::info_log!(
+                        "[sync] convo={} group={} pre-get_epoch call",
+                        conversation_id,
+                        group_id
+                    );
                     match self.mls_context().get_epoch(gid_bytes) {
                         Ok(e) => {
                             crate::info_log!(
-                                "[sync] convo={} FFI get_epoch Ok: {} (surprising — skipping join_or_rejoin)",
-                                convo.group_id,
+                                "[sync] convo={} group={} FFI get_epoch Ok: {} (surprising — skipping join_or_rejoin)",
+                                conversation_id,
+                                group_id,
                                 e
                             );
                             e
                         }
                         Err(e) => {
                             crate::info_log!(
-                                "[sync] convo={} FFI get_epoch Err: {}",
-                                convo.group_id,
+                                "[sync] convo={} group={} FFI get_epoch Err: {}",
+                                conversation_id,
+                                group_id,
                                 e
                             );
-                            if !sync_rejoin_attempted.insert(convo.group_id.clone()) {
+                            if !sync_rejoin_attempted.insert(conversation_id.to_string()) {
                                 crate::info_log!(
                                     "[sync] convo={} SKIP: duplicate in cycle",
-                                    convo.group_id
+                                    conversation_id
                                 );
                                 tracing::debug!(
-                                    conversation_id = %convo.group_id,
+                                    conversation_id = %conversation_id,
+                                    group_id = %group_id,
                                     "Skipping duplicate sync-triggered join/rejoin in same cycle"
                                 );
                                 convo.epoch
-                            } else if !self.should_attempt_sync_rejoin(&convo.group_id).await {
+                            } else if !self.should_attempt_sync_rejoin(conversation_id).await {
                                 crate::info_log!(
                                     "[sync] convo={} SKIP: eligibility gate rejected",
-                                    convo.group_id
+                                    conversation_id
                                 );
                                 tracing::debug!(
-                                    conversation_id = %convo.group_id,
+                                    conversation_id = %conversation_id,
+                                    group_id = %group_id,
                                     "Skipping sync-triggered join/rejoin due to eligibility gate"
                                 );
                                 convo.epoch
                             } else {
                                 crate::info_log!(
-                                    "[sync] convo={} CALLING join_or_rejoin",
-                                    convo.group_id
+                                    "[sync] convo={} group={} CALLING join_or_rejoin",
+                                    conversation_id,
+                                    group_id
                                 );
                                 // Group not in FFI — try Welcome first, fall back to External Commit
                                 tracing::info!(
-                                    conversation_id = %convo.group_id,
+                                    conversation_id = %conversation_id,
+                                    group_id = %group_id,
                                     "Group not found in FFI, joining (Welcome first, External Commit fallback)"
                                 );
-                                match self.join_or_rejoin(&convo.group_id).await {
+                                match self.join_or_rejoin(conversation_id).await {
                                     Ok(epoch) => {
                                         tracing::info!(
-                                            conversation_id = %convo.group_id,
+                                            conversation_id = %conversation_id,
+                                            group_id = %group_id,
                                             epoch,
                                             "Successfully joined group"
                                         );
@@ -322,7 +349,8 @@ where
                                     }
                                     Err(e) => {
                                         tracing::warn!(
-                                            conversation_id = %convo.group_id,
+                                            conversation_id = %conversation_id,
+                                            group_id = %group_id,
                                             error = %e,
                                             "Failed to join group"
                                         );
@@ -342,15 +370,33 @@ where
                     epoch,
                     members,
                 };
-                self.group_states()
-                    .lock()
-                    .await
-                    .insert(convo.group_id.clone(), state.clone());
+                {
+                    let mut states = self.group_states().lock().await;
+                    if conversation_id != group_id {
+                        states.remove(group_id);
+                    }
+                    states.insert(conversation_id.to_string(), state.clone());
+                }
                 self.storage().set_group_state(&state).await?;
             } else {
                 // Update member list from server
-                if let Some(gs) = self.group_states().lock().await.get_mut(&convo.group_id) {
-                    gs.members = convo.members.iter().map(|m| m.did.clone()).collect();
+                let mut states = self.group_states().lock().await;
+                let state_key = if states.contains_key(conversation_id) {
+                    Some(conversation_id.to_string())
+                } else {
+                    states
+                        .iter()
+                        .find(|(_, gs)| {
+                            gs.conversation_id == conversation_id || gs.group_id == group_id
+                        })
+                        .map(|(key, _)| key.clone())
+                };
+                if let Some(state_key) = state_key {
+                    if let Some(mut gs) = states.remove(&state_key) {
+                        gs.conversation_id = conversation_id.to_string();
+                        gs.members = convo.members.iter().map(|m| m.did.clone()).collect();
+                        states.insert(conversation_id.to_string(), gs);
+                    }
                 }
             }
 
@@ -360,17 +406,23 @@ where
                 .await?;
 
             // Check for epoch reconciliation — fetch and process missing commits
-            let local_epoch = self
-                .group_states()
-                .lock()
-                .await
-                .get(&convo.group_id)
-                .map(|gs| gs.epoch)
-                .unwrap_or(0);
+            let local_epoch = {
+                let states = self.group_states().lock().await;
+                states
+                    .get(conversation_id)
+                    .or_else(|| {
+                        states.values().find(|gs| {
+                            gs.conversation_id == conversation_id || gs.group_id == group_id
+                        })
+                    })
+                    .map(|gs| gs.epoch)
+                    .unwrap_or(0)
+            };
 
             if convo.epoch > local_epoch {
                 tracing::info!(
-                    conversation_id = %convo.group_id,
+                    conversation_id = %conversation_id,
+                    group_id = %group_id,
                     local_epoch,
                     server_epoch = convo.epoch,
                     "Server ahead — fetching pending messages to catch up"
@@ -387,7 +439,7 @@ where
                 let to_epoch = Some(convo.epoch.min(u32::MAX as u64) as u32);
                 match self
                     .fetch_messages(
-                        &convo.group_id,
+                        conversation_id,
                         None,
                         50,
                         Some("commit"),
@@ -399,54 +451,64 @@ where
                     Ok((msgs, _)) => {
                         if !msgs.is_empty() {
                             tracing::info!(
-                                conversation_id = %convo.group_id,
+                                conversation_id = %conversation_id,
+                                group_id = %group_id,
                                 processed = msgs.len(),
                                 "Processed pending messages during sync catch-up"
                             );
                         }
                         // Re-check epoch after processing
-                        let new_local = self
-                            .group_states()
-                            .lock()
-                            .await
-                            .get(&convo.group_id)
-                            .map(|gs| gs.epoch)
-                            .unwrap_or(0);
+                        let new_local = {
+                            let states = self.group_states().lock().await;
+                            states
+                                .get(conversation_id)
+                                .or_else(|| {
+                                    states.values().find(|gs| {
+                                        gs.conversation_id == conversation_id
+                                            || gs.group_id == group_id
+                                    })
+                                })
+                                .map(|gs| gs.epoch)
+                                .unwrap_or(0)
+                        };
                         if convo.epoch > new_local {
                             tracing::warn!(
-                                conversation_id = %convo.group_id,
+                                conversation_id = %conversation_id,
+                                group_id = %group_id,
                                 local_epoch = new_local,
                                 server_epoch = convo.epoch,
                                 "Still behind after processing — marking for rejoin"
                             );
-                            let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
+                            let _ = self.storage().mark_needs_rejoin(conversation_id).await;
                         }
                     }
                     Err(e) => {
                         tracing::warn!(
-                            conversation_id = %convo.group_id,
+                            conversation_id = %conversation_id,
+                            group_id = %group_id,
                             error = %e,
                             "Failed to fetch messages for epoch catch-up — marking for rejoin"
                         );
                         // Fetch failed — mark for rejoin regardless of gap size
-                        let _ = self.storage().mark_needs_rejoin(&convo.group_id).await;
+                        let _ = self.storage().mark_needs_rejoin(conversation_id).await;
                     }
                 }
             }
 
             // Commit any pending proposals (e.g. self-remove from departing members).
-            if let Ok(gid_bytes) = hex::decode(&convo.group_id) {
+            if let Ok(gid_bytes) = hex::decode(group_id) {
                 match self.mls_context().commit_pending_proposals(gid_bytes) {
                     Ok(commit_bytes) => {
                         tracing::info!(
-                            conversation_id = %convo.group_id,
+                            conversation_id = %conversation_id,
+                            group_id = %group_id,
                             commit_len = commit_bytes.len(),
                             "Committed pending proposals during sync"
                         );
                         if let Err(e) = self
                             .api_client()
                             .commit_group_change(
-                                &convo.group_id,
+                                conversation_id,
                                 &commit_bytes,
                                 "commitPendingProposals",
                                 None,
@@ -455,7 +517,8 @@ where
                         {
                             tracing::warn!(
                                 error = %e,
-                                conversation_id = %convo.group_id,
+                                conversation_id = %conversation_id,
+                                group_id = %group_id,
                                 "Failed to send pending proposals commit to server"
                             );
                         }
@@ -464,7 +527,8 @@ where
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            conversation_id = %convo.group_id,
+                            conversation_id = %conversation_id,
+                            group_id = %group_id,
                             "Failed to commit pending proposals during sync"
                         );
                     }
@@ -475,29 +539,32 @@ where
             // flagged this conversation, attempt rejoin now (with rate-limiting).
             if self
                 .storage()
-                .needs_rejoin(&convo.group_id)
+                .needs_rejoin(conversation_id)
                 .await
                 .unwrap_or(false)
             {
                 tracing::info!(
-                    conversation_id = %convo.group_id,
+                    conversation_id = %conversation_id,
+                    group_id = %group_id,
                     "Group flagged for rejoin — attempting in sync"
                 );
-                if !sync_rejoin_attempted.contains(&convo.group_id)
-                    && self.should_attempt_sync_rejoin(&convo.group_id).await
+                if !sync_rejoin_attempted.contains(conversation_id)
+                    && self.should_attempt_sync_rejoin(conversation_id).await
                 {
-                    sync_rejoin_attempted.insert(convo.group_id.clone());
-                    match self.join_or_rejoin(&convo.group_id).await {
+                    sync_rejoin_attempted.insert(conversation_id.to_string());
+                    match self.join_or_rejoin(conversation_id).await {
                         Ok(epoch) => {
                             tracing::info!(
-                                conversation_id = %convo.group_id,
+                                conversation_id = %conversation_id,
+                                group_id = %group_id,
                                 epoch,
                                 "Sync rejoin succeeded"
                             );
                         }
                         Err(e) => {
                             tracing::warn!(
-                                conversation_id = %convo.group_id,
+                                conversation_id = %conversation_id,
+                                group_id = %group_id,
                                 error = %e,
                                 "Sync rejoin failed"
                             );
