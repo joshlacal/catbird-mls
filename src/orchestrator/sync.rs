@@ -495,6 +495,53 @@ where
                 }
             }
 
+            // Always-on app-message fetch. The catch-up block above only fires
+            // when the server is ahead on epoch — it filters with
+            // `Some("commit")` because its purpose is epoch advancement. App
+            // messages don't change epoch, so without this second pass the
+            // receive flow is silently dead in already-joined groups (Android
+            // symptom: SSE `messageEvent` arrives, `triggerSync` runs, but
+            // `process_incoming` is never called for app payloads, so
+            // `storage.store_message` never fires and the UI shows nothing).
+            //
+            // Pulls the most recent N messages with no type filter; the
+            // dedup gate inside `process_incoming` (`message_exists`) skips
+            // already-stored entries, so re-fetching is cheap. Uses the
+            // existing `process_incoming` path which handles commits
+            // (merge_incoming_commit) and app messages (storage.store_message)
+            // uniformly. Per-convo cursor tracking would be more efficient
+            // but is deferred — `messageExists` is cheap and correct.
+            match self
+                .fetch_messages(
+                    conversation_id,
+                    None,
+                    20,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok((msgs, _)) => {
+                    if !msgs.is_empty() {
+                        tracing::debug!(
+                            conversation_id = %conversation_id,
+                            group_id = %group_id,
+                            new = msgs.len(),
+                            "Sync app-message pass processed messages"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        conversation_id = %conversation_id,
+                        group_id = %group_id,
+                        error = %e,
+                        "Sync app-message pass failed (non-fatal)"
+                    );
+                }
+            }
+
             // Commit any pending proposals (e.g. self-remove from departing members).
             if let Ok(gid_bytes) = hex::decode(group_id) {
                 match self.mls_context().commit_pending_proposals(gid_bytes) {

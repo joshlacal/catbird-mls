@@ -1210,6 +1210,91 @@ impl MLSContext {
         &self.key_package_bundles
     }
 
+    /// Reconcile the in-memory + persisted KeyPackageBundle cache against
+    /// OpenMLS's authoritative `openmls_key_packages` storage. Drops any
+    /// cached bundles whose hash_ref OpenMLS no longer holds (typically
+    /// because OpenMLS consumed it during a successful Welcome) and
+    /// rewrites the manifest. Returns the count of stale entries removed.
+    ///
+    /// Without this, the manifest accumulates dead hashes which are
+    /// re-advertised to the server via `publishKeyPackages action=sync`,
+    /// causing the server to keep handing them out to inviters whose
+    /// Welcomes then fail `NoMatchingKeyPackage` because OpenMLS storage
+    /// no longer has the underlying init key.
+    pub fn reconcile_key_package_bundles(&mut self) -> Result<usize, MLSError> {
+        let stale: Vec<Vec<u8>> = {
+            let crypto = self.provider.crypto();
+            let storage = self.provider.storage();
+            let mut stale = Vec::new();
+            for (hash_ref_bytes, bundle) in &self.key_package_bundles {
+                let typed_ref = match bundle.key_package().hash_ref(crypto) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        crate::warn_log!(
+                            "[KP-RECONCILE] hash_ref recompute failed for {}: {:?}",
+                            hex::encode(hash_ref_bytes),
+                            e
+                        );
+                        continue;
+                    }
+                };
+                let lookup: Result<Option<openmls::prelude::KeyPackageBundle>, _> =
+                    storage.key_package(&typed_ref);
+                match lookup {
+                    Ok(Some(_)) => {}
+                    Ok(None) => {
+                        crate::info_log!(
+                            "[KP-RECONCILE] Stale manifest entry (not in OpenMLS storage): {}",
+                            hex::encode(hash_ref_bytes)
+                        );
+                        stale.push(hash_ref_bytes.clone());
+                    }
+                    Err(e) => {
+                        crate::warn_log!(
+                            "[KP-RECONCILE] Storage lookup failed for {}: {:?}",
+                            hex::encode(hash_ref_bytes),
+                            e
+                        );
+                    }
+                }
+            }
+            stale
+        };
+
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        let removed_count = stale.len();
+        crate::info_log!(
+            "[KP-RECONCILE] Removing {} stale manifest entries (cache before: {})",
+            removed_count,
+            self.key_package_bundles.len()
+        );
+
+        for hash_ref in &stale {
+            self.key_package_bundles.remove(hash_ref);
+        }
+
+        let mut bundles_map: HashMap<String, String> = self
+            .manifest_storage
+            .read_manifest("key_package_bundles")?
+            .unwrap_or_default();
+        for hash_ref in &stale {
+            bundles_map.remove(&hex::encode(hash_ref));
+        }
+        self.manifest_storage
+            .write_manifest("key_package_bundles", &bundles_map)?;
+
+        crate::info_log!(
+            "[KP-RECONCILE] Reconcile complete: cache={} manifest={}",
+            self.key_package_bundles.len(),
+            bundles_map.len()
+        );
+
+        Ok(removed_count)
+    }
+
     /// Persist group ID to manifest for reload on restart
     fn persist_group_id(&self, group_id: &[u8]) -> Result<(), MLSError> {
         let storage = &self.manifest_storage;

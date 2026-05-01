@@ -264,8 +264,35 @@ impl MLSContext {
         encryption_key: String,
         keychain: Box<dyn KeychainAccess>,
     ) -> Result<Arc<Self>, MLSError> {
-        let (context, interrupt_handles) =
+        let (mut context, interrupt_handles) =
             MLSContextInner::new(storage_path, encryption_key, keychain)?;
+
+        // Reconcile any drift between the manifest cache and OpenMLS's
+        // authoritative key_package storage. Drops stale entries left
+        // behind by Welcomes that consumed a KP from OpenMLS storage but
+        // didn't update the manifest. Without this, the cold-start KP
+        // sync re-advertises the dead hashes to the server, which keeps
+        // handing them out for new Welcomes that then fail
+        // `NoMatchingKeyPackage`. Best-effort: a reconcile failure is
+        // logged but doesn't block context creation.
+        match context.reconcile_key_package_bundles() {
+            Ok(0) => {
+                crate::debug_log!("[MLS-FFI] KP reconcile on init: no drift");
+            }
+            Ok(removed) => {
+                crate::info_log!(
+                    "[MLS-FFI] KP reconcile on init: removed {} stale manifest entries",
+                    removed
+                );
+            }
+            Err(e) => {
+                crate::warn_log!(
+                    "[MLS-FFI] KP reconcile on init failed (non-fatal): {:?}",
+                    e
+                );
+            }
+        }
+
         Ok(Arc::new(Self {
             inner: Arc::new(Mutex::new(Some(context))),
             credential_validator: Arc::new(Mutex::new(None)),
@@ -3230,8 +3257,19 @@ impl MLSContext {
             "[MLS-FFI] process_welcome: Join config created with ratchet tree extension"
         );
 
+        // Capture the welcome's recipient hashes BEFORE consuming `welcome`
+        // — needed so we can purge provably-stale entries from the manifest
+        // cache if processing fails with NoMatchingKeyPackage. Without this
+        // cleanup, the same dead hash would be re-advertised by the next
+        // cold-start sync and the server would keep handing it out.
+        let welcome_secret_hashes: Vec<Vec<u8>> = welcome
+            .secrets()
+            .iter()
+            .map(|egs| egs.new_member().as_slice().to_vec())
+            .collect();
+
         crate::info_log!("[MLS-FFI] process_welcome: Calling StagedWelcome::new_from_welcome...");
-        let mut group = {
+        let staged_result = {
             let provider = &inner.provider;
             StagedWelcome::new_from_welcome(
                 provider,
@@ -3239,36 +3277,74 @@ impl MLSContext {
                 welcome,
                 None,
             )
-            .map_err(|e| {
-                crate::error_log!("[MLS-FFI] ❌ ERROR: StagedWelcome::new_from_welcome failed!");
+            .and_then(|staged| staged.into_group(provider))
+        };
+
+        let mut group = match staged_result {
+            Ok(g) => g,
+            Err(e) => {
+                crate::error_log!("[MLS-FFI] ❌ ERROR: StagedWelcome processing failed!");
                 crate::error_log!("[MLS-FFI] ERROR: OpenMLS error details: {:?}", e);
                 crate::error_log!("[MLS-FFI] ERROR: Error type: {}", std::any::type_name_of_val(&e));
 
-                // Map specific WelcomeError variants to corresponding MLSError types
-                match &e {
+                // On NoMatchingKeyPackage, the welcome's target hash is by
+                // definition not in OpenMLS storage. If we have a manifest
+                // entry for that hash, it's stale (e.g., consumed by a
+                // prior Welcome whose cleanup didn't run). Drop those
+                // entries immediately so the next sync round doesn't
+                // re-publish them.
+                if matches!(e, WelcomeError::NoMatchingKeyPackage) {
+                    let cache = inner.key_package_bundles();
+                    let stale: Vec<Vec<u8>> = welcome_secret_hashes
+                        .iter()
+                        .filter(|h| cache.contains_key(*h))
+                        .cloned()
+                        .collect();
+                    if !stale.is_empty() {
+                        crate::info_log!(
+                            "[MLS-FFI] [KP-RECONCILE] NoMatchingKeyPackage: purging {} stale manifest entries the Welcome referenced",
+                            stale.len()
+                        );
+                        let bundles = inner.key_package_bundles_mut();
+                        for h in &stale {
+                            bundles.remove(h);
+                        }
+                        if let Ok(Some(mut bundles_map)) = inner
+                            .manifest_storage
+                            .read_manifest::<HashMap<String, String>>("key_package_bundles")
+                        {
+                            for h in &stale {
+                                bundles_map.remove(&hex::encode(h));
+                            }
+                            if let Err(write_err) = inner
+                                .manifest_storage
+                                .write_manifest("key_package_bundles", &bundles_map)
+                            {
+                                crate::warn_log!(
+                                    "[MLS-FFI] [KP-RECONCILE] failed to persist purge: {:?}",
+                                    write_err
+                                );
+                            }
+                        }
+                    }
+                }
+
+                return Err(match e {
                     WelcomeError::NoMatchingKeyPackage => {
                         crate::error_log!("[MLS-FFI] ❌ NoMatchingKeyPackage: Welcome references a key package not in local storage");
-                        crate::error_log!("[MLS-FFI] DIAGNOSTIC: This device may not have the key package used to create this Welcome");
-                        crate::error_log!("[MLS-FFI] DIAGNOSTIC: The Welcome was likely created for a different device");
                         MLSError::no_matching_key_package("Welcome references a key package not found in local storage")
                     }
                     WelcomeError::NoMatchingEncryptionKey => {
                         crate::error_log!("[MLS-FFI] ❌ NoMatchingEncryptionKey: Encryption key not in storage");
                         MLSError::no_matching_key_package("No matching encryption key found in storage")
                     }
-                    _ => {
+                    other => {
                         crate::error_log!("[MLS-FFI] DIAGNOSTIC: Unhandled WelcomeError variant");
-                        MLSError::OpenMLS(format!("StagedWelcome failed: {:?}", e))
+                        MLSError::OpenMLS(format!("StagedWelcome failed: {:?}", other))
                     }
-                }
-            })?
-            .into_group(provider)
-            .map_err(|e| {
-                crate::error_log!("[MLS-FFI] ❌ ERROR: into_group failed!");
-                crate::error_log!("[MLS-FFI] ERROR: OpenMLS error details: {:?}", e);
-                MLSError::OpenMLS(format!("into_group failed: {:?}", e))
-            })
-        }?;
+                });
+            }
+        };
 
         crate::info_log!("[MLS-FFI] process_welcome: Successfully joined group via Welcome");
 
@@ -3304,6 +3380,26 @@ impl MLSContext {
         }
 
         inner.add_group(group, &identity)?;
+
+        // OpenMLS just consumed the matched KP from `openmls_key_packages`.
+        // Sweep our manifest cache to drop the corresponding entry (and
+        // any other already-stale entries) so the next cold-start sync
+        // doesn't re-publish dead hashes.
+        match inner.reconcile_key_package_bundles() {
+            Ok(0) => {}
+            Ok(removed) => {
+                crate::info_log!(
+                    "[MLS-FFI] [KP-RECONCILE] post-Welcome cleanup: removed {} stale entries",
+                    removed
+                );
+            }
+            Err(e) => {
+                crate::warn_log!(
+                    "[MLS-FFI] [KP-RECONCILE] post-Welcome cleanup failed (non-fatal): {:?}",
+                    e
+                );
+            }
+        }
 
         // 🔍 DIAGNOSTIC: Verify the group was successfully added and is accessible
         crate::info_log!(
