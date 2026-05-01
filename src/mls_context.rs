@@ -57,11 +57,36 @@ pub struct UpdateGroupMetadataResult {
 }
 use sha2::{Digest, Sha256};
 
-// Plaintext 0xff00 extension is retired (MLS metadata cutover).
-// Only RatchetTree + AppDataDictionary are required; AppDataDictionary
-// holds the encrypted-blob `MetadataReference` at component 0x8001
-// (see `metadata.rs`). New groups never advertise 0xff00.
-fn metadata_extension_capabilities() -> [ExtensionType; 2] {
+// Capabilities split between leaf-advertised vs group-required.
+//
+// Post-cutover NEW groups must NOT require the retired plaintext 0xff00
+// extension — the encrypted MetadataReference at AppDataDictionary 0x8001
+// is the only metadata path. But LEGACY groups created before the cutover
+// (or by a peer that hasn't updated yet) still list 0xff00 in their
+// RequiredCapabilities. Per RFC 9420 §13.4 a new leaf joining a group
+// must advertise support for every extension type the group requires;
+// otherwise OpenMLS rejects it with `LeafNodeValidation(UnsupportedExtensions)`
+// — which was blocking Android's External Commit recovery into legacy
+// groups (see Android logs from Phase G).
+//
+// Resolution: the leaf advertises 0xff00 (so we can join legacy groups)
+// but new groups' RequiredCapabilities omit it. We never write into the
+// 0xff00 extension on outbound commits — Phase A removed those writes.
+
+fn metadata_leaf_extension_capabilities() -> [ExtensionType; 3] {
+    [
+        ExtensionType::RatchetTree,
+        ExtensionType::AppDataDictionary,
+        // Advertise legacy 0xff00 support so we can join groups created
+        // before the cutover. Reading the extension is harmless — the
+        // GroupMetadata struct that consumed it was deleted in Phase F,
+        // but mere "I support this type" doesn't require us to do anything
+        // with the bytes.
+        ExtensionType::Unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE),
+    ]
+}
+
+fn metadata_required_extension_capabilities() -> [ExtensionType; 2] {
     [
         ExtensionType::RatchetTree,
         ExtensionType::AppDataDictionary,
@@ -76,7 +101,7 @@ fn metadata_leaf_capabilities() -> Capabilities {
     Capabilities::new(
         None,
         None,
-        Some(&metadata_extension_capabilities()),
+        Some(&metadata_leaf_extension_capabilities()),
         Some(&metadata_proposal_capabilities()),
         None,
     )
@@ -84,7 +109,7 @@ fn metadata_leaf_capabilities() -> Capabilities {
 
 fn metadata_required_capabilities_extension() -> RequiredCapabilitiesExtension {
     RequiredCapabilitiesExtension::new(
-        &metadata_extension_capabilities(),
+        &metadata_required_extension_capabilities(),
         &metadata_proposal_capabilities(),
         &[],
     )
