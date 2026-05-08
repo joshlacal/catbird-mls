@@ -526,6 +526,108 @@ pub struct FFIVoicePrepareResult {
     pub size: u64,
 }
 
+// Layer 3 Quarantine FFI surface
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum FFIQuarantineReason {
+    PeerBadCommit,
+    MultiPeerBadCommits,
+    RepeatedFramingFailures,
+}
+
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum FFIQuarantineExitReason {
+    PeerCommitSucceeded,
+    ServerReset,
+    UserConfirmedReset,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FFIQuarantineState {
+    pub reason: FFIQuarantineReason,
+    pub since_ms: i64,
+    pub suspected_dids: Vec<String>,
+}
+
+fn qreason_to_ffi(r: crate::orchestrator::types::QuarantineReason) -> FFIQuarantineReason {
+    use crate::orchestrator::types::QuarantineReason as Q;
+    match r {
+        Q::PeerBadCommit => FFIQuarantineReason::PeerBadCommit,
+        Q::MultiPeerBadCommits => FFIQuarantineReason::MultiPeerBadCommits,
+        Q::RepeatedFramingFailures => FFIQuarantineReason::RepeatedFramingFailures,
+    }
+}
+
+#[allow(dead_code)]
+fn ffi_to_qreason(r: &FFIQuarantineReason) -> crate::orchestrator::types::QuarantineReason {
+    use crate::orchestrator::types::QuarantineReason as Q;
+    match r {
+        FFIQuarantineReason::PeerBadCommit => Q::PeerBadCommit,
+        FFIQuarantineReason::MultiPeerBadCommits => Q::MultiPeerBadCommits,
+        FFIQuarantineReason::RepeatedFramingFailures => Q::RepeatedFramingFailures,
+    }
+}
+
+fn qexit_to_ffi(r: crate::orchestrator::types::QuarantineExitReason) -> FFIQuarantineExitReason {
+    use crate::orchestrator::types::QuarantineExitReason as Q;
+    match r {
+        Q::PeerCommitSucceeded => FFIQuarantineExitReason::PeerCommitSucceeded,
+        Q::ServerReset => FFIQuarantineExitReason::ServerReset,
+        Q::UserConfirmedReset => FFIQuarantineExitReason::UserConfirmedReset,
+    }
+}
+
+#[allow(dead_code)]
+fn ffi_to_qexit(r: &FFIQuarantineExitReason) -> crate::orchestrator::types::QuarantineExitReason {
+    use crate::orchestrator::types::QuarantineExitReason as Q;
+    match r {
+        FFIQuarantineExitReason::PeerCommitSucceeded => Q::PeerCommitSucceeded,
+        FFIQuarantineExitReason::ServerReset => Q::ServerReset,
+        FFIQuarantineExitReason::UserConfirmedReset => Q::UserConfirmedReset,
+    }
+}
+
+/// UniFFI callback interface for Layer 3 quarantine events. Platforms
+/// (Android, catmos Tauri, catmos-cli, web) implement this and register via
+/// OrchestratorBridge::set_event_callback. The constructor is unchanged so
+/// existing platform code keeps compiling without binding regen.
+#[uniffi::export(callback_interface)]
+pub trait OrchestratorEventCallback: Send + Sync {
+    fn on_conversation_quarantined(
+        &self,
+        convo_id: String,
+        reason: FFIQuarantineReason,
+        suspected_dids: Vec<String>,
+    );
+    fn on_conversation_quarantine_cleared(&self, convo_id: String, via: FFIQuarantineExitReason);
+}
+
+/// Adapter so a UniFFI OrchestratorEventCallback can be installed via the
+/// internal OrchestratorEventObserver trait the orchestrator core uses.
+struct EventCallbackAdapter(Arc<dyn OrchestratorEventCallback>);
+
+impl crate::orchestrator::event_observer::OrchestratorEventObserver for EventCallbackAdapter {
+    fn on_conversation_quarantined(
+        &self,
+        convo_id: &str,
+        reason: crate::orchestrator::types::QuarantineReason,
+        suspected_dids: Vec<String>,
+    ) {
+        self.0.on_conversation_quarantined(
+            convo_id.to_string(),
+            qreason_to_ffi(reason),
+            suspected_dids,
+        );
+    }
+    fn on_conversation_quarantine_cleared(
+        &self,
+        convo_id: &str,
+        via: crate::orchestrator::types::QuarantineExitReason,
+    ) {
+        self.0
+            .on_conversation_quarantine_cleared(convo_id.to_string(), qexit_to_ffi(via));
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Error type for the bridge
 // ═══════════════════════════════════════════════════════════════════════════
@@ -561,6 +663,13 @@ pub enum OrchestratorBridgeError {
     /// available for this device") from transport-level failures.
     #[error("Server error: status={status}, body={body}")]
     ServerError { status: u16, body: String },
+    /// Layer 3 quarantine: send/encrypt or auto-rejoin was refused because the
+    /// conversation is in Quarantined state. Platforms should surface this to
+    /// the UI (banner + disabled composer) and only clear via
+    /// user_confirmed_manual_reset, server-pushed groupResetEvent, or a healthy
+    /// peer commit.
+    #[error("Conversation {convo_id} is quarantined ({reason})")]
+    ConversationQuarantined { convo_id: String, reason: String },
 }
 
 impl From<OrchestratorError> for OrchestratorBridgeError {
@@ -591,6 +700,9 @@ impl From<OrchestratorError> for OrchestratorBridgeError {
             }
             OrchestratorError::ServerError { status, body } => {
                 OrchestratorBridgeError::ServerError { status, body }
+            }
+            OrchestratorError::ConversationQuarantined { convo_id, reason } => {
+                OrchestratorBridgeError::ConversationQuarantined { convo_id, reason }
             }
             other => OrchestratorBridgeError::Api {
                 message: other.to_string(),
@@ -1998,6 +2110,45 @@ impl OrchestratorBridge {
             .map_err(|e| OrchestratorBridgeError::Mls {
                 message: e.to_string(),
             })
+    }
+
+    // -- Layer 3 Quarantine FFI --
+
+    /// Install (or replace) the Layer 3 event callback. Pass None to detach.
+    pub fn set_event_callback(&self, callback: Option<Box<dyn OrchestratorEventCallback>>) {
+        let observer: Option<
+            Arc<dyn crate::orchestrator::event_observer::OrchestratorEventObserver>,
+        > = callback.map(|cb| {
+            let arc: Arc<dyn OrchestratorEventCallback> = Arc::from(cb);
+            let adapter: Arc<dyn crate::orchestrator::event_observer::OrchestratorEventObserver> =
+                Arc::new(EventCallbackAdapter(arc));
+            adapter
+        });
+        crate::async_runtime::block_on(self.inner.set_event_observer(observer));
+    }
+
+    /// Snapshot of a conversation quarantine state, if any.
+    pub fn get_conversation_quarantine_state(
+        &self,
+        convo_id: String,
+    ) -> Option<FFIQuarantineState> {
+        crate::async_runtime::block_on(self.inner.get_conversation_quarantine_state(&convo_id)).map(
+            |q| FFIQuarantineState {
+                reason: qreason_to_ffi(q.reason),
+                since_ms: q.since_ms,
+                suspected_dids: q.suspected_dids,
+            },
+        )
+    }
+
+    /// User explicitly tapped Reset conversation in the UI. Reports a vote
+    /// to the server (spec section 8.6 quorum) and clears local quarantine.
+    pub fn user_confirmed_manual_reset(
+        &self,
+        convo_id: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.user_confirmed_manual_reset(&convo_id))?;
+        Ok(())
     }
 }
 

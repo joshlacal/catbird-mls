@@ -286,10 +286,7 @@ impl MLSContext {
                 );
             }
             Err(e) => {
-                crate::warn_log!(
-                    "[MLS-FFI] KP reconcile on init failed (non-fatal): {:?}",
-                    e
-                );
+                crate::warn_log!("[MLS-FFI] KP reconcile on init failed (non-fatal): {:?}", e);
             }
         }
 
@@ -1217,7 +1214,7 @@ impl MLSContext {
 
             let planned_ref = crate::metadata::planned_metadata_reference_json(
                 crate::metadata::current_metadata_reference(group).as_ref(),
-                false /* post-Phase-A: legacy 0xff00 path retired */,
+                false, /* post-Phase-A: legacy 0xff00 path retired */
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata ref: {:?}", e)))?;
@@ -1449,7 +1446,7 @@ impl MLSContext {
                 inner_ctx.with_group(&gid, |group, provider, signer| {
                     let planned_reference_json = crate::metadata::planned_metadata_reference_json(
                         crate::metadata::current_metadata_reference(group).as_ref(),
-                        false /* post-Phase-A: legacy 0xff00 path retired */,
+                        false, /* post-Phase-A: legacy 0xff00 path retired */
                         false,
                     )
                     .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
@@ -3271,13 +3268,8 @@ impl MLSContext {
         crate::info_log!("[MLS-FFI] process_welcome: Calling StagedWelcome::new_from_welcome...");
         let staged_result = {
             let provider = &inner.provider;
-            StagedWelcome::new_from_welcome(
-                provider,
-                &join_config,
-                welcome,
-                None,
-            )
-            .and_then(|staged| staged.into_group(provider))
+            StagedWelcome::new_from_welcome(provider, &join_config, welcome, None)
+                .and_then(|staged| staged.into_group(provider))
         };
 
         let mut group = match staged_result {
@@ -3285,7 +3277,10 @@ impl MLSContext {
             Err(e) => {
                 crate::error_log!("[MLS-FFI] ❌ ERROR: StagedWelcome processing failed!");
                 crate::error_log!("[MLS-FFI] ERROR: OpenMLS error details: {:?}", e);
-                crate::error_log!("[MLS-FFI] ERROR: Error type: {}", std::any::type_name_of_val(&e));
+                crate::error_log!(
+                    "[MLS-FFI] ERROR: Error type: {}",
+                    std::any::type_name_of_val(&e)
+                );
 
                 // On NoMatchingKeyPackage, the welcome's target hash is by
                 // definition not in OpenMLS storage. If we have a manifest
@@ -3332,11 +3327,17 @@ impl MLSContext {
                 return Err(match e {
                     WelcomeError::NoMatchingKeyPackage => {
                         crate::error_log!("[MLS-FFI] ❌ NoMatchingKeyPackage: Welcome references a key package not in local storage");
-                        MLSError::no_matching_key_package("Welcome references a key package not found in local storage")
+                        MLSError::no_matching_key_package(
+                            "Welcome references a key package not found in local storage",
+                        )
                     }
                     WelcomeError::NoMatchingEncryptionKey => {
-                        crate::error_log!("[MLS-FFI] ❌ NoMatchingEncryptionKey: Encryption key not in storage");
-                        MLSError::no_matching_key_package("No matching encryption key found in storage")
+                        crate::error_log!(
+                            "[MLS-FFI] ❌ NoMatchingEncryptionKey: Encryption key not in storage"
+                        );
+                        MLSError::no_matching_key_package(
+                            "No matching encryption key found in storage",
+                        )
                     }
                     other => {
                         crate::error_log!("[MLS-FFI] DIAGNOSTIC: Unhandled WelcomeError variant");
@@ -4283,7 +4284,7 @@ impl MLSContext {
 
             let planned_reference_json = crate::metadata::planned_metadata_reference_json(
                 crate::metadata::current_metadata_reference(group).as_ref(),
-                false /* post-Phase-A: legacy 0xff00 path retired */,
+                false, /* post-Phase-A: legacy 0xff00 path retired */
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;

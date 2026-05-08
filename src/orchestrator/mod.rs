@@ -3,6 +3,7 @@ pub mod constants;
 pub mod credentials;
 pub mod devices;
 pub mod error;
+pub mod event_observer;
 pub mod groups;
 pub mod key_packages;
 pub mod messaging;

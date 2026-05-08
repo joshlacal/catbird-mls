@@ -87,10 +87,7 @@ fn metadata_leaf_extension_capabilities() -> [ExtensionType; 3] {
 }
 
 fn metadata_required_extension_capabilities() -> [ExtensionType; 2] {
-    [
-        ExtensionType::RatchetTree,
-        ExtensionType::AppDataDictionary,
-    ]
+    [ExtensionType::RatchetTree, ExtensionType::AppDataDictionary]
 }
 
 fn metadata_proposal_capabilities() -> [ProposalType; 1] {
@@ -2737,7 +2734,12 @@ impl MLSContext {
                         .iter()
                         .copied()
                         .filter(|t| {
-                            !matches!(t, ExtensionType::Unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE))
+                            !matches!(
+                                t,
+                                ExtensionType::Unknown(
+                                    metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE
+                                )
+                            )
                         })
                         .collect()
                 })
@@ -3212,7 +3214,7 @@ impl MLSContext {
 
             let planned_reference_json = metadata::planned_metadata_reference_json(
                 metadata::current_metadata_reference(group).as_ref(),
-                false /* post-Phase-A: legacy 0xff00 path retired */,
+                false, /* post-Phase-A: legacy 0xff00 path retired */
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;

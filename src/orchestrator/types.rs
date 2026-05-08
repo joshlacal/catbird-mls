@@ -181,6 +181,25 @@ pub enum ConversationState {
         /// wire format is portable across platforms and wasm32.
         notified_at_ms: i64,
     },
+    /// Layer 3 quarantine: the orchestrator has classified one or more
+    /// recent failures as caused by a peer's malformed commit / framing /
+    /// validation, not by local state loss. Entering this state suppresses
+    /// every auto-rejoin / External-Commit path on this conversation, so
+    /// that one buggy peer cannot drag healthy clients into an epoch storm.
+    /// Sends are blocked; reads continue to work. Exits via:
+    ///   1. `groupResetEvent` from the server (transitions to `ResetPending`),
+    ///   2. a healthy peer commit merging successfully (transitions to
+    ///      `Active`), or
+    ///   3. user-confirmed manual reset.
+    ///
+    /// Stored on disk via `MLSStorageBackend::mark_quarantined` so the
+    /// state survives orchestrator restart. `since_ms` is Unix milliseconds
+    /// (i64) - same portability rationale as `ResetPending.notified_at_ms`,
+    /// keeps the wire format wasm32-compatible.
+    Quarantined {
+        reason: QuarantineReason,
+        since_ms: i64,
+    },
     Failed,
 }
 
@@ -193,9 +212,63 @@ impl ConversationState {
             ConversationState::ForkDetected => "fork_detected",
             ConversationState::NeedsRejoin => "needs_rejoin",
             ConversationState::ResetPending { .. } => "reset_pending",
+            ConversationState::Quarantined { .. } => "quarantined",
             ConversationState::Failed => "failed",
         }
     }
+}
+
+/// Why a conversation was quarantined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineReason {
+    /// One peer produced 3 or more peer-bad failures (Signal C).
+    PeerBadCommit,
+    /// 2 or more distinct peers produced peer-bad failures within 60s.
+    MultiPeerBadCommits,
+    /// 3 or more distinct message IDs failed framing within 120s (Signal D).
+    RepeatedFramingFailures,
+}
+
+impl QuarantineReason {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            QuarantineReason::PeerBadCommit => "peer_bad_commit",
+            QuarantineReason::MultiPeerBadCommits => "multi_peer_bad_commits",
+            QuarantineReason::RepeatedFramingFailures => "repeated_framing_failures",
+        }
+    }
+}
+
+/// Why a conversation exited quarantine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuarantineExitReason {
+    /// A healthy peer's commit merged successfully.
+    PeerCommitSucceeded,
+    /// Server pushed a groupResetEvent; transitioned to ResetPending.
+    ServerReset,
+    /// User explicitly tapped Reset conversation in the UI.
+    UserConfirmedReset,
+}
+
+impl QuarantineExitReason {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            QuarantineExitReason::PeerCommitSucceeded => "peer_commit_succeeded",
+            QuarantineExitReason::ServerReset => "server_reset",
+            QuarantineExitReason::UserConfirmedReset => "user_confirmed_reset",
+        }
+    }
+}
+
+/// Snapshot of a conversation quarantine state, returned to FFI clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineState {
+    pub reason: QuarantineReason,
+    pub since_ms: i64,
+    /// DIDs of peers Signal C identified. Empty when only Signal D tripped.
+    pub suspected_dids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -67,3 +67,102 @@ fn test_min_rejoin_interval_is_global() {
         "Global MIN_REJOIN_INTERVAL should block different conversations"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `clear_for_fresh_reset` regression tests for the 2026-05-02 deadlock fix.
+//
+// The bug: `MLSOrchestrator::persist_reset_pending_state` previously called
+// `RecoveryTracker::clear`, which armed `last_global_rejoin_at`. That arming
+// blocked `try_first_responder_bootstrap` (which lives behind
+// `enforce_rejoin_backoff`) for ≥30 s after every server-pushed reset event,
+// creating the deadlock where two clients sat behind their own gates waiting
+// for the other to bootstrap.
+//
+// `clear_for_fresh_reset` is the new method that wipes per-convo failure
+// history without arming the global gate or recording a fake "successful
+// rejoin." These tests pin that contract so the bug can't silently come back.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_clear_for_fresh_reset_does_not_arm_global_gate() {
+    let mut tracker = RecoveryTracker::new(3);
+
+    // Sanity: empty tracker doesn't gate anything.
+    assert!(!tracker.should_skip("convo-y"));
+
+    // Server-pushed reset arrives for convo-x. This is NOT an attempt by
+    // this client; the gate must remain open.
+    tracker.clear_for_fresh_reset("convo-x");
+
+    assert!(
+        !tracker.should_skip("convo-y"),
+        "clear_for_fresh_reset must not arm the global rejoin gate \
+         (regression: arming the gate here is what blocked first-responder \
+         bootstrap for ≥30 s after every reset)"
+    );
+    assert!(
+        !tracker.should_skip("convo-x"),
+        "clear_for_fresh_reset must not arm the gate even for the convo it was called on \
+         — the imminent first-responder bootstrap has to be reachable on the next sync tick"
+    );
+}
+
+#[test]
+fn test_clear_for_fresh_reset_preserves_existing_global_gate() {
+    let mut tracker = RecoveryTracker::new(3);
+
+    // Arm the global gate via a real failure on convo-a.
+    tracker.record_failure("convo-a");
+    assert!(
+        tracker.should_skip("convo-b"),
+        "Sanity: gate should be armed by record_failure"
+    );
+
+    // Reset event for an unrelated convo arrives. Must not unarm the gate.
+    tracker.clear_for_fresh_reset("convo-c");
+
+    assert!(
+        tracker.should_skip("convo-b"),
+        "clear_for_fresh_reset must not unarm an already-armed global gate \
+         — the gate was set by a real attempt and still carries valid spiral protection"
+    );
+}
+
+#[test]
+fn test_clear_for_fresh_reset_clears_per_convo_failures() {
+    let mut tracker = RecoveryTracker::new(3);
+
+    // Two failures stack up on convo-x.
+    tracker.record_failure("convo-x");
+    tracker.record_failure("convo-x");
+    assert_eq!(tracker.failed_attempts("convo-x"), 2);
+
+    // Server reset wipes the per-convo failure counter — fresh start.
+    tracker.clear_for_fresh_reset("convo-x");
+    assert_eq!(
+        tracker.failed_attempts("convo-x"),
+        0,
+        "clear_for_fresh_reset must reset the per-convo failure counter to 0 \
+         so the fresh reset's bootstrap doesn't inherit prior backoff"
+    );
+}
+
+#[test]
+fn test_clear_for_fresh_reset_clears_per_convo_cooldown() {
+    let mut tracker = RecoveryTracker::new(3);
+
+    // One failure: per-convo cooldown is now active for convo-x.
+    tracker.record_failure("convo-x");
+    assert!(
+        tracker.cooldown_remaining("convo-x").is_some(),
+        "Sanity: per-convo cooldown should be active after one failure"
+    );
+
+    // Server reset wipes it.
+    tracker.clear_for_fresh_reset("convo-x");
+    assert!(
+        tracker.cooldown_remaining("convo-x").is_none(),
+        "clear_for_fresh_reset must clear the per-convo cooldown \
+         (the global gate may still apply, but THAT one isn't this method's job)"
+    );
+}

@@ -70,6 +70,25 @@ where
 
         tracing::debug!(conversation_id, "Sending message");
 
+        // Layer 3: refuse send when the conversation is quarantined. Surfaces
+        // a structured error to the platform so the UI can disable the composer.
+        if let Some(q) = self
+            .recovery_tracker()
+            .lock()
+            .await
+            .quarantine_snapshot(conversation_id)
+        {
+            tracing::warn!(
+                conversation_id,
+                reason = q.reason.tag(),
+                "send refused: conversation quarantined (Layer 3)"
+            );
+            return Err(OrchestratorError::ConversationQuarantined {
+                convo_id: conversation_id.to_string(),
+                reason: q.reason.tag().to_string(),
+            });
+        }
+
         let group_id_bytes = hex::decode(conversation_id)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
@@ -528,6 +547,32 @@ where
                     conversation_id = %envelope.conversation_id,
                     "Decryption failed"
                 );
+                // Layer 3: classify peer-bad before falling through to fork/rejoin
+                // counters. Peer-bad failures must NOT advance fork-detection or
+                // NeedsRejoin counters --- those drive auto-External-Commits, which
+                // is exactly the cascade we are trying to break.
+                let local_epoch = self.mls_context().get_epoch(group_id_bytes.clone()).ok();
+                let msg_epoch_for_class = self
+                    .group_states()
+                    .lock()
+                    .await
+                    .get(&envelope.conversation_id)
+                    .map(|gs| gs.epoch)
+                    .unwrap_or(0);
+                if Self::classify_peer_bad(&e, local_epoch, msg_epoch_for_class) {
+                    let msg_id = envelope.server_message_id.clone().unwrap_or_else(|| {
+                        format!("unknown-{}", chrono::Utc::now().timestamp_millis())
+                    });
+                    let trigger = {
+                        let mut tracker = self.recovery_tracker().lock().await;
+                        tracker.record_peer_bad_commit(&envelope.conversation_id, &msg_id, None)
+                    };
+                    if let Some(reason) = trigger {
+                        self.enter_quarantine(&envelope.conversation_id, reason)
+                            .await;
+                    }
+                    return Err(OrchestratorError::from(e));
+                }
                 // Track consecutive decrypt failures for fork detection + divergence recovery
                 {
                     let mut counts = self.decrypt_fail_counts().lock().await;
@@ -680,6 +725,24 @@ where
                         merged_epoch,
                         "Merged incoming staged commit"
                     );
+                    // Layer 3: a healthy peer commit clears the rolling peer-bad
+                    // observation buffer and (if quarantined) auto-exits quarantine.
+                    {
+                        let mut tracker = self.recovery_tracker().lock().await;
+                        tracker.record_healthy_peer_commit(&envelope.conversation_id);
+                    }
+                    if self
+                        .recovery_tracker()
+                        .lock()
+                        .await
+                        .is_quarantined(&envelope.conversation_id)
+                    {
+                        self.exit_quarantine(
+                            &envelope.conversation_id,
+                            crate::orchestrator::types::QuarantineExitReason::PeerCommitSucceeded,
+                        )
+                        .await;
+                    }
                 }
                 Err(e) => {
                     // Merge failure: the staged commit was popped from

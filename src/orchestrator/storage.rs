@@ -119,6 +119,26 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         Ok(())
     }
 
+    /// Persist a Layer 3 quarantine transition.
+    ///
+    /// reason_tag is the snake_case tag from QuarantineReason::tag() so
+    /// the wire format is stable across orchestrator versions.
+    /// since_ms is Unix-millis when quarantine was entered.
+    /// Mirrors mark_reset_pending: no-op default, Phase-3 platforms override.
+    async fn mark_quarantined(
+        &self,
+        _conversation_id: &str,
+        _reason_tag: &str,
+        _since_ms: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear any persisted quarantine payload after exit.
+    async fn clear_quarantine(&self, _conversation_id: &str) -> Result<()> {
+        Ok(())
+    }
+
     // -- Messages --
 
     /// Store a decrypted message.

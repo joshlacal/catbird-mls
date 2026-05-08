@@ -798,9 +798,7 @@ where
 
         // 4. Merge locally (advances epoch and applies the new
         //    MetadataReference in AppDataDictionary).
-        let merge_epoch = self
-            .mls_context()
-            .merge_pending_commit(group_id_bytes)?;
+        let merge_epoch = self.mls_context().merge_pending_commit(group_id_bytes)?;
 
         tracing::info!(
             conversation_id,

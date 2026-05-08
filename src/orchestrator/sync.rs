@@ -512,14 +512,7 @@ where
             // uniformly. Per-convo cursor tracking would be more efficient
             // but is deferred — `messageExists` is cheap and correct.
             match self
-                .fetch_messages(
-                    conversation_id,
-                    None,
-                    20,
-                    None,
-                    None,
-                    None,
-                )
+                .fetch_messages(conversation_id, None, 20, None, None, None)
                 .await
             {
                 Ok((msgs, _)) => {

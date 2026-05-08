@@ -74,6 +74,14 @@ pub enum OrchestratorError {
     /// paths — see task #43.
     #[error("Group not joined locally for conversation {convo_id}")]
     NotJoined { convo_id: String },
+
+    /// Layer 3 quarantine guard: the conversation is in Quarantined state, so
+    /// send/encrypt and any auto-External-Commit path is refused. Callers should
+    /// surface this to the UI (banner + disabled composer) and only clear via
+    /// user-confirmed manual reset, server-pushed groupResetEvent, or a healthy
+    /// peer commit.
+    #[error("Conversation {convo_id} is quarantined ({reason})")]
+    ConversationQuarantined { convo_id: String, reason: String },
 }
 
 impl OrchestratorError {

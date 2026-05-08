@@ -31,18 +31,31 @@ pub struct RecoveryTracker {
     /// Failed rejoin attempts per conversation.
     failed_rejoins: HashMap<String, (u32, Instant)>,
     /// Last successful rejoin per conversation. Used to gate sync-triggered
-    /// rejoins via `SUCCESSFUL_REJOIN_COOLDOWN` — prevents epoch-inflation
-    /// spirals where a device successfully external-commits, loses local MLS
-    /// state, and re-rejoins on every sync cycle.
+    /// rejoins via SUCCESSFUL_REJOIN_COOLDOWN.
     successful_rejoins: HashMap<String, Instant>,
-    /// Last successful or attempted rejoin on ANY conversation (regardless of outcome).
-    /// Used to enforce a hard global minimum interval between any rejoin attempts,
-    /// preventing epoch inflation spirals even when attempts succeed.
+    /// Last rejoin attempt on ANY conversation.
     pub(crate) last_global_rejoin_at: Option<Instant>,
     /// Maximum rejoin attempts before giving up.
     max_attempts: u32,
+    /// Layer 3: per-conversation rolling window of recent peer-bad commit
+    /// observations. Each entry is (message_id, observed_at, sender_did).
+    /// sender_did is None when StagedCommitInfo wasnt available (Signal D).
+    /// Cleared on healthy peer commit and on quarantine entry.
+    peer_bad_commits:
+        HashMap<String, std::collections::VecDeque<(String, Instant, Option<String>)>>,
+    /// Layer 3: in-memory quarantine state per conversation. Mirrors what
+    /// is persisted via MLSStorageBackend::mark_quarantined; the in-memory
+    /// copy lets the orchestrator gate sends/rejoins without an async DB hop.
+    quarantined: HashMap<String, QuarantineSnapshot>,
 }
 
+/// In-memory quarantine snapshot, mirroring ConversationState::Quarantined.
+#[derive(Debug, Clone)]
+pub(crate) struct QuarantineSnapshot {
+    pub reason: crate::orchestrator::types::QuarantineReason,
+    pub since_ms: i64,
+    pub suspected_dids: Vec<String>,
+}
 impl RecoveryTracker {
     pub fn new(max_attempts: u32) -> Self {
         Self {
@@ -50,6 +63,8 @@ impl RecoveryTracker {
             successful_rejoins: HashMap::new(),
             last_global_rejoin_at: None,
             max_attempts,
+            peer_bad_commits: HashMap::new(),
+            quarantined: HashMap::new(),
         }
     }
 
@@ -101,8 +116,15 @@ impl RecoveryTracker {
         }
     }
 
-    /// Whether a conversation should skip rejoin (max attempts, cooldown, or min interval).
+    /// Whether a conversation should skip rejoin (max attempts, cooldown, min
+    /// interval, or Layer 3 quarantine).
     pub fn should_skip(&self, convo_id: &str) -> bool {
+        // Layer 3: quarantine is the strongest gate --- the orchestrator must
+        // never auto-rejoin a quarantined conversation. Exit only via server
+        // reset, healthy peer commit, or user-confirmed manual reset.
+        if self.quarantined.contains_key(convo_id) {
+            return true;
+        }
         if self.is_maxed_out(convo_id) || self.cooldown_remaining(convo_id).is_some() {
             return true;
         }
@@ -140,6 +162,43 @@ impl RecoveryTracker {
         self.last_global_rejoin_at = Some(now);
     }
 
+    /// Clear per-conversation rejoin failure tracking for a server-initiated
+    /// reset. Unlike [`clear`], this does NOT arm `last_global_rejoin_at` and
+    /// does NOT insert into `successful_rejoins` — a server-pushed reset is
+    /// not an attempt by THIS client and must not gate the imminent
+    /// first-responder bootstrap that follows.
+    ///
+    /// The 30 s `MIN_REJOIN_INTERVAL` and 5 m `SUCCESSFUL_REJOIN_COOLDOWN`
+    /// gates exist to prevent epoch-inflation spirals from this device's own
+    /// rejoin loop. They are the wrong gate for a fresh `groupResetEvent`,
+    /// where the server has just told us the prior group is dead and we need
+    /// to either fetch a new Welcome or bootstrap immediately.
+    ///
+    /// Call site: [`persist_reset_pending_state`]. Previously called `clear`,
+    /// which armed the global gate on every server reset and blocked
+    /// `try_first_responder_bootstrap` for ≥30 s — the deadlock observed in
+    /// the 2026-05-02 prod incident where two clients sat behind their own
+    /// gates waiting for the other to bootstrap, sometimes for 24+ minutes.
+    pub fn clear_for_fresh_reset(&mut self, convo_id: &str) {
+        // Server-driven reset is the strongest possible "start from scratch"
+        // signal; wipe any in-flight client-side failure history. If a
+        // per-convo backoff was running for an unrelated reason (e.g., epoch
+        // divergence retries), the prior failure count would otherwise stack
+        // on top of the fresh reset's bootstrap attempt.
+        if let Some((attempts, _)) = self.failed_rejoins.get(convo_id) {
+            if *attempts > 0 {
+                tracing::info!(
+                    convo_id,
+                    wiped_attempts = attempts,
+                    "clear_for_fresh_reset: wiping prior per-convo failure history (server reset trumps client retry counter)"
+                );
+            }
+        }
+        self.failed_rejoins.remove(convo_id);
+        // Intentionally do NOT touch `successful_rejoins` or
+        // `last_global_rejoin_at`. See doc comment above for rationale.
+    }
+
     /// Remaining cooldown imposed by a recent SUCCESSFUL rejoin on this
     /// conversation. Applies to sync-triggered rejoins only (see
     /// `should_attempt_sync_rejoin`). `None` means no cooldown active.
@@ -151,6 +210,140 @@ impl RecoveryTracker {
         } else {
             Some(constants::SUCCESSFUL_REJOIN_COOLDOWN - elapsed)
         }
+    }
+
+    // ----- Layer 3 Quarantine -----
+
+    /// Snapshot of the current quarantine state for convo_id, if any.
+    pub fn quarantine_snapshot(&self, convo_id: &str) -> Option<super::types::QuarantineState> {
+        self.quarantined
+            .get(convo_id)
+            .map(|q| super::types::QuarantineState {
+                reason: q.reason,
+                since_ms: q.since_ms,
+                suspected_dids: q.suspected_dids.clone(),
+            })
+    }
+
+    /// Whether convo_id is currently quarantined.
+    pub fn is_quarantined(&self, convo_id: &str) -> bool {
+        self.quarantined.contains_key(convo_id)
+    }
+
+    /// Record a peer-bad commit observation. Returns Some(reason) when the
+    /// thresholds are crossed and the caller should mark the conversation
+    /// quarantined; returns None when below threshold.
+    pub fn record_peer_bad_commit(
+        &mut self,
+        convo_id: &str,
+        message_id: &str,
+        sender_did: Option<String>,
+    ) -> Option<crate::orchestrator::types::QuarantineReason> {
+        if self.is_quarantined(convo_id) {
+            return None;
+        }
+        let now = Instant::now();
+        let buf = self
+            .peer_bad_commits
+            .entry(convo_id.to_string())
+            .or_default();
+        let max_window = constants::QUARANTINE_FRAMING_WINDOW;
+        while let Some((_, ts, _)) = buf.front() {
+            if now.duration_since(*ts) > max_window {
+                buf.pop_front();
+            } else {
+                break;
+            }
+        }
+        while buf.len() >= constants::QUARANTINE_RING_CAPACITY {
+            buf.pop_front();
+        }
+        buf.push_back((message_id.to_string(), now, sender_did.clone()));
+
+        if let Some(ref did) = sender_did {
+            let count = buf
+                .iter()
+                .filter(|(_, _, s)| s.as_deref() == Some(did))
+                .count() as u32;
+            if count >= constants::QUARANTINE_SINGLE_PEER_HITS {
+                return Some(crate::orchestrator::types::QuarantineReason::PeerBadCommit);
+            }
+        }
+
+        let multi_window = constants::QUARANTINE_MULTI_PEER_WINDOW;
+        let mut distinct_peers = std::collections::HashSet::new();
+        for (_, ts, s) in buf.iter() {
+            if now.duration_since(*ts) > multi_window {
+                continue;
+            }
+            if let Some(did) = s {
+                distinct_peers.insert(did.clone());
+            }
+        }
+        if distinct_peers.len() >= constants::QUARANTINE_MULTI_PEER_DISTINCT {
+            return Some(crate::orchestrator::types::QuarantineReason::MultiPeerBadCommits);
+        }
+
+        let framing_window = constants::QUARANTINE_FRAMING_WINDOW;
+        let mut distinct_msgs = std::collections::HashSet::new();
+        for (mid, ts, _) in buf.iter() {
+            if now.duration_since(*ts) > framing_window {
+                continue;
+            }
+            distinct_msgs.insert(mid.clone());
+        }
+        if distinct_msgs.len() >= constants::QUARANTINE_FRAMING_DISTINCT_MSGS {
+            return Some(crate::orchestrator::types::QuarantineReason::RepeatedFramingFailures);
+        }
+
+        None
+    }
+
+    /// A healthy peer commit merged successfully. Clears rolling buffer.
+    pub fn record_healthy_peer_commit(&mut self, convo_id: &str) {
+        self.peer_bad_commits.remove(convo_id);
+    }
+
+    /// Mark the conversation quarantined.
+    pub fn mark_quarantined(
+        &mut self,
+        convo_id: &str,
+        reason: crate::orchestrator::types::QuarantineReason,
+        since_ms: i64,
+        suspected_dids: Vec<String>,
+    ) {
+        self.quarantined.insert(
+            convo_id.to_string(),
+            QuarantineSnapshot {
+                reason,
+                since_ms,
+                suspected_dids,
+            },
+        );
+        self.peer_bad_commits.remove(convo_id);
+        self.failed_rejoins.remove(convo_id);
+    }
+
+    /// Clear quarantine. Returns true if there was a snapshot to clear.
+    pub fn clear_quarantine(&mut self, convo_id: &str) -> bool {
+        self.quarantined.remove(convo_id).is_some()
+    }
+
+    /// Distinct DIDs in the rolling buffer (for entry events).
+    pub fn suspected_dids_for(&self, convo_id: &str) -> Vec<String> {
+        let Some(buf) = self.peer_bad_commits.get(convo_id) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (_, _, s) in buf.iter() {
+            if let Some(did) = s {
+                if seen.insert(did.clone()) {
+                    out.push(did.clone());
+                }
+            }
+        }
+        out
     }
 }
 
@@ -427,6 +620,23 @@ where
     }
 
     pub(crate) async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
+        // Layer 3: quarantined conversations never participate in sync-driven
+        // rejoins. This must run before the rejoin_lock check so that a
+        // background task holding the lock for a quarantine bookkeeping op
+        // does not mask the gate.
+        if self
+            .recovery_tracker()
+            .lock()
+            .await
+            .is_quarantined(convo_id)
+        {
+            tracing::debug!(
+                convo_id,
+                "Skipping sync rejoin: conversation quarantined (Layer 3)"
+            );
+            crate::info_log!("[gate] convo={} REJECT: quarantined (Layer 3)", convo_id);
+            return false;
+        }
         let rejoin_lock = self.rejoin_lock(convo_id).await;
         let lock_guard = match rejoin_lock.try_lock() {
             Ok(guard) => guard,
@@ -677,6 +887,28 @@ where
 
     async fn force_rejoin_unlocked(&self, convo_id: &str, user_did: &str) -> Result<()> {
         tracing::info!(convo_id, "Attempting force rejoin via External Commit");
+
+        // Layer 3: refuse force_rejoin entry on a quarantined conversation.
+        // Quarantine means we have classified recent failures as peer-bad; an
+        // External Commit here would just feed the epoch storm we are trying
+        // to break. Caller must clear quarantine via server reset, healthy
+        // peer commit, or user_confirmed_manual_reset.
+        if let Some(q) = self
+            .recovery_tracker()
+            .lock()
+            .await
+            .quarantine_snapshot(convo_id)
+        {
+            tracing::warn!(
+                convo_id,
+                reason = q.reason.tag(),
+                "force_rejoin refused: conversation is quarantined (Layer 3)"
+            );
+            return Err(OrchestratorError::ConversationQuarantined {
+                convo_id: convo_id.to_string(),
+                reason: q.reason.tag().to_string(),
+            });
+        }
 
         // Check GroupInfo 404 circuit breaker
         {
@@ -1101,8 +1333,15 @@ where
             "Attempting to join group (Welcome first, External Commit fallback)"
         );
 
-        // Step 1: Try Welcome
-        match self.api_client().get_welcome(convo_id).await {
+        // Step 1: Try Welcome.
+        //
+        // Track the outcome so the next steps can decide whether to attempt
+        // first-responder bootstrap. We only try bootstrap when Welcome was
+        // unavailable in an "expected" way (404/410/processing-fail) — a
+        // real network error means we can't trust that the welcome isn't
+        // sitting on the server, and we shouldn't race-bootstrap blind.
+        let welcome_unavailable_expected: bool = match self.api_client().get_welcome(convo_id).await
+        {
             Ok(welcome_data) => {
                 tracing::info!(
                     convo_id,
@@ -1116,7 +1355,7 @@ where
                     identity_bytes,
                     Some(self.config().group_config.clone()),
                 ).map_err(|e| {
-                    tracing::warn!(convo_id, error = %e, "Welcome processing failed, will try External Commit");
+                    tracing::warn!(convo_id, error = %e, "Welcome processing failed, will try first-responder bootstrap or External Commit");
                     e
                 });
 
@@ -1185,16 +1424,20 @@ where
                         return Ok(epoch);
                     }
                     Err(_) => {
-                        // Welcome processing failed — fall through to External Commit
+                        // Welcome bytes returned but processing failed — treat
+                        // as "expected" for bootstrap eligibility (the welcome
+                        // is malformed for us; bootstrapping into a fresh
+                        // group is the right next step if state is ResetPending).
                         tracing::info!(
                             convo_id,
-                            "Welcome processing failed, falling back to External Commit"
+                            "Welcome processing failed, will try first-responder bootstrap (if ResetPending) before External Commit"
                         );
+                        true
                     }
                 }
             }
             Err(e) => {
-                // Check if this is a 404/410 (Welcome not available) vs a real error
+                // Check if this is a 404/410 (Welcome not available) vs a real error.
                 let is_expected = match &e {
                     OrchestratorError::ServerError { status, .. } => {
                         *status == 404 || *status == 410
@@ -1204,67 +1447,119 @@ where
                 if is_expected {
                     tracing::info!(
                         convo_id,
-                        "No Welcome available (device-sync scenario), using External Commit"
+                        "No Welcome available — will try first-responder bootstrap (if ResetPending) before External Commit"
                     );
+                    true
                 } else {
-                    tracing::warn!(convo_id, error = %e, "Welcome fetch failed, falling back to External Commit");
+                    tracing::warn!(convo_id, error = %e, "Welcome fetch failed with non-404/410 error; skipping bootstrap, falling back to External Commit");
+                    false
+                }
+            }
+        };
+
+        // Step 2: First-responder bootstrap (spec §8.5 Phase 1) — try BEFORE
+        // External Commit when state is `ResetPending` and Welcome was
+        // unavailable in the expected shape.
+        //
+        // Pre-fix this lived AFTER External Commit failed. That ordering was
+        // wrong for two reasons:
+        //   (i)  EC against a freshly-emptied group (which is exactly the
+        //        post-reset shape) cannot succeed — the server has wiped the
+        //        membership/epoch state atomically with the reset transaction.
+        //        Running EC first burned a network round-trip + a per-convo
+        //        failure counter increment for no benefit.
+        //   (ii) The 30s MIN_REJOIN_INTERVAL gate sits in front of
+        //        `enforce_rejoin_backoff`. Combined with the fact that
+        //        `record_group_reset` USED to arm that gate (fixed; see
+        //        `clear_for_fresh_reset`), bootstrap was effectively
+        //        unreachable for ≥30 s after every reset, and could remain
+        //        unreachable indefinitely if the gate kept re-arming.
+        //
+        // Gating strictly on `ResetPending` — NOT on the welcome failure shape
+        // alone — is deliberate: never-joined conversations also produce "no
+        // Welcome + no GroupInfo" but must not trigger bootstrap (they belong
+        // to External Commit / standard join).
+        //
+        // Bootstrap itself is NOT gated by `enforce_rejoin_backoff`:
+        //   - bootstrap is a server-serialized CREATE keyed by
+        //     `crypto_sessions UNIQUE (conversation_id, generation)`, not a
+        //     competitive External Commit, so the gate's epoch-inflation
+        //     concern doesn't apply.
+        //   - the race-loser path inside `try_first_responder_bootstrap`
+        //     (409 AlreadyBootstrapped) cleanly drops local pre-bootstrap
+        //     state and lets the next sync tick consume the winner's Welcome.
+        //
+        // With ≤8-device groups the first-responder race resolves within one
+        // or two sync cycles (one winner, others see AlreadyBootstrapped 409 →
+        // Welcome on the next pass).
+        if welcome_unavailable_expected {
+            if let Some(payload) = self.reset_pending_payload(convo_id).await {
+                tracing::info!(
+                    convo_id,
+                    new_group_id = %payload.new_group_id,
+                    reset_generation = payload.reset_generation,
+                    "join_or_rejoin: Welcome unavailable + ResetPending; attempting first-responder bootstrap before External Commit"
+                );
+                match self
+                    .try_first_responder_bootstrap(convo_id, &payload, &user_did)
+                    .await
+                {
+                    Ok(epoch) => {
+                        // Bootstrap winner. State already transitioned to
+                        // Active inside try_first_responder_bootstrap; just
+                        // clear the rejoin failure tracker (idempotent if no
+                        // prior failures).
+                        self.clear_rejoin_failures(convo_id).await;
+                        return Ok(epoch);
+                    }
+                    Err(boot_err) if boot_err.is_bootstrap_already_bootstrapped() => {
+                        // Race loser. try_first_responder_bootstrap already
+                        // dropped the local pre-bootstrap group and KEPT
+                        // reset_pending so the deferred-recovery loop will
+                        // retry Welcome on the next sync tick and pick up
+                        // the winner's published Welcome. Do NOT fall through
+                        // to External Commit — EC against the freshly-bootstrapped
+                        // empty group can't succeed, and we'd burn the global
+                        // gate for nothing. Returning the 409 propagates to the
+                        // sync loop, which schedules the next tick.
+                        tracing::info!(
+                            convo_id,
+                            "first-responder bootstrap race lost; awaiting winner's Welcome on next sync tick (no External Commit fallback)"
+                        );
+                        return Err(boot_err);
+                    }
+                    Err(boot_err) => {
+                        // Other bootstrap error (network, auth, malformed
+                        // GroupInfo export, etc.). Local pre-bootstrap group
+                        // was already dropped inside try_first_responder_bootstrap.
+                        // Fall through to External Commit so we still get a
+                        // chance to recover via the legacy path.
+                        tracing::warn!(
+                            convo_id,
+                            bootstrap_error = %boot_err,
+                            "first-responder bootstrap failed (non-409); falling back to External Commit"
+                        );
+                    }
                 }
             }
         }
 
-        // Step 2: Fall back to External Commit (backoff applies here, not to Welcome)
+        // Step 3: External Commit fallback (gated by enforce_rejoin_backoff).
+        //
+        // Bootstrap was tried above when applicable; this path is for:
+        //   - never-joined convos (state != ResetPending)
+        //   - convos where bootstrap failed for a non-409 reason
+        //   - convos where Welcome failed with a non-404/410 error and we
+        //     skipped bootstrap defensively
         self.enforce_rejoin_backoff(convo_id).await?;
         let rejoin_result = self.force_rejoin_unlocked(convo_id, &user_did).await;
         match rejoin_result {
             Ok(()) => {
                 self.clear_rejoin_failures(convo_id).await;
-                return Ok(self.local_group_epoch(convo_id).await.unwrap_or(0));
+                Ok(self.local_group_epoch(convo_id).await.unwrap_or(0))
             }
             Err(err) => {
                 self.record_rejoin_failure(convo_id).await;
-                // Step 3: First-responder bootstrap (spec §8.5 Phase 1).
-                //
-                // Reachable only when BOTH Welcome and ExternalCommit failed
-                // AND the conversation is in `ResetPending` — i.e. the server
-                // has issued a `groupResetEvent`, the new group is empty
-                // (no Welcome, no GroupInfo published yet), and someone needs
-                // to bootstrap. We're a candidate.
-                //
-                // Gating strictly on `ResetPending` — NOT on the failure
-                // shape — is deliberate: never-joined conversations also
-                // produce "no Welcome + no GroupInfo" but must not trigger
-                // bootstrap. The 30s MIN_REJOIN_INTERVAL + per-convo backoff
-                // already throttle the loop; with ≤8-device groups the
-                // first-responder race resolves within one or two sync
-                // cycles (one winner, others see AlreadyBootstrapped 409 →
-                // Welcome on the next pass).
-                if let Some(payload) = self.reset_pending_payload(convo_id).await {
-                    tracing::info!(
-                        convo_id,
-                        new_group_id = %payload.new_group_id,
-                        reset_generation = payload.reset_generation,
-                        "join_or_rejoin: Welcome+ECommit unavailable, attempting first-responder bootstrap"
-                    );
-                    match self
-                        .try_first_responder_bootstrap(convo_id, &payload, &user_did)
-                        .await
-                    {
-                        Ok(epoch) => {
-                            self.clear_rejoin_failures(convo_id).await;
-                            return Ok(epoch);
-                        }
-                        Err(boot_err) => {
-                            tracing::warn!(
-                                convo_id,
-                                bootstrap_error = %boot_err,
-                                fallthrough_error = %err,
-                                "First-responder bootstrap failed; returning original rejoin error"
-                            );
-                            // Fall through to the original error so the
-                            // deferred-recovery loop applies normal backoff.
-                        }
-                    }
-                }
                 Err(err)
             }
         }
@@ -1352,12 +1647,17 @@ where
     /// 2. Delete the old local MLS group (looked up via `group_states` so we
     ///    drop the *pre-reset* group, not whatever `hex::decode(convo_id)`
     ///    happens to yield).
-    /// 3. Reset the per-conversation `RecoveryTracker` counter to 0 — this is
-    ///    a fresh start from the server, not a continuation of a client-side
-    ///    retry loop.
+    /// 3. Reset the per-conversation `RecoveryTracker` counter to 0 via
+    ///    `clear_for_fresh_reset` — this is a fresh start from the server,
+    ///    not a continuation of a client-side retry loop. **Critically**,
+    ///    this does NOT arm `last_global_rejoin_at`; the global gate is for
+    ///    our own rejoin attempts, and a server-pushed reset is not such an
+    ///    attempt. (Pre-fix this used `clear`, which armed the gate and
+    ///    blocked the imminent first-responder bootstrap for ≥30 s — see
+    ///    `RecoveryTracker::clear_for_fresh_reset` doc.)
     /// 4. Update `group_states[convo_id].group_id = new_group_id_hex` and
     ///    `mark_needs_rejoin` so the next sync-loop pass routes this convo
-    ///    through `join_or_rejoin` (Welcome → ExternalCommit → bootstrap).
+    ///    through `join_or_rejoin` (Welcome → bootstrap → ExternalCommit).
     ///
     /// `new_group_id` is the raw bytes of the new MLS group id (not hex).
     pub async fn record_group_reset(
@@ -1529,12 +1829,14 @@ where
     /// 2. Delete the old local MLS group (looked up via `group_states` so we
     ///    drop the *pre-reset* group, not whatever `hex::decode(convo_id)`
     ///    happens to yield).
-    /// 3. Reset the per-conversation `RecoveryTracker` counter to 0 — this is
-    ///    a fresh start from the server, not a continuation of a client-side
-    ///    retry loop.
+    /// 3. Reset the per-conversation `RecoveryTracker` counter to 0 via
+    ///    `clear_for_fresh_reset` — this is a fresh start from the server,
+    ///    not a continuation of a client-side retry loop. Crucially, this
+    ///    does NOT arm `last_global_rejoin_at`; that gate is for our own
+    ///    rejoin attempts, and a server-pushed reset is not such an attempt.
     /// 4. Update `group_states[convo_id].group_id = new_group_id_hex` and
     ///    `mark_needs_rejoin` so the next sync-loop pass routes this convo
-    ///    through `join_or_rejoin` (Welcome → ExternalCommit → bootstrap).
+    ///    through `join_or_rejoin` (Welcome → bootstrap → ExternalCommit).
     async fn persist_reset_pending_state(
         &self,
         convo_id: &str,
@@ -1601,10 +1903,22 @@ where
         }
 
         // 3. Clear any in-flight rejoin bookkeeping — server reset is a fresh
-        // start, not a continuation of our attempt counter.
-        {
+        // start, not a continuation of our attempt counter. Crucially, this
+        // does NOT arm `last_global_rejoin_at`: that gate gates OUR rejoin
+        // attempts, and a server-pushed reset is not such an attempt. See
+        // `RecoveryTracker::clear_for_fresh_reset` for the bug history.
+        let was_quarantined = {
             let mut tracker = self.recovery_tracker().lock().await;
-            tracker.clear(convo_id);
+            tracker.clear_for_fresh_reset(convo_id);
+            tracker.clear_quarantine(convo_id)
+        };
+        if was_quarantined {
+            // Server reset trumps client-side quarantine; persist the cleared
+            // quarantine row alongside the new ResetPending payload.
+            if let Err(e) = self.storage().clear_quarantine(convo_id).await {
+                tracing::warn!(convo_id, error = %e, "Failed to clear persisted quarantine on server reset");
+            }
+            tracing::info!(convo_id, "[QUARANTINE-CLEAR] via server reset");
         }
         self.groupinfo_404_tracker().lock().await.clear(convo_id);
 
@@ -2000,6 +2314,207 @@ where
 
         Ok(DesyncSeverity::None)
     }
+
+    /// Classify whether an incoming-message processing failure looks peer-bad.
+    /// Used by Layer 3 quarantine to drive .
+    ///
+    /// Signal A (error class) is the primary input. Signal B (epoch context)
+    /// gates Signal A: if the local epoch is BEHIND the message epoch we lean
+    /// self-bad regardless of the error class, because we may simply be missing
+    /// commits and decrypt failures here are normal catch-up.
+    pub(crate) fn classify_peer_bad(
+        err: &crate::MLSError,
+        local_epoch: Option<u64>,
+        message_epoch: u64,
+    ) -> bool {
+        // Signal B: if we are behind the message, we are catching up; not peer-bad.
+        if let Some(local) = local_epoch {
+            if local < message_epoch {
+                return false;
+            }
+        }
+        // Wrong-epoch is the canonical self-bad signal.
+        if err.is_wrong_epoch() {
+            return false;
+        }
+        match err {
+            crate::MLSError::InvalidCommit
+            | crate::MLSError::WireFormatPolicyViolation { .. }
+            | crate::MLSError::InvalidProposalRef
+            | crate::MLSError::TlsCodec(_) => true,
+            crate::MLSError::CommitProcessingFailed { message } => {
+                let m = message.to_lowercase();
+                m.contains("leafnodevalidation")
+                    || m.contains("invalidgroupinfo")
+                    || m.contains("authenticationfailed")
+                    || m.contains("invalidcredential")
+                    || m.contains("proposalvalidationerror")
+            }
+            crate::MLSError::OpenMLS(message) => {
+                let m = message.to_lowercase();
+                m.contains("leafnodevalidation")
+                    || m.contains("invalidgroupinfo")
+                    || m.contains("authenticationfailed")
+                    || m.contains("invalidcredential")
+                    || m.contains("proposalvalidationerror")
+            }
+            // Self-bad / ambiguous classes: treat as not peer-bad so we do not
+            // tip the classifier.
+            _ => false,
+        }
+    }
+
+    /// Public API: snapshot of a conversation quarantine state, if any.
+    pub async fn get_conversation_quarantine_state(
+        &self,
+        convo_id: &str,
+    ) -> Option<crate::orchestrator::types::QuarantineState> {
+        self.recovery_tracker()
+            .lock()
+            .await
+            .quarantine_snapshot(convo_id)
+    }
+
+    /// Internal: mark a conversation quarantined and persist the transition.
+    /// Emits the on_conversation_quarantined event when an event callback is
+    /// installed.
+    pub(crate) async fn enter_quarantine(
+        &self,
+        convo_id: &str,
+        reason: crate::orchestrator::types::QuarantineReason,
+    ) {
+        let since_ms = chrono::Utc::now().timestamp_millis();
+        let suspected_dids = {
+            let tracker = self.recovery_tracker().lock().await;
+            tracker.suspected_dids_for(convo_id)
+        };
+        {
+            let mut tracker = self.recovery_tracker().lock().await;
+            tracker.mark_quarantined(convo_id, reason, since_ms, suspected_dids.clone());
+        }
+        {
+            let mut states = self.conversation_states().lock().await;
+            states.insert(
+                convo_id.to_string(),
+                ConversationState::Quarantined { reason, since_ms },
+            );
+        }
+        if let Err(e) = self
+            .storage()
+            .set_conversation_state(
+                convo_id,
+                ConversationState::Quarantined { reason, since_ms },
+            )
+            .await
+        {
+            tracing::warn!(convo_id, error = %e, "Failed to persist Quarantined state");
+        }
+        if let Err(e) = self
+            .storage()
+            .mark_quarantined(convo_id, reason.tag(), since_ms)
+            .await
+        {
+            tracing::warn!(convo_id, error = %e, "Failed to persist quarantine payload");
+        }
+        tracing::warn!(
+            convo_id,
+            reason = reason.tag(),
+            suspected_count = suspected_dids.len(),
+            "[QUARANTINE-ENTER] conversation quarantined"
+        );
+        self.notify_quarantined(convo_id, reason, suspected_dids)
+            .await;
+    }
+
+    /// Internal: clear quarantine, transition to Active, persist, and emit event.
+    pub(crate) async fn exit_quarantine(
+        &self,
+        convo_id: &str,
+        via: crate::orchestrator::types::QuarantineExitReason,
+    ) {
+        let was = {
+            let mut tracker = self.recovery_tracker().lock().await;
+            tracker.clear_quarantine(convo_id)
+        };
+        if !was {
+            return;
+        }
+        // Conversation state transitions to Active here for PeerCommitSucceeded
+        // and UserConfirmedReset; ServerReset path handles its own transition
+        // (ResetPending) before calling exit_quarantine.
+        if !matches!(
+            via,
+            crate::orchestrator::types::QuarantineExitReason::ServerReset
+        ) {
+            let mut states = self.conversation_states().lock().await;
+            states.insert(convo_id.to_string(), ConversationState::Active);
+            drop(states);
+            if let Err(e) = self
+                .storage()
+                .set_conversation_state(convo_id, ConversationState::Active)
+                .await
+            {
+                tracing::warn!(convo_id, error = %e, "Failed to persist Active state on quarantine exit");
+            }
+        }
+        if let Err(e) = self.storage().clear_quarantine(convo_id).await {
+            tracing::warn!(convo_id, error = %e, "Failed to clear persisted quarantine payload");
+        }
+        tracing::info!(
+            convo_id,
+            via = via.tag(),
+            "[QUARANTINE-CLEAR] conversation quarantine cleared"
+        );
+        self.notify_quarantine_cleared(convo_id, via).await;
+    }
+
+    /// Public API: user-confirmed manual reset. Reports failure to the server
+    /// (so the A7 reset pyramid counts the user vote) and clears local quarantine.
+    pub async fn user_confirmed_manual_reset(&self, convo_id: &str) -> Result<()> {
+        self.check_shutdown().await?;
+        // Report deliberate user vote so server quorum (spec section 8.6) can
+        // include this client. Reason is logged in the structured tracing log.
+        let auth = self.epoch_authenticator_hex(convo_id);
+        if let Err(e) = self
+            .api_client()
+            .report_recovery_failure(
+                convo_id,
+                "user_initiated_quarantine",
+                auth.as_deref(),
+                Some("group_state_unrecoverable"),
+            )
+            .await
+        {
+            tracing::warn!(convo_id, error = %e, "user_confirmed_manual_reset: report_recovery_failure failed (best-effort)");
+        }
+        self.exit_quarantine(
+            convo_id,
+            crate::orchestrator::types::QuarantineExitReason::UserConfirmedReset,
+        )
+        .await;
+        Ok(())
+    }
+
+    pub(crate) async fn notify_quarantined(
+        &self,
+        convo_id: &str,
+        reason: crate::orchestrator::types::QuarantineReason,
+        suspected_dids: Vec<String>,
+    ) {
+        if let Some(obs) = self.current_event_observer().await {
+            obs.on_conversation_quarantined(convo_id, reason, suspected_dids);
+        }
+    }
+
+    pub(crate) async fn notify_quarantine_cleared(
+        &self,
+        convo_id: &str,
+        via: crate::orchestrator::types::QuarantineExitReason,
+    ) {
+        if let Some(obs) = self.current_event_observer().await {
+            obs.on_conversation_quarantine_cleared(convo_id, via);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2074,6 +2589,153 @@ mod tests {
         assert!(
             t.last_global_rejoin_at.is_some(),
             "clear must bump last_global_rejoin_at so MIN_REJOIN_INTERVAL applies"
+        );
+    }
+
+    // ----- Layer 3 quarantine classifier tests -----
+
+    #[test]
+    fn quarantine_two_hits_from_one_peer_does_not_trigger() {
+        let mut t = RecoveryTracker::new(3);
+        let peer = Some("did:plc:abc".to_string());
+        let r1 = t.record_peer_bad_commit("convo", "m1", peer.clone());
+        let r2 = t.record_peer_bad_commit("convo", "m2", peer);
+        assert!(r1.is_none(), "single hit should not trigger");
+        assert!(r2.is_none(), "two hits should not trigger");
+        assert!(!t.is_quarantined("convo"));
+    }
+
+    #[test]
+    fn quarantine_three_hits_from_one_peer_triggers_peer_bad() {
+        let mut t = RecoveryTracker::new(3);
+        let peer = Some("did:plc:abc".to_string());
+        let _ = t.record_peer_bad_commit("convo", "m1", peer.clone());
+        let _ = t.record_peer_bad_commit("convo", "m2", peer.clone());
+        let r3 = t.record_peer_bad_commit("convo", "m3", peer);
+        assert!(
+            matches!(
+                r3,
+                Some(crate::orchestrator::types::QuarantineReason::PeerBadCommit)
+            ),
+            "three hits from one peer must trigger PeerBadCommit, got {:?}",
+            r3
+        );
+    }
+
+    #[test]
+    fn quarantine_two_distinct_peers_triggers_multi_peer() {
+        let mut t = RecoveryTracker::new(3);
+        let r1 = t.record_peer_bad_commit("convo", "m1", Some("did:plc:alpha".to_string()));
+        assert!(r1.is_none());
+        let r2 = t.record_peer_bad_commit("convo", "m2", Some("did:plc:beta".to_string()));
+        assert!(
+            matches!(
+                r2,
+                Some(crate::orchestrator::types::QuarantineReason::MultiPeerBadCommits)
+            ),
+            "two distinct peers within window must trigger MultiPeerBadCommits, got {:?}",
+            r2
+        );
+    }
+
+    #[test]
+    fn quarantine_three_distinct_msgs_no_sender_triggers_framing() {
+        let mut t = RecoveryTracker::new(3);
+        let r1 = t.record_peer_bad_commit("convo", "m1", None);
+        let r2 = t.record_peer_bad_commit("convo", "m2", None);
+        let r3 = t.record_peer_bad_commit("convo", "m3", None);
+        assert!(r1.is_none());
+        assert!(r2.is_none());
+        assert!(
+            matches!(
+                r3,
+                Some(crate::orchestrator::types::QuarantineReason::RepeatedFramingFailures)
+            ),
+            "three distinct messages without sender attribution must trigger framing, got {:?}",
+            r3
+        );
+    }
+
+    #[test]
+    fn healthy_peer_commit_clears_buffer_and_quarantine() {
+        let mut t = RecoveryTracker::new(3);
+        let peer = Some("did:plc:abc".to_string());
+        let _ = t.record_peer_bad_commit("convo", "m1", peer.clone());
+        let _ = t.record_peer_bad_commit("convo", "m2", peer.clone());
+        let r = t.record_peer_bad_commit("convo", "m3", peer);
+        assert!(r.is_some());
+        t.mark_quarantined(
+            "convo",
+            crate::orchestrator::types::QuarantineReason::PeerBadCommit,
+            0,
+            vec!["did:plc:abc".to_string()],
+        );
+        assert!(t.is_quarantined("convo"));
+        t.record_healthy_peer_commit("convo");
+        let cleared = t.clear_quarantine("convo");
+        assert!(cleared);
+        assert!(!t.is_quarantined("convo"));
+    }
+
+    #[test]
+    fn quarantine_blocks_should_skip() {
+        let mut t = RecoveryTracker::new(3);
+        assert!(!t.should_skip("convo"));
+        t.mark_quarantined(
+            "convo",
+            crate::orchestrator::types::QuarantineReason::PeerBadCommit,
+            0,
+            vec![],
+        );
+        assert!(t.should_skip("convo"));
+    }
+
+    #[test]
+    fn record_peer_bad_no_op_when_already_quarantined() {
+        let mut t = RecoveryTracker::new(3);
+        t.mark_quarantined(
+            "convo",
+            crate::orchestrator::types::QuarantineReason::PeerBadCommit,
+            0,
+            vec![],
+        );
+        let r = t.record_peer_bad_commit("convo", "m", Some("did:plc:x".to_string()));
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn quarantine_state_persists_across_mark() {
+        let mut t = RecoveryTracker::new(3);
+        t.mark_quarantined(
+            "convo",
+            crate::orchestrator::types::QuarantineReason::MultiPeerBadCommits,
+            123,
+            vec!["did:plc:a".to_string(), "did:plc:b".to_string()],
+        );
+        let snap = t.quarantine_snapshot("convo").expect("snapshot");
+        assert_eq!(
+            snap.reason,
+            crate::orchestrator::types::QuarantineReason::MultiPeerBadCommits
+        );
+        assert_eq!(snap.since_ms, 123);
+        assert_eq!(snap.suspected_dids.len(), 2);
+    }
+
+    #[test]
+    fn mark_quarantined_clears_failed_rejoins() {
+        let mut t = RecoveryTracker::new(3);
+        t.record_failure("convo");
+        assert_eq!(t.failed_attempts("convo"), 1);
+        t.mark_quarantined(
+            "convo",
+            crate::orchestrator::types::QuarantineReason::PeerBadCommit,
+            0,
+            vec![],
+        );
+        assert_eq!(
+            t.failed_attempts("convo"),
+            0,
+            "failed_rejoins must be cleared on quarantine"
         );
     }
 }

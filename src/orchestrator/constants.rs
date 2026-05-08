@@ -62,3 +62,17 @@ pub const FAILOVER_MIN_DURATION: Duration = Duration::from_secs(120);
 pub const SAFE_EXPORT_EPOCH_BLOB_KEY: u16 = 0;
 /// Component ID for group metadata encryption key (forward-secure within epochs).
 pub const SAFE_EXPORT_METADATA_KEY: u16 = 1;
+
+// Layer 3 Quarantine (defense-in-depth against epoch storms).
+/// One peer producing this many peer-bad commit failures triggers quarantine.
+pub const QUARANTINE_SINGLE_PEER_HITS: u32 = 3;
+/// This many distinct peers within the multi-peer window triggers quarantine.
+pub const QUARANTINE_MULTI_PEER_DISTINCT: usize = 2;
+/// Window for the multi-peer trigger.
+pub const QUARANTINE_MULTI_PEER_WINDOW: Duration = Duration::from_secs(60);
+/// This many distinct message IDs failing within the framing window triggers quarantine.
+pub const QUARANTINE_FRAMING_DISTINCT_MSGS: usize = 3;
+/// Window for the rolling framing trigger (Signal D).
+pub const QUARANTINE_FRAMING_WINDOW: Duration = Duration::from_secs(120);
+/// Maximum entries kept in the per-conversation peer-bad ring buffer.
+pub const QUARANTINE_RING_CAPACITY: usize = 16;

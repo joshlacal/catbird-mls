@@ -119,6 +119,10 @@ where
     pending_staged_commits: Mutex<HashMap<GroupId, PendingCommitMeta>>,
     /// Monotonic counter used to generate handle nonces.
     staged_commit_nonce: Mutex<u64>,
+    /// Layer 3: optional event observer for quarantine entry/exit events.
+    /// Installed via set_event_observer; additive so existing constructors
+    /// keep working without binding regen.
+    event_observer: Mutex<Option<Arc<dyn super::event_observer::OrchestratorEventObserver>>>,
 }
 
 /// Internal bookkeeping for a staged commit.
@@ -199,7 +203,23 @@ where
             fork_detection_states: std::sync::Mutex::new(HashMap::new()),
             pending_staged_commits: Mutex::new(HashMap::new()),
             staged_commit_nonce: Mutex::new(0),
+            event_observer: Mutex::new(None),
         }
+    }
+
+    /// Install (or replace) the Layer 3 event observer. Pass None to detach.
+    pub async fn set_event_observer(
+        &self,
+        observer: Option<Arc<dyn super::event_observer::OrchestratorEventObserver>>,
+    ) {
+        *self.event_observer.lock().await = observer;
+    }
+
+    /// Internal: snapshot the currently-installed observer (cheap: clones an Arc).
+    pub(crate) async fn current_event_observer(
+        &self,
+    ) -> Option<Arc<dyn super::event_observer::OrchestratorEventObserver>> {
+        self.event_observer.lock().await.clone()
     }
 
     /// Initialize the orchestrator for a user.
@@ -231,6 +251,21 @@ where
                                 state = state.tag(),
                                 "Rehydrated conversation state from storage"
                             );
+                            // Layer 3: when rehydrating Quarantined, also mirror
+                            // the state into RecoveryTracker so the in-memory
+                            // gates (should_skip / send preflight / force_rejoin
+                            // guard) fire after restart. Without this mirror the
+                            // gates only consult the tracker map and miss the
+                            // persisted state.
+                            if let ConversationState::Quarantined { reason, since_ms } = &state {
+                                let mut tracker = self.recovery_tracker.lock().await;
+                                tracker.mark_quarantined(
+                                    &convo.conversation_id,
+                                    *reason,
+                                    *since_ms,
+                                    Vec::new(),
+                                );
+                            }
                             states.insert(convo.conversation_id.clone(), state);
                         }
                         Ok(None) => {}
