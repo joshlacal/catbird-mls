@@ -96,43 +96,19 @@ where
         let group_id_bytes = hex::decode(group_id_hex)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
-        // Create conversation on server (metadata is encrypted in MLS extensions, not sent as plaintext)
-        let result = self
-            .api_client()
-            .create_conversation(group_id_hex, filtered_members_ref, None, None, None)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "Server creation failed");
-                e
-            })?;
-
-        let mut convo = result.conversation.clone();
-        let conversation_id = &convo.conversation_id;
-
-        self.storage()
-            .ensure_conversation_exists(user_did, conversation_id, group_id_hex)
-            .await?;
-
-        self.storage()
-            .update_join_info(conversation_id, user_did, JoinMethod::Creator, 0)
-            .await?;
-
-        // Cache conversation
-        self.conversations()
-            .lock()
-            .await
-            .insert(group_id_hex.to_string(), convo.clone());
-
-        // If initial members were provided, add them via proper MLS add_members
-        // This generates the commit + Welcome messages needed for them to join
+        // If initial members were provided, stage the MLS add before calling
+        // createConvo. The server's createConvo path stores the Welcome and
+        // treats that bootstrap add as the initial epoch-1 group material; if
+        // we create first and then call commitGroupChange/addMembers, the DS
+        // has already seeded the row at epoch 1 and rejects our epoch-0 commit.
+        let mut initial_add_result: Option<crate::AddMembersResult> = None;
         if let Some(members) = filtered_members_ref {
             if !members.is_empty() {
                 tracing::info!(
                     count = members.len(),
-                    "Adding initial members via MLS add_members"
+                    "Staging initial members for createConvo Welcome path"
                 );
 
-                // Fetch key packages for the members
                 let member_dids: Vec<String> = members.to_vec();
                 let key_packages = self.api_client().get_key_packages(&member_dids).await?;
 
@@ -178,53 +154,61 @@ where
                         .insert(hash.to_vec(), Instant::now());
                 }
 
-                // Send commit + Welcome to server
-                let server_result = self
-                    .api_client()
-                    .add_members(
-                        group_id_hex,
-                        &member_dids,
-                        &add_result.commit_data,
-                        Some(&add_result.welcome_data),
-                    )
-                    .await?;
-
-                if !server_result.success {
-                    if let Err(e) = self
-                        .mls_context()
-                        .clear_pending_commit(group_id_bytes.clone())
-                    {
-                        tracing::warn!(error = %e, "Failed to clear pending commit after server rejection");
-                    }
-                    return Err(OrchestratorError::Api(
-                        "Server rejected initial member addition".into(),
-                    ));
-                }
-
-                // Best-effort receipt storage
-                if let Some(ref receipt) = server_result.receipt {
-                    if let Err(e) = self.storage().store_sequencer_receipt(receipt).await {
-                        tracing::warn!(error = %e, "Failed to store sequencer receipt");
-                    }
-                }
-
-                // Merge the pending commit to advance local epoch
-                let merged_epoch = self
-                    .mls_context()
-                    .merge_pending_commit(group_id_bytes.clone())?;
-
-                // Update convo epoch
-                convo.epoch = merged_epoch;
-
-                // Cleanup old epoch secrets after initial member add
-                self.cleanup_epoch_secrets_if_needed(group_id_hex, merged_epoch)
-                    .await;
-
-                tracing::info!(
-                    epoch = merged_epoch,
-                    "Initial members added, epoch advanced"
-                );
+                initial_add_result = Some(add_result);
             }
+        }
+
+        // Create conversation on server (metadata is encrypted in MLS extensions, not sent as plaintext).
+        let result = self
+            .api_client()
+            .create_conversation(
+                group_id_hex,
+                filtered_members_ref,
+                None,
+                initial_add_result
+                    .as_ref()
+                    .map(|add| add.commit_data.as_slice()),
+                initial_add_result
+                    .as_ref()
+                    .map(|add| add.welcome_data.as_slice()),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Server creation failed");
+                e
+            })?;
+
+        let mut convo = result.conversation.clone();
+        let conversation_id = &convo.conversation_id;
+
+        self.storage()
+            .ensure_conversation_exists(user_did, conversation_id, group_id_hex)
+            .await?;
+
+        self.storage()
+            .update_join_info(conversation_id, user_did, JoinMethod::Creator, 0)
+            .await?;
+
+        // Cache conversation
+        self.conversations()
+            .lock()
+            .await
+            .insert(group_id_hex.to_string(), convo.clone());
+
+        if initial_add_result.is_some() {
+            let merged_epoch = self
+                .mls_context()
+                .merge_pending_commit(group_id_bytes.clone())?;
+
+            convo.epoch = merged_epoch;
+
+            self.cleanup_epoch_secrets_if_needed(group_id_hex, merged_epoch)
+                .await;
+
+            tracing::info!(
+                epoch = merged_epoch,
+                "Initial members committed via createConvo Welcome path"
+            );
         }
 
         // Get epoch from FFI (authoritative)
