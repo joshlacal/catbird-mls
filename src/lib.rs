@@ -1,6 +1,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
 pub mod blob_crypto;
+pub mod field_encryption;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;
 #[cfg(not(target_arch = "wasm32"))]

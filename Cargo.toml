@@ -52,6 +52,9 @@ web-time = "1.1"
 scopeguard = "1.2"
 tracing = "0.1"
 rand = "0.8"
+hkdf = "0.12"
+hmac = "0.12"
+subtle = "2"
 
 # Voice message processing (non-wasm only — audiopus_sys's opus C lib has no wasm32 sysroot)
 
