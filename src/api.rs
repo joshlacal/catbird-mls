@@ -6205,6 +6205,131 @@ pub fn mls_decrypt_avatar_blob(
         .map_err(|e| MLSError::Internal(format!("{e}")))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Field-level (envelope) encryption — UniFFI surface
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Exposes `crate::field_encryption` (AES-256-GCM payload encryption +
+// HKDF-derived per-conversation keys + HMAC-SHA256 entry chain) to Swift /
+// Kotlin via UniFFI. The content root key is held in-memory inside
+// `MLSContextInner` and supplied by the platform; this layer never persists
+// it.
+#[uniffi::export]
+impl MLSContext {
+    /// Install the content root key used by all subsequent
+    /// encrypt/decrypt/hmac calls. Must be exactly 32 bytes.
+    pub fn set_content_root_key(&self, key: Vec<u8>) -> Result<(), MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| MLSError::lock_poisoned(format!("inner lock: {}", e)))?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.set_content_root_key(key)
+    }
+
+    /// Drop the in-memory content root key.
+    pub fn clear_content_root_key(&self) {
+        if let Ok(guard) = self.inner.lock() {
+            if let Some(inner) = guard.as_ref() {
+                inner.clear_content_root_key();
+            }
+        }
+    }
+
+    /// Encrypt `plaintext` for `conversation_id` using the installed content
+    /// root key. Returns the wire-format bytes: `[version(1) | nonce(12) |
+    /// ciphertext+tag]`.
+    pub fn encrypt_message_payload(
+        &self,
+        conversation_id: String,
+        plaintext: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| MLSError::lock_poisoned(format!("inner lock: {}", e)))?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.with_content_root_key(|root| {
+            crate::field_encryption::encrypt_payload(root, &conversation_id, &plaintext)
+                .map_err(|e| MLSError::Cryptography(e.to_string()))
+        })
+    }
+
+    /// Decrypt a wire-format payload produced by
+    /// [`encrypt_message_payload`] for the same `conversation_id`.
+    pub fn decrypt_message_payload(
+        &self,
+        conversation_id: String,
+        wire: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| MLSError::lock_poisoned(format!("inner lock: {}", e)))?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.with_content_root_key(|root| {
+            crate::field_encryption::decrypt_payload(root, &conversation_id, &wire)
+                .map_err(|e| MLSError::Cryptography(e.to_string()))
+        })
+    }
+
+    /// Compute the chained HMAC tag for a message entry:
+    /// `HMAC(K_hmac, prev_hmac || message_id || payload_wire)`. Use
+    /// `prev_hmac = None` for the first entry in a chain (seeded with zeros).
+    pub fn compute_message_hmac(
+        &self,
+        conversation_id: String,
+        prev_hmac: Option<Vec<u8>>,
+        message_id: String,
+        payload_wire: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| MLSError::lock_poisoned(format!("inner lock: {}", e)))?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.with_content_root_key(|root| {
+            let h = crate::field_encryption::compute_entry_hmac(
+                root,
+                &conversation_id,
+                prev_hmac.as_deref(),
+                &message_id,
+                &payload_wire,
+            )
+            .map_err(|e| MLSError::Cryptography(e.to_string()))?;
+            Ok(h.to_vec())
+        })
+    }
+
+    /// Constant-time verify a previously-computed HMAC tag against the
+    /// chain inputs.
+    pub fn verify_message_hmac(
+        &self,
+        conversation_id: String,
+        prev_hmac: Option<Vec<u8>>,
+        message_id: String,
+        payload_wire: Vec<u8>,
+        expected: Vec<u8>,
+    ) -> Result<bool, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| MLSError::lock_poisoned(format!("inner lock: {}", e)))?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.with_content_root_key(|root| {
+            crate::field_encryption::verify_entry_hmac(
+                root,
+                &conversation_id,
+                prev_hmac.as_deref(),
+                &message_id,
+                &payload_wire,
+                &expected,
+            )
+            .map_err(|e| MLSError::Cryptography(e.to_string()))
+        })
+    }
+}
+
 #[cfg(test)]
 mod padding_tests {
     use super::*;

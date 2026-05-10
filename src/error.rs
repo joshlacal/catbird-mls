@@ -130,6 +130,24 @@ pub enum MLSError {
     #[error("Operation not supported: {reason}")]
     OperationNotSupported { reason: String },
 
+    /// Invalid argument supplied to an FFI / public API call (e.g. wrong
+    /// byte length for a fixed-size key). Mirrors `InvalidInput` but uses a
+    /// single positional field for terse call sites in
+    /// `mls_context::set_content_root_key` and similar.
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
+    /// Caller invoked an operation that requires state which has not been
+    /// initialised yet (e.g. encrypting a payload before the content root
+    /// key has been set).
+    #[error("Invalid state: {0}")]
+    InvalidState(String),
+
+    /// Cryptography (AEAD / HKDF / HMAC) error surfaced from
+    /// `crate::field_encryption` across the FFI boundary.
+    #[error("Cryptography error: {0}")]
+    Cryptography(String),
+
     /// Fencing mismatch between the epoch the server advanced to and the
     /// epoch the locally-staged commit would produce. Returned by
     /// `confirm_commit` when `server_epoch` does not equal the plan's

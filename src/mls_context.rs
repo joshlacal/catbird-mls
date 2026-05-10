@@ -664,6 +664,11 @@ pub struct MLSContext {
     // Per-context replay detection and sequencing
     pub(crate) processed_messages: HashMap<Vec<u8>, Vec<(u64, u32)>>,
     pub(crate) sequence_counters: HashMap<Vec<u8>, u64>,
+    /// Ephemeral in-memory content root key used for field-level (envelope)
+    /// encryption of message payloads (see `crate::field_encryption`). Set by
+    /// the platform after MLS group sync exports the per-conversation secret;
+    /// never persisted by this layer.
+    content_root_key: std::sync::RwLock<Option<Vec<u8>>>,
 }
 
 use openmls::group::MlsGroupJoinConfig;
@@ -1155,6 +1160,7 @@ impl MLSContext {
                 manifest_storage,
                 processed_messages: HashMap::new(),
                 sequence_counters: HashMap::new(),
+                content_root_key: std::sync::RwLock::new(None),
             },
             vec![openmls_interrupt_handle, manifest_interrupt_handle],
         ))
@@ -3558,5 +3564,58 @@ impl MLSContext {
 
             Ok((msg_bytes, ref_bytes))
         })
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Field-level (envelope) encryption: content root key plumbing
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These methods manage an ephemeral, in-memory content root key used by
+// `crate::field_encryption` to encrypt/decrypt message payloads and chain
+// HMACs. The key is platform-supplied (typically exported from MLS group
+// state on the platform layer) and never persisted by this layer.
+impl MLSContext {
+    /// Install the content root key. Must be exactly
+    /// [`crate::field_encryption::KEY_LEN`] bytes (32).
+    pub fn set_content_root_key(&self, key: Vec<u8>) -> Result<(), MLSError> {
+        if key.len() != crate::field_encryption::KEY_LEN {
+            return Err(MLSError::InvalidArgument(format!(
+                "content root key must be {} bytes, got {}",
+                crate::field_encryption::KEY_LEN,
+                key.len(),
+            )));
+        }
+        let mut guard = self
+            .content_root_key
+            .write()
+            .map_err(|e| MLSError::lock_poisoned(format!("content_root_key write: {}", e)))?;
+        *guard = Some(key);
+        Ok(())
+    }
+
+    /// Drop the in-memory content root key. Subsequent calls to
+    /// `with_content_root_key` will return `MLSError::InvalidState` until
+    /// `set_content_root_key` is called again.
+    pub fn clear_content_root_key(&self) {
+        if let Ok(mut guard) = self.content_root_key.write() {
+            *guard = None;
+        }
+    }
+
+    /// Run `f` with a borrowed reference to the current content root key,
+    /// returning `MLSError::InvalidState` if no key has been installed.
+    pub(crate) fn with_content_root_key<F, T>(&self, f: F) -> Result<T, MLSError>
+    where
+        F: FnOnce(&[u8]) -> Result<T, MLSError>,
+    {
+        let guard = self
+            .content_root_key
+            .read()
+            .map_err(|e| MLSError::lock_poisoned(format!("content_root_key read: {}", e)))?;
+        let key = guard
+            .as_ref()
+            .ok_or_else(|| MLSError::InvalidState("content root key not set".to_string()))?;
+        f(key)
     }
 }
