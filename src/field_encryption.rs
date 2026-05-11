@@ -145,6 +145,51 @@ pub fn verify_entry_hmac(
     Ok(bool::from(computed.ct_eq(expected)))
 }
 
+/// Walk a sequence of stored transcript entries and verify each row's
+/// `entry_hmac` matches the recomputed HMAC against the previous row's
+/// computed HMAC. Returns `Ok(None)` if the chain is intact, or
+/// `Ok(Some(idx))` for the first entry index that fails verification.
+///
+/// Caller passes entries in **sequence-number order**, including any
+/// tombstones (their `entry_hmac` and `payload_wire` must remain intact
+/// after soft-delete for the chain to validate).
+///
+/// **Not exposed via UniFFI:** the walker takes lifetime-bound borrows and
+/// is awkward to express across FFI. Platforms that need integrity walks
+/// should iterate their DB rows in sequence order and call the already-
+/// exposed `verify_message_hmac` per row, threading the previously
+/// computed HMAC manually.
+pub fn verify_chain<'a, I>(
+    root_key: &[u8],
+    conversation_id: &str,
+    entries: I,
+) -> Result<Option<usize>, FieldEncryptionError>
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8], &'a [u8])>, // (message_id, payload_wire, stored_hmac)
+{
+    if root_key.len() != KEY_LEN {
+        return Err(FieldEncryptionError::InvalidKeyLength(root_key.len()));
+    }
+    let mut prev: Option<[u8; HMAC_LEN]> = None;
+    for (idx, (message_id, payload_wire, expected)) in entries.into_iter().enumerate() {
+        let computed = compute_entry_hmac(
+            root_key,
+            conversation_id,
+            prev.as_ref().map(|b| b.as_slice()),
+            message_id,
+            payload_wire,
+        )?;
+        // Constant-time compare to avoid leaking position-of-divergence on
+        // timing channels (defensive, even though this is a local op).
+        use subtle::ConstantTimeEq;
+        if !bool::from(computed.ct_eq(expected)) {
+            return Ok(Some(idx));
+        }
+        prev = Some(computed);
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +303,137 @@ mod tests {
         let short = [0u8; 16];
         let err = encrypt_payload(&short, "conv-1", b"x").unwrap_err();
         assert!(matches!(err, FieldEncryptionError::InvalidKeyLength(16)));
+    }
+
+    #[test]
+    fn verify_chain_accepts_intact_chain() {
+        let root = fixed_root_key();
+        let conv = "conv-1";
+        let wire1 = encrypt_payload(&root, conv, b"m1-plaintext").unwrap();
+        let h1 = compute_entry_hmac(&root, conv, None, "m1", &wire1).unwrap();
+        let wire2 = encrypt_payload(&root, conv, b"m2-plaintext").unwrap();
+        let h2 = compute_entry_hmac(&root, conv, Some(&h1), "m2", &wire2).unwrap();
+        let wire3 = encrypt_payload(&root, conv, b"m3-plaintext").unwrap();
+        let h3 = compute_entry_hmac(&root, conv, Some(&h2), "m3", &wire3).unwrap();
+
+        let entries: Vec<(&str, &[u8], &[u8])> = vec![
+            ("m1", &wire1, &h1),
+            ("m2", &wire2, &h2),
+            ("m3", &wire3, &h3),
+        ];
+        assert_eq!(verify_chain(&root, conv, entries).unwrap(), None);
+    }
+
+    #[test]
+    fn verify_chain_finds_first_tampered_index() {
+        let root = fixed_root_key();
+        let conv = "conv-1";
+        let wire1 = encrypt_payload(&root, conv, b"a").unwrap();
+        let h1 = compute_entry_hmac(&root, conv, None, "m1", &wire1).unwrap();
+        let wire2 = encrypt_payload(&root, conv, b"b").unwrap();
+        let h2 = compute_entry_hmac(&root, conv, Some(&h1), "m2", &wire2).unwrap();
+        let wire3 = encrypt_payload(&root, conv, b"c").unwrap();
+        let h3 = compute_entry_hmac(&root, conv, Some(&h2), "m3", &wire3).unwrap();
+        let wire4 = encrypt_payload(&root, conv, b"d").unwrap();
+        // Tamper: corrupt the HMAC of entry 3 (zero-indexed).
+        let mut tampered_h4 = compute_entry_hmac(&root, conv, Some(&h3), "m4", &wire4).unwrap();
+        tampered_h4[0] ^= 0xff;
+
+        let entries: Vec<(&str, &[u8], &[u8])> = vec![
+            ("m1", &wire1, &h1),
+            ("m2", &wire2, &h2),
+            ("m3", &wire3, &h3),
+            ("m4", &wire4, &tampered_h4),
+        ];
+        assert_eq!(verify_chain(&root, conv, entries).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn verify_chain_intact_with_tombstoned_entries() {
+        // Tombstones in the field-level scheme keep payload_wire + entry_hmac
+        // unchanged (only `is_tombstone` / `deleted_at` flags change). The
+        // chain must still validate because the verifier doesn't know or care
+        // about the tombstone flag.
+        let root = fixed_root_key();
+        let conv = "conv-1";
+        let w1 = encrypt_payload(&root, conv, b"keep-1").unwrap();
+        let h1 = compute_entry_hmac(&root, conv, None, "m1", &w1).unwrap();
+        let w2 = encrypt_payload(&root, conv, b"tombstoned").unwrap();
+        let h2 = compute_entry_hmac(&root, conv, Some(&h1), "m2", &w2).unwrap();
+        let w3 = encrypt_payload(&root, conv, b"keep-3").unwrap();
+        let h3 = compute_entry_hmac(&root, conv, Some(&h2), "m3", &w3).unwrap();
+
+        // Caller still presents all three rows in sequence order even though
+        // row 2 is "tombstoned" from the UI's perspective.
+        let entries: Vec<(&str, &[u8], &[u8])> = vec![
+            ("m1", &w1, &h1),
+            ("m2", &w2, &h2),
+            ("m3", &w3, &h3),
+        ];
+        assert_eq!(verify_chain(&root, conv, entries).unwrap(), None);
+    }
+
+    #[test]
+    fn verify_chain_detects_dropped_tombstone_payload() {
+        // If a "tombstone" mistakenly zeroed out payload_wire (the wrong
+        // implementation of tombstoning), the chain breaks because the
+        // computed HMAC over the zeroed payload no longer matches the
+        // originally-stored entry_hmac.
+        let root = fixed_root_key();
+        let conv = "conv-1";
+        let w1 = encrypt_payload(&root, conv, b"a").unwrap();
+        let h1 = compute_entry_hmac(&root, conv, None, "m1", &w1).unwrap();
+        let w2 = encrypt_payload(&root, conv, b"b").unwrap();
+        let h2 = compute_entry_hmac(&root, conv, Some(&h1), "m2", &w2).unwrap();
+        let w3 = encrypt_payload(&root, conv, b"c").unwrap();
+        let h3 = compute_entry_hmac(&root, conv, Some(&h2), "m3", &w3).unwrap();
+
+        // Simulate a "wrong" tombstone that nukes the payload.
+        let empty: &[u8] = &[];
+        let entries: Vec<(&str, &[u8], &[u8])> = vec![
+            ("m1", &w1, &h1),
+            ("m2", empty, &h2), // payload was wiped — h2 no longer matches
+            ("m3", &w3, &h3),
+        ];
+        assert_eq!(verify_chain(&root, conv, entries).unwrap(), Some(1));
+    }
+
+    #[test]
+    fn verify_chain_empty_iterator_is_ok() {
+        let root = fixed_root_key();
+        let entries: Vec<(&str, &[u8], &[u8])> = vec![];
+        assert_eq!(verify_chain(&root, "conv-1", entries).unwrap(), None);
+    }
+
+    #[test]
+    fn verify_chain_rejects_short_root_key() {
+        let short = [0u8; 16];
+        let entries: Vec<(&str, &[u8], &[u8])> = vec![];
+        let err = verify_chain(&short, "conv-1", entries).unwrap_err();
+        assert!(matches!(err, FieldEncryptionError::InvalidKeyLength(16)));
+    }
+
+    #[test]
+    #[ignore = "vector emitter; run with --include-ignored to print"]
+    fn emit_test_vectors() {
+        let root = [0x42u8; KEY_LEN];
+        let conv = "conv-1";
+
+        let ck = derive_content_key(&root, conv).unwrap();
+        println!("content_key = {}", hex::encode(ck));
+        let hk = derive_hmac_key(&root, conv).unwrap();
+        println!("hmac_key    = {}", hex::encode(hk));
+
+        let p1 = [0xABu8; 40];
+        let h1 = compute_entry_hmac(&root, conv, None, "m1", &p1).unwrap();
+        println!("hmac_m1     = {}", hex::encode(h1));
+
+        let p2 = [0xCDu8; 40];
+        let h2 = compute_entry_hmac(&root, conv, Some(&h1), "m2", &p2).unwrap();
+        println!("hmac_m2     = {}", hex::encode(h2));
+
+        let p3 = [0xEFu8; 40];
+        let h3 = compute_entry_hmac(&root, conv, Some(&h2), "m3", &p3).unwrap();
+        println!("hmac_m3     = {}", hex::encode(h3));
     }
 }
