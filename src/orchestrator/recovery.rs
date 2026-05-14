@@ -1006,6 +1006,24 @@ where
 
         // group_id_hex used below when updating group state
 
+        // Track our own External Commit so that when the server fans it back
+        // through `process_incoming` (`messaging.rs:489-503`), the inbound
+        // pipeline recognizes the ciphertext hash as ours and short-circuits
+        // before invoking `decrypt_message`. Mirrors the pattern used by
+        // `groups.rs:151`, `groups.rs:668`, `staged_commit.rs:156`, and
+        // `messaging.rs:181, 371` for all other commit producers. The dedup
+        // key is `sha2::Sha256::digest(ciphertext)`; the entry is evicted
+        // after `OWN_COMMIT_TTL` (`constants.rs`, 300s) by `evict_stale_commits`.
+        {
+            use sha2::{Digest, Sha256};
+            self.evict_stale_commits().await;
+            let commit_hash = Sha256::digest(&ext_commit_result.commit_data).to_vec();
+            self.own_commits()
+                .lock()
+                .await
+                .insert(commit_hash, Instant::now());
+        }
+
         // Get confirmation tag from the new local group state
         let tag_b64 = self
             .mls_context()
