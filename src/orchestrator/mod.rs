@@ -1,6 +1,7 @@
 pub mod api_client;
 pub mod constants;
 pub mod credentials;
+pub mod crypto_provider;
 pub mod devices;
 pub mod error;
 pub mod event_observer;

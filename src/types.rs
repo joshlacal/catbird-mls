@@ -265,13 +265,27 @@ pub struct GroupConfig {
 impl Default for GroupConfig {
     fn default() -> Self {
         Self {
-            max_past_epochs: 5, // Retain 5 past epochs to handle network delays and message reordering
+            max_past_epochs: crate::orchestrator::constants::MAX_PAST_EPOCHS_TO_RETAIN as u32,
             out_of_order_tolerance: 10,
             maximum_forward_distance: 2000,
             max_leaf_lifetime_seconds: 86400 * 90, // 90 days
             group_name: None,
             group_description: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GroupConfig;
+    use crate::orchestrator::constants::MAX_PAST_EPOCHS_TO_RETAIN;
+
+    #[test]
+    fn group_config_default_uses_epoch_retention_constant() {
+        assert_eq!(
+            GroupConfig::default().max_past_epochs,
+            MAX_PAST_EPOCHS_TO_RETAIN as u32
+        );
     }
 }
 

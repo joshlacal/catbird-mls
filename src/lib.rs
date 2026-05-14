@@ -1,7 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
 pub mod blob_crypto;
-pub mod field_encryption;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
@@ -9,6 +8,7 @@ pub mod client_bridge;
 #[cfg(not(target_arch = "wasm32"))]
 mod epoch_storage;
 mod error;
+pub mod field_encryption;
 #[cfg(not(target_arch = "wasm32"))]
 mod hybrid_storage;
 #[cfg(not(target_arch = "wasm32"))]

@@ -6043,6 +6043,7 @@ impl MlsCryptoContext for MLSContext {
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), MLSError> {
         use openmls::prelude::*;
         use tls_codec::Serialize as TlsSerialize;
+
         crate::info_log!(
             "[MLS-FFI] recover_fork_by_readding: group={}, kps={}",
             hex::encode(&group_id),
@@ -6054,23 +6055,83 @@ impl MlsCryptoContext for MLSContext {
             .map_err(|e| MLSError::Internal(format!("Lock failed: {e}")))?;
         let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
         let gid = GroupId::from_slice(&group_id);
-        inner.with_group_mut(&gid, |group, provider| {
-            let mut kps = Vec::new();
-            for kp_bytes in &key_packages {
-                let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
-                    .map_err(|_| MLSError::SerializationError)?;
-                let kp = kp_in
-                    .validate(provider.crypto(), ProtocolVersion::default())
-                    .map_err(|_| MLSError::InvalidKeyPackage)?;
-                kps.push(kp);
+
+        inner.with_group(&gid, |group, provider, signer| {
+            let mut validated_by_identity = std::collections::HashMap::<Vec<u8>, KeyPackage>::new();
+            for (idx, kp_bytes) in key_packages.iter().enumerate() {
+                let kp = if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(kp_bytes) {
+                    match mls_msg.extract() {
+                        MlsMessageBodyIn::KeyPackage(kp_in) => kp_in
+                            .validate(provider.crypto(), ProtocolVersion::default())
+                            .map_err(|_| MLSError::InvalidKeyPackage)?,
+                        _ => {
+                            let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
+                                .map_err(|_| MLSError::SerializationError)?;
+                            kp_in
+                                .validate(provider.crypto(), ProtocolVersion::default())
+                                .map_err(|_| MLSError::InvalidKeyPackage)?
+                        }
+                    }
+                } else {
+                    let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
+                        .map_err(|_| MLSError::SerializationError)?;
+                    kp_in
+                        .validate(provider.crypto(), ProtocolVersion::default())
+                        .map_err(|_| MLSError::InvalidKeyPackage)?
+                };
+
+                let identity = kp.leaf_node().credential().serialized_content().to_vec();
+                if validated_by_identity.insert(identity.clone(), kp).is_some() {
+                    crate::warn_log!(
+                        "[MLS-FFI] recover_fork_by_readding: duplicate key package for identity {} at index {}",
+                        String::from_utf8_lossy(&identity),
+                        idx
+                    );
+                }
             }
-            let (commit, welcome, _gi) = group
-                .recover_fork_by_readding(provider, &[], &kps)
+
+            let own_partition = [group.own_leaf_index()];
+            let builder = group
+                .recover_fork_by_readding(&own_partition)
                 .map_err(|e| MLSError::Internal(format!("Fork recovery failed: {e}")))?;
+
+            let mut readd_key_packages = Vec::new();
+            for member in builder.complement_partition() {
+                let identity = member.credential.serialized_content().to_vec();
+                let kp = validated_by_identity.remove(&identity).ok_or_else(|| {
+                    MLSError::InvalidInput {
+                        message: format!(
+                            "missing key package for fork complement member {}",
+                            String::from_utf8_lossy(&identity)
+                        ),
+                    }
+                })?;
+                readd_key_packages.push(kp);
+            }
+
+            if readd_key_packages.is_empty() {
+                return Err(MLSError::InvalidInput {
+                    message: "fork recovery complement is empty".to_string(),
+                });
+            }
+
+            let commit_bundle = builder
+                .provide_key_packages(readd_key_packages)
+                .load_psks(provider.storage())
+                .map_err(|e| MLSError::OpenMLS(format!("fork recovery load_psks: {e:?}")))?
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
+                .map_err(|e| MLSError::OpenMLS(format!("fork recovery build: {e:?}")))?
+                .stage_commit(provider)
+                .map_err(|e| MLSError::OpenMLS(format!("fork recovery stage: {e:?}")))?;
+
+            let (commit, welcome, _gi) = commit_bundle.into_contents();
             let cb = commit
                 .tls_serialize_detached()
                 .map_err(|_| MLSError::SerializationError)?;
-            let wb = welcome.map(|w| w.tls_serialize_detached().unwrap_or_default());
+            let wb = welcome
+                .map(|w| w.tls_serialize_detached())
+                .transpose()
+                .map_err(|_| MLSError::SerializationError)?;
             Ok((cb, wb))
         })
     }

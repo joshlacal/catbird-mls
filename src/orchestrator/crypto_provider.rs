@@ -6,6 +6,7 @@ pub struct CryptoGroupCreationResult {
     pub group_id: Vec<u8>,
 }
 
+
 /// Result of adding members (commit + welcome).
 #[derive(Debug, Clone)]
 pub struct CryptoAddMembersResult {
@@ -69,11 +70,25 @@ pub struct CryptoGroupConfig {
 impl Default for CryptoGroupConfig {
     fn default() -> Self {
         Self {
-            max_past_epochs: 5,
+            max_past_epochs: crate::orchestrator::constants::MAX_PAST_EPOCHS_TO_RETAIN as u32,
             out_of_order_tolerance: 10,
             maximum_forward_distance: 2000,
             max_leaf_lifetime_seconds: 86400 * 90,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CryptoGroupConfig;
+    use crate::orchestrator::constants::MAX_PAST_EPOCHS_TO_RETAIN;
+
+    #[test]
+    fn crypto_group_config_default_uses_epoch_retention_constant() {
+        assert_eq!(
+            CryptoGroupConfig::default().max_past_epochs,
+            MAX_PAST_EPOCHS_TO_RETAIN as u32
+        );
     }
 }
 
@@ -125,7 +140,7 @@ pub trait MLSCryptoProvider: Send + Sync {
         add_key_packages: Vec<CryptoKeyPackageData>,
     ) -> Result<CryptoAddMembersResult> {
         let _ = (group_id, remove_identities, add_key_packages);
-        Err(super::error::OrchestratorError::Internal(
+        Err(super::error::OrchestratorError::RecoveryFailed(
             "swap_members not supported on this platform".into(),
         ))
     }
@@ -173,4 +188,3 @@ pub trait MLSCryptoProvider: Send + Sync {
         identity: Vec<u8>,
     ) -> Result<CryptoKeyPackageResult>;
 }
-
