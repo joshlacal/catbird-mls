@@ -152,13 +152,11 @@ pub fn classify_welcome_processing_error(err: &crate::MLSError) -> Option<LastRe
         crate::MLSError::NoMatchingKeyPackage { .. } => {
             Some(LastRecoveryError::NoMatchingKeyPackage)
         }
-        _ => {
-            let msg = err.to_string().to_lowercase();
+        other => {
+            let msg = other.to_string().to_lowercase();
             if msg.contains("nomatchingencryptionkey") || msg.contains("no matching encryption key")
             {
                 Some(LastRecoveryError::NoMatchingEncryptionKey)
-            } else if msg.contains("no matching key package") {
-                Some(LastRecoveryError::NoMatchingKeyPackage)
             } else {
                 None
             }

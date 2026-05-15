@@ -13,8 +13,8 @@ use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 use super::welcome_recovery::{
-    classify_welcome_processing_error, decide_welcome_recovery, LastRecoveryError,
-    WelcomeRecoveryDecision, WelcomeRecoveryInput,
+    classify_server_error, classify_welcome_processing_error, decide_welcome_recovery,
+    LastRecoveryError, WelcomeRecoveryDecision, WelcomeRecoveryInput,
 };
 
 /// Snapshot of a conversation's `ResetPending` payload for use inside the
@@ -1550,6 +1550,7 @@ where
                     _ => false,
                 };
                 if is_expected {
+                    welcome_recovery_error = Some(classify_server_error(&e));
                     tracing::info!(
                         convo_id,
                         "No Welcome available — will try first-responder bootstrap (if ResetPending) before External Commit"
