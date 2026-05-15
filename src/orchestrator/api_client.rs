@@ -208,6 +208,24 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         ))
     }
 
+    /// Ask the server to request a replacement Welcome from the inviter/admin.
+    ///
+    /// This is the typed hook for `blue.catbird.mlsChat.reissueWelcome`.
+    /// Backends can wire it once Phase A/B generated types and endpoints are
+    /// available; until then callers see an explicit missing-API result rather
+    /// than silently falling back to External Commit.
+    async fn request_welcome_reissue(
+        &self,
+        convo_id: &str,
+        recipient_device_did: &str,
+        reason: &str,
+    ) -> Result<super::welcome_recovery::WelcomeReissueRequestResult> {
+        let _ = (convo_id, recipient_device_did, reason);
+        Err(crate::orchestrator::error::OrchestratorError::Api(
+            "request_welcome_reissue not implemented".into(),
+        ))
+    }
+
     /// Request sequencer failover for a conversation.
     ///
     /// Called when the current sequencer is unreachable after consecutive failures.

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use catbird_mls::orchestrator::welcome_recovery::{ReissueAttempt, ReissueAttemptLog};
 use catbird_mls::orchestrator::{
     ConversationState, ConversationView, GroupState, JoinMethod, MLSStorageBackend, Message,
     OrchestratorError, Result, SyncCursor,
@@ -58,6 +59,8 @@ struct Inner {
     /// Number of times `mark_reset_pending` has been called per conversation.
     /// Used by idempotency tests to assert duplicate calls collapse.
     mark_reset_pending_calls: HashMap<String, u32>,
+    /// conversation_id -> Welcome reissue attempts.
+    welcome_reissue_attempts: HashMap<String, Vec<ReissueAttempt>>,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -190,6 +193,17 @@ impl MockStorage {
             .mark_reset_pending_calls
             .get(conversation_id)
             .copied()
+            .unwrap_or(0)
+    }
+
+    #[allow(dead_code)]
+    pub fn welcome_reissue_attempt_count(&self, conversation_id: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .welcome_reissue_attempts
+            .get(conversation_id)
+            .map(Vec::len)
             .unwrap_or(0)
     }
 }
@@ -328,6 +342,34 @@ impl MLSStorageBackend for MockStorage {
         if let Some(record) = inner.conversations.get_mut(conversation_id) {
             record.needs_rejoin = false;
         }
+        Ok(())
+    }
+
+    async fn get_welcome_reissue_attempt_log(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ReissueAttemptLog> {
+        let inner = self.inner.lock().unwrap();
+        Ok(ReissueAttemptLog {
+            attempts: inner
+                .welcome_reissue_attempts
+                .get(conversation_id)
+                .cloned()
+                .unwrap_or_default(),
+        })
+    }
+
+    async fn record_welcome_reissue_attempt(
+        &self,
+        conversation_id: &str,
+        attempted_at_ms: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .welcome_reissue_attempts
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push(ReissueAttempt { attempted_at_ms });
         Ok(())
     }
 

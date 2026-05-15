@@ -16,6 +16,7 @@ pub mod staged_commit;
 pub mod storage;
 pub mod sync;
 pub mod types;
+pub mod welcome_recovery;
 
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
@@ -26,3 +27,4 @@ pub use mls_provider::MlsCryptoContext;
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
 pub use storage::MLSStorageBackend;
 pub use types::*;
+pub use welcome_recovery::*;
