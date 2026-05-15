@@ -89,6 +89,32 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     /// Clear the rejoin flag for a conversation.
     async fn clear_rejoin_flag(&self, conversation_id: &str) -> Result<()>;
 
+    /// Read persisted Welcome reissue attempts for the conversation.
+    ///
+    /// Backends should persist this counter durably so app restart does not
+    /// reset the "ask inviter to reissue before External Commit" policy. The
+    /// default empty log preserves backward compatibility for platforms that
+    /// have not added the column/table yet.
+    async fn get_welcome_reissue_attempt_log(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<super::welcome_recovery::ReissueAttemptLog> {
+        Ok(super::welcome_recovery::ReissueAttemptLog::default())
+    }
+
+    /// Persist one Welcome reissue request attempt for the conversation.
+    ///
+    /// `attempted_at_ms` is Unix epoch milliseconds. Default no-op keeps old
+    /// backends source-compatible; production backends should override before
+    /// relying on cross-restart attempt exhaustion.
+    async fn record_welcome_reissue_attempt(
+        &self,
+        _conversation_id: &str,
+        _attempted_at_ms: i64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Persist a server-initiated RESET_PENDING transition (spec §8.6).
     ///
     /// `new_group_id_hex` is the hex-encoded group id the server handed down

@@ -12,6 +12,10 @@ use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
+use super::welcome_recovery::{
+    classify_welcome_processing_error, decide_welcome_recovery, LastRecoveryError,
+    WelcomeRecoveryDecision, WelcomeRecoveryInput,
+};
 
 /// Snapshot of a conversation's `ResetPending` payload for use inside the
 /// recovery loop. Mirrors the variant on `ConversationState::ResetPending`
@@ -799,6 +803,87 @@ where
             .record_failure(convo_id);
     }
 
+    async fn route_welcome_recovery_decision(
+        &self,
+        convo_id: &str,
+        user_did: &str,
+        last_error: LastRecoveryError,
+    ) -> Result<bool> {
+        let attempts = self
+            .storage()
+            .get_welcome_reissue_attempt_log(convo_id)
+            .await?;
+
+        let has_groupinfo = self.api_client().get_group_info(convo_id).await.is_ok();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let decision = decide_welcome_recovery(WelcomeRecoveryInput {
+            attempts,
+            last_error,
+            has_groupinfo,
+            last_seen_epoch: self.local_group_epoch(convo_id).await.unwrap_or(0),
+            now_ms,
+        });
+
+        match decision {
+            WelcomeRecoveryDecision::RequestReissue {
+                reason,
+                retry_after,
+            } => {
+                if !retry_after.is_zero() {
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "Welcome reissue suppressed for {convo_id}: retry after {}s",
+                        retry_after.as_secs()
+                    )));
+                }
+
+                let recipient_device_did = self
+                    .credentials()
+                    .get_mls_did(user_did)
+                    .await?
+                    .unwrap_or_else(|| user_did.to_string());
+                self.api_client()
+                    .request_welcome_reissue(convo_id, &recipient_device_did, &reason)
+                    .await?;
+                self.storage()
+                    .record_welcome_reissue_attempt(convo_id, now_ms)
+                    .await?;
+                self.storage().mark_needs_rejoin(convo_id).await?;
+                Err(OrchestratorError::RecoveryFailed(format!(
+                    "Welcome reissue requested for {convo_id}"
+                )))
+            }
+            WelcomeRecoveryDecision::ExternalCommitWithHistoryGap { last_seen_epoch } => {
+                tracing::warn!(
+                    convo_id,
+                    last_seen_epoch,
+                    "Welcome recovery exhausted reissue path; authorizing External Commit with history gap"
+                );
+                Ok(true)
+            }
+            WelcomeRecoveryDecision::Surrender {
+                reason,
+                retry_after,
+            } => {
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .insert(convo_id.to_string(), ConversationState::Failed);
+                let _ = self
+                    .storage()
+                    .set_conversation_state(convo_id, ConversationState::Failed)
+                    .await;
+                Err(OrchestratorError::RecoveryFailed(match retry_after {
+                    Some(delay) => format!(
+                        "Welcome recovery surrendered for {convo_id}: {reason}; retry after {}s",
+                        delay.as_secs()
+                    ),
+                    None => format!("Welcome recovery surrendered for {convo_id}: {reason}"),
+                }))
+            }
+            WelcomeRecoveryDecision::Accept { .. } => Ok(false),
+        }
+    }
+
     fn cached_group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
         let states = self.group_states().try_lock().ok()?;
         states
@@ -1358,6 +1443,7 @@ where
         // unavailable in an "expected" way (404/410/processing-fail) — a
         // real network error means we can't trust that the welcome isn't
         // sitting on the server, and we shouldn't race-bootstrap blind.
+        let mut welcome_recovery_error: Option<LastRecoveryError> = None;
         let welcome_unavailable_expected: bool = match self.api_client().get_welcome(convo_id).await
         {
             Ok(welcome_data) => {
@@ -1441,7 +1527,8 @@ where
                         tracing::info!(convo_id, epoch, "Successfully joined via Welcome");
                         return Ok(epoch);
                     }
-                    Err(_) => {
+                    Err(err) => {
+                        welcome_recovery_error = classify_welcome_processing_error(&err);
                         // Welcome bytes returned but processing failed — treat
                         // as "expected" for bootstrap eligibility (the welcome
                         // is malformed for us; bootstrapping into a fresh
@@ -1569,6 +1656,16 @@ where
         //   - convos where bootstrap failed for a non-409 reason
         //   - convos where Welcome failed with a non-404/410 error and we
         //     skipped bootstrap defensively
+        if let Some(last_error) = welcome_recovery_error {
+            let allow_external_commit = self
+                .route_welcome_recovery_decision(convo_id, &user_did, last_error)
+                .await?;
+            if !allow_external_commit {
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "Welcome recovery did not authorize External Commit for {convo_id}"
+                )));
+            }
+        }
         self.enforce_rejoin_backoff(convo_id).await?;
         let rejoin_result = self.force_rejoin_unlocked(convo_id, &user_did).await;
         match rejoin_result {
