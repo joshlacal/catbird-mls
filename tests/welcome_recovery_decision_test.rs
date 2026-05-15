@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 use catbird_mls::orchestrator::welcome_recovery::{
-    decide_welcome_recovery, LastRecoveryError, ReissueAttemptLog, WelcomeRecoveryDecision,
-    WelcomeRecoveryInput,
+    classify_welcome_processing_error, decide_welcome_recovery, LastRecoveryError,
+    ReissueAttemptLog, WelcomeRecoveryDecision, WelcomeRecoveryInput,
 };
+use catbird_mls::MLSError;
 
 #[test]
 fn fresh_key_package_failure_requests_reissue() {
@@ -77,5 +78,22 @@ fn second_reissue_waits_for_backoff_window() {
             reason: "no_matching_key_package".to_string(),
             retry_after: Duration::from_secs(9),
         }
+    );
+}
+
+#[test]
+fn welcome_processing_classifier_uses_no_matching_key_package_enum() {
+    assert_eq!(
+        classify_welcome_processing_error(&MLSError::NoMatchingKeyPackage {
+            message: "target hash absent".to_string(),
+        }),
+        Some(LastRecoveryError::NoMatchingKeyPackage)
+    );
+
+    assert_eq!(
+        classify_welcome_processing_error(&MLSError::Internal(
+            "contains no matching key package wording".to_string()
+        )),
+        None
     );
 }

@@ -33,6 +33,7 @@
 
 mod e2e_harness;
 
+use catbird_mls::orchestrator::MLSStorageBackend;
 use e2e_harness::TestWorld;
 
 /// Regression: after `record_group_reset`, the very next `join_or_rejoin`
@@ -163,4 +164,34 @@ async fn test_fresh_reset_skips_existing_global_gate_for_bootstrap() {
     // Sanity: convo-a is untouched. We don't assert anything about it; this
     // is just a guard that creating two convos didn't fail silently.
     let _ = convo_a;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_welcome_404_without_groupinfo_surrenders_via_recovery_policy() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo_id = "welcome-404-no-groupinfo";
+    let local_group_id = "00112233445566778899aabbccddeeff";
+    alice
+        .storage
+        .ensure_conversation_exists(&alice.did, convo_id, local_group_id)
+        .await
+        .expect("test conversation should be persisted");
+
+    let result = alice.orchestrator.join_or_rejoin(convo_id).await;
+    let err = result.expect_err("404 Welcome with no GroupInfo must surrender");
+    let msg = format!("{err}");
+
+    assert!(
+        msg.contains("Welcome recovery surrendered")
+            && msg.contains("welcome_and_group_info_unavailable"),
+        "get_welcome 404 should be routed through WelcomeRecoveryDecision; got {msg}"
+    );
+    assert!(
+        !msg.contains("Failed to fetch GroupInfo"),
+        "get_welcome 404 skipped the WelcomeRecoveryDecision policy and fell through to External Commit; got {msg}"
+    );
 }
