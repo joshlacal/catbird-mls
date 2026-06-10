@@ -393,6 +393,9 @@ impl MLSStorageBackend for BotStorage {
             .pending_messages
             .remove(message_id))
     }
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &["store_pending_message", "remove_pending_message"]
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

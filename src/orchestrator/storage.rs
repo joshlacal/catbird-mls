@@ -15,6 +15,35 @@ pub trait MLSStorageBackendBounds {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> MLSStorageBackendBounds for T {}
 
+/// Every `MLSStorageBackend` method that ships a default no-op impl.
+///
+/// Used by the orchestrator's init-time capabilities check (WS-5.6): any
+/// method in this list that the backend does not report via
+/// [`MLSStorageBackend::implemented_optional_methods`] is logged as a warning,
+/// because state routed through a default no-op is silently dropped (e.g.
+/// `mark_reset_pending` dropping a RESET_PENDING payload across restart).
+pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
+    "get_conversation_state",
+    "get_welcome_reissue_attempt_log",
+    "record_welcome_reissue_attempt",
+    "mark_reset_pending",
+    "clear_reset_pending",
+    "mark_quarantined",
+    "clear_quarantine",
+    "store_pending_message",
+    "remove_pending_message",
+    "store_sequencer_receipt",
+    "get_sequencer_receipts",
+    "cleanup_old_epoch_data",
+    "get_recovery_state",
+    "set_recovery_backoff",
+    "clear_recovery_backoff",
+    "set_last_global_rejoin_attempt_at",
+    "mark_pending_local_delete",
+    "clear_pending_local_delete",
+    "list_pending_local_deletes",
+];
+
 /// Platform-agnostic storage backend for MLS orchestration state.
 ///
 /// Implementations should persist data durably (e.g. SQLite, GRDB, Room).
@@ -245,5 +274,75 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         _retain_from_epoch: u64,
     ) -> Result<()> {
         Ok(())
+    }
+
+    // -- RecoveryTracker persistence (WS-5.4, invariant E7) --
+
+    /// Read the persisted RecoveryTracker state for startup hydration.
+    ///
+    /// Hydration ignores entries whose `last_attempt_at_ms` is older than
+    /// `constants::RECOVERY_BACKOFF_TTL` (24 h) and honors — never extends —
+    /// remaining cooldown/quarantine. Default empty state preserves the
+    /// pre-WS-5.4 "restart resets backoff" behavior for backends that have
+    /// not added the table yet.
+    async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
+        Ok(PersistedRecoveryState::default())
+    }
+
+    /// Write-through one conversation's rejoin-backoff snapshot. Called on
+    /// every failed rejoin attempt (and on quarantine-lockout entry). Default
+    /// no-op for backward compatibility.
+    async fn set_recovery_backoff(&self, _entry: &PersistedRecoveryBackoff) -> Result<()> {
+        Ok(())
+    }
+
+    /// Remove a conversation's persisted backoff entry. Called on successful
+    /// rejoin and on server-initiated reset (fresh start). Default no-op.
+    async fn clear_recovery_backoff(&self, _conversation_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Persist the global last-rejoin-attempt timestamp (epoch ms), which
+    /// backs `MIN_REJOIN_INTERVAL` across restarts. Default no-op.
+    async fn set_last_global_rejoin_attempt_at(&self, _at_ms: i64) -> Result<()> {
+        Ok(())
+    }
+
+    // -- Pending local deletes (WS-5.3 crash-safe force_delete_local) --
+
+    /// Record the intent to locally delete a conversation BEFORE the MLS-layer
+    /// and storage deletes run. Idempotent. Default no-op.
+    async fn mark_pending_local_delete(
+        &self,
+        _conversation_id: &str,
+        _group_id_hex: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clear a pending local-delete intent after all delete steps succeeded.
+    /// Default no-op.
+    async fn clear_pending_local_delete(&self, _conversation_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// List local deletes that were started but never completed (crash between
+    /// intent and completion). Consumed by the startup reconcile sweep.
+    /// Default empty.
+    async fn list_pending_local_deletes(&self) -> Result<Vec<PendingLocalDelete>> {
+        Ok(vec![])
+    }
+
+    // -- Capabilities (WS-5.6) --
+
+    /// Names of the optional (default no-op) trait methods this backend
+    /// actually overrides. Purely informational: the orchestrator's init-time
+    /// capabilities check warns about every method in
+    /// [`OPTIONAL_STORAGE_METHODS`] not reported here, so silently-dropped
+    /// state (default no-ops) is observable in logs. Backends that override
+    /// optional methods should keep this list in sync; a stale list only
+    /// produces a spurious warning, never a behavior change.
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &[]
     }
 }

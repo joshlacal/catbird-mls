@@ -479,7 +479,8 @@ where
                                 server_epoch = convo.epoch,
                                 "Still behind after processing — marking for rejoin"
                             );
-                            let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                            // WS-5.2: recovery-critical write — escalate drops.
+                            self.mark_needs_rejoin_critical(conversation_id).await;
                         }
                     }
                     Err(e) => {
@@ -489,8 +490,9 @@ where
                             error = %e,
                             "Failed to fetch messages for epoch catch-up — marking for rejoin"
                         );
-                        // Fetch failed — mark for rejoin regardless of gap size
-                        let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                        // Fetch failed — mark for rejoin regardless of gap size.
+                        // WS-5.2: recovery-critical write — escalate drops.
+                        self.mark_needs_rejoin_critical(conversation_id).await;
                     }
                 }
             }

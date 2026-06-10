@@ -53,6 +53,12 @@ pub const REJOIN_BACKOFF: [Duration; 3] = [
 // §10 Epoch Secret Retention
 pub const MAX_PAST_EPOCHS_TO_RETAIN: u64 = 5;
 
+/// E7-coordinated TTL for persisted RecoveryTracker state (WS-5.4 / WS-6.4).
+/// Persisted per-conversation backoff entries whose `last_attempt_at` is older
+/// than this are ignored on hydration. The Swift twin
+/// (`MLSRecoveryManager.hydrateFromDatabase`) MUST use the same value.
+pub const RECOVERY_BACKOFF_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 // §8.8 Sequencer Failover
 pub const FAILOVER_MIN_FAILURES: u32 = 3;
 pub const FAILOVER_MIN_DURATION: Duration = Duration::from_secs(120);

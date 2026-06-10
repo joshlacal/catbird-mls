@@ -203,6 +203,76 @@ impl RecoveryTracker {
         // `last_global_rejoin_at`. See doc comment above for rationale.
     }
 
+    /// Hydrate backoff state from storage on startup (WS-5.4, invariant E7).
+    ///
+    /// Rules (coordinated with the Swift twin, WS-6.4):
+    /// - Entries whose `last_attempt_at_ms` is older than
+    ///   `RECOVERY_BACKOFF_TTL` (24 h) are ignored.
+    /// - Remaining cooldown/quarantine is honored but never extended: the
+    ///   in-memory attempt timestamp is back-dated by the real elapsed time,
+    ///   and an expired `quarantined_until_ms` clamps the failure count below
+    ///   `max_attempts` so the maxed-out gate cannot outlive its lockout.
+    /// - `last_global_rejoin_attempt_at_ms` re-arms `MIN_REJOIN_INTERVAL` for
+    ///   whatever window remains.
+    pub fn hydrate_from_persisted(&mut self, state: &PersistedRecoveryState, now_ms: i64) {
+        let ttl_ms = constants::RECOVERY_BACKOFF_TTL.as_millis() as i64;
+        let now = Instant::now();
+
+        for entry in &state.entries {
+            let elapsed_ms = now_ms.saturating_sub(entry.last_attempt_at_ms);
+            if elapsed_ms >= ttl_ms {
+                tracing::info!(
+                    convo_id = %entry.conversation_id,
+                    last_attempt_at_ms = entry.last_attempt_at_ms,
+                    "Persisted rejoin backoff older than TTL — ignoring on hydration"
+                );
+                continue;
+            }
+            let mut count = entry.failed_rejoin_count;
+            if count == 0 {
+                continue;
+            }
+            if count >= self.max_attempts {
+                let quarantine_active = entry
+                    .quarantined_until_ms
+                    .is_some_and(|until| until > now_ms);
+                if !quarantine_active {
+                    // Lockout expired: honor it, don't extend. Clamping below
+                    // max_attempts re-opens exactly one attempt (after the
+                    // normal per-attempt cooldown) instead of re-arming the
+                    // indefinite maxed-out gate.
+                    count = self.max_attempts.saturating_sub(1);
+                    if count == 0 {
+                        continue;
+                    }
+                }
+            }
+            // Back-date the in-memory timestamp by the real elapsed time so
+            // cooldown_remaining computes the true remainder. If the monotonic
+            // clock can't represent that far back (process older than boot
+            // window), drop the entry — under-gating never extends backoff.
+            let Some(at) = now.checked_sub(Duration::from_millis(elapsed_ms.max(0) as u64)) else {
+                tracing::warn!(
+                    convo_id = %entry.conversation_id,
+                    elapsed_ms,
+                    "Cannot back-date persisted rejoin backoff on this clock — dropping entry"
+                );
+                continue;
+            };
+            self.failed_rejoins
+                .insert(entry.conversation_id.clone(), (count, at));
+        }
+
+        if let Some(global_ms) = state.last_global_rejoin_attempt_at_ms {
+            let elapsed_ms = now_ms.saturating_sub(global_ms);
+            if elapsed_ms < ttl_ms {
+                if let Some(at) = now.checked_sub(Duration::from_millis(elapsed_ms.max(0) as u64)) {
+                    self.last_global_rejoin_at = Some(at);
+                }
+            }
+        }
+    }
+
     /// Remaining cooldown imposed by a recent SUCCESSFUL rejoin on this
     /// conversation. Applies to sync-triggered rejoins only (see
     /// `should_attempt_sync_rejoin`). `None` means no cooldown active.
@@ -577,7 +647,9 @@ where
                         gs.epoch = ep;
                         let sc = gs.clone();
                         drop(st);
-                        let _ = self.storage().set_group_state(&sc).await;
+                        if let Err(e) = self.storage().set_group_state(&sc).await {
+                            tracing::warn!(error = %e, convo_id, "Failed to persist group state after fork readd");
+                        }
                     }
                 }
                 {
@@ -619,7 +691,7 @@ where
             .lock()
             .await
             .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
-        let _ = self.storage().mark_needs_rejoin(convo_id).await;
+        self.mark_needs_rejoin_critical(convo_id).await;
         tracing::info!(convo_id, "Fork escalated to NeedsRejoin");
     }
 
@@ -792,15 +864,87 @@ where
         Ok(())
     }
 
+    /// Log a recovery-critical storage-write failure and surface it through
+    /// the platform event observer (WS-5.2). Never silent: losing one of
+    /// these writes cancels deferred recovery across restart.
+    pub(crate) async fn report_recovery_storage_failure(
+        &self,
+        convo_id: &str,
+        operation: &str,
+        error: &OrchestratorError,
+    ) {
+        tracing::error!(
+            convo_id,
+            operation,
+            error = %error,
+            "Recovery-critical storage write failed — deferred recovery state may be lost"
+        );
+        if let Some(obs) = self.current_event_observer().await {
+            obs.on_recovery_storage_write_failed(convo_id, operation, &error.to_string());
+        }
+    }
+
+    /// `mark_needs_rejoin` with WS-5.2 escalation: the rejoin flag is what the
+    /// deferred-recovery loop consumes, so a dropped write here silently
+    /// cancels recovery.
+    pub(crate) async fn mark_needs_rejoin_critical(&self, convo_id: &str) {
+        if let Err(e) = self.storage().mark_needs_rejoin(convo_id).await {
+            self.report_recovery_storage_failure(convo_id, "mark_needs_rejoin", &e)
+                .await;
+        }
+    }
+
     pub(crate) async fn clear_rejoin_failures(&self, convo_id: &str) {
         self.recovery_tracker().lock().await.clear(convo_id);
+        // WS-5.4 write-through: successful rejoin clears the persisted entry;
+        // `clear` arms the global gate, so persist that too.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
+            self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
+                .await;
+        }
+        if let Err(e) = self
+            .storage()
+            .set_last_global_rejoin_attempt_at(now_ms)
+            .await
+        {
+            self.report_recovery_storage_failure(convo_id, "set_last_global_rejoin_attempt_at", &e)
+                .await;
+        }
     }
 
     async fn record_rejoin_failure(&self, convo_id: &str) {
-        self.recovery_tracker()
-            .lock()
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (count, max_attempts) = {
+            let mut tracker = self.recovery_tracker().lock().await;
+            tracker.record_failure(convo_id);
+            (
+                tracker.failed_attempts(convo_id),
+                self.config().max_rejoin_attempts,
+            )
+        };
+        // WS-5.4 write-through (E7 schema): persist on every state change so
+        // restart cannot reset backoff. Maxed-out conversations carry a
+        // quarantined_until lockout matching the hydration TTL.
+        let entry = PersistedRecoveryBackoff {
+            conversation_id: convo_id.to_string(),
+            failed_rejoin_count: count,
+            last_attempt_at_ms: now_ms,
+            quarantined_until_ms: (count >= max_attempts)
+                .then(|| now_ms + constants::RECOVERY_BACKOFF_TTL.as_millis() as i64),
+        };
+        if let Err(e) = self.storage().set_recovery_backoff(&entry).await {
+            self.report_recovery_storage_failure(convo_id, "set_recovery_backoff", &e)
+                .await;
+        }
+        if let Err(e) = self
+            .storage()
+            .set_last_global_rejoin_attempt_at(now_ms)
             .await
-            .record_failure(convo_id);
+        {
+            self.report_recovery_storage_failure(convo_id, "set_last_global_rejoin_attempt_at", &e)
+                .await;
+        }
     }
 
     async fn route_welcome_recovery_decision(
@@ -868,10 +1012,13 @@ where
                     .lock()
                     .await
                     .insert(convo_id.to_string(), ConversationState::Failed);
-                let _ = self
+                if let Err(e) = self
                     .storage()
                     .set_conversation_state(convo_id, ConversationState::Failed)
-                    .await;
+                    .await
+                {
+                    tracing::warn!(error = %e, convo_id, "Failed to persist Failed state after Welcome recovery surrender");
+                }
                 Err(OrchestratorError::RecoveryFailed(match retry_after {
                     Some(delay) => format!(
                         "Welcome recovery surrendered for {convo_id}: {reason}; retry after {}s",
@@ -1180,7 +1327,9 @@ where
         }
 
         // Clear rejoin flag
-        let _ = self.storage().clear_rejoin_flag(convo_id).await;
+        if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
+            tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag after force rejoin");
+        }
 
         // Insert history boundary marker for device rejoin.
         // On iOS, Swift inserts first with the correct content key — the message_exists
@@ -1493,7 +1642,9 @@ where
                         }
 
                         // Clear rejoin flag
-                        let _ = self.storage().clear_rejoin_flag(convo_id).await;
+                        if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
+                            tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag after Welcome join");
+                        }
                         self.clear_rejoin_failures(convo_id).await;
 
                         // Insert history boundary marker for Welcome join.
@@ -1717,7 +1868,7 @@ where
 
         // 4. Mark conversations for rejoin
         for convo_id in conversation_ids {
-            let _ = self.storage().mark_needs_rejoin(convo_id).await;
+            self.mark_needs_rejoin_critical(convo_id).await;
         }
 
         // 5. Process rejoins
@@ -2028,6 +2179,13 @@ where
             tracker.clear_for_fresh_reset(convo_id);
             tracker.clear_quarantine(convo_id)
         };
+        // WS-5.4 write-through: a server reset wipes the persisted backoff
+        // entry too, mirroring `clear_for_fresh_reset` (no global-gate write —
+        // a server-pushed reset is not an attempt by this client).
+        if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
+            self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
+                .await;
+        }
         if was_quarantined {
             // Server reset trumps client-side quarantine; persist the cleared
             // quarantine row alongside the new ResetPending payload.
@@ -2065,13 +2223,9 @@ where
                 );
             }
         }
-        if let Err(e) = self.storage().mark_needs_rejoin(convo_id).await {
-            tracing::warn!(
-                convo_id,
-                error = %e,
-                "Failed to set needs_rejoin flag after group reset"
-            );
-        }
+        // WS-5.2: the needs_rejoin flag is what routes this conversation into
+        // the deferred-recovery loop — escalate a dropped write.
+        self.mark_needs_rejoin_critical(convo_id).await;
 
         Ok(())
     }
@@ -2079,18 +2233,22 @@ where
     /// Handle a server-initiated group reset (spec §8.5 Phase 1 / §8.6).
     ///
     /// **Deprecated:** prefer `record_group_reset` from event handlers and
-    /// let the deferred-recovery sync loop drive `join_or_rejoin`. This
-    /// composite method runs the network step inline, which violates the
-    /// "External Commits only in deferred recovery" invariant that
-    /// orchestrator-using clients (catmos, WASM, BIRDaemon) rely on to
-    /// avoid the epoch-inflation class of bug observed in March 2026
-    /// (see `project_handle_group_reset_design_gaps.md` session note).
+    /// let the deferred-recovery sync loop drive `join_or_rejoin`.
     ///
-    /// Retained as a thin alias so out-of-tree callers that already
-    /// invoked `handle_group_reset(...)` keep compiling. New code should
-    /// call `record_group_reset(...)` from the WS/SSE handler and rely
-    /// on the next `sync_with_server` cycle to invoke `join_or_rejoin`
-    /// (which now includes the first-responder bootstrap branch).
+    /// WS-5.1 (invariant S1, spec §8.5): this method no longer performs the
+    /// inline `join_or_rejoin` it historically ran. The auto-External-Commit
+    /// pattern it embodied is exactly what caused production epoch inflation
+    /// (March 2026 incident class; see
+    /// `project_handle_group_reset_design_gaps.md`). The body now delegates
+    /// to `record_group_reset` — persist `RESET_PENDING`, drop the old local
+    /// group, clear recovery counters, flag `needs_rejoin` — and returns. The
+    /// deferred-recovery loop in `sync_with_server` drives `join_or_rejoin`
+    /// (Welcome → first-responder bootstrap → External Commit) on the next
+    /// cycle.
+    ///
+    /// The signature is retained (and stays reachable via the UniFFI bridge)
+    /// so out-of-tree callers keep compiling — removing it would be an ABI
+    /// break for android/catmos/catmos-cli/web bindings.
     #[deprecated(
         since = "0.2.0",
         note = "Call `record_group_reset` from event handlers; deferred-recovery loop will drive `join_or_rejoin` (which now includes first-responder bootstrap). See spec §8.5 Phase 1."
@@ -2101,62 +2259,15 @@ where
         new_group_id: Vec<u8>,
         reset_generation: i32,
     ) -> Result<()> {
-        let new_group_id_hex = hex::encode(&new_group_id);
+        tracing::warn!(
+            convo_id,
+            reset_generation,
+            "handle_group_reset is deprecated and no longer rejoins inline; \
+             delegating to record_group_reset (deferred recovery, invariant S1 / spec §8.5). \
+             Callers should migrate to record_group_reset and rely on the sync loop."
+        );
         self.record_group_reset(convo_id, new_group_id, reset_generation)
-            .await?;
-
-        match self.join_or_rejoin(convo_id).await {
-            Ok(epoch) => {
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(convo_id.to_string(), ConversationState::Active);
-                if let Err(e) = self
-                    .storage()
-                    .set_conversation_state(convo_id, ConversationState::Active)
-                    .await
-                {
-                    tracing::warn!(
-                        convo_id,
-                        error = %e,
-                        "Failed to persist Active state after reset adoption"
-                    );
-                }
-                if let Err(e) = self.storage().clear_reset_pending(convo_id).await {
-                    tracing::warn!(
-                        convo_id,
-                        error = %e,
-                        "Failed to clear reset_pending flag after success"
-                    );
-                }
-                tracing::info!(
-                    convo_id,
-                    epoch,
-                    new_group_id = %new_group_id_hex,
-                    reset_generation,
-                    "Group reset adopted successfully (legacy inline path)"
-                );
-                Ok(())
-            }
-            Err(e) => {
-                tracing::error!(
-                    convo_id,
-                    error = %e,
-                    new_group_id = %new_group_id_hex,
-                    "Reset adoption failed — transitioning to NeedsRejoin"
-                );
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
-                let _ = self
-                    .storage()
-                    .set_conversation_state(convo_id, ConversationState::NeedsRejoin)
-                    .await;
-                let _ = self.storage().mark_needs_rejoin(convo_id).await;
-                Err(e)
-            }
-        }
+            .await
     }
 
     /// Snapshot of the `ResetPending` payload for a conversation, or `None`
@@ -2334,12 +2445,22 @@ where
                     .lock()
                     .await
                     .insert(convo_id.to_string(), ConversationState::Active);
-                let _ = self
+                if let Err(e) = self
                     .storage()
                     .set_conversation_state(convo_id, ConversationState::Active)
-                    .await;
-                let _ = self.storage().clear_reset_pending(convo_id).await;
-                let _ = self.storage().clear_rejoin_flag(convo_id).await;
+                    .await
+                {
+                    tracing::warn!(error = %e, convo_id, "Failed to persist Active state after bootstrap win");
+                }
+                // A stale reset_pending row would re-trigger bootstrap on a
+                // later restart — escalate a dropped clear.
+                if let Err(e) = self.storage().clear_reset_pending(convo_id).await {
+                    self.report_recovery_storage_failure(convo_id, "clear_reset_pending", &e)
+                        .await;
+                }
+                if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
+                    tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag after bootstrap win");
+                }
                 let epoch = self
                     .mls_context()
                     .get_epoch(new_group_id_bytes)

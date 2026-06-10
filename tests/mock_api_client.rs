@@ -309,6 +309,25 @@ impl MockDeliveryService {
             .map_or_else(Vec::new, |c| c.members.clone())
     }
 
+    /// Server-side epoch of a conversation, if it exists.
+    pub fn conversation_epoch(&self, convo_id: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .conversations
+            .get(convo_id)
+            .map(|c| c.view.epoch)
+    }
+
+    /// Remove a conversation server-side (simulates deletion / membership
+    /// loss so sync's stale-conversation cleanup fires).
+    pub fn remove_conversation_for_test(&self, convo_id: &str) {
+        let mut guard = self.state.lock().unwrap();
+        guard.conversations.remove(convo_id);
+        guard.messages.remove(convo_id);
+        guard.group_infos.remove(convo_id);
+    }
+
     /// Number of external commits processed for a conversation.
     pub fn external_commit_count(&self, convo_id: &str) -> u32 {
         self.state

@@ -67,7 +67,7 @@ pub trait OrchestratorStorageCallback: Send + Sync {
 
     /// Persist the `RESET_PENDING` payload for a server-initiated group reset.
     ///
-    /// Called from `MLSOrchestrator::handle_group_reset` before any local MLS
+    /// Called from `MLSOrchestrator::record_group_reset` before any local MLS
     /// state mutation, so the platform can recover the pending-reset target on
     /// restart (spec §8.5 Phase 1 / ADR-001 level 3).
     ///
@@ -1017,8 +1017,8 @@ impl MLSStorageBackend for StorageAdapter {
         // The UniFFI bridge carries only the state *tag* across the boundary.
         // For the `ResetPending` variant the full payload (new_group_id,
         // reset_generation, notified_at_ms) is forwarded separately via
-        // `mark_reset_pending`; `handle_group_reset` in `recovery.rs` is the
-        // call site that invokes both in sequence.
+        // `mark_reset_pending`; `persist_reset_pending_state` in `recovery.rs`
+        // is the call site that invokes both in sequence.
         self.0
             .set_conversation_state(conversation_id.to_string(), state.tag().to_string())
             .map_err(bridge_err)
@@ -1045,6 +1045,13 @@ impl MLSStorageBackend for StorageAdapter {
         self.0
             .clear_reset_pending(conversation_id.to_string())
             .map_err(bridge_err)
+    }
+
+    // WS-5.6 capabilities declaration: the bridge forwards these optional
+    // methods to the platform callback; everything else still rides the
+    // default no-ops (warned at orchestrator init).
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &["mark_reset_pending", "clear_reset_pending"]
     }
 
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
@@ -1959,17 +1966,22 @@ impl OrchestratorBridge {
     /// Handle a server-initiated group reset (`GroupResetEvent` delivered via
     /// SSE/WS from the DS).
     ///
-    /// The orchestrator transitions the conversation to `RESET_PENDING`,
-    /// persists the payload via `mark_reset_pending`, deletes the old local
-    /// MLS group, clears per-conversation recovery trackers, rebinds the group
-    /// id, then attempts `join_or_rejoin` (Welcome → ExternalCommit).
+    /// **Deprecated alias for `record_group_reset` (WS-5.1, invariant S1).**
+    /// This method no longer performs an inline `join_or_rejoin`: the
+    /// orchestrator transitions the conversation to `RESET_PENDING`, persists
+    /// the payload via `mark_reset_pending`, deletes the old local MLS group,
+    /// clears per-conversation recovery trackers, rebinds the group id, and
+    /// flags `needs_rejoin`. The deferred-recovery loop driven by
+    /// `sync_with_server` performs the actual rejoin on the next cycle —
+    /// inline External Commits from event paths are the production
+    /// epoch-inflation pattern (spec §8.5).
     ///
     /// - `convo_id`: stable conversation id.
     /// - `new_group_id_hex`: hex-encoded new MLS group id advertised by the DS.
     /// - `reset_generation`: monotonic reset counter from the DS.
     ///
-    /// Spec §8.5 Phase 1 / ADR-001 levels 1–3. Platforms should call this on
-    /// every incoming `GroupResetEvent`.
+    /// Kept for FFI ABI compatibility; new code should call
+    /// `record_group_reset`.
     pub fn handle_group_reset(
         &self,
         convo_id: String,
@@ -2000,12 +2012,12 @@ impl OrchestratorBridge {
     /// it through `join_or_rejoin` — which now includes a first-responder
     /// bootstrap step gated on `ConversationState::ResetPending`.
     ///
-    /// New code should prefer this over `handle_group_reset`. The legacy
-    /// composite `handle_group_reset` is retained as a deprecated alias
-    /// for backward compatibility (it now calls `record_group_reset`
-    /// followed by an inline `join_or_rejoin` — same observable behavior
-    /// as before, but the inline `join_or_rejoin` is the part that
-    /// violates the "no External Commits in event handlers" invariant).
+    /// New code should prefer this over `handle_group_reset`. As of WS-5.1
+    /// the legacy `handle_group_reset` is a pure deprecated alias for this
+    /// method — its historical inline `join_or_rejoin` (the part that
+    /// violated the "no External Commits in event handlers" invariant) has
+    /// been removed; both entry points now only record deferred-recovery
+    /// state.
     pub fn record_group_reset(
         &self,
         convo_id: String,
