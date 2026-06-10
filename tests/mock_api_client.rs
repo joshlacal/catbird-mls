@@ -319,6 +319,16 @@ impl MockDeliveryService {
             .map(|c| c.view.epoch)
     }
 
+    /// Force the server-side epoch of a conversation (stale-needs_rejoin
+    /// tests where the local group must be >= the server listing epoch).
+    #[allow(dead_code)]
+    pub fn set_conversation_epoch_for_test(&self, convo_id: &str, epoch: u64) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(c) = guard.conversations.get_mut(convo_id) {
+            c.view.epoch = epoch;
+        }
+    }
+
     /// Remove a conversation server-side (simulates deletion / membership
     /// loss so sync's stale-conversation cleanup fires).
     pub fn remove_conversation_for_test(&self, convo_id: &str) {

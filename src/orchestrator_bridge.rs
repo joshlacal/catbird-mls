@@ -11,8 +11,8 @@ use crate::orchestrator::{
     ConversationView, CreateConversationResult, CredentialStore, DeviceInfo, GroupState,
     IncomingEnvelope, JoinMethod, KeyPackageRef, KeyPackageStats, KeyPackageSyncResult,
     MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView, Message,
-    OrchestratorConfig, OrchestratorError, ProcessExternalCommitResult, SendMessageResponse,
-    SyncCursor,
+    OrchestratorConfig, OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff,
+    PersistedRecoveryState, ProcessExternalCommitResult, SendMessageResponse, SyncCursor,
 };
 
 use crate::api::MLSContext;
@@ -119,6 +119,53 @@ pub trait OrchestratorStorageCallback: Send + Sync {
         group_id: String,
     ) -> Result<Option<FFIGroupState>, OrchestratorBridgeError>;
     fn delete_group_state(&self, group_id: String) -> Result<(), OrchestratorBridgeError>;
+
+    // -- RecoveryTracker persistence (WS-5.4, invariant E7) --
+
+    /// Read the persisted RecoveryTracker state for startup hydration.
+    /// Return an empty state if the platform has not written any entries yet.
+    fn get_recovery_state(&self) -> Result<FFIPersistedRecoveryState, OrchestratorBridgeError>;
+
+    /// Write-through one conversation's rejoin-backoff snapshot. Called on
+    /// every failed rejoin attempt (and on quarantine-lockout entry/expiry).
+    fn set_recovery_backoff(
+        &self,
+        entry: FFIPersistedRecoveryBackoff,
+    ) -> Result<(), OrchestratorBridgeError>;
+
+    /// Remove a conversation's persisted backoff entry (successful rejoin,
+    /// server reset, quarantine entry, stale-flag housekeeping, local delete).
+    fn clear_recovery_backoff(
+        &self,
+        conversation_id: String,
+    ) -> Result<(), OrchestratorBridgeError>;
+
+    /// Persist the global last-rejoin-attempt timestamp (epoch ms), which
+    /// backs `MIN_REJOIN_INTERVAL` across restarts.
+    fn set_last_global_rejoin_attempt_at(&self, at_ms: i64) -> Result<(), OrchestratorBridgeError>;
+
+    // -- Pending local deletes (WS-5.3 crash-safe force_delete_local) --
+
+    /// Record the intent to locally delete a conversation BEFORE the
+    /// MLS-layer and storage deletes run. Idempotent.
+    fn mark_pending_local_delete(
+        &self,
+        conversation_id: String,
+        group_id_hex: Option<String>,
+    ) -> Result<(), OrchestratorBridgeError>;
+
+    /// Clear a pending local-delete intent after all delete steps succeeded.
+    fn clear_pending_local_delete(
+        &self,
+        conversation_id: String,
+    ) -> Result<(), OrchestratorBridgeError>;
+
+    /// List local deletes that were started but never completed (crash
+    /// between intent and completion). Consumed by the startup reconcile
+    /// sweep.
+    fn list_pending_local_deletes(
+        &self,
+    ) -> Result<Vec<FFIPendingLocalDelete>, OrchestratorBridgeError>;
 }
 
 /// API client callback interface for Swift/Kotlin.
@@ -446,6 +493,39 @@ pub struct FFIIncomingEnvelope {
     pub server_message_id: Option<String>,
 }
 
+/// FFI mirror of `PersistedRecoveryBackoff` (WS-5.4 / invariant E7). All
+/// timestamps are Unix epoch milliseconds; the schema matches the Swift twin
+/// (WS-6.4) so restart cannot reset backoff on any platform.
+#[derive(uniffi::Record, Clone)]
+pub struct FFIPersistedRecoveryBackoff {
+    pub conversation_id: String,
+    /// Consecutive failed rejoin attempts.
+    pub failed_rejoin_count: u32,
+    /// When the most recent rejoin attempt happened (epoch ms).
+    pub last_attempt_at_ms: i64,
+    /// When the maxed-out rejoin lockout expires (epoch ms). `None` when the
+    /// conversation has not exhausted MAX_REJOIN_ATTEMPTS.
+    pub quarantined_until_ms: Option<i64>,
+}
+
+/// FFI mirror of `PersistedRecoveryState` returned by
+/// `OrchestratorStorageCallback::get_recovery_state` on startup (WS-5.4).
+#[derive(uniffi::Record, Clone)]
+pub struct FFIPersistedRecoveryState {
+    pub entries: Vec<FFIPersistedRecoveryBackoff>,
+    /// Last rejoin attempt on ANY conversation (epoch ms).
+    pub last_global_rejoin_attempt_at_ms: Option<i64>,
+}
+
+/// FFI mirror of `PendingLocalDelete` — a persisted intent row for an
+/// in-progress `force_delete_local` (WS-5.3 crash safety).
+#[derive(uniffi::Record, Clone)]
+pub struct FFIPendingLocalDelete {
+    pub conversation_id: String,
+    /// Hex group id bound to the conversation when the delete started.
+    pub group_id_hex: Option<String>,
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct FFIOrchestratorConfig {
     pub max_devices: u32,
@@ -586,10 +666,12 @@ fn ffi_to_qexit(r: &FFIQuarantineExitReason) -> crate::orchestrator::types::Quar
     }
 }
 
-/// UniFFI callback interface for Layer 3 quarantine events. Platforms
-/// (Android, catmos Tauri, catmos-cli, web) implement this and register via
-/// OrchestratorBridge::set_event_callback. The constructor is unchanged so
-/// existing platform code keeps compiling without binding regen.
+/// UniFFI callback interface for orchestrator events (Layer 3 quarantine +
+/// WS-5.2 recovery-storage escalation). Platforms (Android, catmos Tauri,
+/// catmos-cli, web) implement this and register via
+/// OrchestratorBridge::set_event_callback. Adding a method here requires a
+/// binding regen on each platform before it compiles against the new
+/// interface.
 #[uniffi::export(callback_interface)]
 pub trait OrchestratorEventCallback: Send + Sync {
     fn on_conversation_quarantined(
@@ -599,6 +681,16 @@ pub trait OrchestratorEventCallback: Send + Sync {
         suspected_dids: Vec<String>,
     );
     fn on_conversation_quarantine_cleared(&self, convo_id: String, via: FFIQuarantineExitReason);
+    /// A recovery-critical storage write failed (WS-5.2). `operation` is the
+    /// storage-trait method name (e.g. `mark_needs_rejoin`). Losing such a
+    /// write silently cancels deferred recovery across restart — platforms
+    /// should surface it (diagnostics, error UI) rather than ignore it.
+    fn on_recovery_storage_write_failed(
+        &self,
+        conversation_id: String,
+        operation: String,
+        error: String,
+    );
 }
 
 /// Adapter so a UniFFI OrchestratorEventCallback can be installed via the
@@ -625,6 +717,13 @@ impl crate::orchestrator::event_observer::OrchestratorEventObserver for EventCal
     ) {
         self.0
             .on_conversation_quarantine_cleared(convo_id.to_string(), qexit_to_ffi(via));
+    }
+    fn on_recovery_storage_write_failed(&self, convo_id: &str, operation: &str, error: &str) {
+        self.0.on_recovery_storage_write_failed(
+            convo_id.to_string(),
+            operation.to_string(),
+            error.to_string(),
+        );
     }
 }
 
@@ -1051,7 +1150,110 @@ impl MLSStorageBackend for StorageAdapter {
     // methods to the platform callback; everything else still rides the
     // default no-ops (warned at orchestrator init).
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
-        &["mark_reset_pending", "clear_reset_pending"]
+        &[
+            "mark_reset_pending",
+            "clear_reset_pending",
+            "get_recovery_state",
+            "set_recovery_backoff",
+            "clear_recovery_backoff",
+            "set_last_global_rejoin_attempt_at",
+            "mark_pending_local_delete",
+            "clear_pending_local_delete",
+            "list_pending_local_deletes",
+        ]
+    }
+
+    // -- RecoveryTracker persistence (WS-5.4, invariant E7) --
+
+    async fn get_recovery_state(&self) -> crate::orchestrator::Result<PersistedRecoveryState> {
+        self.0
+            .get_recovery_state()
+            .map(|ffi| PersistedRecoveryState {
+                entries: ffi
+                    .entries
+                    .into_iter()
+                    .map(|e| PersistedRecoveryBackoff {
+                        conversation_id: e.conversation_id,
+                        failed_rejoin_count: e.failed_rejoin_count,
+                        last_attempt_at_ms: e.last_attempt_at_ms,
+                        quarantined_until_ms: e.quarantined_until_ms,
+                    })
+                    .collect(),
+                last_global_rejoin_attempt_at_ms: ffi.last_global_rejoin_attempt_at_ms,
+            })
+            .map_err(bridge_err)
+    }
+
+    async fn set_recovery_backoff(
+        &self,
+        entry: &PersistedRecoveryBackoff,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .set_recovery_backoff(FFIPersistedRecoveryBackoff {
+                conversation_id: entry.conversation_id.clone(),
+                failed_rejoin_count: entry.failed_rejoin_count,
+                last_attempt_at_ms: entry.last_attempt_at_ms,
+                quarantined_until_ms: entry.quarantined_until_ms,
+            })
+            .map_err(bridge_err)
+    }
+
+    async fn clear_recovery_backoff(
+        &self,
+        conversation_id: &str,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .clear_recovery_backoff(conversation_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn set_last_global_rejoin_attempt_at(
+        &self,
+        at_ms: i64,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .set_last_global_rejoin_attempt_at(at_ms)
+            .map_err(bridge_err)
+    }
+
+    // -- Pending local deletes (WS-5.3 crash-safe force_delete_local) --
+
+    async fn mark_pending_local_delete(
+        &self,
+        conversation_id: &str,
+        group_id_hex: Option<&str>,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .mark_pending_local_delete(
+                conversation_id.to_string(),
+                group_id_hex.map(|s| s.to_string()),
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn clear_pending_local_delete(
+        &self,
+        conversation_id: &str,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .clear_pending_local_delete(conversation_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn list_pending_local_deletes(
+        &self,
+    ) -> crate::orchestrator::Result<Vec<PendingLocalDelete>> {
+        self.0
+            .list_pending_local_deletes()
+            .map(|v| {
+                v.into_iter()
+                    .map(|ffi| PendingLocalDelete {
+                        conversation_id: ffi.conversation_id,
+                        group_id_hex: ffi.group_id_hex,
+                    })
+                    .collect()
+            })
+            .map_err(bridge_err)
     }
 
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
@@ -2206,4 +2408,360 @@ pub fn ffi_decode_opus_to_pcm(opus_data: Vec<u8>) -> Result<Vec<u8>, Orchestrato
     crate::voice::decode_opus_to_pcm(&opus_data).map_err(|e| OrchestratorBridgeError::Voice {
         message: e.to_string(),
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Bridge unit tests (WS-5 FIX-4): the E7 persistence + WS-5.2 escalation
+// surface must actually cross the UniFFI adapter layer, not ride the trait
+// default no-ops.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // ── Event callback: WS-5.2 escalation must reach the platform ─────────
+
+    #[derive(Default)]
+    struct RecordingEventCallback {
+        storage_failures: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl OrchestratorEventCallback for RecordingEventCallback {
+        fn on_conversation_quarantined(
+            &self,
+            _convo_id: String,
+            _reason: FFIQuarantineReason,
+            _suspected_dids: Vec<String>,
+        ) {
+        }
+        fn on_conversation_quarantine_cleared(
+            &self,
+            _convo_id: String,
+            _via: FFIQuarantineExitReason,
+        ) {
+        }
+        fn on_recovery_storage_write_failed(
+            &self,
+            conversation_id: String,
+            operation: String,
+            error: String,
+        ) {
+            self.storage_failures
+                .lock()
+                .unwrap()
+                .push((conversation_id, operation, error));
+        }
+    }
+
+    #[test]
+    fn event_adapter_forwards_recovery_storage_write_failed() {
+        use crate::orchestrator::event_observer::OrchestratorEventObserver;
+
+        let callback = Arc::new(RecordingEventCallback::default());
+        let adapter = EventCallbackAdapter(callback.clone() as Arc<dyn OrchestratorEventCallback>);
+
+        adapter.on_recovery_storage_write_failed("convo-1", "mark_needs_rejoin", "disk full");
+
+        let captured = callback.storage_failures.lock().unwrap();
+        assert_eq!(
+            captured.as_slice(),
+            &[(
+                "convo-1".to_string(),
+                "mark_needs_rejoin".to_string(),
+                "disk full".to_string()
+            )],
+            "EventCallbackAdapter must forward WS-5.2 escalations across the bridge"
+        );
+    }
+
+    // ── Storage callback: E7 backoff rows must round-trip the adapter ─────
+
+    #[derive(Default)]
+    struct RecordingStorageCallback {
+        backoff: Mutex<std::collections::HashMap<String, FFIPersistedRecoveryBackoff>>,
+        last_global_ms: Mutex<Option<i64>>,
+        pending_deletes: Mutex<std::collections::HashMap<String, FFIPendingLocalDelete>>,
+    }
+
+    impl OrchestratorStorageCallback for RecordingStorageCallback {
+        fn ensure_conversation_exists(
+            &self,
+            _user_did: String,
+            _conversation_id: String,
+            _group_id: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn update_join_info(
+            &self,
+            _conversation_id: String,
+            _user_did: String,
+            _join_method: String,
+            _join_epoch: u64,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn get_conversation(
+            &self,
+            _user_did: String,
+            _conversation_id: String,
+        ) -> Result<Option<FFIConversationView>, OrchestratorBridgeError> {
+            Ok(None)
+        }
+        fn list_conversations(
+            &self,
+            _user_did: String,
+        ) -> Result<Vec<FFIConversationView>, OrchestratorBridgeError> {
+            Ok(vec![])
+        }
+        fn delete_conversations(
+            &self,
+            _user_did: String,
+            _ids: Vec<String>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn set_conversation_state(
+            &self,
+            _conversation_id: String,
+            _state: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn mark_reset_pending(
+            &self,
+            _conversation_id: String,
+            _new_group_id_hex: String,
+            _reset_generation: i32,
+            _notified_at_ms: i64,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn clear_reset_pending(
+            &self,
+            _conversation_id: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn mark_needs_rejoin(
+            &self,
+            _conversation_id: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn needs_rejoin(&self, _conversation_id: String) -> Result<bool, OrchestratorBridgeError> {
+            Ok(false)
+        }
+        fn clear_rejoin_flag(
+            &self,
+            _conversation_id: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn store_message(&self, _message: FFIMessage) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn get_messages(
+            &self,
+            _conversation_id: String,
+            _limit: u32,
+            _before_sequence: Option<u64>,
+        ) -> Result<Vec<FFIMessage>, OrchestratorBridgeError> {
+            Ok(vec![])
+        }
+        fn message_exists(&self, _message_id: String) -> Result<bool, OrchestratorBridgeError> {
+            Ok(false)
+        }
+        fn get_sync_cursor(
+            &self,
+            _user_did: String,
+        ) -> Result<FFISyncCursor, OrchestratorBridgeError> {
+            Ok(FFISyncCursor {
+                conversations_cursor: None,
+                messages_cursor: None,
+            })
+        }
+        fn set_sync_cursor(
+            &self,
+            _user_did: String,
+            _cursor: FFISyncCursor,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn set_group_state(&self, _state: FFIGroupState) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn get_group_state(
+            &self,
+            _group_id: String,
+        ) -> Result<Option<FFIGroupState>, OrchestratorBridgeError> {
+            Ok(None)
+        }
+        fn delete_group_state(&self, _group_id: String) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+        fn get_recovery_state(&self) -> Result<FFIPersistedRecoveryState, OrchestratorBridgeError> {
+            let mut entries: Vec<FFIPersistedRecoveryBackoff> =
+                self.backoff.lock().unwrap().values().cloned().collect();
+            entries.sort_by(|a, b| a.conversation_id.cmp(&b.conversation_id));
+            Ok(FFIPersistedRecoveryState {
+                entries,
+                last_global_rejoin_attempt_at_ms: *self.last_global_ms.lock().unwrap(),
+            })
+        }
+        fn set_recovery_backoff(
+            &self,
+            entry: FFIPersistedRecoveryBackoff,
+        ) -> Result<(), OrchestratorBridgeError> {
+            self.backoff
+                .lock()
+                .unwrap()
+                .insert(entry.conversation_id.clone(), entry);
+            Ok(())
+        }
+        fn clear_recovery_backoff(
+            &self,
+            conversation_id: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            self.backoff.lock().unwrap().remove(&conversation_id);
+            Ok(())
+        }
+        fn set_last_global_rejoin_attempt_at(
+            &self,
+            at_ms: i64,
+        ) -> Result<(), OrchestratorBridgeError> {
+            *self.last_global_ms.lock().unwrap() = Some(at_ms);
+            Ok(())
+        }
+        fn mark_pending_local_delete(
+            &self,
+            conversation_id: String,
+            group_id_hex: Option<String>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            self.pending_deletes.lock().unwrap().insert(
+                conversation_id.clone(),
+                FFIPendingLocalDelete {
+                    conversation_id,
+                    group_id_hex,
+                },
+            );
+            Ok(())
+        }
+        fn clear_pending_local_delete(
+            &self,
+            conversation_id: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            self.pending_deletes
+                .lock()
+                .unwrap()
+                .remove(&conversation_id);
+            Ok(())
+        }
+        fn list_pending_local_deletes(
+            &self,
+        ) -> Result<Vec<FFIPendingLocalDelete>, OrchestratorBridgeError> {
+            Ok(self
+                .pending_deletes
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_adapter_round_trips_recovery_backoff() {
+        let callback = Arc::new(RecordingStorageCallback::default());
+        let adapter = StorageAdapter(callback.clone() as Arc<dyn OrchestratorStorageCallback>);
+
+        // set → get
+        let entry = PersistedRecoveryBackoff {
+            conversation_id: "convo-rt".to_string(),
+            failed_rejoin_count: 2,
+            last_attempt_at_ms: 1_700_000_000_000,
+            quarantined_until_ms: Some(1_700_086_400_000),
+        };
+        adapter
+            .set_recovery_backoff(&entry)
+            .await
+            .expect("set_recovery_backoff must forward");
+        adapter
+            .set_last_global_rejoin_attempt_at(1_700_000_000_500)
+            .await
+            .expect("set_last_global_rejoin_attempt_at must forward");
+
+        let state = adapter
+            .get_recovery_state()
+            .await
+            .expect("get_recovery_state must forward");
+        assert_eq!(state.entries, vec![entry.clone()]);
+        assert_eq!(
+            state.last_global_rejoin_attempt_at_ms,
+            Some(1_700_000_000_500)
+        );
+
+        // clear → empty
+        adapter
+            .clear_recovery_backoff("convo-rt")
+            .await
+            .expect("clear_recovery_backoff must forward");
+        let state = adapter.get_recovery_state().await.unwrap();
+        assert!(
+            state.entries.is_empty(),
+            "cleared backoff entry must not survive the adapter round-trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_adapter_round_trips_pending_local_deletes() {
+        let callback = Arc::new(RecordingStorageCallback::default());
+        let adapter = StorageAdapter(callback.clone() as Arc<dyn OrchestratorStorageCallback>);
+
+        adapter
+            .mark_pending_local_delete("convo-del", Some("aabb"))
+            .await
+            .expect("mark_pending_local_delete must forward");
+        let pending = adapter.list_pending_local_deletes().await.unwrap();
+        assert_eq!(
+            pending,
+            vec![PendingLocalDelete {
+                conversation_id: "convo-del".to_string(),
+                group_id_hex: Some("aabb".to_string()),
+            }]
+        );
+
+        adapter
+            .clear_pending_local_delete("convo-del")
+            .await
+            .expect("clear_pending_local_delete must forward");
+        assert!(adapter
+            .list_pending_local_deletes()
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn storage_adapter_declares_e7_optional_methods() {
+        let callback = Arc::new(RecordingStorageCallback::default());
+        let adapter = StorageAdapter(callback as Arc<dyn OrchestratorStorageCallback>);
+        let declared = adapter.implemented_optional_methods();
+        for method in [
+            "get_recovery_state",
+            "set_recovery_backoff",
+            "clear_recovery_backoff",
+            "set_last_global_rejoin_attempt_at",
+            "mark_pending_local_delete",
+            "clear_pending_local_delete",
+            "list_pending_local_deletes",
+        ] {
+            assert!(
+                declared.contains(&method),
+                "StorageAdapter must declare {method} as implemented (WS-5.6 capabilities check)"
+            );
+        }
+    }
 }

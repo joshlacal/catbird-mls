@@ -498,3 +498,655 @@ async fn force_delete_local_clears_its_intent() {
         "stale conversation should be locally deleted by sync"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// WS-5 review fixes (2026-06-10)
+// ───────────────────────────────────────────────────────────────────────────
+
+use catbird_mls::orchestrator::IncomingEnvelope;
+
+/// Event observer that records WS-5.2 recovery-storage escalations.
+#[derive(Default)]
+struct RecordingObserver {
+    storage_failures: std::sync::Mutex<Vec<(String, String, String)>>,
+}
+
+impl catbird_mls::orchestrator::event_observer::OrchestratorEventObserver for RecordingObserver {
+    fn on_recovery_storage_write_failed(&self, convo_id: &str, operation: &str, error: &str) {
+        self.storage_failures.lock().unwrap().push((
+            convo_id.to_string(),
+            operation.to_string(),
+            error.to_string(),
+        ));
+    }
+}
+
+/// FIX-1: clearing a STALE needs_rejoin flag (local group already caught up)
+/// is pure housekeeping — it must NOT arm the global rejoin gate, must NOT
+/// record a per-convo "successful rejoin", and must NOT persist a
+/// global-attempt stamp. A rejoin on another conversation immediately after
+/// must be permitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_rejoin_flag_clear_does_not_arm_global_gate() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("FIX-1 stale flag", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    // Align the server listing epoch with the local group epoch so the flag
+    // below is genuinely STALE (the local group is fully caught up).
+    let local_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&convo.group_id).unwrap())
+        .expect("local group must exist");
+    world
+        .delivery_service()
+        .set_conversation_epoch_for_test(&convo_id, local_epoch);
+
+    // Flag needs_rejoin even though the local group is fully caught up —
+    // exactly the stale-flag situation the sync housekeeping branch handles.
+    alice
+        .storage
+        .mark_needs_rejoin(&convo_id)
+        .await
+        .expect("mark_needs_rejoin failed");
+    assert!(alice.storage.has_rejoin_flag(&convo_id));
+
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("sync should succeed");
+
+    assert!(
+        !alice.storage.has_rejoin_flag(&convo_id),
+        "stale needs_rejoin flag must be cleared by the sync housekeeping branch"
+    );
+    {
+        let tracker = alice.orchestrator.recovery_tracker().lock().await;
+        assert!(
+            !tracker.should_skip("some-other-convo"),
+            "FIX-1 REGRESSION: stale-flag housekeeping armed the global \
+             MIN_REJOIN_INTERVAL gate — re-armed every 5s sync pass it never opens"
+        );
+        assert!(
+            tracker.success_cooldown_remaining(&convo_id).is_none(),
+            "stale-flag housekeeping must not record a per-convo successful rejoin"
+        );
+    }
+    assert!(
+        alice
+            .storage
+            .get_persisted_last_global_rejoin_at_ms()
+            .is_none(),
+        "FIX-1 REGRESSION: stale-flag housekeeping persisted a global-attempt \
+         stamp — the spurious gate would survive restart"
+    );
+}
+
+/// FIX-1: when the flag-clear write itself fails, the failure must escalate
+/// through the observer (operation = clear_rejoin_flag) and the tracker
+/// housekeeping must be skipped for that pass (clearing tracker state while
+/// the flag persists would loop every sync pass).
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_clear_rejoin_flag_escalates_and_skips_tracker_clear() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("FIX-1 escalation", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    // Seed real failure-tracking state via an injected failed rejoin.
+    world.delivery_service().fail_next_get_group_info();
+    let _ = alice.orchestrator.force_rejoin(&convo_id).await;
+    assert_eq!(
+        alice
+            .orchestrator
+            .recovery_tracker()
+            .lock()
+            .await
+            .failed_attempts(&convo_id),
+        1
+    );
+    assert!(alice
+        .storage
+        .get_persisted_recovery_backoff(&convo_id)
+        .is_some());
+
+    // Stale flag + failing clear (server listing epoch aligned with local so
+    // the stale-housekeeping branch fires).
+    let local_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&convo.group_id).unwrap())
+        .expect("local group must exist");
+    world
+        .delivery_service()
+        .set_conversation_epoch_for_test(&convo_id, local_epoch);
+    alice.storage.mark_needs_rejoin(&convo_id).await.unwrap();
+    alice.storage.fail_next_clear_rejoin_flag();
+
+    let observer = Arc::new(RecordingObserver::default());
+    alice
+        .orchestrator
+        .set_event_observer(Some(observer.clone()))
+        .await;
+
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("sync should succeed");
+
+    let escalations = observer.storage_failures.lock().unwrap().clone();
+    assert!(
+        escalations
+            .iter()
+            .any(|(cid, op, _)| cid == &convo_id && op == "clear_rejoin_flag"),
+        "failing clear_rejoin_flag must escalate via the observer, got {escalations:?}"
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .recovery_tracker()
+            .lock()
+            .await
+            .failed_attempts(&convo_id),
+        1,
+        "tracker clear must be SKIPPED when the flag-clear write failed"
+    );
+    assert!(
+        alice
+            .storage
+            .get_persisted_recovery_backoff(&convo_id)
+            .is_some(),
+        "persisted backoff row must survive when the flag-clear write failed"
+    );
+}
+
+/// Crypto context whose decrypt always fails with a peer-bad class error
+/// (InvalidCommit). The production `MLSContext` flattens OpenMLS process
+/// failures to `DecryptionFailed`, so the Layer-3 peer-bad classifier can't
+/// be tripped through real crypto in-process; this mock drives the
+/// quarantine-entry path directly through `process_incoming`.
+struct PeerBadCrypto;
+
+impl catbird_mls::orchestrator::MlsCryptoContext for PeerBadCrypto {
+    fn create_key_package(
+        &self,
+        _identity: Vec<u8>,
+    ) -> Result<catbird_mls::KeyPackageResult, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn create_group(
+        &self,
+        _identity: Vec<u8>,
+        _config: Option<catbird_mls::GroupConfig>,
+    ) -> Result<catbird_mls::GroupCreationResult, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn add_members(
+        &self,
+        _group_id: Vec<u8>,
+        _key_packages: Vec<catbird_mls::KeyPackageData>,
+    ) -> Result<catbird_mls::AddMembersResult, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn remove_members(
+        &self,
+        _group_id: Vec<u8>,
+        _member_identities: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn merge_pending_commit(&self, _group_id: Vec<u8>) -> Result<u64, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn clear_pending_commit(&self, _group_id: Vec<u8>) -> Result<(), catbird_mls::MLSError> {
+        Ok(())
+    }
+    fn get_epoch(&self, _group_id: Vec<u8>) -> Result<u64, catbird_mls::MLSError> {
+        Ok(1)
+    }
+    fn get_confirmation_tag(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn export_group_info(
+        &self,
+        _group_id: Vec<u8>,
+        _signer_identity: Vec<u8>,
+    ) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn encrypt_message(
+        &self,
+        _group_id: Vec<u8>,
+        _plaintext: Vec<u8>,
+    ) -> Result<catbird_mls::EncryptResult, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn decrypt_message(
+        &self,
+        _group_id: Vec<u8>,
+        _ciphertext: Vec<u8>,
+    ) -> Result<catbird_mls::DecryptResult, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::InvalidCommit)
+    }
+    fn create_external_commit(
+        &self,
+        _group_info: Vec<u8>,
+        _identity: Vec<u8>,
+    ) -> Result<catbird_mls::ExternalCommitResult, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn discard_pending_external_join(
+        &self,
+        _group_id: Vec<u8>,
+    ) -> Result<(), catbird_mls::MLSError> {
+        Ok(())
+    }
+    fn delete_group(&self, _group_id: Vec<u8>) -> Result<(), catbird_mls::MLSError> {
+        Ok(())
+    }
+    fn update_group_metadata(
+        &self,
+        _group_id: Vec<u8>,
+        _metadata_json: Vec<u8>,
+    ) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn process_welcome(
+        &self,
+        _welcome_data: Vec<u8>,
+        _identity: Vec<u8>,
+        _config: Option<catbird_mls::GroupConfig>,
+    ) -> Result<catbird_mls::WelcomeResult, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn propose_self_remove(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+    fn commit_pending_proposals(
+        &self,
+        _group_id: Vec<u8>,
+    ) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+    }
+}
+
+/// FIX-3: entering quarantine drops the in-memory failed_rejoins entry; the
+/// persisted backoff row must be dropped too, or restart hydration within
+/// the 24h TTL re-imports a maxed-out lockout for a conversation whose
+/// quarantine already exited (ghost gate).
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
+    let did = "did:plc:alice";
+    let convo_id = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+    let storage = e2e_harness::mock_storage::MockStorage::new();
+    let credentials = e2e_harness::mock_credentials::MockCredentials::new();
+    let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
+
+    let orchestrator = MLSOrchestrator::new(
+        Arc::new(PeerBadCrypto),
+        Arc::new(storage.clone()),
+        Arc::new(ds.clone_as(did)),
+        Arc::new(credentials.clone()),
+        OrchestratorConfig::default(),
+    );
+    orchestrator.initialize(did).await.expect("initialize");
+
+    let max = OrchestratorConfig::default().max_rejoin_attempts;
+    // Maxed-out persisted row, as accumulated rejoin failures would write it.
+    storage.seed_recovery_backoff(PersistedRecoveryBackoff {
+        conversation_id: convo_id.clone(),
+        failed_rejoin_count: max,
+        last_attempt_at_ms: now_ms(),
+        quarantined_until_ms: Some(now_ms() + constants::RECOVERY_BACKOFF_TTL.as_millis() as i64),
+    });
+
+    // Drive Layer-3 quarantine entry: three distinct peer-bad frames trip
+    // RepeatedFramingFailures.
+    for i in 0..3 {
+        let envelope = IncomingEnvelope {
+            conversation_id: convo_id.clone(),
+            sender_did: "did:plc:mallory".to_string(),
+            ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some(format!("bad-frame-{i}")),
+        };
+        let _ = orchestrator.process_incoming(&envelope).await;
+    }
+    assert!(
+        orchestrator
+            .get_conversation_quarantine_state(&convo_id)
+            .await
+            .is_some(),
+        "three peer-bad frames must enter Layer-3 quarantine (test precondition)"
+    );
+
+    assert!(
+        storage.get_persisted_recovery_backoff(&convo_id).is_none(),
+        "FIX-3 REGRESSION: enter_quarantine left the persisted maxed-out \
+         backoff row behind"
+    );
+
+    // Exit quarantine (user-confirmed; the mock DS report path is
+    // best-effort), then simulate restart hydration over the same storage.
+    orchestrator
+        .user_confirmed_manual_reset(&convo_id)
+        .await
+        .expect("user_confirmed_manual_reset failed");
+    assert!(orchestrator
+        .get_conversation_quarantine_state(&convo_id)
+        .await
+        .is_none());
+
+    let restarted = MLSOrchestrator::new(
+        Arc::new(PeerBadCrypto),
+        Arc::new(storage.clone()),
+        Arc::new(ds.clone_as(did)),
+        Arc::new(credentials.clone()),
+        OrchestratorConfig::default(),
+    );
+    restarted.initialize(did).await.expect("re-initialize");
+    {
+        let tracker = restarted.recovery_tracker().lock().await;
+        assert!(
+            !tracker.is_maxed_out(&convo_id),
+            "FIX-3 REGRESSION: restart re-imported a ghost maxed-out lockout \
+             for a conversation that already exited quarantine"
+        );
+        assert_eq!(tracker.failed_attempts(&convo_id), 0);
+        assert!(!tracker.should_skip(&convo_id));
+    }
+}
+
+/// FIX-5: a real delete-step failure keeps the pending-delete intent so the
+/// next pass retries; the retry (where the missing MLS group is a
+/// NotFound-class success) completes and clears the intent.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_delete_step_keeps_intent_then_retry_clears_it() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("FIX-5 keep intent", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    world
+        .delivery_service()
+        .remove_conversation_for_test(&convo_id);
+
+    // First pass: storage delete fails — the intent must survive.
+    alice.storage.fail_next_delete_conversations();
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("sync should succeed");
+    assert_eq!(
+        alice.storage.pending_local_delete_count(),
+        1,
+        "FIX-5 REGRESSION: pending-delete intent was cleared even though a \
+         delete step failed"
+    );
+
+    // Retry happens on the next startup sweep (reconcile_pending_local_deletes):
+    // the MLS group is gone on the fresh context (NotFound counts as
+    // success) and the storage delete now succeeds, so the intent clears.
+    let (_restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+    assert_eq!(
+        alice.storage.pending_local_delete_count(),
+        0,
+        "startup sweep retry must complete the delete and clear the intent"
+    );
+    assert!(alice
+        .storage
+        .get_conversation(&alice.did, &convo_id)
+        .await
+        .unwrap()
+        .is_none());
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// FIX-6: force_delete_local must also delete the conversation's recovery
+/// state. A maxed-out backoff row left behind would be re-imported by
+/// hydration and gate a re-added conversation with the same server
+/// conversation_id.
+#[tokio::test(flavor = "multi_thread")]
+async fn local_delete_clears_recovery_state_no_ghost_after_restart() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("FIX-6 recovery cleanup", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    let max = OrchestratorConfig::default().max_rejoin_attempts;
+    alice
+        .storage
+        .seed_recovery_backoff(PersistedRecoveryBackoff {
+            conversation_id: convo_id.clone(),
+            failed_rejoin_count: max,
+            last_attempt_at_ms: now_ms(),
+            quarantined_until_ms: Some(
+                now_ms() + constants::RECOVERY_BACKOFF_TTL.as_millis() as i64,
+            ),
+        });
+
+    // Drive force_delete_local via sync's stale-conversation cleanup.
+    world
+        .delivery_service()
+        .remove_conversation_for_test(&convo_id);
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("sync should succeed");
+
+    assert!(
+        alice
+            .storage
+            .get_persisted_recovery_backoff(&convo_id)
+            .is_none(),
+        "FIX-6 REGRESSION: local delete left the persisted backoff row behind"
+    );
+
+    let (restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+    {
+        let tracker = restarted.recovery_tracker().lock().await;
+        assert!(
+            !tracker.is_maxed_out(&convo_id),
+            "FIX-6 REGRESSION: hydration re-imported recovery state for a \
+             deleted conversation"
+        );
+        assert_eq!(tracker.failed_attempts(&convo_id), 0);
+        assert!(!tracker.should_skip(&convo_id));
+    }
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// FIX-8: entries future-dated by a backward wall-clock step are invalid
+/// persisted state — they must be dropped on hydration (TTL gate can't fire
+/// on negative elapsed, and honoring them would restart the full cooldown
+/// every boot / pin quarantine far past 24h of real time). Same policy for
+/// the global stamp.
+#[test]
+fn future_dated_persisted_state_dropped_on_hydration() {
+    let mut tracker = RecoveryTracker::new(3);
+    let now = now_ms();
+    let state = PersistedRecoveryState {
+        entries: vec![PersistedRecoveryBackoff {
+            conversation_id: "future-convo".into(),
+            failed_rejoin_count: 3,
+            // Written "one hour from now": the wall clock stepped backwards.
+            last_attempt_at_ms: now + 3_600_000,
+            quarantined_until_ms: Some(now + 25 * 3_600_000),
+        }],
+        last_global_rejoin_attempt_at_ms: Some(now + 3_600_000),
+    };
+    tracker.hydrate_from_persisted(&state, now);
+
+    assert_eq!(
+        tracker.failed_attempts("future-convo"),
+        0,
+        "FIX-8 REGRESSION: future-dated backoff entry must be dropped"
+    );
+    assert!(!tracker.is_maxed_out("future-convo"));
+    assert!(
+        !tracker.should_skip("future-convo"),
+        "future-dated entry must not gate"
+    );
+    assert!(
+        !tracker.should_skip("any-other-convo"),
+        "FIX-8 REGRESSION: future-dated global stamp must be dropped, not \
+         honored as an armed MIN_REJOIN_INTERVAL gate"
+    );
+}
+
+/// FIX-9 (tracker level): a maxed-out lockout that lapses while the process
+/// is running stops gating at runtime — is_maxed_out/should_skip open the
+/// moment the lockout lapses, and expire_lapsed_lockout clamps the count to
+/// max-1 so exactly one fresh attempt re-opens. Exercises the clamp the
+/// hydration-only path could never reach for self-written entries (their
+/// lockout expiry coincides with the 24h TTL drop).
+#[tokio::test]
+async fn runtime_lockout_expiry_reopens_one_attempt() {
+    let max = 3;
+    let mut tracker = RecoveryTracker::new(max);
+    let now = now_ms();
+    // Hydrate a maxed entry whose lockout lapses 200ms from now (a
+    // long-running process awaiting expiry, compressed for the test).
+    tracker.hydrate_from_persisted(
+        &PersistedRecoveryState {
+            entries: vec![PersistedRecoveryBackoff {
+                conversation_id: "locked".into(),
+                failed_rejoin_count: max,
+                last_attempt_at_ms: now - 3_600_000,
+                quarantined_until_ms: Some(now + 200),
+            }],
+            last_global_rejoin_attempt_at_ms: None,
+        },
+        now,
+    );
+
+    assert!(
+        tracker.is_maxed_out("locked"),
+        "lockout active: gate closed"
+    );
+    assert!(tracker.should_skip("locked"));
+    assert!(
+        tracker.expire_lapsed_lockout("locked").is_none(),
+        "no clamp while the lockout is active"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    assert!(
+        !tracker.is_maxed_out("locked"),
+        "FIX-9 REGRESSION: lapsed lockout still gates at runtime — a \
+         long-running process would be locked out for its whole lifetime"
+    );
+    assert!(
+        tracker.cooldown_remaining("locked").is_none(),
+        "post-lockout entry behaves as max-1 attempts with a long-elapsed \
+         cooldown"
+    );
+    assert!(!tracker.should_skip("locked"));
+
+    let (clamped, last_attempt_at_ms) = tracker
+        .expire_lapsed_lockout("locked")
+        .expect("lapsed lockout must clamp");
+    assert_eq!(clamped, max - 1, "exactly one fresh attempt re-opens");
+    let drift = (now_ms() - 3_600_000 - last_attempt_at_ms).abs();
+    assert!(
+        drift < 10_000,
+        "clamp must report the original last-attempt time for the persisted \
+         row (drift {drift}ms)"
+    );
+    assert_eq!(tracker.failed_attempts("locked"), max - 1);
+    assert!(
+        tracker.expire_lapsed_lockout("locked").is_none(),
+        "clamp is one-shot"
+    );
+}
+
+/// FIX-9 (orchestrator level): the rejoin gate itself honors runtime expiry —
+/// a force_rejoin during the lockout is suppressed with max-attempts, and the
+/// same call after the lockout lapses proceeds to a real attempt (failing
+/// with the injected server error instead of the gate error).
+#[tokio::test(flavor = "multi_thread")]
+async fn rejoin_gate_reopens_after_runtime_lockout_expiry() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("FIX-9 gate reopen", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    let max = OrchestratorConfig::default().max_rejoin_attempts;
+    alice
+        .storage
+        .seed_recovery_backoff(PersistedRecoveryBackoff {
+            conversation_id: convo_id.clone(),
+            failed_rejoin_count: max,
+            last_attempt_at_ms: now_ms() - 3_600_000,
+            quarantined_until_ms: Some(now_ms() + 2_000),
+        });
+
+    let (restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+
+    // Lockout still active: suppressed by the maxed-out gate.
+    let err = restarted
+        .force_rejoin(&convo_id)
+        .await
+        .expect_err("rejoin must be suppressed during the lockout");
+    assert!(
+        err.to_string().contains("max attempts"),
+        "expected max-attempts suppression, got: {err}"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+
+    // Lockout lapsed: the gate clamps to max-1 and lets one attempt through,
+    // which then fails with the injected server error (not the gate).
+    world.delivery_service().fail_next_get_group_info();
+    let err = restarted
+        .force_rejoin(&convo_id)
+        .await
+        .expect_err("attempt should fail via injected server error");
+    assert!(
+        !err.to_string().contains("max attempts"),
+        "FIX-9 REGRESSION: gate still closed after the lockout lapsed: {err}"
+    );
+    let _ = std::fs::remove_dir_all(temp_dir);
+}

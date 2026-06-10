@@ -819,24 +819,47 @@ where
         }
 
         // 2. Run the delete steps.
-        self.force_delete_local_steps(convo_id, group_id_hex.as_deref())
+        let all_steps_ok = self
+            .force_delete_local_steps(convo_id, group_id_hex.as_deref())
             .await;
 
-        // 3. All steps ran — clear the intent.
-        if let Err(e) = self.storage().clear_pending_local_delete(convo_id).await {
-            tracing::warn!(error = %e, convo_id, "Failed to clear local-delete intent (startup sweep will redo an idempotent delete)");
+        // 3. Clear the intent only after all delete steps succeeded (trait
+        // contract on `clear_pending_local_delete`). A failed step keeps the
+        // intent so the next startup sweep retries the idempotent delete.
+        if all_steps_ok {
+            if let Err(e) = self.storage().clear_pending_local_delete(convo_id).await {
+                tracing::warn!(error = %e, convo_id, "Failed to clear local-delete intent (startup sweep will redo an idempotent delete)");
+            }
+        } else {
+            tracing::warn!(
+                convo_id,
+                "force_delete_local: one or more delete steps failed — keeping pending-delete intent for the startup sweep"
+            );
         }
     }
 
     /// The idempotent delete steps shared by `force_delete_local` and the
     /// startup reconcile sweep. Every step tolerates already-deleted state.
-    async fn force_delete_local_steps(&self, convo_id: &str, group_id_hex: Option<&str>) {
+    ///
+    /// Returns `true` when every step succeeded (NotFound-class outcomes —
+    /// state that is already gone — count as success for an idempotent
+    /// delete). Returns `false` on any real failure so callers keep the
+    /// pending-delete intent and the next startup sweep retries.
+    async fn force_delete_local_steps(&self, convo_id: &str, group_id_hex: Option<&str>) -> bool {
         let user_did = self.require_user_did().await.unwrap_or_default();
+        let mut all_ok = true;
 
-        // Delete MLS group from FFI
+        // Delete MLS group from FFI. An already-deleted group is success.
         if let Some(group_id_bytes) = group_id_hex.and_then(|group_id| hex::decode(group_id).ok()) {
-            if let Err(e) = self.mls_context().delete_group(group_id_bytes) {
-                tracing::warn!(error = %e, convo_id, "Failed to delete MLS group from FFI");
+            match self.mls_context().delete_group(group_id_bytes) {
+                Ok(()) => {}
+                Err(crate::MLSError::GroupNotFound { .. }) => {
+                    tracing::debug!(convo_id, "MLS group already deleted (NotFound — ok)");
+                }
+                Err(e) => {
+                    all_ok = false;
+                    tracing::warn!(error = %e, convo_id, "Failed to delete MLS group from FFI");
+                }
             }
         }
 
@@ -846,15 +869,43 @@ where
             .delete_conversations(&user_did, &[convo_id])
             .await
         {
+            all_ok = false;
             tracing::warn!(error = %e, convo_id, "Failed to delete from storage");
         }
         if let Err(e) = self.storage().delete_group_state(convo_id).await {
+            all_ok = false;
             tracing::warn!(error = %e, convo_id, "Failed to delete group state from storage");
         }
         if let Some(group_id) = group_id_hex.filter(|group_id| *group_id != convo_id) {
             if let Err(e) = self.storage().delete_group_state(group_id).await {
+                all_ok = false;
                 tracing::warn!(error = %e, convo_id, group_id, "Failed to delete group state from storage");
             }
+        }
+
+        // Recovery-state cleanup: stale rows for a deleted conversation would
+        // be re-imported by startup hydration and gate a re-added
+        // conversation that reuses the same server conversation_id (e.g. a
+        // maxed-out backoff row blocking rejoin on a fresh re-add).
+        self.recovery_tracker()
+            .lock()
+            .await
+            .forget_conversation(convo_id);
+        if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
+            all_ok = false;
+            tracing::warn!(error = %e, convo_id, "Failed to clear persisted recovery backoff during local delete");
+        }
+        if let Err(e) = self.storage().clear_reset_pending(convo_id).await {
+            all_ok = false;
+            tracing::warn!(error = %e, convo_id, "Failed to clear persisted reset-pending payload during local delete");
+        }
+        if let Err(e) = self.storage().clear_quarantine(convo_id).await {
+            all_ok = false;
+            tracing::warn!(error = %e, convo_id, "Failed to clear persisted quarantine during local delete");
+        }
+        if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
+            all_ok = false;
+            tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag during local delete");
         }
 
         // Remove from caches
@@ -870,6 +921,8 @@ where
             }
         }
         self.conversation_states().lock().await.remove(convo_id);
+
+        all_ok
     }
 
     /// WS-5.3 startup sweep: finish local deletes that a crash interrupted
@@ -898,14 +951,22 @@ where
                         .await
                 }
             };
-            self.force_delete_local_steps(&intent.conversation_id, group_id_hex.as_deref())
+            let steps_ok = self
+                .force_delete_local_steps(&intent.conversation_id, group_id_hex.as_deref())
                 .await;
-            if let Err(e) = self
-                .storage()
-                .clear_pending_local_delete(&intent.conversation_id)
-                .await
-            {
-                tracing::warn!(error = %e, convo_id = %intent.conversation_id, "Failed to clear reconciled local-delete intent");
+            if steps_ok {
+                if let Err(e) = self
+                    .storage()
+                    .clear_pending_local_delete(&intent.conversation_id)
+                    .await
+                {
+                    tracing::warn!(error = %e, convo_id = %intent.conversation_id, "Failed to clear reconciled local-delete intent");
+                }
+            } else {
+                tracing::warn!(
+                    convo_id = %intent.conversation_id,
+                    "Reconcile sweep: delete steps failed — keeping intent for the next startup sweep"
+                );
             }
         }
     }

@@ -30,10 +30,24 @@ pub(crate) struct ResetPendingPayload {
     pub notified_at_ms: i64,
 }
 
+/// One conversation's failed-rejoin bookkeeping (in-memory side of the
+/// persisted `PersistedRecoveryBackoff` schema, WS-5.4 / invariant E7).
+#[derive(Debug, Clone)]
+struct FailedRejoinEntry {
+    /// Consecutive failed rejoin attempts.
+    count: u32,
+    /// When the most recent attempt happened.
+    last_attempt: Instant,
+    /// When the maxed-out lockout expires. Set when `count` reaches
+    /// `max_attempts`; mirrors the persisted `quarantined_until_ms`. `None`
+    /// for non-maxed entries.
+    lockout_until: Option<Instant>,
+}
+
 /// Tracks recovery state per conversation.
 pub struct RecoveryTracker {
     /// Failed rejoin attempts per conversation.
-    failed_rejoins: HashMap<String, (u32, Instant)>,
+    failed_rejoins: HashMap<String, FailedRejoinEntry>,
     /// Last successful rejoin per conversation. Used to gate sync-triggered
     /// rejoins via SUCCESSFUL_REJOIN_COOLDOWN.
     successful_rejoins: HashMap<String, Instant>,
@@ -92,32 +106,98 @@ impl RecoveryTracker {
     pub fn failed_attempts(&self, convo_id: &str) -> u32 {
         self.failed_rejoins
             .get(convo_id)
-            .map(|(n, _)| *n)
+            .map(|e| e.count)
             .unwrap_or(0)
     }
 
-    /// Whether max attempts have been reached.
+    /// Whether the entry's maxed-out lockout has lapsed (E7 runtime expiry).
+    /// Entries written by `record_failure` always carry a `lockout_until`;
+    /// for defensive completeness a maxed entry without one falls back to
+    /// `last_attempt + RECOVERY_BACKOFF_TTL` (the same value
+    /// `record_rejoin_failure` persists).
+    fn lockout_lapsed(&self, entry: &FailedRejoinEntry) -> bool {
+        let until = entry
+            .lockout_until
+            .unwrap_or_else(|| entry.last_attempt + constants::RECOVERY_BACKOFF_TTL);
+        Instant::now() >= until
+    }
+
+    /// Whether max attempts have been reached AND the lockout is still
+    /// active. E7 runtime expiry: a lapsed lockout no longer gates — the
+    /// mutating clamp (count → max-1 + persisted-row update) happens at the
+    /// rejoin gate via [`expire_lapsed_lockout`]; this read-only view simply
+    /// stops closing the gate the moment the lockout lapses (mirrors the
+    /// Swift twin `MLSRecoveryManager.shouldSkipRejoin`, which removes
+    /// expired quarantine at runtime).
+    ///
+    /// [`expire_lapsed_lockout`]: RecoveryTracker::expire_lapsed_lockout
     pub fn is_maxed_out(&self, convo_id: &str) -> bool {
-        let Some((attempts, _)) = self.failed_rejoins.get(convo_id) else {
+        let Some(entry) = self.failed_rejoins.get(convo_id) else {
             return false;
         };
-        *attempts >= self.max_attempts
+        if entry.count < self.max_attempts {
+            return false;
+        }
+        !self.lockout_lapsed(entry)
     }
 
     /// Remaining cooldown before the next rejoin attempt is eligible.
     pub fn cooldown_remaining(&self, convo_id: &str) -> Option<Duration> {
-        let (attempts, last_attempt) = self.failed_rejoins.get(convo_id)?;
-        if *attempts == 0 || *attempts >= self.max_attempts {
+        let entry = self.failed_rejoins.get(convo_id)?;
+        // E7 runtime expiry: a maxed entry whose lockout lapsed behaves as
+        // count = max-1 (one fresh attempt re-opens). Its last_attempt is at
+        // least RECOVERY_BACKOFF_TTL old by then — beyond every
+        // REJOIN_BACKOFF step — so this computes to None in practice.
+        let attempts = if entry.count >= self.max_attempts && self.lockout_lapsed(entry) {
+            self.max_attempts.saturating_sub(1)
+        } else {
+            entry.count
+        };
+        if attempts == 0 || attempts >= self.max_attempts {
             return None;
         }
 
-        let cooldown = self.cooldown_for_attempts(*attempts);
-        let elapsed = last_attempt.elapsed();
+        let cooldown = self.cooldown_for_attempts(attempts);
+        let elapsed = entry.last_attempt.elapsed();
         if elapsed >= cooldown {
             None
         } else {
             Some(cooldown - elapsed)
         }
+    }
+
+    /// Runtime twin of the hydration clamp (E7): when a maxed-out entry's
+    /// lockout lapses while the process is running, clamp the count to
+    /// `max_attempts - 1` so exactly one fresh attempt re-opens, and clear
+    /// the in-memory lockout. Long-running processes (BIRDaemon, catmos
+    /// desktop) otherwise carry a hydrated lockout for the whole process
+    /// lifetime.
+    ///
+    /// Returns `Some((clamped_count, last_attempt_at_ms))` when a clamp
+    /// happened so the caller can write the persisted row through (a
+    /// `clamped_count` of 0 means the entry was dropped entirely and the
+    /// persisted row should be cleared). `None` when nothing changed.
+    pub fn expire_lapsed_lockout(&mut self, convo_id: &str) -> Option<(u32, i64)> {
+        let lapsed = {
+            let entry = self.failed_rejoins.get(convo_id)?;
+            entry.count >= self.max_attempts && self.lockout_lapsed(entry)
+        };
+        if !lapsed {
+            return None;
+        }
+        let clamped = self.max_attempts.saturating_sub(1);
+        if clamped == 0 {
+            // max_attempts == 1: mirroring hydration, a zero count is not
+            // tracked at all.
+            self.failed_rejoins.remove(convo_id);
+            return Some((0, chrono::Utc::now().timestamp_millis()));
+        }
+        let entry = self.failed_rejoins.get_mut(convo_id)?;
+        entry.count = clamped;
+        entry.lockout_until = None;
+        let last_attempt_at_ms =
+            chrono::Utc::now().timestamp_millis() - entry.last_attempt.elapsed().as_millis() as i64;
+        Some((clamped, last_attempt_at_ms))
     }
 
     /// Whether a conversation should skip rejoin (max attempts, cooldown, min
@@ -144,12 +224,22 @@ impl RecoveryTracker {
     /// Record a failed rejoin attempt.
     pub fn record_failure(&mut self, convo_id: &str) {
         let now = Instant::now();
+        let max_attempts = self.max_attempts;
         let entry = self
             .failed_rejoins
             .entry(convo_id.to_string())
-            .or_insert((0, now));
-        entry.0 += 1;
-        entry.1 = now;
+            .or_insert(FailedRejoinEntry {
+                count: 0,
+                last_attempt: now,
+                lockout_until: None,
+            });
+        entry.count += 1;
+        entry.last_attempt = now;
+        // Maxed-out lockout: mirrors the persisted `quarantined_until_ms`
+        // written by `record_rejoin_failure` (RECOVERY_BACKOFF_TTL lockout
+        // duration, Swift parity) so runtime expiry can fire in-process.
+        entry.lockout_until =
+            (entry.count >= max_attempts).then(|| now + constants::RECOVERY_BACKOFF_TTL);
         self.last_global_rejoin_at = Some(now);
     }
 
@@ -189,11 +279,11 @@ impl RecoveryTracker {
         // per-convo backoff was running for an unrelated reason (e.g., epoch
         // divergence retries), the prior failure count would otherwise stack
         // on top of the fresh reset's bootstrap attempt.
-        if let Some((attempts, _)) = self.failed_rejoins.get(convo_id) {
-            if *attempts > 0 {
+        if let Some(entry) = self.failed_rejoins.get(convo_id) {
+            if entry.count > 0 {
                 tracing::info!(
                     convo_id,
-                    wiped_attempts = attempts,
+                    wiped_attempts = entry.count,
                     "clear_for_fresh_reset: wiping prior per-convo failure history (server reset trumps client retry counter)"
                 );
             }
@@ -201,6 +291,38 @@ impl RecoveryTracker {
         self.failed_rejoins.remove(convo_id);
         // Intentionally do NOT touch `successful_rejoins` or
         // `last_global_rejoin_at`. See doc comment above for rationale.
+    }
+
+    /// Clear per-conversation failure tracking when sync clears a STALE
+    /// `needs_rejoin` flag (the local group turned out to be already caught
+    /// up — NO rejoin was attempted). Modeled on [`clear_for_fresh_reset`]:
+    /// this does NOT arm `last_global_rejoin_at` and does NOT insert into
+    /// `successful_rejoins`.
+    ///
+    /// The stale-flag branch in `sync_with_server` can re-fire every
+    /// `SYNC_INTERVAL_SECS` (5 s) pass. Routing it through [`clear`] would
+    /// re-arm the 30 s global `MIN_REJOIN_INTERVAL` gate continuously —
+    /// blocking rejoins on EVERY conversation indefinitely (the same gate
+    /// deadlock class as the 2026-05-02 prod incident, see
+    /// [`clear_for_fresh_reset`]) — and the WS-5.4 write-through would
+    /// persist that spurious gate across restart.
+    ///
+    /// [`clear`]: RecoveryTracker::clear
+    pub fn clear_stale_flag(&mut self, convo_id: &str) {
+        self.failed_rejoins.remove(convo_id);
+        // Intentionally do NOT touch `successful_rejoins` or
+        // `last_global_rejoin_at` — no rejoin happened here.
+    }
+
+    /// Drop ALL in-memory recovery bookkeeping for a conversation that is
+    /// being locally deleted (WS-5.3 `force_delete_local`). Leaves the
+    /// global gate untouched — deleting one conversation says nothing about
+    /// rejoin pressure on others.
+    pub fn forget_conversation(&mut self, convo_id: &str) {
+        self.failed_rejoins.remove(convo_id);
+        self.successful_rejoins.remove(convo_id);
+        self.peer_bad_commits.remove(convo_id);
+        self.quarantined.remove(convo_id);
     }
 
     /// Hydrate backoff state from storage on startup (WS-5.4, invariant E7).
@@ -220,6 +342,22 @@ impl RecoveryTracker {
 
         for entry in &state.entries {
             let elapsed_ms = now_ms.saturating_sub(entry.last_attempt_at_ms);
+            if elapsed_ms < 0 {
+                // Future-dated entry: the wall clock moved backwards since the
+                // write (clock correction). Negative elapsed would dodge the
+                // TTL gate, restart the full cooldown (violating
+                // honor-never-extend), and pin a future quarantined_until far
+                // past 24 h of real time. Treat it as invalid persisted state
+                // and drop it (same policy as the monotonic-underflow drop
+                // below) — under-gating never extends backoff.
+                tracing::warn!(
+                    convo_id = %entry.conversation_id,
+                    last_attempt_at_ms = entry.last_attempt_at_ms,
+                    now_ms,
+                    "Persisted rejoin backoff is future-dated (wall clock moved backwards) — dropping entry"
+                );
+                continue;
+            }
             if elapsed_ms >= ttl_ms {
                 tracing::info!(
                     convo_id = %entry.conversation_id,
@@ -232,11 +370,21 @@ impl RecoveryTracker {
             if count == 0 {
                 continue;
             }
+            let mut lockout_until = None;
             if count >= self.max_attempts {
                 let quarantine_active = entry
                     .quarantined_until_ms
                     .is_some_and(|until| until > now_ms);
-                if !quarantine_active {
+                if quarantine_active {
+                    // Carry the remaining lockout into memory so runtime
+                    // expiry (`expire_lapsed_lockout` / `is_maxed_out`) can
+                    // fire in-process for long-running clients.
+                    let remaining_ms = entry
+                        .quarantined_until_ms
+                        .expect("quarantine_active implies Some")
+                        .saturating_sub(now_ms);
+                    lockout_until = Some(now + Duration::from_millis(remaining_ms.max(0) as u64));
+                } else {
                     // Lockout expired: honor it, don't extend. Clamping below
                     // max_attempts re-opens exactly one attempt (after the
                     // normal per-attempt cooldown) instead of re-arming the
@@ -251,7 +399,7 @@ impl RecoveryTracker {
             // cooldown_remaining computes the true remainder. If the monotonic
             // clock can't represent that far back (process older than boot
             // window), drop the entry — under-gating never extends backoff.
-            let Some(at) = now.checked_sub(Duration::from_millis(elapsed_ms.max(0) as u64)) else {
+            let Some(at) = now.checked_sub(Duration::from_millis(elapsed_ms as u64)) else {
                 tracing::warn!(
                     convo_id = %entry.conversation_id,
                     elapsed_ms,
@@ -259,15 +407,34 @@ impl RecoveryTracker {
                 );
                 continue;
             };
-            self.failed_rejoins
-                .insert(entry.conversation_id.clone(), (count, at));
+            self.failed_rejoins.insert(
+                entry.conversation_id.clone(),
+                FailedRejoinEntry {
+                    count,
+                    last_attempt: at,
+                    lockout_until,
+                },
+            );
         }
 
         if let Some(global_ms) = state.last_global_rejoin_attempt_at_ms {
             let elapsed_ms = now_ms.saturating_sub(global_ms);
-            if elapsed_ms < ttl_ms {
-                if let Some(at) = now.checked_sub(Duration::from_millis(elapsed_ms.max(0) as u64)) {
+            if elapsed_ms < 0 {
+                // Same backward-clock policy as per-convo entries above.
+                tracing::warn!(
+                    global_ms,
+                    now_ms,
+                    "Persisted global rejoin stamp is future-dated (wall clock moved backwards) — dropping"
+                );
+            } else if elapsed_ms < ttl_ms {
+                if let Some(at) = now.checked_sub(Duration::from_millis(elapsed_ms as u64)) {
                     self.last_global_rejoin_at = Some(at);
+                } else {
+                    tracing::warn!(
+                        global_ms,
+                        elapsed_ms,
+                        "Cannot back-date persisted global rejoin stamp on this clock — dropping"
+                    );
                 }
             }
         }
@@ -773,6 +940,40 @@ where
     }
 
     async fn enforce_rejoin_backoff(&self, convo_id: &str) -> Result<()> {
+        // E7 runtime expiry: a maxed-out lockout that lapsed while this
+        // process was running re-opens exactly one attempt (clamp to
+        // max-1), mirroring the hydration clamp and the Swift twin's
+        // runtime quarantine removal. Update the persisted row to match so
+        // a restart sees the same clamped state.
+        let clamp = {
+            let mut tracker = self.recovery_tracker().lock().await;
+            tracker.expire_lapsed_lockout(convo_id)
+        };
+        if let Some((clamped_count, last_attempt_at_ms)) = clamp {
+            tracing::info!(
+                convo_id,
+                clamped_count,
+                "Maxed-out rejoin lockout lapsed at runtime — clamping below max (one fresh attempt re-opens)"
+            );
+            if clamped_count == 0 {
+                if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
+                    self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
+                        .await;
+                }
+            } else {
+                let entry = PersistedRecoveryBackoff {
+                    conversation_id: convo_id.to_string(),
+                    failed_rejoin_count: clamped_count,
+                    last_attempt_at_ms,
+                    quarantined_until_ms: None,
+                };
+                if let Err(e) = self.storage().set_recovery_backoff(&entry).await {
+                    self.report_recovery_storage_failure(convo_id, "set_recovery_backoff", &e)
+                        .await;
+                }
+            }
+        }
+
         let tracker = self.recovery_tracker().lock().await;
         if tracker.is_maxed_out(convo_id) {
             tracing::warn!(
@@ -879,6 +1080,16 @@ where
             error = %error,
             "Recovery-critical storage write failed — deferred recovery state may be lost"
         );
+        // Also route through the platform logging facility (MLSLogger):
+        // Android/iOS never see `tracing` output (no subscriber outside the
+        // echo-bot feature), so without this the failure is invisible on
+        // platforms that haven't wired the event observer yet.
+        crate::error_log!(
+            "[recovery-storage] convo={} op={} CRITICAL: storage write failed ({}) — deferred recovery state may be lost",
+            convo_id,
+            operation,
+            error
+        );
         if let Some(obs) = self.current_event_observer().await {
             obs.on_recovery_storage_write_failed(convo_id, operation, &error.to_string());
         }
@@ -911,6 +1122,30 @@ where
             self.report_recovery_storage_failure(convo_id, "set_last_global_rejoin_attempt_at", &e)
                 .await;
         }
+    }
+
+    /// Stale-flag housekeeping twin of [`clear_rejoin_failures`]
+    /// (`Self::clear_rejoin_failures`). Used by the sync loop when a
+    /// persisted `needs_rejoin` flag turns out to be stale (local epoch
+    /// already caught up): NO rejoin attempt happened, so this must not arm
+    /// the global rejoin gate, must not record a per-convo success, and must
+    /// not persist a global-attempt stamp (precedent: the
+    /// `record_group_reset` write-through, which deliberately skips the
+    /// global-gate write because a non-attempt is not an attempt by this
+    /// client).
+    pub(crate) async fn clear_stale_rejoin_state(&self, convo_id: &str) {
+        self.recovery_tracker()
+            .lock()
+            .await
+            .clear_stale_flag(convo_id);
+        // WS-5.4 write-through: drop the persisted backoff row to match the
+        // in-memory clear. Escalate failures — a surviving row re-imports a
+        // ghost cooldown on the next restart.
+        if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
+            self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
+                .await;
+        }
+        // Intentionally NO set_last_global_rejoin_attempt_at here.
     }
 
     async fn record_rejoin_failure(&self, convo_id: &str) {
@@ -1873,7 +2108,20 @@ where
 
         // 5. Process rejoins
         for convo_id in conversation_ids {
-            if self.storage().needs_rejoin(convo_id).await.unwrap_or(false) {
+            let needs_rejoin = match self.storage().needs_rejoin(convo_id).await {
+                Ok(flag) => flag,
+                Err(e) => {
+                    // A storage READ failure must not silently read as
+                    // "no rejoin needed" without a trace.
+                    tracing::warn!(
+                        convo_id = %convo_id,
+                        error = %e,
+                        "needs_rejoin read failed during silent recovery — defaulting to false (rejoin skipped this pass)"
+                    );
+                    false
+                }
+            };
+            if needs_rejoin {
                 match self.join_or_rejoin(convo_id).await {
                     Ok(epoch) => {
                         tracing::info!(convo_id = %convo_id, epoch, "Rejoin successful during recovery");
@@ -2136,22 +2384,24 @@ where
             )
             .await
         {
-            tracing::warn!(
+            // WS-5.2: the persisted ResetPending payload is the sole
+            // cross-restart carrier of the first-responder bootstrap gate —
+            // a dropped write here silently cancels Phase 1 recovery after
+            // restart. Escalate like the matching `clear_reset_pending`.
+            self.report_recovery_storage_failure(
                 convo_id,
-                error = %e,
-                "Failed to persist ResetPending state"
-            );
+                "set_conversation_state:reset_pending",
+                &e,
+            )
+            .await;
         }
         if let Err(e) = self
             .storage()
             .mark_reset_pending(convo_id, new_group_id_hex, reset_generation, notified_at_ms)
             .await
         {
-            tracing::warn!(
-                convo_id,
-                error = %e,
-                "Failed to persist ResetPending payload via mark_reset_pending"
-            );
+            self.report_recovery_storage_failure(convo_id, "mark_reset_pending", &e)
+                .await;
         }
 
         // 2. Delete the old local MLS group. Prefer group_states lookup; fall
@@ -2629,6 +2879,17 @@ where
             let mut tracker = self.recovery_tracker().lock().await;
             tracker.mark_quarantined(convo_id, reason, since_ms, suspected_dids.clone());
         }
+        // WS-5.4 write-through: `mark_quarantined` dropped the in-memory
+        // failed_rejoins entry; mirror that to the persisted backoff row.
+        // Quarantine has its own persisted lifecycle — leaving a maxed-out
+        // backoff row behind would let hydration re-import the lockout
+        // within the 24 h TTL and gate a conversation that already exited
+        // quarantine. Mirrors the server-reset clear in
+        // `persist_reset_pending_state`.
+        if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
+            self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
+                .await;
+        }
         {
             let mut states = self.conversation_states().lock().await;
             states.insert(
@@ -2813,7 +3074,7 @@ mod tests {
         let mut t = RecoveryTracker::new(3);
         t.record_failure("convo-a");
         assert_eq!(
-            t.failed_rejoins.get("convo-a").map(|(n, _)| *n),
+            t.failed_rejoins.get("convo-a").map(|e| e.count),
             Some(1),
             "record_failure should insert failure count"
         );

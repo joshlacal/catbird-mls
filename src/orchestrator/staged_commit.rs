@@ -291,13 +291,11 @@ where
                         "Failed to clear stale pending commit after merge failure in confirm_commit"
                     );
                 }
-                if let Err(storage_err) = self.storage().mark_needs_rejoin(&handle.group_id).await {
-                    tracing::warn!(
-                        error = %storage_err,
-                        conversation_id = %handle.group_id,
-                        "Failed to mark group for rejoin after confirm_commit failure"
-                    );
-                }
+                // WS-5.2: same recovery-critical pattern as the messaging
+                // merge-failure path — the persisted flag is what routes this
+                // conversation into deferred recovery, so escalate a dropped
+                // write instead of warn-and-forget.
+                self.mark_needs_rejoin_critical(&handle.group_id).await;
                 return Err(e.into());
             }
         };

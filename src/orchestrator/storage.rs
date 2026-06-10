@@ -320,8 +320,10 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         Ok(())
     }
 
-    /// Clear a pending local-delete intent after all delete steps succeeded.
-    /// Default no-op.
+    /// Clear a pending local-delete intent after all delete steps succeeded
+    /// (NotFound-class outcomes — state already gone — count as success for
+    /// the idempotent delete). When any step really fails the orchestrator
+    /// keeps the intent so the next startup sweep retries. Default no-op.
     async fn clear_pending_local_delete(&self, _conversation_id: &str) -> Result<()> {
         Ok(())
     }

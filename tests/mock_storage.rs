@@ -68,6 +68,13 @@ struct Inner {
     last_global_rejoin_attempt_at_ms: Option<i64>,
     /// conversation_id -> pending local-delete intent (WS-5.3).
     pending_local_deletes: HashMap<String, PendingLocalDelete>,
+    /// When set, the next `clear_rejoin_flag` call fails once (WS-5 FIX-1
+    /// escalation tests). Mirrors the `fail_next_*` pattern in
+    /// `mock_api_client.rs`.
+    fail_next_clear_rejoin_flag: bool,
+    /// When set, the next `delete_conversations` call fails once (WS-5 FIX-5
+    /// keep-intent-on-failure tests).
+    fail_next_delete_conversations: bool,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -259,6 +266,18 @@ impl MockStorage {
     pub fn pending_local_delete_count(&self) -> usize {
         self.inner.lock().unwrap().pending_local_deletes.len()
     }
+
+    /// Make the next `clear_rejoin_flag` call fail once.
+    #[allow(dead_code)]
+    pub fn fail_next_clear_rejoin_flag(&self) {
+        self.inner.lock().unwrap().fail_next_clear_rejoin_flag = true;
+    }
+
+    /// Make the next `delete_conversations` call fail once.
+    #[allow(dead_code)]
+    pub fn fail_next_delete_conversations(&self) {
+        self.inner.lock().unwrap().fail_next_delete_conversations = true;
+    }
 }
 
 #[async_trait]
@@ -339,6 +358,12 @@ impl MLSStorageBackend for MockStorage {
 
     async fn delete_conversations(&self, _user_did: &str, ids: &[&str]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_delete_conversations {
+            inner.fail_next_delete_conversations = false;
+            return Err(OrchestratorError::Storage(
+                "injected delete_conversations failure".to_string(),
+            ));
+        }
         for id in ids {
             inner.conversations.remove(*id);
             inner.messages.remove(*id);
@@ -392,6 +417,12 @@ impl MLSStorageBackend for MockStorage {
 
     async fn clear_rejoin_flag(&self, conversation_id: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_clear_rejoin_flag {
+            inner.fail_next_clear_rejoin_flag = false;
+            return Err(OrchestratorError::Storage(
+                "injected clear_rejoin_flag failure".to_string(),
+            ));
+        }
         if let Some(record) = inner.conversations.get_mut(conversation_id) {
             record.needs_rejoin = false;
         }

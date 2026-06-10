@@ -513,16 +513,28 @@ where
             // WrongEpoch/TooDistantInThePast. Commit catch-up above is the
             // path for epoch advancement; this pass is for current-epoch app
             // traffic.
+            // get_epoch Err means the group is missing locally; Ok(epoch) —
+            // including epoch 0, which is legitimate between group creation
+            // and the first commit — means fetch app traffic for that epoch.
             let app_epoch = match hex::decode(group_id)
                 .ok()
-                .and_then(|gid_bytes| self.mls_context().get_epoch(gid_bytes).ok())
+                .map(|gid_bytes| self.mls_context().get_epoch(gid_bytes))
             {
-                Some(epoch) if epoch > 0 => epoch.min(u32::MAX as u64) as u32,
-                _ => {
+                Some(Ok(epoch)) => epoch.min(u32::MAX as u64) as u32,
+                Some(Err(e)) => {
                     tracing::debug!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
+                        error = %e,
                         "Skipping app-message pass: local MLS group is unavailable"
+                    );
+                    continue;
+                }
+                None => {
+                    tracing::debug!(
+                        conversation_id = %conversation_id,
+                        group_id = %group_id,
+                        "Skipping app-message pass: group id is not valid hex"
                     );
                     continue;
                 }
@@ -600,12 +612,21 @@ where
 
             // Auto-consume needs_rejoin flag: if a previous sync or decrypt failure
             // flagged this conversation, attempt rejoin now (with rate-limiting).
-            if self
-                .storage()
-                .needs_rejoin(conversation_id)
-                .await
-                .unwrap_or(false)
-            {
+            let needs_rejoin = match self.storage().needs_rejoin(conversation_id).await {
+                Ok(flag) => flag,
+                Err(e) => {
+                    // A storage READ failure must not silently read as
+                    // "no rejoin needed" without a trace — deferred recovery
+                    // stalls for this conversation until the read recovers.
+                    tracing::warn!(
+                        conversation_id = %conversation_id,
+                        error = %e,
+                        "needs_rejoin read failed during sync — defaulting to false (deferred recovery skipped this pass)"
+                    );
+                    false
+                }
+            };
+            if needs_rejoin {
                 let current_epoch = hex::decode(group_id)
                     .ok()
                     .and_then(|gid_bytes| self.mls_context().get_epoch(gid_bytes).ok());
@@ -618,8 +639,22 @@ where
                         server_epoch = convo.epoch,
                         "Clearing stale needs_rejoin flag; local MLS group is already caught up"
                     );
-                    let _ = self.storage().clear_rejoin_flag(conversation_id).await;
-                    self.clear_rejoin_failures(conversation_id).await;
+                    // No rejoin happened here, so this housekeeping must not
+                    // arm the global rejoin gate (see clear_stale_rejoin_state).
+                    // A failing flag-clear is escalated and the tracker clear
+                    // is skipped for this pass: this branch re-fires every
+                    // SYNC_INTERVAL_SECS while the flag persists, and clearing
+                    // tracker state without clearing the flag would loop.
+                    if let Err(e) = self.storage().clear_rejoin_flag(conversation_id).await {
+                        self.report_recovery_storage_failure(
+                            conversation_id,
+                            "clear_rejoin_flag",
+                            &e,
+                        )
+                        .await;
+                    } else {
+                        self.clear_stale_rejoin_state(conversation_id).await;
+                    }
                     continue;
                 }
 

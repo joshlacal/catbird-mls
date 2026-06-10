@@ -596,9 +596,13 @@ where
                                 envelope.conversation_id.clone(),
                                 ConversationState::NeedsRejoin,
                             );
-                            let _ = self
-                                .storage()
-                                .mark_needs_rejoin(&envelope.conversation_id)
+                            // WS-5.2: the deferred-recovery loop consumes ONLY
+                            // the persisted flag — a dropped write here would
+                            // silently cancel recovery on the most common
+                            // trigger (persistent decrypt failure). Escalate,
+                            // and reset the counter only after the flag-write
+                            // path has run.
+                            self.mark_needs_rejoin_critical(&envelope.conversation_id)
                                 .await;
                             *count = 0;
                         }
@@ -764,17 +768,11 @@ where
                         target_epoch = decrypt_result.epoch,
                         "Failed to merge incoming staged commit — marking for rejoin"
                     );
-                    if let Err(storage_err) = self
-                        .storage()
-                        .mark_needs_rejoin(&envelope.conversation_id)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %storage_err,
-                            conversation_id = %envelope.conversation_id,
-                            "Failed to persist rejoin flag after merge_incoming_commit failure"
-                        );
-                    }
+                    // WS-5.2: this flag is the sole recovery driver after a
+                    // merge failure — escalate a dropped write instead of
+                    // warn-and-forget.
+                    self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                        .await;
                     // Don't return an error — the commit has been processed
                     // to the extent we can, and surfacing an error here would
                     // propagate out of `fetch_messages` and abort downstream
