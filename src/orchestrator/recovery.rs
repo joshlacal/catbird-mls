@@ -792,7 +792,7 @@ where
         Ok(())
     }
 
-    async fn clear_rejoin_failures(&self, convo_id: &str) {
+    pub(crate) async fn clear_rejoin_failures(&self, convo_id: &str) {
         self.recovery_tracker().lock().await.clear(convo_id);
     }
 

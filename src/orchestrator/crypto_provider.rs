@@ -6,7 +6,6 @@ pub struct CryptoGroupCreationResult {
     pub group_id: Vec<u8>,
 }
 
-
 /// Result of adding members (commit + welcome).
 #[derive(Debug, Clone)]
 pub struct CryptoAddMembersResult {
@@ -126,11 +125,8 @@ pub trait MLSCryptoProvider: Send + Sync {
     ) -> Result<CryptoAddMembersResult>;
 
     /// Remove members from a group (produces commit data).
-    fn remove_members(
-        &self,
-        group_id: Vec<u8>,
-        member_identities: Vec<Vec<u8>>,
-    ) -> Result<Vec<u8>>;
+    fn remove_members(&self, group_id: Vec<u8>, member_identities: Vec<Vec<u8>>)
+        -> Result<Vec<u8>>;
 
     /// Atomically swap members in a single commit.
     fn swap_members(
@@ -149,11 +145,8 @@ pub trait MLSCryptoProvider: Send + Sync {
     fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64>;
 
     /// Encrypt a message for a group.
-    fn encrypt_message(
-        &self,
-        group_id: Vec<u8>,
-        plaintext: Vec<u8>,
-    ) -> Result<CryptoEncryptResult>;
+    fn encrypt_message(&self, group_id: Vec<u8>, plaintext: Vec<u8>)
+        -> Result<CryptoEncryptResult>;
 
     /// Decrypt a message from a group.
     fn decrypt_message(
@@ -163,11 +156,7 @@ pub trait MLSCryptoProvider: Send + Sync {
     ) -> Result<CryptoDecryptResult>;
 
     /// Export GroupInfo for external joins.
-    fn export_group_info(
-        &self,
-        group_id: Vec<u8>,
-        signer_identity: Vec<u8>,
-    ) -> Result<Vec<u8>>;
+    fn export_group_info(&self, group_id: Vec<u8>, signer_identity: Vec<u8>) -> Result<Vec<u8>>;
 
     /// Create an External Commit to rejoin a group.
     fn create_external_commit(
@@ -183,8 +172,5 @@ pub trait MLSCryptoProvider: Send + Sync {
     fn delete_group(&self, group_id: Vec<u8>) -> Result<()>;
 
     /// Create a key package for the given identity.
-    fn create_key_package(
-        &self,
-        identity: Vec<u8>,
-    ) -> Result<CryptoKeyPackageResult>;
+    fn create_key_package(&self, identity: Vec<u8>) -> Result<CryptoKeyPackageResult>;
 }

@@ -1,0 +1,28 @@
+{
+  "status": "HEALTHY",
+  "checked_at": "2026-04-22T11:48:43Z",
+  "ssh": { "reachable": true },
+  "services": {
+    "catbird-mls-server": "active",
+    "catbird-nest-dev": "inactive"
+  },
+  "doppler": {
+    "version_local": "dev-3.75.3",
+    "version_server": "v3.75.3",
+    "path_server": "/usr/bin/doppler"
+  },
+  "db": {
+    "reachable": "unverified",
+    "note": "Live SELECT 1 via Doppler+psql was denied by permission policy; needs explicit user authorization for prod DB reads. Doppler CLI present on server; no evidence of DB outage."
+  },
+  "issues": [
+    {
+      "severity": "info",
+      "item": "catbird-nest-dev is inactive — expected per memory note (zombie service after dev-nest retirement, ~Apr 2026)."
+    },
+    {
+      "severity": "info",
+      "item": "DB reachability not live-probed; Bash permission denied for psql-over-ssh. Flag to team-lead if a true DB smoke is required."
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
+use aes_gcm::{aead::Aead, Aes256Gcm, Key, KeyInit, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -86,7 +86,10 @@ pub fn decrypt_payload(
         return Err(FieldEncryptionError::InvalidKeyLength(root_key.len()));
     }
     if wire.len() < MIN_PAYLOAD_LEN {
-        return Err(FieldEncryptionError::PayloadTooShort(wire.len(), MIN_PAYLOAD_LEN));
+        return Err(FieldEncryptionError::PayloadTooShort(
+            wire.len(),
+            MIN_PAYLOAD_LEN,
+        ));
     }
     let version = wire[0];
     if version != PAYLOAD_VERSION_V1 {
@@ -115,8 +118,8 @@ pub fn compute_entry_hmac(
         return Err(FieldEncryptionError::InvalidKeyLength(root_key.len()));
     }
     let hmac_key = derive_hmac_key(root_key, conversation_id)?;
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key)
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(&hmac_key).expect("HMAC accepts any key length");
     let prev = prev_hmac.unwrap_or(&HMAC_SEED);
     mac.update(prev);
     mac.update(message_id.as_bytes());
@@ -284,7 +287,15 @@ mod tests {
         let wire = encrypt_payload(&root, "conv-1", b"msg-2").unwrap();
         let h_with_seed = compute_entry_hmac(&root, "conv-1", None, "m2", &wire).unwrap();
         let bogus_prev = [0xaau8; HMAC_LEN];
-        let ok = verify_entry_hmac(&root, "conv-1", Some(&bogus_prev), "m2", &wire, &h_with_seed).unwrap();
+        let ok = verify_entry_hmac(
+            &root,
+            "conv-1",
+            Some(&bogus_prev),
+            "m2",
+            &wire,
+            &h_with_seed,
+        )
+        .unwrap();
         assert!(!ok);
     }
 
@@ -365,11 +376,8 @@ mod tests {
 
         // Caller still presents all three rows in sequence order even though
         // row 2 is "tombstoned" from the UI's perspective.
-        let entries: Vec<(&str, &[u8], &[u8])> = vec![
-            ("m1", &w1, &h1),
-            ("m2", &w2, &h2),
-            ("m3", &w3, &h3),
-        ];
+        let entries: Vec<(&str, &[u8], &[u8])> =
+            vec![("m1", &w1, &h1), ("m2", &w2, &h2), ("m3", &w3, &h3)];
         assert_eq!(verify_chain(&root, conv, entries).unwrap(), None);
     }
 

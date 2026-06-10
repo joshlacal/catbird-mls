@@ -504,15 +504,36 @@ where
             // `process_incoming` is never called for app payloads, so
             // `storage.store_message` never fires and the UI shows nothing).
             //
-            // Pulls the most recent N messages with no type filter; the
-            // dedup gate inside `process_incoming` (`message_exists`) skips
-            // already-stored entries, so re-fetching is cheap. Uses the
-            // existing `process_incoming` path which handles commits
-            // (merge_incoming_commit) and app messages (storage.store_message)
-            // uniformly. Per-convo cursor tracking would be more efficient
-            // but is deferred — `messageExists` is cheap and correct.
+            // Pulls the most recent messages for the current local epoch.
+            // After Welcome/External Commit recovery, older epoch material is
+            // often intentionally unavailable on this device. Replaying those
+            // stale ciphertexts makes the UI look broken while OpenMLS reports
+            // WrongEpoch/TooDistantInThePast. Commit catch-up above is the
+            // path for epoch advancement; this pass is for current-epoch app
+            // traffic.
+            let app_epoch = match hex::decode(group_id)
+                .ok()
+                .and_then(|gid_bytes| self.mls_context().get_epoch(gid_bytes).ok())
+            {
+                Some(epoch) if epoch > 0 => epoch.min(u32::MAX as u64) as u32,
+                _ => {
+                    tracing::debug!(
+                        conversation_id = %conversation_id,
+                        group_id = %group_id,
+                        "Skipping app-message pass: local MLS group is unavailable"
+                    );
+                    continue;
+                }
+            };
             match self
-                .fetch_messages(conversation_id, None, 20, None, None, None)
+                .fetch_messages(
+                    conversation_id,
+                    None,
+                    20,
+                    Some("app"),
+                    Some(app_epoch),
+                    None,
+                )
                 .await
             {
                 Ok((msgs, _)) => {
@@ -583,6 +604,23 @@ where
                 .await
                 .unwrap_or(false)
             {
+                let current_epoch = hex::decode(group_id)
+                    .ok()
+                    .and_then(|gid_bytes| self.mls_context().get_epoch(gid_bytes).ok());
+
+                if current_epoch.is_some_and(|epoch| epoch >= convo.epoch) {
+                    tracing::info!(
+                        conversation_id = %conversation_id,
+                        group_id = %group_id,
+                        local_epoch = current_epoch.unwrap_or_default(),
+                        server_epoch = convo.epoch,
+                        "Clearing stale needs_rejoin flag; local MLS group is already caught up"
+                    );
+                    let _ = self.storage().clear_rejoin_flag(conversation_id).await;
+                    self.clear_rejoin_failures(conversation_id).await;
+                    continue;
+                }
+
                 tracing::info!(
                     conversation_id = %conversation_id,
                     group_id = %group_id,
