@@ -27,6 +27,12 @@ pub trait OrchestratorEventObserver: Send + Sync {
 
     /// Conversation exited quarantine. Called from .
     fn on_conversation_quarantine_cleared(&self, _convo_id: &str, _via: QuarantineExitReason) {}
+
+    /// A recovery-critical storage write failed (WS-5.2). `operation` is the
+    /// storage-trait method name (e.g. `mark_needs_rejoin`). Failing such a
+    /// write silently cancels deferred recovery across restart, so platforms
+    /// should surface it (diagnostics, error UI) rather than ignore it.
+    fn on_recovery_storage_write_failed(&self, _convo_id: &str, _operation: &str, _error: &str) {}
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -39,4 +45,5 @@ pub trait OrchestratorEventObserver {
     ) {
     }
     fn on_conversation_quarantine_cleared(&self, _convo_id: &str, _via: QuarantineExitReason) {}
+    fn on_recovery_storage_write_failed(&self, _convo_id: &str, _operation: &str, _error: &str) {}
 }

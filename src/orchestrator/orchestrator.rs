@@ -163,10 +163,10 @@ pub(crate) enum StagedCommitKindSummary {
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
-    S: MLSStorageBackend,
-    A: MLSAPIClient,
-    C: CredentialStore,
-    M: MlsCryptoContext,
+    S: MLSStorageBackend + 'static,
+    A: MLSAPIClient + 'static,
+    C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
 {
     /// Create a new orchestrator instance.
     pub fn new(
@@ -227,6 +227,51 @@ where
         tracing::info!(user_did, "Initializing MLS orchestrator");
         *self.user_did.lock().await = Some(user_did.to_string());
         *self.shutting_down.lock().await = false;
+
+        // WS-5.6: capabilities check — make default no-op storage methods
+        // observable so silently-dropped state (e.g. `mark_reset_pending`
+        // dropping RESET_PENDING across restart) shows up in logs.
+        {
+            let implemented = self.storage.implemented_optional_methods();
+            for method in super::storage::OPTIONAL_STORAGE_METHODS {
+                if !implemented.contains(method) {
+                    tracing::warn!(
+                        method,
+                        "Storage backend does not declare an override for optional trait \
+                         method — if it is still the default no-op, state routed through \
+                         it is silently dropped (declare via implemented_optional_methods)"
+                    );
+                }
+            }
+        }
+
+        // WS-5.4: hydrate persisted rejoin-backoff/quarantine state so restart
+        // cannot reset recovery backoff (invariant E7; TTL + never-extend
+        // rules in RecoveryTracker::hydrate_from_persisted).
+        match self.storage.get_recovery_state().await {
+            Ok(state) => {
+                if !state.entries.is_empty() || state.last_global_rejoin_attempt_at_ms.is_some() {
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    let mut tracker = self.recovery_tracker.lock().await;
+                    tracker.hydrate_from_persisted(&state, now_ms);
+                    tracing::info!(
+                        entries = state.entries.len(),
+                        has_global = state.last_global_rejoin_attempt_at_ms.is_some(),
+                        "Hydrated RecoveryTracker from persisted state"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Failed to read persisted RecoveryTracker state — backoff starts fresh"
+                );
+            }
+        }
+
+        // WS-5.3: finish any force_delete_local a crash interrupted between
+        // the persisted intent and completion.
+        self.reconcile_pending_local_deletes().await;
 
         // Rehydrate persisted conversation state (spec §8.2 / §8.5 Phase 1).
         // Conversations themselves are populated from server data on first

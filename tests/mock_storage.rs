@@ -7,7 +7,8 @@ use async_trait::async_trait;
 use catbird_mls::orchestrator::welcome_recovery::{ReissueAttempt, ReissueAttemptLog};
 use catbird_mls::orchestrator::{
     ConversationState, ConversationView, GroupState, JoinMethod, MLSStorageBackend, Message,
-    OrchestratorError, Result, SyncCursor,
+    OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState,
+    Result, SyncCursor,
 };
 
 /// Tracks a conversation state transition for test verification.
@@ -61,6 +62,12 @@ struct Inner {
     mark_reset_pending_calls: HashMap<String, u32>,
     /// conversation_id -> Welcome reissue attempts.
     welcome_reissue_attempts: HashMap<String, Vec<ReissueAttempt>>,
+    /// conversation_id -> persisted rejoin-backoff entry (WS-5.4 / E7).
+    recovery_backoff: HashMap<String, PersistedRecoveryBackoff>,
+    /// Persisted global last-rejoin-attempt timestamp (epoch ms).
+    last_global_rejoin_attempt_at_ms: Option<i64>,
+    /// conversation_id -> pending local-delete intent (WS-5.3).
+    pending_local_deletes: HashMap<String, PendingLocalDelete>,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -205,6 +212,52 @@ impl MockStorage {
             .get(conversation_id)
             .map(Vec::len)
             .unwrap_or(0)
+    }
+
+    /// Returns the persisted rejoin-backoff entry for a conversation (WS-5.4).
+    #[allow(dead_code)]
+    pub fn get_persisted_recovery_backoff(
+        &self,
+        conversation_id: &str,
+    ) -> Option<PersistedRecoveryBackoff> {
+        self.inner
+            .lock()
+            .unwrap()
+            .recovery_backoff
+            .get(conversation_id)
+            .cloned()
+    }
+
+    /// Returns the persisted global last-rejoin-attempt timestamp (WS-5.4).
+    #[allow(dead_code)]
+    pub fn get_persisted_last_global_rejoin_at_ms(&self) -> Option<i64> {
+        self.inner.lock().unwrap().last_global_rejoin_attempt_at_ms
+    }
+
+    /// Directly seed a persisted backoff entry, simulating state written by a
+    /// previous process (restart/TTL tests).
+    #[allow(dead_code)]
+    pub fn seed_recovery_backoff(&self, entry: PersistedRecoveryBackoff) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .recovery_backoff
+            .insert(entry.conversation_id.clone(), entry);
+    }
+
+    /// Directly seed a pending local-delete intent, simulating a crash between
+    /// intent and completion (WS-5.3 reconcile tests).
+    #[allow(dead_code)]
+    pub fn seed_pending_local_delete(&self, intent: PendingLocalDelete) {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .pending_local_deletes
+            .insert(intent.conversation_id.clone(), intent);
+    }
+
+    /// Returns the current pending local-delete intents (WS-5.3).
+    #[allow(dead_code)]
+    pub fn pending_local_delete_count(&self) -> usize {
+        self.inner.lock().unwrap().pending_local_deletes.len()
     }
 }
 
@@ -534,6 +587,84 @@ impl MLSStorageBackend for MockStorage {
     async fn remove_pending_message(&self, message_id: &str) -> Result<bool> {
         let mut inner = self.inner.lock().unwrap();
         Ok(inner.pending_messages.remove(message_id))
+    }
+
+    // ── RecoveryTracker persistence (WS-5.4 / E7) ────────────────────────
+
+    async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
+        let inner = self.inner.lock().unwrap();
+        Ok(PersistedRecoveryState {
+            entries: inner.recovery_backoff.values().cloned().collect(),
+            last_global_rejoin_attempt_at_ms: inner.last_global_rejoin_attempt_at_ms,
+        })
+    }
+
+    async fn set_recovery_backoff(&self, entry: &PersistedRecoveryBackoff) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .recovery_backoff
+            .insert(entry.conversation_id.clone(), entry.clone());
+        Ok(())
+    }
+
+    async fn clear_recovery_backoff(&self, conversation_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.recovery_backoff.remove(conversation_id);
+        Ok(())
+    }
+
+    async fn set_last_global_rejoin_attempt_at(&self, at_ms: i64) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.last_global_rejoin_attempt_at_ms = Some(at_ms);
+        Ok(())
+    }
+
+    // ── Pending local deletes (WS-5.3) ───────────────────────────────────
+
+    async fn mark_pending_local_delete(
+        &self,
+        conversation_id: &str,
+        group_id_hex: Option<&str>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending_local_deletes.insert(
+            conversation_id.to_string(),
+            PendingLocalDelete {
+                conversation_id: conversation_id.to_string(),
+                group_id_hex: group_id_hex.map(|g| g.to_string()),
+            },
+        );
+        Ok(())
+    }
+
+    async fn clear_pending_local_delete(&self, conversation_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.pending_local_deletes.remove(conversation_id);
+        Ok(())
+    }
+
+    async fn list_pending_local_deletes(&self) -> Result<Vec<PendingLocalDelete>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.pending_local_deletes.values().cloned().collect())
+    }
+
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &[
+            "get_conversation_state",
+            "get_welcome_reissue_attempt_log",
+            "record_welcome_reissue_attempt",
+            "mark_reset_pending",
+            "clear_reset_pending",
+            "store_pending_message",
+            "remove_pending_message",
+            "get_recovery_state",
+            "set_recovery_backoff",
+            "clear_recovery_backoff",
+            "set_last_global_rejoin_attempt_at",
+            "mark_pending_local_delete",
+            "clear_pending_local_delete",
+            "list_pending_local_deletes",
+        ]
     }
 }
 

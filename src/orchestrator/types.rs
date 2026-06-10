@@ -140,6 +140,49 @@ pub struct SyncCursor {
     pub messages_cursor: Option<String>,
 }
 
+/// Persisted per-conversation rejoin-backoff snapshot (WS-5.4, invariant E7).
+///
+/// This is the cross-platform RecoveryTracker persistence schema; the Swift
+/// twin (WS-6.4) MUST persist the same fields with the same units so restart
+/// cannot reset backoff on either platform. All timestamps are Unix epoch
+/// milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRecoveryBackoff {
+    pub conversation_id: ConversationId,
+    /// Consecutive failed rejoin attempts.
+    pub failed_rejoin_count: u32,
+    /// When the most recent rejoin attempt happened (epoch ms). Entries older
+    /// than `constants::RECOVERY_BACKOFF_TTL` are ignored on hydration.
+    pub last_attempt_at_ms: i64,
+    /// When the maxed-out rejoin lockout expires (epoch ms). `None` when the
+    /// conversation has not exhausted `MAX_REJOIN_ATTEMPTS`.
+    pub quarantined_until_ms: Option<i64>,
+}
+
+/// Persisted RecoveryTracker state returned by
+/// [`crate::orchestrator::MLSStorageBackend::get_recovery_state`] on startup
+/// (WS-5.4).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedRecoveryState {
+    pub entries: Vec<PersistedRecoveryBackoff>,
+    /// Last rejoin attempt on ANY conversation (epoch ms). Hydrating this
+    /// honors the remaining `MIN_REJOIN_INTERVAL`, never extends it.
+    pub last_global_rejoin_attempt_at_ms: Option<i64>,
+}
+
+/// Persisted intent row for an in-progress `force_delete_local` (WS-5.3).
+///
+/// Written before the MLS-layer and storage deletes, cleared after both
+/// succeed; the startup reconcile sweep finishes any delete that a crash
+/// interrupted in between.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingLocalDelete {
+    pub conversation_id: ConversationId,
+    /// Hex group id bound to the conversation when the delete started, so the
+    /// sweep can drop the MLS group even after the conversation row is gone.
+    pub group_id_hex: Option<GroupId>,
+}
+
 /// Information about a registered device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {

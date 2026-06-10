@@ -331,7 +331,7 @@ where
                         conversation_id,
                         "409 recovery: all commits failed to process — flagging NEEDS_REJOIN"
                     );
-                    let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                    self.mark_needs_rejoin_critical(conversation_id).await;
                     return Err(OrchestratorError::EpochMismatch {
                         local: epoch,
                         remote,
@@ -342,7 +342,7 @@ where
                 let retry_epoch = match self.mls_context().get_epoch(group_id_bytes.clone()) {
                     Ok(e) => e,
                     Err(_) => {
-                        let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                        self.mark_needs_rejoin_critical(conversation_id).await;
                         return Err(OrchestratorError::EpochMismatch {
                             local: epoch,
                             remote,
@@ -361,7 +361,7 @@ where
                             error = %e,
                             "409 recovery: re-encryption failed — flagging NEEDS_REJOIN"
                         );
-                        let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                        self.mark_needs_rejoin_critical(conversation_id).await;
                         return Err(OrchestratorError::from(e));
                     }
                 };
@@ -401,7 +401,7 @@ where
                             conversation_id,
                             "409 recovery: second 409 after sync — flagging NEEDS_REJOIN"
                         );
-                        let _ = self.storage().mark_needs_rejoin(conversation_id).await;
+                        self.mark_needs_rejoin_critical(conversation_id).await;
                         return Err(OrchestratorError::EpochMismatch {
                             local: retry_epoch,
                             remote,
@@ -672,7 +672,9 @@ where
                 // Fast path: in-memory pending_messages
                 if self.pending_messages().lock().await.remove(msg_id) {
                     // Also clean up persistent entry
-                    let _ = self.storage().remove_pending_message(msg_id).await;
+                    if let Err(e) = self.storage().remove_pending_message(msg_id).await {
+                        tracing::warn!(error = %e, message_id = %msg_id, "Failed to remove persisted pending-message entry");
+                    }
                     tracing::debug!(
                         message_id = %msg_id,
                         "Received own message back from server, skipping (in-memory)"
