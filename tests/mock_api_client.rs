@@ -55,6 +55,11 @@ struct FailureFlags {
     fail_next_create: bool,
     fail_next_get_messages: bool,
     fail_next_get_group_info: bool,
+    /// When true, next get_welcome fails with a generic (non-404) error.
+    /// Drives `join_or_rejoin` straight to the External Commit fallback,
+    /// bypassing the WelcomeRecoveryDecision policy (which only routes
+    /// expected 404/410 welcome misses).
+    fail_next_get_welcome: bool,
     fail_next_get_key_packages: bool,
     fail_next_add_members: bool,
     fail_next_remove_members: bool,
@@ -184,6 +189,10 @@ impl MockDeliveryService {
 
     pub fn fail_next_get_group_info(&self) {
         self.state.lock().unwrap().failures.fail_next_get_group_info = true;
+    }
+
+    pub fn fail_next_get_welcome(&self) {
+        self.state.lock().unwrap().failures.fail_next_get_welcome = true;
     }
 
     pub fn fail_next_get_key_packages(&self) {
@@ -1026,6 +1035,10 @@ impl MLSAPIClient for MockDeliveryService {
 
     async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
         let mut guard = self.state.lock().unwrap();
+        check_fail(
+            &mut guard.failures.fail_next_get_welcome,
+            "injected get_welcome failure",
+        )?;
         let did = self
             .effective_did_from_guard(&guard)
             .ok_or(OrchestratorError::NotAuthenticated)?;

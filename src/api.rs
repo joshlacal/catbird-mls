@@ -56,6 +56,40 @@ fn strip_padding(data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Re-flatten N38 typed decrypt error classes for the FFI surface.
+///
+/// `decrypt_message_classified` surfaces typed OpenMLS process-failure
+/// classes so the in-process orchestrator can run the Layer-3 peer-bad
+/// classifier and the WrongEpoch silent-skip on REAL crypto errors. Platform
+/// clients, however, contract on the legacy flattened shape:
+/// - iOS variant-matches `.DecryptionFailed` for ratchet-desync detection
+///   (`MLSClient.swift:1731/2669`) and string-matches `"DecryptionFailed"`
+///   (`Messaging.swift:1238/1326/1445`)
+/// - catmos-cli matches `DecryptionFailed` as well
+///
+/// So the FFI-exported `decrypt_message` maps every process-stage error class
+/// back to [`MLSError::DecryptionFailed`], byte-identical to the pre-N38
+/// behavior. Errors that never came from `process_protocol_message`
+/// (lock/context/serialization/group-lookup failures) pass through untouched.
+fn flatten_decrypt_error_for_ffi(e: MLSError) -> MLSError {
+    match e {
+        MLSError::InvalidCommit
+        | MLSError::WireFormatPolicyViolation { .. }
+        | MLSError::TlsCodec(_) => MLSError::DecryptionFailed,
+        // Process-stage stringified errors (incl. WrongEpoch) — produced only
+        // by `map_process_message_error` / `compute_app_data_updates` inside
+        // `process_protocol_message`.
+        MLSError::OpenMLS(msg)
+            if msg.starts_with("unprotect_message failed")
+                || msg.starts_with("process_message failed")
+                || msg.contains("AppData proposal reference missing") =>
+        {
+            MLSError::DecryptionFailed
+        }
+        other => other,
+    }
+}
+
 /// Bucket sizes for traffic-analysis-resistant padding.
 const BUCKET_SIZES: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 
@@ -127,6 +161,58 @@ fn compute_app_data_updates(
     })
 }
 
+/// Map an OpenMLS [`ProcessMessageError`] to a typed [`MLSError`] class (N38).
+///
+/// The Layer-3 peer-bad quarantine classifier
+/// (`MLSOrchestrator::classify_peer_bad`, `orchestrator/recovery.rs`) keys on
+/// the typed variants `InvalidCommit`, `WireFormatPolicyViolation`, and
+/// `TlsCodec`. Before this mapping every process failure was stringified into
+/// `MLSError::OpenMLS(debug)`, whose substring list lacked those classes, so
+/// the classifier was only reachable with mock crypto.
+///
+/// Class mapping:
+/// - wire-format policy breaches (`IncompatibleWireFormat`,
+///   `WrongWireFormat`, `UnencryptedApplicationMessage`) →
+///   [`MLSError::WireFormatPolicyViolation`] (peer-bad)
+/// - authenticated-but-malformed framing (`MalformedContent` after AEAD
+///   succeeded) → [`MLSError::TlsCodec`] (peer-bad)
+/// - commit semantic-validation failures (`StageCommitError`) →
+///   [`MLSError::InvalidCommit`] (peer-bad), EXCEPT
+///   `StageCommitError::EpochMismatch`, which is epoch skew (stale/replayed
+///   commit), not a peer-bad signal — it stays in the debug-string form.
+/// - everything else keeps the legacy `MLSError::OpenMLS(debug)` shape.
+///   Notably `ValidationError::WrongEpoch` MUST stay here:
+///   [`MLSError::is_wrong_epoch`] substring-matches `"WrongEpoch"` and the
+///   orchestrator's silent-skip arm (`messaging.rs`) depends on it.
+fn map_process_message_error<StorageError: std::fmt::Debug>(
+    e: ProcessMessageError<StorageError>,
+    stage: &str,
+    context: &str,
+) -> MLSError {
+    crate::error_log!("[{}] {} failed: {:?}", context, stage, e);
+    use openmls::framing::errors::MessageDecryptionError;
+    match e {
+        ProcessMessageError::IncompatibleWireFormat => MLSError::WireFormatPolicyViolation {
+            message: format!("{stage}: incompatible wire format"),
+        },
+        ProcessMessageError::ValidationError(ValidationError::WrongWireFormat)
+        | ProcessMessageError::ValidationError(ValidationError::UnencryptedApplicationMessage)
+        | ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
+            MessageDecryptionError::WrongWireFormat,
+        )) => MLSError::WireFormatPolicyViolation {
+            message: format!("{stage}: wrong wire format"),
+        },
+        ProcessMessageError::ValidationError(ValidationError::UnableToDecrypt(
+            MessageDecryptionError::MalformedContent,
+        )) => MLSError::TlsCodec(format!("{stage}: malformed message content")),
+        ProcessMessageError::InvalidCommit(StageCommitError::EpochMismatch) => {
+            MLSError::OpenMLS(format!("{stage} failed: InvalidCommit(EpochMismatch)"))
+        }
+        ProcessMessageError::InvalidCommit(_) => MLSError::InvalidCommit,
+        other => MLSError::OpenMLS(format!("{stage} failed: {:?}", other)),
+    }
+}
+
 fn process_protocol_message<Provider: OpenMlsProvider>(
     group: &mut MlsGroup,
     provider: &Provider,
@@ -135,10 +221,7 @@ fn process_protocol_message<Provider: OpenMlsProvider>(
 ) -> Result<ProcessedMessage, MLSError> {
     let unverified_message = group
         .unprotect_message(provider, protocol_msg)
-        .map_err(|e| {
-            crate::error_log!("[{}] Failed to unprotect message: {:?}", context, e);
-            MLSError::OpenMLS(format!("unprotect_message failed: {:?}", e))
-        })?;
+        .map_err(|e| map_process_message_error(e, "unprotect_message", context))?;
 
     let app_data_updates =
         if let Some(committed_proposals) = unverified_message.committed_proposals() {
@@ -153,10 +236,7 @@ fn process_protocol_message<Provider: OpenMlsProvider>(
             unverified_message,
             app_data_updates,
         )
-        .map_err(|e| {
-            crate::error_log!("[{}] Failed to process message: {:?}", context, e);
-            MLSError::OpenMLS(format!("process_message failed: {:?}", e))
-        })
+        .map_err(|e| map_process_message_error(e, "process_message", context))
 }
 
 /// MLS context wrapper for FFI
@@ -1899,286 +1979,24 @@ impl MLSContext {
         })?
     }
 
+    /// Decrypt an incoming MLS message (FFI surface).
+    ///
+    /// N38: this is a thin wrapper over [`MLSContext::decrypt_message_classified`]
+    /// that RE-FLATTENS process-stage error classes to
+    /// [`MLSError::DecryptionFailed`]. iOS variant-matches `.DecryptionFailed`
+    /// for ratchet-desync detection (MLSClient.swift) and string-matches
+    /// `"DecryptionFailed"` (Messaging.swift); catmos-cli matches it too. The
+    /// typed classes (`InvalidCommit`, `WireFormatPolicyViolation`,
+    /// `TlsCodec`, wrong-epoch `OpenMLS` strings) are only surfaced to the
+    /// in-process orchestrator via the `MlsCryptoContext` trait impl, which
+    /// calls the classified fn directly.
     pub fn decrypt_message(
         &self,
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
-        self.check_suspended()?;
-        // 🔍 DIAGNOSTIC: Thread tracking
-        let thread_id = std::thread::current().id();
-        let timestamp = std::time::SystemTime::now();
-
-        crate::debug_log!(
-            "[DECRYPT] 🧵 Thread {:?} starting decrypt_message at {:?}",
-            thread_id,
-            timestamp
-        );
-        crate::debug_log!(
-            "[DECRYPT] Group ID: {} ({} bytes)",
-            hex::encode(&group_id),
-            group_id.len()
-        );
-        crate::debug_log!("[DECRYPT] Ciphertext size: {} bytes", ciphertext.len());
-        crate::debug_log!(
-            "[DECRYPT] Ciphertext first 32 bytes: {:02x?}",
-            &ciphertext[..ciphertext.len().min(32)]
-        );
-
-        // 🔍 DIAGNOSTIC: Lock acquisition tracking
-        crate::debug_log!(
-            "[DECRYPT] 🔒 Thread {:?} attempting to acquire lock",
-            thread_id
-        );
-        let lock_start = std::time::SystemTime::now();
-
-        let mut guard = self.inner.lock().map_err(|e| {
-            crate::error_log!(
-                "[DECRYPT] ❌ Thread {:?} failed to acquire lock: {:?}",
-                thread_id,
-                e
-            );
-            MLSError::ContextNotInitialized
-        })?;
-        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
-
-        let lock_duration = lock_start.elapsed().unwrap_or_default();
-        crate::debug_log!(
-            "[DECRYPT] ✅ Thread {:?} acquired lock (waited {:?})",
-            thread_id,
-            lock_duration
-        );
-
-        let gid = GroupId::from_slice(&group_id);
-
-        // Capture epoch manager for staged commit auto-merge
-        let epoch_manager = inner.epoch_secret_manager().clone();
-
-        // Strip padding envelope before MLS deserialization
-        let ciphertext = strip_padding(&ciphertext);
-
-        // Deserialize to peek at message epoch for diagnostics (outside with_group)
-        let (mls_msg, remaining) =
-            MlsMessageIn::tls_deserialize_bytes(&ciphertext).map_err(|e| {
-                crate::error_log!("[DECRYPT] ❌ Failed to deserialize MlsMessage: {:?}", e);
-                MLSError::SerializationError
-            })?;
-        crate::debug_log!(
-            "[DECRYPT] MlsMessage deserialized ({} bytes remaining)",
-            remaining.len()
-        );
-
-        let protocol_msg: ProtocolMessage = mls_msg.try_into().map_err(|e| {
-            crate::error_log!("[DECRYPT] ❌ Failed to convert to ProtocolMessage: {:?}", e);
-            MLSError::DecryptionFailed
-        })?;
-
-        let message_epoch = protocol_msg.epoch().as_u64();
-
-        // 🔍 DIAGNOSTIC: Replay detection check (using per-context storage)
-        // Note: We can't extract generation without processing, so we track by epoch only for now
-        {
-            let group_history = inner
-                .processed_messages
-                .entry(group_id.clone())
-                .or_insert_with(Vec::new);
-
-            // Check if we've seen this exact epoch recently (simple replay detection)
-            let recent_epochs: Vec<u64> = group_history.iter().map(|(e, _)| *e).collect();
-            // Get current epoch from group for comparison
-            let current_epoch = inner
-                .groups
-                .get(&group_id)
-                .map(|gs| gs.group.epoch().as_u64())
-                .unwrap_or(0);
-
-            if recent_epochs.contains(&message_epoch) && message_epoch < current_epoch {
-                crate::error_log!(
-                    "[DECRYPT] 🔴 REPLAY SUSPECTED: Message from epoch {} was already processed!",
-                    message_epoch
-                );
-                crate::error_log!("[DECRYPT]   Current epoch: {}", current_epoch);
-                crate::error_log!("[DECRYPT]   Recent processed epochs: {:?}", recent_epochs);
-            }
-
-            crate::debug_log!(
-                "[DECRYPT] Recently processed epochs for this group: {:?}",
-                recent_epochs
-            );
-        }
-
-        let (plaintext, epoch, sender_credential, staged_commit_opt): (Vec<u8>, u64, CredentialData, Option<Box<StagedCommit>>) = inner.with_group(&gid, |group, provider, _signer| {
-            // 🔍 DIAGNOSTIC: Get current epoch and estimated generation BEFORE processing
-            let current_epoch = group.epoch().as_u64();
-            crate::info_log!("[DECRYPT] 📊 PRE-PROCESSING STATE:");
-            crate::info_log!("[DECRYPT]   Group: {}", hex::encode(&group_id));
-            crate::info_log!("[DECRYPT]   Current epoch: {}", current_epoch);
-            crate::info_log!("[DECRYPT]   Thread: {:?}", thread_id);
-
-            // 🔍 DIAGNOSTIC: Message metadata
-            crate::info_log!("[DECRYPT] 📨 MESSAGE METADATA:");
-            crate::info_log!("[DECRYPT]   Message epoch: {}", message_epoch);
-            crate::info_log!("[DECRYPT]   Message wire format: {:?}", protocol_msg.wire_format());
-
-            // 🔍 DIAGNOSTIC: Epoch mismatch check
-            if message_epoch != current_epoch {
-                crate::warn_log!("[DECRYPT] ⚠️ EPOCH MISMATCH DETECTED!");
-                crate::warn_log!("[DECRYPT]   Message epoch: {}, Group epoch: {}", message_epoch, current_epoch);
-                if message_epoch < current_epoch {
-                    crate::warn_log!("[DECRYPT]   Message is from PAST epoch (likely replayed or delayed)");
-                } else {
-                    crate::warn_log!("[DECRYPT]   Message is from FUTURE epoch (group out of sync)");
-                }
-            }
-
-            crate::debug_log!("[DECRYPT] 🔄 Calling OpenMLS process_message...");
-            let process_start = std::time::SystemTime::now();
-
-            let processed =
-                process_protocol_message(group, provider, protocol_msg, "DECRYPT").map_err(|e| {
-                    crate::error_log!("[DECRYPT] ❌ OpenMLS process_message FAILED!");
-                    crate::error_log!("[DECRYPT]   Error: {:?}", e);
-                    crate::error_log!("[DECRYPT]   Message epoch: {}", message_epoch);
-                    crate::error_log!("[DECRYPT]   Group epoch: {}", current_epoch);
-
-                    let error_str = format!("{:?}", e);
-                    if error_str.contains("SecretReuse") {
-                        crate::error_log!("[DECRYPT] 🔴 SECRET REUSE ERROR DETECTED!");
-                        crate::error_log!("[DECRYPT]   This indicates either:");
-                        crate::error_log!("[DECRYPT]   1. Message replay (same message processed twice)");
-                        crate::error_log!("[DECRYPT]   2. Concurrent access (multiple threads racing)");
-                        crate::error_log!("[DECRYPT]   3. Storage corruption (secret tree not persisted correctly)");
-                    }
-
-                    MLSError::DecryptionFailed
-                })?;
-
-            let process_duration = process_start.elapsed().unwrap_or_default();
-            crate::debug_log!("[DECRYPT] ✅ OpenMLS process_message succeeded (took {:?})", process_duration);
-
-            // 🔍 DIAGNOSTIC: Post-processing state
-            let epoch_after = group.epoch().as_u64();
-            crate::info_log!("[DECRYPT] 📊 POST-PROCESSING STATE:");
-            crate::info_log!("[DECRYPT]   Epoch after: {}", epoch_after);
-            if epoch_after != current_epoch {
-                crate::warn_log!("[DECRYPT]   ⚠️ Epoch CHANGED during processing! {} -> {}", current_epoch, epoch_after);
-            }
-
-            // Extract sender credential BEFORE consuming the processed message
-            let sender_cred = processed.credential().clone();
-            let sender_credential = CredentialData {
-                credential_type: format!("{:?}", sender_cred.credential_type()),
-                identity: sender_cred.serialized_content().to_vec(),
-            };
-            crate::debug_log!("[DECRYPT] Sender credential extracted: {} bytes", sender_credential.identity.len());
-
-            match processed.into_content() {
-                ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                    let bytes = app_msg.into_bytes();
-                    crate::debug_log!("[DECRYPT] ApplicationMessage processed: {} bytes", bytes.len());
-                    if !bytes.is_empty() {
-                        crate::debug_log!("[DECRYPT] Plaintext preview: {:?}", String::from_utf8_lossy(&bytes[..bytes.len().min(200)]));
-                    }
-                    Ok((bytes, message_epoch, sender_credential, None))
-                },
-                ProcessedMessageContent::ProposalMessage(prop) => {
-                    crate::debug_log!("[DECRYPT] ProposalMessage received: {:?}", std::any::type_name_of_val(&prop));
-                    Ok((vec![], message_epoch, sender_credential, None))
-                },
-                ProcessedMessageContent::ExternalJoinProposalMessage(ext) => {
-                    crate::debug_log!("[DECRYPT] ExternalJoinProposalMessage received: {:?}", std::any::type_name_of_val(&ext));
-                    Ok((vec![], message_epoch, sender_credential, None))
-                },
-                ProcessedMessageContent::StagedCommitMessage(staged) => {
-                    // Task #33: stage the incoming commit instead of auto-merging.
-                    // Platform must explicitly call `merge_incoming_commit(group_id, target_epoch)`
-                    // to advance the epoch (or `discard_incoming_commit` to abandon).
-                    let target_epoch = staged.group_context().epoch().as_u64();
-                    crate::info_log!(
-                        "[DECRYPT] StagedCommitMessage received - STAGING for explicit merge (target epoch {})",
-                        target_epoch
-                    );
-
-                    // Export current epoch secret now (forward-secrecy window includes pre-merge epoch)
-                    if let Err(e) = crate::async_runtime::block_on(
-                        epoch_manager.export_current_epoch_secret(group, provider)
-                    ) {
-                        crate::warn_log!("[DECRYPT] ⚠️ Failed to export epoch secret before staging: {:?}", e);
-                    }
-
-                    // Return the staged commit in the 4th tuple slot; the caller (decrypt_message)
-                    // will stash it in `pending_incoming_merges` keyed by (group_id, target_epoch).
-                    Ok((vec![], target_epoch, sender_credential, Some(staged)))
-                },
-            }
-        })?;
-
-        // Task #33: if an incoming StagedCommit was produced, stash it for explicit confirmation.
-        // Overwrites any prior pending entry for the same (group_id, epoch) — OpenMLS produces
-        // deterministic StagedCommits for the same wire message, so overwrite is idempotent.
-        if let Some(staged) = staged_commit_opt {
-            let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
-                crate::error_log!("[DECRYPT] ❌ pending_incoming_merges mutex poisoned");
-                MLSError::ContextNotInitialized
-            })?;
-            let key = (group_id.clone(), epoch);
-            if pending.insert(key, staged).is_some() {
-                crate::warn_log!(
-                    "[DECRYPT] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
-                    hex::encode(&group_id),
-                    epoch
-                );
-            }
-        }
-
-        let total_duration = timestamp.elapsed().unwrap_or_default();
-        crate::debug_log!(
-            "[DECRYPT] 🧵 Thread {:?} completed decrypt_message in {:?}",
-            thread_id,
-            total_duration
-        );
-        crate::debug_log!("[DECRYPT] ✅ Plaintext size: {} bytes", plaintext.len());
-
-        // 🔍 DIAGNOSTIC: Record this successful processing (using per-context storage)
-        // Note: We still don't have generation here, but we record the epoch
-        {
-            let group_history = inner
-                .processed_messages
-                .entry(group_id.clone())
-                .or_insert_with(Vec::new);
-
-            // Keep only last 100 messages per group to avoid unbounded growth
-            if group_history.len() >= 100 {
-                group_history.remove(0);
-            }
-
-            // Record (epoch, generation=0) since we don't track generation separately
-            group_history.push((message_epoch, 0));
-            crate::debug_log!(
-                "[DECRYPT] Recorded message processing: epoch {}",
-                message_epoch
-            );
-        }
-
-        // Increment and get sequence number for this group (using per-context storage)
-        let sequence_number = {
-            let counter = inner.sequence_counters.entry(group_id.clone()).or_insert(0);
-            *counter += 1;
-            *counter
-        };
-
-        crate::debug_log!(
-            "[DECRYPT] Message metadata - epoch: {}, sequence_number: {}",
-            epoch,
-            sequence_number
-        );
-
-        Ok(DecryptResult {
-            plaintext,
-            epoch,
-            sequence_number,
-            sender_credential,
-        })
+        self.decrypt_message_classified(group_id, ciphertext)
+            .map_err(flatten_decrypt_error_for_ffi)
     }
 
     /// Async variant of decrypt_message - offloads crypto work to avoid blocking
@@ -5333,6 +5151,309 @@ impl MLSContext {
     }
 }
 
+// Non-exported (in-process only) methods. Deliberately OUTSIDE the
+// `#[uniffi::export]` impl block so UniFFI never sees them.
+impl MLSContext {
+    /// Class-preserving decrypt (N38).
+    ///
+    /// Identical to the FFI-exported [`MLSContext::decrypt_message`] except
+    /// that OpenMLS process failures keep the typed [`MLSError`] classes
+    /// produced by `map_process_message_error` (`InvalidCommit`,
+    /// `WireFormatPolicyViolation`, `TlsCodec`, and `OpenMLS` strings that
+    /// preserve `WrongEpoch`). Used by the `MlsCryptoContext` trait impl so
+    /// the orchestrator's WrongEpoch silent-skip arm and Layer-3 peer-bad
+    /// quarantine classifier (`messaging.rs`) are reachable with REAL crypto
+    /// errors. Platform FFI callers must go through `decrypt_message`, which
+    /// re-flattens these classes to `DecryptionFailed`.
+    pub(crate) fn decrypt_message_classified(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<DecryptResult, MLSError> {
+        self.check_suspended()?;
+        // 🔍 DIAGNOSTIC: Thread tracking
+        let thread_id = std::thread::current().id();
+        let timestamp = std::time::SystemTime::now();
+
+        crate::debug_log!(
+            "[DECRYPT] 🧵 Thread {:?} starting decrypt_message at {:?}",
+            thread_id,
+            timestamp
+        );
+        crate::debug_log!(
+            "[DECRYPT] Group ID: {} ({} bytes)",
+            hex::encode(&group_id),
+            group_id.len()
+        );
+        crate::debug_log!("[DECRYPT] Ciphertext size: {} bytes", ciphertext.len());
+        crate::debug_log!(
+            "[DECRYPT] Ciphertext first 32 bytes: {:02x?}",
+            &ciphertext[..ciphertext.len().min(32)]
+        );
+
+        // 🔍 DIAGNOSTIC: Lock acquisition tracking
+        crate::debug_log!(
+            "[DECRYPT] 🔒 Thread {:?} attempting to acquire lock",
+            thread_id
+        );
+        let lock_start = std::time::SystemTime::now();
+
+        let mut guard = self.inner.lock().map_err(|e| {
+            crate::error_log!(
+                "[DECRYPT] ❌ Thread {:?} failed to acquire lock: {:?}",
+                thread_id,
+                e
+            );
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let lock_duration = lock_start.elapsed().unwrap_or_default();
+        crate::debug_log!(
+            "[DECRYPT] ✅ Thread {:?} acquired lock (waited {:?})",
+            thread_id,
+            lock_duration
+        );
+
+        let gid = GroupId::from_slice(&group_id);
+
+        // Capture epoch manager for staged commit auto-merge
+        let epoch_manager = inner.epoch_secret_manager().clone();
+
+        // Strip padding envelope before MLS deserialization
+        let ciphertext = strip_padding(&ciphertext);
+
+        // Deserialize to peek at message epoch for diagnostics (outside with_group)
+        let (mls_msg, remaining) =
+            MlsMessageIn::tls_deserialize_bytes(&ciphertext).map_err(|e| {
+                crate::error_log!("[DECRYPT] ❌ Failed to deserialize MlsMessage: {:?}", e);
+                MLSError::SerializationError
+            })?;
+        crate::debug_log!(
+            "[DECRYPT] MlsMessage deserialized ({} bytes remaining)",
+            remaining.len()
+        );
+
+        let protocol_msg: ProtocolMessage = mls_msg.try_into().map_err(|e| {
+            crate::error_log!("[DECRYPT] ❌ Failed to convert to ProtocolMessage: {:?}", e);
+            MLSError::DecryptionFailed
+        })?;
+
+        let message_epoch = protocol_msg.epoch().as_u64();
+
+        // 🔍 DIAGNOSTIC: Replay detection check (using per-context storage)
+        // Note: We can't extract generation without processing, so we track by epoch only for now
+        {
+            let group_history = inner
+                .processed_messages
+                .entry(group_id.clone())
+                .or_insert_with(Vec::new);
+
+            // Check if we've seen this exact epoch recently (simple replay detection)
+            let recent_epochs: Vec<u64> = group_history.iter().map(|(e, _)| *e).collect();
+            // Get current epoch from group for comparison
+            let current_epoch = inner
+                .groups
+                .get(&group_id)
+                .map(|gs| gs.group.epoch().as_u64())
+                .unwrap_or(0);
+
+            if recent_epochs.contains(&message_epoch) && message_epoch < current_epoch {
+                crate::error_log!(
+                    "[DECRYPT] 🔴 REPLAY SUSPECTED: Message from epoch {} was already processed!",
+                    message_epoch
+                );
+                crate::error_log!("[DECRYPT]   Current epoch: {}", current_epoch);
+                crate::error_log!("[DECRYPT]   Recent processed epochs: {:?}", recent_epochs);
+            }
+
+            crate::debug_log!(
+                "[DECRYPT] Recently processed epochs for this group: {:?}",
+                recent_epochs
+            );
+        }
+
+        let (plaintext, epoch, sender_credential, staged_commit_opt): (Vec<u8>, u64, CredentialData, Option<Box<StagedCommit>>) = inner.with_group(&gid, |group, provider, _signer| {
+            // 🔍 DIAGNOSTIC: Get current epoch and estimated generation BEFORE processing
+            let current_epoch = group.epoch().as_u64();
+            crate::info_log!("[DECRYPT] 📊 PRE-PROCESSING STATE:");
+            crate::info_log!("[DECRYPT]   Group: {}", hex::encode(&group_id));
+            crate::info_log!("[DECRYPT]   Current epoch: {}", current_epoch);
+            crate::info_log!("[DECRYPT]   Thread: {:?}", thread_id);
+
+            // 🔍 DIAGNOSTIC: Message metadata
+            crate::info_log!("[DECRYPT] 📨 MESSAGE METADATA:");
+            crate::info_log!("[DECRYPT]   Message epoch: {}", message_epoch);
+            crate::info_log!("[DECRYPT]   Message wire format: {:?}", protocol_msg.wire_format());
+
+            // 🔍 DIAGNOSTIC: Epoch mismatch check
+            if message_epoch != current_epoch {
+                crate::warn_log!("[DECRYPT] ⚠️ EPOCH MISMATCH DETECTED!");
+                crate::warn_log!("[DECRYPT]   Message epoch: {}, Group epoch: {}", message_epoch, current_epoch);
+                if message_epoch < current_epoch {
+                    crate::warn_log!("[DECRYPT]   Message is from PAST epoch (likely replayed or delayed)");
+                } else {
+                    crate::warn_log!("[DECRYPT]   Message is from FUTURE epoch (group out of sync)");
+                }
+            }
+
+            crate::debug_log!("[DECRYPT] 🔄 Calling OpenMLS process_message...");
+            let process_start = std::time::SystemTime::now();
+
+            let processed =
+                process_protocol_message(group, provider, protocol_msg, "DECRYPT").map_err(|e| {
+                    crate::error_log!("[DECRYPT] ❌ OpenMLS process_message FAILED!");
+                    crate::error_log!("[DECRYPT]   Error: {:?}", e);
+                    crate::error_log!("[DECRYPT]   Message epoch: {}", message_epoch);
+                    crate::error_log!("[DECRYPT]   Group epoch: {}", current_epoch);
+
+                    let error_str = format!("{:?}", e);
+                    if error_str.contains("SecretReuse") {
+                        crate::error_log!("[DECRYPT] 🔴 SECRET REUSE ERROR DETECTED!");
+                        crate::error_log!("[DECRYPT]   This indicates either:");
+                        crate::error_log!("[DECRYPT]   1. Message replay (same message processed twice)");
+                        crate::error_log!("[DECRYPT]   2. Concurrent access (multiple threads racing)");
+                        crate::error_log!("[DECRYPT]   3. Storage corruption (secret tree not persisted correctly)");
+                    }
+
+                    // N38: propagate the typed error class produced by
+                    // `map_process_message_error`. The FFI-facing
+                    // `decrypt_message` wrapper re-flattens these to
+                    // `DecryptionFailed`; the orchestrator trait path keeps
+                    // them so the peer-bad classifier and the WrongEpoch
+                    // silent-skip arm can fire on real OpenMLS errors.
+                    e
+                })?;
+
+            let process_duration = process_start.elapsed().unwrap_or_default();
+            crate::debug_log!("[DECRYPT] ✅ OpenMLS process_message succeeded (took {:?})", process_duration);
+
+            // 🔍 DIAGNOSTIC: Post-processing state
+            let epoch_after = group.epoch().as_u64();
+            crate::info_log!("[DECRYPT] 📊 POST-PROCESSING STATE:");
+            crate::info_log!("[DECRYPT]   Epoch after: {}", epoch_after);
+            if epoch_after != current_epoch {
+                crate::warn_log!("[DECRYPT]   ⚠️ Epoch CHANGED during processing! {} -> {}", current_epoch, epoch_after);
+            }
+
+            // Extract sender credential BEFORE consuming the processed message
+            let sender_cred = processed.credential().clone();
+            let sender_credential = CredentialData {
+                credential_type: format!("{:?}", sender_cred.credential_type()),
+                identity: sender_cred.serialized_content().to_vec(),
+            };
+            crate::debug_log!("[DECRYPT] Sender credential extracted: {} bytes", sender_credential.identity.len());
+
+            match processed.into_content() {
+                ProcessedMessageContent::ApplicationMessage(app_msg) => {
+                    let bytes = app_msg.into_bytes();
+                    crate::debug_log!("[DECRYPT] ApplicationMessage processed: {} bytes", bytes.len());
+                    if !bytes.is_empty() {
+                        crate::debug_log!("[DECRYPT] Plaintext preview: {:?}", String::from_utf8_lossy(&bytes[..bytes.len().min(200)]));
+                    }
+                    Ok((bytes, message_epoch, sender_credential, None))
+                },
+                ProcessedMessageContent::ProposalMessage(prop) => {
+                    crate::debug_log!("[DECRYPT] ProposalMessage received: {:?}", std::any::type_name_of_val(&prop));
+                    Ok((vec![], message_epoch, sender_credential, None))
+                },
+                ProcessedMessageContent::ExternalJoinProposalMessage(ext) => {
+                    crate::debug_log!("[DECRYPT] ExternalJoinProposalMessage received: {:?}", std::any::type_name_of_val(&ext));
+                    Ok((vec![], message_epoch, sender_credential, None))
+                },
+                ProcessedMessageContent::StagedCommitMessage(staged) => {
+                    // Task #33: stage the incoming commit instead of auto-merging.
+                    // Platform must explicitly call `merge_incoming_commit(group_id, target_epoch)`
+                    // to advance the epoch (or `discard_incoming_commit` to abandon).
+                    let target_epoch = staged.group_context().epoch().as_u64();
+                    crate::info_log!(
+                        "[DECRYPT] StagedCommitMessage received - STAGING for explicit merge (target epoch {})",
+                        target_epoch
+                    );
+
+                    // Export current epoch secret now (forward-secrecy window includes pre-merge epoch)
+                    if let Err(e) = crate::async_runtime::block_on(
+                        epoch_manager.export_current_epoch_secret(group, provider)
+                    ) {
+                        crate::warn_log!("[DECRYPT] ⚠️ Failed to export epoch secret before staging: {:?}", e);
+                    }
+
+                    // Return the staged commit in the 4th tuple slot; the caller (decrypt_message)
+                    // will stash it in `pending_incoming_merges` keyed by (group_id, target_epoch).
+                    Ok((vec![], target_epoch, sender_credential, Some(staged)))
+                },
+            }
+        })?;
+
+        // Task #33: if an incoming StagedCommit was produced, stash it for explicit confirmation.
+        // Overwrites any prior pending entry for the same (group_id, epoch) — OpenMLS produces
+        // deterministic StagedCommits for the same wire message, so overwrite is idempotent.
+        if let Some(staged) = staged_commit_opt {
+            let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
+                crate::error_log!("[DECRYPT] ❌ pending_incoming_merges mutex poisoned");
+                MLSError::ContextNotInitialized
+            })?;
+            let key = (group_id.clone(), epoch);
+            if pending.insert(key, staged).is_some() {
+                crate::warn_log!(
+                    "[DECRYPT] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
+                    hex::encode(&group_id),
+                    epoch
+                );
+            }
+        }
+
+        let total_duration = timestamp.elapsed().unwrap_or_default();
+        crate::debug_log!(
+            "[DECRYPT] 🧵 Thread {:?} completed decrypt_message in {:?}",
+            thread_id,
+            total_duration
+        );
+        crate::debug_log!("[DECRYPT] ✅ Plaintext size: {} bytes", plaintext.len());
+
+        // 🔍 DIAGNOSTIC: Record this successful processing (using per-context storage)
+        // Note: We still don't have generation here, but we record the epoch
+        {
+            let group_history = inner
+                .processed_messages
+                .entry(group_id.clone())
+                .or_insert_with(Vec::new);
+
+            // Keep only last 100 messages per group to avoid unbounded growth
+            if group_history.len() >= 100 {
+                group_history.remove(0);
+            }
+
+            // Record (epoch, generation=0) since we don't track generation separately
+            group_history.push((message_epoch, 0));
+            crate::debug_log!(
+                "[DECRYPT] Recorded message processing: epoch {}",
+                message_epoch
+            );
+        }
+
+        // Increment and get sequence number for this group (using per-context storage)
+        let sequence_number = {
+            let counter = inner.sequence_counters.entry(group_id.clone()).or_insert(0);
+            *counter += 1;
+            *counter
+        };
+
+        crate::debug_log!(
+            "[DECRYPT] Message metadata - epoch: {}, sequence_number: {}",
+            epoch,
+            sequence_number
+        );
+
+        Ok(DecryptResult {
+            plaintext,
+            epoch,
+            sequence_number,
+            sender_credential,
+        })
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Sender-side three-phase commit API on MLSContext (task #62)
 //
@@ -5938,7 +6059,12 @@ impl MlsCryptoContext for MLSContext {
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
-        self.decrypt_message(group_id, ciphertext)
+        // N38: the orchestrator gets the CLASS-PRESERVING decrypt so its
+        // WrongEpoch silent-skip arm and Layer-3 peer-bad quarantine
+        // classifier (`messaging.rs`) see real OpenMLS error classes. The
+        // FFI-exported `decrypt_message` keeps flattening to
+        // `DecryptionFailed` for iOS/catmos-cli compatibility.
+        self.decrypt_message_classified(group_id, ciphertext)
     }
 
     fn merge_incoming_commit(&self, group_id: Vec<u8>, target_epoch: u64) -> Result<u64, MLSError> {

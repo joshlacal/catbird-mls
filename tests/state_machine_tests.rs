@@ -292,21 +292,27 @@ async fn test_commit_messages_advance_epoch() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Circuit breaker is a permanent death spiral
+// 4. Circuit breaker recovers via cooldown
 // ---------------------------------------------------------------------------
 
-/// BUG: Once consecutive_sync_failures >= max_consecutive_sync_failures (5),
-/// sync_with_server returns Ok(()) without doing anything. Since success
-/// resets the counter (sync.rs:56) but sync never runs, the counter never
-/// resets. The circuit breaker is permanent.
+/// The sync circuit breaker trips after max_consecutive_sync_failures (5)
+/// consecutive failures and recovers via a cooldown (sync.rs:31-67): the
+/// first post-threshold call records `circuit_breaker_tripped_at` and skips
+/// silently; once the cooldown elapses the counter resets and sync actually
+/// runs again, with exponential backoff (30s → … → 300s) on re-trips.
 ///
-/// Scenario: Inject N consecutive sync failures to trip the breaker, then
-/// restore server health. Verify that sync NEVER recovers.
+/// HISTORY (N36): this test originally documented a permanent-death-spiral
+/// bug ("sync returns Ok(()) forever, counter never resets") and asserted
+/// that ten back-to-back retries surface an error. The cooldown-based
+/// recovery has been in `sync_with_server` since the squashed repo import
+/// (71a32ac) — the bug is fixed — but the old test could not observe it:
+/// the 30s base cooldown (`SYNC_CIRCUIT_BREAKER_BASE_SECS`) far exceeds the
+/// test's immediate-retry loop, so every retry was (correctly) skipped and
+/// the test stayed red. The test now pins the cooldown contract instead,
+/// simulating cooldown expiry by zeroing `circuit_breaker_cooldown_secs`
+/// rather than sleeping 30s.
 ///
 /// Ref: state-machine-messaging.md §5 (sync.rs:28-37), state-machine-recovery.md §7.5
-///
-/// Expected fix: Add a timeout/backoff that eventually resets the counter,
-/// or return a distinct error when circuit-broken so callers can act.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_circuit_breaker_recovery() {
     let mut world = TestWorld::new();
@@ -322,43 +328,73 @@ async fn test_circuit_breaker_recovery() {
         .await
         .expect("create_group failed");
 
-    // Inject enough failures to trip the circuit breaker (default max = 5)
-    // Each sync calls get_conversations, which we'll make fail.
+    // Inject one more failure than the breaker threshold (default max = 5).
+    // Each sync calls get_conversations, which we'll make fail. The sixth
+    // injected failure is consumed only AFTER the cooldown reopens the
+    // breaker — proof that sync really ran again.
     world.delivery_service().fail_get_conversations_n_times(6);
 
-    for i in 0..6 {
+    for i in 0..5 {
         let result = alice.orchestrator.sync_with_server(false).await;
-        // First 5 should fail, 6th might be silently skipped
-        if i < 5 {
-            assert!(result.is_err(), "Sync #{i} should have failed");
-        }
+        assert!(result.is_err(), "Sync #{i} should have failed");
     }
 
-    // Circuit breaker is now tripped. Even though the server is healthy,
-    // sync should be permanently skipped.
-    // Make the server healthy again (no more injected failures).
-
-    // Try syncing multiple times — with the bug, ALL will silently succeed
-    // (Ok(())) without actually syncing.
-    let mut any_sync_ran = false;
-    for _ in 0..10 {
-        let result = alice.orchestrator.sync_with_server(false).await;
-        // If sync actually ran and succeeded, the circuit breaker should reset.
-        // But with the bug, it never runs.
-        if result.is_err() {
-            // If it errors, sync at least attempted to run
-            any_sync_ran = true;
-        }
-    }
-
-    // The real test: after "recovery", does the sync actually contact the server?
-    // With the bug, it doesn't — sync is permanently dead.
-    // We verify by checking that at least one sync attempt actually ran.
-    // A working circuit breaker would eventually retry after a cooldown.
+    // Threshold reached: the next call trips the breaker — recorded
+    // trip-time, silent skip (no server contact, Ok(())).
+    let result = alice.orchestrator.sync_with_server(false).await;
+    assert!(result.is_ok(), "breaker-tripping call must skip silently");
     assert!(
-        any_sync_ran,
-        "After server recovery, sync should eventually resume, \
-         but circuit breaker is permanently tripped"
+        alice
+            .orchestrator
+            .circuit_breaker_tripped_at()
+            .lock()
+            .await
+            .is_some(),
+        "breaker must record its trip time"
+    );
+
+    // While the cooldown is active every sync is skipped silently — the
+    // remaining injected failure is NOT consumed.
+    let result = alice.orchestrator.sync_with_server(false).await;
+    assert!(result.is_ok(), "cooldown-active call must skip silently");
+
+    // Simulate cooldown expiry (base cooldown is 30s — too long to sleep in
+    // a unit test).
+    *alice
+        .orchestrator
+        .circuit_breaker_cooldown_secs()
+        .lock()
+        .await = 0;
+
+    // Cooldown expired → breaker resets and sync actually contacts the
+    // server again, hitting the one remaining injected failure.
+    let result = alice.orchestrator.sync_with_server(false).await;
+    assert!(
+        result.is_err(),
+        "after cooldown expiry sync must actually run (and consume the last \
+         injected failure); a permanently-tripped breaker would skip with Ok"
+    );
+
+    // Server is healthy now: sync recovers fully and clears breaker state.
+    let result = alice.orchestrator.sync_with_server(false).await;
+    assert!(
+        result.is_ok(),
+        "healthy sync after recovery failed: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        *alice.orchestrator.consecutive_sync_failures().lock().await,
+        0,
+        "successful sync must reset the failure counter"
+    );
+    assert!(
+        alice
+            .orchestrator
+            .circuit_breaker_tripped_at()
+            .lock()
+            .await
+            .is_none(),
+        "successful sync must clear the breaker trip time"
     );
 }
 
@@ -783,12 +819,19 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
     let result = alice.orchestrator.sync_with_server(false).await;
     assert!(result.is_ok(), "sync failed: {:?}", result.err());
 
+    // Two GroupInfo fetches, BOTH keyed by the stable conversation id:
+    // (1) the WelcomeRecoveryDecision policy probe added by Phase C
+    //     (commits ea82f4f / 4598446 — `route_welcome_recovery_decision`
+    //     checks GroupInfo availability before authorizing External Commit;
+    //     the original test predates it and expected a single call), and
+    // (2) the External Commit fetch in `force_rejoin_unlocked`.
     assert_eq!(
         world
             .delivery_service()
             .get_group_info_call_count(&conversation_id),
-        1,
-        "sync rejoin should fetch GroupInfo by stable conversation ID"
+        2,
+        "sync rejoin should fetch GroupInfo by stable conversation ID \
+         (policy probe + External Commit fetch)"
     );
     assert_eq!(
         world
@@ -851,6 +894,21 @@ async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
     );
 }
 
+/// HISTORY (N36): this test originally armed a single get_group_info
+/// failure and expected the welcome-404 path to reach the External Commit
+/// fallback directly. The Phase C WelcomeRecoveryDecision routing (commits
+/// ea82f4f / 4598446, "Route missing welcomes through recovery policy")
+/// changed that contract: an EXPECTED welcome miss (404/410) now consults
+/// the recovery policy first, which probes get_group_info itself and — when
+/// the probe also fails — SURRENDERS without burning an External Commit
+/// attempt (so no rejoin-failure cooldown is armed). The rejoin cooldown
+/// (`enforce_rejoin_backoff`) now only gates the EC fallback itself.
+///
+/// The test therefore drives the EC fallback directly: a non-404 welcome
+/// error skips the policy (join_or_rejoin treats it as "can't trust that no
+/// welcome exists"), the EC GroupInfo fetch fails, and a rejoin failure is
+/// recorded. The immediate retry must then be suppressed by the per-convo
+/// cooldown BEFORE any second External Commit GroupInfo fetch.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
     let mut world = TestWorld::new();
@@ -872,11 +930,25 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
         .delete_group(group_id_bytes)
         .expect("delete_group failed");
 
+    // Non-404 welcome error → skip the WelcomeRecoveryDecision policy and
+    // go straight to the External Commit fallback...
+    world.delivery_service().fail_next_get_welcome();
+    // ...whose GroupInfo fetch then fails → rejoin failure recorded →
+    // per-conversation cooldown armed.
     world.delivery_service().fail_next_get_group_info();
 
     let first = alice.orchestrator.join_or_rejoin(group_id).await;
     assert!(first.is_err(), "First join_or_rejoin should fail");
+    assert_eq!(
+        world.delivery_service().get_group_info_call_count(group_id),
+        1,
+        "first attempt should fetch GroupInfo exactly once (EC fallback)"
+    );
 
+    // Immediate retry: the welcome miss is now an expected 404, so the
+    // recovery policy probes get_group_info (one extra, successful call)
+    // and authorizes External Commit — but the per-convo cooldown from the
+    // failed first attempt must suppress it before the EC GroupInfo fetch.
     let second = alice.orchestrator.join_or_rejoin(group_id).await;
     match second {
         Err(OrchestratorError::RecoveryFailed(msg)) => {
@@ -890,7 +962,8 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
 
     assert_eq!(
         world.delivery_service().get_group_info_call_count(group_id),
-        1,
-        "Cooldown retry should not call get_group_info again"
+        2,
+        "cooldown retry may run the welcome-recovery policy probe (+1) but \
+         must NOT reach the External Commit GroupInfo fetch"
     );
 }
