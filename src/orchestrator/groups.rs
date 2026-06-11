@@ -129,6 +129,17 @@ where
                     );
                 }
 
+                // WS-3 stage 1 (ADR-009 D3): verify fetched key-package
+                // credentials against the DIDs they were fetched for.
+                // Warn-and-allow — never alters the operation.
+                self.verify_fetched_key_packages(
+                    &member_dids,
+                    &key_packages,
+                    "create_group",
+                    Some(group_id_hex),
+                )
+                .await;
+
                 let kp_data: Vec<crate::KeyPackageData> = key_packages
                     .iter()
                     .map(|kp| crate::KeyPackageData {
@@ -357,6 +368,11 @@ where
 
         // Fetch key packages for the new members.
         let key_packages = self.api_client().get_key_packages(member_dids).await?;
+
+        // WS-3 stage 1 (ADR-009 D3): warn-and-allow credential binding check.
+        self.verify_fetched_key_packages(member_dids, &key_packages, "add_members", Some(group_id))
+            .await;
+
         let kp_data: Vec<crate::KeyPackageData> = key_packages
             .iter()
             .map(|kp| crate::KeyPackageData {
@@ -393,11 +409,11 @@ where
                     return Err(OrchestratorError::MemberSyncFailed);
                 }
 
-                // Best-effort receipt storage.
+                // Best-effort receipt storage, with equivocation detection
+                // against previously stored receipts (WS-3 stage 1, ADR-009 D8).
                 if let Some(ref receipt) = result.receipt {
-                    if let Err(e) = self.storage().store_sequencer_receipt(receipt).await {
-                        tracing::warn!(error = %e, group_id, "Failed to store sequencer receipt");
-                    }
+                    self.record_and_check_sequencer_receipt(receipt, "add_members")
+                        .await;
                 }
 
                 // Confirm — but only if the server actually advanced the
@@ -519,6 +535,11 @@ where
         );
 
         let key_packages = self.api_client().get_key_packages(add_dids).await?;
+
+        // WS-3 stage 1 (ADR-009 D3): warn-and-allow credential binding check.
+        self.verify_fetched_key_packages(add_dids, &key_packages, "swap_members", Some(group_id))
+            .await;
+
         let kp_data: Vec<crate::KeyPackageData> = key_packages
             .iter()
             .map(|kp| crate::KeyPackageData {
@@ -554,10 +575,10 @@ where
                     return Err(OrchestratorError::MemberSyncFailed);
                 }
                 if let Some(ref receipt) = result.receipt {
-                    // Best-effort: receipts are diagnostics, not recovery state.
-                    if let Err(e) = self.storage().store_sequencer_receipt(receipt).await {
-                        tracing::warn!(error = %e, "Failed to store sequencer receipt");
-                    }
+                    // Best-effort receipt storage + equivocation detection
+                    // (WS-3 stage 1, ADR-009 D8); never blocks the operation.
+                    self.record_and_check_sequencer_receipt(receipt, "swap_members")
+                        .await;
                 }
                 let current_epoch =
                     self.mls_context()

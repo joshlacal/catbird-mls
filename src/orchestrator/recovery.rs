@@ -1555,11 +1555,14 @@ where
             }
         };
 
-        // Best-effort receipt storage
+        // Best-effort receipt storage, preceded by sequencer-equivocation
+        // detection against previously stored receipts for this conversation
+        // (WS-3 stage 1, ADR-009 D8 / backlog E3). Stage 1 is detection-only:
+        // on conflict this logs loudly and escalates via the event observer,
+        // then the rejoin proceeds unchanged.
         if let Some(ref receipt) = ext_commit_server_result.receipt {
-            if let Err(e) = self.storage().store_sequencer_receipt(receipt).await {
-                tracing::warn!(error = %e, convo_id, "Failed to store sequencer receipt");
-            }
+            self.record_and_check_sequencer_receipt(receipt, "external_commit")
+                .await;
         }
 
         // Merge the external join locally

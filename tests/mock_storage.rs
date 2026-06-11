@@ -8,7 +8,7 @@ use catbird_mls::orchestrator::welcome_recovery::{ReissueAttempt, ReissueAttempt
 use catbird_mls::orchestrator::{
     ConversationState, ConversationView, GroupState, JoinMethod, MLSStorageBackend, Message,
     OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState,
-    Result, SyncCursor,
+    Result, SequencerReceipt, SyncCursor,
 };
 
 /// Tracks a conversation state transition for test verification.
@@ -84,6 +84,8 @@ struct Inner {
     fail_next_set_conversation_state: bool,
     fail_next_mark_quarantined: bool,
     fail_next_clear_quarantine: bool,
+    /// Stored sequencer receipts (WS-3 equivocation detection tests).
+    sequencer_receipts: Vec<SequencerReceipt>,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -696,6 +698,28 @@ impl MLSStorageBackend for MockStorage {
     async fn remove_pending_message(&self, message_id: &str) -> Result<bool> {
         let mut inner = self.inner.lock().unwrap();
         Ok(inner.pending_messages.remove(message_id))
+    }
+
+    // ── Sequencer Receipts (WS-3 equivocation detection) ─────────────────
+
+    async fn store_sequencer_receipt(&self, receipt: &SequencerReceipt) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.sequencer_receipts.push(receipt.clone());
+        Ok(())
+    }
+
+    async fn get_sequencer_receipts(
+        &self,
+        convo_id: &str,
+        since_epoch: Option<i32>,
+    ) -> Result<Vec<SequencerReceipt>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .sequencer_receipts
+            .iter()
+            .filter(|r| r.convo_id == convo_id && since_epoch.is_none_or(|e| r.epoch >= e))
+            .cloned()
+            .collect())
     }
 
     // ── RecoveryTracker persistence (WS-5.4 / E7) ────────────────────────

@@ -1,5 +1,6 @@
 pub mod api_client;
 pub mod constants;
+pub mod credential_binding;
 pub mod credentials;
 pub mod crypto_provider;
 pub mod devices;
@@ -21,6 +22,7 @@ pub mod welcome_recovery;
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
 pub use constants::*;
+pub use credential_binding::CredentialVerification;
 pub use credentials::CredentialStore;
 pub use error::{OrchestratorError, Result};
 pub use mls_provider::MlsCryptoContext;

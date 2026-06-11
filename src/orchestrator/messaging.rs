@@ -668,6 +668,19 @@ where
         let sender_did = String::from_utf8(decrypt_result.sender_credential.identity.clone())
             .unwrap_or_else(|_| envelope.sender_did.clone());
 
+        // WS-3 stage 1 (ADR-009 D4): cross-check the MLS sender credential
+        // against the envelope's claimed sender DID. The envelope is a
+        // routing hint, not proof. Warn-and-allow — processing continues
+        // unchanged on mismatch. Covers application messages AND inbound
+        // commit frames (including External-Commit joiners), since both pass
+        // through this decrypt path before the empty-plaintext branch below.
+        self.verify_inbound_sender_credential(
+            &envelope.conversation_id,
+            &envelope.sender_did,
+            &decrypt_result.sender_credential.identity,
+        )
+        .await;
+
         let is_own = sender_did.to_lowercase() == user_did.to_lowercase();
 
         // Check if this is an own message that we already sent

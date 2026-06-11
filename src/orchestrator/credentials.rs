@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use super::credential_binding::{check_identity_claim, CredentialVerification};
 use super::error::Result;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -46,4 +47,29 @@ pub trait CredentialStore: CredentialStoreBounds {
 
     /// Clear all credentials for a user (used during recovery).
     async fn clear_all(&self, user_did: &str) -> Result<()>;
+
+    /// Verify that a member's MLS leaf credential belongs to the expected
+    /// ATProto DID (ADR-009, WS-3).
+    ///
+    /// `claimed_identity` is the UTF-8 identity extracted from the MLS
+    /// BasicCredential (bare DID or `did:...#device-id`); `expected_did` is
+    /// the DID the credential was presented for (the DID a key package was
+    /// fetched for, or the envelope sender DID on inbound processing).
+    ///
+    /// The default implementation is the **stage-1 structural check**: the
+    /// credential's DID root must equal the expected DID (fragment-aware).
+    /// Platforms override this to add the second half of the ADR-009 proof —
+    /// resolving the root DID's ATProto repo and matching the leaf signature
+    /// key against an active `blue.catbird.mlsChat.device` record, with D6
+    /// caching/revocation semantics. Overrides should return
+    /// `CredentialVerification` outcomes, reserving `Err` for verifier
+    /// infrastructure failures (network/storage), which callers treat as
+    /// warn-only in the warn-and-allow rollout stage.
+    async fn verify_member_credential(
+        &self,
+        expected_did: &str,
+        claimed_identity: &str,
+    ) -> Result<CredentialVerification> {
+        Ok(check_identity_claim(expected_did, claimed_identity))
+    }
 }

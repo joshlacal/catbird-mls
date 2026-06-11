@@ -93,6 +93,17 @@ struct MockState {
     /// Artificial delay for process_external_commit (used by concurrency tests).
     process_external_commit_delay_ms: u64,
 
+    /// Key-package redirects for credential-binding tests (WS-3): when a key
+    /// package is requested for the key DID, serve one from the value DID's
+    /// pool instead — still labeled with the requested DID. Simulates a
+    /// malicious or buggy DS substituting another user's key package.
+    key_package_redirects: HashMap<String, String>,
+
+    /// When true, `process_external_commit` returns a `SequencerReceipt`
+    /// whose commit hash is SHA-256 of the submitted commit bytes
+    /// (mirrors the real sequencer). Used by equivocation-detection tests.
+    issue_external_commit_receipts: bool,
+
     /// Pending Welcomes per (conversation_id, recipient_did). Delivered FIFO by
     /// `get_welcome` for the currently-authenticated DID. A single Welcome blob
     /// from `add_members` or `create_conversation` typically targets multiple
@@ -363,6 +374,25 @@ impl MockDeliveryService {
     /// Set an artificial delay for `process_external_commit`.
     pub fn set_process_external_commit_delay_ms(&self, delay_ms: u64) {
         self.state.lock().unwrap().process_external_commit_delay_ms = delay_ms;
+    }
+
+    /// WS-3 credential-binding tests: serve key packages from
+    /// `serve_from_did`'s pool whenever `requested_did`'s packages are
+    /// fetched, still labeling the result with `requested_did`. Simulates a
+    /// malicious DS substituting another user's key package.
+    pub fn redirect_key_packages_for_test(&self, requested_did: &str, serve_from_did: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .key_package_redirects
+            .insert(requested_did.to_string(), serve_from_did.to_string());
+    }
+
+    /// WS-3 equivocation tests: make `process_external_commit` return a
+    /// `SequencerReceipt` over the submitted commit (hash = SHA-256 of the
+    /// commit bytes), as the real sequencer does.
+    pub fn issue_external_commit_receipts_for_test(&self, enabled: bool) {
+        self.state.lock().unwrap().issue_external_commit_receipts = enabled;
     }
 }
 
@@ -829,7 +859,14 @@ impl MLSAPIClient for MockDeliveryService {
 
         let mut result = Vec::new();
         for did in dids {
-            if let Some(packages) = guard.key_packages.get_mut(did) {
+            // WS-3 tests: a redirect serves another DID's package while still
+            // labeling it with the requested DID (malicious-DS simulation).
+            let source_did = guard
+                .key_package_redirects
+                .get(did)
+                .cloned()
+                .unwrap_or_else(|| did.clone());
+            if let Some(packages) = guard.key_packages.get_mut(&source_did) {
                 if let Some(pkg) = packages.first().cloned() {
                     // Consume FIFO — remove the first element.
                     packages.remove(0);
@@ -1021,10 +1058,26 @@ impl MLSAPIClient for MockDeliveryService {
                 timestamp: Utc::now(),
             });
 
+        // WS-3 equivocation tests: optionally issue a receipt over the
+        // commit, mirroring the real sequencer's receipt shape.
+        let receipt = if guard.issue_external_commit_receipts {
+            use sha2::{Digest, Sha256};
+            Some(SequencerReceipt {
+                convo_id: convo_id.to_string(),
+                epoch: new_epoch as i32,
+                commit_hash: Sha256::digest(commit_data).to_vec(),
+                sequencer_did: "did:web:sequencer.test".to_string(),
+                issued_at: Utc::now().timestamp(),
+                signature: vec![],
+            })
+        } else {
+            None
+        };
+
         Ok(ProcessExternalCommitResult {
             epoch: new_epoch,
             rejoined_at: Utc::now().to_rfc3339(),
-            receipt: None,
+            receipt,
         })
     }
 }
