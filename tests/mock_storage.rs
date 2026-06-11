@@ -75,6 +75,15 @@ struct Inner {
     /// When set, the next `delete_conversations` call fails once (WS-5 FIX-5
     /// keep-intent-on-failure tests).
     fail_next_delete_conversations: bool,
+    /// conversation_id -> persisted quarantine payload `(reason_tag,
+    /// since_ms)` (Layer 3; mirrors the platform `mark_quarantined` /
+    /// `clear_quarantine` columns).
+    quarantines: HashMap<String, (String, i64)>,
+    /// One-shot failure injections for the quarantine persist escalation
+    /// tests (E7 follow-up R-2).
+    fail_next_set_conversation_state: bool,
+    fail_next_mark_quarantined: bool,
+    fail_next_clear_quarantine: bool,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -278,6 +287,37 @@ impl MockStorage {
     pub fn fail_next_delete_conversations(&self) {
         self.inner.lock().unwrap().fail_next_delete_conversations = true;
     }
+
+    /// Make the next `set_conversation_state` call fail once (R-2
+    /// quarantine-persist escalation tests).
+    #[allow(dead_code)]
+    pub fn fail_next_set_conversation_state(&self) {
+        self.inner.lock().unwrap().fail_next_set_conversation_state = true;
+    }
+
+    /// Make the next `mark_quarantined` call fail once.
+    #[allow(dead_code)]
+    pub fn fail_next_mark_quarantined(&self) {
+        self.inner.lock().unwrap().fail_next_mark_quarantined = true;
+    }
+
+    /// Make the next `clear_quarantine` call fail once.
+    #[allow(dead_code)]
+    pub fn fail_next_clear_quarantine(&self) {
+        self.inner.lock().unwrap().fail_next_clear_quarantine = true;
+    }
+
+    /// Returns the persisted quarantine payload `(reason_tag, since_ms)` for
+    /// `conversation_id`, if any.
+    #[allow(dead_code)]
+    pub fn get_persisted_quarantine(&self, conversation_id: &str) -> Option<(String, i64)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .quarantines
+            .get(conversation_id)
+            .cloned()
+    }
 }
 
 #[async_trait]
@@ -377,6 +417,12 @@ impl MLSStorageBackend for MockStorage {
         state: ConversationState,
     ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_set_conversation_state {
+            inner.fail_next_set_conversation_state = false;
+            return Err(OrchestratorError::Storage(
+                "injected set_conversation_state failure".to_string(),
+            ));
+        }
         let prev = inner
             .conversations
             .get(conversation_id)
@@ -486,6 +532,38 @@ impl MLSStorageBackend for MockStorage {
             .mark_reset_pending_calls
             .entry(conversation_id.to_string())
             .or_insert(0) += 1;
+        Ok(())
+    }
+
+    async fn mark_quarantined(
+        &self,
+        conversation_id: &str,
+        reason_tag: &str,
+        since_ms: i64,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_mark_quarantined {
+            inner.fail_next_mark_quarantined = false;
+            return Err(OrchestratorError::Storage(
+                "injected mark_quarantined failure".to_string(),
+            ));
+        }
+        inner.quarantines.insert(
+            conversation_id.to_string(),
+            (reason_tag.to_string(), since_ms),
+        );
+        Ok(())
+    }
+
+    async fn clear_quarantine(&self, conversation_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_clear_quarantine {
+            inner.fail_next_clear_quarantine = false;
+            return Err(OrchestratorError::Storage(
+                "injected clear_quarantine failure".to_string(),
+            ));
+        }
+        inner.quarantines.remove(conversation_id);
         Ok(())
     }
 
@@ -686,6 +764,8 @@ impl MLSStorageBackend for MockStorage {
             "record_welcome_reissue_attempt",
             "mark_reset_pending",
             "clear_reset_pending",
+            "mark_quarantined",
+            "clear_quarantine",
             "store_pending_message",
             "remove_pending_message",
             "get_recovery_state",

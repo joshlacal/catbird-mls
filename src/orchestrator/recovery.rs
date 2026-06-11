@@ -336,9 +336,25 @@ impl RecoveryTracker {
     ///   `max_attempts` so the maxed-out gate cannot outlive its lockout.
     /// - `last_global_rejoin_attempt_at_ms` re-arms `MIN_REJOIN_INTERVAL` for
     ///   whatever window remains.
-    pub fn hydrate_from_persisted(&mut self, state: &PersistedRecoveryState, now_ms: i64) {
+    ///
+    /// Returns the conversation ids of entries hydration REJECTED
+    /// (TTL-expired, future-dated, zero-count, or undatable on this clock).
+    /// The caller must delete the corresponding persisted rows
+    /// (`clear_recovery_backoff`) — Swift twin parity:
+    /// `MLSRecoveryManager.hydrateFromDatabase` ignores AND deletes. A kept
+    /// row could resurrect later (e.g. a TTL-expired row becomes "valid"
+    /// again if the wall clock regresses), and a kept future-dated row
+    /// re-logs its drop warning on every restart. This is a pure tracker
+    /// function; storage I/O stays with the caller.
+    #[must_use = "rejected entries must be deleted from storage (clear_recovery_backoff)"]
+    pub fn hydrate_from_persisted(
+        &mut self,
+        state: &PersistedRecoveryState,
+        now_ms: i64,
+    ) -> Vec<String> {
         let ttl_ms = constants::RECOVERY_BACKOFF_TTL.as_millis() as i64;
         let now = Instant::now();
+        let mut rejected: Vec<String> = Vec::new();
 
         for entry in &state.entries {
             let elapsed_ms = now_ms.saturating_sub(entry.last_attempt_at_ms);
@@ -356,6 +372,7 @@ impl RecoveryTracker {
                     now_ms,
                     "Persisted rejoin backoff is future-dated (wall clock moved backwards) — dropping entry"
                 );
+                rejected.push(entry.conversation_id.clone());
                 continue;
             }
             if elapsed_ms >= ttl_ms {
@@ -364,10 +381,14 @@ impl RecoveryTracker {
                     last_attempt_at_ms = entry.last_attempt_at_ms,
                     "Persisted rejoin backoff older than TTL — ignoring on hydration"
                 );
+                rejected.push(entry.conversation_id.clone());
                 continue;
             }
             let mut count = entry.failed_rejoin_count;
             if count == 0 {
+                // No failure state to carry — a dead row (e.g. a runtime
+                // lockout expiry written through with max_attempts == 1).
+                rejected.push(entry.conversation_id.clone());
                 continue;
             }
             let mut lockout_until = None;
@@ -391,6 +412,7 @@ impl RecoveryTracker {
                     // indefinite maxed-out gate.
                     count = self.max_attempts.saturating_sub(1);
                     if count == 0 {
+                        rejected.push(entry.conversation_id.clone());
                         continue;
                     }
                 }
@@ -405,6 +427,11 @@ impl RecoveryTracker {
                     elapsed_ms,
                     "Cannot back-date persisted rejoin backoff on this clock — dropping entry"
                 );
+                // Elapsed only grows (a regressed clock hits the future-dated
+                // drop instead), so this entry can never hydrate on this
+                // device again — reject so the row is deleted rather than
+                // re-warning every restart until the TTL drop.
+                rejected.push(entry.conversation_id.clone());
                 continue;
             };
             self.failed_rejoins.insert(
@@ -421,6 +448,10 @@ impl RecoveryTracker {
             let elapsed_ms = now_ms.saturating_sub(global_ms);
             if elapsed_ms < 0 {
                 // Same backward-clock policy as per-convo entries above.
+                // (Not in `rejected`: the global stamp has no per-convo row,
+                // and the storage trait has no clear API for it — the next
+                // rejoin attempt overwrites it via
+                // set_last_global_rejoin_attempt_at.)
                 tracing::warn!(
                     global_ms,
                     now_ms,
@@ -438,6 +469,8 @@ impl RecoveryTracker {
                 }
             }
         }
+
+        rejected
     }
 
     /// Remaining cooldown imposed by a recent SUCCESSFUL rejoin on this
@@ -2897,6 +2930,10 @@ where
                 ConversationState::Quarantined { reason, since_ms },
             );
         }
+        // WS-5.2: quarantine state is recovery-critical — a dropped write
+        // here means the quarantine silently does not survive restart and
+        // the conversation re-enters the message flow until Layer 3 trips
+        // again. Escalate like the backoff-row clear above.
         if let Err(e) = self
             .storage()
             .set_conversation_state(
@@ -2905,14 +2942,20 @@ where
             )
             .await
         {
-            tracing::warn!(convo_id, error = %e, "Failed to persist Quarantined state");
+            self.report_recovery_storage_failure(
+                convo_id,
+                "set_conversation_state:quarantined",
+                &e,
+            )
+            .await;
         }
         if let Err(e) = self
             .storage()
             .mark_quarantined(convo_id, reason.tag(), since_ms)
             .await
         {
-            tracing::warn!(convo_id, error = %e, "Failed to persist quarantine payload");
+            self.report_recovery_storage_failure(convo_id, "mark_quarantined", &e)
+                .await;
         }
         tracing::warn!(
             convo_id,
@@ -2947,16 +2990,27 @@ where
             let mut states = self.conversation_states().lock().await;
             states.insert(convo_id.to_string(), ConversationState::Active);
             drop(states);
+            // WS-5.2: a dropped write here leaves the persisted state
+            // Quarantined, so restart rehydration re-quarantines a
+            // conversation the user/peer already cleared. Escalate.
             if let Err(e) = self
                 .storage()
                 .set_conversation_state(convo_id, ConversationState::Active)
                 .await
             {
-                tracing::warn!(convo_id, error = %e, "Failed to persist Active state on quarantine exit");
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "set_conversation_state:active_quarantine_exit",
+                    &e,
+                )
+                .await;
             }
         }
+        // WS-5.2: a surviving quarantine payload row resurrects the
+        // quarantine on restart. Escalate like the state write above.
         if let Err(e) = self.storage().clear_quarantine(convo_id).await {
-            tracing::warn!(convo_id, error = %e, "Failed to clear persisted quarantine payload");
+            self.report_recovery_storage_failure(convo_id, "clear_quarantine", &e)
+                .await;
         }
         tracing::info!(
             convo_id,

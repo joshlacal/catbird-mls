@@ -252,13 +252,33 @@ where
             Ok(state) => {
                 if !state.entries.is_empty() || state.last_global_rejoin_attempt_at_ms.is_some() {
                     let now_ms = chrono::Utc::now().timestamp_millis();
-                    let mut tracker = self.recovery_tracker.lock().await;
-                    tracker.hydrate_from_persisted(&state, now_ms);
+                    let rejected = {
+                        let mut tracker = self.recovery_tracker.lock().await;
+                        tracker.hydrate_from_persisted(&state, now_ms)
+                    };
                     tracing::info!(
                         entries = state.entries.len(),
+                        rejected = rejected.len(),
                         has_global = state.last_global_rejoin_attempt_at_ms.is_some(),
                         "Hydrated RecoveryTracker from persisted state"
                     );
+                    // Swift twin parity (MLSRecoveryManager.hydrateFromDatabase):
+                    // rejected entries (TTL-expired / future-dated / invalid)
+                    // are DELETED, not just ignored. A kept TTL-expired row
+                    // could resurrect if the wall clock later regresses, and
+                    // a kept future-dated row re-logs its drop warning on
+                    // every restart. Failures escalate: a surviving rejected
+                    // row keeps re-entering this path with stale gating data.
+                    for convo_id in &rejected {
+                        if let Err(e) = self.storage.clear_recovery_backoff(convo_id).await {
+                            self.report_recovery_storage_failure(
+                                convo_id,
+                                "clear_recovery_backoff:hydration_reject",
+                                &e,
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
             Err(e) => {

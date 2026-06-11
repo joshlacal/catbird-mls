@@ -300,6 +300,90 @@ async fn persisted_backoff_older_than_ttl_is_ignored_on_hydration() {
         );
         assert!(!tracker.should_skip("stale-convo"));
     }
+    // R-1 (Swift twin parity): the TTL-rejected entry must also be DELETED
+    // from storage, not just ignored — a kept row would resurrect if the
+    // wall clock later regressed.
+    assert!(
+        alice
+            .storage
+            .get_persisted_recovery_backoff("stale-convo")
+            .is_none(),
+        "R-1 REGRESSION: TTL-rejected backoff row survived hydration"
+    );
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+/// R-1: hydration deletes every persisted row it rejects (TTL-expired AND
+/// future-dated) while keeping valid rows intact. Without the delete, the
+/// future-dated drop (FIX-8) re-logs its warning on every restart because
+/// the row survives, and an expired row can resurrect on clock regression.
+#[tokio::test(flavor = "multi_thread")]
+async fn hydration_deletes_rejected_rows_and_keeps_valid_rows() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+
+    let ttl_ms = constants::RECOVERY_BACKOFF_TTL.as_millis() as i64;
+    alice
+        .storage
+        .seed_recovery_backoff(PersistedRecoveryBackoff {
+            conversation_id: "expired-convo".to_string(),
+            failed_rejoin_count: 2,
+            last_attempt_at_ms: now_ms() - ttl_ms - 60_000,
+            quarantined_until_ms: None,
+        });
+    alice
+        .storage
+        .seed_recovery_backoff(PersistedRecoveryBackoff {
+            conversation_id: "future-convo".to_string(),
+            failed_rejoin_count: 3,
+            // Written "one hour from now": the wall clock stepped backwards.
+            last_attempt_at_ms: now_ms() + 3_600_000,
+            quarantined_until_ms: Some(now_ms() + 25 * 3_600_000),
+        });
+    alice
+        .storage
+        .seed_recovery_backoff(PersistedRecoveryBackoff {
+            conversation_id: "valid-convo".to_string(),
+            failed_rejoin_count: 1,
+            last_attempt_at_ms: now_ms() - 10_000,
+            quarantined_until_ms: None,
+        });
+
+    let (restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+    {
+        let tracker = restarted.recovery_tracker().lock().await;
+        assert_eq!(tracker.failed_attempts("expired-convo"), 0);
+        assert_eq!(tracker.failed_attempts("future-convo"), 0);
+        assert_eq!(
+            tracker.failed_attempts("valid-convo"),
+            1,
+            "valid entry must hydrate normally"
+        );
+    }
+    assert!(
+        alice
+            .storage
+            .get_persisted_recovery_backoff("expired-convo")
+            .is_none(),
+        "R-1 REGRESSION: TTL-rejected row survived hydration"
+    );
+    assert!(
+        alice
+            .storage
+            .get_persisted_recovery_backoff("future-convo")
+            .is_none(),
+        "R-1 REGRESSION: future-dated row survived hydration — its drop \
+         warning would repeat on every restart"
+    );
+    assert!(
+        alice
+            .storage
+            .get_persisted_recovery_backoff("valid-convo")
+            .is_some(),
+        "hydration must not delete rows it accepted"
+    );
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
@@ -385,7 +469,12 @@ fn tracker_hydration_honors_remaining_cooldown() {
         ],
         last_global_rejoin_attempt_at_ms: Some(now - 10_000),
     };
-    tracker.hydrate_from_persisted(&state, now);
+    let rejected = tracker.hydrate_from_persisted(&state, now);
+    assert_eq!(
+        rejected,
+        vec!["zero-count".to_string()],
+        "zero-count entries carry no state and must be rejected for deletion"
+    );
 
     let remaining = tracker
         .cooldown_remaining("fresh-failure")
@@ -875,6 +964,98 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
     }
 }
 
+/// R-2 (E7 follow-up): quarantine state persists are recovery-critical —
+/// `enter_quarantine` / `exit_quarantine` write failures must escalate
+/// through `report_recovery_storage_failure` (event observer + error_log),
+/// not warn-only tracing. A dropped enter-side write silently loses the
+/// quarantine across restart; a dropped exit-side write resurrects it. The
+/// backoff-row clear right next to them already escalates (FIX-3 in
+/// 771e6e4); this pins the same policy for the four sibling writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_quarantine_persists_escalate() {
+    let did = "did:plc:alice";
+    let convo_id = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+    let storage = e2e_harness::mock_storage::MockStorage::new();
+    let credentials = e2e_harness::mock_credentials::MockCredentials::new();
+    let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
+
+    let orchestrator = MLSOrchestrator::new(
+        Arc::new(PeerBadCrypto),
+        Arc::new(storage.clone()),
+        Arc::new(ds.clone_as(did)),
+        Arc::new(credentials.clone()),
+        OrchestratorConfig::default(),
+    );
+    orchestrator.initialize(did).await.expect("initialize");
+
+    let observer = Arc::new(RecordingObserver::default());
+    orchestrator
+        .set_event_observer(Some(observer.clone()))
+        .await;
+
+    let frame = |i: usize| IncomingEnvelope {
+        conversation_id: convo_id.clone(),
+        sender_did: "did:plc:mallory".to_string(),
+        ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
+        timestamp: chrono::Utc::now(),
+        server_message_id: Some(format!("bad-frame-{i}")),
+    };
+
+    // Two peer-bad frames arm Layer 3; inject the enter-side persist
+    // failures only for the third (quarantine-tripping) frame so the
+    // one-shot flags are consumed by enter_quarantine itself.
+    for i in 0..2 {
+        let _ = orchestrator.process_incoming(&frame(i)).await;
+    }
+    storage.fail_next_set_conversation_state();
+    storage.fail_next_mark_quarantined();
+    let _ = orchestrator.process_incoming(&frame(2)).await;
+
+    assert!(
+        orchestrator
+            .get_conversation_quarantine_state(&convo_id)
+            .await
+            .is_some(),
+        "three peer-bad frames must enter Layer-3 quarantine (test precondition)"
+    );
+    {
+        let escalations = observer.storage_failures.lock().unwrap().clone();
+        assert!(
+            escalations
+                .iter()
+                .any(|(cid, op, _)| cid == &convo_id && op == "set_conversation_state:quarantined"),
+            "R-2 REGRESSION: failing Quarantined state persist must escalate, got {escalations:?}"
+        );
+        assert!(
+            escalations
+                .iter()
+                .any(|(cid, op, _)| cid == &convo_id && op == "mark_quarantined"),
+            "R-2 REGRESSION: failing mark_quarantined must escalate, got {escalations:?}"
+        );
+    }
+
+    // Exit side: both persists fail — must escalate, not warn.
+    storage.fail_next_set_conversation_state();
+    storage.fail_next_clear_quarantine();
+    orchestrator
+        .user_confirmed_manual_reset(&convo_id)
+        .await
+        .expect("user_confirmed_manual_reset failed");
+
+    let escalations = observer.storage_failures.lock().unwrap().clone();
+    assert!(
+        escalations.iter().any(|(cid, op, _)| cid == &convo_id
+            && op == "set_conversation_state:active_quarantine_exit"),
+        "R-2 REGRESSION: failing Active state persist on quarantine exit must escalate, got {escalations:?}"
+    );
+    assert!(
+        escalations
+            .iter()
+            .any(|(cid, op, _)| cid == &convo_id && op == "clear_quarantine"),
+        "R-2 REGRESSION: failing clear_quarantine must escalate, got {escalations:?}"
+    );
+}
+
 /// FIX-5: a real delete-step failure keeps the pending-delete intent so the
 /// next pass retries; the retry (where the missing MLS group is a
 /// NotFound-class success) completes and clears the intent.
@@ -1009,7 +1190,13 @@ fn future_dated_persisted_state_dropped_on_hydration() {
         }],
         last_global_rejoin_attempt_at_ms: Some(now + 3_600_000),
     };
-    tracker.hydrate_from_persisted(&state, now);
+    let rejected = tracker.hydrate_from_persisted(&state, now);
+    assert_eq!(
+        rejected,
+        vec!["future-convo".to_string()],
+        "future-dated entry must be reported rejected so the caller deletes \
+         the row (otherwise the drop warning repeats every restart)"
+    );
 
     assert_eq!(
         tracker.failed_attempts("future-convo"),
@@ -1041,7 +1228,7 @@ async fn runtime_lockout_expiry_reopens_one_attempt() {
     let now = now_ms();
     // Hydrate a maxed entry whose lockout lapses 200ms from now (a
     // long-running process awaiting expiry, compressed for the test).
-    tracker.hydrate_from_persisted(
+    let rejected = tracker.hydrate_from_persisted(
         &PersistedRecoveryState {
             entries: vec![PersistedRecoveryBackoff {
                 conversation_id: "locked".into(),
@@ -1052,6 +1239,10 @@ async fn runtime_lockout_expiry_reopens_one_attempt() {
             last_global_rejoin_attempt_at_ms: None,
         },
         now,
+    );
+    assert!(
+        rejected.is_empty(),
+        "an active lockout within TTL is valid state — must not be rejected"
     );
 
     assert!(
