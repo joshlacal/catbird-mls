@@ -691,6 +691,32 @@ pub trait OrchestratorEventCallback: Send + Sync {
         operation: String,
         error: String,
     );
+    /// A credential-binding check failed in warn-and-allow mode (WS-3 stage 1,
+    /// ADR-009 D5). The operation continued; platforms should surface this in
+    /// diagnostics/telemetry — a clean week of field data gates the enforce
+    /// flip. `operation` is the ADR-009 D5 operation tag (`fetch`, `message`,
+    /// ...). `convo_id` is `"<none>"` when no conversation is in scope yet
+    /// (e.g. key-package fetch during group creation).
+    fn on_credential_binding_warning(
+        &self,
+        convo_id: String,
+        operation: String,
+        expected_did: String,
+        claimed_identity: String,
+        reason: String,
+    );
+    /// Sequencer equivocation detected (WS-3 stage 1, ADR-009 D8 / E3): two
+    /// receipts for the same `(conversation, epoch)` carry different commit
+    /// hashes. Stage 1 is detection-only — the triggering operation
+    /// continued. Hashes are hex-encoded.
+    fn on_sequencer_equivocation(
+        &self,
+        convo_id: String,
+        epoch: i32,
+        stored_commit_hash_hex: String,
+        new_commit_hash_hex: String,
+        sequencer_did: String,
+    );
 }
 
 /// Adapter so a UniFFI OrchestratorEventCallback can be installed via the
@@ -723,6 +749,38 @@ impl crate::orchestrator::event_observer::OrchestratorEventObserver for EventCal
             convo_id.to_string(),
             operation.to_string(),
             error.to_string(),
+        );
+    }
+    fn on_credential_binding_warning(
+        &self,
+        convo_id: &str,
+        operation: &str,
+        expected_did: &str,
+        claimed_identity: &str,
+        reason: &str,
+    ) {
+        self.0.on_credential_binding_warning(
+            convo_id.to_string(),
+            operation.to_string(),
+            expected_did.to_string(),
+            claimed_identity.to_string(),
+            reason.to_string(),
+        );
+    }
+    fn on_sequencer_equivocation(
+        &self,
+        convo_id: &str,
+        epoch: i32,
+        stored_commit_hash_hex: &str,
+        new_commit_hash_hex: &str,
+        sequencer_did: &str,
+    ) {
+        self.0.on_sequencer_equivocation(
+            convo_id.to_string(),
+            epoch,
+            stored_commit_hash_hex.to_string(),
+            new_commit_hash_hex.to_string(),
+            sequencer_did.to_string(),
         );
     }
 }
@@ -2423,9 +2481,16 @@ mod tests {
 
     // ── Event callback: WS-5.2 escalation must reach the platform ─────────
 
+    /// (convo_id, operation, expected_did, claimed_identity, reason)
+    type RecordedBindingWarning = (String, String, String, String, String);
+    /// (convo_id, epoch, stored_commit_hash_hex, new_commit_hash_hex, sequencer_did)
+    type RecordedEquivocation = (String, i32, String, String, String);
+
     #[derive(Default)]
     struct RecordingEventCallback {
         storage_failures: Mutex<Vec<(String, String, String)>>,
+        binding_warnings: Mutex<Vec<RecordedBindingWarning>>,
+        equivocations: Mutex<Vec<RecordedEquivocation>>,
     }
 
     impl OrchestratorEventCallback for RecordingEventCallback {
@@ -2453,6 +2518,38 @@ mod tests {
                 .unwrap()
                 .push((conversation_id, operation, error));
         }
+        fn on_credential_binding_warning(
+            &self,
+            convo_id: String,
+            operation: String,
+            expected_did: String,
+            claimed_identity: String,
+            reason: String,
+        ) {
+            self.binding_warnings.lock().unwrap().push((
+                convo_id,
+                operation,
+                expected_did,
+                claimed_identity,
+                reason,
+            ));
+        }
+        fn on_sequencer_equivocation(
+            &self,
+            convo_id: String,
+            epoch: i32,
+            stored_commit_hash_hex: String,
+            new_commit_hash_hex: String,
+            sequencer_did: String,
+        ) {
+            self.equivocations.lock().unwrap().push((
+                convo_id,
+                epoch,
+                stored_commit_hash_hex,
+                new_commit_hash_hex,
+                sequencer_did,
+            ));
+        }
     }
 
     #[test]
@@ -2473,6 +2570,58 @@ mod tests {
                 "disk full".to_string()
             )],
             "EventCallbackAdapter must forward WS-5.2 escalations across the bridge"
+        );
+    }
+
+    #[test]
+    fn event_adapter_forwards_credential_binding_warning() {
+        use crate::orchestrator::event_observer::OrchestratorEventObserver;
+
+        let callback = Arc::new(RecordingEventCallback::default());
+        let adapter = EventCallbackAdapter(callback.clone() as Arc<dyn OrchestratorEventCallback>);
+
+        adapter.on_credential_binding_warning(
+            "convo-1",
+            "message",
+            "did:plc:alice",
+            "did:plc:mallory",
+            "credential DID does not match key-package owner",
+        );
+
+        let captured = callback.binding_warnings.lock().unwrap();
+        assert_eq!(
+            captured.as_slice(),
+            &[(
+                "convo-1".to_string(),
+                "message".to_string(),
+                "did:plc:alice".to_string(),
+                "did:plc:mallory".to_string(),
+                "credential DID does not match key-package owner".to_string()
+            )],
+            "EventCallbackAdapter must forward WS-3 credential-binding warnings across the bridge"
+        );
+    }
+
+    #[test]
+    fn event_adapter_forwards_sequencer_equivocation() {
+        use crate::orchestrator::event_observer::OrchestratorEventObserver;
+
+        let callback = Arc::new(RecordingEventCallback::default());
+        let adapter = EventCallbackAdapter(callback.clone() as Arc<dyn OrchestratorEventCallback>);
+
+        adapter.on_sequencer_equivocation("convo-2", 42, "aabb01", "ccdd02", "did:web:sequencer");
+
+        let captured = callback.equivocations.lock().unwrap();
+        assert_eq!(
+            captured.as_slice(),
+            &[(
+                "convo-2".to_string(),
+                42,
+                "aabb01".to_string(),
+                "ccdd02".to_string(),
+                "did:web:sequencer".to_string()
+            )],
+            "EventCallbackAdapter must forward WS-3 equivocation detections across the bridge"
         );
     }
 

@@ -40,8 +40,6 @@ pub trait OrchestratorEventObserver: Send + Sync {
     /// flip. `operation` is the ADR-009 D5 operation tag (`fetch`, `message`,
     /// ...). `convo_id` is `"<none>"` when no conversation is in scope yet
     /// (e.g. key-package fetch during group creation).
-    ///
-    /// Not yet exposed through the UniFFI EventCallback bridge — follow-up.
     fn on_credential_binding_warning(
         &self,
         _convo_id: &str,
@@ -56,8 +54,6 @@ pub trait OrchestratorEventObserver: Send + Sync {
     /// receipts for the same `(conversation, epoch)` carry different commit
     /// hashes. Stage 1 is detection-only — the triggering operation
     /// continued. Hashes are hex-encoded.
-    ///
-    /// Not yet exposed through the UniFFI EventCallback bridge — follow-up.
     fn on_sequencer_equivocation(
         &self,
         _convo_id: &str,

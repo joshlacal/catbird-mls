@@ -83,7 +83,8 @@ fn highpass_filter(samples: &mut [f32], cutoff_hz: f32, sample_rate: f32) {
     }
     let omega = 2.0 * std::f32::consts::PI * cutoff_hz / sample_rate;
     let cos_omega = omega.cos();
-    let alpha = omega.sin() / (2.0 * 0.7071); // Q = 0.7071 (Butterworth)
+    // Q = 1/sqrt(2) ~= 0.7071 (Butterworth)
+    let alpha = omega.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
 
     let b0 = (1.0 + cos_omega) / 2.0;
     let b1 = -(1.0 + cos_omega);
