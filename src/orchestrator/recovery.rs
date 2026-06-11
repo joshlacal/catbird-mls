@@ -811,6 +811,16 @@ where
                 return Err(OrchestratorError::RecoveryFailed(format!("{e}")));
             }
         };
+
+        // WS-3 stage 1 (ADR-009 D3): warn-and-allow credential binding check
+        // before the fetched packages are consumed by the fork-readd commit
+        // (`recover_fork_by_readding` → `commit_group_change("forkReadd")`).
+        // This is an automated Add path a malicious DS can steer clients into
+        // via decrypt failures, so it must hit the same verify-on-fetch
+        // chokepoint as create_group / add_members / swap_members.
+        self.verify_fetched_key_packages(&mems, &kp_refs, "fork_readd", Some(convo_id))
+            .await;
+
         let kps: Vec<Vec<u8>> = kp_refs.iter().map(|r| r.key_package_data.clone()).collect();
         let (commit, _) = match self
             .mls_context()

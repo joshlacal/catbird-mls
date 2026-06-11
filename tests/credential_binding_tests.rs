@@ -18,7 +18,7 @@ mod e2e_harness;
 use std::sync::{Arc, Mutex};
 
 use catbird_mls::orchestrator::event_observer::OrchestratorEventObserver;
-use catbird_mls::orchestrator::{MLSStorageBackend, SequencerReceipt};
+use catbird_mls::orchestrator::{IncomingEnvelope, MLSStorageBackend, SequencerReceipt};
 use e2e_harness::TestWorld;
 
 // ---------------------------------------------------------------------------
@@ -201,6 +201,92 @@ async fn mismatched_key_package_warns_and_operation_succeeds() {
         w.reason
     );
     assert_eq!(w.convo_id, convo.group_id);
+}
+
+// ---------------------------------------------------------------------------
+// (b2) Fork-readd fetch path: substituted key package → warn + escalate
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_readd_key_package_fetch_warns_on_mismatch() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.add_client("Mallory").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+    let mallory_did = world.register_device("Mallory").await.unwrap();
+
+    let alice = world.client("Alice");
+
+    let observer = Arc::new(RecordingObserver::default());
+    alice
+        .orchestrator
+        .set_event_observer(Some(observer.clone()))
+        .await;
+
+    // Create the group WITH Bob so `group_states` carries members for the
+    // fork-readd key-package fetch.
+    let convo = alice
+        .orchestrator
+        .create_group("fork-readd-cred-bind", Some(&[bob_did.clone()]), None)
+        .await
+        .expect("create_group failed");
+    let group_id = convo.group_id.clone();
+    assert!(
+        observer.credential_warnings().is_empty(),
+        "clean create_group must not produce binding warnings, got: {:?}",
+        observer.credential_warnings()
+    );
+
+    // Malicious DS: from now on, fetches of Bob's key packages serve
+    // Mallory's package, still labeled as Bob's.
+    world
+        .delivery_service()
+        .redirect_key_packages_for_test(&bob_did, &mallory_did);
+
+    // Drive the automated fork-readd path: FORK_DETECTION_THRESHOLD (2)
+    // consecutive decrypt failures on an Active conversation trigger
+    // `attempt_fork_readd`, which fetches member key packages and consumes
+    // them in a forkReadd commit. Stage-1 contract: the fetch is verified
+    // and the mismatch warns; recovery behavior is unchanged.
+    for i in 0..2 {
+        let envelope = IncomingEnvelope {
+            conversation_id: group_id.clone(),
+            sender_did: bob_did.clone(),
+            ciphertext: format!("not-an-mls-message-{i}").into_bytes(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some(format!("fork-readd-bad-frame-{i}")),
+        };
+        let result = world
+            .client("Alice")
+            .orchestrator
+            .process_incoming(&envelope)
+            .await;
+        assert!(
+            result.is_err(),
+            "invalid ciphertext should drive decrypt failure"
+        );
+    }
+
+    let warnings = observer.credential_warnings();
+    let w = warnings
+        .iter()
+        .find(|w| w.expected_did == bob_did)
+        .unwrap_or_else(|| {
+            panic!(
+                "fork-readd fetch must run credential verification; \
+                 no warning for expected DID {bob_did}, got {warnings:?}"
+            )
+        });
+    assert_eq!(w.operation, "fetch");
+    assert_eq!(w.claimed_identity, mallory_did);
+    assert!(
+        w.reason.contains("does not match"),
+        "reason should describe the DID mismatch, got: {}",
+        w.reason
+    );
+    assert_eq!(w.convo_id, group_id);
 }
 
 // ---------------------------------------------------------------------------

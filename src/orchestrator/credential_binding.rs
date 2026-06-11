@@ -158,12 +158,14 @@ where
                 .iter()
                 .any(|d| d.eq_ignore_ascii_case(&kp.did))
             {
+                // The credential hasn't been parsed yet at this point, so
+                // there is no claimed identity to report — only the DS label.
                 self.emit_credential_binding_warning(
                     conversation_id,
                     "fetch",
                     context,
                     &kp.did,
-                    &kp.did,
+                    "<unparsed>",
                     &hash_prefix,
                     "key package returned for a DID that was not requested",
                 )
@@ -481,8 +483,20 @@ where
                 }
             }
             Err(e) => {
+                // Platform-visible (warn_log! routes through MLSLogger, unlike
+                // bare tracing): a failed load means equivocation detection is
+                // silently degraded for this receipt — infra failure, not a
+                // security signal, but platforms must be able to see it.
+                crate::warn_log!(
+                    "[SEQUENCER-EQUIVOCATION] receipt-load-failed operation={} convo_id={} epoch={} error={} — equivocation detection skipped for this receipt",
+                    operation,
+                    receipt.convo_id,
+                    receipt.epoch,
+                    e
+                );
                 tracing::warn!(
                     error = %e,
+                    operation,
                     convo_id = %receipt.convo_id,
                     "Failed to load stored sequencer receipts for equivocation check"
                 );
