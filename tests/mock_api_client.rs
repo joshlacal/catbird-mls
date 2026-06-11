@@ -356,6 +356,20 @@ impl MockDeliveryService {
         }
     }
 
+    /// Force the server-side `sequencerDid` of a conversation (WS-4 rung 2
+    /// exposure tests; ADR-010 D4).
+    #[allow(dead_code)]
+    pub fn set_conversation_sequencer_for_test(
+        &self,
+        convo_id: &str,
+        sequencer_did: Option<String>,
+    ) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(c) = guard.conversations.get_mut(convo_id) {
+            c.view.sequencer_did = sequencer_did;
+        }
+    }
+
     /// Remove a conversation server-side (simulates deletion / membership
     /// loss so sync's stale-conversation cleanup fires).
     pub fn remove_conversation_for_test(&self, convo_id: &str) {
@@ -556,6 +570,7 @@ impl MLSAPIClient for MockDeliveryService {
             metadata: metadata.cloned(),
             created_at: Some(now),
             updated_at: Some(now),
+            sequencer_did: None,
         };
 
         let stored = StoredConversation {

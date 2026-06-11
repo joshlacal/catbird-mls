@@ -28,6 +28,7 @@ pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
     "record_welcome_reissue_attempt",
     "mark_reset_pending",
     "clear_reset_pending",
+    "set_conversation_sequencer",
     "mark_quarantined",
     "clear_quarantine",
     "store_pending_message",
@@ -172,6 +173,23 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     /// Clear any persisted RESET_PENDING payload for a conversation (called
     /// after successful adoption of the new group).
     async fn clear_reset_pending(&self, _conversation_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Persist the conversation→sequencer mapping (ADR-010 D4 rule 4 cache).
+    ///
+    /// `sequencer_did` is the base DID (no fragment) of the DS currently
+    /// sequencing the conversation, as reported by `convoView.sequencerDid`.
+    /// Routing does NOT consult this yet (WS-4 rung 3); rung 2 only records
+    /// the mapping so the client-side cache exists before the routing flip.
+    ///
+    /// Default no-op for backward compat; platforms that don't override are
+    /// surfaced by the WS-5.6 init-time capabilities check.
+    async fn set_conversation_sequencer(
+        &self,
+        _conversation_id: &str,
+        _sequencer_did: &str,
+    ) -> Result<()> {
         Ok(())
     }
 

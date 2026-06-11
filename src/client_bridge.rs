@@ -94,6 +94,10 @@ fn ffi_to_convo_view(ffi: &crate::orchestrator_bridge::FFIConversationView) -> C
             .as_ref()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.with_timezone(&chrono::Utc)),
+        // FFIConversationView does not carry sequencerDid yet (WS-4 rung 3,
+        // ADR-010 A6): UniFFI record shapes are deliberately unchanged in
+        // rung 2.
+        sequencer_did: None,
     }
 }
 

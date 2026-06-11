@@ -86,6 +86,12 @@ struct Inner {
     fail_next_clear_quarantine: bool,
     /// Stored sequencer receipts (WS-3 equivocation detection tests).
     sequencer_receipts: Vec<SequencerReceipt>,
+    /// conversation_id -> persisted sequencer DID (WS-4 rung 2; ADR-010 D4
+    /// rule-4 client cache, written by `set_conversation_sequencer`).
+    sequencer_mappings: HashMap<String, String>,
+    /// Number of times `set_conversation_sequencer` has been called per
+    /// conversation (asserts persist-only-on-change behavior).
+    set_conversation_sequencer_calls: HashMap<String, u32>,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -320,6 +326,31 @@ impl MockStorage {
             .get(conversation_id)
             .cloned()
     }
+
+    /// Returns the persisted sequencer DID for `conversation_id` as written
+    /// by `set_conversation_sequencer` (WS-4 rung 2; ADR-010 D4).
+    #[allow(dead_code)]
+    pub fn get_persisted_sequencer(&self, conversation_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .sequencer_mappings
+            .get(conversation_id)
+            .cloned()
+    }
+
+    /// Number of times `set_conversation_sequencer` was called for
+    /// `conversation_id` (asserts persist-only-on-change behavior).
+    #[allow(dead_code)]
+    pub fn set_conversation_sequencer_call_count(&self, conversation_id: &str) -> u32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_conversation_sequencer_calls
+            .get(conversation_id)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 #[async_trait]
@@ -352,6 +383,7 @@ impl MLSStorageBackend for MockStorage {
                     metadata: None,
                     created_at: Some(chrono::Utc::now()),
                     updated_at: Some(chrono::Utc::now()),
+                    sequencer_did: None,
                 },
             });
         Ok(())
@@ -572,6 +604,22 @@ impl MLSStorageBackend for MockStorage {
     async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.reset_pending.remove(conversation_id);
+        Ok(())
+    }
+
+    async fn set_conversation_sequencer(
+        &self,
+        conversation_id: &str,
+        sequencer_did: &str,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .sequencer_mappings
+            .insert(conversation_id.to_string(), sequencer_did.to_string());
+        *inner
+            .set_conversation_sequencer_calls
+            .entry(conversation_id.to_string())
+            .or_insert(0) += 1;
         Ok(())
     }
 
@@ -796,6 +844,7 @@ impl MLSStorageBackend for MockStorage {
             "record_welcome_reissue_attempt",
             "mark_reset_pending",
             "clear_reset_pending",
+            "set_conversation_sequencer",
             "mark_quarantined",
             "clear_quarantine",
             "store_pending_message",

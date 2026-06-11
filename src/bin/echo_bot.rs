@@ -229,6 +229,7 @@ impl MLSStorageBackend for BotStorage {
                 metadata: None,
                 created_at: Some(Utc::now()),
                 updated_at: Some(Utc::now()),
+                sequencer_did: None,
             });
         Ok(())
     }
@@ -532,6 +533,7 @@ impl MLSAPIClient for HttpDSClient {
             metadata: None,
             created_at: Some(Utc::now()),
             updated_at: Some(Utc::now()),
+            sequencer_did: None,
         });
 
         Ok(CreateConversationResult {
@@ -1054,6 +1056,9 @@ fn parse_convo_view(val: &serde_json::Value) -> Option<ConversationView> {
         metadata: None,
         created_at: parse_datetime(val["createdAt"].as_str()),
         updated_at: parse_datetime(val["updatedAt"].as_str()),
+        // Optional convoView.sequencerDid (ADR-010 D4); absent on
+        // pre-rung-2 servers.
+        sequencer_did: val["sequencerDid"].as_str().map(|s| s.to_string()),
     })
 }
 

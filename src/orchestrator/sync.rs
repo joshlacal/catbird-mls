@@ -220,10 +220,43 @@ where
             let conversation_id = convo.conversation_id.as_str();
             let group_id = convo.group_id.as_str();
 
-            self.conversations()
+            let previous_view = self
+                .conversations()
                 .lock()
                 .await
                 .insert(conversation_id.to_string(), convo.clone());
+
+            // ADR-010 D4: record the conversation→sequencer mapping. Routing
+            // does NOT consult this yet (WS-4 rung 3); every sync refresh
+            // overwrites the mapping, which trivially satisfies the D4 rule-4
+            // invalidation requirement for rung 2.
+            let sequencer_changed = previous_view
+                .as_ref()
+                .map(|prev| prev.sequencer_did != convo.sequencer_did)
+                .unwrap_or(convo.sequencer_did.is_some());
+            crate::info_log!(
+                "[sync] convo={} sequencer_did={:?}{}",
+                conversation_id,
+                convo.sequencer_did,
+                if sequencer_changed { " (CHANGED)" } else { "" }
+            );
+            if sequencer_changed {
+                if let Some(sequencer_did) = convo.sequencer_did.as_deref() {
+                    if let Err(e) = self
+                        .storage()
+                        .set_conversation_sequencer(conversation_id, sequencer_did)
+                        .await
+                    {
+                        // Log-and-continue: recovery-critical-write escalation
+                        // is WS-5 territory, but never silently drop the error.
+                        crate::warn_log!(
+                            "[sync] convo={} failed to persist sequencer mapping: {}",
+                            conversation_id,
+                            e
+                        );
+                    }
+                }
+            }
 
             // Detect a stale persisted GroupState: the orchestrator has a
             // record for this convo, but the local MLS context does NOT have
