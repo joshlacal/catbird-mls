@@ -22,7 +22,9 @@ pub mod welcome_recovery;
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
 pub use constants::*;
-pub use credential_binding::CredentialVerification;
+pub use credential_binding::{
+    extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,
+};
 pub use credentials::CredentialStore;
 pub use error::{OrchestratorError, Result};
 pub use mls_provider::MlsCryptoContext;

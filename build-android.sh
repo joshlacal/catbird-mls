@@ -148,6 +148,10 @@ STAGING_DIR="$OUTPUT_ROOT/mlsffi"
 KOTLIN_DIR="$STAGING_DIR/src/main/kotlin"
 JNI_DIR="$STAGING_DIR/src/main/jniLibs"
 
+# N41: in a fresh worktree/checkout build/android doesn't exist yet, and
+# `find` on a missing directory aborts the script under `set -e`.
+mkdir -p "$OUTPUT_ROOT"
+
 find "$OUTPUT_ROOT" -mindepth 1 -maxdepth 1 -type d \
   \( -name "kotlin" -o -name "jniLibs" -o -name "*-kotlin" \) \
   -exec rm -rf {} +

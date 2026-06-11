@@ -19,13 +19,42 @@ struct UserCredentials {
 #[derive(Debug, Clone)]
 pub struct MockCredentials {
     state: Arc<Mutex<HashMap<String, UserCredentials>>>,
+    /// WS-3 stage 2: configurable authorized-device-key sets per root DID.
+    /// DID absent from the map → `get_authorized_device_keys` returns
+    /// `Ok(None)` (the trait default: "no DID-resolution surface").
+    authorized_device_keys: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>,
+    /// Number of `get_authorized_device_keys` calls per DID — used by the
+    /// ADR-009 D6 cache test to prove no repeat resolution within the TTL.
+    device_key_lookup_counts: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl MockCredentials {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(HashMap::new())),
+            authorized_device_keys: Arc::new(Mutex::new(HashMap::new())),
+            device_key_lookup_counts: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// WS-3 stage 2: declare the authorized MLS device signing keys for a
+    /// root DID. Once set, lookups for that DID resolve (`Ok(Some(keys))`);
+    /// DIDs without an entry still return the unsupported default.
+    pub fn set_authorized_device_keys(&self, root_did: &str, keys: Vec<Vec<u8>>) {
+        self.authorized_device_keys
+            .lock()
+            .unwrap()
+            .insert(root_did.to_string(), keys);
+    }
+
+    /// Number of `get_authorized_device_keys` calls observed for a DID.
+    pub fn device_key_lookup_count(&self, root_did: &str) -> u32 {
+        self.device_key_lookup_counts
+            .lock()
+            .unwrap()
+            .get(root_did)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -89,6 +118,21 @@ impl CredentialStore for MockCredentials {
         let mut map = self.state.lock().unwrap();
         map.remove(user_did);
         Ok(())
+    }
+
+    async fn get_authorized_device_keys(&self, root_did: &str) -> Result<Option<Vec<Vec<u8>>>> {
+        *self
+            .device_key_lookup_counts
+            .lock()
+            .unwrap()
+            .entry(root_did.to_string())
+            .or_default() += 1;
+        Ok(self
+            .authorized_device_keys
+            .lock()
+            .unwrap()
+            .get(root_did)
+            .cloned())
     }
 }
 

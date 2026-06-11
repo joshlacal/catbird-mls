@@ -2482,6 +2482,18 @@ where
             self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
                 .await;
         }
+        // WS-3 stage 2 (backlog N44a): a server reset also wipes stored
+        // sequencer receipts for this conversation. The reset rebuilds the
+        // MLS group — epochs restart — so comparing receipts across the reset
+        // boundary is meaningless and would false-positive the ADR-009 D8
+        // equivocation check (stale pre-reset receipt at epoch N vs genuine
+        // post-reset receipt at the same N). A failed clear leaves those
+        // false-positive-producing rows behind, so escalate like the
+        // recovery-critical writes above.
+        if let Err(e) = self.storage().clear_sequencer_receipts(convo_id).await {
+            self.report_recovery_storage_failure(convo_id, "clear_sequencer_receipts", &e)
+                .await;
+        }
         if was_quarantined {
             // Server reset trumps client-side quarantine; persist the cleared
             // quarantine row alongside the new ResetPending payload.

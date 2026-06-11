@@ -72,4 +72,33 @@ pub trait CredentialStore: CredentialStoreBounds {
     ) -> Result<CredentialVerification> {
         Ok(check_identity_claim(expected_did, claimed_identity))
     }
+
+    /// Optional capability (WS-3 stage 2): resolve the set of MLS device
+    /// signing public keys currently authorized for `root_did`, enabling the
+    /// second half of the ADR-009 proof (DID-rooted credential AND leaf
+    /// signing key published as an authorized device key).
+    ///
+    /// Return values:
+    /// - `Ok(None)` — **default**: this platform provides no DID-resolution
+    ///   surface. The orchestrator logs at debug level and skips the
+    ///   device-key half of the check; the structural DID-root check from
+    ///   stage 1 still runs. The orchestrator itself has no DID-document /
+    ///   ATProto-repo access (`MLSAPIClient` only reaches the DS), so this
+    ///   stays `None` until the platform wires its ATProto client in.
+    /// - `Ok(Some(keys))` — resolution succeeded; `keys` are the raw signing
+    ///   public keys authorized for `root_did` (per ADR-009 D1: active
+    ///   `blue.catbird.mlsChat.device` records in the DID's ATProto repo,
+    ///   or equivalently the DID document's `#atproto_mls` verification
+    ///   method key). An EMPTY vec means "resolved, zero authorized keys" —
+    ///   every presented key then fails the (warn-only) check.
+    /// - `Err(_)` — verifier infrastructure failure (network/storage).
+    ///   Warn-only in the ADR-009 D5 rollout stage; never blocks.
+    ///
+    /// Implementations do NOT need their own cache: the orchestrator caches
+    /// results per root DID for `constants::DEVICE_KEY_CACHE_TTL` (ADR-009
+    /// D6), bounding positive and negative results by the same TTL, so no
+    /// network resolution happens in hot paths beyond the first lookup.
+    async fn get_authorized_device_keys(&self, _root_did: &str) -> Result<Option<Vec<Vec<u8>>>> {
+        Ok(None)
+    }
 }

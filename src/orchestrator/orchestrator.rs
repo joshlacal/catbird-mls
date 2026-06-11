@@ -123,6 +123,11 @@ where
     /// Installed via set_event_observer; additive so existing constructors
     /// keep working without binding regen.
     event_observer: Mutex<Option<Arc<dyn super::event_observer::OrchestratorEventObserver>>>,
+    /// WS-3 stage 2 (ADR-009 D6): per-root-DID cache of authorized device
+    /// signing keys resolved via `CredentialStore::get_authorized_device_keys`.
+    /// Positive, negative, AND unsupported results all expire after
+    /// `constants::DEVICE_KEY_CACHE_TTL` so revocation propagates.
+    device_key_cache: Mutex<HashMap<String, super::credential_binding::DeviceKeyCacheEntry>>,
 }
 
 /// Internal bookkeeping for a staged commit.
@@ -204,6 +209,7 @@ where
             pending_staged_commits: Mutex::new(HashMap::new()),
             staged_commit_nonce: Mutex::new(0),
             event_observer: Mutex::new(None),
+            device_key_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -523,6 +529,21 @@ where
     /// Access the pending-staged-commits map (task #44).
     pub(crate) fn pending_staged_commits(&self) -> &Mutex<HashMap<GroupId, PendingCommitMeta>> {
         &self.pending_staged_commits
+    }
+
+    /// Access the ADR-009 D6 authorized-device-key cache (WS-3 stage 2).
+    pub(crate) fn device_key_cache(
+        &self,
+    ) -> &Mutex<HashMap<String, super::credential_binding::DeviceKeyCacheEntry>> {
+        &self.device_key_cache
+    }
+
+    /// Drop all cached authorized-device-key lookups (ADR-009 D6 requires
+    /// the cache to be bypassable for diagnostics or explicit refresh).
+    /// The next credential-binding check re-resolves through
+    /// `CredentialStore::get_authorized_device_keys`.
+    pub async fn invalidate_device_key_cache(&self) {
+        self.device_key_cache.lock().await.clear();
     }
 
     /// Allocate a fresh nonce for a staged commit handle. Wraps at `u64::MAX`

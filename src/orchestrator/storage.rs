@@ -34,6 +34,7 @@ pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
     "remove_pending_message",
     "store_sequencer_receipt",
     "get_sequencer_receipts",
+    "clear_sequencer_receipts",
     "cleanup_old_epoch_data",
     "get_recovery_state",
     "set_recovery_backoff",
@@ -259,6 +260,20 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         _since_epoch: Option<i32>,
     ) -> Result<Vec<SequencerReceipt>> {
         Ok(vec![])
+    }
+
+    /// Delete ALL stored sequencer receipts for a conversation.
+    ///
+    /// Called when a server group reset is ingested (WS-3 stage 2 / backlog
+    /// N44a): a reset rebuilds the MLS group from scratch, so epochs restart
+    /// and comparing receipts across the reset boundary is meaningless — a
+    /// stale pre-reset receipt at epoch N would false-positive the
+    /// equivocation check against a genuine post-reset receipt at the same N.
+    /// Default no-op for backward compatibility; backends that implement
+    /// `store_sequencer_receipt` MUST implement this too or their
+    /// equivocation detection mis-fires after the first reset.
+    async fn clear_sequencer_receipts(&self, _conversation_id: &str) -> Result<()> {
+        Ok(())
     }
 
     // -- Epoch Secret Cleanup --

@@ -26,18 +26,32 @@
 //! to enforcement means returning an error from the chokepoint instead of
 //! logging, not rewriting call sites.
 //!
-//! ## Verification depth (stage 1 vs later stages)
+//! ## Verification depth (stage 1 vs stage 2)
 //!
 //! Stage 1 implements the **structural** half of ADR-009's proof: credential
 //! decodes, identity is UTF-8, and the DID root of the claimed identity
 //! (substring before `#`, fragment/device-id aware) equals the expected DID.
-//! The second half — leaf signature key matches an active
-//! `blue.catbird.mlsChat.device` record in the root DID's ATProto repo, with
-//! D6 caching/revocation — is the platform-overridable seam on
-//! `CredentialStore::verify_member_credential`. Platforms with repo access
-//! override that method; the default stays structural.
+//!
+//! Stage 2 adds the **device-key** half on the fetch path: the leaf signature
+//! public key must be an authorized MLS device key for the credential's root
+//! DID (ADR-009 D1 part 2). The orchestrator has no DID-resolution surface of
+//! its own (`MLSAPIClient` only reaches the DS), so resolution is the optional
+//! `CredentialStore::get_authorized_device_keys` capability — default
+//! "unsupported" (skip with debug log) until a platform wires its ATProto
+//! client in. Results are cached per root DID for
+//! `constants::DEVICE_KEY_CACHE_TTL` (ADR-009 D6); positive, negative, and
+//! unsupported outcomes share the TTL so revocation propagates and the
+//! default path logs once per DID per window, not once per package.
+//!
+//! The device-key half does NOT yet run on the inbound path:
+//! `DecryptResult.sender_credential` (`CredentialData`) carries only the
+//! identity, not the leaf signature key, and extending that UniFFI record is
+//! out of scope for this stage (backlog N44d). Inbound remains structural.
+
+use web_time::Instant;
 
 use super::api_client::MLSAPIClient;
+use super::constants;
 use super::credentials::CredentialStore;
 use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
@@ -97,29 +111,76 @@ pub fn check_identity_claim(expected_did: &str, claimed_identity: &str) -> Crede
     }
 }
 
+/// Credential-binding material structurally extracted from a serialized MLS
+/// KeyPackage: the two fields ADR-009's proof binds together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPackageBindingInfo {
+    /// UTF-8 leaf credential identity (bare DID or `did:...#device-id`).
+    pub identity: String,
+    /// Raw leaf signature public key bytes.
+    pub signature_key: Vec<u8>,
+}
+
 /// Structurally decode a serialized MLS KeyPackage and extract its leaf
-/// credential identity as a UTF-8 string.
+/// credential identity plus leaf signature public key.
 ///
 /// This performs TLS decoding only — no signature verification (that still
 /// happens in `MLSContext::add_members` via `KeyPackageIn::validate`). It is
 /// deliberately a pure function so both fetch-time verification and tests can
 /// use it without an MLS group in scope.
-pub fn extract_key_package_identity(key_package_data: &[u8]) -> Result<String, String> {
+pub fn extract_key_package_binding(
+    key_package_data: &[u8],
+) -> Result<KeyPackageBindingInfo, String> {
     use openmls::prelude::tls_codec::DeserializeBytes;
     use openmls::prelude::KeyPackageIn;
 
     let (kp_in, _rest) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
         .map_err(|e| format!("key package TLS decode failed: {e:?}"))?;
     let credential_with_key = kp_in.unverified_credential();
-    String::from_utf8(credential_with_key.credential.serialized_content().to_vec())
-        .map_err(|_| "credential identity is not UTF-8".to_string())
+    let identity = String::from_utf8(credential_with_key.credential.serialized_content().to_vec())
+        .map_err(|_| "credential identity is not UTF-8".to_string())?;
+    Ok(KeyPackageBindingInfo {
+        identity,
+        signature_key: credential_with_key.signature_key.as_slice().to_vec(),
+    })
 }
 
-/// Short hash prefix of a key package's serialized bytes for log correlation
-/// (ADR-009 D5 structured-warning field).
-fn kp_hash_prefix(key_package_data: &[u8]) -> String {
+/// Structurally decode a serialized MLS KeyPackage and extract its leaf
+/// credential identity as a UTF-8 string. See [`extract_key_package_binding`]
+/// for the variant that also returns the leaf signature key.
+pub fn extract_key_package_identity(key_package_data: &[u8]) -> Result<String, String> {
+    extract_key_package_binding(key_package_data).map(|info| info.identity)
+}
+
+/// Cached outcome of an authorized-device-key resolution (ADR-009 D6).
+///
+/// All three variants share the same `constants::DEVICE_KEY_CACHE_TTL` bound:
+/// positive (`Keys`), negative (`Keys(empty)`), and capability-missing
+/// (`Unsupported`). Caching `Unsupported` keeps the default-no-capability
+/// path at exactly one debug-logged seam call per DID per TTL window instead
+/// of one per key package.
+#[derive(Debug, Clone)]
+pub enum DeviceKeyLookup {
+    /// `CredentialStore::get_authorized_device_keys` returned `None`: this
+    /// platform has no DID-resolution surface wired in.
+    Unsupported,
+    /// Resolution succeeded; the authorized signing keys for the root DID
+    /// (possibly empty — "resolved, zero authorized keys").
+    Keys(std::sync::Arc<Vec<Vec<u8>>>),
+}
+
+/// A device-key cache row: when it was resolved plus what was resolved.
+#[derive(Debug, Clone)]
+pub struct DeviceKeyCacheEntry {
+    pub resolved_at: Instant,
+    pub lookup: DeviceKeyLookup,
+}
+
+/// Short SHA-256 prefix of a byte blob (key package or signature key) for
+/// log correlation (ADR-009 D5 structured-warning field).
+fn sha256_prefix(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    hex::encode(&Sha256::digest(key_package_data)[..8])
+    hex::encode(&Sha256::digest(data)[..8])
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -151,7 +212,7 @@ where
         conversation_id: Option<&str>,
     ) {
         for kp in key_packages {
-            let hash_prefix = kp_hash_prefix(&kp.key_package_data);
+            let hash_prefix = sha256_prefix(&kp.key_package_data);
 
             // 1. Response DID must be one the caller actually requested.
             if !requested_dids
@@ -173,9 +234,9 @@ where
                 // Still run the credential check below against the labeled DID.
             }
 
-            // 2. Structural decode of the leaf credential.
-            let claimed_identity = match extract_key_package_identity(&kp.key_package_data) {
-                Ok(identity) => identity,
+            // 2. Structural decode of the leaf credential + signature key.
+            let binding = match extract_key_package_binding(&kp.key_package_data) {
+                Ok(info) => info,
                 Err(reason) => {
                     self.emit_credential_binding_warning(
                         conversation_id,
@@ -190,6 +251,7 @@ where
                     continue;
                 }
             };
+            let claimed_identity = binding.identity.clone();
 
             // 3. Identity-claim consistency via the CredentialStore seam.
             match self
@@ -203,6 +265,21 @@ where
                         context,
                         "key package credential binding verified"
                     );
+                    // 4. WS-3 stage 2: device-key half of the ADR-009 proof —
+                    // the leaf signing key must be an authorized device key
+                    // for the credential's root DID. Warn-only; skipped with
+                    // a debug log when the platform provides no resolution
+                    // surface (`get_authorized_device_keys` default).
+                    self.verify_leaf_device_key_binding(
+                        conversation_id,
+                        "fetch",
+                        context,
+                        credential_root_did(&claimed_identity),
+                        &claimed_identity,
+                        &binding.signature_key,
+                        &hash_prefix,
+                    )
+                    .await;
                 }
                 Ok(CredentialVerification::DidMismatch {
                     expected_did,
@@ -255,6 +332,122 @@ where
         }
     }
 
+    /// Resolve (with ADR-009 D6 caching) the authorized device signing keys
+    /// for a root DID via the optional `CredentialStore` capability.
+    ///
+    /// Cache semantics: positive, negative, and `Unsupported` outcomes are
+    /// all cached for `constants::DEVICE_KEY_CACHE_TTL`; seam **errors are
+    /// not cached** (the next check retries). Keyed by ASCII-lowercased root
+    /// DID to match the orchestrator's DID comparison semantics.
+    pub(crate) async fn lookup_authorized_device_keys(
+        &self,
+        root_did: &str,
+    ) -> super::error::Result<DeviceKeyLookup> {
+        let cache_key = root_did.to_ascii_lowercase();
+        {
+            let cache = self.device_key_cache().lock().await;
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.resolved_at.elapsed() < constants::DEVICE_KEY_CACHE_TTL {
+                    return Ok(entry.lookup.clone());
+                }
+            }
+        }
+
+        let lookup = match self
+            .credentials()
+            .get_authorized_device_keys(root_did)
+            .await
+        {
+            Ok(Some(keys)) => DeviceKeyLookup::Keys(std::sync::Arc::new(keys)),
+            Ok(None) => DeviceKeyLookup::Unsupported,
+            Err(e) => return Err(e),
+        };
+
+        self.device_key_cache().lock().await.insert(
+            cache_key,
+            DeviceKeyCacheEntry {
+                resolved_at: Instant::now(),
+                lookup: lookup.clone(),
+            },
+        );
+        Ok(lookup)
+    }
+
+    /// ADR-009 full check, device-key half (WS-3 stage 2, warn-and-allow):
+    /// verify that a leaf's signature public key is currently published as
+    /// an authorized MLS device key for the credential's root DID.
+    ///
+    /// Outcomes:
+    /// - platform has no DID-resolution surface → `debug!` and skip (the
+    ///   structural stage-1 check has already run);
+    /// - key found in the authorized set → `debug!`;
+    /// - key NOT in the authorized set (including "resolved, zero keys") →
+    ///   structured warning through the stage-1 chokepoint, operation
+    ///   continues (D5 warn-and-allow);
+    /// - resolution infrastructure error → warning, operation continues.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn verify_leaf_device_key_binding(
+        &self,
+        conversation_id: Option<&str>,
+        operation: &str,
+        context: &str,
+        root_did: &str,
+        claimed_identity: &str,
+        leaf_signature_key: &[u8],
+        kp_hash_prefix: &str,
+    ) {
+        match self.lookup_authorized_device_keys(root_did).await {
+            Ok(DeviceKeyLookup::Unsupported) => {
+                tracing::debug!(
+                    root_did,
+                    context,
+                    "device-key binding skipped: platform provides no \
+                     get_authorized_device_keys resolution surface (ADR-009 \
+                     full check unavailable; structural check already ran)"
+                );
+            }
+            Ok(DeviceKeyLookup::Keys(keys)) => {
+                if keys.iter().any(|k| k.as_slice() == leaf_signature_key) {
+                    tracing::debug!(
+                        root_did,
+                        context,
+                        "leaf signature key verified against authorized device keys"
+                    );
+                } else {
+                    let key_hash_prefix = sha256_prefix(leaf_signature_key);
+                    let reason = format!(
+                        "leaf signature key (sha256 prefix {key_hash_prefix}) is not an \
+                         authorized device key for `{root_did}` ({} authorized key(s) resolved)",
+                        keys.len()
+                    );
+                    self.emit_credential_binding_warning(
+                        conversation_id,
+                        operation,
+                        context,
+                        root_did,
+                        claimed_identity,
+                        kp_hash_prefix,
+                        &reason,
+                    )
+                    .await;
+                }
+            }
+            Err(e) => {
+                let reason = format!("authorized-device-key resolution failed: {e}");
+                self.emit_credential_binding_warning(
+                    conversation_id,
+                    operation,
+                    context,
+                    root_did,
+                    claimed_identity,
+                    kp_hash_prefix,
+                    &reason,
+                )
+                .await;
+            }
+        }
+    }
+
     /// ADR-009 D4 (verify inbound), stage-1 warn-and-allow.
     ///
     /// Cross-checks the MLS sender credential extracted from a decrypted
@@ -273,6 +466,12 @@ where
     /// see ADR-009 D4 "Add proposals and commits"). The sender check below
     /// still covers External-Commit joiners and commit senders, because their
     /// credential IS the sender credential of the commit frame.
+    ///
+    /// Stage-2 scope note: the device-key half of the ADR-009 proof
+    /// (`verify_leaf_device_key_binding`) cannot run here either —
+    /// `CredentialData` carries the identity but not the sender's leaf
+    /// signature public key, and extending that UniFFI record is out of
+    /// scope for this stage (backlog N44d). Inbound stays structural.
     pub(crate) async fn verify_inbound_sender_credential(
         &self,
         conversation_id: &str,

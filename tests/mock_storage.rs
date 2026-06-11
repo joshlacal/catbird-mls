@@ -722,6 +722,14 @@ impl MLSStorageBackend for MockStorage {
             .collect())
     }
 
+    async fn clear_sequencer_receipts(&self, conversation_id: &str) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .sequencer_receipts
+            .retain(|r| r.convo_id != conversation_id);
+        Ok(())
+    }
+
     // ── RecoveryTracker persistence (WS-5.4 / E7) ────────────────────────
 
     async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
@@ -792,6 +800,9 @@ impl MLSStorageBackend for MockStorage {
             "clear_quarantine",
             "store_pending_message",
             "remove_pending_message",
+            "store_sequencer_receipt",
+            "get_sequencer_receipts",
+            "clear_sequencer_receipts",
             "get_recovery_state",
             "set_recovery_backoff",
             "clear_recovery_backoff",

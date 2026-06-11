@@ -63,6 +63,12 @@ pub const RECOVERY_BACKOFF_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const FAILOVER_MIN_FAILURES: u32 = 3;
 pub const FAILOVER_MIN_DURATION: Duration = Duration::from_secs(120);
 
+/// ADR-009 D6: maximum TTL for cached authorized-device-key lookups (WS-3
+/// stage 2 credential binding). Positive AND negative results are bounded by
+/// this same TTL; a revoked device key may be accepted until the cache
+/// expires, after which fresh resolution must reject it.
+pub const DEVICE_KEY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+
 // §Safe Export — Puncturable PRF component IDs (extensions-draft-08)
 /// Component ID for epoch blob decryption key (forward-secure within epochs).
 pub const SAFE_EXPORT_EPOCH_BLOB_KEY: u16 = 0;

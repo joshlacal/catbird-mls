@@ -99,6 +99,13 @@ struct MockState {
     /// malicious or buggy DS substituting another user's key package.
     key_package_redirects: HashMap<String, String>,
 
+    /// Envelope sender relabels for inbound credential-binding tests (WS-3
+    /// stage 2, ADR-009 D4): when `get_messages` serves a stored message
+    /// whose sender DID matches the key, the envelope's `sender_did` is
+    /// relabeled to the value — the genuine MLS ciphertext is untouched.
+    /// Simulates a malicious or buggy DS spoofing the envelope routing hint.
+    envelope_sender_relabels: HashMap<String, String>,
+
     /// When true, `process_external_commit` returns a `SequencerReceipt`
     /// whose commit hash is SHA-256 of the submitted commit bytes
     /// (mirrors the real sequencer). Used by equivocation-detection tests.
@@ -393,6 +400,23 @@ impl MockDeliveryService {
     /// commit bytes), as the real sequencer does.
     pub fn issue_external_commit_receipts_for_test(&self, enabled: bool) {
         self.state.lock().unwrap().issue_external_commit_receipts = enabled;
+    }
+
+    /// WS-3 stage-2 inbound credential-binding tests (ADR-009 D4): relabel
+    /// the envelope `sender_did` of every stored message actually sent by
+    /// `actual_sender_did` to `spoofed_sender_did` when served through
+    /// `get_messages`. The MLS ciphertext is untouched — only the envelope
+    /// routing hint lies, which is exactly the spoof a malicious DS can
+    /// perform without breaking MLS decryption.
+    pub fn relabel_envelope_sender_for_test(
+        &self,
+        actual_sender_did: &str,
+        spoofed_sender_did: &str,
+    ) {
+        self.state.lock().unwrap().envelope_sender_relabels.insert(
+            actual_sender_did.to_string(),
+            spoofed_sender_did.to_string(),
+        );
     }
 }
 
@@ -803,7 +827,13 @@ impl MLSAPIClient for MockDeliveryService {
             .iter()
             .map(|m| IncomingEnvelope {
                 conversation_id: m.conversation_id.clone(),
-                sender_did: m.sender_did.clone(),
+                // WS-3 stage-2 tests: a relabel entry spoofs the envelope's
+                // claimed sender (routing hint only — ciphertext untouched).
+                sender_did: guard
+                    .envelope_sender_relabels
+                    .get(&m.sender_did)
+                    .cloned()
+                    .unwrap_or_else(|| m.sender_did.clone()),
                 ciphertext: m.ciphertext.clone(),
                 timestamp: m.timestamp,
                 server_message_id: Some(m.id.clone()),
