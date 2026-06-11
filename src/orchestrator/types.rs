@@ -45,6 +45,10 @@ pub struct ConversationView {
     pub metadata: Option<ConversationMetadata>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+    /// Base DID of the DS currently sequencing this conversation
+    /// (ADR-010 D4). Routing does NOT consult this yet (WS-4 rung 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequencer_did: Option<String>,
 }
 
 /// A member within a conversation.
