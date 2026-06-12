@@ -2740,8 +2740,28 @@ impl MLSContext {
         &self,
         identity_bytes: Vec<u8>,
     ) -> Result<KeyPackageResult, MLSError> {
+        let mut results = self.create_key_packages(identity_bytes, 1)?;
+        results.pop().ok_or(MLSError::ContextClosed)
+    }
+
+    /// Create `count` key packages with a SINGLE persistence pass: one bundle-row
+    /// transaction and one WAL checkpoint at the end of the batch, instead of a
+    /// full manifest rewrite + checkpoint per package.
+    ///
+    /// 0xdead10cc prevention: the suspension flag is checked between packages.
+    /// On suspension the batch stops early and returns the packages created so
+    /// far (their bundles are persisted before returning); ContextClosed is
+    /// returned only if suspension was signaled before any package was built.
+    pub fn create_key_packages(
+        &self,
+        identity_bytes: Vec<u8>,
+        count: u32,
+    ) -> Result<Vec<KeyPackageResult>, MLSError> {
         // Early bail-out if suspension is in progress (0xdead10cc prevention).
         self.check_suspended()?;
+        if count == 0 {
+            return Ok(Vec::new());
+        }
 
         let mut guard = self
             .inner
@@ -2752,68 +2772,10 @@ impl MLSContext {
         let identity = String::from_utf8(identity_bytes)
             .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
 
-        let credential = Credential::new(CredentialType::Basic, identity.as_bytes().to_vec());
+        // Resolve the persistent identity signer ONCE for the whole batch.
+        let signature_keys = Self::resolve_or_create_signer(inner, &identity)?;
 
-        // Use persistent identity keypair instead of generating new one each time
-        // Try to retrieve existing signature keypair for this identity
-        crate::debug_log!(
-            "[CREATE-KEY-PACKAGE] Looking for signer for identity: {}",
-            identity
-        );
-        let signature_keys = match inner.get_signer_for_identity(&identity) {
-            Some(existing_signer) => {
-                crate::debug_log!(
-                    "[CREATE-KEY-PACKAGE] Reusing existing signer, PK: {}",
-                    hex::encode(existing_signer.public())
-                );
-                existing_signer
-            }
-            None => {
-                // No existing signer - create a new persistent one
-                crate::info_log!(
-                    "[CREATE-KEY-PACKAGE] Creating NEW signer for identity: {}",
-                    identity
-                );
-                let new_keys = SignatureKeyPair::new(SignatureScheme::ED25519).map_err(|e| {
-                    MLSError::OpenMLS(format!("Failed to create SignatureKeyPair: {:?}", e))
-                })?;
-
-                let signer_public_key = new_keys.public().to_vec();
-                crate::debug_log!(
-                    "[CREATE-KEY-PACKAGE]   New signer PK: {}",
-                    hex::encode(&signer_public_key)
-                );
-
-                // Store in OpenMLS storage
-                crate::debug_log!("[CREATE-KEY-PACKAGE]   Calling new_keys.store()...");
-                new_keys.store(inner.provider.storage()).map_err(|e| {
-                    MLSError::OpenMLS(format!("Failed to store SignatureKeyPair: {:?}", e))
-                })?;
-                crate::debug_log!("[CREATE-KEY-PACKAGE]   store() completed without error");
-
-                // Verify the signer can be loaded back immediately
-                match SignatureKeyPair::read(
-                    inner.provider.storage(),
-                    &signer_public_key,
-                    SignatureScheme::ED25519,
-                ) {
-                    Some(_) => {
-                        crate::debug_log!("[CREATE-KEY-PACKAGE]   VERIFIED: Signer can be loaded back from storage");
-                    }
-                    None => {
-                        crate::error_log!("[CREATE-KEY-PACKAGE]   CRITICAL: Signer NOT found in storage immediately after store()!");
-                    }
-                }
-
-                // Register the signer for this identity so it can be found later
-                inner.register_signer(&identity, signer_public_key.clone())?;
-                crate::debug_log!("[CREATE-KEY-PACKAGE]   Registered signer mapping");
-
-                new_keys
-            }
-        };
-
-        // 🔥 SIGNATURE KEY FORENSICS: Log the public key being embedded in this KeyPackage
+        // 🔥 SIGNATURE KEY FORENSICS: Log the public key embedded in this batch
         let signer_public_key = signature_keys.public().to_vec();
         crate::info_log!("🔑 [SIGNATURE KEY FORENSICS - KeyPackage Creation]");
         crate::info_log!("   Identity: {}", identity);
@@ -2824,123 +2786,60 @@ impl MLSContext {
         crate::info_log!("   ⚠️  This is the PERSISTENT identity key for this user");
         crate::info_log!("   ⚠️  All KeyPackages and messages will use THIS SAME KEY");
 
-        let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+        let mut results: Vec<KeyPackageResult> = Vec::with_capacity(count as usize);
+        let mut bundle_rows: Vec<(String, String)> = Vec::with_capacity(count as usize);
 
-        // CRITICAL: Key packages must advertise support for RatchetTree extension
-        // AND the Catbird metadata extension (0xff00) so members can join groups
-        // that use encrypted group metadata in context extensions.
-        let capabilities = Capabilities::builder()
-            .extensions(vec![
-                ExtensionType::RatchetTree,
-                ExtensionType::AppDataDictionary,
-                ExtensionType::Unknown(crate::metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE),
-            ])
-            .proposals(vec![ProposalType::AppDataUpdate])
-            .build();
+        for built in 0..count {
+            if self.is_suspended.load(Ordering::Acquire) {
+                crate::warn_log!(
+                    "[MLS-FFI] ⚠️ Suspension signaled mid-batch: created {} of {} key packages",
+                    built,
+                    count
+                );
+                break;
+            }
+            let (result, row) = Self::build_key_package_locked(inner, &identity, &signature_keys)?;
+            results.push(result);
+            bundle_rows.push(row);
+        }
 
-        let key_package_bundle = KeyPackage::builder()
-            .leaf_node_capabilities(capabilities)
-            .build(
-                ciphersuite,
-                &inner.provider,
-                &signature_keys,
-                CredentialWithKey {
-                    credential,
-                    signature_key: signature_keys.public().into(),
-                },
-            )
-            .map_err(|e| MLSError::OpenMLS(format!("Failed to build KeyPackage: {:?}", e)))?;
+        if results.is_empty() {
+            return Err(MLSError::ContextClosed);
+        }
 
-        // Serialize key package directly (raw format for compatibility)
-        let key_package = key_package_bundle.key_package().clone();
-
-        let key_package_data = key_package
-            .tls_serialize_detached()
-            .map_err(|_| MLSError::SerializationError)?;
-
-        // Get hash reference (keep both typed and bytes versions)
-        let hash_ref_typed = key_package.hash_ref(inner.provider_crypto()).map_err(|e| {
-            MLSError::OpenMLS(format!("Failed to compute KeyPackage hash_ref: {:?}", e))
-        })?;
-        let hash_ref = hash_ref_typed.as_slice().to_vec();
-
-        // CRITICAL FIX: Store the bundle in the cache for serialization and Welcome message processing
-        // This ensures the private key material is available when processing Welcome messages
+        // Single persistence pass for the whole batch (one small transaction —
+        // per-row inserts, NOT a rewrite of every stored bundle).
+        inner.manifest_storage.insert_bundles(&bundle_rows)?;
         crate::debug_log!(
-            "[MLS-FFI] Storing key package bundle in cache (hash_ref: {})",
-            hex::encode(&hash_ref)
-        );
-        crate::info_log!(
-            "[MLS-WELCOME-DEBUG] 📦 Key package CREATED: hash_ref = {}",
-            hex::encode(&hash_ref)
-        );
-        // Also log how many OpenMLS has in its internal table right after build()
-        let openmls_count = inner.manifest_storage.debug_count_openmls_key_packages();
-        crate::info_log!(
-            "[MLS-WELCOME-DEBUG] 📦 OpenMLS internal key_packages count after build(): {}",
-            openmls_count
-        );
-        inner
-            .key_package_bundles_mut()
-            .insert(hash_ref.clone(), key_package_bundle.clone());
-        crate::debug_log!(
-            "[MLS-FFI] Bundle cached successfully, cache now has {} bundles",
-            inner.key_package_bundles_mut().len()
+            "[MLS-FFI] 📋 Persisted {} bundle row(s), {} total in storage",
+            bundle_rows.len(),
+            inner.manifest_storage.count_bundles()
         );
 
-        // 🔥 PERSISTENCE FIX: Serialize and store the bundle using serde_json
-        // We can't use OpenMLS's write_key_package() because it causes UNIQUE constraint violations
-        // (OpenMLS already persists the private key during .build(), but not the full bundle)
-        // Instead, we serialize the bundle and store it using a custom storage key
-        crate::info_log!("[MLS-FFI] ✍️ Persisting key package bundle to custom storage...");
-
-        let bundle_json = serde_json::to_vec(&key_package_bundle).map_err(|e| {
-            crate::error_log!("[MLS-FFI] ❌ Failed to serialize bundle: {:?}", e);
-            MLSError::SerializationError
-        })?;
-
-        // Persist bundle to manifest storage
-        let storage = &inner.manifest_storage;
-        let hex_ref = hex::encode(&hash_ref);
-        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_json);
-
-        // Read existing bundles map or create new one
-        let mut bundles_map: HashMap<String, String> = storage
-            .read_manifest("key_package_bundles")?
-            .unwrap_or_else(HashMap::new);
-
-        // Add or update this bundle
-        bundles_map.insert(hex_ref.clone(), bundle_b64);
-
-        // Write updated map back to storage (bail if app is suspending — 0xdead10cc prevention)
-        self.check_suspended()?;
-        storage.write_manifest("key_package_bundles", &bundles_map)?;
-
-        crate::debug_log!(
-            "[MLS-FFI] 📋 Updated bundle manifest, now tracking {} bundles",
-            bundles_map.len()
-        );
-
-        // 🔒 CRITICAL FIX: Force database flush after key package bundle creation
-        // Without this, SQLite WAL entries may not be checkpointed to the main database file,
-        // causing NoMatchingKeyPackage errors after app restart when bundles are lost.
-        self.check_suspended()?;
-        inner.flush_database().map_err(|e| {
+        // Single WAL checkpoint after the batch. Skipped when suspension was
+        // signaled mid-batch: the rows are already durably committed to the
+        // WAL, and a checkpoint's fsync is exactly the operation that gets the
+        // process killed with 0xdead10cc if iOS suspends during it. Checkpoint
+        // failure is non-fatal for the same reason.
+        if self.is_suspended.load(Ordering::Acquire) {
+            crate::warn_log!(
+                "[MLS-FFI] ⚠️ Skipping post-batch checkpoint (suspension in progress)"
+            );
+        } else if let Err(e) = inner.flush_database() {
             crate::error_log!(
                 "[MLS-FFI] ⚠️ WARNING: Failed to flush database after bundle creation: {:?}",
                 e
             );
-            e
-        })?;
-        crate::debug_log!("[MLS-FFI] ✅ Database flushed after bundle creation");
+        } else {
+            crate::debug_log!("[MLS-FFI] ✅ Database flushed after batch creation");
+        }
 
-        crate::info_log!("[MLS-FFI] ✅ Key package bundle persisted successfully");
+        crate::info_log!(
+            "[MLS-FFI] ✅ {} key package bundle(s) persisted successfully",
+            results.len()
+        );
 
-        Ok(KeyPackageResult {
-            key_package_data,
-            hash_ref,
-            signature_public_key: signer_public_key,
-        })
+        Ok(results)
     }
 
     pub fn process_welcome(
@@ -3018,40 +2917,34 @@ impl MLSContext {
             );
         }
 
-        // List what's in our local key package manifest
+        // List what's in our local key package bundle storage
         let manifest = &inner.manifest_storage;
-        if let Ok(Some(bundles_map)) = manifest
-            .read_manifest::<std::collections::HashMap<String, String>>("key_package_bundles")
-        {
+        let bundle_count = manifest.count_bundles();
+        if bundle_count > 0 {
             crate::info_log!(
-                "[MLS-WELCOME-DEBUG] 🔍 Local manifest has {} key package bundles:",
-                bundles_map.len()
+                "[MLS-WELCOME-DEBUG] 🔍 Local storage has {} key package bundles:",
+                bundle_count
             );
-            for (i, hash_hex) in bundles_map.keys().enumerate() {
-                if i < 5 {
-                    crate::info_log!("[MLS-WELCOME-DEBUG]   Local[{}] hash = {}", i, hash_hex);
-                }
+            for (i, hash_hex) in manifest.list_bundle_refs(5).iter().enumerate() {
+                crate::info_log!("[MLS-WELCOME-DEBUG]   Local[{}] hash = {}", i, hash_hex);
             }
-            if bundles_map.len() > 5 {
-                crate::info_log!(
-                    "[MLS-WELCOME-DEBUG]   ... and {} more",
-                    bundles_map.len() - 5
-                );
+            if bundle_count > 5 {
+                crate::info_log!("[MLS-WELCOME-DEBUG]   ... and {} more", bundle_count - 5);
             }
 
-            // Check if any Welcome hash matches local manifest
+            // Check if any Welcome hash matches local storage
             for (idx, egs) in welcome.secrets().iter().enumerate() {
                 let hash_ref_hex = hex::encode(egs.new_member().as_slice());
-                let found = bundles_map.contains_key(&hash_ref_hex);
+                let found = manifest.contains_bundle(&hash_ref_hex);
                 crate::info_log!(
-                    "[MLS-WELCOME-DEBUG]   Secret[{}] hash {} MATCH in local manifest: {}",
+                    "[MLS-WELCOME-DEBUG]   Secret[{}] hash {} MATCH in local storage: {}",
                     idx,
                     &hash_ref_hex[..hash_ref_hex.len().min(16)],
                     found
                 );
             }
         } else {
-            crate::warn_log!("[MLS-WELCOME-DEBUG] ⚠️ No key_package_bundles manifest found");
+            crate::warn_log!("[MLS-WELCOME-DEBUG] ⚠️ No key package bundles in local storage");
         }
 
         let group_config = config.unwrap_or_default();
@@ -3122,22 +3015,12 @@ impl MLSContext {
                         for h in &stale {
                             bundles.remove(h);
                         }
-                        if let Ok(Some(mut bundles_map)) = inner
-                            .manifest_storage
-                            .read_manifest::<HashMap<String, String>>("key_package_bundles")
-                        {
-                            for h in &stale {
-                                bundles_map.remove(&hex::encode(h));
-                            }
-                            if let Err(write_err) = inner
-                                .manifest_storage
-                                .write_manifest("key_package_bundles", &bundles_map)
-                            {
-                                crate::warn_log!(
-                                    "[MLS-FFI] [KP-RECONCILE] failed to persist purge: {:?}",
-                                    write_err
-                                );
-                            }
+                        let stale_hex: Vec<String> = stale.iter().map(hex::encode).collect();
+                        if let Err(write_err) = inner.manifest_storage.delete_bundles(&stale_hex) {
+                            crate::warn_log!(
+                                "[MLS-FFI] [KP-RECONCILE] failed to persist purge: {:?}",
+                                write_err
+                            );
                         }
                     }
                 }
@@ -4819,30 +4702,10 @@ impl MLSContext {
             bundles.len()
         );
 
-        // Delete from persistent storage
-        let storage = &inner.manifest_storage;
-
-        // Read existing bundles map
-        let mut bundles_map: HashMap<String, String> = storage
-            .read_manifest("key_package_bundles")?
-            .unwrap_or_else(HashMap::new);
-
-        let initial_persistent_count = bundles_map.len();
-
-        // Remove bundles from persistent storage
-        for hash_ref in &hash_refs {
-            let hex_ref = hex::encode(hash_ref);
-            if bundles_map.remove(&hex_ref).is_some() {
-                crate::debug_log!(
-                    "[MLS-FFI]   ✅ Deleted from persistent storage: {}",
-                    hex_ref
-                );
-            }
-        }
-
-        // Write updated map back to storage (bail if app is suspending — 0xdead10cc prevention)
+        // Delete from persistent storage (per-row; bail if app is suspending — 0xdead10cc prevention)
         self.check_suspended()?;
-        storage.write_manifest("key_package_bundles", &bundles_map)?;
+        let hex_refs: Vec<String> = hash_refs.iter().map(hex::encode).collect();
+        let persistent_deleted = inner.manifest_storage.delete_bundles(&hex_refs)?;
 
         // 🔒 CRITICAL FIX: Force database flush after bundle deletion
         // Ensures deleted bundles are not restored from WAL after app restart
@@ -4856,11 +4719,10 @@ impl MLSContext {
         })?;
         crate::debug_log!("[MLS-FFI] ✅ Database flushed after bundle deletion");
 
-        let persistent_deleted = initial_persistent_count - bundles_map.len();
         crate::info_log!(
             "[MLS-FFI] 💾 Persistent storage: {} bundles removed, {} remain",
             persistent_deleted,
-            bundles_map.len()
+            inner.manifest_storage.count_bundles()
         );
 
         crate::info_log!(
@@ -5154,6 +5016,159 @@ impl MLSContext {
 // Non-exported (in-process only) methods. Deliberately OUTSIDE the
 // `#[uniffi::export]` impl block so UniFFI never sees them.
 impl MLSContext {
+    /// Look up the persistent identity signer, creating + registering one if
+    /// absent. Must be called with the inner lock held.
+    fn resolve_or_create_signer(
+        inner: &mut MLSContextInner,
+        identity: &str,
+    ) -> Result<SignatureKeyPair, MLSError> {
+        // Use persistent identity keypair instead of generating new one each time
+        crate::debug_log!(
+            "[CREATE-KEY-PACKAGE] Looking for signer for identity: {}",
+            identity
+        );
+        match inner.get_signer_for_identity(identity) {
+            Some(existing_signer) => {
+                crate::debug_log!(
+                    "[CREATE-KEY-PACKAGE] Reusing existing signer, PK: {}",
+                    hex::encode(existing_signer.public())
+                );
+                Ok(existing_signer)
+            }
+            None => {
+                // No existing signer - create a new persistent one
+                crate::info_log!(
+                    "[CREATE-KEY-PACKAGE] Creating NEW signer for identity: {}",
+                    identity
+                );
+                let new_keys = SignatureKeyPair::new(SignatureScheme::ED25519).map_err(|e| {
+                    MLSError::OpenMLS(format!("Failed to create SignatureKeyPair: {:?}", e))
+                })?;
+
+                let signer_public_key = new_keys.public().to_vec();
+                crate::debug_log!(
+                    "[CREATE-KEY-PACKAGE]   New signer PK: {}",
+                    hex::encode(&signer_public_key)
+                );
+
+                // Store in OpenMLS storage
+                crate::debug_log!("[CREATE-KEY-PACKAGE]   Calling new_keys.store()...");
+                new_keys.store(inner.provider.storage()).map_err(|e| {
+                    MLSError::OpenMLS(format!("Failed to store SignatureKeyPair: {:?}", e))
+                })?;
+                crate::debug_log!("[CREATE-KEY-PACKAGE]   store() completed without error");
+
+                // Verify the signer can be loaded back immediately
+                match SignatureKeyPair::read(
+                    inner.provider.storage(),
+                    &signer_public_key,
+                    SignatureScheme::ED25519,
+                ) {
+                    Some(_) => {
+                        crate::debug_log!("[CREATE-KEY-PACKAGE]   VERIFIED: Signer can be loaded back from storage");
+                    }
+                    None => {
+                        crate::error_log!("[CREATE-KEY-PACKAGE]   CRITICAL: Signer NOT found in storage immediately after store()!");
+                    }
+                }
+
+                // Register the signer for this identity so it can be found later
+                inner.register_signer(identity, signer_public_key.clone())?;
+                crate::debug_log!("[CREATE-KEY-PACKAGE]   Registered signer mapping");
+
+                Ok(new_keys)
+            }
+        }
+    }
+
+    /// Build ONE key package and stage it: caches the bundle in memory and
+    /// returns the FFI result plus the (hex hash_ref, base64 bundle JSON)
+    /// persistence row for the caller's batched insert. Must be called with
+    /// the inner lock held. Does not write bundle rows or checkpoint — the
+    /// caller persists the whole batch in one pass (note: OpenMLS itself
+    /// stores the private key during `.build()`).
+    fn build_key_package_locked(
+        inner: &mut MLSContextInner,
+        identity: &str,
+        signature_keys: &SignatureKeyPair,
+    ) -> Result<(KeyPackageResult, (String, String)), MLSError> {
+        let credential = Credential::new(CredentialType::Basic, identity.as_bytes().to_vec());
+
+        let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+
+        // CRITICAL: Key packages must advertise support for RatchetTree extension
+        // AND the Catbird metadata extension (0xff00) so members can join groups
+        // that use encrypted group metadata in context extensions.
+        let capabilities = Capabilities::builder()
+            .extensions(vec![
+                ExtensionType::RatchetTree,
+                ExtensionType::AppDataDictionary,
+                ExtensionType::Unknown(crate::metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE),
+            ])
+            .proposals(vec![ProposalType::AppDataUpdate])
+            .build();
+
+        let key_package_bundle = KeyPackage::builder()
+            .leaf_node_capabilities(capabilities)
+            .build(
+                ciphersuite,
+                &inner.provider,
+                signature_keys,
+                CredentialWithKey {
+                    credential,
+                    signature_key: signature_keys.public().into(),
+                },
+            )
+            .map_err(|e| MLSError::OpenMLS(format!("Failed to build KeyPackage: {:?}", e)))?;
+
+        // Serialize key package directly (raw format for compatibility)
+        let key_package = key_package_bundle.key_package().clone();
+
+        let key_package_data = key_package
+            .tls_serialize_detached()
+            .map_err(|_| MLSError::SerializationError)?;
+
+        // Get hash reference (keep both typed and bytes versions)
+        let hash_ref_typed = key_package.hash_ref(inner.provider_crypto()).map_err(|e| {
+            MLSError::OpenMLS(format!("Failed to compute KeyPackage hash_ref: {:?}", e))
+        })?;
+        let hash_ref = hash_ref_typed.as_slice().to_vec();
+
+        // CRITICAL FIX: Store the bundle in the cache for serialization and Welcome message processing
+        // This ensures the private key material is available when processing Welcome messages
+        crate::info_log!(
+            "[MLS-WELCOME-DEBUG] 📦 Key package CREATED: hash_ref = {}",
+            hex::encode(&hash_ref)
+        );
+        inner
+            .key_package_bundles_mut()
+            .insert(hash_ref.clone(), key_package_bundle.clone());
+        crate::debug_log!(
+            "[MLS-FFI] Bundle cached successfully, cache now has {} bundles",
+            inner.key_package_bundles_mut().len()
+        );
+
+        // 🔥 PERSISTENCE FIX: Serialize the bundle using serde_json for storage.
+        // We can't use OpenMLS's write_key_package() because it causes UNIQUE constraint violations
+        // (OpenMLS already persists the private key during .build(), but not the full bundle)
+        let bundle_json = serde_json::to_vec(&key_package_bundle).map_err(|e| {
+            crate::error_log!("[MLS-FFI] ❌ Failed to serialize bundle: {:?}", e);
+            MLSError::SerializationError
+        })?;
+
+        let hex_ref = hex::encode(&hash_ref);
+        let bundle_b64 = base64::engine::general_purpose::STANDARD.encode(&bundle_json);
+
+        Ok((
+            KeyPackageResult {
+                key_package_data,
+                hash_ref,
+                signature_public_key: signature_keys.public().to_vec(),
+            },
+            (hex_ref, bundle_b64),
+        ))
+    }
+
     /// Class-preserving decrypt (N38).
     ///
     /// Identical to the FFI-exported [`MLSContext::decrypt_message`] except

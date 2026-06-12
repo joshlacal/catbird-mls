@@ -153,6 +153,18 @@ fn derive_cipher_salt_hex(encryption_key: &str) -> String {
 /// long checkpoint operations during suspension.
 const CHECKPOINT_BUDGET: u64 = 32;
 
+/// Maximum age for a stored key package bundle before it is pruned (90 days).
+/// Matches the OpenMLS KeyPackage lifetime — older bundles are unusable by
+/// joiners, so keeping them only bloats storage and slows writes.
+const KEY_PACKAGE_BUNDLE_MAX_AGE_SECS: u64 = 90 * 24 * 60 * 60;
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Helper for storing application manifests in SQLite
 /// This is separate from OpenMLS's storage and uses direct rusqlite access
 pub(crate) struct ManifestStorage {
@@ -306,7 +318,82 @@ impl ManifestStorage {
                 map_sqlite_error("create_table(mls_manifests)", &e)
             })?;
 
+        // Per-row key package bundle storage. Replaces the monolithic
+        // "key_package_bundles" JSON blob in mls_manifests, whose full
+        // read-modify-write on every create/delete grew with install age and
+        // widened the 0xdead10cc suspension-kill window.
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS mls_key_package_bundles (
+                hash_ref TEXT PRIMARY KEY,
+                bundle_b64 TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+                [],
+            )
+            .map_err(|e| {
+                crate::error_log!("[MANIFEST-STORAGE] Failed to create bundle table: {:?}", e);
+                map_sqlite_error("create_table(mls_key_package_bundles)", &e)
+            })?;
+
+        self.migrate_key_package_bundles_blob()?;
+
         Ok(())
+    }
+
+    /// One-time migration: move the legacy "key_package_bundles" JSON blob
+    /// from mls_manifests into per-row mls_key_package_bundles entries.
+    ///
+    /// Idempotent and safe across processes (main app + NSE): runs in a single
+    /// IMMEDIATE transaction with INSERT OR IGNORE; whichever process commits
+    /// first deletes the blob, and the other finds nothing to migrate.
+    fn migrate_key_package_bundles_blob(&self) -> Result<(), MLSError> {
+        let blob: Option<HashMap<String, String>> = self.read_manifest("key_package_bundles")?;
+        let Some(bundles_map) = blob else {
+            return Ok(());
+        };
+
+        let now = unix_now_secs();
+        crate::info_log!(
+            "[MANIFEST-STORAGE] Migrating {} key package bundles from blob to per-row storage",
+            bundles_map.len()
+        );
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| map_sqlite_error("bundle_migration.begin", &e))?;
+
+        let migrate = || -> Result<(), rusqlite::Error> {
+            for (hex_ref, bundle_b64) in &bundles_map {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO mls_key_package_bundles (hash_ref, bundle_b64, created_at) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![hex_ref, bundle_b64, now],
+                )?;
+            }
+            self.conn.execute(
+                "DELETE FROM mls_manifests WHERE key = 'key_package_bundles'",
+                [],
+            )?;
+            Ok(())
+        };
+
+        match migrate() {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| map_sqlite_error("bundle_migration.commit", &e))?;
+                crate::info_log!("[MANIFEST-STORAGE] ✅ Bundle blob migration complete");
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                crate::error_log!(
+                    "[MANIFEST-STORAGE] ❌ Bundle blob migration failed: {:?}",
+                    e
+                );
+                Err(map_sqlite_error("bundle_migration", &e))
+            }
+        }
     }
 
     /// Get an interrupt handle for aborting in-flight SQLCipher operations.
@@ -538,6 +625,145 @@ impl ManifestStorage {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(map_sqlite_error("read_manifest.query_row", &e)),
         }
+    }
+
+    // ─── Per-row key package bundle storage ────────────────────────────────
+
+    /// Insert (or replace) key package bundle rows in a single transaction.
+    /// Entries are (hex hash_ref, base64 bundle JSON) pairs.
+    pub(crate) fn insert_bundles(&self, bundles: &[(String, String)]) -> Result<(), MLSError> {
+        if bundles.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now_secs();
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| map_sqlite_error("insert_bundles.begin", &e))?;
+        for (hex_ref, bundle_b64) in bundles {
+            tx.execute(
+                "INSERT OR REPLACE INTO mls_key_package_bundles (hash_ref, bundle_b64, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![hex_ref, bundle_b64, now],
+            )
+            .map_err(|e| map_sqlite_error("insert_bundles", &e))?;
+        }
+        tx.commit()
+            .map_err(|e| map_sqlite_error("insert_bundles.commit", &e))?;
+        self.maybe_truncate_checkpoint();
+        Ok(())
+    }
+
+    /// Delete bundle rows by hex hash_ref. Returns the number of rows removed.
+    pub(crate) fn delete_bundles(&self, hex_refs: &[String]) -> Result<usize, MLSError> {
+        if hex_refs.is_empty() {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| map_sqlite_error("delete_bundles.begin", &e))?;
+        let mut removed = 0usize;
+        for hex_ref in hex_refs {
+            removed += tx
+                .execute(
+                    "DELETE FROM mls_key_package_bundles WHERE hash_ref = ?1",
+                    [hex_ref],
+                )
+                .map_err(|e| map_sqlite_error("delete_bundles", &e))?;
+        }
+        tx.commit()
+            .map_err(|e| map_sqlite_error("delete_bundles.commit", &e))?;
+        self.maybe_truncate_checkpoint();
+        Ok(removed)
+    }
+
+    /// Load all bundle rows as (hex hash_ref, base64 bundle JSON) pairs.
+    pub(crate) fn load_all_bundles(&self) -> Result<Vec<(String, String)>, MLSError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash_ref, bundle_b64 FROM mls_key_package_bundles")
+            .map_err(|e| map_sqlite_error("load_all_bundles.prepare", &e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| map_sqlite_error("load_all_bundles.query", &e))?;
+        let mut bundles = Vec::new();
+        for row in rows {
+            bundles.push(row.map_err(|e| map_sqlite_error("load_all_bundles.row", &e))?);
+        }
+        Ok(bundles)
+    }
+
+    /// Number of stored bundle rows.
+    pub(crate) fn count_bundles(&self) -> usize {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM mls_key_package_bundles", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap_or(0)
+    }
+
+    /// First `limit` bundle hash_refs (hex), for diagnostics.
+    pub(crate) fn list_bundle_refs(&self, limit: usize) -> Vec<String> {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT hash_ref FROM mls_key_package_bundles LIMIT ?1")
+        else {
+            return Vec::new();
+        };
+        let refs = match stmt.query_map([limit], |row| row.get::<_, String>(0)) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        };
+        refs
+    }
+
+    /// Whether a bundle row exists for the given hex hash_ref.
+    pub(crate) fn contains_bundle(&self, hex_ref: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM mls_key_package_bundles WHERE hash_ref = ?1",
+                [hex_ref],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    /// Remove bundle rows older than `max_age_secs`. Returns the pruned hex
+    /// hash_refs so callers can evict matching in-memory cache entries.
+    pub(crate) fn prune_bundles_older_than(
+        &self,
+        max_age_secs: u64,
+    ) -> Result<Vec<String>, MLSError> {
+        let cutoff = unix_now_secs().saturating_sub(max_age_secs as i64);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hash_ref FROM mls_key_package_bundles WHERE created_at < ?1")
+            .map_err(|e| map_sqlite_error("prune_bundles.prepare", &e))?;
+        let expired: Vec<String> = stmt
+            .query_map([cutoff], |row| row.get::<_, String>(0))
+            .map_err(|e| map_sqlite_error("prune_bundles.query", &e))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+
+        if expired.is_empty() {
+            return Ok(expired);
+        }
+        self.conn
+            .execute(
+                "DELETE FROM mls_key_package_bundles WHERE created_at < ?1",
+                [cutoff],
+            )
+            .map_err(|e| map_sqlite_error("prune_bundles.delete", &e))?;
+        self.maybe_truncate_checkpoint();
+        crate::info_log!(
+            "[MANIFEST-STORAGE] 🧹 Pruned {} expired key package bundles (older than {}s)",
+            expired.len(),
+            max_age_secs
+        );
+        Ok(expired)
     }
 
     /// DEBUG: Count key packages in OpenMLS's internal storage table.
@@ -902,67 +1128,64 @@ impl MLSContext {
 
         let mut key_package_bundles = HashMap::new();
 
-        // Read the manifest to get list of all bundle refs and their data
-        match manifest_storage.read_manifest::<HashMap<String, String>>("key_package_bundles")? {
-            Some(bundles_map) => {
-                crate::info_log!(
-                    "[MLS-CONTEXT] 📋 Found {} bundle entries",
-                    bundles_map.len()
-                );
+        // Load all bundle rows (per-row storage; legacy blob is migrated on open)
+        let bundle_rows = manifest_storage.load_all_bundles()?;
+        if bundle_rows.is_empty() {
+            crate::info_log!("[MLS-CONTEXT] 📋 No bundles found, starting with empty bundle cache");
+        } else {
+            crate::info_log!(
+                "[MLS-CONTEXT] 📋 Found {} bundle entries",
+                bundle_rows.len()
+            );
 
-                let mut loaded_count = 0;
-                for (hex_ref, bundle_b64) in &bundles_map {
-                    // Decode base64 first (bundles are stored as base64-encoded JSON)
-                    match base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        bundle_b64,
-                    ) {
-                        Ok(bundle_json_bytes) => {
-                            // Then deserialize JSON
-                            match serde_json::from_slice::<openmls::prelude::KeyPackageBundle>(
-                                &bundle_json_bytes,
-                            ) {
-                                Ok(bundle) => {
-                                    if let Ok(hash_ref) = hex::decode(hex_ref) {
-                                        key_package_bundles.insert(hash_ref, bundle);
-                                        loaded_count += 1;
-                                    } else {
-                                        crate::error_log!(
-                                            "[MLS-CONTEXT] ⚠️ Failed to decode hash ref: {}",
-                                            hex_ref
-                                        );
-                                    }
-                                }
-                                Err(e) => {
+            let total = bundle_rows.len();
+            let mut loaded_count = 0;
+            for (hex_ref, bundle_b64) in bundle_rows {
+                // Decode base64 first (bundles are stored as base64-encoded JSON)
+                match base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &bundle_b64,
+                ) {
+                    Ok(bundle_json_bytes) => {
+                        // Then deserialize JSON
+                        match serde_json::from_slice::<openmls::prelude::KeyPackageBundle>(
+                            &bundle_json_bytes,
+                        ) {
+                            Ok(bundle) => {
+                                if let Ok(hash_ref) = hex::decode(&hex_ref) {
+                                    key_package_bundles.insert(hash_ref, bundle);
+                                    loaded_count += 1;
+                                } else {
                                     crate::error_log!(
-                                        "[MLS-CONTEXT] ⚠️ Failed to deserialize bundle {}: {:?}",
-                                        hex_ref,
-                                        e
+                                        "[MLS-CONTEXT] ⚠️ Failed to decode hash ref: {}",
+                                        hex_ref
                                     );
                                 }
                             }
-                        }
-                        Err(e) => {
-                            crate::error_log!(
-                                "[MLS-CONTEXT] ⚠️ Failed to decode base64 for bundle {}: {:?}",
-                                hex_ref,
-                                e
-                            );
+                            Err(e) => {
+                                crate::error_log!(
+                                    "[MLS-CONTEXT] ⚠️ Failed to deserialize bundle {}: {:?}",
+                                    hex_ref,
+                                    e
+                                );
+                            }
                         }
                     }
+                    Err(e) => {
+                        crate::error_log!(
+                            "[MLS-CONTEXT] ⚠️ Failed to decode base64 for bundle {}: {:?}",
+                            hex_ref,
+                            e
+                        );
+                    }
                 }
+            }
 
-                crate::info_log!(
-                    "[MLS-CONTEXT] ✅ Loaded {} / {} bundles successfully",
-                    loaded_count,
-                    bundles_map.len()
-                );
-            }
-            None => {
-                crate::info_log!(
-                    "[MLS-CONTEXT] 📋 No bundles found, starting with empty bundle cache"
-                );
-            }
+            crate::info_log!(
+                "[MLS-CONTEXT] ✅ Loaded {} / {} bundles successfully",
+                loaded_count,
+                total
+            );
         }
 
         // 🔄 SIGNER LOADING: Load all persisted signer identity mappings FIRST
@@ -1264,35 +1487,39 @@ impl MLSContext {
             stale
         };
 
-        if stale.is_empty() {
+        // Age-based pruning runs regardless of staleness: expired bundles are
+        // unusable by joiners (KeyPackage lifetime) and only bloat storage.
+        let pruned = self
+            .manifest_storage
+            .prune_bundles_older_than(KEY_PACKAGE_BUNDLE_MAX_AGE_SECS)?;
+        for hex_ref in &pruned {
+            if let Ok(hash_ref) = hex::decode(hex_ref) {
+                self.key_package_bundles.remove(&hash_ref);
+            }
+        }
+
+        if stale.is_empty() && pruned.is_empty() {
             return Ok(0);
         }
 
-        let removed_count = stale.len();
+        let removed_count = stale.len() + pruned.len();
         crate::info_log!(
-            "[KP-RECONCILE] Removing {} stale manifest entries (cache before: {})",
-            removed_count,
+            "[KP-RECONCILE] Removing {} stale + {} expired entries (cache before: {})",
+            stale.len(),
+            pruned.len(),
             self.key_package_bundles.len()
         );
 
         for hash_ref in &stale {
             self.key_package_bundles.remove(hash_ref);
         }
-
-        let mut bundles_map: HashMap<String, String> = self
-            .manifest_storage
-            .read_manifest("key_package_bundles")?
-            .unwrap_or_default();
-        for hash_ref in &stale {
-            bundles_map.remove(&hex::encode(hash_ref));
-        }
-        self.manifest_storage
-            .write_manifest("key_package_bundles", &bundles_map)?;
+        let stale_hex: Vec<String> = stale.iter().map(hex::encode).collect();
+        self.manifest_storage.delete_bundles(&stale_hex)?;
 
         crate::info_log!(
-            "[KP-RECONCILE] Reconcile complete: cache={} manifest={}",
+            "[KP-RECONCILE] Reconcile complete: cache={} rows={}",
             self.key_package_bundles.len(),
-            bundles_map.len()
+            self.manifest_storage.count_bundles()
         );
 
         Ok(removed_count)
@@ -3617,5 +3844,161 @@ impl MLSContext {
             .as_ref()
             .ok_or_else(|| MLSError::InvalidState("content root key not set".to_string()))?;
         f(key)
+    }
+}
+
+#[cfg(test)]
+mod manifest_bundle_storage_tests {
+    use super::*;
+
+    fn make_storage() -> (ManifestStorage, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, AtomicOrdering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "catbird_mls_manifest_bundle_tests_{}_{}_{}",
+            std::process::id(),
+            id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage =
+            ManifestStorage::new(dir.join("manifest.db"), "test-key-1234567890123456").unwrap();
+        (storage, dir)
+    }
+
+    #[test]
+    fn bundle_rows_round_trip() {
+        let (storage, _dir) = make_storage();
+
+        let rows = vec![
+            ("aa11".to_string(), "YnVuZGxlMQ==".to_string()),
+            ("bb22".to_string(), "YnVuZGxlMg==".to_string()),
+        ];
+        storage.insert_bundles(&rows).unwrap();
+
+        assert_eq!(storage.count_bundles(), 2);
+        assert!(storage.contains_bundle("aa11"));
+        assert!(!storage.contains_bundle("cc33"));
+
+        let mut loaded = storage.load_all_bundles().unwrap();
+        loaded.sort();
+        assert_eq!(loaded, rows);
+
+        let removed = storage.delete_bundles(&["aa11".to_string()]).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(storage.count_bundles(), 1);
+        assert!(!storage.contains_bundle("aa11"));
+
+        // Deleting an absent ref is a no-op, not an error.
+        let removed = storage.delete_bundles(&["zz99".to_string()]).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn legacy_blob_migrates_to_rows_on_open() {
+        let (storage, dir) = make_storage();
+
+        // Seed the legacy monolithic blob format.
+        let mut blob: HashMap<String, String> = HashMap::new();
+        blob.insert("aa11".to_string(), "YnVuZGxlMQ==".to_string());
+        blob.insert("bb22".to_string(), "YnVuZGxlMg==".to_string());
+        storage
+            .write_manifest("key_package_bundles", &blob)
+            .unwrap();
+        drop(storage);
+
+        // Reopen: migration must move blob entries into per-row storage.
+        let reopened =
+            ManifestStorage::new(dir.join("manifest.db"), "test-key-1234567890123456").unwrap();
+
+        let mut rows = reopened.load_all_bundles().unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("aa11".to_string(), "YnVuZGxlMQ==".to_string()),
+                ("bb22".to_string(), "YnVuZGxlMg==".to_string()),
+            ],
+            "blob entries must be migrated into per-row storage"
+        );
+
+        let blob_after: Option<HashMap<String, String>> =
+            reopened.read_manifest("key_package_bundles").unwrap();
+        assert!(
+            blob_after.is_none(),
+            "legacy blob must be deleted after migration"
+        );
+
+        // Migration is idempotent across reopens.
+        drop(reopened);
+        let reopened_again =
+            ManifestStorage::new(dir.join("manifest.db"), "test-key-1234567890123456").unwrap();
+        assert_eq!(reopened_again.count_bundles(), 2);
+    }
+
+    #[test]
+    fn migration_does_not_clobber_existing_rows() {
+        let (storage, dir) = make_storage();
+
+        // A row already exists (e.g. written by the migrated process)...
+        storage
+            .insert_bundles(&[("aa11".to_string(), "bmV3LXJvdw==".to_string())])
+            .unwrap();
+        // ...while a stale blob with the same hash_ref reappears (e.g. written
+        // by a not-yet-updated NSE process).
+        let mut blob: HashMap<String, String> = HashMap::new();
+        blob.insert("aa11".to_string(), "b2xkLWJsb2I=".to_string());
+        storage
+            .write_manifest("key_package_bundles", &blob)
+            .unwrap();
+        drop(storage);
+
+        let reopened =
+            ManifestStorage::new(dir.join("manifest.db"), "test-key-1234567890123456").unwrap();
+        let rows = reopened.load_all_bundles().unwrap();
+        assert_eq!(
+            rows,
+            vec![("aa11".to_string(), "bmV3LXJvdw==".to_string())],
+            "INSERT OR IGNORE migration must keep the newer row over the stale blob entry"
+        );
+    }
+
+    #[test]
+    fn prune_removes_only_expired_bundles() {
+        let (storage, _dir) = make_storage();
+
+        storage
+            .insert_bundles(&[
+                ("old1".to_string(), "YQ==".to_string()),
+                ("new1".to_string(), "Yg==".to_string()),
+            ])
+            .unwrap();
+
+        // Backdate one row past the 90-day lifetime.
+        let backdated = unix_now_secs() - (KEY_PACKAGE_BUNDLE_MAX_AGE_SECS as i64) - 60;
+        storage
+            .conn
+            .execute(
+                "UPDATE mls_key_package_bundles SET created_at = ?1 WHERE hash_ref = 'old1'",
+                [backdated],
+            )
+            .unwrap();
+
+        let pruned = storage
+            .prune_bundles_older_than(KEY_PACKAGE_BUNDLE_MAX_AGE_SECS)
+            .unwrap();
+        assert_eq!(pruned, vec!["old1".to_string()]);
+        assert_eq!(storage.count_bundles(), 1);
+        assert!(storage.contains_bundle("new1"));
+
+        // Fresh rows survive a second prune.
+        let pruned = storage
+            .prune_bundles_older_than(KEY_PACKAGE_BUNDLE_MAX_AGE_SECS)
+            .unwrap();
+        assert!(pruned.is_empty());
     }
 }
