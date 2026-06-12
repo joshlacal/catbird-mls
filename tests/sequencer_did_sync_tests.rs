@@ -185,3 +185,69 @@ async fn sync_parses_persists_and_repersist_sequencer_did_on_change() {
         "changed sequencer_did must re-persist exactly once"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Typed wire contract (real catbird-atproto generated ConvoView)
+// ---------------------------------------------------------------------------
+
+/// The REAL generated jacquard struct (`blue.catbird.mlsChat#convoView` via
+/// `catbird_mls::atproto`) carries `sequencerDid` on the wire after the WS-4
+/// rung-2 lexicon delta. This guards the seam against lexicon/codegen drift:
+/// the typed field must parse from server wire JSON and flow into the
+/// orchestrator's `ConversationView` the way platform mappers map it
+/// (fragment-free base DID string). Parse/persist/log only — no routing.
+#[test]
+fn typed_convo_view_sequencer_did_flows_through() {
+    use catbird_mls::atproto::blue_catbird::mlsChat::ConvoView as TypedConvoView;
+
+    let wire = r#"{
+        "conversationId": "convo-1",
+        "groupId": "abcd",
+        "creator": "did:plc:creatorxyz",
+        "members": [],
+        "epoch": 7,
+        "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+        "createdAt": "2026-06-12T00:00:00.000Z",
+        "sequencerDid": "did:web:ds-b.example"
+    }"#;
+
+    let typed: TypedConvoView<'_> = serde_json::from_str(wire).expect("typed wire parse");
+    assert_eq!(
+        typed.sequencer_did.as_ref().map(|d| d.as_str()),
+        Some("did:web:ds-b.example"),
+        "generated ConvoView must expose sequencerDid as a typed Did field"
+    );
+
+    // Map typed -> orchestrator view as platform api clients do (rung 2).
+    let view = ConversationView {
+        group_id: typed.group_id.to_string(),
+        conversation_id: typed.conversation_id.to_string(),
+        epoch: typed.epoch as u64,
+        members: vec![],
+        metadata: None,
+        created_at: None,
+        updated_at: None,
+        sequencer_did: typed.sequencer_did.as_ref().map(|d| d.as_str().to_string()),
+    };
+    assert_eq!(view.sequencer_did.as_deref(), Some("did:web:ds-b.example"));
+}
+
+/// Back-compat: a pre-rung-2 server response without `sequencerDid` must
+/// still parse into the typed struct with `None`.
+#[test]
+fn typed_convo_view_parses_without_sequencer_did() {
+    use catbird_mls::atproto::blue_catbird::mlsChat::ConvoView as TypedConvoView;
+
+    let wire = r#"{
+        "conversationId": "convo-1",
+        "groupId": "abcd",
+        "creator": "did:plc:creatorxyz",
+        "members": [],
+        "epoch": 7,
+        "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+        "createdAt": "2026-06-12T00:00:00.000Z"
+    }"#;
+
+    let typed: TypedConvoView<'_> = serde_json::from_str(wire).expect("typed wire parse");
+    assert!(typed.sequencer_did.is_none());
+}
