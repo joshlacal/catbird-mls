@@ -90,6 +90,66 @@ fn flatten_decrypt_error_for_ffi(e: MLSError) -> MLSError {
     }
 }
 
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum FfiKeyPackageBindingStatus {
+    Verified,
+    IdentityMismatch,
+    SigningKeyMismatch,
+    SigningKeyUnavailable,
+    Unverifiable,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiKeyPackageBindingClassification {
+    pub status: FfiKeyPackageBindingStatus,
+    pub identity_matches: bool,
+    pub signing_key_matches: Option<bool>,
+    pub expected_root_did: String,
+    pub claimed_identity: Option<String>,
+    pub claimed_root_did: Option<String>,
+    pub signature_public_key: Option<Vec<u8>>,
+    pub signature_algorithm: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum FfiMlsErrorKind {
+    InvalidCommit,
+    WireFormatPolicyViolation,
+    InvalidProposalRef,
+    TlsCodec,
+    CommitProcessingFailed,
+    OpenMls,
+    DecryptionFailed,
+    Other,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiPeerBadErrorClassification {
+    pub peer_bad: bool,
+    pub quarantine_trigger_eligible: bool,
+    pub wrong_epoch: bool,
+    pub reason: String,
+}
+
+fn ffi_error_kind_is_peer_bad(kind: &FfiMlsErrorKind, message: &str) -> bool {
+    match kind {
+        FfiMlsErrorKind::InvalidCommit
+        | FfiMlsErrorKind::WireFormatPolicyViolation
+        | FfiMlsErrorKind::InvalidProposalRef
+        | FfiMlsErrorKind::TlsCodec => true,
+        FfiMlsErrorKind::CommitProcessingFailed | FfiMlsErrorKind::OpenMls => {
+            let m = message.to_lowercase();
+            m.contains("leafnodevalidation")
+                || m.contains("invalidgroupinfo")
+                || m.contains("authenticationfailed")
+                || m.contains("invalidcredential")
+                || m.contains("proposalvalidationerror")
+        }
+        FfiMlsErrorKind::DecryptionFailed | FfiMlsErrorKind::Other => false,
+    }
+}
+
 /// Bucket sizes for traffic-analysis-resistant padding.
 const BUCKET_SIZES: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 
@@ -5845,6 +5905,144 @@ pub fn mls_compute_key_package_hash(key_package_bytes: Vec<u8>) -> Result<Vec<u8
         .map_err(|_| MLSError::OpenMLSError)?
         .as_slice()
         .to_vec())
+}
+
+/// Classify a serialized KeyPackage against an expected DID and, when
+/// available, the DID-resolved set of authorized MLS signing keys.
+#[uniffi::export]
+pub fn mls_classify_key_package_binding(
+    expected_did: String,
+    key_package_bytes: Vec<u8>,
+    authorized_signature_keys: Option<Vec<Vec<u8>>>,
+) -> FfiKeyPackageBindingClassification {
+    let expected_root =
+        crate::orchestrator::credential_binding::credential_root_did(&expected_did).to_string();
+
+    let claimed_identity = match mls_extract_key_package_identity(key_package_bytes.clone()) {
+        Ok(identity) => identity,
+        Err(e) => {
+            return FfiKeyPackageBindingClassification {
+                status: FfiKeyPackageBindingStatus::Unverifiable,
+                identity_matches: false,
+                signing_key_matches: None,
+                expected_root_did: expected_root,
+                claimed_identity: None,
+                claimed_root_did: None,
+                signature_public_key: None,
+                signature_algorithm: None,
+                reason: Some(format!("key package identity extraction failed: {e}")),
+            };
+        }
+    };
+    let claimed_root =
+        crate::orchestrator::credential_binding::credential_root_did(&claimed_identity).to_string();
+    let identity_matches =
+        !claimed_root.is_empty() && claimed_root.eq_ignore_ascii_case(&expected_root);
+
+    let signature_public_key =
+        match mls_extract_key_package_signature_public_key(key_package_bytes.clone()) {
+            Ok(key) => key,
+            Err(e) => {
+                return FfiKeyPackageBindingClassification {
+                    status: FfiKeyPackageBindingStatus::Unverifiable,
+                    identity_matches,
+                    signing_key_matches: None,
+                    expected_root_did: expected_root,
+                    claimed_identity: Some(claimed_identity),
+                    claimed_root_did: Some(claimed_root),
+                    signature_public_key: None,
+                    signature_algorithm: None,
+                    reason: Some(format!("key package signing-key extraction failed: {e}")),
+                };
+            }
+        };
+    let signature_algorithm = mls_extract_key_package_signature_algorithm(key_package_bytes).ok();
+    let signing_key_matches = authorized_signature_keys
+        .as_ref()
+        .map(|keys| keys.iter().any(|key| key.as_slice() == signature_public_key.as_slice()));
+
+    let (status, reason) = if !identity_matches {
+        (
+            FfiKeyPackageBindingStatus::IdentityMismatch,
+            Some(format!(
+                "credential root DID `{claimed_root}` does not match expected DID `{expected_root}`"
+            )),
+        )
+    } else {
+        match signing_key_matches {
+            Some(true) => (FfiKeyPackageBindingStatus::Verified, None),
+            Some(false) => (
+                FfiKeyPackageBindingStatus::SigningKeyMismatch,
+                Some(format!(
+                    "leaf signature key is not authorized for `{expected_root}`"
+                )),
+            ),
+            None => (
+                FfiKeyPackageBindingStatus::SigningKeyUnavailable,
+                Some("authorized signing-key resolution unavailable".to_string()),
+            ),
+        }
+    };
+
+    FfiKeyPackageBindingClassification {
+        status,
+        identity_matches,
+        signing_key_matches,
+        expected_root_did: expected_root,
+        claimed_identity: Some(claimed_identity),
+        claimed_root_did: Some(claimed_root),
+        signature_public_key: Some(signature_public_key),
+        signature_algorithm,
+        reason,
+    }
+}
+
+/// Classify an MLS processing error using the same Layer-3 peer-bad rules the
+/// orchestrator applies before it increments quarantine-trigger counters.
+#[uniffi::export]
+pub fn mls_classify_peer_bad_error(
+    error_kind: FfiMlsErrorKind,
+    error_message: String,
+    local_epoch: Option<u64>,
+    message_epoch: u64,
+) -> FfiPeerBadErrorClassification {
+    if let Some(local) = local_epoch {
+        if local < message_epoch {
+            return FfiPeerBadErrorClassification {
+                peer_bad: false,
+                quarantine_trigger_eligible: false,
+                wrong_epoch: false,
+                reason: format!(
+                    "local epoch {local} is behind message epoch {message_epoch}; catching up"
+                ),
+            };
+        }
+    }
+
+    let wrong_epoch = matches!(
+        error_kind,
+        FfiMlsErrorKind::OpenMls | FfiMlsErrorKind::CommitProcessingFailed
+    ) && error_message.contains("WrongEpoch");
+    if wrong_epoch {
+        return FfiPeerBadErrorClassification {
+            peer_bad: false,
+            quarantine_trigger_eligible: false,
+            wrong_epoch: true,
+            reason: "WrongEpoch is treated as self/catch-up, not peer-bad".to_string(),
+        };
+    }
+
+    let peer_bad = ffi_error_kind_is_peer_bad(&error_kind, &error_message);
+    FfiPeerBadErrorClassification {
+        peer_bad,
+        quarantine_trigger_eligible: peer_bad,
+        wrong_epoch: false,
+        reason: if peer_bad {
+            "error class is eligible for Layer-3 peer-bad quarantine counters".to_string()
+        } else {
+            "error class is not eligible for Layer-3 peer-bad quarantine counters".to_string()
+        },
+    }
 }
 
 /// Extract the credential identity from a serialized KeyPackage
