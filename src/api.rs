@@ -5957,9 +5957,10 @@ pub fn mls_classify_key_package_binding(
             }
         };
     let signature_algorithm = mls_extract_key_package_signature_algorithm(key_package_bytes).ok();
-    let signing_key_matches = authorized_signature_keys
-        .as_ref()
-        .map(|keys| keys.iter().any(|key| key.as_slice() == signature_public_key.as_slice()));
+    let signing_key_matches = authorized_signature_keys.as_ref().map(|keys| {
+        keys.iter()
+            .any(|key| key.as_slice() == signature_public_key.as_slice())
+    });
 
     let (status, reason) = if !identity_matches {
         (

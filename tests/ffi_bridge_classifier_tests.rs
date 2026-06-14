@@ -101,13 +101,11 @@ fn key_package_binding_classifier_reports_identity_mismatch_before_key_mismatch(
     );
     assert!(!classification.identity_matches);
     assert_eq!(classification.signing_key_matches, Some(true));
-    assert!(
-        classification
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("does not match expected DID")
-    );
+    assert!(classification
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("does not match expected DID"));
 }
 
 #[test]
@@ -145,22 +143,14 @@ fn key_package_binding_classifier_reports_unavailable_signing_key_resolution() {
 
 #[test]
 fn peer_bad_error_classifier_matches_orchestrator_epoch_gate() {
-    let peer_bad = mls_classify_peer_bad_error(
-        FfiMlsErrorKind::InvalidCommit,
-        "".to_string(),
-        Some(7),
-        7,
-    );
+    let peer_bad =
+        mls_classify_peer_bad_error(FfiMlsErrorKind::InvalidCommit, "".to_string(), Some(7), 7);
     assert!(peer_bad.peer_bad);
     assert!(peer_bad.quarantine_trigger_eligible);
     assert!(!peer_bad.wrong_epoch);
 
-    let catching_up = mls_classify_peer_bad_error(
-        FfiMlsErrorKind::InvalidCommit,
-        "".to_string(),
-        Some(6),
-        7,
-    );
+    let catching_up =
+        mls_classify_peer_bad_error(FfiMlsErrorKind::InvalidCommit, "".to_string(), Some(6), 7);
     assert!(!catching_up.peer_bad);
     assert!(!catching_up.quarantine_trigger_eligible);
 
