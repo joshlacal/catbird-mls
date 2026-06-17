@@ -363,6 +363,10 @@ pub trait OrchestratorCredentialCallback: Send + Sync {
     fn get_device_uuid(&self, user_did: String) -> Result<Option<String>, OrchestratorBridgeError>;
     fn has_credentials(&self, user_did: String) -> Result<bool, OrchestratorBridgeError>;
     fn clear_all(&self, user_did: String) -> Result<(), OrchestratorBridgeError>;
+    fn get_authorized_device_keys(
+        &self,
+        user_did: String,
+    ) -> Result<Option<Vec<Vec<u8>>>, OrchestratorBridgeError>;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1814,6 +1818,15 @@ impl CredentialStore for CredentialAdapter {
 
     async fn clear_all(&self, user_did: &str) -> crate::orchestrator::Result<()> {
         self.0.clear_all(user_did.to_string()).map_err(bridge_err)
+    }
+
+    async fn get_authorized_device_keys(
+        &self,
+        user_did: &str,
+    ) -> crate::orchestrator::Result<Option<Vec<Vec<u8>>>> {
+        self.0
+            .get_authorized_device_keys(user_did.to_string())
+            .map_err(bridge_err)
     }
 }
 
