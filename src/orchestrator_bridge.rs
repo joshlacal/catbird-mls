@@ -2071,6 +2071,19 @@ impl OrchestratorBridge {
         Ok(message_to_ffi(&msg))
     }
 
+    /// Send a JSON-encoded MLS message payload envelope.
+    pub fn send_payload_json(
+        &self,
+        conversation_id: String,
+        payload_json: String,
+    ) -> Result<FFIMessage, OrchestratorBridgeError> {
+        let msg = crate::async_runtime::block_on(
+            self.inner
+                .send_payload_json(&conversation_id, &payload_json),
+        )?;
+        Ok(message_to_ffi(&msg))
+    }
+
     /// Send an encrypted reaction payload.
     pub fn send_reaction(
         &self,

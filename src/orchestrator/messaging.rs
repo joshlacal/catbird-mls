@@ -42,6 +42,22 @@ where
         .await
     }
 
+    /// Send a pre-encoded MLS message payload JSON envelope.
+    ///
+    /// This lets platform clients keep their existing payload model as the wire
+    /// compatibility boundary while Rust remains authoritative for MLS encrypt,
+    /// send, retry, recovery, and local storage.
+    pub async fn send_payload_json(
+        &self,
+        conversation_id: &str,
+        payload_json: &str,
+    ) -> Result<Message> {
+        let payload = MLSMessagePayload::decode(payload_json.as_bytes()).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("Failed to decode message payload JSON: {e}"))
+        })?;
+        self.send_payload_message(conversation_id, payload).await
+    }
+
     /// Send an encrypted reaction (add or remove emoji) to a message.
     ///
     /// The reaction is encrypted as an MLS application message with
