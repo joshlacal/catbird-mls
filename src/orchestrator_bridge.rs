@@ -347,7 +347,7 @@ pub trait OrchestratorCredentialCallback: Send + Sync {
         key_data: Vec<u8>,
     ) -> Result<(), OrchestratorBridgeError>;
     fn get_signing_key(&self, user_did: String)
-        -> Result<Option<Vec<u8>>, OrchestratorBridgeError>;
+    -> Result<Option<Vec<u8>>, OrchestratorBridgeError>;
     fn delete_signing_key(&self, user_did: String) -> Result<(), OrchestratorBridgeError>;
     fn store_mls_did(
         &self,
@@ -2493,6 +2493,16 @@ impl OrchestratorBridge {
         crate::async_runtime::block_on(self.inner.set_event_observer(observer));
     }
 
+    /// Opt in to returning/storing known non-displayable MLS control payloads
+    /// from `process_incoming`.
+    ///
+    /// Defaults off for source compatibility with existing clients. Catbird iOS
+    /// enables this in Rust-authoritative mode and handles the side effects in
+    /// Swift after Rust has performed the MLS decrypt/process step.
+    pub fn set_store_control_messages(&self, enabled: bool) {
+        self.inner.set_store_control_messages(enabled);
+    }
+
     /// Snapshot of a conversation quarantine state, if any.
     pub fn get_conversation_quarantine_state(
         &self,
@@ -3023,11 +3033,13 @@ mod tests {
             .clear_pending_local_delete("convo-del")
             .await
             .expect("clear_pending_local_delete must forward");
-        assert!(adapter
-            .list_pending_local_deletes()
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            adapter
+                .list_pending_local_deletes()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

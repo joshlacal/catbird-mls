@@ -831,13 +831,22 @@ where
         let (plaintext, payload_json) = match MLSMessagePayload::decode(&decrypt_result.plaintext) {
             Ok(payload) => {
                 if !payload.is_displayable() {
+                    if !(self.store_control_messages() && payload.is_known_control()) {
+                        tracing::debug!(
+                            conversation_id = %envelope.conversation_id,
+                            epoch = decrypt_result.epoch,
+                            message_type = ?payload.message_type,
+                            "Ignoring non-displayable MLS payload"
+                        );
+                        return Ok(None);
+                    }
+
                     tracing::debug!(
                         conversation_id = %envelope.conversation_id,
                         epoch = decrypt_result.epoch,
                         message_type = ?payload.message_type,
-                        "Ignoring non-displayable MLS payload"
+                        "Storing non-displayable MLS control payload"
                     );
-                    return Ok(None);
                 }
 
                 let display_text = payload.display_text();

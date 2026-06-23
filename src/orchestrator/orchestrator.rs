@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::Mutex;
 use web_time::Instant;
 
@@ -128,6 +131,9 @@ where
     /// Positive, negative, AND unsupported results all expire after
     /// `constants::DEVICE_KEY_CACHE_TTL` so revocation propagates.
     device_key_cache: Mutex<HashMap<String, super::credential_binding::DeviceKeyCacheEntry>>,
+    /// Defaults off so existing clients keep dropping non-displayable control
+    /// payloads. Catbird iOS enables this only in Rust-authoritative mode.
+    store_control_messages: AtomicBool,
 }
 
 /// Internal bookkeeping for a staged commit.
@@ -210,6 +216,7 @@ where
             staged_commit_nonce: Mutex::new(0),
             event_observer: Mutex::new(None),
             device_key_cache: Mutex::new(HashMap::new()),
+            store_control_messages: AtomicBool::new(false),
         }
     }
 
@@ -420,6 +427,21 @@ where
     /// Access the configuration.
     pub fn config(&self) -> &OrchestratorConfig {
         &self.config
+    }
+
+    /// Opt in to returning/storing known non-displayable MLS control payloads
+    /// from `process_incoming`.
+    ///
+    /// The default is `false` so existing clients do not accidentally render
+    /// raw control JSON. Catbird iOS enables this in Rust-authoritative mode
+    /// and consumes the payloads for local side effects.
+    pub fn set_store_control_messages(&self, enabled: bool) {
+        self.store_control_messages
+            .store(enabled, Ordering::Relaxed);
+    }
+
+    pub(crate) fn store_control_messages(&self) -> bool {
+        self.store_control_messages.load(Ordering::Relaxed)
     }
 
     /// Access the conversations cache.

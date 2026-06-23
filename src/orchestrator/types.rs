@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
 use serde::{Deserialize, Serialize};
 
 mod base64_bytes {
@@ -782,6 +782,19 @@ impl MLSMessagePayload {
         }
     }
 
+    pub fn is_known_control(&self) -> bool {
+        matches!(
+            self.message_type,
+            MLSMessageType::Reaction
+                | MLSMessageType::ReadReceipt
+                | MLSMessageType::Typing
+                | MLSMessageType::AdminRoster
+                | MLSMessageType::AdminAction
+                | MLSMessageType::DeliveryAck
+                | MLSMessageType::RecoveryRequest
+        )
+    }
+
     /// Extract the display text from a payload, with fallback for raw UTF-8.
     pub fn extract_text(data: &[u8]) -> Option<String> {
         if data.is_empty() {
@@ -978,6 +991,7 @@ mod tests {
         let decoded = MLSMessagePayload::decode(json.as_bytes()).expect("must decode");
         assert_eq!(decoded.message_type, MLSMessageType::DeliveryAck);
         assert!(!decoded.is_displayable());
+        assert!(decoded.is_known_control());
         let ack = decoded.delivery_ack.expect("ack payload present");
         assert_eq!(ack.message_id, "abc-123");
     }
@@ -988,10 +1002,21 @@ mod tests {
         let decoded = MLSMessagePayload::decode(json.as_bytes()).expect("must decode");
         assert_eq!(decoded.message_type, MLSMessageType::RecoveryRequest);
         assert!(!decoded.is_displayable());
+        assert!(decoded.is_known_control());
         let req = decoded.recovery_request.expect("recovery payload present");
         assert_eq!(req.message_id, "msg-1");
         assert_eq!(req.epoch, 42);
         assert_eq!(req.sequence_number, 7);
+    }
+
+    #[test]
+    fn reaction_is_known_control_but_not_displayable() {
+        let payload = MLSMessagePayload::reaction("msg-1", "👍", ReactionAction::Add);
+
+        assert_eq!(payload.message_type, MLSMessageType::Reaction);
+        assert!(!payload.is_displayable());
+        assert!(payload.is_known_control());
+        assert!(payload.display_text().is_empty());
     }
 
     #[test]
@@ -1003,6 +1028,7 @@ mod tests {
         let decoded = MLSMessagePayload::decode(json.as_bytes()).expect("must decode");
         assert_eq!(decoded.message_type, MLSMessageType::Unknown);
         assert!(!decoded.is_displayable());
+        assert!(!decoded.is_known_control());
     }
 
     #[test]
