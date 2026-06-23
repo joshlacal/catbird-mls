@@ -187,6 +187,17 @@ pub struct PendingLocalDelete {
     pub group_id_hex: Option<GroupId>,
 }
 
+/// Result of recording a server reset event into local deferred-recovery state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResetRecordOutcome {
+    /// The reset event was recorded and local deferred-recovery state changed.
+    Recorded,
+    /// The incoming reset generation was already recorded or superseded.
+    StaleOrDuplicate,
+    /// The event targets the group this client already has locally.
+    SelfEchoNoOp,
+}
+
 /// Information about a registered device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceInfo {

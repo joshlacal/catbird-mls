@@ -26,7 +26,7 @@
 mod e2e_harness;
 
 use catbird_mls::orchestrator::{
-    ConversationState, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
+    ConversationState, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, ResetRecordOutcome,
 };
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use std::sync::Arc;
@@ -120,6 +120,94 @@ async fn test_record_reset_requested_idempotent_on_same_generation() {
         1,
         "idempotent second call must NOT issue another mark_reset_pending storage write"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_record_group_reset_with_outcome_distinguishes_recorded_stale_and_self_echo() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let self_echo_convo = alice
+        .orchestrator
+        .create_group("GroupReset Outcome Self Echo Test", None, None)
+        .await
+        .expect("create_group failed");
+    let self_echo_group =
+        hex::decode(&self_echo_convo.group_id).expect("created group id must be valid hex");
+
+    let self_echo = alice
+        .orchestrator
+        .record_group_reset_with_outcome(&self_echo_convo.conversation_id, self_echo_group, 10)
+        .await
+        .expect("self-echo record_group_reset_with_outcome should not fail");
+    assert_eq!(self_echo, ResetRecordOutcome::SelfEchoNoOp);
+
+    let recorded_convo = alice
+        .orchestrator
+        .create_group("GroupReset Outcome Recorded Test", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = recorded_convo.conversation_id.clone();
+    let new_group = vec![0x32; 32];
+
+    let recorded = alice
+        .orchestrator
+        .record_group_reset_with_outcome(&convo_id, new_group, 11)
+        .await
+        .expect("fresh record_group_reset_with_outcome should record");
+    assert_eq!(recorded, ResetRecordOutcome::Recorded);
+
+    let stale = alice
+        .orchestrator
+        .record_group_reset_with_outcome(&convo_id, vec![0x33; 32], 10)
+        .await
+        .expect("stale record_group_reset_with_outcome should not fail");
+    assert_eq!(stale, ResetRecordOutcome::StaleOrDuplicate);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_record_reset_requested_with_outcome_distinguishes_recorded_and_stale() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("ResetRequested Outcome Test", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    let recorded = alice
+        .orchestrator
+        .record_reset_requested_with_outcome(
+            &convo_id,
+            "crypto-session-outcome",
+            21,
+            "inlineGroupInfo404",
+            "req-inline-404:outcome:21",
+            None,
+        )
+        .await
+        .expect("fresh record_reset_requested_with_outcome should record");
+    assert_eq!(recorded, ResetRecordOutcome::Recorded);
+
+    let stale = alice
+        .orchestrator
+        .record_reset_requested_with_outcome(
+            &convo_id,
+            "crypto-session-outcome",
+            20,
+            "inlineGroupInfo404",
+            "req-inline-404:outcome:20",
+            None,
+        )
+        .await
+        .expect("stale record_reset_requested_with_outcome should not fail");
+    assert_eq!(stale, ResetRecordOutcome::StaleOrDuplicate);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -2227,6 +2227,17 @@ where
         new_group_id: Vec<u8>,
         reset_generation: i32,
     ) -> Result<()> {
+        self.record_group_reset_with_outcome(convo_id, new_group_id, reset_generation)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_group_reset_with_outcome(
+        &self,
+        convo_id: &str,
+        new_group_id: Vec<u8>,
+        reset_generation: i32,
+    ) -> Result<ResetRecordOutcome> {
         self.check_shutdown().await?;
         let new_group_id_hex = hex::encode(&new_group_id);
         tracing::info!(
@@ -2245,7 +2256,7 @@ where
                 reset_generation,
                 "GroupResetEvent: target already matches an existing local group, self-echo no-op"
             );
-            return Ok(());
+            return Ok(ResetRecordOutcome::SelfEchoNoOp);
         }
         if let Some(existing) = self.reset_pending_payload(convo_id).await {
             if existing.reset_generation >= reset_generation {
@@ -2257,7 +2268,7 @@ where
                     incoming_new_group_id = %new_group_id_hex,
                     "GroupResetEvent: stale or duplicate generation, no-op"
                 );
-                return Ok(());
+                return Ok(ResetRecordOutcome::StaleOrDuplicate);
             }
             tracing::info!(
                 convo_id,
@@ -2267,7 +2278,8 @@ where
             );
         }
         self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation)
-            .await
+            .await?;
+        Ok(ResetRecordOutcome::Recorded)
     }
 
     /// Phase 2.5 (`docs/plans/phase-2-5-indirect-funneling.md` §3, §5 Stage 1):
@@ -2341,6 +2353,27 @@ where
         request_event_id: &str,
         expected_new_mls_group_id: Option<String>,
     ) -> Result<()> {
+        self.record_reset_requested_with_outcome(
+            convo_id,
+            crypto_session_id,
+            reset_generation,
+            trigger,
+            request_event_id,
+            expected_new_mls_group_id,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn record_reset_requested_with_outcome(
+        &self,
+        convo_id: &str,
+        crypto_session_id: &str,
+        reset_generation: i32,
+        trigger: &str,
+        request_event_id: &str,
+        expected_new_mls_group_id: Option<String>,
+    ) -> Result<ResetRecordOutcome> {
         self.check_shutdown().await?;
 
         // Idempotency/stale check: if we're already in ResetPending at this
@@ -2358,7 +2391,7 @@ where
                     existing_new_group_id = %existing.new_group_id,
                     "resetRequestedEvent: stale or duplicate generation, no-op"
                 );
-                return Ok(());
+                return Ok(ResetRecordOutcome::StaleOrDuplicate);
             }
             tracing::info!(
                 convo_id,
@@ -2415,11 +2448,12 @@ where
                 new_group_id = %new_group_id_hex,
                 "resetRequestedEvent: target already matches an existing local group, self-echo no-op"
             );
-            return Ok(());
+            return Ok(ResetRecordOutcome::SelfEchoNoOp);
         }
 
         self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation)
-            .await
+            .await?;
+        Ok(ResetRecordOutcome::Recorded)
     }
 
     /// Internal helper shared by `record_group_reset` (legacy direct path) and

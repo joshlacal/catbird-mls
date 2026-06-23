@@ -12,7 +12,8 @@ use crate::orchestrator::{
     IncomingEnvelope, JoinMethod, KeyPackageRef, KeyPackageStats, KeyPackageSyncResult,
     MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView, Message,
     OrchestratorConfig, OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff,
-    PersistedRecoveryState, ProcessExternalCommitResult, SendMessageResponse, SyncCursor,
+    PersistedRecoveryState, ProcessExternalCommitResult, ResetRecordOutcome, SendMessageResponse,
+    SyncCursor,
 };
 
 use crate::api::MLSContext;
@@ -845,6 +846,23 @@ pub enum FFIConversationRecoveryState {
     Recovering,
     UnrecoverableLocal,
     ResetPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FFIResetRecordOutcome {
+    Recorded,
+    StaleOrDuplicate,
+    SelfEchoNoOp,
+}
+
+impl From<ResetRecordOutcome> for FFIResetRecordOutcome {
+    fn from(value: ResetRecordOutcome) -> Self {
+        match value {
+            ResetRecordOutcome::Recorded => FFIResetRecordOutcome::Recorded,
+            ResetRecordOutcome::StaleOrDuplicate => FFIResetRecordOutcome::StaleOrDuplicate,
+            ResetRecordOutcome::SelfEchoNoOp => FFIResetRecordOutcome::SelfEchoNoOp,
+        }
+    }
 }
 
 fn project_conversation_recovery_state(
@@ -2433,6 +2451,27 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Outcome-returning variant of `record_group_reset` for platforms that
+    /// need to distinguish recorded resets from stale/self-echo no-ops before
+    /// triggering UI notifications or sync work.
+    pub fn record_group_reset_outcome(
+        &self,
+        convo_id: String,
+        new_group_id_hex: String,
+        reset_generation: i32,
+    ) -> Result<FFIResetRecordOutcome, OrchestratorBridgeError> {
+        let new_group_id =
+            hex::decode(&new_group_id_hex).map_err(|e| OrchestratorBridgeError::InvalidInput {
+                message: format!("new_group_id_hex is not valid hex: {e}"),
+            })?;
+        let outcome = crate::async_runtime::block_on(self.inner.record_group_reset_with_outcome(
+            &convo_id,
+            new_group_id,
+            reset_generation,
+        ))?;
+        Ok(outcome.into())
+    }
+
     /// Persist a Phase 2.5 `resetRequestedEvent` from the DS — the indirect-
     /// trigger SSE event where the server has NOT minted a new MLS group id
     /// and is asking subscribed clients to elect a first responder
@@ -2498,6 +2537,41 @@ impl OrchestratorBridge {
             expected_new_mls_group_id_hex,
         ))?;
         Ok(())
+    }
+
+    /// Outcome-returning variant of `record_reset_requested` for platforms
+    /// that need to avoid follow-up sync/UI churn when Rust classified the
+    /// event as stale or self-echo.
+    pub fn record_reset_requested_outcome(
+        &self,
+        convo_id: String,
+        crypto_session_id: String,
+        reset_generation: i32,
+        trigger: String,
+        request_event_id: String,
+        expected_new_mls_group_id_hex: Option<String>,
+    ) -> Result<FFIResetRecordOutcome, OrchestratorBridgeError> {
+        // Validate hex up-front when present so a malformed id surfaces as
+        // `InvalidInput` rather than silently round-tripping into storage.
+        if let Some(ref hex_id) = expected_new_mls_group_id_hex {
+            if !hex_id.is_empty() {
+                if let Err(e) = hex::decode(hex_id) {
+                    return Err(OrchestratorBridgeError::InvalidInput {
+                        message: format!("expected_new_mls_group_id_hex is not valid hex: {e}"),
+                    });
+                }
+            }
+        }
+        let outcome =
+            crate::async_runtime::block_on(self.inner.record_reset_requested_with_outcome(
+                &convo_id,
+                &crypto_session_id,
+                reset_generation,
+                &trigger,
+                &request_event_id,
+                expected_new_mls_group_id_hex,
+            ))?;
+        Ok(outcome.into())
     }
 
     /// Return the RFC 9420 §8.7 `epoch_authenticator` for a group's current
