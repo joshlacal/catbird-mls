@@ -348,7 +348,7 @@ pub trait OrchestratorCredentialCallback: Send + Sync {
         key_data: Vec<u8>,
     ) -> Result<(), OrchestratorBridgeError>;
     fn get_signing_key(&self, user_did: String)
-    -> Result<Option<Vec<u8>>, OrchestratorBridgeError>;
+        -> Result<Option<Vec<u8>>, OrchestratorBridgeError>;
     fn delete_signing_key(&self, user_did: String) -> Result<(), OrchestratorBridgeError>;
     fn store_mls_did(
         &self,
@@ -848,6 +848,12 @@ pub enum FFIConversationRecoveryState {
     ResetPending,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FFIJoinOrRejoinResult {
+    pub epoch: u64,
+    pub recovery_state: FFIConversationRecoveryState,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FFIResetRecordOutcome {
     Recorded,
@@ -877,6 +883,43 @@ fn project_conversation_recovery_state(
         Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
             FFIConversationRecoveryState::UnrecoverableLocal
         }
+    }
+}
+
+async fn project_conversation_recovery_state_for(
+    inner: &ConcreteOrchestrator,
+    conversation_id: &str,
+) -> FFIConversationRecoveryState {
+    let state = inner
+        .conversation_states()
+        .lock()
+        .await
+        .get(conversation_id)
+        .cloned();
+    let projected = project_conversation_recovery_state(state.as_ref());
+
+    if projected != FFIConversationRecoveryState::Healthy {
+        return projected;
+    }
+
+    let group_id = inner
+        .group_states()
+        .lock()
+        .await
+        .values()
+        .find(|group| group.conversation_id == conversation_id)
+        .map(|group| group.group_id.clone());
+
+    let Some(group_id) = group_id else {
+        return projected;
+    };
+    let Ok(group_id_bytes) = hex::decode(&group_id) else {
+        return projected;
+    };
+
+    match inner.mls_context().get_epoch(group_id_bytes) {
+        Ok(_) => projected,
+        Err(_) => FFIConversationRecoveryState::GroupMissing,
     }
 }
 
@@ -2330,6 +2373,27 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Join or rejoin one conversation through the normal Rust recovery path.
+    ///
+    /// Unlike `perform_silent_recovery`, this does not delete or re-register
+    /// the device. It delegates to `MLSOrchestrator::join_or_rejoin`, preserving
+    /// the Welcome-first and ResetPending-bootstrap-before-External-Commit
+    /// ordering used by sync and incoming-message recovery.
+    pub fn join_or_rejoin(
+        &self,
+        convo_id: String,
+    ) -> Result<FFIJoinOrRejoinResult, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(async {
+            let epoch = self.inner.join_or_rejoin(&convo_id).await?;
+            let recovery_state =
+                project_conversation_recovery_state_for(&self.inner, &convo_id).await;
+            Ok(FFIJoinOrRejoinResult {
+                epoch,
+                recovery_state,
+            })
+        })
+    }
+
     /// Project the orchestrator's current conversation recovery state into the
     /// Swift `ConversationRecoveryState` vocabulary.
     ///
@@ -2341,41 +2405,9 @@ impl OrchestratorBridge {
         &self,
         conversation_id: String,
     ) -> Result<FFIConversationRecoveryState, OrchestratorBridgeError> {
-        crate::async_runtime::block_on(async {
-            let state = self
-                .inner
-                .conversation_states()
-                .lock()
-                .await
-                .get(&conversation_id)
-                .cloned();
-            let projected = project_conversation_recovery_state(state.as_ref());
-
-            if projected != FFIConversationRecoveryState::Healthy {
-                return Ok(projected);
-            }
-
-            let group_id = self
-                .inner
-                .group_states()
-                .lock()
-                .await
-                .values()
-                .find(|group| group.conversation_id == conversation_id)
-                .map(|group| group.group_id.clone());
-
-            let Some(group_id) = group_id else {
-                return Ok(projected);
-            };
-            let Ok(group_id_bytes) = hex::decode(&group_id) else {
-                return Ok(projected);
-            };
-
-            match self.inner.mls_context().get_epoch(group_id_bytes) {
-                Ok(_) => Ok(projected),
-                Err(_) => Ok(FFIConversationRecoveryState::GroupMissing),
-            }
-        })
+        Ok(crate::async_runtime::block_on(
+            project_conversation_recovery_state_for(&self.inner, &conversation_id),
+        ))
     }
 
     /// Handle a server-initiated group reset (`GroupResetEvent` delivered via
@@ -2698,6 +2730,8 @@ pub fn ffi_decode_opus_to_pcm(opus_data: Vec<u8>) -> Result<Vec<u8>, Orchestrato
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     // ── Event callback: WS-5.2 escalation must reach the platform ─────────
@@ -3060,6 +3094,348 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RecordingKeychain {
+        entries: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::keychain::KeychainAccess for RecordingKeychain {
+        async fn read(&self, key: String) -> Result<Option<Vec<u8>>, crate::MLSError> {
+            Ok(self.entries.lock().unwrap().get(&key).cloned())
+        }
+
+        async fn write(&self, key: String, value: Vec<u8>) -> Result<(), crate::MLSError> {
+            self.entries.lock().unwrap().insert(key, value);
+            Ok(())
+        }
+
+        async fn delete(&self, key: String) -> Result<(), crate::MLSError> {
+            self.entries.lock().unwrap().remove(&key);
+            Ok(())
+        }
+    }
+
+    struct WelcomeCountingApiCallback {
+        current_did: String,
+        welcome_calls: Arc<AtomicUsize>,
+    }
+
+    impl WelcomeCountingApiCallback {
+        fn new(current_did: &str, welcome_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                current_did: current_did.to_string(),
+                welcome_calls,
+            }
+        }
+    }
+
+    impl OrchestratorAPICallback for WelcomeCountingApiCallback {
+        fn is_authenticated_as(&self, did: String) -> bool {
+            did == self.current_did
+        }
+
+        fn current_did(&self) -> Option<String> {
+            Some(self.current_did.clone())
+        }
+
+        fn get_conversations(
+            &self,
+            _limit: u32,
+            _cursor: Option<String>,
+        ) -> Result<FFIConversationListPage, OrchestratorBridgeError> {
+            Ok(FFIConversationListPage {
+                conversations: vec![],
+                cursor: None,
+            })
+        }
+
+        fn create_conversation(
+            &self,
+            _group_id: String,
+            _initial_members: Option<Vec<String>>,
+            _metadata_name: Option<String>,
+            _metadata_description: Option<String>,
+            _commit_data: Option<Vec<u8>>,
+            _welcome_data: Option<Vec<u8>>,
+        ) -> Result<FFICreateConversationResult, OrchestratorBridgeError> {
+            Err(OrchestratorBridgeError::Api {
+                message: "not used by bridge joinOrRejoin test".to_string(),
+            })
+        }
+
+        fn leave_conversation(&self, _convo_id: String) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+
+        fn add_members(
+            &self,
+            _convo_id: String,
+            _member_dids: Vec<String>,
+            _commit_data: Vec<u8>,
+            _welcome_data: Option<Vec<u8>>,
+        ) -> Result<FFIAddMembersResult, OrchestratorBridgeError> {
+            Err(OrchestratorBridgeError::Api {
+                message: "not used by bridge joinOrRejoin test".to_string(),
+            })
+        }
+
+        fn remove_members(
+            &self,
+            _convo_id: String,
+            _member_dids: Vec<String>,
+            _commit_data: Vec<u8>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+
+        fn send_message(
+            &self,
+            _convo_id: String,
+            _ciphertext: Vec<u8>,
+            _epoch: u64,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+
+        fn get_messages(
+            &self,
+            _convo_id: String,
+            _cursor: Option<String>,
+            _limit: u32,
+            _message_type: Option<String>,
+            _from_epoch: Option<u32>,
+            _to_epoch: Option<u32>,
+        ) -> Result<FFIMessagesPage, OrchestratorBridgeError> {
+            Ok(FFIMessagesPage {
+                envelopes: vec![],
+                cursor: None,
+            })
+        }
+
+        fn publish_key_package(
+            &self,
+            _key_package: Vec<u8>,
+            _cipher_suite: String,
+            _expires_at: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+
+        fn get_key_packages(
+            &self,
+            _dids: Vec<String>,
+        ) -> Result<Vec<FFIKeyPackageRef>, OrchestratorBridgeError> {
+            Ok(vec![])
+        }
+
+        fn get_key_package_stats(&self) -> Result<FFIKeyPackageStats, OrchestratorBridgeError> {
+            Ok(FFIKeyPackageStats {
+                available: 0,
+                total: 0,
+            })
+        }
+
+        fn sync_key_packages(
+            &self,
+            _local_hashes: Vec<String>,
+            _device_id: String,
+        ) -> Result<FFIKeyPackageSyncResult, OrchestratorBridgeError> {
+            Ok(FFIKeyPackageSyncResult {
+                orphaned_count: 0,
+                deleted_count: 0,
+            })
+        }
+
+        fn register_device(
+            &self,
+            _device_uuid: String,
+            _device_name: String,
+            _mls_did: String,
+            _signature_key: Vec<u8>,
+            _key_packages: Vec<Vec<u8>>,
+        ) -> Result<FFIDeviceInfo, OrchestratorBridgeError> {
+            Err(OrchestratorBridgeError::Api {
+                message: "not used by bridge joinOrRejoin test".to_string(),
+            })
+        }
+
+        fn list_devices(&self) -> Result<Vec<FFIDeviceInfo>, OrchestratorBridgeError> {
+            Ok(vec![])
+        }
+
+        fn remove_device(&self, _device_id: String) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+
+        fn publish_group_info(
+            &self,
+            _convo_id: String,
+            _group_info: Vec<u8>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+
+        fn get_group_info(&self, _convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError> {
+            Err(OrchestratorBridgeError::ServerError {
+                status: 503,
+                body: "bridge joinOrRejoin test stopped at GroupInfo".to_string(),
+            })
+        }
+
+        fn get_welcome(&self, _convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError> {
+            self.welcome_calls.fetch_add(1, Ordering::SeqCst);
+            Err(OrchestratorBridgeError::ServerError {
+                status: 503,
+                body: "bridge joinOrRejoin test Welcome probe".to_string(),
+            })
+        }
+
+        fn process_external_commit(
+            &self,
+            _convo_id: String,
+            _commit_data: Vec<u8>,
+            _group_info: Option<Vec<u8>>,
+            _confirmation_tag: Option<String>,
+        ) -> Result<FFIProcessExternalCommitResult, OrchestratorBridgeError> {
+            Err(OrchestratorBridgeError::Api {
+                message: "not used by bridge joinOrRejoin test".to_string(),
+            })
+        }
+
+        fn report_recovery_failure(
+            &self,
+            _convo_id: String,
+            _failure_type: String,
+            _epoch_authenticator: Option<String>,
+            _failure_mode: Option<String>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCredentialCallback {
+        signing_keys: Mutex<HashMap<String, Vec<u8>>>,
+        mls_dids: Mutex<HashMap<String, String>>,
+        device_uuids: Mutex<HashMap<String, String>>,
+    }
+
+    impl OrchestratorCredentialCallback for RecordingCredentialCallback {
+        fn store_signing_key(
+            &self,
+            user_did: String,
+            key_data: Vec<u8>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            self.signing_keys.lock().unwrap().insert(user_did, key_data);
+            Ok(())
+        }
+
+        fn get_signing_key(
+            &self,
+            user_did: String,
+        ) -> Result<Option<Vec<u8>>, OrchestratorBridgeError> {
+            Ok(self.signing_keys.lock().unwrap().get(&user_did).cloned())
+        }
+
+        fn delete_signing_key(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
+            self.signing_keys.lock().unwrap().remove(&user_did);
+            Ok(())
+        }
+
+        fn store_mls_did(
+            &self,
+            user_did: String,
+            mls_did: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            self.mls_dids.lock().unwrap().insert(user_did, mls_did);
+            Ok(())
+        }
+
+        fn get_mls_did(&self, user_did: String) -> Result<Option<String>, OrchestratorBridgeError> {
+            Ok(self.mls_dids.lock().unwrap().get(&user_did).cloned())
+        }
+
+        fn store_device_uuid(
+            &self,
+            user_did: String,
+            uuid: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            self.device_uuids.lock().unwrap().insert(user_did, uuid);
+            Ok(())
+        }
+
+        fn get_device_uuid(
+            &self,
+            user_did: String,
+        ) -> Result<Option<String>, OrchestratorBridgeError> {
+            Ok(self.device_uuids.lock().unwrap().get(&user_did).cloned())
+        }
+
+        fn has_credentials(&self, user_did: String) -> Result<bool, OrchestratorBridgeError> {
+            Ok(self.mls_dids.lock().unwrap().contains_key(&user_did)
+                && self.device_uuids.lock().unwrap().contains_key(&user_did))
+        }
+
+        fn clear_all(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
+            self.signing_keys.lock().unwrap().remove(&user_did);
+            self.mls_dids.lock().unwrap().remove(&user_did);
+            self.device_uuids.lock().unwrap().remove(&user_did);
+            Ok(())
+        }
+
+        fn get_authorized_device_keys(
+            &self,
+            _user_did: String,
+        ) -> Result<Option<Vec<Vec<u8>>>, OrchestratorBridgeError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn orchestrator_bridge_join_or_rejoin_reaches_rust_recovery_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bridge-join-or-rejoin.sqlite");
+        let mls_context = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            "bridge-join-or-rejoin-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let welcome_calls = Arc::new(AtomicUsize::new(0));
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                welcome_calls.clone(),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        );
+
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("bridge initialize");
+        let result = bridge.join_or_rejoin("convo-bridge-probe".to_string());
+
+        assert!(result.is_err(), "stubbed GroupInfo should stop recovery");
+        assert_eq!(
+            welcome_calls.load(Ordering::SeqCst),
+            1,
+            "OrchestratorBridge.joinOrRejoin must call MLSOrchestrator::join_or_rejoin, whose first step probes Welcome"
+        );
+    }
+
     #[test]
     fn conversation_recovery_projection_matches_swift_vocabulary() {
         assert_eq!(
@@ -3168,13 +3544,11 @@ mod tests {
             .clear_pending_local_delete("convo-del")
             .await
             .expect("clear_pending_local_delete must forward");
-        assert!(
-            adapter
-                .list_pending_local_deletes()
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(adapter
+            .list_pending_local_deletes()
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
