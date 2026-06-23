@@ -238,6 +238,84 @@ async fn test_record_group_reset_ignores_stale_lower_generation() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_record_group_reset_ignores_self_echo_existing_group() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Self Echo GroupReset Test", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+    let current_group_id = convo.group_id.clone();
+    let current_group = hex::decode(&current_group_id).expect("created group id must be valid hex");
+
+    alice
+        .orchestrator
+        .record_group_reset(&convo_id, current_group, 10)
+        .await
+        .expect("self-echo record_group_reset should be ignored");
+
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&convo_id)
+            .is_none(),
+        "self-echo reset target matching an existing local group must not persist RESET_PENDING"
+    );
+    assert_eq!(
+        alice.storage.mark_reset_pending_call_count(&convo_id),
+        0,
+        "self-echo reset target matching an existing local group must not write mark_reset_pending"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_record_reset_requested_ignores_self_echo_expected_group() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Self Echo ResetRequested Test", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+    let current_group_id = convo.group_id.clone();
+
+    alice
+        .orchestrator
+        .record_reset_requested(
+            &convo_id,
+            "crypto-session-self-echo",
+            10,
+            "adminRequest",
+            "req-admin:self-echo",
+            Some(current_group_id),
+        )
+        .await
+        .expect("self-echo record_reset_requested should be ignored");
+
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&convo_id)
+            .is_none(),
+        "self-echo expected group matching an existing local group must not persist RESET_PENDING"
+    );
+    assert_eq!(
+        alice.storage.mark_reset_pending_call_count(&convo_id),
+        0,
+        "self-echo expected group matching an existing local group must not write mark_reset_pending"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. None group_id path: client mints a fresh candidate.
 // ---------------------------------------------------------------------------

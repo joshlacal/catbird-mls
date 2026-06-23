@@ -2235,6 +2235,18 @@ where
             reset_generation,
             "Recording server-initiated GroupReset (deferred adoption)"
         );
+        if self
+            .reset_target_is_current_existing_group(convo_id, &new_group_id_hex)
+            .await
+        {
+            tracing::info!(
+                convo_id,
+                new_group_id = %new_group_id_hex,
+                reset_generation,
+                "GroupResetEvent: target already matches an existing local group, self-echo no-op"
+            );
+            return Ok(());
+        }
         if let Some(existing) = self.reset_pending_payload(convo_id).await {
             if existing.reset_generation >= reset_generation {
                 tracing::info!(
@@ -2389,6 +2401,22 @@ where
                 minted
             }
         };
+
+        if self
+            .reset_target_is_current_existing_group(convo_id, &new_group_id_hex)
+            .await
+        {
+            tracing::info!(
+                convo_id,
+                crypto_session_id,
+                reset_generation,
+                trigger,
+                request_event_id,
+                new_group_id = %new_group_id_hex,
+                "resetRequestedEvent: target already matches an existing local group, self-echo no-op"
+            );
+            return Ok(());
+        }
 
         self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation)
             .await
@@ -2554,6 +2582,20 @@ where
         self.mark_needs_rejoin_critical(convo_id).await;
 
         Ok(())
+    }
+
+    async fn reset_target_is_current_existing_group(
+        &self,
+        convo_id: &str,
+        new_group_id_hex: &str,
+    ) -> bool {
+        let Some(current_group_id_bytes) = self.group_id_bytes_for_conversation(convo_id).await
+        else {
+            return false;
+        };
+        let current_group_id_hex = hex::encode(&current_group_id_bytes);
+        current_group_id_hex.eq_ignore_ascii_case(new_group_id_hex)
+            && self.mls_context().group_exists(current_group_id_bytes)
     }
 
     /// Handle a server-initiated group reset (spec §8.5 Phase 1 / §8.6).

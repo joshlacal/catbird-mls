@@ -87,6 +87,15 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError>;
 
+    /// Return true when the MLS group exists in local crypto storage.
+    ///
+    /// Defaulting to `get_epoch` keeps existing platform implementors
+    /// source-compatible while still giving the orchestrator a portable
+    /// existence probe for reset-event self-echo guards.
+    fn group_exists(&self, group_id: Vec<u8>) -> bool {
+        self.get_epoch(group_id).is_ok()
+    }
+
     fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
 
     /// Return the RFC 9420 §8.7 `epoch_authenticator` for the group's current

@@ -6269,6 +6269,10 @@ impl MlsCryptoContext for MLSContext {
         self.get_epoch(group_id)
     }
 
+    fn group_exists(&self, group_id: Vec<u8>) -> bool {
+        MLSContext::group_exists(self, group_id)
+    }
+
     fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         self.get_confirmation_tag(group_id)
     }
