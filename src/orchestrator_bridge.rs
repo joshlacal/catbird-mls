@@ -1016,6 +1016,18 @@ fn message_to_ffi(msg: &Message) -> FFIMessage {
     }
 }
 
+fn ffi_reaction_action(
+    action: &str,
+) -> Result<crate::orchestrator::types::ReactionAction, OrchestratorBridgeError> {
+    match action {
+        "add" => Ok(crate::orchestrator::types::ReactionAction::Add),
+        "remove" => Ok(crate::orchestrator::types::ReactionAction::Remove),
+        other => Err(OrchestratorBridgeError::InvalidInput {
+            message: format!("Unsupported reaction action: {other}"),
+        }),
+    }
+}
+
 fn ffi_to_delivery_status(ffi: &FFIDeliveryStatus) -> crate::orchestrator::types::DeliveryStatus {
     use crate::orchestrator::types::DeliveryStatus;
     match ffi {
@@ -2059,6 +2071,24 @@ impl OrchestratorBridge {
         Ok(message_to_ffi(&msg))
     }
 
+    /// Send an encrypted reaction payload.
+    pub fn send_reaction(
+        &self,
+        conversation_id: String,
+        message_id: String,
+        emoji: String,
+        action: String,
+    ) -> Result<FFIMessage, OrchestratorBridgeError> {
+        let action = ffi_reaction_action(&action)?;
+        let msg = crate::async_runtime::block_on(self.inner.send_reaction(
+            &conversation_id,
+            &message_id,
+            &emoji,
+            action,
+        ))?;
+        Ok(message_to_ffi(&msg))
+    }
+
     /// Encode PCM audio to Opus, extract waveform, encrypt blob.
     /// Returns the encrypted data + metadata needed to upload and send.
     pub fn prepare_voice_message(
@@ -2674,6 +2704,24 @@ mod tests {
                 "disk full".to_string()
             )],
             "EventCallbackAdapter must forward WS-5.2 escalations across the bridge"
+        );
+    }
+
+    #[test]
+    fn ffi_reaction_action_accepts_only_supported_wire_values() {
+        assert_eq!(
+            ffi_reaction_action("add").unwrap(),
+            crate::orchestrator::types::ReactionAction::Add
+        );
+        assert_eq!(
+            ffi_reaction_action("remove").unwrap(),
+            crate::orchestrator::types::ReactionAction::Remove
+        );
+
+        let err = ffi_reaction_action("toggle").unwrap_err();
+        assert!(
+            matches!(err, OrchestratorBridgeError::InvalidInput { .. }),
+            "unexpected error: {err:?}"
         );
     }
 
