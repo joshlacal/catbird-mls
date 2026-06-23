@@ -79,6 +79,11 @@ browser = []
 echo-bot = ["reqwest", "clap", "tracing-subscriber"]
 # Fork resolution via OpenMLS 0.8.1+ recover_fork_by_readding API.
 fork-resolution = []
+# Disabled-by-default prototype for letting host platforms provide the OpenMLS
+# key-value storage driver over UniFFI. Production native clients continue to
+# use openmls_sqlite_storage + HybridStorageProvider unless this feature is
+# explicitly enabled for fixture work.
+storage-driver-prototype = []
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 openmls_sqlite_storage = { version = "0.2", features = ["extensions-draft-08"] }

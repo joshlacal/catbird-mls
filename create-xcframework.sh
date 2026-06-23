@@ -6,6 +6,11 @@ echo "📦 Building CatbirdMLS with UniFFI for iOS"
 echo "========================================"
 echo ""
 
+# Keep Cargo from falling back to iOS 10/macOS 10 era link targets when
+# compiling C dependencies for the XCFramework.
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
+
 # Clean previous builds
 rm -rf CatbirdMLSFFI.xcframework
 rm -rf build/frameworks

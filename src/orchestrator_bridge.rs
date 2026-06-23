@@ -833,6 +833,35 @@ pub enum OrchestratorBridgeError {
     ConversationQuarantined { convo_id: String, reason: String },
 }
 
+// FFI projection of Rust's internal `ConversationState` into the Swift
+// `ConversationRecoveryState` vocabulary. This is additive: callers that do
+// not opt into the orchestrator authority path can ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FFIConversationRecoveryState {
+    Healthy,
+    EpochBehind,
+    GroupMissing,
+    NeedsRejoin,
+    Recovering,
+    UnrecoverableLocal,
+    ResetPending,
+}
+
+fn project_conversation_recovery_state(
+    state: Option<&ConversationState>,
+) -> FFIConversationRecoveryState {
+    match state {
+        None | Some(ConversationState::Active) => FFIConversationRecoveryState::Healthy,
+        Some(ConversationState::Initializing) => FFIConversationRecoveryState::Recovering,
+        Some(ConversationState::ForkDetected) => FFIConversationRecoveryState::EpochBehind,
+        Some(ConversationState::NeedsRejoin) => FFIConversationRecoveryState::NeedsRejoin,
+        Some(ConversationState::ResetPending { .. }) => FFIConversationRecoveryState::ResetPending,
+        Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
+            FFIConversationRecoveryState::UnrecoverableLocal
+        }
+    }
+}
+
 impl From<OrchestratorError> for OrchestratorBridgeError {
     fn from(e: OrchestratorError) -> Self {
         match e {
@@ -2240,6 +2269,54 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Project the orchestrator's current conversation recovery state into the
+    /// Swift `ConversationRecoveryState` vocabulary.
+    ///
+    /// Unknown conversations default to `Healthy` so adding this method does not
+    /// change behavior for clients that have not opted into Rust authority. When
+    /// Rust has a cached group state but the low-level MLS context no longer has
+    /// matching local group state, the projection reports `GroupMissing`.
+    pub fn get_conversation_recovery_state(
+        &self,
+        conversation_id: String,
+    ) -> Result<FFIConversationRecoveryState, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(async {
+            let state = self
+                .inner
+                .conversation_states()
+                .lock()
+                .await
+                .get(&conversation_id)
+                .cloned();
+            let projected = project_conversation_recovery_state(state.as_ref());
+
+            if projected != FFIConversationRecoveryState::Healthy {
+                return Ok(projected);
+            }
+
+            let group_id = self
+                .inner
+                .group_states()
+                .lock()
+                .await
+                .values()
+                .find(|group| group.conversation_id == conversation_id)
+                .map(|group| group.group_id.clone());
+
+            let Some(group_id) = group_id else {
+                return Ok(projected);
+            };
+            let Ok(group_id_bytes) = hex::decode(&group_id) else {
+                return Ok(projected);
+            };
+
+            match self.inner.mls_context().get_epoch(group_id_bytes) {
+                Ok(_) => Ok(projected),
+                Err(_) => Ok(FFIConversationRecoveryState::GroupMissing),
+            }
+        })
+    }
+
     /// Handle a server-initiated group reset (`GroupResetEvent` delivered via
     /// SSE/WS from the DS).
     ///
@@ -2836,6 +2913,49 @@ mod tests {
                 .cloned()
                 .collect())
         }
+    }
+
+    #[test]
+    fn conversation_recovery_projection_matches_swift_vocabulary() {
+        assert_eq!(
+            project_conversation_recovery_state(None),
+            FFIConversationRecoveryState::Healthy
+        );
+        assert_eq!(
+            project_conversation_recovery_state(Some(&ConversationState::Active)),
+            FFIConversationRecoveryState::Healthy
+        );
+        assert_eq!(
+            project_conversation_recovery_state(Some(&ConversationState::Initializing)),
+            FFIConversationRecoveryState::Recovering
+        );
+        assert_eq!(
+            project_conversation_recovery_state(Some(&ConversationState::ForkDetected)),
+            FFIConversationRecoveryState::EpochBehind
+        );
+        assert_eq!(
+            project_conversation_recovery_state(Some(&ConversationState::NeedsRejoin)),
+            FFIConversationRecoveryState::NeedsRejoin
+        );
+        assert_eq!(
+            project_conversation_recovery_state(Some(&ConversationState::ResetPending {
+                new_group_id: "aabb".to_string(),
+                reset_generation: 7,
+                notified_at_ms: 1_700_000_000_000,
+            })),
+            FFIConversationRecoveryState::ResetPending
+        );
+        assert_eq!(
+            project_conversation_recovery_state(Some(&ConversationState::Quarantined {
+                reason: crate::orchestrator::QuarantineReason::PeerBadCommit,
+                since_ms: 1_700_000_000_000,
+            })),
+            FFIConversationRecoveryState::UnrecoverableLocal
+        );
+        assert_eq!(
+            project_conversation_recovery_state(Some(&ConversationState::Failed)),
+            FFIConversationRecoveryState::UnrecoverableLocal
+        );
     }
 
     #[tokio::test]

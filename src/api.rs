@@ -22,6 +22,8 @@ use crate::orchestrator::mls_provider::MlsCryptoContext;
 use crate::types::*;
 
 use crate::keychain::KeychainAccess;
+#[cfg(feature = "storage-driver-prototype")]
+use crate::storage_driver_prototype::OpenMlsStorageDriver;
 
 // Helper function to safely truncate strings for display
 fn truncate_str(s: &str, max_len: usize) -> &str {
@@ -174,6 +176,29 @@ fn pad_ciphertext(ciphertext: &[u8]) -> (Vec<u8>, u32) {
 
 fn current_metadata_reference_json(group: &MlsGroup) -> Option<Vec<u8>> {
     crate::metadata::current_metadata_reference_json(group)
+}
+
+#[cfg(feature = "storage-driver-prototype")]
+#[uniffi::export]
+impl MLSContext {
+    /// Experimental constructor for host-owned OpenMLS storage drivers.
+    ///
+    /// This constructor is compiled only with `storage-driver-prototype` and is
+    /// intentionally not wired to production storage. It exists so Swift/Kotlin
+    /// fixture work can generate bindings against the target API shape while
+    /// the default `new(storage_path, encryption_key, keychain)` path continues
+    /// to use `openmls_sqlite_storage` and `HybridStorageProvider`.
+    #[uniffi::constructor]
+    pub fn new_with_storage_driver(
+        driver: Box<dyn OpenMlsStorageDriver>,
+        keychain: Box<dyn KeychainAccess>,
+    ) -> Result<Arc<Self>, MLSError> {
+        drop(driver);
+        drop(keychain);
+        Err(MLSError::OperationNotSupported {
+            reason: "storage-driver-prototype exposes the FFI contract only; production MLSContext storage still uses openmls_sqlite_storage until fixture compatibility is proven".to_string(),
+        })
+    }
 }
 
 fn compute_app_data_updates(

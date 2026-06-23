@@ -20,6 +20,8 @@ mod mls_context;
 pub mod orchestrator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod orchestrator_bridge;
+#[cfg(all(not(target_arch = "wasm32"), feature = "storage-driver-prototype"))]
+pub mod storage_driver_prototype;
 mod types;
 // Voice depends on audiopus which has no wasm32 sysroot.
 #[cfg(not(target_arch = "wasm32"))]
