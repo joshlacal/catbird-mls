@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use p256::ecdsa::{Signature, VerifyingKey, signature::Verifier};
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 mod base64_bytes {
