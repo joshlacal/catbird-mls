@@ -13,8 +13,8 @@ use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 use super::welcome_recovery::{
-    classify_server_error, classify_welcome_processing_error, decide_welcome_recovery,
-    LastRecoveryError, WelcomeRecoveryDecision, WelcomeRecoveryInput,
+    LastRecoveryError, WelcomeRecoveryDecision, WelcomeRecoveryInput, classify_server_error,
+    classify_welcome_processing_error, decide_welcome_recovery,
 };
 
 /// Snapshot of a conversation's `ResetPending` payload for use inside the
@@ -2235,6 +2235,25 @@ where
             reset_generation,
             "Recording server-initiated GroupReset (deferred adoption)"
         );
+        if let Some(existing) = self.reset_pending_payload(convo_id).await {
+            if existing.reset_generation >= reset_generation {
+                tracing::info!(
+                    convo_id,
+                    existing_reset_generation = existing.reset_generation,
+                    incoming_reset_generation = reset_generation,
+                    existing_new_group_id = %existing.new_group_id,
+                    incoming_new_group_id = %new_group_id_hex,
+                    "GroupResetEvent: stale or duplicate generation, no-op"
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                convo_id,
+                old_reset_generation = existing.reset_generation,
+                new_reset_generation = reset_generation,
+                "GroupResetEvent: superseding existing ResetPending at newer generation"
+            );
+        }
         self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation)
             .await
     }
@@ -2312,24 +2331,23 @@ where
     ) -> Result<()> {
         self.check_shutdown().await?;
 
-        // Idempotency check: if we're already in ResetPending at this
-        // generation, drop the duplicate.
+        // Idempotency/stale check: if we're already in ResetPending at this
+        // generation or newer, drop the duplicate/stale replay before it can
+        // overwrite the current target group or delete the current local group.
         if let Some(existing) = self.reset_pending_payload(convo_id).await {
-            if existing.reset_generation == reset_generation {
+            if existing.reset_generation >= reset_generation {
                 tracing::info!(
                     convo_id,
                     crypto_session_id,
-                    reset_generation,
+                    existing_reset_generation = existing.reset_generation,
+                    incoming_reset_generation = reset_generation,
                     trigger,
                     request_event_id,
                     existing_new_group_id = %existing.new_group_id,
-                    "resetRequestedEvent: already in ResetPending at this generation, idempotent no-op"
+                    "resetRequestedEvent: stale or duplicate generation, no-op"
                 );
                 return Ok(());
             }
-            // Different generation arriving — fall through and overwrite.
-            // Higher generation supersedes; lower would be a stale replay but
-            // we still re-persist (the server is authoritative).
             tracing::info!(
                 convo_id,
                 crypto_session_id,
@@ -2337,7 +2355,7 @@ where
                 new_reset_generation = reset_generation,
                 trigger,
                 request_event_id,
-                "resetRequestedEvent: superseding existing ResetPending at different generation"
+                "resetRequestedEvent: superseding existing ResetPending at newer generation"
             );
         }
 

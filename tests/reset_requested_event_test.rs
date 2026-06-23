@@ -122,6 +122,122 @@ async fn test_record_reset_requested_idempotent_on_same_generation() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_record_reset_requested_ignores_stale_lower_generation() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Stale ResetRequested Test", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    alice
+        .orchestrator
+        .record_reset_requested(
+            &convo_id,
+            "crypto-session-current",
+            17,
+            "quorumVote",
+            "req-quorum:current",
+            None,
+        )
+        .await
+        .expect("current record_reset_requested failed");
+
+    let current_payload = alice
+        .storage
+        .get_persisted_reset_pending(&convo_id)
+        .expect("current call must persist RESET_PENDING");
+
+    alice
+        .orchestrator
+        .record_reset_requested(
+            &convo_id,
+            "crypto-session-stale",
+            16,
+            "quorumVote",
+            "req-quorum:stale",
+            None,
+        )
+        .await
+        .expect("stale record_reset_requested should be ignored");
+
+    let stale_result = alice
+        .storage
+        .get_persisted_reset_pending(&convo_id)
+        .expect("stale path must keep existing RESET_PENDING");
+    assert_eq!(
+        stale_result.reset_generation, current_payload.reset_generation,
+        "stale lower generation must not replace the current reset generation"
+    );
+    assert_eq!(
+        stale_result.new_group_id_hex, current_payload.new_group_id_hex,
+        "stale lower generation must not mint or persist a new candidate group id"
+    );
+    assert_eq!(
+        alice.storage.mark_reset_pending_call_count(&convo_id),
+        1,
+        "stale lower generation must not issue another mark_reset_pending write"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_record_group_reset_ignores_stale_lower_generation() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Stale GroupReset Test", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    let current_group = hex::decode("00112233445566778899aabbccddeeff").expect("fixture hex");
+    alice
+        .orchestrator
+        .record_group_reset(&convo_id, current_group, 9)
+        .await
+        .expect("current record_group_reset failed");
+
+    let current_payload = alice
+        .storage
+        .get_persisted_reset_pending(&convo_id)
+        .expect("current group reset must persist RESET_PENDING");
+
+    let stale_group = hex::decode("ffeeddccbbaa99887766554433221100").expect("fixture hex");
+    alice
+        .orchestrator
+        .record_group_reset(&convo_id, stale_group, 8)
+        .await
+        .expect("stale record_group_reset should be ignored");
+
+    let stale_result = alice
+        .storage
+        .get_persisted_reset_pending(&convo_id)
+        .expect("stale path must keep existing RESET_PENDING");
+    assert_eq!(
+        stale_result.reset_generation, current_payload.reset_generation,
+        "stale lower generation must not replace the current reset generation"
+    );
+    assert_eq!(
+        stale_result.new_group_id_hex, current_payload.new_group_id_hex,
+        "stale lower generation must not rebind to the older group id"
+    );
+    assert_eq!(
+        alice.storage.mark_reset_pending_call_count(&convo_id),
+        1,
+        "stale lower generation must not issue another mark_reset_pending write"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. None group_id path: client mints a fresh candidate.
 // ---------------------------------------------------------------------------
