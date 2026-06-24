@@ -238,15 +238,6 @@ where
     /// Initialize the orchestrator for a user.
     pub async fn initialize(&self, user_did: &str) -> Result<()> {
         tracing::info!(user_did, "Initializing MLS orchestrator");
-        let needs_user_reset = self
-            .user_did
-            .lock()
-            .await
-            .as_deref()
-            .is_some_and(|current_user_did| current_user_did != user_did);
-        if needs_user_reset {
-            self.reset_user_scoped_state().await;
-        }
         *self.user_did.lock().await = Some(user_did.to_string());
         *self.shutting_down.lock().await = false;
 
@@ -382,7 +373,17 @@ where
     pub async fn shutdown(&self) {
         tracing::info!("Shutting down MLS orchestrator");
         *self.shutting_down.lock().await = true;
-        self.reset_user_scoped_state().await;
+        self.conversations.lock().await.clear();
+        self.group_states.lock().await.clear();
+        self.conversation_states.lock().await.clear();
+        self.pending_messages.lock().await.clear();
+        self.own_commits.lock().await.clear();
+        self.rejoin_locks.lock().await.clear();
+        if let Ok(mut fds) = self.fork_detection_states.lock() {
+            fds.clear();
+        }
+        self.pending_staged_commits.lock().await.clear();
+        *self.user_did.lock().await = None;
     }
 
     /// Get the authenticated user DID or return an error.
@@ -392,11 +393,6 @@ where
             .await
             .clone()
             .ok_or(OrchestratorError::NotAuthenticated)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn current_user_did_for_test(&self) -> Option<String> {
-        self.user_did.lock().await.clone()
     }
 
     /// Check if the orchestrator is shutting down, returning an error if so.
@@ -446,32 +442,6 @@ where
 
     pub(crate) fn store_control_messages(&self) -> bool {
         self.store_control_messages.load(Ordering::Relaxed)
-    }
-
-    async fn reset_user_scoped_state(&self) {
-        self.conversations.lock().await.clear();
-        self.group_states.lock().await.clear();
-        self.conversation_states.lock().await.clear();
-        self.pending_messages.lock().await.clear();
-        self.own_commits.lock().await.clear();
-        self.groups_being_created.lock().await.clear();
-        self.rejoin_locks.lock().await.clear();
-        *self.sync_in_progress.lock().await = false;
-        *self.consecutive_sync_failures.lock().await = 0;
-        *self.circuit_breaker_tripped_at.lock().await = None;
-        *self.circuit_breaker_cooldown_secs.lock().await =
-            constants::SYNC_CIRCUIT_BREAKER_BASE_SECS;
-        *self.recovery_tracker.lock().await = RecoveryTracker::new(self.config.max_rejoin_attempts);
-        *self.failover_tracker.lock().await = SequencerFailoverTracker::new();
-        self.decrypt_fail_counts.lock().await.clear();
-        *self.groupinfo_404_tracker.lock().await = GroupInfo404Tracker::new();
-        if let Ok(mut fds) = self.fork_detection_states.lock() {
-            fds.clear();
-        }
-        self.pending_staged_commits.lock().await.clear();
-        *self.staged_commit_nonce.lock().await = 0;
-        self.device_key_cache.lock().await.clear();
-        *self.user_did.lock().await = None;
     }
 
     /// Access the conversations cache.

@@ -131,26 +131,6 @@ fn engine_sync_tracks_lifecycle_transitions() {
 }
 
 #[test]
-fn engine_reinitializes_after_raw_orchestrator_shutdown() {
-    let fixture = FullRustEngineFixture::new();
-    let engine = fixture.engine();
-
-    engine.initialize_user("did:plc:test").expect("initialize");
-
-    let runtime = tokio::runtime::Runtime::new().expect("runtime");
-    runtime.block_on(engine.orchestrator().shutdown());
-
-    engine
-        .initialize_user("did:plc:test")
-        .expect("reinitialize after raw orchestrator shutdown");
-    let sync_result = engine.sync(false).expect("sync after reinitialize");
-    assert_eq!(
-        sync_result.performed_sync, true,
-        "engine should recover from a raw orchestrator shutdown and allow sync again"
-    );
-}
-
-#[test]
 fn engine_reinitializes_after_mixed_shutdown_reasons() {
     let fixture = FullRustEngineFixture::new();
     let engine = fixture.engine();

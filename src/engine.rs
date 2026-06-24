@@ -98,7 +98,7 @@ where
         }
     }
 
-    pub fn orchestrator(&self) -> Arc<MLSOrchestrator<S, A, C, M>> {
+    pub(crate) fn orchestrator(&self) -> Arc<MLSOrchestrator<S, A, C, M>> {
         Arc::clone(&self.orchestrator)
     }
 
@@ -112,6 +112,15 @@ where
                 Err(OrchestratorError::ShuttingDown) => {}
                 Err(err) => return Err(err),
             }
+        }
+
+        let needs_user_rebind = state.phase == EnginePhase::Initialized
+            && state
+                .initialized_user_did
+                .as_deref()
+                .is_some_and(|did| did != user_did);
+        if needs_user_rebind {
+            crate::async_runtime::block_on(self.orchestrator.shutdown());
         }
 
         crate::async_runtime::block_on(self.orchestrator.initialize(user_did))?;

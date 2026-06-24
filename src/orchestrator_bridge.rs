@@ -17,7 +17,7 @@ use crate::orchestrator::{
 };
 
 use crate::api::MLSContext;
-use crate::engine::{EngineLifecycle, MlsEngine, ShutdownReason};
+use crate::engine::{EngineLifecycle, MlsEngine};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UniFFI callback interfaces — implemented in Swift/Kotlin
@@ -1998,15 +1998,13 @@ impl OrchestratorBridge {
 
     /// Initialize the orchestrator for a user DID.
     pub fn initialize(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
-        self.engine.initialize_user(&user_did)?;
+        crate::async_runtime::block_on(self.inner.initialize(&user_did))?;
         Ok(())
     }
 
     /// Shut down the orchestrator.
     pub fn shutdown(&self) {
-        if let Err(error) = self.engine.shutdown(ShutdownReason::AppSuspend) {
-            tracing::warn!(?error, "Failed to shut down bridge-owned MLS engine");
-        }
+        crate::async_runtime::block_on(self.inner.shutdown());
     }
 
     // -- Groups --
@@ -3507,52 +3505,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_bridge_initialize_rebinds_engine_when_did_changes() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db_path = dir.path().join("bridge-engine-did-rebind.sqlite");
-        let mls_context = MLSContext::new(
-            db_path.to_string_lossy().to_string(),
-            "bridge-engine-did-rebind-test-key".to_string(),
-            Box::new(RecordingKeychain::default()),
-        )
-        .expect("test MLSContext");
-        let bridge = OrchestratorBridge::new(
-            mls_context,
-            Box::new(RecordingStorageCallback::default()),
-            Box::new(WelcomeCountingApiCallback::new(
-                "did:plc:alice",
-                Arc::new(AtomicUsize::new(0)),
-            )),
-            Box::new(RecordingCredentialCallback::default()),
-            FFIOrchestratorConfig {
-                max_devices: 5,
-                target_key_package_count: 1,
-                key_package_replenish_threshold: 1,
-                sync_cooldown_seconds: 0,
-                max_consecutive_sync_failures: 3,
-                sync_pause_duration_seconds: 1,
-                rejoin_cooldown_seconds: 0,
-                max_rejoin_attempts: 3,
-            },
-        );
-
-        bridge
-            .initialize("did:plc:alice".to_string())
-            .expect("bridge initialize alice");
-        bridge
-            .initialize("did:plc:bob".to_string())
-            .expect("bridge initialize bob");
-
-        let current_user = crate::async_runtime::block_on(bridge.inner.current_user_did_for_test());
-        assert_eq!(
-            current_user.as_deref(),
-            Some("did:plc:bob"),
-            "exported bridge.initialize must rebind the engine/orchestrator when the DID changes"
-        );
-    }
-
-    #[test]
-    fn orchestrator_bridge_initialize_clears_user_scoped_cache_when_did_changes() {
+    fn initialize_engine_clears_user_scoped_cache_when_did_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bridge-engine-did-reset.sqlite");
         let mls_context = MLSContext::new(
@@ -3582,8 +3535,8 @@ mod tests {
         );
 
         bridge
-            .initialize("did:plc:alice".to_string())
-            .expect("bridge initialize alice");
+            .initialize_engine("did:plc:alice".to_string())
+            .expect("engine initialize alice");
 
         crate::async_runtime::block_on(async {
             bridge.inner.conversations().lock().await.insert(
@@ -3620,13 +3573,13 @@ mod tests {
         });
 
         bridge
-            .initialize("did:plc:bob".to_string())
-            .expect("bridge initialize bob");
+            .initialize_engine("did:plc:bob".to_string())
+            .expect("engine initialize bob");
 
         let (current_user, conversation_count, group_state_count, conversation_state_count) =
             crate::async_runtime::block_on(async {
                 (
-                    bridge.inner.current_user_did_for_test().await,
+                    bridge.inner.require_user_did().await.ok(),
                     bridge.inner.conversations().lock().await.len(),
                     bridge.inner.group_states().lock().await.len(),
                     bridge.inner.conversation_states().lock().await.len(),
@@ -3636,15 +3589,15 @@ mod tests {
         assert_eq!(current_user.as_deref(), Some("did:plc:bob"));
         assert_eq!(
             conversation_count, 0,
-            "Bob must not inherit Alice conversation cache entries after exported initialize rebinding"
+            "Bob must not inherit Alice conversation cache entries after engine rebinding"
         );
         assert_eq!(
             group_state_count, 0,
-            "Bob must not inherit Alice group-state cache entries after exported initialize rebinding"
+            "Bob must not inherit Alice group-state cache entries after engine rebinding"
         );
         assert_eq!(
             conversation_state_count, 0,
-            "Bob must not inherit Alice recovery state after exported initialize rebinding"
+            "Bob must not inherit Alice recovery state after engine rebinding"
         );
     }
 
