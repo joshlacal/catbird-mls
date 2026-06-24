@@ -3552,6 +3552,103 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_bridge_initialize_clears_user_scoped_cache_when_did_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bridge-engine-did-reset.sqlite");
+        let mls_context = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            "bridge-engine-did-reset-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        );
+
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("bridge initialize alice");
+
+        crate::async_runtime::block_on(async {
+            bridge.inner.conversations().lock().await.insert(
+                "alice-convo".to_string(),
+                ConversationView {
+                    group_id: "a1".to_string(),
+                    conversation_id: "alice-convo".to_string(),
+                    epoch: 7,
+                    members: vec![MemberView {
+                        did: "did:plc:alice".to_string(),
+                        role: MemberRole::Admin,
+                    }],
+                    metadata: None,
+                    created_at: None,
+                    updated_at: None,
+                    sequencer_did: None,
+                },
+            );
+            bridge.inner.group_states().lock().await.insert(
+                "a1".to_string(),
+                GroupState {
+                    group_id: "a1".to_string(),
+                    conversation_id: "alice-convo".to_string(),
+                    epoch: 7,
+                    members: vec!["did:plc:alice".to_string()],
+                },
+            );
+            bridge
+                .inner
+                .conversation_states()
+                .lock()
+                .await
+                .insert("alice-convo".to_string(), ConversationState::NeedsRejoin);
+        });
+
+        bridge
+            .initialize("did:plc:bob".to_string())
+            .expect("bridge initialize bob");
+
+        let (current_user, conversation_count, group_state_count, conversation_state_count) =
+            crate::async_runtime::block_on(async {
+                (
+                    bridge.inner.current_user_did_for_test().await,
+                    bridge.inner.conversations().lock().await.len(),
+                    bridge.inner.group_states().lock().await.len(),
+                    bridge.inner.conversation_states().lock().await.len(),
+                )
+            });
+
+        assert_eq!(current_user.as_deref(), Some("did:plc:bob"));
+        assert_eq!(
+            conversation_count, 0,
+            "Bob must not inherit Alice conversation cache entries after exported initialize rebinding"
+        );
+        assert_eq!(
+            group_state_count, 0,
+            "Bob must not inherit Alice group-state cache entries after exported initialize rebinding"
+        );
+        assert_eq!(
+            conversation_state_count, 0,
+            "Bob must not inherit Alice recovery state after exported initialize rebinding"
+        );
+    }
+
+    #[test]
     fn conversation_recovery_projection_matches_swift_vocabulary() {
         assert_eq!(
             project_conversation_recovery_state(None),
