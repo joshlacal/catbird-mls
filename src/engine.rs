@@ -104,8 +104,10 @@ where
 
     pub fn initialize_user(&self, user_did: &str) -> Result<()> {
         let state = self.lock_state()?.clone();
+        let actual_user_did = self.current_orchestrator_user_did()?;
         let same_initialized_did = state.phase == EnginePhase::Initialized
-            && state.initialized_user_did.as_deref() == Some(user_did);
+            && state.initialized_user_did.as_deref() == Some(user_did)
+            && actual_user_did.as_deref() == Some(user_did);
         if same_initialized_did {
             match crate::async_runtime::block_on(self.orchestrator.check_shutdown()) {
                 Ok(()) => return Ok(()),
@@ -115,10 +117,13 @@ where
         }
 
         let needs_user_rebind = state.phase == EnginePhase::Initialized
-            && state
+            && (state
                 .initialized_user_did
                 .as_deref()
-                .is_some_and(|did| did != user_did);
+                .is_some_and(|did| did != user_did)
+                || actual_user_did
+                    .as_deref()
+                    .is_some_and(|did| did != user_did));
         if needs_user_rebind {
             crate::async_runtime::block_on(self.orchestrator.shutdown());
         }
@@ -172,5 +177,13 @@ where
         self.state
             .lock()
             .map_err(|_| OrchestratorError::InvalidInput("engine state lock poisoned".to_string()))
+    }
+
+    fn current_orchestrator_user_did(&self) -> Result<Option<String>> {
+        match crate::async_runtime::block_on(self.orchestrator.require_user_did()) {
+            Ok(user_did) => Ok(Some(user_did)),
+            Err(OrchestratorError::NotAuthenticated) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }

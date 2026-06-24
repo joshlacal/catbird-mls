@@ -3501,6 +3501,56 @@ mod tests {
     }
 
     #[test]
+    fn initialize_engine_rebinds_after_legacy_initialize_changes_orchestrator_user() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bridge-engine-mixed-init.sqlite");
+        let mls_context = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            "bridge-engine-mixed-init-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        );
+
+        bridge
+            .initialize_engine("did:plc:alice".to_string())
+            .expect("engine initialize alice");
+        bridge
+            .initialize("did:plc:bob".to_string())
+            .expect("legacy initialize bob");
+        bridge
+            .initialize_engine("did:plc:alice".to_string())
+            .expect("engine reinitialize alice");
+
+        let current_user =
+            crate::async_runtime::block_on(async { bridge.inner.require_user_did().await.ok() });
+
+        assert_eq!(
+            current_user.as_deref(),
+            Some("did:plc:alice"),
+            "engine initialize must reconcile its cached DID with the actual raw orchestrator user"
+        );
+    }
+
+    #[test]
     fn initialize_engine_clears_user_scoped_cache_when_did_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bridge-engine-did-reset.sqlite");
