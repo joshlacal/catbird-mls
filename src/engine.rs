@@ -103,28 +103,25 @@ where
     }
 
     pub fn initialize_user(&self, user_did: &str) -> Result<()> {
-        let state = self.lock_state()?.clone();
         let actual_user_did = self.current_orchestrator_user_did()?;
-        let same_initialized_did = state.phase == EnginePhase::Initialized
-            && state.initialized_user_did.as_deref() == Some(user_did)
-            && actual_user_did.as_deref() == Some(user_did);
-        if same_initialized_did {
+        if actual_user_did.as_deref() == Some(user_did) {
             match crate::async_runtime::block_on(self.orchestrator.check_shutdown()) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    *self.lock_state()? = EngineState {
+                        phase: EnginePhase::Initialized,
+                        initialized_user_did: Some(user_did.to_string()),
+                    };
+                    return Ok(());
+                }
                 Err(OrchestratorError::ShuttingDown) => {}
                 Err(err) => return Err(err),
             }
         }
 
-        let needs_user_rebind = state.phase == EnginePhase::Initialized
-            && (state
-                .initialized_user_did
-                .as_deref()
-                .is_some_and(|did| did != user_did)
-                || actual_user_did
-                    .as_deref()
-                    .is_some_and(|did| did != user_did));
-        if needs_user_rebind {
+        if actual_user_did
+            .as_deref()
+            .is_some_and(|did| did != user_did)
+        {
             crate::async_runtime::block_on(self.orchestrator.shutdown());
         }
 

@@ -3551,6 +3551,110 @@ mod tests {
     }
 
     #[test]
+    fn initialize_engine_clears_raw_state_after_legacy_rebind_while_suspended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bridge-engine-mixed-phase-rebind.sqlite");
+        let mls_context = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            "bridge-engine-mixed-phase-rebind-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        );
+
+        bridge
+            .initialize_engine("did:plc:alice".to_string())
+            .expect("engine initialize alice");
+        bridge
+            .engine
+            .shutdown(crate::ShutdownReason::AppSuspend)
+            .expect("suspend engine");
+        bridge
+            .initialize("did:plc:bob".to_string())
+            .expect("legacy initialize bob");
+
+        crate::async_runtime::block_on(async {
+            bridge.inner.conversations().lock().await.insert(
+                "bob-convo".to_string(),
+                ConversationView {
+                    group_id: "b1".to_string(),
+                    conversation_id: "bob-convo".to_string(),
+                    epoch: 11,
+                    members: vec![MemberView {
+                        did: "did:plc:bob".to_string(),
+                        role: MemberRole::Admin,
+                    }],
+                    metadata: None,
+                    created_at: None,
+                    updated_at: None,
+                    sequencer_did: None,
+                },
+            );
+            bridge.inner.group_states().lock().await.insert(
+                "b1".to_string(),
+                GroupState {
+                    group_id: "b1".to_string(),
+                    conversation_id: "bob-convo".to_string(),
+                    epoch: 11,
+                    members: vec!["did:plc:bob".to_string()],
+                },
+            );
+            bridge
+                .inner
+                .conversation_states()
+                .lock()
+                .await
+                .insert("bob-convo".to_string(), ConversationState::NeedsRejoin);
+        });
+
+        bridge
+            .initialize_engine("did:plc:alice".to_string())
+            .expect("engine resume alice");
+
+        let (current_user, conversation_count, group_state_count, conversation_state_count) =
+            crate::async_runtime::block_on(async {
+                (
+                    bridge.inner.require_user_did().await.ok(),
+                    bridge.inner.conversations().lock().await.len(),
+                    bridge.inner.group_states().lock().await.len(),
+                    bridge.inner.conversation_states().lock().await.len(),
+                )
+            });
+
+        assert_eq!(current_user.as_deref(), Some("did:plc:alice"));
+        assert_eq!(
+            conversation_count, 0,
+            "engine reinitialize must clear Bob conversation cache after suspended legacy rebind"
+        );
+        assert_eq!(
+            group_state_count, 0,
+            "engine reinitialize must clear Bob group cache after suspended legacy rebind"
+        );
+        assert_eq!(
+            conversation_state_count, 0,
+            "engine reinitialize must clear Bob recovery cache after suspended legacy rebind"
+        );
+    }
+
+    #[test]
     fn initialize_engine_clears_user_scoped_cache_when_did_changes() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("bridge-engine-did-reset.sqlite");
