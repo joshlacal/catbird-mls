@@ -6,6 +6,8 @@ pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client_bridge;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod engine;
+#[cfg(not(target_arch = "wasm32"))]
 mod epoch_storage;
 mod error;
 pub mod field_encryption;
@@ -33,6 +35,8 @@ pub mod atproto_bytes;
 #[cfg(not(target_arch = "wasm32"))]
 pub use api::*;
 pub use catbird_atproto as atproto;
+#[cfg(not(target_arch = "wasm32"))]
+pub use engine::*;
 pub use error::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use keychain::*;

@@ -17,6 +17,7 @@ use crate::orchestrator::{
 };
 
 use crate::api::MLSContext;
+use crate::engine::{EngineLifecycle, MlsEngine};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UniFFI callback interfaces — implemented in Swift/Kotlin
@@ -1938,6 +1939,7 @@ impl CredentialStore for CredentialAdapter {
 
 type ConcreteOrchestrator =
     MLSOrchestrator<StorageAdapter, APIAdapter, CredentialAdapter, MLSContext>;
+type ConcreteEngine = MlsEngine<StorageAdapter, APIAdapter, CredentialAdapter, MLSContext>;
 
 /// UniFFI-exported MLS Orchestrator object.
 ///
@@ -1945,7 +1947,8 @@ type ConcreteOrchestrator =
 /// Swift/Kotlin provides the platform-specific storage, API, and credential backends.
 #[derive(uniffi::Object)]
 pub struct OrchestratorBridge {
-    inner: ConcreteOrchestrator,
+    inner: Arc<ConcreteOrchestrator>,
+    engine: Arc<ConcreteEngine>,
 }
 
 #[uniffi::export]
@@ -1977,20 +1980,30 @@ impl OrchestratorBridge {
             group_config: crate::GroupConfig::default(),
         };
 
-        let inner = MLSOrchestrator::new(
+        let storage = Arc::new(StorageAdapter(Arc::from(storage)));
+        let api_client = Arc::new(APIAdapter(Arc::from(api_client)));
+        let credentials = Arc::new(CredentialAdapter(Arc::from(credentials)));
+        let engine = Arc::new(MlsEngine::new(
             mls_context,
-            Arc::new(StorageAdapter(Arc::from(storage))),
-            Arc::new(APIAdapter(Arc::from(api_client))),
-            Arc::new(CredentialAdapter(Arc::from(credentials))),
+            storage,
+            api_client,
+            credentials,
+            Arc::new(EngineLifecycle::default()),
             orch_config,
-        );
+        ));
+        let inner = engine.orchestrator();
 
-        Arc::new(Self { inner })
+        Arc::new(Self { inner, engine })
     }
 
     /// Initialize the orchestrator for a user DID.
     pub fn initialize(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.initialize(&user_did))?;
+        Ok(())
+    }
+
+    pub fn initialize_engine(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
+        self.engine.initialize_user(&user_did)?;
         Ok(())
     }
 
