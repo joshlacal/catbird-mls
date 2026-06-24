@@ -395,6 +395,11 @@ where
             .ok_or(OrchestratorError::NotAuthenticated)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn current_user_did_for_test(&self) -> Option<String> {
+        self.user_did.lock().await.clone()
+    }
+
     /// Check if the orchestrator is shutting down, returning an error if so.
     pub(crate) async fn check_shutdown(&self) -> Result<()> {
         if *self.shutting_down.lock().await {

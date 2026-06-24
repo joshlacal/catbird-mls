@@ -18,11 +18,26 @@ pub struct EngineSyncResult {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EngineState {
+enum EnginePhase {
     New,
     Initialized,
     Suspended,
     Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EngineState {
+    phase: EnginePhase,
+    initialized_user_did: Option<String>,
+}
+
+impl Default for EngineState {
+    fn default() -> Self {
+        Self {
+            phase: EnginePhase::New,
+            initialized_user_did: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -79,7 +94,7 @@ where
                 config,
             )),
             lifecycle,
-            state: Mutex::new(EngineState::New),
+            state: Mutex::new(EngineState::default()),
         }
     }
 
@@ -88,19 +103,28 @@ where
     }
 
     pub fn initialize_user(&self, user_did: &str) -> Result<()> {
-        let mut state = self.lock_state()?;
-        if *state == EngineState::Initialized {
-            return Ok(());
+        let state = self.lock_state()?.clone();
+        let same_initialized_did = state.phase == EnginePhase::Initialized
+            && state.initialized_user_did.as_deref() == Some(user_did);
+        if same_initialized_did {
+            match crate::async_runtime::block_on(self.orchestrator.check_shutdown()) {
+                Ok(()) => return Ok(()),
+                Err(OrchestratorError::ShuttingDown) => {}
+                Err(err) => return Err(err),
+            }
         }
 
         crate::async_runtime::block_on(self.orchestrator.initialize(user_did))?;
-        *state = EngineState::Initialized;
+        *self.lock_state()? = EngineState {
+            phase: EnginePhase::Initialized,
+            initialized_user_did: Some(user_did.to_string()),
+        };
         Ok(())
     }
 
     pub fn sync(&self, full_sync: bool) -> Result<EngineSyncResult> {
-        let state = *self.lock_state()?;
-        if state != EngineState::Initialized {
+        let state = self.lock_state()?.clone();
+        if state.phase != EnginePhase::Initialized {
             return Ok(EngineSyncResult {
                 full_sync,
                 performed_sync: false,
@@ -115,20 +139,23 @@ where
     }
 
     pub fn shutdown(&self, reason: ShutdownReason) -> Result<()> {
-        let mut state = self.lock_state()?;
-        let next_state = match reason {
-            ShutdownReason::AppSuspend => EngineState::Suspended,
-            ShutdownReason::ProcessExit => EngineState::Shutdown,
+        let next_phase = match reason {
+            ShutdownReason::AppSuspend => EnginePhase::Suspended,
+            ShutdownReason::ProcessExit => EnginePhase::Shutdown,
         };
+        let state = self.lock_state()?.clone();
 
-        if *state == next_state {
+        if state.phase == next_phase {
             self.lifecycle.record_shutdown(reason)?;
             return Ok(());
         }
 
         crate::async_runtime::block_on(self.orchestrator.shutdown());
         self.lifecycle.record_shutdown(reason)?;
-        *state = next_state;
+        *self.lock_state()? = EngineState {
+            phase: next_phase,
+            initialized_user_did: None,
+        };
         Ok(())
     }
 

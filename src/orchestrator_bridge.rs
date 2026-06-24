@@ -17,7 +17,7 @@ use crate::orchestrator::{
 };
 
 use crate::api::MLSContext;
-use crate::engine::{EngineLifecycle, MlsEngine};
+use crate::engine::{EngineLifecycle, MlsEngine, ShutdownReason};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UniFFI callback interfaces — implemented in Swift/Kotlin
@@ -1998,18 +1998,15 @@ impl OrchestratorBridge {
 
     /// Initialize the orchestrator for a user DID.
     pub fn initialize(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
-        crate::async_runtime::block_on(self.inner.initialize(&user_did))?;
-        Ok(())
-    }
-
-    pub fn initialize_engine(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
         self.engine.initialize_user(&user_did)?;
         Ok(())
     }
 
     /// Shut down the orchestrator.
     pub fn shutdown(&self) {
-        crate::async_runtime::block_on(self.inner.shutdown());
+        if let Err(error) = self.engine.shutdown(ShutdownReason::AppSuspend) {
+            tracing::warn!(?error, "Failed to shut down bridge-owned MLS engine");
+        }
     }
 
     // -- Groups --
@@ -2686,6 +2683,17 @@ impl OrchestratorBridge {
         convo_id: String,
     ) -> Result<(), OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.user_confirmed_manual_reset(&convo_id))?;
+        Ok(())
+    }
+}
+
+impl OrchestratorBridge {
+    #[allow(dead_code)]
+    pub(crate) fn initialize_engine(
+        &self,
+        user_did: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        self.engine.initialize_user(&user_did)?;
         Ok(())
     }
 }
@@ -3446,6 +3454,100 @@ mod tests {
             welcome_calls.load(Ordering::SeqCst),
             1,
             "OrchestratorBridge.joinOrRejoin must call MLSOrchestrator::join_or_rejoin, whose first step probes Welcome"
+        );
+    }
+
+    #[test]
+    fn orchestrator_bridge_engine_shutdown_reinitialize_allows_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bridge-engine-lifecycle.sqlite");
+        let mls_context = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            "bridge-engine-lifecycle-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        );
+
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("bridge initialize");
+        bridge.shutdown();
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("bridge reinitialize");
+        bridge
+            .sync_with_server(false)
+            .expect("sync should succeed after bridge shutdown and reinitialize");
+
+        bridge.shutdown();
+        let shutdown_result = crate::async_runtime::block_on(bridge.inner.check_shutdown());
+        assert!(
+            matches!(shutdown_result, Err(OrchestratorError::ShuttingDown)),
+            "second bridge shutdown must reach the raw orchestrator after public reinitialize"
+        );
+    }
+
+    #[test]
+    fn orchestrator_bridge_initialize_rebinds_engine_when_did_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bridge-engine-did-rebind.sqlite");
+        let mls_context = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            "bridge-engine-did-rebind-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        );
+
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("bridge initialize alice");
+        bridge
+            .initialize("did:plc:bob".to_string())
+            .expect("bridge initialize bob");
+
+        let current_user = crate::async_runtime::block_on(bridge.inner.current_user_did_for_test());
+        assert_eq!(
+            current_user.as_deref(),
+            Some("did:plc:bob"),
+            "exported bridge.initialize must rebind the engine/orchestrator when the DID changes"
         );
     }
 

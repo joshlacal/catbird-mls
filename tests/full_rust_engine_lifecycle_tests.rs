@@ -101,3 +101,80 @@ fn engine_initialize_and_shutdown_are_idempotent() {
         .shutdown(ShutdownReason::AppSuspend)
         .expect("second shutdown is no-op");
 }
+
+#[test]
+fn engine_sync_tracks_lifecycle_transitions() {
+    let fixture = FullRustEngineFixture::new();
+    let engine = fixture.engine();
+
+    let before_init = engine.sync(false).expect("sync before init");
+    assert_eq!(
+        before_init.performed_sync, false,
+        "sync should be a no-op before initialization"
+    );
+
+    engine.initialize_user("did:plc:test").expect("initialize");
+    let after_init = engine.sync(false).expect("sync after init");
+    assert_eq!(
+        after_init.performed_sync, true,
+        "sync should run once the engine is initialized"
+    );
+
+    engine
+        .shutdown(ShutdownReason::AppSuspend)
+        .expect("shutdown to suspended");
+    let after_suspend = engine.sync(false).expect("sync after suspend");
+    assert_eq!(
+        after_suspend.performed_sync, false,
+        "sync should be skipped while suspended"
+    );
+}
+
+#[test]
+fn engine_reinitializes_after_raw_orchestrator_shutdown() {
+    let fixture = FullRustEngineFixture::new();
+    let engine = fixture.engine();
+
+    engine.initialize_user("did:plc:test").expect("initialize");
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(engine.orchestrator().shutdown());
+
+    engine
+        .initialize_user("did:plc:test")
+        .expect("reinitialize after raw orchestrator shutdown");
+    let sync_result = engine.sync(false).expect("sync after reinitialize");
+    assert_eq!(
+        sync_result.performed_sync, true,
+        "engine should recover from a raw orchestrator shutdown and allow sync again"
+    );
+}
+
+#[test]
+fn engine_reinitializes_after_mixed_shutdown_reasons() {
+    let fixture = FullRustEngineFixture::new();
+    let engine = fixture.engine();
+
+    engine.initialize_user("did:plc:test").expect("initialize");
+    engine
+        .shutdown(ShutdownReason::AppSuspend)
+        .expect("suspend shutdown");
+    engine
+        .initialize_user("did:plc:test")
+        .expect("reinitialize after suspend");
+    engine
+        .shutdown(ShutdownReason::ProcessExit)
+        .expect("process exit shutdown");
+    engine
+        .initialize_user("did:plc:test")
+        .expect("reinitialize after process exit");
+
+    let sync_result = engine.sync(true).expect("full sync after mixed shutdowns");
+    assert_eq!(
+        sync_result,
+        catbird_mls::EngineSyncResult {
+            full_sync: true,
+            performed_sync: true,
+        }
+    );
+}
