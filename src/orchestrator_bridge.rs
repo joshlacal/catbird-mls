@@ -2686,11 +2686,7 @@ impl OrchestratorBridge {
 }
 
 impl OrchestratorBridge {
-    #[allow(dead_code)]
-    pub(crate) fn initialize_engine(
-        &self,
-        user_did: String,
-    ) -> Result<(), OrchestratorBridgeError> {
+    pub fn initialize_engine(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
         self.engine.initialize_user(&user_did)?;
         Ok(())
     }
