@@ -5,6 +5,7 @@
 // are implemented by callback interfaces that delegate to Swift/Kotlin code.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::orchestrator::{
     AddMembersServerResult, ConversationListPage, ConversationMetadata, ConversationState,
@@ -2685,9 +2686,39 @@ impl OrchestratorBridge {
     }
 }
 
+#[uniffi::export]
 impl OrchestratorBridge {
     pub fn initialize_engine(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
         self.engine.initialize_user(&user_did)?;
+        Ok(())
+    }
+
+    pub fn prepare_for_suspend(
+        &self,
+        reason: String,
+        deadline_ms: u64,
+    ) -> Result<FFISuspendResult, OrchestratorBridgeError> {
+        let result = self
+            .engine
+            .prepare_for_suspend(&reason, Duration::from_millis(deadline_ms))?;
+        Ok(FFISuspendResult {
+            accepting_new_work: result.accepting_new_work,
+            interrupted_contexts: result.interrupted_contexts,
+        })
+    }
+
+    pub fn resume_from_suspend(&self, reason: String) -> Result<(), OrchestratorBridgeError> {
+        self.engine.resume_from_suspend(&reason)?;
+        Ok(())
+    }
+
+    pub fn interrupt_storage(&self, reason: String) -> Result<(), OrchestratorBridgeError> {
+        let _ = self.engine.interrupt_storage(&reason)?;
+        Ok(())
+    }
+
+    pub fn emergency_close(&self, reason: String) -> Result<(), OrchestratorBridgeError> {
+        self.engine.emergency_close(&reason)?;
         Ok(())
     }
 }
@@ -2696,6 +2727,12 @@ impl OrchestratorBridge {
 pub struct FFIFetchMessagesResult {
     pub messages: Vec<FFIMessage>,
     pub cursor: Option<String>,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FFISuspendResult {
+    pub accepting_new_work: bool,
+    pub interrupted_contexts: u32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

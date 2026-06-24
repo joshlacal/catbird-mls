@@ -1,9 +1,11 @@
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use crate::orchestrator::{
     CredentialStore, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext,
     OrchestratorConfig, OrchestratorError, Result,
 };
+use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownReason {
@@ -43,6 +45,7 @@ impl Default for EngineState {
 #[derive(Debug, Default)]
 pub struct EngineLifecycle {
     last_shutdown_reason: Mutex<Option<ShutdownReason>>,
+    platform: PlatformLifecycle,
 }
 
 impl EngineLifecycle {
@@ -55,6 +58,10 @@ impl EngineLifecycle {
         self.last_shutdown_reason.lock().map_err(|_| {
             OrchestratorError::InvalidInput("engine lifecycle lock poisoned".to_string())
         })
+    }
+
+    fn platform(&self) -> &PlatformLifecycle {
+        &self.platform
     }
 }
 
@@ -155,6 +162,14 @@ where
             ShutdownReason::ProcessExit => EnginePhase::Shutdown,
         };
         let state = self.lock_state()?.clone();
+        let preserved_user_did = if reason == ShutdownReason::AppSuspend {
+            state
+                .initialized_user_did
+                .clone()
+                .or(self.current_orchestrator_user_did()?)
+        } else {
+            None
+        };
 
         if state.phase == next_phase {
             self.lifecycle.record_shutdown(reason)?;
@@ -165,9 +180,58 @@ where
         self.lifecycle.record_shutdown(reason)?;
         *self.lock_state()? = EngineState {
             phase: next_phase,
-            initialized_user_did: None,
+            initialized_user_did: preserved_user_did,
         };
         Ok(())
+    }
+
+    pub fn prepare_for_suspend(&self, reason: &str, deadline: Duration) -> Result<SuspendResult> {
+        let result = self.lifecycle.platform().begin_suspend(
+            self.orchestrator.mls_context().as_ref(),
+            reason,
+            deadline,
+        )?;
+        self.shutdown(ShutdownReason::AppSuspend)?;
+        Ok(result)
+    }
+
+    pub fn resume_from_suspend(&self, reason: &str) -> Result<()> {
+        self.lifecycle
+            .platform()
+            .resume(self.orchestrator.mls_context().as_ref(), reason);
+
+        let user_did = self
+            .lock_state()?
+            .initialized_user_did
+            .clone()
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        self.initialize_user(&user_did)
+    }
+
+    pub fn interrupt_storage(&self, reason: &str) -> Result<usize> {
+        Ok(self
+            .lifecycle
+            .platform()
+            .interrupt_storage(self.orchestrator.mls_context().as_ref(), reason))
+    }
+
+    pub fn emergency_close(&self, reason: &str) -> Result<()> {
+        self.lifecycle
+            .platform()
+            .emergency_close(self.orchestrator.mls_context().as_ref(), reason)?;
+        *self.lock_state()? = EngineState {
+            phase: EnginePhase::Shutdown,
+            initialized_user_did: None,
+        };
+        self.lifecycle
+            .record_shutdown(ShutdownReason::ProcessExit)?;
+        Ok(())
+    }
+
+    pub fn is_suspended(&self) -> bool {
+        self.lock_state()
+            .map(|state| state.phase == EnginePhase::Suspended)
+            .unwrap_or_else(|_| self.lifecycle.platform().is_suspending())
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, EngineState>> {

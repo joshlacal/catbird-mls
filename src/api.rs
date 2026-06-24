@@ -6215,6 +6215,19 @@ impl MlsCryptoContext for MLSContext {
         self.create_key_package(identity)
     }
 
+    fn set_suspended(&self, value: bool) {
+        MLSContext::set_suspended(self, value);
+    }
+
+    fn interrupt_storage(&self) -> usize {
+        self.interrupt();
+        self.interrupt_handles.len()
+    }
+
+    fn flush_and_prepare_close(&self) -> Result<(), MLSError> {
+        MLSContext::flush_and_prepare_close(self)
+    }
+
     fn create_group(
         &self,
         identity: Vec<u8>,

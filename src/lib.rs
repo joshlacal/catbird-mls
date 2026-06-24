@@ -22,6 +22,8 @@ mod mls_context;
 pub mod orchestrator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod orchestrator_bridge;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod platform_lifecycle;
 #[cfg(all(not(target_arch = "wasm32"), feature = "storage-driver-prototype"))]
 pub mod storage_driver_prototype;
 mod types;
@@ -40,6 +42,8 @@ pub use engine::*;
 pub use error::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use keychain::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub use platform_lifecycle::*;
 pub use types::*;
 
 // ═══════════════════════════════════════════════════════════════════════════

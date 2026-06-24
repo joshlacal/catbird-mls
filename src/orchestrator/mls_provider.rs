@@ -22,6 +22,18 @@ impl<T> MlsCryptoContextBounds for T {}
 pub trait MlsCryptoContext: MlsCryptoContextBounds {
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError>;
 
+    fn set_suspended(&self, _value: bool) {}
+
+    fn interrupt_storage(&self) -> usize {
+        0
+    }
+
+    fn flush_and_prepare_close(&self) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "flush_and_prepare_close not available on this platform".to_string(),
+        })
+    }
+
     fn create_group(
         &self,
         identity: Vec<u8>,

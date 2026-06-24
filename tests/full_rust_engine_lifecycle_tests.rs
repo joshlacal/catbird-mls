@@ -158,3 +158,27 @@ fn engine_reinitializes_after_mixed_shutdown_reasons() {
         }
     );
 }
+
+#[test]
+fn prepare_for_suspend_blocks_new_work_and_interrupts_storage() {
+    let fixture = FullRustEngineFixture::new();
+    let engine = fixture.engine();
+
+    engine.initialize_user("did:plc:test").expect("initialize");
+    let result = engine
+        .prepare_for_suspend("unit-test", std::time::Duration::from_millis(250))
+        .expect("prepare for suspend");
+
+    assert_eq!(
+        result.accepting_new_work, false,
+        "engine should reject new work once suspension starts"
+    );
+    assert!(
+        result.interrupted_contexts >= 1,
+        "suspension should interrupt at least one SQLCipher context"
+    );
+    assert!(
+        engine.is_suspended(),
+        "engine should report suspended state"
+    );
+}
