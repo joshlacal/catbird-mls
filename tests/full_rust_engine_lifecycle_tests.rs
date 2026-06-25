@@ -181,4 +181,83 @@ fn prepare_for_suspend_blocks_new_work_and_interrupts_storage() {
         engine.is_suspended(),
         "engine should report suspended state"
     );
+
+    let sync_while_suspended = engine.sync(false).expect("sync while suspended");
+    assert_eq!(
+        sync_while_suspended.performed_sync, false,
+        "post-suspend work must stay gated until resume"
+    );
+}
+
+#[test]
+fn resume_from_suspend_restores_initialized_phase_without_replaying_startup() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("mls.db");
+    let context = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        "test-key".to_string(),
+        Box::new(InMemoryKeychain::new()),
+    )
+    .expect("MLSContext");
+    let storage = Arc::new(MockStorage::new());
+    let api = Arc::new(MockDeliveryService::new("did:plc:test"));
+    let credentials = Arc::new(MockCredentials::new());
+    let engine = MlsEngine::new(
+        context,
+        Arc::clone(&storage),
+        api,
+        credentials,
+        Arc::new(EngineLifecycle::default()),
+        OrchestratorConfig::default(),
+    );
+
+    engine.initialize_user("did:plc:test").expect("initialize");
+    let startup_probes_before_suspend = storage.startup_probe_counts();
+
+    engine
+        .prepare_for_suspend("unit-test", std::time::Duration::from_millis(250))
+        .expect("prepare for suspend");
+    engine
+        .resume_from_suspend("unit-test")
+        .expect("resume from suspend");
+
+    assert_eq!(
+        storage.startup_probe_counts(),
+        startup_probes_before_suspend,
+        "resume must not rerun initialize-time hydration or recovery probes"
+    );
+
+    let sync_after_resume = engine.sync(false).expect("sync after resume");
+    assert_eq!(
+        sync_after_resume.performed_sync, true,
+        "resume should restore initialized engine state"
+    );
+}
+
+#[test]
+fn emergency_close_requires_fresh_initialize_before_resume() {
+    let fixture = FullRustEngineFixture::new();
+    let engine = fixture.engine();
+
+    engine.initialize_user("did:plc:test").expect("initialize");
+    engine
+        .emergency_close("unit-test")
+        .expect("emergency close");
+
+    let resume_error = engine
+        .resume_from_suspend("unit-test")
+        .expect_err("resume should fail after emergency close");
+    assert!(
+        matches!(
+            resume_error,
+            catbird_mls::orchestrator::OrchestratorError::NotAuthenticated
+        ),
+        "expected NotAuthenticated after emergency close, got {resume_error:?}"
+    );
+
+    let sync_after_emergency_close = engine.sync(false).expect("sync after emergency close");
+    assert_eq!(
+        sync_after_emergency_close.performed_sync, false,
+        "shutdown engine must keep work gated until a fresh initialize"
+    );
 }

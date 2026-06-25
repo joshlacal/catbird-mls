@@ -196,16 +196,27 @@ where
     }
 
     pub fn resume_from_suspend(&self, reason: &str) -> Result<()> {
+        let user_did = {
+            let state = self.lock_state()?.clone();
+            match state.phase {
+                EnginePhase::Suspended | EnginePhase::Initialized => state
+                    .initialized_user_did
+                    .ok_or(OrchestratorError::NotAuthenticated)?,
+                EnginePhase::New | EnginePhase::Shutdown => {
+                    return Err(OrchestratorError::NotAuthenticated)
+                }
+            }
+        };
+
         self.lifecycle
             .platform()
             .resume(self.orchestrator.mls_context().as_ref(), reason);
-
-        let user_did = self
-            .lock_state()?
-            .initialized_user_did
-            .clone()
-            .ok_or(OrchestratorError::NotAuthenticated)?;
-        self.initialize_user(&user_did)
+        crate::async_runtime::block_on(self.orchestrator.resume_after_suspend(&user_did));
+        *self.lock_state()? = EngineState {
+            phase: EnginePhase::Initialized,
+            initialized_user_did: Some(user_did),
+        };
+        Ok(())
     }
 
     pub fn interrupt_storage(&self, reason: &str) -> Result<usize> {

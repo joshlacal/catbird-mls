@@ -92,6 +92,15 @@ struct Inner {
     /// Number of times `set_conversation_sequencer` has been called per
     /// conversation (asserts persist-only-on-change behavior).
     set_conversation_sequencer_calls: HashMap<String, u32>,
+    startup_probe_counts: StartupProbeCounts,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StartupProbeCounts {
+    pub list_conversations: u32,
+    pub get_conversation_state: u32,
+    pub get_recovery_state: u32,
+    pub list_pending_local_deletes: u32,
 }
 
 /// An in-memory mock of `MLSStorageBackend` suitable for unit and integration tests.
@@ -258,6 +267,11 @@ impl MockStorage {
         self.inner.lock().unwrap().last_global_rejoin_attempt_at_ms
     }
 
+    #[allow(dead_code)]
+    pub fn startup_probe_counts(&self) -> StartupProbeCounts {
+        self.inner.lock().unwrap().startup_probe_counts
+    }
+
     /// Directly seed a persisted backoff entry, simulating state written by a
     /// previous process (restart/TTL tests).
     #[allow(dead_code)]
@@ -420,7 +434,8 @@ impl MLSStorageBackend for MockStorage {
     }
 
     async fn list_conversations(&self, user_did: &str) -> Result<Vec<ConversationView>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.startup_probe_counts.list_conversations += 1;
         let views = inner
             .conversations
             .values()
@@ -627,7 +642,8 @@ impl MLSStorageBackend for MockStorage {
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationState>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.startup_probe_counts.get_conversation_state += 1;
         // Prefer the explicit reset_pending row when present so the rehydrated
         // state carries the payload regardless of whether
         // `set_conversation_state` was also called (matches the iOS/GRDB
@@ -781,7 +797,8 @@ impl MLSStorageBackend for MockStorage {
     // ── RecoveryTracker persistence (WS-5.4 / E7) ────────────────────────
 
     async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.startup_probe_counts.get_recovery_state += 1;
         Ok(PersistedRecoveryState {
             entries: inner.recovery_backoff.values().cloned().collect(),
             last_global_rejoin_attempt_at_ms: inner.last_global_rejoin_attempt_at_ms,
@@ -833,7 +850,8 @@ impl MLSStorageBackend for MockStorage {
     }
 
     async fn list_pending_local_deletes(&self) -> Result<Vec<PendingLocalDelete>> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        inner.startup_probe_counts.list_pending_local_deletes += 1;
         Ok(inner.pending_local_deletes.values().cloned().collect())
     }
 

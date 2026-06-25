@@ -369,6 +369,14 @@ where
         Ok(())
     }
 
+    /// Resume the orchestrator after a lifecycle suspend without replaying the
+    /// full startup hydration / recovery path.
+    pub async fn resume_after_suspend(&self, user_did: &str) {
+        tracing::info!(user_did, "Resuming MLS orchestrator after suspend");
+        *self.user_did.lock().await = Some(user_did.to_string());
+        *self.shutting_down.lock().await = false;
+    }
+
     /// Shut down the orchestrator, releasing resources.
     pub async fn shutdown(&self) {
         tracing::info!("Shutting down MLS orchestrator");
