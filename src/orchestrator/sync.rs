@@ -93,17 +93,27 @@ where
                 continue;
             }
 
-            if self.local_group_epoch(&convo_id).await.is_some() {
-                report.healthy += 1;
-                continue;
+            match self.local_group_epoch_result(&convo_id).await {
+                Ok(Some(_)) => {
+                    report.healthy += 1;
+                    continue;
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        conversation_id = %convo_id,
+                        "Startup reconcile marked missing local group for rejoin"
+                    );
+                    self.project_startup_needs_rejoin(&convo_id).await;
+                    report.needs_rejoin += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        conversation_id = %convo_id,
+                        error = %err,
+                        "Startup reconcile preserved existing state after local epoch probe failed"
+                    );
+                }
             }
-
-            tracing::info!(
-                conversation_id = %convo_id,
-                "Startup reconcile marked missing local group for rejoin"
-            );
-            self.project_startup_needs_rejoin(&convo_id).await;
-            report.needs_rejoin += 1;
         }
 
         Ok(report)

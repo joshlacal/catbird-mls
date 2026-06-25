@@ -228,3 +228,40 @@ async fn startup_reconcile_preserves_reset_pending_and_unrecoverable_states_in_r
         "unrecoverable conversations must not be re-flagged as needs_rejoin"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_reconcile_does_not_mark_rejoin_when_local_epoch_probe_returns_context_closed() {
+    let fixture = StartupReconcileFixture::new();
+    fixture
+        .persist_local_group("convo-context-closed", ConversationState::Active)
+        .await;
+
+    fixture
+        .engine
+        .initialize_user(fixture.did)
+        .expect("initialize_user");
+    fixture
+        .context
+        .flush_and_prepare_close()
+        .expect("flush_and_prepare_close");
+
+    let report = fixture
+        .engine
+        .startup_reconcile()
+        .expect("startup_reconcile");
+
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.healthy, 0);
+    assert_eq!(report.needs_rejoin, 0);
+    assert_eq!(report.reset_pending, 0);
+    assert_eq!(report.unrecoverable_local, 0);
+    assert!(
+        !fixture.storage.has_rejoin_flag("convo-context-closed"),
+        "context lifecycle errors must not be reclassified as missing local groups"
+    );
+    assert_eq!(
+        fixture.storage.get_current_state("convo-context-closed"),
+        Some(ConversationState::Active),
+        "startup reconcile must preserve the existing persisted state on context errors"
+    );
+}

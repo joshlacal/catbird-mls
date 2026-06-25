@@ -1394,6 +1394,21 @@ where
         self.mls_context().get_epoch(group_id_bytes).ok()
     }
 
+    pub(crate) async fn local_group_epoch_result(
+        &self,
+        convo_id: &str,
+    ) -> std::result::Result<Option<u64>, crate::MLSError> {
+        let Some(group_id_bytes) = self.group_id_bytes_for_conversation(convo_id).await else {
+            return Ok(None);
+        };
+
+        match self.mls_context().get_epoch(group_id_bytes) {
+            Ok(epoch) => Ok(Some(epoch)),
+            Err(crate::MLSError::GroupNotFound { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Best-effort helper that returns the hex-encoded epoch_authenticator for
     /// the group currently bound to `convo_id`.
     ///
