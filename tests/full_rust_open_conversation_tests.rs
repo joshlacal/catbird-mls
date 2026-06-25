@@ -180,6 +180,78 @@ async fn needs_rejoin_returns_recovery_vocabulary_instead_of_generic_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn join_or_rejoin_failure_returns_non_ready_non_healthy_result() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    let _alice_did = world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("Recovery failure", Some(&[bob_did.clone()]), None)
+        .await
+        .expect("create_group failed");
+
+    world.delivery_service().fail_next_get_welcome();
+    world
+        .delivery_service()
+        .clear_group_info_for_test(&convo.conversation_id);
+
+    let result = bob
+        .orchestrator
+        .ensure_conversation_ready(&convo.conversation_id)
+        .await
+        .expect("non-ready recovery state should be returned instead of a generic failure");
+
+    assert!(!result.send_allowed);
+    assert_ne!(result.recovery_state, ConversationRecoveryState::Healthy);
+    assert_eq!(result.epoch, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn known_non_ready_state_survives_local_epoch_probe_errors() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Closed context", None, None)
+        .await
+        .expect("create_group failed");
+
+    alice
+        .orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .insert(convo.conversation_id.clone(), ConversationState::Failed);
+
+    alice
+        .orchestrator
+        .mls_context()
+        .flush_and_prepare_close()
+        .expect("closing test context should succeed");
+
+    let result = alice
+        .orchestrator
+        .ensure_conversation_ready(&convo.conversation_id)
+        .await
+        .expect("known non-ready states should survive epoch probe failures");
+
+    assert_eq!(
+        result.recovery_state,
+        ConversationRecoveryState::UnrecoverableLocal
+    );
+    assert_eq!(result.epoch, None);
+    assert!(!result.send_allowed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unrecoverable_local_returns_recovery_vocabulary_without_attempting_rejoin() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;

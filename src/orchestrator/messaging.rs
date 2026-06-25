@@ -18,6 +18,24 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    fn ready_result(
+        recovery_state: ConversationRecoveryState,
+        epoch: Option<u64>,
+    ) -> ConversationReadyResult {
+        let normalized_state =
+            if recovery_state == ConversationRecoveryState::Healthy && epoch.is_none() {
+                ConversationRecoveryState::GroupMissing
+            } else {
+                recovery_state
+            };
+
+        ConversationReadyResult {
+            recovery_state: normalized_state,
+            epoch,
+            send_allowed: normalized_state == ConversationRecoveryState::Healthy && epoch.is_some(),
+        }
+    }
+
     /// Send a text message to a conversation.
     ///
     /// 1. Encrypts the message via MLS FFI
@@ -82,25 +100,18 @@ where
         self.require_user_did().await?;
 
         let projected = self.project_conversation_recovery_state(convo_id).await;
-        let local_epoch = self.local_group_epoch_result(convo_id).await?;
-
-        if projected == ConversationRecoveryState::Healthy && local_epoch.is_some() {
-            return Ok(ConversationReadyResult {
-                recovery_state: projected,
-                epoch: local_epoch,
-                send_allowed: true,
-            });
-        }
 
         if matches!(
             projected,
             ConversationRecoveryState::Recovering | ConversationRecoveryState::UnrecoverableLocal
         ) {
-            return Ok(ConversationReadyResult {
-                recovery_state: projected,
-                epoch: local_epoch,
-                send_allowed: false,
-            });
+            return Ok(Self::ready_result(projected, None));
+        }
+
+        let local_epoch = self.local_group_epoch_result(convo_id).await?;
+
+        if projected == ConversationRecoveryState::Healthy && local_epoch.is_some() {
+            return Ok(Self::ready_result(projected, local_epoch));
         }
 
         match self.join_or_rejoin(convo_id).await {
@@ -110,23 +121,14 @@ where
                     .local_group_epoch_result(convo_id)
                     .await?
                     .or(Some(epoch));
-                Ok(ConversationReadyResult {
-                    recovery_state: projected,
-                    epoch,
-                    send_allowed: projected == ConversationRecoveryState::Healthy
-                        && epoch.is_some(),
-                })
+                Ok(Self::ready_result(projected, epoch))
             }
             Err(OrchestratorError::NotAuthenticated) => Err(OrchestratorError::NotAuthenticated),
             Err(OrchestratorError::ShuttingDown) => Err(OrchestratorError::ShuttingDown),
             Err(_) => {
                 let projected = self.project_conversation_recovery_state(convo_id).await;
                 let epoch = self.local_group_epoch_result(convo_id).await?;
-                Ok(ConversationReadyResult {
-                    recovery_state: projected,
-                    epoch,
-                    send_allowed: false,
-                })
+                Ok(Self::ready_result(projected, epoch))
             }
         }
     }
