@@ -762,48 +762,24 @@ where
                 }
             };
             if needs_rejoin {
-                let current_epoch = hex::decode(group_id)
-                    .ok()
-                    .and_then(|gid_bytes| self.mls_context().get_epoch(gid_bytes).ok());
-
-                if current_epoch.is_some_and(|epoch| epoch >= convo.epoch) {
-                    tracing::info!(
-                        conversation_id = %conversation_id,
-                        group_id = %group_id,
-                        local_epoch = current_epoch.unwrap_or_default(),
-                        server_epoch = convo.epoch,
-                        "Clearing stale needs_rejoin flag; local MLS group is already caught up"
-                    );
-                    // No rejoin happened here, so this housekeeping must not
-                    // arm the global rejoin gate (see clear_stale_rejoin_state).
-                    // A failing flag-clear is escalated and the tracker clear
-                    // is skipped for this pass: this branch re-fires every
-                    // SYNC_INTERVAL_SECS while the flag persists, and clearing
-                    // tracker state without clearing the flag would loop.
-                    if let Err(e) = self.storage().clear_rejoin_flag(conversation_id).await {
-                        self.report_recovery_storage_failure(
-                            conversation_id,
-                            "clear_rejoin_flag",
-                            &e,
-                        )
-                        .await;
-                    } else {
-                        self.clear_stale_rejoin_state(conversation_id).await;
-                    }
-                    continue;
-                }
-
                 tracing::info!(
                     conversation_id = %conversation_id,
                     group_id = %group_id,
                     "Group flagged for rejoin — attempting in sync"
                 );
-                if !sync_rejoin_attempted.contains(conversation_id)
-                    && self.should_attempt_sync_rejoin(conversation_id).await
-                {
-                    sync_rejoin_attempted.insert(conversation_id.to_string());
-                    match self.join_or_rejoin(conversation_id).await {
-                        Ok(epoch) => {
+                if !sync_rejoin_attempted.contains(conversation_id) {
+                    match self
+                        .consume_deferred_recovery_for_conversation(
+                            conversation_id,
+                            Some(convo.epoch),
+                            Some(group_id),
+                        )
+                        .await
+                    {
+                        Ok(super::recovery::DeferredRecoveryOutcome::ClearedStale) => continue,
+                        Ok(super::recovery::DeferredRecoveryOutcome::Skipped) => {}
+                        Ok(super::recovery::DeferredRecoveryOutcome::Recovered(epoch)) => {
+                            sync_rejoin_attempted.insert(conversation_id.to_string());
                             tracing::info!(
                                 conversation_id = %conversation_id,
                                 group_id = %group_id,
@@ -812,6 +788,7 @@ where
                             );
                         }
                         Err(e) => {
+                            sync_rejoin_attempted.insert(conversation_id.to_string());
                             tracing::warn!(
                                 conversation_id = %conversation_id,
                                 group_id = %group_id,

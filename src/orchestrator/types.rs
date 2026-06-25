@@ -197,6 +197,16 @@ pub struct StartupReconcileReport {
     pub unrecoverable_local: u32,
 }
 
+/// Diagnostics summary from a Rust-owned deferred-recovery sweep.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredRecoveryReport {
+    pub scanned: u32,
+    pub attempted: u32,
+    pub recovered: u32,
+    pub skipped: u32,
+    pub failed: u32,
+}
+
 /// Result of recording a server reset event into local deferred-recovery state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResetRecordOutcome {

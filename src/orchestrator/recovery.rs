@@ -17,6 +17,12 @@ use super::welcome_recovery::{
     LastRecoveryError, WelcomeRecoveryDecision, WelcomeRecoveryInput,
 };
 
+pub(crate) enum DeferredRecoveryOutcome {
+    ClearedStale,
+    Skipped,
+    Recovered(u64),
+}
+
 /// Snapshot of a conversation's `ResetPending` payload for use inside the
 /// recovery loop. Mirrors the variant on `ConversationState::ResetPending`
 /// without dragging the full enum into call sites that only need to inspect
@@ -1000,6 +1006,159 @@ where
         crate::info_log!("[gate] convo={} ACCEPT: proceeding with rejoin", convo_id);
 
         true
+    }
+
+    fn state_requires_deferred_recovery(state: &ConversationState) -> bool {
+        matches!(
+            state,
+            ConversationState::NeedsRejoin | ConversationState::ResetPending { .. }
+        )
+    }
+
+    pub(crate) async fn consume_deferred_recovery_for_conversation(
+        &self,
+        convo_id: &str,
+        server_epoch: Option<u64>,
+        server_group_id: Option<&str>,
+    ) -> Result<DeferredRecoveryOutcome> {
+        if let Some(server_epoch) = server_epoch {
+            let candidate_group_id = if let Some(server_group_id) = server_group_id {
+                Some(server_group_id.to_string())
+            } else {
+                self.group_states()
+                    .lock()
+                    .await
+                    .get(convo_id)
+                    .map(|state| state.group_id.clone())
+            };
+            let current_epoch = {
+                candidate_group_id
+                    .and_then(|group_id| hex::decode(group_id).ok())
+                    .and_then(|gid_bytes| self.mls_context().get_epoch(gid_bytes).ok())
+            };
+
+            if current_epoch.is_some_and(|epoch| epoch >= server_epoch) {
+                tracing::info!(
+                    conversation_id = %convo_id,
+                    local_epoch = current_epoch.unwrap_or_default(),
+                    server_epoch,
+                    "Clearing stale needs_rejoin flag; local MLS group is already caught up"
+                );
+                if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
+                    self.report_recovery_storage_failure(convo_id, "clear_rejoin_flag", &e)
+                        .await;
+                } else {
+                    self.clear_stale_rejoin_state(convo_id).await;
+                }
+                return Ok(DeferredRecoveryOutcome::ClearedStale);
+            }
+        }
+
+        if !self.should_attempt_sync_rejoin(convo_id).await {
+            return Ok(DeferredRecoveryOutcome::Skipped);
+        }
+
+        let epoch = self.join_or_rejoin(convo_id).await?;
+        Ok(DeferredRecoveryOutcome::Recovered(epoch))
+    }
+
+    pub async fn run_deferred_recovery(&self, reason: &str) -> Result<DeferredRecoveryReport> {
+        self.check_shutdown().await?;
+        let user_did = self.require_user_did().await?;
+        let conversations = self.storage().list_conversations(&user_did).await?;
+        let mut report = DeferredRecoveryReport {
+            scanned: conversations.len() as u32,
+            ..DeferredRecoveryReport::default()
+        };
+
+        tracing::info!(
+            reason,
+            scanned = report.scanned,
+            "Starting Rust-owned deferred recovery sweep"
+        );
+
+        for convo in conversations {
+            let convo_id = convo.conversation_id;
+            let persisted_state = match self.storage().get_conversation_state(&convo_id).await {
+                Ok(state) => state,
+                Err(e) => {
+                    tracing::warn!(
+                        conversation_id = %convo_id,
+                        error = %e,
+                        "Failed to read persisted conversation state during deferred recovery sweep"
+                    );
+                    self.conversation_states()
+                        .lock()
+                        .await
+                        .get(&convo_id)
+                        .cloned()
+                }
+            };
+
+            let needs_rejoin = match self.storage().needs_rejoin(&convo_id).await {
+                Ok(flag) => flag,
+                Err(e) => {
+                    tracing::warn!(
+                        conversation_id = %convo_id,
+                        error = %e,
+                        "needs_rejoin read failed during deferred recovery sweep"
+                    );
+                    false
+                }
+            };
+
+            let in_memory_state = if persisted_state.is_none() {
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .get(&convo_id)
+                    .cloned()
+            } else {
+                None
+            };
+
+            let state_requires_recovery = persisted_state
+                .as_ref()
+                .is_some_and(Self::state_requires_deferred_recovery)
+                || in_memory_state
+                    .as_ref()
+                    .is_some_and(Self::state_requires_deferred_recovery);
+
+            if !needs_rejoin && !state_requires_recovery {
+                continue;
+            }
+
+            match self
+                .consume_deferred_recovery_for_conversation(&convo_id, None, None)
+                .await
+            {
+                Ok(DeferredRecoveryOutcome::ClearedStale | DeferredRecoveryOutcome::Skipped) => {
+                    report.skipped += 1;
+                }
+                Ok(DeferredRecoveryOutcome::Recovered(epoch)) => {
+                    report.attempted += 1;
+                    report.recovered += 1;
+                    tracing::info!(
+                        conversation_id = %convo_id,
+                        epoch,
+                        reason,
+                        "Deferred recovery succeeded"
+                    );
+                }
+                Err(err) => {
+                    report.attempted += 1;
+                    report.failed += 1;
+                    tracing::warn!(
+                        conversation_id = %convo_id,
+                        error = %err,
+                        reason,
+                        "Deferred recovery attempt failed"
+                    );
+                }
+            }
+        }
+
+        Ok(report)
     }
 
     async fn enforce_rejoin_backoff(&self, convo_id: &str) -> Result<()> {

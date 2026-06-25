@@ -93,6 +93,8 @@ struct MockState {
     group_infos: HashMap<String, Vec<u8>>,
     /// Number of get_group_info calls per conversation.
     get_group_info_calls: HashMap<String, u32>,
+    /// Number of get_welcome calls per conversation.
+    get_welcome_calls: HashMap<String, u32>,
     /// Number of external commits processed per conversation.
     external_commit_counts: HashMap<String, u32>,
     /// Artificial delay for process_external_commit (used by concurrency tests).
@@ -396,6 +398,17 @@ impl MockDeliveryService {
             .lock()
             .unwrap()
             .get_group_info_calls
+            .get(convo_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Number of Welcome fetches for a conversation.
+    pub fn welcome_fetch_count(&self, convo_id: &str) -> u32 {
+        self.state
+            .lock()
+            .unwrap()
+            .get_welcome_calls
             .get(convo_id)
             .copied()
             .unwrap_or(0)
@@ -1050,6 +1063,10 @@ impl MLSAPIClient for MockDeliveryService {
 
     async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
         let mut guard = self.state.lock().unwrap();
+        *guard
+            .get_welcome_calls
+            .entry(convo_id.to_string())
+            .or_default() += 1;
         check_fail(
             &mut guard.failures.fail_next_get_welcome,
             "injected get_welcome failure",

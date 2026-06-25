@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use crate::orchestrator::{
     AddMembersServerResult, ConversationListPage, ConversationMetadata, ConversationState,
-    ConversationView, CreateConversationResult, CredentialStore, DeviceInfo, GroupState,
-    IncomingEnvelope, JoinMethod, KeyPackageRef, KeyPackageStats, KeyPackageSyncResult,
-    MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView, Message,
-    OrchestratorConfig, OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff,
+    ConversationView, CreateConversationResult, CredentialStore, DeferredRecoveryReport,
+    DeviceInfo, GroupState, IncomingEnvelope, JoinMethod, KeyPackageRef, KeyPackageStats,
+    KeyPackageSyncResult, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView,
+    Message, OrchestratorConfig, OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff,
     PersistedRecoveryState, ProcessExternalCommitResult, ResetRecordOutcome, SendMessageResponse,
     StartupReconcileReport, SyncCursor,
 };
@@ -873,6 +873,27 @@ impl From<StartupReconcileReport> for FFIStartupReconcileReport {
             needs_rejoin: value.needs_rejoin,
             reset_pending: value.reset_pending,
             unrecoverable_local: value.unrecoverable_local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FFIDeferredRecoveryReport {
+    pub scanned: u32,
+    pub attempted: u32,
+    pub recovered: u32,
+    pub skipped: u32,
+    pub failed: u32,
+}
+
+impl From<DeferredRecoveryReport> for FFIDeferredRecoveryReport {
+    fn from(value: DeferredRecoveryReport) -> Self {
+        Self {
+            scanned: value.scanned,
+            attempted: value.attempted,
+            recovered: value.recovered,
+            skipped: value.skipped,
+            failed: value.failed,
         }
     }
 }
@@ -2321,6 +2342,13 @@ impl OrchestratorBridge {
 
     pub fn startup_reconcile(&self) -> Result<FFIStartupReconcileReport, OrchestratorBridgeError> {
         Ok(self.engine.startup_reconcile()?.into())
+    }
+
+    pub fn run_deferred_recovery(
+        &self,
+        reason: String,
+    ) -> Result<FFIDeferredRecoveryReport, OrchestratorBridgeError> {
+        Ok(self.engine.run_deferred_recovery(&reason)?.into())
     }
 
     // -- Key Packages --
