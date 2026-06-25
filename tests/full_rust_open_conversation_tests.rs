@@ -180,6 +180,94 @@ async fn needs_rejoin_returns_recovery_vocabulary_instead_of_generic_error() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn needs_rejoin_survives_local_epoch_probe_errors() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Needs rejoin closed context", None, None)
+        .await
+        .expect("create_group failed");
+
+    alice
+        .orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .insert(
+            convo.conversation_id.clone(),
+            ConversationState::NeedsRejoin,
+        );
+
+    alice
+        .orchestrator
+        .mls_context()
+        .flush_and_prepare_close()
+        .expect("closing test context should succeed");
+
+    let result = alice
+        .orchestrator
+        .ensure_conversation_ready(&convo.conversation_id)
+        .await
+        .expect("needs-rejoin should survive epoch probe failures");
+
+    assert_eq!(
+        result,
+        ConversationReadyResult {
+            recovery_state: ConversationRecoveryState::NeedsRejoin,
+            epoch: None,
+            send_allowed: false,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_pending_survives_local_epoch_probe_errors() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Reset pending closed context", None, None)
+        .await
+        .expect("create_group failed");
+
+    let new_group_id =
+        hex::decode("11223344556677889900aabbccddeeff").expect("fixture must be valid hex");
+    alice
+        .orchestrator
+        .record_group_reset(&convo.conversation_id, new_group_id, 1)
+        .await
+        .expect("record_group_reset failed");
+
+    alice
+        .orchestrator
+        .mls_context()
+        .flush_and_prepare_close()
+        .expect("closing test context should succeed");
+
+    let result = alice
+        .orchestrator
+        .ensure_conversation_ready(&convo.conversation_id)
+        .await
+        .expect("reset-pending should survive epoch probe failures");
+
+    assert_eq!(
+        result,
+        ConversationReadyResult {
+            recovery_state: ConversationRecoveryState::ResetPending,
+            epoch: None,
+            send_allowed: false,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn join_or_rejoin_failure_returns_non_ready_non_healthy_result() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;

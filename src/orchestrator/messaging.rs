@@ -108,7 +108,19 @@ where
             return Ok(Self::ready_result(projected, None));
         }
 
-        let local_epoch = self.local_group_epoch_result(convo_id).await?;
+        let local_epoch = match self.local_group_epoch_result(convo_id).await {
+            Ok(epoch) => epoch,
+            Err(err)
+                if matches!(
+                    projected,
+                    ConversationRecoveryState::NeedsRejoin
+                        | ConversationRecoveryState::ResetPending
+                ) =>
+            {
+                return Ok(Self::ready_result(projected, None));
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         if projected == ConversationRecoveryState::Healthy && local_epoch.is_some() {
             return Ok(Self::ready_result(projected, local_epoch));
@@ -127,7 +139,19 @@ where
             Err(OrchestratorError::ShuttingDown) => Err(OrchestratorError::ShuttingDown),
             Err(_) => {
                 let projected = self.project_conversation_recovery_state(convo_id).await;
-                let epoch = self.local_group_epoch_result(convo_id).await?;
+                let epoch = match self.local_group_epoch_result(convo_id).await {
+                    Ok(epoch) => epoch,
+                    Err(err)
+                        if matches!(
+                            projected,
+                            ConversationRecoveryState::NeedsRejoin
+                                | ConversationRecoveryState::ResetPending
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(err) => return Err(err.into()),
+                };
                 Ok(Self::ready_result(projected, epoch))
             }
         }
