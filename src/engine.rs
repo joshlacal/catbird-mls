@@ -219,6 +219,26 @@ where
         Ok(())
     }
 
+    pub fn reattach_after_suspend(&self, user_did: &str, reason: &str) -> Result<()> {
+        if self
+            .current_orchestrator_user_did()?
+            .as_deref()
+            .is_some_and(|did| did != user_did)
+        {
+            crate::async_runtime::block_on(self.orchestrator.shutdown());
+        }
+
+        self.lifecycle
+            .platform()
+            .resume(self.orchestrator.mls_context().as_ref(), reason);
+        crate::async_runtime::block_on(self.orchestrator.resume_after_suspend(user_did));
+        *self.lock_state()? = EngineState {
+            phase: EnginePhase::Initialized,
+            initialized_user_did: Some(user_did.to_string()),
+        };
+        Ok(())
+    }
+
     pub fn interrupt_storage(&self, reason: &str) -> Result<usize> {
         Ok(self
             .lifecycle

@@ -261,3 +261,68 @@ fn emergency_close_requires_fresh_initialize_before_resume() {
         "shutdown engine must keep work gated until a fresh initialize"
     );
 }
+
+#[test]
+fn reattach_after_suspend_on_fresh_engine_restores_initialized_phase_without_startup_replay() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let db_path = temp_dir.path().join("mls.db");
+    let storage = Arc::new(MockStorage::new());
+
+    let first_context = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        "test-key".to_string(),
+        Box::new(InMemoryKeychain::new()),
+    )
+    .expect("first MLSContext");
+    let first_engine = MlsEngine::new(
+        first_context,
+        Arc::clone(&storage),
+        Arc::new(MockDeliveryService::new("did:plc:test")),
+        Arc::new(MockCredentials::new()),
+        Arc::new(EngineLifecycle::default()),
+        OrchestratorConfig::default(),
+    );
+
+    first_engine
+        .initialize_user("did:plc:test")
+        .expect("initialize first engine");
+    first_engine
+        .prepare_for_suspend("unit-test", std::time::Duration::from_millis(250))
+        .expect("prepare first engine for suspend");
+    first_engine
+        .emergency_close("unit-test")
+        .expect("close first engine");
+
+    let second_context = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        "test-key".to_string(),
+        Box::new(InMemoryKeychain::new()),
+    )
+    .expect("second MLSContext");
+    let second_engine = MlsEngine::new(
+        second_context,
+        Arc::clone(&storage),
+        Arc::new(MockDeliveryService::new("did:plc:test")),
+        Arc::new(MockCredentials::new()),
+        Arc::new(EngineLifecycle::default()),
+        OrchestratorConfig::default(),
+    );
+
+    let startup_probes_before_reattach = storage.startup_probe_counts();
+
+    second_engine
+        .reattach_after_suspend("did:plc:test", "unit-test")
+        .expect("reattach suspended engine");
+
+    assert_eq!(
+        storage.startup_probe_counts(),
+        startup_probes_before_reattach,
+        "reattach must not replay initialize-time hydration or recovery probes"
+    );
+
+    let sync_after_reattach = second_engine.sync(false).expect("sync after reattach");
+    assert_eq!(
+        sync_after_reattach.performed_sync, true,
+        "reattach should restore initialized engine state on a fresh runtime"
+    );
+}

@@ -2707,6 +2707,15 @@ impl OrchestratorBridge {
         })
     }
 
+    pub fn reattach_after_suspend(
+        &self,
+        user_did: String,
+        reason: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        self.engine.reattach_after_suspend(&user_did, &reason)?;
+        Ok(())
+    }
+
     pub fn resume_from_suspend(&self, reason: String) -> Result<(), OrchestratorBridgeError> {
         self.engine.resume_from_suspend(&reason)?;
         Ok(())
