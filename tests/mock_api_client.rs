@@ -97,6 +97,8 @@ struct MockState {
     get_welcome_calls: HashMap<String, u32>,
     /// Number of external commits processed per conversation.
     external_commit_counts: HashMap<String, u32>,
+    /// Number of bootstrap_reset_group attempts per conversation.
+    bootstrap_reset_group_calls: HashMap<String, u32>,
     /// Artificial delay for process_external_commit (used by concurrency tests).
     process_external_commit_delay_ms: u64,
 
@@ -414,6 +416,20 @@ impl MockDeliveryService {
             .unwrap_or(0)
     }
 
+    pub fn bootstrap_reset_group_call_count(&self, convo_id: &str) -> u32 {
+        self.state
+            .lock()
+            .unwrap()
+            .bootstrap_reset_group_calls
+            .get(convo_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn clear_group_info_for_test(&self, convo_id: &str) {
+        self.state.lock().unwrap().group_infos.remove(convo_id);
+    }
+
     /// Set an artificial delay for `process_external_commit`.
     pub fn set_process_external_commit_delay_ms(&self, delay_ms: u64) {
         self.state.lock().unwrap().process_external_commit_delay_ms = delay_ms;
@@ -629,6 +645,25 @@ impl MLSAPIClient for MockDeliveryService {
             commit_data: commit_data.map(|d| d.to_vec()),
             welcome_data: welcome_data.map(|d| d.to_vec()),
         })
+    }
+
+    async fn bootstrap_reset_group(
+        &self,
+        original_convo_id: &str,
+        _new_group_id: &str,
+        _cipher_suite: &str,
+        _group_info: &[u8],
+        _members: &[String],
+        _welcome_message: Option<&[u8]>,
+    ) -> Result<CreateConversationResult> {
+        let mut guard = self.state.lock().unwrap();
+        *guard
+            .bootstrap_reset_group_calls
+            .entry(original_convo_id.to_string())
+            .or_default() += 1;
+        Err(OrchestratorError::Api(
+            "bootstrap_reset_group not implemented".to_string(),
+        ))
     }
 
     async fn leave_conversation(&self, convo_id: &str) -> Result<()> {

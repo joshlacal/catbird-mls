@@ -2,8 +2,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::orchestrator::{
-    CredentialStore, DeferredRecoveryReport, MLSAPIClient, MLSOrchestrator, MLSStorageBackend,
-    MlsCryptoContext, OrchestratorConfig, OrchestratorError, Result, StartupReconcileReport,
+    ConversationReadyResult, CredentialStore, DeferredRecoveryReport, MLSAPIClient,
+    MLSOrchestrator, MLSStorageBackend, MlsCryptoContext, OrchestratorConfig, OrchestratorError,
+    Result, StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 
@@ -166,6 +167,12 @@ where
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.run_deferred_recovery(reason))
+    }
+
+    pub fn ensure_conversation_ready(&self, convo_id: &str) -> Result<ConversationReadyResult> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.ensure_conversation_ready(convo_id))
     }
 
     pub fn shutdown(&self, reason: ShutdownReason) -> Result<()> {

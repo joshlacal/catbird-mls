@@ -207,6 +207,26 @@ pub struct DeferredRecoveryReport {
     pub failed: u32,
 }
 
+/// Projection of orchestrator/local-group health into the client recovery vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConversationRecoveryState {
+    Healthy,
+    EpochBehind,
+    GroupMissing,
+    NeedsRejoin,
+    Recovering,
+    UnrecoverableLocal,
+    ResetPending,
+}
+
+/// Result of checking whether one conversation is ready for open/send work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationReadyResult {
+    pub recovery_state: ConversationRecoveryState,
+    pub epoch: Option<u64>,
+    pub send_allowed: bool,
+}
+
 /// Result of recording a server reset event into local deferred-recovery state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResetRecordOutcome {

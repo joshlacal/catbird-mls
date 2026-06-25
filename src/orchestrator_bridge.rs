@@ -857,6 +857,13 @@ pub struct FFIJoinOrRejoinResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FFIConversationReadyResult {
+    pub recovery_state: FFIConversationRecoveryState,
+    pub epoch: Option<u64>,
+    pub send_allowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FFIStartupReconcileReport {
     pub scanned: u32,
     pub healthy: u32,
@@ -898,6 +905,16 @@ impl From<DeferredRecoveryReport> for FFIDeferredRecoveryReport {
     }
 }
 
+impl From<crate::orchestrator::ConversationReadyResult> for FFIConversationReadyResult {
+    fn from(value: crate::orchestrator::ConversationReadyResult) -> Self {
+        Self {
+            recovery_state: ffi_conversation_recovery_state(value.recovery_state),
+            epoch: value.epoch,
+            send_allowed: value.send_allowed,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FFIResetRecordOutcome {
     Recorded,
@@ -915,17 +932,30 @@ impl From<ResetRecordOutcome> for FFIResetRecordOutcome {
     }
 }
 
-fn project_conversation_recovery_state(
-    state: Option<&ConversationState>,
+fn ffi_conversation_recovery_state(
+    state: crate::orchestrator::ConversationRecoveryState,
 ) -> FFIConversationRecoveryState {
     match state {
-        None | Some(ConversationState::Active) => FFIConversationRecoveryState::Healthy,
-        Some(ConversationState::Initializing) => FFIConversationRecoveryState::Recovering,
-        Some(ConversationState::ForkDetected) => FFIConversationRecoveryState::EpochBehind,
-        Some(ConversationState::NeedsRejoin) => FFIConversationRecoveryState::NeedsRejoin,
-        Some(ConversationState::ResetPending { .. }) => FFIConversationRecoveryState::ResetPending,
-        Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
+        crate::orchestrator::ConversationRecoveryState::Healthy => {
+            FFIConversationRecoveryState::Healthy
+        }
+        crate::orchestrator::ConversationRecoveryState::EpochBehind => {
+            FFIConversationRecoveryState::EpochBehind
+        }
+        crate::orchestrator::ConversationRecoveryState::GroupMissing => {
+            FFIConversationRecoveryState::GroupMissing
+        }
+        crate::orchestrator::ConversationRecoveryState::NeedsRejoin => {
+            FFIConversationRecoveryState::NeedsRejoin
+        }
+        crate::orchestrator::ConversationRecoveryState::Recovering => {
+            FFIConversationRecoveryState::Recovering
+        }
+        crate::orchestrator::ConversationRecoveryState::UnrecoverableLocal => {
             FFIConversationRecoveryState::UnrecoverableLocal
+        }
+        crate::orchestrator::ConversationRecoveryState::ResetPending => {
+            FFIConversationRecoveryState::ResetPending
         }
     }
 }
@@ -934,37 +964,11 @@ async fn project_conversation_recovery_state_for(
     inner: &ConcreteOrchestrator,
     conversation_id: &str,
 ) -> FFIConversationRecoveryState {
-    let state = inner
-        .conversation_states()
-        .lock()
-        .await
-        .get(conversation_id)
-        .cloned();
-    let projected = project_conversation_recovery_state(state.as_ref());
-
-    if projected != FFIConversationRecoveryState::Healthy {
-        return projected;
-    }
-
-    let group_id = inner
-        .group_states()
-        .lock()
-        .await
-        .values()
-        .find(|group| group.conversation_id == conversation_id)
-        .map(|group| group.group_id.clone());
-
-    let Some(group_id) = group_id else {
-        return projected;
-    };
-    let Ok(group_id_bytes) = hex::decode(&group_id) else {
-        return projected;
-    };
-
-    match inner.mls_context().get_epoch(group_id_bytes) {
-        Ok(_) => projected,
-        Err(_) => FFIConversationRecoveryState::GroupMissing,
-    }
+    ffi_conversation_recovery_state(
+        inner
+            .project_conversation_recovery_state(conversation_id)
+            .await,
+    )
 }
 
 impl From<OrchestratorError> for OrchestratorBridgeError {
@@ -2454,6 +2458,15 @@ impl OrchestratorBridge {
                 recovery_state,
             })
         })
+    }
+
+    /// Ensure one conversation is ready for open/send work using the same
+    /// recovery ordering as the Rust recovery pipeline.
+    pub fn ensure_conversation_ready(
+        &self,
+        convo_id: String,
+    ) -> Result<FFIConversationReadyResult, OrchestratorBridgeError> {
+        Ok(self.engine.ensure_conversation_ready(&convo_id)?.into())
     }
 
     /// Project the orchestrator's current conversation recovery state into the

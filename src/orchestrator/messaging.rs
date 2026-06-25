@@ -28,6 +28,109 @@ where
             .await
     }
 
+    pub(crate) async fn project_conversation_recovery_state(
+        &self,
+        conversation_id: &str,
+    ) -> ConversationRecoveryState {
+        let state = self
+            .conversation_states()
+            .lock()
+            .await
+            .get(conversation_id)
+            .cloned();
+        let projected = match state.as_ref() {
+            None | Some(ConversationState::Active) => ConversationRecoveryState::Healthy,
+            Some(ConversationState::Initializing) => ConversationRecoveryState::Recovering,
+            Some(ConversationState::ForkDetected) => ConversationRecoveryState::EpochBehind,
+            Some(ConversationState::NeedsRejoin) => ConversationRecoveryState::NeedsRejoin,
+            Some(ConversationState::ResetPending { .. }) => ConversationRecoveryState::ResetPending,
+            Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
+                ConversationRecoveryState::UnrecoverableLocal
+            }
+        };
+
+        if projected != ConversationRecoveryState::Healthy {
+            return projected;
+        }
+
+        let group_id = self
+            .group_states()
+            .lock()
+            .await
+            .values()
+            .find(|group| group.conversation_id == conversation_id)
+            .map(|group| group.group_id.clone());
+
+        let Some(group_id) = group_id else {
+            return projected;
+        };
+        let Ok(group_id_bytes) = hex::decode(&group_id) else {
+            return projected;
+        };
+
+        match self.mls_context().get_epoch(group_id_bytes) {
+            Ok(_) => projected,
+            Err(_) => ConversationRecoveryState::GroupMissing,
+        }
+    }
+
+    pub async fn ensure_conversation_ready(
+        &self,
+        convo_id: &str,
+    ) -> Result<ConversationReadyResult> {
+        self.check_shutdown().await?;
+        self.require_user_did().await?;
+
+        let projected = self.project_conversation_recovery_state(convo_id).await;
+        let local_epoch = self.local_group_epoch_result(convo_id).await?;
+
+        if projected == ConversationRecoveryState::Healthy && local_epoch.is_some() {
+            return Ok(ConversationReadyResult {
+                recovery_state: projected,
+                epoch: local_epoch,
+                send_allowed: true,
+            });
+        }
+
+        if matches!(
+            projected,
+            ConversationRecoveryState::Recovering | ConversationRecoveryState::UnrecoverableLocal
+        ) {
+            return Ok(ConversationReadyResult {
+                recovery_state: projected,
+                epoch: local_epoch,
+                send_allowed: false,
+            });
+        }
+
+        match self.join_or_rejoin(convo_id).await {
+            Ok(epoch) => {
+                let projected = self.project_conversation_recovery_state(convo_id).await;
+                let epoch = self
+                    .local_group_epoch_result(convo_id)
+                    .await?
+                    .or(Some(epoch));
+                Ok(ConversationReadyResult {
+                    recovery_state: projected,
+                    epoch,
+                    send_allowed: projected == ConversationRecoveryState::Healthy
+                        && epoch.is_some(),
+                })
+            }
+            Err(OrchestratorError::NotAuthenticated) => Err(OrchestratorError::NotAuthenticated),
+            Err(OrchestratorError::ShuttingDown) => Err(OrchestratorError::ShuttingDown),
+            Err(_) => {
+                let projected = self.project_conversation_recovery_state(convo_id).await;
+                let epoch = self.local_group_epoch_result(convo_id).await?;
+                Ok(ConversationReadyResult {
+                    recovery_state: projected,
+                    epoch,
+                    send_allowed: false,
+                })
+            }
+        }
+    }
+
     /// Send a text message with a rich embed.
     pub async fn send_message_with_embed(
         &self,
