@@ -905,6 +905,26 @@ where
         tracing::info!(convo_id, "Fork escalated to NeedsRejoin");
     }
 
+    pub(crate) async fn project_startup_needs_rejoin(&self, convo_id: &str) {
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
+        if let Err(e) = self
+            .storage()
+            .set_conversation_state(convo_id, ConversationState::NeedsRejoin)
+            .await
+        {
+            self.report_recovery_storage_failure(
+                convo_id,
+                "set_conversation_state:needs_rejoin",
+                &e,
+            )
+            .await;
+        }
+        self.mark_needs_rejoin_critical(convo_id).await;
+    }
+
     pub(crate) async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
         // Layer 3: quarantined conversations never participate in sync-driven
         // rejoins. This must run before the rejoin_lock check so that a
@@ -1369,7 +1389,7 @@ where
         hex::decode(group_id_hex).ok()
     }
 
-    async fn local_group_epoch(&self, convo_id: &str) -> Option<u64> {
+    pub(crate) async fn local_group_epoch(&self, convo_id: &str) -> Option<u64> {
         let group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await?;
         self.mls_context().get_epoch(group_id_bytes).ok()
     }

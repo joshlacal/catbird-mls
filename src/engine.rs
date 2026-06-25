@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::orchestrator::{
     CredentialStore, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext,
-    OrchestratorConfig, OrchestratorError, Result,
+    OrchestratorConfig, OrchestratorError, Result, StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 
@@ -154,6 +154,12 @@ where
             full_sync,
             performed_sync: true,
         })
+    }
+
+    pub fn startup_reconcile(&self) -> Result<StartupReconcileReport> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.startup_reconcile())
     }
 
     pub fn shutdown(&self, reason: ShutdownReason) -> Result<()> {

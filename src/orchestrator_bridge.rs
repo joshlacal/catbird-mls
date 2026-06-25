@@ -14,7 +14,7 @@ use crate::orchestrator::{
     MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView, Message,
     OrchestratorConfig, OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff,
     PersistedRecoveryState, ProcessExternalCommitResult, ResetRecordOutcome, SendMessageResponse,
-    SyncCursor,
+    StartupReconcileReport, SyncCursor,
 };
 
 use crate::api::MLSContext;
@@ -854,6 +854,27 @@ pub enum FFIConversationRecoveryState {
 pub struct FFIJoinOrRejoinResult {
     pub epoch: u64,
     pub recovery_state: FFIConversationRecoveryState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FFIStartupReconcileReport {
+    pub scanned: u32,
+    pub healthy: u32,
+    pub needs_rejoin: u32,
+    pub reset_pending: u32,
+    pub unrecoverable_local: u32,
+}
+
+impl From<StartupReconcileReport> for FFIStartupReconcileReport {
+    fn from(value: StartupReconcileReport) -> Self {
+        Self {
+            scanned: value.scanned,
+            healthy: value.healthy,
+            needs_rejoin: value.needs_rejoin,
+            reset_pending: value.reset_pending,
+            unrecoverable_local: value.unrecoverable_local,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -2296,6 +2317,10 @@ impl OrchestratorBridge {
     pub fn sync_with_server(&self, full_sync: bool) -> Result<(), OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.sync_with_server(full_sync))?;
         Ok(())
+    }
+
+    pub fn startup_reconcile(&self) -> Result<FFIStartupReconcileReport, OrchestratorBridgeError> {
+        Ok(self.engine.startup_reconcile()?.into())
     }
 
     // -- Key Packages --

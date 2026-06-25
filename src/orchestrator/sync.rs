@@ -17,6 +17,98 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    /// Project persisted conversations into Rust-owned recovery state on startup.
+    pub async fn startup_reconcile(&self) -> Result<StartupReconcileReport> {
+        let user_did = self.require_user_did().await?;
+        let conversations = self.storage().list_conversations(&user_did).await?;
+        let mut report = StartupReconcileReport {
+            scanned: conversations.len() as u32,
+            ..StartupReconcileReport::default()
+        };
+
+        for convo in conversations {
+            let convo_id = convo.conversation_id.clone();
+            let persisted_state = match self.storage().get_conversation_state(&convo_id).await {
+                Ok(state) => state,
+                Err(e) => {
+                    tracing::warn!(
+                        conversation_id = %convo_id,
+                        error = %e,
+                        "Failed to read persisted conversation state during startup reconcile"
+                    );
+                    self.conversation_states()
+                        .lock()
+                        .await
+                        .get(&convo_id)
+                        .cloned()
+                }
+            };
+
+            match persisted_state {
+                Some(state @ ConversationState::ResetPending { .. }) => {
+                    self.conversation_states()
+                        .lock()
+                        .await
+                        .insert(convo_id.clone(), state);
+                    report.reset_pending += 1;
+                    continue;
+                }
+                Some(state @ ConversationState::Quarantined { .. })
+                | Some(state @ ConversationState::Failed) => {
+                    self.conversation_states()
+                        .lock()
+                        .await
+                        .insert(convo_id.clone(), state);
+                    report.unrecoverable_local += 1;
+                    continue;
+                }
+                Some(ConversationState::NeedsRejoin) => {
+                    self.project_startup_needs_rejoin(&convo_id).await;
+                    report.needs_rejoin += 1;
+                    continue;
+                }
+                Some(state) => {
+                    self.conversation_states()
+                        .lock()
+                        .await
+                        .insert(convo_id.clone(), state);
+                }
+                None => {}
+            }
+
+            let needs_rejoin = match self.storage().needs_rejoin(&convo_id).await {
+                Ok(flag) => flag,
+                Err(e) => {
+                    tracing::warn!(
+                        conversation_id = %convo_id,
+                        error = %e,
+                        "needs_rejoin read failed during startup reconcile"
+                    );
+                    false
+                }
+            };
+            if needs_rejoin {
+                self.project_startup_needs_rejoin(&convo_id).await;
+                report.needs_rejoin += 1;
+                continue;
+            }
+
+            if self.local_group_epoch(&convo_id).await.is_some() {
+                report.healthy += 1;
+                continue;
+            }
+
+            tracing::info!(
+                conversation_id = %convo_id,
+                "Startup reconcile marked missing local group for rejoin"
+            );
+            self.project_startup_needs_rejoin(&convo_id).await;
+            report.needs_rejoin += 1;
+        }
+
+        Ok(report)
+    }
+
     /// Sync conversations with the server.
     ///
     /// 1. Acquires sync lock (skip if already syncing)

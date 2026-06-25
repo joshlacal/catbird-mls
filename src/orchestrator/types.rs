@@ -187,6 +187,16 @@ pub struct PendingLocalDelete {
     pub group_id_hex: Option<GroupId>,
 }
 
+/// Diagnostics summary from the Rust-owned startup reconcile pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartupReconcileReport {
+    pub scanned: u32,
+    pub healthy: u32,
+    pub needs_rejoin: u32,
+    pub reset_pending: u32,
+    pub unrecoverable_local: u32,
+}
+
 /// Result of recording a server reset event into local deferred-recovery state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResetRecordOutcome {
