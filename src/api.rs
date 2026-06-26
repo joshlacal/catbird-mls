@@ -10,7 +10,7 @@ use openmls_traits::signatures::Signer;
 use openmls_traits::storage::StorageProvider;
 use openmls_traits::{crypto::OpenMlsCrypto, OpenMlsProvider};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // Import StorageId to wrap public keys for storage
@@ -338,11 +338,10 @@ pub struct MLSContext {
     inner: Arc<Mutex<Option<MLSContextInner>>>,
     credential_validator: Arc<Mutex<Option<Arc<dyn CredentialValidator>>>>,
     external_join_authorizer: Arc<Mutex<Option<Arc<dyn ExternalJoinAuthorizer>>>>,
-    /// SQLCipher interrupt handles stored OUTSIDE the inner Mutex.
-    /// This allows calling sqlite3_interrupt() from any thread even when another thread
-    /// holds the Mutex for an in-flight FFI operation. Critical for 0xdead10cc prevention:
-    /// interrupting in-flight ops lets flush_and_prepare_close acquire the lock promptly.
-    interrupt_handles: Vec<rusqlite::InterruptHandle>,
+    /// Registry for Rust-owned OpenMLS/SQLCipher connections and their lifecycle.
+    /// This keeps interrupt handles, busy-state tracking, and the last storage
+    /// operation label in one additive status surface for host diagnostics.
+    storage_registry: Arc<StorageConnectionRegistry>,
     /// Suspension flag stored OUTSIDE the Mutex for cheap atomic checks.
     /// When true, long-running operations (key package creation, write_manifest)
     /// should bail out early to release the Mutex and file locks before iOS suspends.
@@ -402,6 +401,80 @@ struct PendingOutgoingCommitMeta {
     target_epoch: u64,
 }
 
+struct StorageConnectionRegistry {
+    interrupt_handles: Vec<rusqlite::InterruptHandle>,
+    busy_contexts: AtomicU32,
+    is_closed: AtomicBool,
+    last_operation_label: Mutex<Option<String>>,
+}
+
+impl StorageConnectionRegistry {
+    fn new(interrupt_handles: Vec<rusqlite::InterruptHandle>) -> Self {
+        Self {
+            interrupt_handles,
+            busy_contexts: AtomicU32::new(0),
+            is_closed: AtomicBool::new(false),
+            last_operation_label: Mutex::new(Some("initialized".to_string())),
+        }
+    }
+
+    fn begin_operation(self: &Arc<Self>, label: &str) -> StorageOperationGuard {
+        self.busy_contexts.fetch_add(1, Ordering::AcqRel);
+        self.set_last_operation(label);
+        StorageOperationGuard {
+            registry: Arc::clone(self),
+        }
+    }
+
+    fn interrupt_all(&self) -> usize {
+        self.set_last_operation("interrupt");
+        for handle in &self.interrupt_handles {
+            handle.interrupt();
+        }
+        self.interrupt_handles.len()
+    }
+
+    fn connection_count(&self) -> u32 {
+        self.interrupt_handles.len() as u32
+    }
+
+    fn busy_contexts(&self) -> u32 {
+        self.busy_contexts.load(Ordering::Acquire)
+    }
+
+    fn last_operation_label(&self) -> Option<String> {
+        self.last_operation_label
+            .lock()
+            .ok()
+            .and_then(|label| label.clone())
+    }
+
+    fn set_last_operation(&self, label: &str) {
+        if let Ok(mut last_operation_label) = self.last_operation_label.lock() {
+            *last_operation_label = Some(label.to_string());
+        }
+    }
+
+    fn mark_closed(&self, label: &str) {
+        self.is_closed.store(true, Ordering::Release);
+        self.set_last_operation(label);
+    }
+
+    fn is_closed(&self) -> bool {
+        self.is_closed.load(Ordering::Acquire)
+    }
+}
+
+struct StorageOperationGuard {
+    registry: Arc<StorageConnectionRegistry>,
+}
+
+impl Drop for StorageOperationGuard {
+    fn drop(&mut self) {
+        self.registry.busy_contexts.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Drop for MLSContext {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.inner.lock() {
@@ -411,6 +484,7 @@ impl Drop for MLSContext {
             // Take the inner to drop it and close database connections
             *guard = None;
         }
+        self.storage_registry.mark_closed("drop");
     }
 }
 
@@ -431,6 +505,7 @@ impl MLSContext {
     ) -> Result<Arc<Self>, MLSError> {
         let (mut context, interrupt_handles) =
             MLSContextInner::new(storage_path, encryption_key, keychain)?;
+        let storage_registry = Arc::new(StorageConnectionRegistry::new(interrupt_handles));
 
         // Reconcile any drift between the manifest cache and OpenMLS's
         // authoritative key_package storage. Drops stale entries left
@@ -459,7 +534,7 @@ impl MLSContext {
             inner: Arc::new(Mutex::new(Some(context))),
             credential_validator: Arc::new(Mutex::new(None)),
             external_join_authorizer: Arc::new(Mutex::new(None)),
-            interrupt_handles,
+            storage_registry,
             is_suspended: Arc::new(AtomicBool::new(false)),
             pending_incoming_merges: Arc::new(Mutex::new(HashMap::new())),
             pending_outgoing_commits: Arc::new(Mutex::new(HashMap::new())),
@@ -479,6 +554,7 @@ impl MLSContext {
             "[MLS-FFI] set_epoch_secret_storage: Setting epoch secret storage backend"
         );
 
+        let _storage_operation = self.begin_storage_operation("set_epoch_secret_storage");
         let guard = self
             .inner
             .lock()
@@ -505,11 +581,9 @@ impl MLSContext {
     pub fn interrupt(&self) {
         crate::info_log!(
             "[MLS-FFI] interrupt: Sending sqlite3_interrupt to {} connection(s)",
-            self.interrupt_handles.len()
+            self.storage_registry.connection_count()
         );
-        for handle in &self.interrupt_handles {
-            handle.interrupt();
-        }
+        self.storage_registry.interrupt_all();
     }
 
     /// Set the suspension flag. When true, long-running operations bail out early
@@ -597,6 +671,8 @@ impl MLSContext {
             );
         }
 
+        self.storage_registry.mark_closed("flush_and_prepare_close");
+
         Ok(())
     }
 
@@ -626,18 +702,28 @@ impl MLSContext {
     }
 
     pub fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
-        let state = if self.is_closed() {
+        let state = if self.storage_registry.is_closed() || self.is_closed() {
             StorageLifecycleState::Closed
         } else if self.is_suspended.load(Ordering::Acquire) {
             StorageLifecycleState::Suspended
         } else {
             StorageLifecycleState::Open
         };
+        let mutex_busy = matches!(
+            self.inner.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        );
+        let busy_contexts = self
+            .storage_registry
+            .busy_contexts()
+            .max(u32::from(mutex_busy));
 
         StorageLifecycleStatus {
             state,
-            interruptible_contexts: self.interrupt_handles.len() as u32,
-            last_operation_label: None,
+            interruptible_contexts: self.storage_registry.connection_count(),
+            is_busy: busy_contexts > 0,
+            busy_contexts,
+            last_operation_label: self.storage_registry.last_operation_label(),
         }
     }
 
@@ -679,6 +765,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         signer_identity_bytes: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError> {
+        let _storage_operation = self.begin_storage_operation("export_group_info");
         let mut guard = self
             .inner
             .lock()
@@ -808,6 +895,7 @@ impl MLSContext {
         );
         crate::debug_log!("[MLS-FFI] Identity bytes: {} bytes", identity_bytes.len());
 
+        let _storage_operation = self.begin_storage_operation("create_group");
         let mut guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
             MLSError::ContextNotInitialized
@@ -864,10 +952,12 @@ impl MLSContext {
         self.check_suspended()?;
         let inner = self.inner.clone();
         let suspended = self.is_suspended.clone();
+        let storage_registry = Arc::clone(&self.storage_registry);
 
         tokio::task::spawn_blocking(move || {
             crate::info_log!("[MLS-FFI-ASYNC] create_group_async: Starting");
 
+            let _storage_operation = storage_registry.begin_operation("create_group_async");
             let mut guard = inner.lock().map_err(|e| {
                 crate::error_log!(
                     "[MLS-FFI-ASYNC] ERROR: Failed to acquire write lock: {:?}",
@@ -1584,6 +1674,7 @@ impl MLSContext {
     ) -> Result<AddMembersResult, MLSError> {
         self.check_suspended()?;
         let inner = self.inner.clone();
+        let storage_registry = Arc::clone(&self.storage_registry);
 
         tokio::task::spawn_blocking(move || {
             crate::debug_log!(
@@ -1591,6 +1682,7 @@ impl MLSContext {
                 key_packages.len()
             );
 
+            let _storage_operation = storage_registry.begin_operation("add_members_async");
             let mut guard = inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
             let inner_ctx = guard.as_mut().ok_or(MLSError::ContextClosed)?;
 
@@ -1953,6 +2045,7 @@ impl MLSContext {
         );
         crate::debug_log!("[MLS-FFI] Plaintext size: {} bytes", plaintext.len());
 
+        let _storage_operation = self.begin_storage_operation("encrypt_message");
         let mut guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
             MLSError::ContextNotInitialized
@@ -2023,12 +2116,14 @@ impl MLSContext {
     ) -> Result<EncryptResult, MLSError> {
         self.check_suspended()?;
         let inner = self.inner.clone();
+        let storage_registry = Arc::clone(&self.storage_registry);
 
         tokio::task::spawn_blocking(move || {
             crate::debug_log!("[MLS-FFI] encrypt_message_async: Starting on worker thread");
             crate::debug_log!("[MLS-FFI] Group ID: {} ({} bytes)", hex::encode(&group_id), group_id.len());
             crate::debug_log!("[MLS-FFI] Plaintext size: {} bytes", plaintext.len());
 
+            let _storage_operation = storage_registry.begin_operation("encrypt_message_async");
             let mut guard = inner.lock()
                 .map_err(|e| {
                     crate::error_log!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
@@ -2111,6 +2206,7 @@ impl MLSContext {
         // Task #33: also carry the pending-merges map so we can stash incoming StagedCommits
         // from the worker thread.
         let pending_incoming_merges = self.pending_incoming_merges.clone();
+        let storage_registry = Arc::clone(&self.storage_registry);
 
         tokio::task::spawn_blocking(move || {
             let thread_id = std::thread::current().id();
@@ -2130,6 +2226,7 @@ impl MLSContext {
                 ciphertext.len()
             );
 
+            let _storage_operation = storage_registry.begin_operation("decrypt_message_async");
             let mut guard = inner.lock().map_err(|e| {
                 crate::error_log!(
                     "[DECRYPT-ASYNC] ❌ Thread {:?} failed to acquire lock: {:?}",
@@ -2611,11 +2708,13 @@ impl MLSContext {
         let inner = self.inner.clone();
         // Task #33: carry the pending-merges map into the worker thread.
         let pending_incoming_merges = self.pending_incoming_merges.clone();
+        let storage_registry = Arc::clone(&self.storage_registry);
 
         tokio::task::spawn_blocking(move || {
             crate::debug_log!("[MLS-FFI-ASYNC] process_message_async: Starting");
             crate::debug_log!("[MLS-FFI-ASYNC] Group ID: {} ({} bytes)", hex::encode(&group_id), group_id.len());
 
+            let _storage_operation = storage_registry.begin_operation("process_message_async");
             let mut guard = inner.lock()
                 .map_err(|e| {
                     crate::error_log!("[MLS-FFI-ASYNC] ERROR: Failed to acquire write lock: {:?}", e);
@@ -3375,6 +3474,7 @@ impl MLSContext {
         crate::debug_log!("[MLS-FFI] get_epoch: Starting");
         crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
 
+        let _storage_operation = self.begin_storage_operation("get_epoch");
         let guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire read lock: {:?}", e);
             MLSError::ContextNotInitialized
@@ -3395,6 +3495,7 @@ impl MLSContext {
     pub fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         crate::debug_log!("[MLS-FFI] get_confirmation_tag: {}", hex::encode(&group_id));
 
+        let _storage_operation = self.begin_storage_operation("get_confirmation_tag");
         let guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
             MLSError::ContextNotInitialized
@@ -3427,6 +3528,7 @@ impl MLSContext {
     pub fn epoch_authenticator(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         crate::debug_log!("[MLS-FFI] epoch_authenticator: {}", hex::encode(&group_id));
 
+        let _storage_operation = self.begin_storage_operation("epoch_authenticator");
         let guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
             MLSError::ContextNotInitialized
@@ -3464,6 +3566,7 @@ impl MLSContext {
             hex::encode(&group_id)
         );
 
+        let _storage_operation = self.begin_storage_operation("update_group_metadata");
         let mut guard = self
             .inner
             .lock()
@@ -3511,6 +3614,7 @@ impl MLSContext {
             hex::encode(&group_id)
         );
 
+        let _storage_operation = self.begin_storage_operation("update_group_metadata_encrypted");
         let mut guard = self
             .inner
             .lock()
@@ -3550,6 +3654,7 @@ impl MLSContext {
         crate::debug_log!("[MLS-FFI] get_tree_hash: Starting");
         crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
 
+        let _storage_operation = self.begin_storage_operation("get_tree_hash");
         let guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire read lock: {:?}", e);
             MLSError::ContextNotInitialized
@@ -3581,6 +3686,7 @@ impl MLSContext {
         crate::info_log!("[MLS-FFI] export_epoch_secret: Manually exporting epoch secret");
         crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
 
+        let _storage_operation = self.begin_storage_operation("export_epoch_secret");
         let mut guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire read lock: {:?}", e);
             MLSError::ContextNotInitialized
@@ -3622,6 +3728,7 @@ impl MLSContext {
             &group_id_hex[..std::cmp::min(16, group_id_hex.len())]
         );
 
+        let _storage_operation = self.begin_storage_operation("get_current_metadata");
         let mut guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
             MLSError::ContextNotInitialized
@@ -4485,6 +4592,7 @@ impl MLSContext {
     ///   - group_id: Group identifier to check
     /// - Returns: true if group exists, false otherwise
     pub fn group_exists(&self, group_id: Vec<u8>) -> bool {
+        let _storage_operation = self.begin_storage_operation("group_exists");
         let guard = match self.inner.lock() {
             Ok(g) => g,
             Err(_) => return false,
@@ -4508,6 +4616,7 @@ impl MLSContext {
         );
 
         let gid = GroupId::from_slice(&group_id);
+        let _storage_operation = self.begin_storage_operation("get_group_member_count");
         let mut guard = self.inner.lock().map_err(|_| MLSError::InvalidInput {
             message: "Failed to acquire lock".to_string(),
         })?;
@@ -4540,6 +4649,7 @@ impl MLSContext {
         );
 
         let gid = GroupId::from_slice(&group_id);
+        let _storage_operation = self.begin_storage_operation("debug_group_members");
         let mut guard = self.inner.lock().map_err(|_| MLSError::InvalidInput {
             message: "Failed to acquire lock".to_string(),
         })?;
@@ -5114,6 +5224,31 @@ impl MLSContext {
     }
 }
 
+impl MLSContext {
+    fn begin_storage_operation(&self, label: &str) -> StorageOperationGuard {
+        self.storage_registry.begin_operation(label)
+    }
+
+    #[doc(hidden)]
+    pub fn debug_hold_storage_lock_for_test(
+        &self,
+        started: Arc<AtomicBool>,
+        duration: std::time::Duration,
+    ) -> Result<(), MLSError> {
+        self.storage_registry
+            .busy_contexts
+            .fetch_add(1, Ordering::AcqRel);
+        self.storage_registry
+            .set_last_operation("debug_hold_storage_lock_for_test");
+        started.store(true, Ordering::Release);
+        std::thread::sleep(duration);
+        self.storage_registry
+            .busy_contexts
+            .fetch_sub(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
 // Non-exported (in-process only) methods. Deliberately OUTSIDE the
 // `#[uniffi::export]` impl block so UniFFI never sees them.
 impl MLSContext {
@@ -5314,6 +5449,7 @@ impl MLSContext {
         );
         let lock_start = std::time::SystemTime::now();
 
+        let _storage_operation = self.begin_storage_operation("decrypt_message");
         let mut guard = self.inner.lock().map_err(|e| {
             crate::error_log!(
                 "[DECRYPT] ❌ Thread {:?} failed to acquire lock: {:?}",
@@ -6237,7 +6373,7 @@ impl MlsCryptoContext for MLSContext {
 
     fn interrupt_storage(&self) -> usize {
         self.interrupt();
-        self.interrupt_handles.len()
+        self.storage_registry.connection_count() as usize
     }
 
     fn flush_and_prepare_close(&self) -> Result<(), MLSError> {

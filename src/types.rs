@@ -13,6 +13,8 @@ pub enum StorageLifecycleState {
 pub struct StorageLifecycleStatus {
     pub state: StorageLifecycleState,
     pub interruptible_contexts: u32,
+    pub is_busy: bool,
+    pub busy_contexts: u32,
     pub last_operation_label: Option<String>,
 }
 

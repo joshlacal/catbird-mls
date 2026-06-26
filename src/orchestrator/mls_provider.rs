@@ -38,6 +38,8 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         StorageLifecycleStatus {
             state: StorageLifecycleState::Open,
             interruptible_contexts: 0,
+            is_busy: false,
+            busy_contexts: 0,
             last_operation_label: None,
         }
     }
