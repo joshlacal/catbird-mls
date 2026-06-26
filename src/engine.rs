@@ -2,11 +2,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::orchestrator::{
-    ConversationReadyResult, CredentialStore, DeferredRecoveryReport, MLSAPIClient,
-    MLSOrchestrator, MLSStorageBackend, MlsCryptoContext, OrchestratorConfig, OrchestratorError,
-    Result, StartupReconcileReport,
+    ConversationReadyResult, ConversationRecoveryState, CredentialStore, DeferredRecoveryReport,
+    EngineEvent, IncomingEnvelope, MLSAPIClient, MLSOrchestrator, MLSStorageBackend,
+    MlsCryptoContext, OrchestratorConfig, OrchestratorError, ResetRecordOutcome, Result,
+    StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownReason {
@@ -47,6 +49,44 @@ impl Default for EngineState {
 pub struct EngineLifecycle {
     last_shutdown_reason: Mutex<Option<ShutdownReason>>,
     platform: PlatformLifecycle,
+}
+
+#[derive(Debug, Clone)]
+pub struct SendResult {
+    pub message: crate::orchestrator::Message,
+    pub events: Vec<EngineEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageProcessingResult {
+    pub message: Option<crate::orchestrator::Message>,
+    pub events: Vec<EngineEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ServerEventEnvelope {
+    GroupReset {
+        #[serde(alias = "convoId")]
+        convo_id: String,
+        #[serde(alias = "newGroupId")]
+        new_group_id: String,
+        #[serde(alias = "resetGeneration")]
+        reset_generation: i32,
+    },
+    ResetRequested {
+        #[serde(alias = "convoId")]
+        convo_id: String,
+        #[serde(alias = "cryptoSessionId")]
+        crypto_session_id: String,
+        #[serde(alias = "resetGeneration")]
+        reset_generation: i32,
+        trigger: String,
+        #[serde(alias = "requestEventId")]
+        request_event_id: String,
+        #[serde(alias = "expectedNewMlsGroupIdHex")]
+        expected_new_mls_group_id_hex: Option<String>,
+    },
 }
 
 impl EngineLifecycle {
@@ -175,6 +215,89 @@ where
         crate::async_runtime::block_on(self.orchestrator.ensure_conversation_ready(convo_id))
     }
 
+    pub fn send_payload(&self, convo_id: &str, payload_json: &str) -> Result<SendResult> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let message = crate::async_runtime::block_on(
+            self.orchestrator.send_payload_json(convo_id, payload_json),
+        )?;
+        let events = vec![EngineEvent::MessageInserted {
+            message_id: message.id.clone(),
+            convo_id: message.conversation_id.clone(),
+        }];
+        Ok(SendResult { message, events })
+    }
+
+    pub fn process_server_event(&self, event_json: &str) -> Result<Vec<EngineEvent>> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let event: ServerEventEnvelope = serde_json::from_str(event_json).map_err(|err| {
+            OrchestratorError::InvalidInput(format!("Failed to decode server event JSON: {err}"))
+        })?;
+
+        match event {
+            ServerEventEnvelope::GroupReset {
+                convo_id,
+                new_group_id,
+                reset_generation,
+            } => {
+                let new_group_id = hex::decode(&new_group_id).map_err(|err| {
+                    OrchestratorError::InvalidInput(format!(
+                        "groupReset newGroupId was not valid hex: {err}"
+                    ))
+                })?;
+                let outcome = crate::async_runtime::block_on(
+                    self.orchestrator.record_group_reset_with_outcome(
+                        &convo_id,
+                        new_group_id,
+                        reset_generation,
+                    ),
+                )?;
+                Ok(events_for_reset_outcome(&convo_id, outcome))
+            }
+            ServerEventEnvelope::ResetRequested {
+                convo_id,
+                crypto_session_id,
+                reset_generation,
+                trigger,
+                request_event_id,
+                expected_new_mls_group_id_hex,
+            } => {
+                let outcome = crate::async_runtime::block_on(
+                    self.orchestrator.record_reset_requested_with_outcome(
+                        &convo_id,
+                        &crypto_session_id,
+                        reset_generation,
+                        &trigger,
+                        &request_event_id,
+                        expected_new_mls_group_id_hex,
+                    ),
+                )?;
+                Ok(events_for_reset_outcome(&convo_id, outcome))
+            }
+        }
+    }
+
+    pub fn process_incoming_message(
+        &self,
+        envelope: IncomingEnvelope,
+    ) -> Result<MessageProcessingResult> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let message =
+            crate::async_runtime::block_on(self.orchestrator.process_incoming(&envelope))?;
+        let events = message
+            .as_ref()
+            .map(|message| {
+                vec![EngineEvent::MessageInserted {
+                    message_id: message.id.clone(),
+                    convo_id: message.conversation_id.clone(),
+                }]
+            })
+            .unwrap_or_default();
+        Ok(MessageProcessingResult { message, events })
+    }
+
     pub fn shutdown(&self, reason: ShutdownReason) -> Result<()> {
         let next_phase = match reason {
             ShutdownReason::AppSuspend => EnginePhase::Suspended,
@@ -297,4 +420,20 @@ where
             Err(err) => Err(err),
         }
     }
+}
+
+fn events_for_reset_outcome(convo_id: &str, outcome: ResetRecordOutcome) -> Vec<EngineEvent> {
+    if outcome != ResetRecordOutcome::Recorded {
+        return Vec::new();
+    }
+
+    vec![
+        EngineEvent::RecoveryStateChanged {
+            convo_id: convo_id.to_string(),
+            state: ConversationRecoveryState::ResetPending,
+        },
+        EngineEvent::NeedsUiRefresh {
+            convo_id: convo_id.to_string(),
+        },
+    ]
 }

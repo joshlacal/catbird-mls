@@ -9,7 +9,32 @@
 //! Methods are sync to keep callbacks fast (they may be called while holding
 //! orchestrator mutexes); platforms should dispatch heavy work to a runtime.
 
-use super::types::{QuarantineExitReason, QuarantineReason};
+use serde::{Deserialize, Serialize};
+
+use super::types::{ConversationRecoveryState, QuarantineExitReason, QuarantineReason};
+
+/// Platform-facing events emitted by the Rust-owned full-authority pipeline.
+///
+/// The variants are intentionally additive and coarse-grained so Swift can
+/// update UI/state without re-entering low-level MLS mutation paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum EngineEvent {
+    ConversationUpdated {
+        convo_id: String,
+    },
+    MessageInserted {
+        message_id: String,
+        convo_id: String,
+    },
+    RecoveryStateChanged {
+        convo_id: String,
+        state: ConversationRecoveryState,
+    },
+    NeedsUiRefresh {
+        convo_id: String,
+    },
+}
 
 /// Platform-agnostic observer for orchestrator events. Currently only carries
 /// Layer 3 quarantine events; can be extended in future for other event

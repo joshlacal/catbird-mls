@@ -1720,6 +1720,7 @@ impl MLSAPIClient for APIAdapter {
                             .parse::<chrono::DateTime<chrono::Utc>>()
                             .unwrap_or_else(|_| chrono::Utc::now()),
                         server_message_id: e.server_message_id.clone(),
+                        server_epoch: None,
                     })
                     .collect();
                 (envelopes, ffi.cursor)
@@ -2310,6 +2311,7 @@ impl OrchestratorBridge {
                 .parse::<chrono::DateTime<chrono::Utc>>()
                 .unwrap_or_else(|_| chrono::Utc::now()),
             server_message_id: envelope.server_message_id,
+            server_epoch: None,
         };
         let result = crate::async_runtime::block_on(self.inner.process_incoming(&inner_envelope))?;
         Ok(result.map(|m| message_to_ffi(&m)))

@@ -2,6 +2,8 @@ use chrono::Utc;
 use sha2::Digest;
 use std::collections::HashMap;
 
+use crate::engine::MessageProcessingResult;
+
 use super::api_client::MLSAPIClient;
 use super::constants;
 use super::credentials::CredentialStore;
@@ -1100,6 +1102,60 @@ where
         self.storage().store_message(&message).await?;
 
         Ok(Some(message))
+    }
+
+    pub async fn process_incoming_message(
+        &self,
+        envelope: &IncomingEnvelope,
+    ) -> Result<MessageProcessingResult> {
+        if let Some(server_epoch) = envelope.server_epoch {
+            let local_epoch = self
+                .local_group_epoch_result(&envelope.conversation_id)
+                .await?
+                .unwrap_or(0);
+            if server_epoch > local_epoch {
+                let from_epoch = Some((local_epoch.saturating_add(1)).min(u32::MAX as u64) as u32);
+                let to_epoch = Some(server_epoch.min(u32::MAX as u64) as u32);
+                let (fetched_messages, _) = self
+                    .fetch_messages(
+                        &envelope.conversation_id,
+                        None,
+                        50,
+                        Some("commit"),
+                        from_epoch,
+                        to_epoch,
+                    )
+                    .await?;
+
+                if let Some(server_message_id) = envelope.server_message_id.as_deref() {
+                    if let Some(message) = fetched_messages
+                        .into_iter()
+                        .find(|message| message.id == server_message_id)
+                    {
+                        let events = vec![crate::orchestrator::EngineEvent::MessageInserted {
+                            message_id: message.id.clone(),
+                            convo_id: message.conversation_id.clone(),
+                        }];
+                        return Ok(MessageProcessingResult {
+                            message: Some(message),
+                            events,
+                        });
+                    }
+                }
+            }
+        }
+
+        let message = self.process_incoming(envelope).await?;
+        let events = message
+            .as_ref()
+            .map(|message| {
+                vec![crate::orchestrator::EngineEvent::MessageInserted {
+                    message_id: message.id.clone(),
+                    convo_id: message.conversation_id.clone(),
+                }]
+            })
+            .unwrap_or_default();
+        Ok(MessageProcessingResult { message, events })
     }
 
     /// Fetch and process new messages from the server for a conversation.

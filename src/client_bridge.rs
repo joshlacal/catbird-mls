@@ -499,6 +499,7 @@ impl MLSAPIClient for ClientAPIAdapter {
                             .parse::<chrono::DateTime<chrono::Utc>>()
                             .unwrap_or_else(|_| chrono::Utc::now()),
                         server_message_id: e.server_message_id.clone(),
+                        server_epoch: None,
                     })
                     .collect();
                 (envelopes, ffi.cursor)

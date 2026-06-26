@@ -27,6 +27,7 @@ pub use credential_binding::{
 };
 pub use credentials::CredentialStore;
 pub use error::{OrchestratorError, Result};
+pub use event_observer::EngineEvent;
 pub use mls_provider::MlsCryptoContext;
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
 pub use storage::MLSStorageBackend;

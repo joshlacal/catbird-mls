@@ -908,6 +908,7 @@ impl MLSAPIClient for MockDeliveryService {
                     .unwrap_or_else(|| m.sender_did.clone()),
                 ciphertext: m.ciphertext.clone(),
                 timestamp: m.timestamp,
+                server_epoch: None,
                 server_message_id: Some(m.id.clone()),
             })
             .collect();

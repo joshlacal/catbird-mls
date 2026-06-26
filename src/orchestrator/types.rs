@@ -562,6 +562,8 @@ pub struct IncomingEnvelope {
     pub timestamp: DateTime<Utc>,
     /// Server-assigned message ID for deduplication.
     pub server_message_id: Option<String>,
+    /// Server-reported epoch for the message, when available.
+    pub server_epoch: Option<u64>,
 }
 
 /// Encrypted reaction to a message (add or remove emoji).
