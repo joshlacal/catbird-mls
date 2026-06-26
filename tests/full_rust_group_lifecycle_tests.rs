@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use catbird_mls::orchestrator::{MLSAPIClient, OrchestratorConfig};
+use catbird_mls::orchestrator::{MLSAPIClient, MLSStorageBackend, OrchestratorConfig};
 use catbird_mls::{
     CreateConversationRequest, EngineLifecycle, GroupMutationResult, KeychainAccess, LeaveResult,
     MLSContext, MLSError, MlsEngine,
@@ -47,6 +47,7 @@ impl KeychainAccess for InMemoryKeychain {
 
 struct GroupLifecycleFixture {
     engine: MlsEngine<MockStorage, MockDeliveryService, MockCredentials, MLSContext>,
+    storage: Arc<MockStorage>,
     api: Arc<MockDeliveryService>,
     _temp_dir: tempfile::TempDir,
 }
@@ -75,7 +76,7 @@ impl GroupLifecycleFixture {
 
         let engine = MlsEngine::new(
             context,
-            storage,
+            Arc::clone(&storage),
             Arc::clone(&api),
             credentials,
             Arc::new(EngineLifecycle::default()),
@@ -87,10 +88,60 @@ impl GroupLifecycleFixture {
 
         Self {
             engine,
+            storage,
             api,
             _temp_dir: temp_dir,
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn add_remove_resolve_stable_conversation_id_to_current_group_id() {
+    let fixture = GroupLifecycleFixture::with_one_recipient_key_package().await;
+
+    let created = fixture
+        .engine
+        .create_conversation(CreateConversationRequest {
+            name: "rotated".into(),
+            member_dids: vec![],
+            description: None,
+        })
+        .expect("create conversation");
+    let original_group_id = created.conversation.group_id.clone();
+    let stable_convo_id = "stable-convo-after-reset";
+
+    fixture
+        .api
+        .rekey_conversation_for_test(&created.conversation.conversation_id, stable_convo_id);
+    fixture
+        .storage
+        .ensure_conversation_exists("did:plc:alice", stable_convo_id, &original_group_id)
+        .await
+        .expect("seed stable conversation mapping");
+
+    let added: GroupMutationResult = fixture
+        .engine
+        .add_members(stable_convo_id, &["did:plc:bob".into()])
+        .expect("add members through stable conversation id");
+    assert_eq!(added.conversation.conversation_id, stable_convo_id);
+    assert_eq!(added.conversation.group_id, original_group_id);
+    assert!(added
+        .conversation
+        .members
+        .iter()
+        .any(|member| member.did == "did:plc:bob"));
+
+    let removed: GroupMutationResult = fixture
+        .engine
+        .remove_members(stable_convo_id, &["did:plc:bob".into()])
+        .expect("remove members through stable conversation id");
+    assert_eq!(removed.conversation.conversation_id, stable_convo_id);
+    assert_eq!(removed.conversation.group_id, original_group_id);
+    assert!(!removed
+        .conversation
+        .members
+        .iter()
+        .any(|member| member.did == "did:plc:bob"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

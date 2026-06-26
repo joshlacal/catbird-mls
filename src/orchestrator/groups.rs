@@ -357,10 +357,15 @@ where
     /// `confirm_commit` / `discard_pending` API added in task #44. Platforms
     /// can migrate to the new API incrementally; this wrapper will remain
     /// until all clients have moved over.
-    pub async fn add_members(&self, group_id: &str, member_dids: &[String]) -> Result<()> {
+    pub async fn add_members(&self, conversation_id: &str, member_dids: &[String]) -> Result<()> {
         self.check_shutdown().await?;
+        let group_id = self
+            .group_id_hex_for_conversation(conversation_id)
+            .await
+            .unwrap_or_else(|| conversation_id.to_string());
 
         tracing::info!(
+            conversation_id,
             group_id,
             count = member_dids.len(),
             "Adding members to group"
@@ -370,8 +375,13 @@ where
         let key_packages = self.api_client().get_key_packages(member_dids).await?;
 
         // WS-3 stage 1 (ADR-009 D3): warn-and-allow credential binding check.
-        self.verify_fetched_key_packages(member_dids, &key_packages, "add_members", Some(group_id))
-            .await;
+        self.verify_fetched_key_packages(
+            member_dids,
+            &key_packages,
+            "add_members",
+            Some(&group_id),
+        )
+        .await;
 
         let kp_data: Vec<crate::KeyPackageData> = key_packages
             .iter()
@@ -383,7 +393,7 @@ where
         // Stage the commit via the new API.
         let plan = self
             .stage_commit(
-                group_id,
+                &group_id,
                 CommitKind::AddMembers {
                     member_dids: member_dids.to_vec(),
                     key_packages: kp_data,
@@ -395,7 +405,7 @@ where
         let server_result = self
             .api_client()
             .add_members(
-                group_id,
+                conversation_id,
                 member_dids,
                 &plan.commit_bytes,
                 plan.welcome_bytes.as_deref(),
@@ -423,7 +433,7 @@ where
                 // not merged.
                 let current_epoch =
                     self.mls_context()
-                        .get_epoch(hex::decode(group_id).map_err(|_| {
+                        .get_epoch(hex::decode(&group_id).map_err(|_| {
                             OrchestratorError::InvalidInput("Invalid hex group ID".into())
                         })?)?;
 
@@ -440,7 +450,7 @@ where
                         .await?;
                 } else {
                     tracing::warn!(
-                        group_id,
+                        group_id = %group_id,
                         server_epoch = result.new_epoch,
                         local_epoch = current_epoch,
                         "Server accepted add_members but epoch did not advance — discarding pending commit"
@@ -451,7 +461,7 @@ where
                     // backward compatibility — legacy callers rely on the
                     // members appearing even when the epoch didn't move.
                     let mut states = self.group_states().lock().await;
-                    if let Some(gs) = states.get_mut(group_id) {
+                    if let Some(gs) = states.get_mut(&group_id) {
                         for did in member_dids {
                             if !gs.members.contains(did) {
                                 gs.members.push(did.clone());
@@ -460,7 +470,7 @@ where
                         let state_clone = gs.clone();
                         drop(states);
                         if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                            tracing::warn!(error = %e, group_id, "Failed to persist group state after no-advance add_members");
+                            tracing::warn!(error = %e, group_id = %group_id, "Failed to persist group state after no-advance add_members");
                         }
                     }
                 }
@@ -471,7 +481,7 @@ where
             }
         }
 
-        tracing::info!(group_id, "Members added successfully");
+        tracing::info!(conversation_id, group_id = %group_id, "Members added successfully");
         Ok(())
     }
 
@@ -479,10 +489,19 @@ where
     ///
     /// Backward-compatible wrapper around the three-phase `stage_commit` /
     /// `confirm_commit` / `discard_pending` API added in task #44.
-    pub async fn remove_members(&self, group_id: &str, member_dids: &[String]) -> Result<()> {
+    pub async fn remove_members(
+        &self,
+        conversation_id: &str,
+        member_dids: &[String],
+    ) -> Result<()> {
         self.check_shutdown().await?;
+        let group_id = self
+            .group_id_hex_for_conversation(conversation_id)
+            .await
+            .unwrap_or_else(|| conversation_id.to_string());
 
         tracing::info!(
+            conversation_id,
             group_id,
             count = member_dids.len(),
             "Removing members from group"
@@ -490,7 +509,7 @@ where
 
         let plan = self
             .stage_commit(
-                group_id,
+                &group_id,
                 CommitKind::RemoveMembers {
                     member_dids: member_dids.to_vec(),
                 },
@@ -499,7 +518,7 @@ where
 
         match self
             .api_client()
-            .remove_members(group_id, member_dids, &plan.commit_bytes)
+            .remove_members(conversation_id, member_dids, &plan.commit_bytes)
             .await
         {
             Ok(()) => {
