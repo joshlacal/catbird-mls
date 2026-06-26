@@ -60,10 +60,24 @@ where
         conversation_id: &str,
         kind: CommitKind,
     ) -> Result<CommitPlan> {
+        let group_id = self
+            .group_id_hex_for_conversation(conversation_id)
+            .await
+            .unwrap_or_else(|| conversation_id.to_string());
+        self.stage_commit_for_group(conversation_id, &group_id, kind)
+            .await
+    }
+
+    pub(crate) async fn stage_commit_for_group(
+        &self,
+        conversation_id: &str,
+        group_id: &str,
+        kind: CommitKind,
+    ) -> Result<CommitPlan> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
-        let group_id_bytes = hex::decode(conversation_id)
+        let group_id_bytes = hex::decode(group_id)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
         // Guard: OpenMLS allows at most one pending commit per group. If we
@@ -71,7 +85,7 @@ where
         // confirms or discards the existing one.
         {
             let pending = self.pending_staged_commits().lock().await;
-            if pending.contains_key(conversation_id) {
+            if pending.contains_key(group_id) {
                 return Err(OrchestratorError::InvalidInput(format!(
                     "A staged commit already exists for conversation {}; confirm or discard it before staging another",
                     conversation_id
@@ -171,8 +185,9 @@ where
         let target_epoch = source_epoch.saturating_add(1);
 
         self.pending_staged_commits().lock().await.insert(
-            conversation_id.to_string(),
+            group_id.to_string(),
             PendingCommitMeta {
+                conversation_id: conversation_id.to_string(),
                 nonce,
                 source_epoch,
                 target_epoch,
@@ -182,6 +197,7 @@ where
 
         tracing::debug!(
             conversation_id,
+            group_id,
             nonce,
             source_epoch,
             target_epoch,
@@ -190,7 +206,7 @@ where
 
         Ok(CommitPlan {
             handle: StagedCommitHandle {
-                group_id: conversation_id.to_string(),
+                group_id: group_id.to_string(),
                 nonce,
             },
             commit_bytes,
@@ -277,7 +293,8 @@ where
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    conversation_id = %handle.group_id,
+                    conversation_id = %meta.conversation_id,
+                    group_id = %handle.group_id,
                     target_epoch = meta.target_epoch,
                     "CRITICAL: merge_pending_commit failed during confirm_commit"
                 );
@@ -287,7 +304,8 @@ where
                 {
                     tracing::warn!(
                         error = %clear_err,
-                        conversation_id = %handle.group_id,
+                        conversation_id = %meta.conversation_id,
+                        group_id = %handle.group_id,
                         "Failed to clear stale pending commit after merge failure in confirm_commit"
                     );
                 }
@@ -295,7 +313,7 @@ where
                 // merge-failure path — the persisted flag is what routes this
                 // conversation into deferred recovery, so escalate a dropped
                 // write instead of warn-and-forget.
-                self.mark_needs_rejoin_critical(&handle.group_id).await;
+                self.mark_needs_rejoin_critical(&meta.conversation_id).await;
                 return Err(e.into());
             }
         };
@@ -342,7 +360,8 @@ where
                 if let Err(e) = self.storage().set_group_state(&state_clone).await {
                     tracing::warn!(
                         error = %e,
-                        conversation_id = %handle.group_id,
+                        conversation_id = %meta.conversation_id,
+                        group_id = %handle.group_id,
                         "Failed to persist group state after confirm_commit"
                     );
                 }
@@ -357,12 +376,13 @@ where
             Ok(group_info) => {
                 if let Err(e) = self
                     .api_client()
-                    .publish_group_info(&handle.group_id, &group_info)
+                    .publish_group_info(&meta.conversation_id, &group_info)
                     .await
                 {
                     tracing::warn!(
                         error = %e,
-                        conversation_id = %handle.group_id,
+                        conversation_id = %meta.conversation_id,
+                        group_id = %handle.group_id,
                         "Failed to publish GroupInfo after confirm_commit"
                     );
                 }
@@ -370,14 +390,16 @@ where
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    conversation_id = %handle.group_id,
+                    conversation_id = %meta.conversation_id,
+                    group_id = %handle.group_id,
                     "Failed to export GroupInfo after confirm_commit"
                 );
             }
         }
 
         tracing::debug!(
-            conversation_id = %handle.group_id,
+            conversation_id = %meta.conversation_id,
+            group_id = %handle.group_id,
             new_epoch,
             "Confirmed staged commit"
         );

@@ -142,6 +142,18 @@ async fn add_remove_resolve_stable_conversation_id_to_current_group_id() {
         .members
         .iter()
         .any(|member| member.did == "did:plc:bob"));
+    assert!(
+        fixture.api.get_group_info(stable_convo_id).await.is_ok(),
+        "post-mutation GroupInfo must stay published under the stable conversation id"
+    );
+    assert!(
+        fixture
+            .api
+            .get_group_info(&original_group_id)
+            .await
+            .is_err(),
+        "post-mutation GroupInfo must not be republished under the raw MLS group id"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

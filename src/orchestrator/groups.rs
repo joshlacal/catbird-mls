@@ -392,7 +392,8 @@ where
 
         // Stage the commit via the new API.
         let plan = self
-            .stage_commit(
+            .stage_commit_for_group(
+                conversation_id,
                 &group_id,
                 CommitKind::AddMembers {
                     member_dids: member_dids.to_vec(),
@@ -508,7 +509,8 @@ where
         );
 
         let plan = self
-            .stage_commit(
+            .stage_commit_for_group(
+                conversation_id,
                 &group_id,
                 CommitKind::RemoveMembers {
                     member_dids: member_dids.to_vec(),

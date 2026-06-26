@@ -139,6 +139,9 @@ where
 /// Internal bookkeeping for a staged commit.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingCommitMeta {
+    /// Stable conversation ID to use for delivery-service side effects.
+    /// This may differ from `group_id` after resets/rotations.
+    pub conversation_id: String,
     /// Nonce that must match the handle passed to `confirm_commit` or
     /// `discard_pending`.
     pub nonce: u64,
