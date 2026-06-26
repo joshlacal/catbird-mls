@@ -10,11 +10,11 @@ use std::time::Duration;
 use crate::orchestrator::{
     AddMembersServerResult, ConversationListPage, ConversationMetadata, ConversationState,
     ConversationView, CreateConversationResult, CredentialStore, DeferredRecoveryReport,
-    DeviceInfo, GroupState, IncomingEnvelope, JoinMethod, KeyPackageRef, KeyPackageStats,
-    KeyPackageSyncResult, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView,
-    Message, OrchestratorConfig, OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff,
-    PersistedRecoveryState, ProcessExternalCommitResult, ResetRecordOutcome, SendMessageResponse,
-    StartupReconcileReport, SyncCursor,
+    DeviceInfo, EngineEvent, GroupState, IncomingEnvelope, JoinMethod, KeyPackageRef,
+    KeyPackageStats, KeyPackageSyncResult, MLSAPIClient, MLSOrchestrator, MLSStorageBackend,
+    MemberRole, MemberView, Message, OrchestratorConfig, OrchestratorError, PendingLocalDelete,
+    PersistedRecoveryBackoff, PersistedRecoveryState, ProcessExternalCommitResult,
+    ResetRecordOutcome, SendMessageResponse, StartupReconcileReport, SyncCursor,
 };
 
 use crate::api::MLSContext;
@@ -498,6 +498,34 @@ pub struct FFIIncomingEnvelope {
     pub ciphertext: Vec<u8>,
     pub timestamp: String,
     pub server_message_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FFIEngineEventKind {
+    ConversationUpdated,
+    MessageInserted,
+    RecoveryStateChanged,
+    NeedsUiRefresh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FFIEngineEvent {
+    pub kind: FFIEngineEventKind,
+    pub conversation_id: String,
+    pub message_id: Option<String>,
+    pub recovery_state: Option<FFIConversationRecoveryState>,
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct FFISendResult {
+    pub message: FFIMessage,
+    pub events: Vec<FFIEngineEvent>,
+}
+
+#[derive(Clone, uniffi::Record)]
+pub struct FFIMessageProcessingResult {
+    pub message: Option<FFIMessage>,
+    pub events: Vec<FFIEngineEvent>,
 }
 
 /// FFI mirror of `PersistedRecoveryBackoff` (WS-5.4 / invariant E7). All
@@ -1123,6 +1151,59 @@ fn message_to_ffi(msg: &Message) -> FFIMessage {
         delivery_status: msg.delivery_status.as_ref().map(delivery_status_to_ffi),
         payload_json: msg.payload_json.clone(),
     }
+}
+
+fn ffi_incoming_envelope_to_internal(
+    envelope: FFIIncomingEnvelope,
+    server_epoch: Option<u64>,
+) -> IncomingEnvelope {
+    IncomingEnvelope {
+        conversation_id: envelope.conversation_id,
+        sender_did: envelope.sender_did,
+        ciphertext: envelope.ciphertext,
+        timestamp: envelope
+            .timestamp
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap_or_else(|_| chrono::Utc::now()),
+        server_message_id: envelope.server_message_id,
+        server_epoch,
+    }
+}
+
+fn engine_event_to_ffi(event: &EngineEvent) -> FFIEngineEvent {
+    match event {
+        EngineEvent::ConversationUpdated { convo_id } => FFIEngineEvent {
+            kind: FFIEngineEventKind::ConversationUpdated,
+            conversation_id: convo_id.clone(),
+            message_id: None,
+            recovery_state: None,
+        },
+        EngineEvent::MessageInserted {
+            message_id,
+            convo_id,
+        } => FFIEngineEvent {
+            kind: FFIEngineEventKind::MessageInserted,
+            conversation_id: convo_id.clone(),
+            message_id: Some(message_id.clone()),
+            recovery_state: None,
+        },
+        EngineEvent::RecoveryStateChanged { convo_id, state } => FFIEngineEvent {
+            kind: FFIEngineEventKind::RecoveryStateChanged,
+            conversation_id: convo_id.clone(),
+            message_id: None,
+            recovery_state: Some(ffi_conversation_recovery_state(*state)),
+        },
+        EngineEvent::NeedsUiRefresh { convo_id } => FFIEngineEvent {
+            kind: FFIEngineEventKind::NeedsUiRefresh,
+            conversation_id: convo_id.clone(),
+            message_id: None,
+            recovery_state: None,
+        },
+    }
+}
+
+fn engine_events_to_ffi(events: &[EngineEvent]) -> Vec<FFIEngineEvent> {
+    events.iter().map(engine_event_to_ffi).collect()
 }
 
 fn ffi_reaction_action(
@@ -2201,6 +2282,34 @@ impl OrchestratorBridge {
         Ok(message_to_ffi(&msg))
     }
 
+    /// Send a JSON-encoded MLS message payload through the Rust-owned engine.
+    pub fn send_payload_result_json(
+        &self,
+        conversation_id: String,
+        payload_json: String,
+    ) -> Result<FFISendResult, OrchestratorBridgeError> {
+        let result = self
+            .engine
+            .send_payload(&conversation_id, &payload_json)
+            .map_err(OrchestratorBridgeError::from)?;
+        Ok(FFISendResult {
+            message: message_to_ffi(&result.message),
+            events: engine_events_to_ffi(&result.events),
+        })
+    }
+
+    /// Process a server event envelope through the Rust-owned engine.
+    pub fn process_server_event(
+        &self,
+        event_json: String,
+    ) -> Result<Vec<FFIEngineEvent>, OrchestratorBridgeError> {
+        let events = self
+            .engine
+            .process_server_event(&event_json)
+            .map_err(OrchestratorBridgeError::from)?;
+        Ok(engine_events_to_ffi(&events))
+    }
+
     /// Send an encrypted reaction payload.
     pub fn send_reaction(
         &self,
@@ -2302,19 +2411,25 @@ impl OrchestratorBridge {
         &self,
         envelope: FFIIncomingEnvelope,
     ) -> Result<Option<FFIMessage>, OrchestratorBridgeError> {
-        let inner_envelope = IncomingEnvelope {
-            conversation_id: envelope.conversation_id,
-            sender_did: envelope.sender_did,
-            ciphertext: envelope.ciphertext,
-            timestamp: envelope
-                .timestamp
-                .parse::<chrono::DateTime<chrono::Utc>>()
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            server_message_id: envelope.server_message_id,
-            server_epoch: None,
-        };
+        let inner_envelope = ffi_incoming_envelope_to_internal(envelope, None);
         let result = crate::async_runtime::block_on(self.inner.process_incoming(&inner_envelope))?;
         Ok(result.map(|m| message_to_ffi(&m)))
+    }
+
+    /// Process an incoming encrypted envelope through the Rust-owned engine.
+    pub fn process_incoming_message(
+        &self,
+        envelope: FFIIncomingEnvelope,
+        server_epoch: Option<u64>,
+    ) -> Result<FFIMessageProcessingResult, OrchestratorBridgeError> {
+        let result = self
+            .engine
+            .process_incoming_message(ffi_incoming_envelope_to_internal(envelope, server_epoch))
+            .map_err(OrchestratorBridgeError::from)?;
+        Ok(FFIMessageProcessingResult {
+            message: result.message.as_ref().map(message_to_ffi),
+            events: engine_events_to_ffi(&result.events),
+        })
     }
 
     /// Fetch and process new messages from server.

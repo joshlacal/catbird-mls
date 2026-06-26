@@ -284,18 +284,7 @@ where
     ) -> Result<MessageProcessingResult> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
-        let message =
-            crate::async_runtime::block_on(self.orchestrator.process_incoming(&envelope))?;
-        let events = message
-            .as_ref()
-            .map(|message| {
-                vec![EngineEvent::MessageInserted {
-                    message_id: message.id.clone(),
-                    convo_id: message.conversation_id.clone(),
-                }]
-            })
-            .unwrap_or_default();
-        Ok(MessageProcessingResult { message, events })
+        crate::async_runtime::block_on(self.orchestrator.process_incoming_message(&envelope))
     }
 
     pub fn shutdown(&self, reason: ShutdownReason) -> Result<()> {
