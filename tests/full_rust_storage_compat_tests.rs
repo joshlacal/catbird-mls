@@ -8,6 +8,8 @@ mod mock_credentials;
 mod mock_storage;
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -49,8 +51,9 @@ impl KeychainAccess for SharedKeychain {
 }
 
 struct StorageCompatFixture {
-    did: &'static str,
+    did: String,
     db_path: String,
+    encryption_key: String,
     keychain: SharedKeychain,
     storage: Arc<MockStorage>,
     api: Arc<MockDeliveryService>,
@@ -58,10 +61,13 @@ struct StorageCompatFixture {
     _temp_dir: tempfile::TempDir,
 }
 
+#[derive(Clone, serde::Deserialize)]
 struct ExistingFixtureState {
+    did: String,
     conversation_id: String,
     group_id_hex: String,
     epoch: u64,
+    encryption_key: String,
 }
 
 impl StorageCompatFixture {
@@ -69,8 +75,9 @@ impl StorageCompatFixture {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("mls.db").to_string_lossy().to_string();
         Self {
-            did: "did:plc:alice",
+            did: "did:plc:alice".to_string(),
             db_path,
+            encryption_key: "test-key".to_string(),
             keychain: SharedKeychain::default(),
             storage: Arc::new(MockStorage::new()),
             api: Arc::new(MockDeliveryService::new("did:plc:alice")),
@@ -79,10 +86,37 @@ impl StorageCompatFixture {
         }
     }
 
+    fn load_preexisting_openmls_fixture() -> (Self, ExistingFixtureState) {
+        let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let existing: ExistingFixtureState = serde_json::from_slice(
+            &fs::read(fixture_dir.join("openmls_preexisting_metadata.json"))
+                .expect("read preexisting fixture metadata"),
+        )
+        .expect("decode preexisting fixture metadata");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("mls.db");
+        fs::copy(fixture_dir.join("openmls_preexisting.sqlite"), &db_path)
+            .expect("copy preexisting OpenMLS SQLite fixture");
+
+        (
+            Self {
+                did: existing.did.clone(),
+                db_path: db_path.to_string_lossy().to_string(),
+                encryption_key: existing.encryption_key.clone(),
+                keychain: SharedKeychain::default(),
+                storage: Arc::new(MockStorage::new()),
+                api: Arc::new(MockDeliveryService::new("did:plc:alice")),
+                credentials: Arc::new(MockCredentials::new()),
+                _temp_dir: temp_dir,
+            },
+            existing,
+        )
+    }
+
     fn context(&self) -> Arc<MLSContext> {
         MLSContext::new(
             self.db_path.clone(),
-            "test-key".to_string(),
+            self.encryption_key.clone(),
             Box::new(self.keychain.clone()),
         )
         .expect("MLSContext")
@@ -106,16 +140,7 @@ impl StorageCompatFixture {
         )
     }
 
-    fn build_preexisting_openmls_fixture(&self) -> ExistingFixtureState {
-        let context = self.context();
-        let created = context
-            .create_group(self.did.as_bytes().to_vec(), None)
-            .expect("create direct OpenMLS fixture group");
-        let epoch = context
-            .get_epoch(created.group_id.clone())
-            .expect("fixture group epoch");
-        let conversation_id = "convo-preexisting".to_string();
-        let group_id_hex = hex::encode(&created.group_id);
+    fn load_fixture_projection_rows(&self, existing: &ExistingFixtureState) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -123,50 +148,40 @@ impl StorageCompatFixture {
 
         runtime
             .block_on(self.storage.ensure_conversation_exists(
-                self.did,
-                &conversation_id,
-                &group_id_hex,
+                &existing.did,
+                &existing.conversation_id,
+                &existing.group_id_hex,
             ))
             .expect("seed conversation projection");
         runtime
             .block_on(self.storage.update_join_info(
-                &conversation_id,
-                self.did,
+                &existing.conversation_id,
+                &existing.did,
                 JoinMethod::Creator,
-                epoch,
+                existing.epoch,
             ))
             .expect("seed join info");
         runtime
             .block_on(
                 self.storage
-                    .set_conversation_state(&conversation_id, ConversationState::Active),
+                    .set_conversation_state(&existing.conversation_id, ConversationState::Active),
             )
             .expect("seed conversation state");
         runtime
             .block_on(self.storage.set_group_state(&GroupState {
-                group_id: group_id_hex.clone(),
-                conversation_id: conversation_id.clone(),
-                epoch,
-                members: vec![self.did.to_string()],
+                group_id: existing.group_id_hex.clone(),
+                conversation_id: existing.conversation_id.clone(),
+                epoch: existing.epoch,
+                members: vec![existing.did.clone()],
             }))
             .expect("seed group state");
-
-        context
-            .flush_and_prepare_close()
-            .expect("close fixture builder context");
-
-        ExistingFixtureState {
-            conversation_id,
-            group_id_hex,
-            epoch,
-        }
     }
 }
 
 #[test]
 fn existing_openmls_sqlite_state_loads_under_rust_engine_storage() {
-    let fixture = StorageCompatFixture::new();
-    let existing = fixture.build_preexisting_openmls_fixture();
+    let (fixture, existing) = StorageCompatFixture::load_preexisting_openmls_fixture();
+    fixture.load_fixture_projection_rows(&existing);
 
     assert_eq!(
         fixture.storage.storage_projection_counts(),
@@ -180,7 +195,7 @@ fn existing_openmls_sqlite_state_loads_under_rust_engine_storage() {
 
     let reopened = fixture.engine();
     reopened
-        .initialize_user(fixture.did)
+        .initialize_user(&fixture.did)
         .expect("initialize reopened engine");
 
     let ready = reopened
@@ -212,7 +227,7 @@ fn openmls_sqlite_state_round_trips_under_rust_engine_storage() {
     let fixture = StorageCompatFixture::new();
     let (conversation_id, group_id, epoch_before_close) = {
         let engine = fixture.engine();
-        engine.initialize_user(fixture.did).expect("initialize");
+        engine.initialize_user(&fixture.did).expect("initialize");
         let created = engine
             .create_conversation(CreateConversationRequest {
                 name: "storage-owned-by-rust".into(),
@@ -251,7 +266,7 @@ fn openmls_sqlite_state_round_trips_under_rust_engine_storage() {
 
     let reopened = fixture.engine();
     reopened
-        .initialize_user(fixture.did)
+        .initialize_user(&fixture.did)
         .expect("initialize reopened engine");
 
     let ready = reopened
@@ -284,13 +299,43 @@ fn storage_lifecycle_status_reports_busy_interrupt_suspend_and_close() {
     let context = fixture.context();
     let engine = fixture.engine_with_context(Arc::clone(&context));
 
-    engine.initialize_user(fixture.did).expect("initialize");
+    engine.initialize_user(&fixture.did).expect("initialize");
     let initial = engine.storage_lifecycle_status();
     assert_eq!(initial.state, StorageLifecycleState::Open);
     assert!(!initial.is_busy);
     assert_eq!(initial.busy_contexts, 0);
     assert_eq!(initial.last_operation_label.as_deref(), Some("initialized"));
     assert_eq!(initial.interruptible_contexts, 2);
+
+    let created = engine
+        .create_conversation(CreateConversationRequest {
+            name: "operation-labels".into(),
+            member_dids: vec![],
+            description: None,
+        })
+        .expect("create conversation");
+    let group_id = hex::decode(&created.conversation.group_id).expect("group id hex");
+    let ciphertext = context
+        .encrypt_message(group_id.clone(), b"hello from rust".to_vec())
+        .expect("encrypt fixture message")
+        .ciphertext;
+    let after_encrypt = engine.storage_lifecycle_status();
+    assert_eq!(
+        after_encrypt.last_operation_label.as_deref(),
+        Some("encrypt_message"),
+        "engine status should preserve the storage registry label for host-facing lifecycle status"
+    );
+    let decrypt_result = context.decrypt_message(group_id, ciphertext);
+    assert!(
+        decrypt_result.is_err(),
+        "single-context fixture is only exercising the storage label path here"
+    );
+    let after_decrypt = engine.storage_lifecycle_status();
+    assert_eq!(
+        after_decrypt.last_operation_label.as_deref(),
+        Some("decrypt_message"),
+        "engine status should keep the latest storage operation label visible to Swift hosts"
+    );
 
     let busy_context = Arc::clone(&context);
     let busy_started = Arc::new(AtomicBool::new(false));
@@ -342,7 +387,7 @@ fn storage_lifecycle_status_reports_busy_interrupt_suspend_and_close() {
     assert_eq!(after_interrupt.busy_contexts, 0);
     assert_eq!(
         after_interrupt.last_operation_label.as_deref(),
-        Some("interrupt: unit-test interrupt")
+        Some("interrupt")
     );
 
     engine
@@ -352,10 +397,7 @@ fn storage_lifecycle_status_reports_busy_interrupt_suspend_and_close() {
     assert_eq!(suspended.state, StorageLifecycleState::Suspended);
     assert!(!suspended.is_busy);
     assert_eq!(suspended.busy_contexts, 0);
-    assert_eq!(
-        suspended.last_operation_label.as_deref(),
-        Some("prepare_for_suspend: unit-test suspend")
-    );
+    assert_eq!(suspended.last_operation_label.as_deref(), Some("interrupt"));
 
     engine
         .emergency_close("unit-test close")
@@ -366,6 +408,6 @@ fn storage_lifecycle_status_reports_busy_interrupt_suspend_and_close() {
     assert_eq!(closed.busy_contexts, 0);
     assert_eq!(
         closed.last_operation_label.as_deref(),
-        Some("emergency_close: unit-test close")
+        Some("flush_and_prepare_close")
     );
 }

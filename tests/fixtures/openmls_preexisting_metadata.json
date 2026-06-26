@@ -1,0 +1,7 @@
+{
+  "did": "did:plc:alice",
+  "conversation_id": "convo-preexisting",
+  "group_id_hex": "9a4f4d718f66420489f6a6f6d89c2f11",
+  "epoch": 0,
+  "encryption_key": "fixture-key"
+}

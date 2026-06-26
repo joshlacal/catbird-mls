@@ -130,12 +130,6 @@ impl EngineLifecycle {
         Ok(())
     }
 
-    fn last_storage_operation_label(&self) -> Option<String> {
-        self.lock_last_storage_operation_label()
-            .ok()
-            .and_then(|label| label.clone())
-    }
-
     fn lock_last_storage_operation_label(&self) -> Result<MutexGuard<'_, Option<String>>> {
         self.last_storage_operation_label.lock().map_err(|_| {
             OrchestratorError::InvalidInput("engine lifecycle lock poisoned".to_string())
@@ -508,7 +502,6 @@ where
         if status.state != StorageLifecycleState::Closed && self.is_suspended() {
             status.state = StorageLifecycleState::Suspended;
         }
-        status.last_operation_label = self.lifecycle.last_storage_operation_label();
         status
     }
 
