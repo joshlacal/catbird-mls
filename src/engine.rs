@@ -2,10 +2,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::orchestrator::{
-    ConversationReadyResult, ConversationRecoveryState, CredentialStore, DeferredRecoveryReport,
-    EngineEvent, IncomingEnvelope, MLSAPIClient, MLSOrchestrator, MLSStorageBackend,
-    MlsCryptoContext, OrchestratorConfig, OrchestratorError, ResetRecordOutcome, Result,
-    StartupReconcileReport,
+    ConversationReadyResult, ConversationRecoveryState, ConversationView, CredentialStore,
+    DeferredRecoveryReport, EngineEvent, GroupState, IncomingEnvelope, MLSAPIClient,
+    MLSOrchestrator, MLSStorageBackend, MlsCryptoContext, OrchestratorConfig, OrchestratorError,
+    ResetRecordOutcome, Result, StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 use serde::Deserialize;
@@ -61,6 +61,24 @@ pub struct SendResult {
 pub struct MessageProcessingResult {
     pub message: Option<crate::orchestrator::Message>,
     pub events: Vec<EngineEvent>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateConversationRequest {
+    pub name: String,
+    pub member_dids: Vec<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupMutationResult {
+    pub conversation: ConversationView,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeaveResult {
+    pub conversation_id: String,
+    pub group_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -226,6 +244,65 @@ where
             convo_id: message.conversation_id.clone(),
         }];
         Ok(SendResult { message, events })
+    }
+
+    pub fn create_conversation(
+        &self,
+        request: CreateConversationRequest,
+    ) -> Result<crate::orchestrator::CreateConversationResult> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let members = if request.member_dids.is_empty() {
+            None
+        } else {
+            Some(request.member_dids.as_slice())
+        };
+        let conversation = crate::async_runtime::block_on(self.orchestrator.create_group(
+            &request.name,
+            members,
+            request.description.as_deref(),
+        ))?;
+        self.store_conversation_snapshot(&conversation)?;
+        Ok(crate::orchestrator::CreateConversationResult {
+            conversation,
+            commit_data: None,
+            welcome_data: None,
+        })
+    }
+
+    pub fn add_members(
+        &self,
+        convo_id: &str,
+        member_dids: &[String],
+    ) -> Result<GroupMutationResult> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.add_members(convo_id, member_dids))?;
+        let conversation = self.refresh_conversation_snapshot(convo_id)?;
+        Ok(GroupMutationResult { conversation })
+    }
+
+    pub fn remove_members(
+        &self,
+        convo_id: &str,
+        member_dids: &[String],
+    ) -> Result<GroupMutationResult> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.remove_members(convo_id, member_dids))?;
+        let conversation = self.refresh_conversation_snapshot(convo_id)?;
+        Ok(GroupMutationResult { conversation })
+    }
+
+    pub fn leave_conversation(&self, convo_id: &str) -> Result<LeaveResult> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let group_id = self.current_conversation_group_id(convo_id)?;
+        crate::async_runtime::block_on(self.orchestrator.leave_group(convo_id))?;
+        Ok(LeaveResult {
+            conversation_id: convo_id.to_string(),
+            group_id,
+        })
     }
 
     pub fn process_server_event(&self, event_json: &str) -> Result<Vec<EngineEvent>> {
@@ -408,6 +485,94 @@ where
             Err(OrchestratorError::NotAuthenticated) => Ok(None),
             Err(err) => Err(err),
         }
+    }
+
+    fn current_conversation_group_id(&self, convo_id: &str) -> Result<Option<String>> {
+        let user_did = self
+            .current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+
+        if let Some(conversation) = crate::async_runtime::block_on(
+            self.orchestrator
+                .storage()
+                .get_conversation(&user_did, convo_id),
+        )? {
+            return Ok(Some(conversation.group_id));
+        }
+
+        Ok(crate::async_runtime::block_on(async {
+            self.orchestrator
+                .conversations()
+                .lock()
+                .await
+                .get(convo_id)
+                .map(|conversation| conversation.group_id.clone())
+        }))
+    }
+
+    fn refresh_conversation_snapshot(&self, convo_id: &str) -> Result<ConversationView> {
+        let snapshot = crate::async_runtime::block_on(async {
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = self
+                    .orchestrator
+                    .api_client()
+                    .get_conversations(100, cursor.as_deref())
+                    .await?;
+                if let Some(conversation) = page
+                    .conversations
+                    .into_iter()
+                    .find(|conversation| conversation.conversation_id == convo_id)
+                {
+                    return Ok(conversation);
+                }
+                cursor = page.cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+
+            self.orchestrator
+                .conversations()
+                .lock()
+                .await
+                .get(convo_id)
+                .cloned()
+                .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))
+        })?;
+        self.store_conversation_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    fn store_conversation_snapshot(&self, conversation: &ConversationView) -> Result<()> {
+        let state = GroupState {
+            group_id: conversation.group_id.clone(),
+            conversation_id: conversation.conversation_id.clone(),
+            epoch: conversation.epoch,
+            members: conversation
+                .members
+                .iter()
+                .map(|member| member.did.clone())
+                .collect(),
+        };
+
+        crate::async_runtime::block_on(async {
+            self.orchestrator
+                .conversations()
+                .lock()
+                .await
+                .insert(conversation.conversation_id.clone(), conversation.clone());
+            self.orchestrator
+                .group_states()
+                .lock()
+                .await
+                .insert(conversation.group_id.clone(), state.clone());
+            self.orchestrator.conversation_states().lock().await.insert(
+                conversation.conversation_id.clone(),
+                crate::orchestrator::ConversationState::Active,
+            );
+            self.orchestrator.storage().set_group_state(&state).await
+        })
     }
 }
 

@@ -18,7 +18,9 @@ use crate::orchestrator::{
 };
 
 use crate::api::MLSContext;
-use crate::engine::{EngineLifecycle, MlsEngine};
+use crate::engine::{
+    CreateConversationRequest, EngineLifecycle, GroupMutationResult, LeaveResult, MlsEngine,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UniFFI callback interfaces — implemented in Swift/Kotlin
@@ -449,6 +451,17 @@ pub struct FFICreateConversationResult {
 pub struct FFIAddMembersResult {
     pub success: bool,
     pub new_epoch: u64,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FFIGroupMutationResult {
+    pub conversation: FFIConversationView,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct FFILeaveResult {
+    pub conversation_id: String,
+    pub group_id: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -2154,6 +2167,29 @@ impl OrchestratorBridge {
         Ok(convo_view_to_ffi(&convo))
     }
 
+    /// Create a new MLS conversation through the Rust-owned engine and
+    /// return the conversation snapshot needed by full-authority clients.
+    pub fn create_conversation(
+        &self,
+        name: String,
+        initial_members: Option<Vec<String>>,
+        description: Option<String>,
+    ) -> Result<FFICreateConversationResult, OrchestratorBridgeError> {
+        let result = self
+            .engine
+            .create_conversation(CreateConversationRequest {
+                name,
+                member_dids: initial_members.unwrap_or_default(),
+                description,
+            })
+            .map_err(OrchestratorBridgeError::from)?;
+        Ok(FFICreateConversationResult {
+            conversation: convo_view_to_ffi(&result.conversation),
+            commit_data: result.commit_data,
+            welcome_data: result.welcome_data,
+        })
+    }
+
     /// Join an existing group via Welcome message.
     pub fn join_group(
         &self,
@@ -2173,6 +2209,22 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Add members through the Rust-owned engine and return the updated
+    /// conversation snapshot for full-authority clients.
+    pub fn add_members_result(
+        &self,
+        conversation_id: String,
+        member_dids: Vec<String>,
+    ) -> Result<FFIGroupMutationResult, OrchestratorBridgeError> {
+        let result: GroupMutationResult = self
+            .engine
+            .add_members(&conversation_id, &member_dids)
+            .map_err(OrchestratorBridgeError::from)?;
+        Ok(FFIGroupMutationResult {
+            conversation: convo_view_to_ffi(&result.conversation),
+        })
+    }
+
     /// Remove members from a group.
     pub fn remove_members(
         &self,
@@ -2181,6 +2233,22 @@ impl OrchestratorBridge {
     ) -> Result<(), OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.remove_members(&group_id, &member_dids))?;
         Ok(())
+    }
+
+    /// Remove members through the Rust-owned engine and return the updated
+    /// conversation snapshot for full-authority clients.
+    pub fn remove_members_result(
+        &self,
+        conversation_id: String,
+        member_dids: Vec<String>,
+    ) -> Result<FFIGroupMutationResult, OrchestratorBridgeError> {
+        let result: GroupMutationResult = self
+            .engine
+            .remove_members(&conversation_id, &member_dids)
+            .map_err(OrchestratorBridgeError::from)?;
+        Ok(FFIGroupMutationResult {
+            conversation: convo_view_to_ffi(&result.conversation),
+        })
     }
 
     /// Atomically swap members in a single commit.
@@ -2255,6 +2323,22 @@ impl OrchestratorBridge {
     pub fn leave_group(&self, convo_id: String) -> Result<(), OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.leave_group(&convo_id))?;
         Ok(())
+    }
+
+    /// Leave a conversation through the Rust-owned engine and return the
+    /// identifiers Swift needs to clean up local state immediately.
+    pub fn leave_conversation(
+        &self,
+        conversation_id: String,
+    ) -> Result<FFILeaveResult, OrchestratorBridgeError> {
+        let result: LeaveResult = self
+            .engine
+            .leave_conversation(&conversation_id)
+            .map_err(OrchestratorBridgeError::from)?;
+        Ok(FFILeaveResult {
+            conversation_id: result.conversation_id,
+            group_id: result.group_id,
+        })
     }
 
     // -- Messaging --
