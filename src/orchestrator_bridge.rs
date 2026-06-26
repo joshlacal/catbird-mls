@@ -21,6 +21,7 @@ use crate::api::MLSContext;
 use crate::engine::{
     CreateConversationRequest, EngineLifecycle, GroupMutationResult, LeaveResult, MlsEngine,
 };
+use crate::StorageLifecycleStatus;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // UniFFI callback interfaces — implemented in Swift/Kotlin
@@ -2996,6 +2997,10 @@ impl OrchestratorBridge {
     pub fn emergency_close(&self, reason: String) -> Result<(), OrchestratorBridgeError> {
         self.engine.emergency_close(&reason)?;
         Ok(())
+    }
+
+    pub fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
+        self.engine.storage_lifecycle_status()
     }
 }
 

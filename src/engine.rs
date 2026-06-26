@@ -2,12 +2,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::orchestrator::{
-    ConversationReadyResult, ConversationRecoveryState, ConversationView, CredentialStore,
-    DeferredRecoveryReport, EngineEvent, GroupState, IncomingEnvelope, MLSAPIClient,
-    MLSOrchestrator, MLSStorageBackend, MlsCryptoContext, OrchestratorConfig, OrchestratorError,
-    ResetRecordOutcome, Result, StartupReconcileReport,
+    ConversationReadyResult, ConversationRecoveryState, ConversationState, ConversationView,
+    CredentialStore, DeferredRecoveryReport, EngineEvent, GroupState, IncomingEnvelope,
+    MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext, OrchestratorConfig,
+    OrchestratorError, ResetRecordOutcome, Result, StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
+use crate::{StorageLifecycleState, StorageLifecycleStatus};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,7 @@ impl Default for EngineState {
 #[derive(Debug, Default)]
 pub struct EngineLifecycle {
     last_shutdown_reason: Mutex<Option<ShutdownReason>>,
+    last_storage_operation_label: Mutex<Option<String>>,
     platform: PlatformLifecycle,
 }
 
@@ -121,6 +123,23 @@ impl EngineLifecycle {
 
     fn platform(&self) -> &PlatformLifecycle {
         &self.platform
+    }
+
+    fn record_storage_operation(&self, label: impl Into<String>) -> Result<()> {
+        *self.lock_last_storage_operation_label()? = Some(label.into());
+        Ok(())
+    }
+
+    fn last_storage_operation_label(&self) -> Option<String> {
+        self.lock_last_storage_operation_label()
+            .ok()
+            .and_then(|label| label.clone())
+    }
+
+    fn lock_last_storage_operation_label(&self) -> Result<MutexGuard<'_, Option<String>>> {
+        self.last_storage_operation_label.lock().map_err(|_| {
+            OrchestratorError::InvalidInput("engine lifecycle lock poisoned".to_string())
+        })
     }
 }
 
@@ -196,6 +215,7 @@ where
             phase: EnginePhase::Initialized,
             initialized_user_did: Some(user_did.to_string()),
         };
+        self.lifecycle.record_storage_operation("initialized")?;
         Ok(())
     }
 
@@ -394,6 +414,8 @@ where
     }
 
     pub fn prepare_for_suspend(&self, reason: &str, deadline: Duration) -> Result<SuspendResult> {
+        self.lifecycle
+            .record_storage_operation(format!("prepare_for_suspend: {reason}"))?;
         let result = self.lifecycle.platform().begin_suspend(
             self.orchestrator.mls_context().as_ref(),
             reason,
@@ -419,6 +441,8 @@ where
         self.lifecycle
             .platform()
             .resume(self.orchestrator.mls_context().as_ref(), reason);
+        self.lifecycle
+            .record_storage_operation(format!("resume_from_suspend: {reason}"))?;
         crate::async_runtime::block_on(self.orchestrator.resume_after_suspend(&user_did));
         *self.lock_state()? = EngineState {
             phase: EnginePhase::Initialized,
@@ -439,6 +463,8 @@ where
         self.lifecycle
             .platform()
             .resume(self.orchestrator.mls_context().as_ref(), reason);
+        self.lifecycle
+            .record_storage_operation(format!("reattach_after_suspend: {reason}"))?;
         crate::async_runtime::block_on(self.orchestrator.resume_after_suspend(user_did));
         *self.lock_state()? = EngineState {
             phase: EnginePhase::Initialized,
@@ -448,6 +474,8 @@ where
     }
 
     pub fn interrupt_storage(&self, reason: &str) -> Result<usize> {
+        self.lifecycle
+            .record_storage_operation(format!("interrupt: {reason}"))?;
         Ok(self
             .lifecycle
             .platform()
@@ -455,6 +483,8 @@ where
     }
 
     pub fn emergency_close(&self, reason: &str) -> Result<()> {
+        self.lifecycle
+            .record_storage_operation(format!("emergency_close: {reason}"))?;
         self.lifecycle
             .platform()
             .emergency_close(self.orchestrator.mls_context().as_ref(), reason)?;
@@ -471,6 +501,15 @@ where
         self.lock_state()
             .map(|state| state.phase == EnginePhase::Suspended)
             .unwrap_or_else(|_| self.lifecycle.platform().is_suspending())
+    }
+
+    pub fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
+        let mut status = self.orchestrator.mls_context().storage_lifecycle_status();
+        if status.state != StorageLifecycleState::Closed && self.is_suspended() {
+            status.state = StorageLifecycleState::Suspended;
+        }
+        status.last_operation_label = self.lifecycle.last_storage_operation_label();
+        status
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, EngineState>> {
@@ -569,9 +608,13 @@ where
                 .insert(conversation.group_id.clone(), state.clone());
             self.orchestrator.conversation_states().lock().await.insert(
                 conversation.conversation_id.clone(),
-                crate::orchestrator::ConversationState::Active,
+                ConversationState::Active,
             );
-            self.orchestrator.storage().set_group_state(&state).await
+            self.orchestrator.storage().set_group_state(&state).await?;
+            self.orchestrator
+                .storage()
+                .set_conversation_state(&conversation.conversation_id, ConversationState::Active)
+                .await
         })
     }
 }

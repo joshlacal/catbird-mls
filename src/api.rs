@@ -625,6 +625,22 @@ impl MLSContext {
         }
     }
 
+    pub fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
+        let state = if self.is_closed() {
+            StorageLifecycleState::Closed
+        } else if self.is_suspended.load(Ordering::Acquire) {
+            StorageLifecycleState::Suspended
+        } else {
+            StorageLifecycleState::Open
+        };
+
+        StorageLifecycleStatus {
+            state,
+            interruptible_contexts: self.interrupt_handles.len() as u32,
+            last_operation_label: None,
+        }
+    }
+
     /// Set the credential validator callback for client-side validation
     ///
     /// This enables the Swift layer to validate credentials before accepting
@@ -6226,6 +6242,10 @@ impl MlsCryptoContext for MLSContext {
 
     fn flush_and_prepare_close(&self) -> Result<(), MLSError> {
         MLSContext::flush_and_prepare_close(self)
+    }
+
+    fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
+        MLSContext::storage_lifecycle_status(self)
     }
 
     fn create_group(

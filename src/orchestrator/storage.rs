@@ -50,6 +50,13 @@ pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
 ///
 /// Implementations should persist data durably (e.g. SQLite, GRDB, Room).
 /// All methods are async to allow non-blocking I/O.
+///
+/// This trait is not the OpenMLS cryptographic state store. Native Rust
+/// engines keep OpenMLS group state, key packages, ratchets, and manifest
+/// data inside `MLSContext` via `openmls_sqlite_storage` and
+/// `HybridStorageProvider`. Platform callbacks project app-facing rows only:
+/// conversation metadata, message rows, recovery flags, cursors, and other UI
+/// or orchestration state that Swift/Kotlin/catmos own outside OpenMLS.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait MLSStorageBackend: MLSStorageBackendBounds {

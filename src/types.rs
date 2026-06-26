@@ -1,5 +1,21 @@
 // UniFFI Record types (structs passed across FFI)
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
+pub enum StorageLifecycleState {
+    Open,
+    Suspended,
+    Closed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct StorageLifecycleStatus {
+    pub state: StorageLifecycleState,
+    pub interruptible_contexts: u32,
+    pub last_operation_label: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct KeyPackageData {

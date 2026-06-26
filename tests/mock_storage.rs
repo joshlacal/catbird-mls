@@ -365,6 +365,23 @@ impl MockStorage {
             .copied()
             .unwrap_or(0)
     }
+
+    #[allow(dead_code)]
+    pub fn storage_projection_counts(&self) -> StorageProjectionCounts {
+        let inner = self.inner.lock().unwrap();
+        StorageProjectionCounts {
+            conversations: inner.conversations.len(),
+            group_states: inner.group_states.len(),
+            messages: inner.messages.values().map(Vec::len).sum(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StorageProjectionCounts {
+    pub conversations: usize,
+    pub group_states: usize,
+    pub messages: usize,
 }
 
 #[async_trait]

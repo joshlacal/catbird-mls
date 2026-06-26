@@ -34,6 +34,14 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
 
+    fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
+        StorageLifecycleStatus {
+            state: StorageLifecycleState::Open,
+            interruptible_contexts: 0,
+            last_operation_label: None,
+        }
+    }
+
     fn create_group(
         &self,
         identity: Vec<u8>,

@@ -916,6 +916,7 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
             ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
             timestamp: chrono::Utc::now(),
             server_message_id: Some(format!("bad-frame-{i}")),
+            server_epoch: None,
         };
         let _ = orchestrator.process_incoming(&envelope).await;
     }
@@ -999,6 +1000,7 @@ async fn failing_quarantine_persists_escalate() {
         ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
         timestamp: chrono::Utc::now(),
         server_message_id: Some(format!("bad-frame-{i}")),
+        server_epoch: None,
     };
 
     // Two peer-bad frames arm Layer 3; inject the enter-side persist
