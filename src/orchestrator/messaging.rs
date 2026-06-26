@@ -115,6 +115,7 @@ where
                     projected,
                     ConversationRecoveryState::NeedsRejoin
                         | ConversationRecoveryState::ResetPending
+                        | ConversationRecoveryState::EpochBehind
                 ) =>
             {
                 return Ok(Self::ready_result(projected, None));
@@ -146,6 +147,7 @@ where
                             projected,
                             ConversationRecoveryState::NeedsRejoin
                                 | ConversationRecoveryState::ResetPending
+                                | ConversationRecoveryState::EpochBehind
                         ) =>
                     {
                         None

@@ -268,6 +268,51 @@ async fn reset_pending_survives_local_epoch_probe_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn epoch_behind_survives_local_epoch_probe_errors() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Fork detected closed context", None, None)
+        .await
+        .expect("create_group failed");
+
+    alice
+        .orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .insert(
+            convo.conversation_id.clone(),
+            ConversationState::ForkDetected,
+        );
+
+    alice
+        .orchestrator
+        .mls_context()
+        .flush_and_prepare_close()
+        .expect("closing test context should succeed");
+
+    let result = alice
+        .orchestrator
+        .ensure_conversation_ready(&convo.conversation_id)
+        .await
+        .expect("fork-detected should survive epoch probe failures");
+
+    assert_eq!(
+        result,
+        ConversationReadyResult {
+            recovery_state: ConversationRecoveryState::EpochBehind,
+            epoch: None,
+            send_allowed: false,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn join_or_rejoin_failure_returns_non_ready_non_healthy_result() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
