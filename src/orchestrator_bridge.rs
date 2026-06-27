@@ -2546,6 +2546,17 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Return the Rust-orchestrator storage projection for full-authority
+    /// clients that need to refresh platform UI caches after sync/recovery.
+    pub fn list_conversations(
+        &self,
+        user_did: String,
+    ) -> Result<Vec<FFIConversationView>, OrchestratorBridgeError> {
+        let conversations =
+            crate::async_runtime::block_on(self.inner.storage().list_conversations(&user_did))?;
+        Ok(conversations.iter().map(convo_view_to_ffi).collect())
+    }
+
     pub fn startup_reconcile(&self) -> Result<FFIStartupReconcileReport, OrchestratorBridgeError> {
         Ok(self.engine.startup_reconcile()?.into())
     }
