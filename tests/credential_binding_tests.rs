@@ -266,6 +266,7 @@ async fn fork_readd_key_package_fetch_warns_on_mismatch() {
             ciphertext: format!("not-an-mls-message-{i}").into_bytes(),
             timestamp: chrono::Utc::now(),
             server_message_id: Some(format!("fork-readd-bad-frame-{i}")),
+            server_epoch: None,
         };
         let result = world
             .client("Alice")

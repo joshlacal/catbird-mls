@@ -441,6 +441,7 @@ async fn trigger_fork_detection<A>(
             ciphertext: format!("not-an-mls-message-{i}").into_bytes(),
             timestamp: Utc::now(),
             server_message_id: Some(format!("bad-fork-frame-{i}")),
+            server_epoch: None,
         };
         let result = orchestrator.process_incoming(&envelope).await;
         assert!(
@@ -640,6 +641,7 @@ async fn fork_readd_falls_back_to_needs_rejoin_when_crypto_unsupported() {
             ciphertext: format!("unsupported-fork-{i}").into_bytes(),
             timestamp: Utc::now(),
             server_message_id: Some(format!("unsupported-fork-{i}")),
+            server_epoch: None,
         };
         let result = orchestrator.process_incoming(&envelope).await;
         assert!(result.is_err(), "fake crypto always fails decryption");

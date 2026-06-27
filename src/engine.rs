@@ -4,8 +4,8 @@ use std::time::Duration;
 use crate::orchestrator::{
     ConversationReadyResult, ConversationRecoveryState, ConversationState, ConversationView,
     CredentialStore, DeferredRecoveryReport, EngineEvent, GroupState, IncomingEnvelope,
-    MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext, OrchestratorConfig,
-    OrchestratorError, ResetRecordOutcome, Result, StartupReconcileReport,
+    MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MessageProcessingResult, MlsCryptoContext,
+    OrchestratorConfig, OrchestratorError, ResetRecordOutcome, Result, StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 use crate::{StorageLifecycleState, StorageLifecycleStatus};
@@ -56,12 +56,6 @@ pub struct EngineLifecycle {
 #[derive(Debug, Clone)]
 pub struct SendResult {
     pub message: crate::orchestrator::Message,
-    pub events: Vec<EngineEvent>,
-}
-
-#[derive(Debug, Clone)]
-pub struct MessageProcessingResult {
-    pub message: Option<crate::orchestrator::Message>,
     pub events: Vec<EngineEvent>,
 }
 

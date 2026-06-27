@@ -4071,6 +4071,32 @@ mod tests {
 
     #[test]
     fn conversation_recovery_projection_matches_swift_vocabulary() {
+        fn project_conversation_recovery_state(
+            state: Option<&ConversationState>,
+        ) -> FFIConversationRecoveryState {
+            let projected = match state {
+                None | Some(ConversationState::Active) => {
+                    crate::orchestrator::ConversationRecoveryState::Healthy
+                }
+                Some(ConversationState::Initializing) => {
+                    crate::orchestrator::ConversationRecoveryState::Recovering
+                }
+                Some(ConversationState::ForkDetected) => {
+                    crate::orchestrator::ConversationRecoveryState::EpochBehind
+                }
+                Some(ConversationState::NeedsRejoin) => {
+                    crate::orchestrator::ConversationRecoveryState::NeedsRejoin
+                }
+                Some(ConversationState::ResetPending { .. }) => {
+                    crate::orchestrator::ConversationRecoveryState::ResetPending
+                }
+                Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
+                    crate::orchestrator::ConversationRecoveryState::UnrecoverableLocal
+                }
+            };
+            ffi_conversation_recovery_state(projected)
+        }
+
         assert_eq!(
             project_conversation_recovery_state(None),
             FFIConversationRecoveryState::Healthy

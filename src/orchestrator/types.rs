@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+use super::event_observer::EngineEvent;
+
 mod base64_bytes {
     use base64::Engine as _;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -225,6 +227,12 @@ pub struct ConversationReadyResult {
     pub recovery_state: ConversationRecoveryState,
     pub epoch: Option<u64>,
     pub send_allowed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageProcessingResult {
+    pub message: Option<Message>,
+    pub events: Vec<EngineEvent>,
 }
 
 /// Result of recording a server reset event into local deferred-recovery state.

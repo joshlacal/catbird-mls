@@ -144,6 +144,7 @@ fn envelope(convo_id: &str, ciphertext: Vec<u8>, msg_id: &str) -> IncomingEnvelo
         ciphertext,
         timestamp: chrono::Utc::now(),
         server_message_id: Some(msg_id.to_string()),
+        server_epoch: None,
     }
 }
 

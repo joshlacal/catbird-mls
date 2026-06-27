@@ -2,8 +2,6 @@ use chrono::Utc;
 use sha2::Digest;
 use std::collections::HashMap;
 
-use crate::engine::MessageProcessingResult;
-
 use super::api_client::MLSAPIClient;
 use super::constants;
 use super::credentials::CredentialStore;
