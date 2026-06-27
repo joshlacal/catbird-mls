@@ -4,12 +4,14 @@ use std::time::Duration;
 use crate::orchestrator::{
     ConversationReadyResult, ConversationRecoveryState, ConversationState, ConversationView,
     CredentialStore, DeferredRecoveryReport, EngineEvent, GroupState, IncomingEnvelope,
-    MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MessageProcessingResult, MlsCryptoContext,
-    OrchestratorConfig, OrchestratorError, ResetRecordOutcome, Result, StartupReconcileReport,
+    MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext, OrchestratorConfig,
+    OrchestratorError, ResetRecordOutcome, Result, StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 use crate::{StorageLifecycleState, StorageLifecycleStatus};
 use serde::Deserialize;
+
+pub use crate::orchestrator::MessageProcessingResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShutdownReason {

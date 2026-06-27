@@ -1078,6 +1078,10 @@ fn parse_incoming_envelope(convo_id: &str, val: &serde_json::Value) -> Option<In
         .as_str()
         .or_else(|| val["messageId"].as_str())
         .map(|s| s.to_string());
+    let server_epoch = val["serverEpoch"]
+        .as_u64()
+        .or_else(|| val["server_epoch"].as_u64())
+        .or_else(|| val["epoch"].as_u64());
 
     Some(IncomingEnvelope {
         conversation_id: convo_id.to_string(),
@@ -1085,6 +1089,7 @@ fn parse_incoming_envelope(convo_id: &str, val: &serde_json::Value) -> Option<In
         ciphertext,
         timestamp,
         server_message_id,
+        server_epoch,
     })
 }
 
