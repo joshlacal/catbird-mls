@@ -42,6 +42,7 @@ struct StoredKeyPackage {
     data: Vec<u8>,
     cipher_suite: String,
     expires_at: String,
+    device_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -317,6 +318,33 @@ impl MockDeliveryService {
             .key_packages
             .get(did)
             .map_or(0, |v| v.len())
+    }
+
+    /// The server-minted `device_id` of the most recently registered device
+    /// for a DID. Like the real delivery service, `register_device` mints its
+    /// own id and ignores the client-supplied UUID; device-scoped publishes
+    /// must reference this minted id, not the client UUID.
+    pub fn latest_registered_device_id(&self, did: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .devices
+            .get(did)
+            .and_then(|v| v.last())
+            .map(|d| d.info.device_id.clone())
+    }
+
+    /// The `device_id` captured for every key package published by a DID, in
+    /// publish order. Used to assert the orchestrator scopes publishes to the
+    /// registered device id.
+    pub fn published_device_ids(&self, did: &str) -> Vec<Option<String>> {
+        self.state
+            .lock()
+            .unwrap()
+            .key_packages
+            .get(did)
+            .map(|v| v.iter().map(|kp| kp.device_id.clone()).collect())
+            .unwrap_or_default()
     }
 
     /// List all conversation IDs.
@@ -929,6 +957,7 @@ impl MLSAPIClient for MockDeliveryService {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
         check_fail(
@@ -948,6 +977,7 @@ impl MLSAPIClient for MockDeliveryService {
                 data: key_package.to_vec(),
                 cipher_suite: cipher_suite.to_string(),
                 expires_at: expires_at.to_string(),
+                device_id: device_id.map(str::to_string),
             });
 
         Ok(())
@@ -1286,10 +1316,10 @@ mod tests {
     #[tokio::test]
     async fn test_key_packages_fifo() {
         let svc = MockDeliveryService::new("did:plc:alice");
-        svc.publish_key_package(b"kp-1", "suite-1", "2099-01-01")
+        svc.publish_key_package(b"kp-1", "suite-1", "2099-01-01", None)
             .await
             .unwrap();
-        svc.publish_key_package(b"kp-2", "suite-1", "2099-01-01")
+        svc.publish_key_package(b"kp-2", "suite-1", "2099-01-01", None)
             .await
             .unwrap();
 

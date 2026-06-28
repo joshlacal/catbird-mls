@@ -3,9 +3,9 @@ use std::time::Duration;
 
 use crate::orchestrator::{
     ConversationReadyResult, ConversationRecoveryState, ConversationState, ConversationView,
-    CredentialStore, DeferredRecoveryReport, EngineEvent, GroupState, IncomingEnvelope,
-    MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext, OrchestratorConfig,
-    OrchestratorError, ResetRecordOutcome, Result, StartupReconcileReport,
+    CredentialStore, DebugWipeLocalGroupResult, DeferredRecoveryReport, EngineEvent, GroupState,
+    IncomingEnvelope, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext,
+    OrchestratorConfig, OrchestratorError, ResetRecordOutcome, Result, StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 use crate::{StorageLifecycleState, StorageLifecycleStatus};
@@ -241,6 +241,18 @@ where
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.ensure_conversation_ready(convo_id))
+    }
+
+    pub fn debug_wipe_local_group_for_recovery(
+        &self,
+        convo_id: &str,
+    ) -> Result<DebugWipeLocalGroupResult> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(
+            self.orchestrator
+                .debug_wipe_local_group_for_recovery(convo_id),
+        )
     }
 
     pub fn send_payload(&self, convo_id: &str, payload_json: &str) -> Result<SendResult> {

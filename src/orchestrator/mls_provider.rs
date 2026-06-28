@@ -22,6 +22,15 @@ impl<T> MlsCryptoContextBounds for T {}
 pub trait MlsCryptoContext: MlsCryptoContextBounds {
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError>;
 
+    fn create_last_resort_key_package(
+        &self,
+        _identity: Vec<u8>,
+    ) -> Result<KeyPackageResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "last-resort key package generation not available on this platform".to_string(),
+        })
+    }
+
     fn set_suspended(&self, _value: bool) {}
 
     fn interrupt_storage(&self) -> usize {

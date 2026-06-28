@@ -9,12 +9,13 @@ use std::time::Duration;
 
 use crate::orchestrator::{
     AddMembersServerResult, ConversationListPage, ConversationMetadata, ConversationState,
-    ConversationView, CreateConversationResult, CredentialStore, DeferredRecoveryReport,
-    DeviceInfo, EngineEvent, GroupState, IncomingEnvelope, JoinMethod, KeyPackageRef,
-    KeyPackageStats, KeyPackageSyncResult, MLSAPIClient, MLSOrchestrator, MLSStorageBackend,
-    MemberRole, MemberView, Message, OrchestratorConfig, OrchestratorError, PendingLocalDelete,
-    PersistedRecoveryBackoff, PersistedRecoveryState, ProcessExternalCommitResult,
-    ResetRecordOutcome, SendMessageResponse, StartupReconcileReport, SyncCursor,
+    ConversationView, CreateConversationResult, CredentialStore, DebugWipeLocalGroupResult,
+    DeferredRecoveryReport, DeviceInfo, EngineEvent, GroupState, IncomingEnvelope, JoinMethod,
+    KeyPackageRef, KeyPackageStats, KeyPackageSyncResult, MLSAPIClient, MLSOrchestrator,
+    MLSStorageBackend, MemberRole, MemberView, Message, OrchestratorConfig, OrchestratorError,
+    PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState,
+    ProcessExternalCommitResult, ResetRecordOutcome, SendMessageResponse, StartupReconcileReport,
+    SyncCursor,
 };
 
 use crate::api::MLSContext;
@@ -243,6 +244,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
         key_package: Vec<u8>,
         cipher_suite: String,
         expires_at: String,
+        device_id: Option<String>,
     ) -> Result<(), OrchestratorBridgeError>;
 
     fn get_key_packages(
@@ -906,6 +908,13 @@ pub struct FFIConversationReadyResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FFIDebugWipeLocalGroupResult {
+    pub conversation_id: String,
+    pub group_id: Option<String>,
+    pub deleted_local_group: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct FFIStartupReconcileReport {
     pub scanned: u32,
     pub healthy: u32,
@@ -953,6 +962,16 @@ impl From<crate::orchestrator::ConversationReadyResult> for FFIConversationReady
             recovery_state: ffi_conversation_recovery_state(value.recovery_state),
             epoch: value.epoch,
             send_allowed: value.send_allowed,
+        }
+    }
+}
+
+impl From<DebugWipeLocalGroupResult> for FFIDebugWipeLocalGroupResult {
+    fn from(value: DebugWipeLocalGroupResult) -> Self {
+        Self {
+            conversation_id: value.conversation_id,
+            group_id: value.group_id,
+            deleted_local_group: value.deleted_local_group,
         }
     }
 }
@@ -1828,12 +1847,14 @@ impl MLSAPIClient for APIAdapter {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> crate::orchestrator::Result<()> {
         self.0
             .publish_key_package(
                 key_package.to_vec(),
                 cipher_suite.to_string(),
                 expires_at.to_string(),
+                device_id.map(str::to_string),
             )
             .map_err(bridge_err)
     }
@@ -2680,6 +2701,20 @@ impl OrchestratorBridge {
         convo_id: String,
     ) -> Result<FFIConversationReadyResult, OrchestratorBridgeError> {
         Ok(self.engine.ensure_conversation_ready(&convo_id)?.into())
+    }
+
+    /// Fault-injection hook used by rustFull E2E recovery tests.
+    ///
+    /// Deletes only local OpenMLS group state, preserves the conversation
+    /// projection, and marks the conversation for Rust-owned rejoin.
+    pub fn debug_wipe_local_group_for_recovery(
+        &self,
+        convo_id: String,
+    ) -> Result<FFIDebugWipeLocalGroupResult, OrchestratorBridgeError> {
+        Ok(self
+            .engine
+            .debug_wipe_local_group_for_recovery(&convo_id)?
+            .into())
     }
 
     /// Project the orchestrator's current conversation recovery state into the
@@ -3562,6 +3597,7 @@ mod tests {
             _key_package: Vec<u8>,
             _cipher_suite: String,
             _expires_at: String,
+            _device_id: Option<String>,
         ) -> Result<(), OrchestratorBridgeError> {
             Ok(())
         }
@@ -3777,6 +3813,46 @@ mod tests {
             welcome_calls.load(Ordering::SeqCst),
             1,
             "OrchestratorBridge.joinOrRejoin must call MLSOrchestrator::join_or_rejoin, whose first step probes Welcome"
+        );
+    }
+
+    #[test]
+    fn orchestrator_bridge_debug_wipe_local_group_uses_engine_auth_guard() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("bridge-debug-wipe-local-group.sqlite");
+        let mls_context = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            "bridge-debug-wipe-local-group-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        );
+
+        let err = bridge
+            .debug_wipe_local_group_for_recovery("convo-bridge-probe".to_string())
+            .expect_err("debug wipe must require engine initialization");
+
+        assert!(
+            matches!(err, OrchestratorBridgeError::NotAuthenticated),
+            "debug wipe should route through MlsEngine and preserve its auth guard, got {err:?}"
         );
     }
 

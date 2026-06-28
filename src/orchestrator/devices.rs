@@ -77,12 +77,20 @@ where
                 e
             })?;
 
-        // Store credentials
+        // Store credentials.
+        //
+        // The delivery service MINTS its own `device_id` and ignores the
+        // client-supplied `device_uuid`, returning the minted id in
+        // `device_info.device_id`. Every device-scoped call (publish, sync)
+        // must reference that minted id, so persist it — not the throwaway
+        // `device_uuid` we sent as the registration input. Storing the client
+        // UUID here is what stranded fresh devices: publishes carried an id the
+        // server never created and were rejected (403).
         self.credentials()
             .store_mls_did(&user_did, &mls_did)
             .await?;
         self.credentials()
-            .store_device_uuid(&user_did, &device_uuid)
+            .store_device_uuid(&user_did, &device_info.device_id)
             .await?;
         self.credentials()
             .store_signing_key(&user_did, &kp_result.signature_public_key)

@@ -512,12 +512,14 @@ impl MLSAPIClient for ClientAPIAdapter {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> crate::orchestrator::Result<()> {
         self.0
             .publish_key_package(
                 key_package.to_vec(),
                 cipher_suite.to_string(),
                 expires_at.to_string(),
+                device_id.map(str::to_string),
             )
             .map_err(bridge_err)
     }

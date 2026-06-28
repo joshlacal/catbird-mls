@@ -735,14 +735,18 @@ impl MLSAPIClient for HttpDSClient {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> OrcResult<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "keyPackages": [{
                 "data": base64::engine::general_purpose::STANDARD.encode(key_package),
                 "cipherSuite": cipher_suite,
                 "expiresAt": expires_at,
             }],
         });
+        if let Some(device_id) = device_id {
+            body["deviceId"] = serde_json::Value::String(device_id.to_string());
+        }
         let resp = self
             .client
             .post(self.xrpc_url("blue.catbird.mlsChat.publishKeyPackages"))

@@ -229,6 +229,15 @@ pub struct ConversationReadyResult {
     pub send_allowed: bool,
 }
 
+/// Fault-injection result for deleting only local OpenMLS group state while
+/// preserving the server conversation projection for Rust-owned recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugWipeLocalGroupResult {
+    pub conversation_id: ConversationId,
+    pub group_id: Option<GroupId>,
+    pub deleted_local_group: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct MessageProcessingResult {
     pub message: Option<Message>,

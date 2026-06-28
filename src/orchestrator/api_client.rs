@@ -151,11 +151,19 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     // -- Key Packages --
 
     /// Publish a key package to the server.
+    ///
+    /// `device_id` scopes the package to the publishing device so the server
+    /// can bind it to that device's signature key. Rust owns this identity (it
+    /// is generated and stored during `ensure_device_registered`); callers
+    /// pass the current device UUID. `None` falls back to legacy single-device
+    /// resolution, which the delivery service rejects for an unscoped fresh
+    /// device.
     async fn publish_key_package(
         &self,
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> Result<()>;
 
     /// Get key packages for a set of DIDs.

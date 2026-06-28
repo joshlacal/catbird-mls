@@ -8,6 +8,8 @@
 
 use async_trait::async_trait;
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
+use openmls::prelude::{DeserializeBytes, KeyPackageIn, ProtocolVersion};
+use openmls_traits::OpenMlsProvider;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -162,4 +164,30 @@ fn single_create_delegates_to_batch() {
     assert!(!result.key_package_data.is_empty());
     assert!(!result.hash_ref.is_empty());
     assert_eq!(ctx.get_key_package_bundle_count().unwrap(), 1);
+}
+
+#[test]
+fn last_resort_create_marks_package_and_persists_bundle() {
+    let (path, _dir) = make_db_path();
+    let ctx = open_context(&path);
+
+    let result = ctx
+        .create_last_resort_key_package(IDENTITY.to_vec())
+        .expect("last-resort key package creation should succeed");
+    assert!(!result.key_package_data.is_empty());
+    assert!(!result.hash_ref.is_empty());
+    assert_eq!(ctx.get_key_package_bundle_count().unwrap(), 1);
+
+    let (kp_in, remaining) = KeyPackageIn::tls_deserialize_bytes(&result.key_package_data)
+        .expect("generated key package should deserialize");
+    assert!(
+        remaining.is_empty(),
+        "raw KeyPackage serialization should not leave trailing bytes"
+    );
+
+    let provider = openmls_libcrux_crypto::Provider::new().expect("libcrux provider");
+    let kp = kp_in
+        .validate(provider.crypto(), ProtocolVersion::default())
+        .expect("generated key package should validate");
+    assert!(kp.last_resort(), "generated package must carry LastResort");
 }

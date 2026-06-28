@@ -2944,6 +2944,35 @@ impl MLSContext {
         results.pop().ok_or(MLSError::ContextClosed)
     }
 
+    pub fn create_last_resort_key_package(
+        &self,
+        identity_bytes: Vec<u8>,
+    ) -> Result<KeyPackageResult, MLSError> {
+        self.check_suspended()?;
+
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+
+        let identity = String::from_utf8(identity_bytes)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
+        let signature_keys = Self::resolve_or_create_signer(inner, &identity)?;
+        let (result, row) =
+            Self::build_key_package_locked(inner, &identity, &signature_keys, true)?;
+
+        inner.manifest_storage.insert_bundles(&[row])?;
+        if let Err(e) = inner.flush_database() {
+            crate::error_log!(
+                "[MLS-FFI] ⚠️ WARNING: Failed to flush database after last-resort bundle creation: {:?}",
+                e
+            );
+        }
+
+        Ok(result)
+    }
+
     /// Create `count` key packages with a SINGLE persistence pass: one bundle-row
     /// transaction and one WAL checkpoint at the end of the batch, instead of a
     /// full manifest rewrite + checkpoint per package.
@@ -2998,7 +3027,8 @@ impl MLSContext {
                 );
                 break;
             }
-            let (result, row) = Self::build_key_package_locked(inner, &identity, &signature_keys)?;
+            let (result, row) =
+                Self::build_key_package_locked(inner, &identity, &signature_keys, false)?;
             results.push(result);
             bundle_rows.push(row);
         }
@@ -5327,6 +5357,7 @@ impl MLSContext {
         inner: &mut MLSContextInner,
         identity: &str,
         signature_keys: &SignatureKeyPair,
+        last_resort: bool,
     ) -> Result<(KeyPackageResult, (String, String)), MLSError> {
         let credential = Credential::new(CredentialType::Basic, identity.as_bytes().to_vec());
 
@@ -5335,17 +5366,25 @@ impl MLSContext {
         // CRITICAL: Key packages must advertise support for RatchetTree extension
         // AND the Catbird metadata extension (0xff00) so members can join groups
         // that use encrypted group metadata in context extensions.
+        let mut supported_extensions = vec![
+            ExtensionType::RatchetTree,
+            ExtensionType::AppDataDictionary,
+            ExtensionType::Unknown(crate::metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE),
+        ];
+        if last_resort {
+            supported_extensions.push(ExtensionType::LastResort);
+        }
+
         let capabilities = Capabilities::builder()
-            .extensions(vec![
-                ExtensionType::RatchetTree,
-                ExtensionType::AppDataDictionary,
-                ExtensionType::Unknown(crate::metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE),
-            ])
+            .extensions(supported_extensions)
             .proposals(vec![ProposalType::AppDataUpdate])
             .build();
 
-        let key_package_bundle = KeyPackage::builder()
-            .leaf_node_capabilities(capabilities)
+        let mut builder = KeyPackage::builder().leaf_node_capabilities(capabilities);
+        if last_resort {
+            builder = builder.mark_as_last_resort();
+        }
+        let key_package_bundle = builder
             .build(
                 ciphersuite,
                 &inner.provider,
@@ -6365,6 +6404,13 @@ pub fn mls_hash_psk(psk: Vec<u8>) -> String {
 impl MlsCryptoContext for MLSContext {
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
         self.create_key_package(identity)
+    }
+
+    fn create_last_resort_key_package(
+        &self,
+        identity: Vec<u8>,
+    ) -> Result<KeyPackageResult, MLSError> {
+        self.create_last_resort_key_package(identity)
     }
 
     fn set_suspended(&self, value: bool) {

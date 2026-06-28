@@ -880,6 +880,86 @@ where
         }
     }
 
+    /// Fault-injection helper used by rustFull E2E recovery gates.
+    ///
+    /// Deletes only the local OpenMLS group for a conversation and marks the
+    /// conversation for rejoin. Unlike `force_delete_local`, this preserves the
+    /// conversation projection so deferred Rust recovery can rediscover and
+    /// repair the half-joined state.
+    pub async fn debug_wipe_local_group_for_recovery(
+        &self,
+        convo_id: &str,
+    ) -> Result<DebugWipeLocalGroupResult> {
+        self.check_shutdown().await?;
+        self.require_user_did().await?;
+
+        let group_id_hex = self.group_id_hex_for_conversation(convo_id).await;
+        let mut deleted_local_group = false;
+
+        if let Some(group_id_bytes) = group_id_hex
+            .as_deref()
+            .and_then(|group_id| hex::decode(group_id).ok())
+        {
+            match self.mls_context().delete_group(group_id_bytes) {
+                Ok(()) => deleted_local_group = true,
+                Err(crate::MLSError::GroupNotFound { .. }) => {
+                    tracing::debug!(
+                        convo_id,
+                        group_id = ?group_id_hex,
+                        "Debug wipe found local MLS group already absent"
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        if let Err(e) = self.storage().delete_group_state(convo_id).await {
+            tracing::warn!(
+                error = %e,
+                convo_id,
+                "Debug wipe failed to delete conversation-keyed group state"
+            );
+            return Err(e);
+        }
+        if let Some(group_id) = group_id_hex
+            .as_deref()
+            .filter(|group_id| *group_id != convo_id)
+        {
+            if let Err(e) = self.storage().delete_group_state(group_id).await {
+                tracing::warn!(
+                    error = %e,
+                    convo_id,
+                    group_id,
+                    "Debug wipe failed to delete group-id-keyed group state"
+                );
+                return Err(e);
+            }
+        }
+
+        self.storage().mark_needs_rejoin(convo_id).await?;
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
+
+        {
+            let mut states = self.group_states().lock().await;
+            states.remove(convo_id);
+            if let Some(group_id) = group_id_hex
+                .as_deref()
+                .filter(|group_id| *group_id != convo_id)
+            {
+                states.remove(group_id);
+            }
+        }
+
+        Ok(DebugWipeLocalGroupResult {
+            conversation_id: convo_id.to_string(),
+            group_id: group_id_hex,
+            deleted_local_group,
+        })
+    }
+
     /// The idempotent delete steps shared by `force_delete_local` and the
     /// startup reconcile sweep. Every step tolerates already-deleted state.
     ///

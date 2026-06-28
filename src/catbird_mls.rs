@@ -393,6 +393,18 @@ impl CatbirdMls {
             })
     }
 
+    /// Create a reusable last-resort key package (low-level).
+    pub fn create_last_resort_key_package(
+        &self,
+        identity_bytes: Vec<u8>,
+    ) -> Result<KeyPackageResult, OrchestratorBridgeError> {
+        self.mls_context
+            .create_last_resort_key_package(identity_bytes)
+            .map_err(|e| OrchestratorBridgeError::Mls {
+                message: e.to_string(),
+            })
+    }
+
     /// Create multiple key packages in one call.
     pub fn create_key_packages_batch(
         &self,

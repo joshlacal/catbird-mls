@@ -143,9 +143,10 @@ impl MLSAPIClient for RecordingCommitApi {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> OrchestratorResult<()> {
         self.inner
-            .publish_key_package(key_package, cipher_suite, expires_at)
+            .publish_key_package(key_package, cipher_suite, expires_at, device_id)
             .await
     }
 

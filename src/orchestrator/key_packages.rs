@@ -30,12 +30,19 @@ where
         let expires_at = chrono::Utc::now() + chrono::Duration::days(30);
         let expires_at_str = expires_at.to_rfc3339();
 
+        // Scope the publish to this device. The UUID is generated and stored
+        // during `ensure_device_registered`, so it is always present by the
+        // time we replenish; without it the server cannot bind the package to
+        // the device signature key and rejects an unscoped fresh device (403).
+        let device_uuid = self.credentials().get_device_uuid(&user_did).await?;
+
         // Upload to server
         self.api_client()
             .publish_key_package(
                 &kp_result.key_package_data,
                 "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                 &expires_at_str,
+                device_uuid.as_deref(),
             )
             .await?;
 

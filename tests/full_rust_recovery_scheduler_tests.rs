@@ -210,6 +210,66 @@ async fn deferred_recovery_uses_welcome_first_and_avoids_external_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn debug_wipe_local_group_preserves_conversation_and_marks_rejoin() {
+    let shared_server = MockDeliveryService::new("did:plc:bootstrap");
+    let alice = TestClientHarness::new("alice-debug-wipe", &shared_server).await;
+    alice.initialize().await;
+
+    let created = alice
+        .engine
+        .create_conversation(catbird_mls::CreateConversationRequest {
+            name: "Debug wipe fixture".to_string(),
+            member_dids: vec![],
+            description: None,
+        })
+        .expect("create conversation");
+    let conversation_id = created.conversation.conversation_id.clone();
+    let group_id = created.conversation.group_id.clone();
+    let group_id_bytes = hex::decode(&group_id).expect("group id should be hex");
+
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())
+            .is_ok(),
+        "created fixture should have local OpenMLS group state before debug wipe"
+    );
+
+    let result = alice
+        .engine
+        .debug_wipe_local_group_for_recovery(&conversation_id)
+        .expect("debug wipe should succeed");
+
+    assert_eq!(result.conversation_id, conversation_id);
+    assert_eq!(result.group_id, Some(group_id.clone()));
+    assert!(
+        result.deleted_local_group,
+        "debug wipe should report that local OpenMLS group state was removed"
+    );
+    assert!(
+        alice
+            .storage
+            .get_conversation(&alice.did, &conversation_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "debug wipe must preserve the conversation projection so recovery can still find it"
+    );
+    assert!(
+        alice.storage.has_rejoin_flag(&conversation_id),
+        "debug wipe must mark needs_rejoin so Rust deferred recovery owns the repair"
+    );
+    assert!(
+        matches!(
+            alice.orchestrator.mls_context().get_epoch(group_id_bytes),
+            Err(MLSError::GroupNotFound { .. })
+        ),
+        "debug wipe must delete local OpenMLS group state through Rust"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn deferred_recovery_respects_success_cooldown() {
     let fixture = RecoverySchedulerFixture::with_missing_local_group_and_available_welcome().await;
 
