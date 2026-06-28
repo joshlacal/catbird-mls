@@ -6472,6 +6472,15 @@ impl MlsCryptoContext for MLSContext {
         self.swap_members(group_id, remove_identities, add_key_packages)
     }
 
+    fn group_member_identities(&self, group_id: Vec<u8>) -> Result<Vec<Vec<u8>>, MLSError> {
+        let info = self.debug_group_members(group_id)?;
+        Ok(info
+            .members
+            .into_iter()
+            .map(|m| m.credential_identity)
+            .collect())
+    }
+
     fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
         self.merge_pending_commit(group_id).map(|r| r.new_epoch)
     }

@@ -112,6 +112,19 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         ))
     }
 
+    /// Return the MLS credential identities (`Vec<u8>` each) of every current
+    /// member of the group. Used by the Welcome-reissue responder to locate a
+    /// recipient's stale leaf so it can be swapped out in a single commit.
+    ///
+    /// Default returns `OperationNotSupported` so existing platforms continue
+    /// to compile until they wire up member enumeration.
+    fn group_member_identities(&self, group_id: Vec<u8>) -> Result<Vec<Vec<u8>>, MLSError> {
+        let _ = group_id;
+        Err(MLSError::OperationNotSupported {
+            reason: "group_member_identities not available on this platform".to_string(),
+        })
+    }
+
     fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError>;
 
     fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError>;
