@@ -93,6 +93,24 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         welcome_data: Option<&[u8]>,
     ) -> Result<AddMembersServerResult>;
 
+    /// Add members carrying an idempotency key. The delivery service uses the
+    /// key to mark a pending Welcome-reissue request answered
+    /// (`mark_reissue_request_answered_tx`). Backends that don't support an
+    /// idempotency key fall back to `add_members` (the key is then ignored —
+    /// acceptable for non-reissue add paths).
+    async fn add_members_with_idempotency(
+        &self,
+        convo_id: &str,
+        member_dids: &[String],
+        commit_data: &[u8],
+        welcome_data: Option<&[u8]>,
+        idempotency_key: &str,
+    ) -> Result<AddMembersServerResult> {
+        let _ = idempotency_key;
+        self.add_members(convo_id, member_dids, commit_data, welcome_data)
+            .await
+    }
+
     /// Remove members from a conversation on the server.
     async fn remove_members(
         &self,

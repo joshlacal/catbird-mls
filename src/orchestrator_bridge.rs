@@ -207,6 +207,18 @@ pub trait OrchestratorAPICallback: Send + Sync {
         welcome_data: Option<Vec<u8>>,
     ) -> Result<FFIAddMembersResult, OrchestratorBridgeError>;
 
+    /// Add members carrying an idempotency key. The delivery service uses the
+    /// key to mark a pending Welcome-reissue request answered. Platform
+    /// implementations forward `idempotency_key` into the XRPC body.
+    fn add_members_with_idempotency(
+        &self,
+        convo_id: String,
+        member_dids: Vec<String>,
+        commit_data: Vec<u8>,
+        welcome_data: Option<Vec<u8>>,
+        idempotency_key: String,
+    ) -> Result<FFIAddMembersResult, OrchestratorBridgeError>;
+
     fn remove_members(
         &self,
         convo_id: String,
@@ -1761,6 +1773,30 @@ impl MLSAPIClient for APIAdapter {
                 member_dids.to_vec(),
                 commit_data.to_vec(),
                 welcome_data.map(|d| d.to_vec()),
+            )
+            .map(|ffi| AddMembersServerResult {
+                success: ffi.success,
+                new_epoch: ffi.new_epoch,
+                receipt: None,
+            })
+            .map_err(bridge_err)
+    }
+
+    async fn add_members_with_idempotency(
+        &self,
+        convo_id: &str,
+        member_dids: &[String],
+        commit_data: &[u8],
+        welcome_data: Option<&[u8]>,
+        idempotency_key: &str,
+    ) -> crate::orchestrator::Result<AddMembersServerResult> {
+        self.0
+            .add_members_with_idempotency(
+                convo_id.to_string(),
+                member_dids.to_vec(),
+                commit_data.to_vec(),
+                welcome_data.map(|d| d.to_vec()),
+                idempotency_key.to_string(),
             )
             .map(|ffi| AddMembersServerResult {
                 success: ffi.success,
@@ -3557,6 +3593,17 @@ mod tests {
             Err(OrchestratorBridgeError::Api {
                 message: "not used by bridge joinOrRejoin test".to_string(),
             })
+        }
+
+        fn add_members_with_idempotency(
+            &self,
+            convo_id: String,
+            member_dids: Vec<String>,
+            commit_data: Vec<u8>,
+            welcome_data: Option<Vec<u8>>,
+            _idempotency_key: String,
+        ) -> Result<FFIAddMembersResult, OrchestratorBridgeError> {
+            self.add_members(convo_id, member_dids, commit_data, welcome_data)
         }
 
         fn remove_members(
