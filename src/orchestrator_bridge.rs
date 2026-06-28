@@ -2324,6 +2324,25 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Fulfill a Welcome-reissue request as an admin member (rustFull mode).
+    /// Mirrors `swap_members` (no external commit): removes the recipient's
+    /// stale leaf and re-adds them with a fresh key package, threading
+    /// `request_id` as the server idempotency key so the delivery service marks
+    /// the reissue request answered.
+    pub fn respond_to_welcome_reissue(
+        &self,
+        convo_id: String,
+        recipient_device_did: String,
+        request_id: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.respond_to_welcome_reissue(
+            &convo_id,
+            &recipient_device_did,
+            &request_id,
+        ))?;
+        Ok(())
+    }
+
     // -- Sender-side three-phase commit API (task #44) --
     //
     // Additive surface for platforms that need to inspect / batch / retry
