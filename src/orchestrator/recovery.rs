@@ -1568,6 +1568,158 @@ where
         }
     }
 
+    /// Fulfill a Welcome-reissue request as an admin member, in rustFull mode.
+    ///
+    /// Mirrors [`swap_members`](Self::swap_members) (no external commit) but
+    /// resolves the recipient's stale leaf internally and threads `request_id`
+    /// as the server idempotency key so the delivery service marks the request
+    /// answered (`mark_reissue_request_answered_tx`). Only a current group
+    /// member with the group secrets can seal a Welcome, so this is necessarily
+    /// an admin-client duty — in rustFull the admin's crypto lives here.
+    ///
+    /// Idempotent against the wire: a repeat call with the same `request_id` is
+    /// absorbed by the server idempotency key + the epoch fence (the DS replays
+    /// the answered request without advancing the epoch, so the fence discards
+    /// the duplicate staged commit and the local epoch does not advance again).
+    ///
+    /// Returns a typed [`OrchestratorError::RecoveryFailed`] — which the Swift
+    /// layer classifies as "unfulfillable here" so the requester stops
+    /// retrying — when this device has no local state for the group or the
+    /// recipient has no leaf to swap.
+    pub async fn respond_to_welcome_reissue(
+        &self,
+        convo_id: &str,
+        recipient_device_did: &str,
+        request_id: &str,
+    ) -> Result<()> {
+        self.check_shutdown().await?;
+
+        // Resolve the group id from the conversation id. NOTE: this returns
+        // `Option`, NOT `Result` — `None` means this device has no local MLS
+        // state for the group, so it cannot seal a Welcome. Map it to a typed
+        // unfulfillable-here error so Swift stops retrying. We deliberately do
+        // NOT fall back to treating `convo_id` as a raw hex group id (the way
+        // `add_members` does), because that would hide the signal Swift needs.
+        let group_id = match self.group_id_hex_for_conversation(convo_id).await {
+            Some(g) => g,
+            None => {
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "convo {convo_id} not present in local MLS group state"
+                )))
+            }
+        };
+
+        let recipient_user_did =
+            super::credential_binding::credential_root_did(recipient_device_did).to_string();
+
+        tracing::info!(
+            convo_id,
+            group_id = %group_id,
+            request_id,
+            "respond_to_welcome_reissue"
+        );
+
+        // Compute remove_dids: every local leaf whose credential identity maps
+        // to the recipient user (mirror Swift `removeIdentities` — split the
+        // device-qualified DID at `#`, compare case-insensitively).
+        let group_id_bytes = hex::decode(&group_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        let identities = self.mls_context().group_member_identities(group_id_bytes)?;
+        let remove_dids: Vec<String> = identities
+            .iter()
+            .filter_map(|raw| String::from_utf8(raw.clone()).ok())
+            .filter(|id| {
+                super::credential_binding::credential_root_did(id)
+                    .eq_ignore_ascii_case(&recipient_user_did)
+            })
+            .collect();
+        if remove_dids.is_empty() {
+            // No leaf for the recipient locally — this device is not a current
+            // member of the group (or the recipient is already gone), so it
+            // cannot fulfill the reissue. Surface the typed unfulfillable error.
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "recipient {recipient_user_did} not present in local MLS group state"
+            )));
+        }
+
+        // Fetch a fresh key package for the recipient and stage the swap. Same
+        // body shape as `swap_members`, but ships through
+        // `add_members_with_idempotency` so the DS answers the reissue request.
+        let key_packages = self
+            .api_client()
+            .get_key_packages(&[recipient_user_did.clone()])
+            .await?;
+        self.verify_fetched_key_packages(
+            &[recipient_user_did.clone()],
+            &key_packages,
+            "respond_to_welcome_reissue",
+            Some(&group_id),
+        )
+        .await;
+        let kp_data: Vec<crate::KeyPackageData> = key_packages
+            .iter()
+            .map(|kp| crate::KeyPackageData {
+                data: kp.key_package_data.clone(),
+            })
+            .collect();
+
+        let plan = self
+            .stage_commit(
+                &group_id,
+                CommitKind::SwapMembers {
+                    remove_dids: remove_dids.clone(),
+                    add_dids: vec![recipient_user_did.clone()],
+                    add_key_packages: kp_data,
+                },
+            )
+            .await?;
+
+        let server_result = self
+            .api_client()
+            .add_members_with_idempotency(
+                convo_id,
+                &[recipient_user_did.clone()],
+                &plan.commit_bytes,
+                plan.welcome_bytes.as_deref(),
+                request_id,
+            )
+            .await;
+
+        match server_result {
+            Ok(result) => {
+                if !result.success {
+                    let _ = self.discard_pending(plan.handle).await;
+                    return Err(OrchestratorError::MemberSyncFailed);
+                }
+                if let Some(ref receipt) = result.receipt {
+                    self.record_and_check_sequencer_receipt(receipt, "respond_to_welcome_reissue")
+                        .await;
+                }
+                // Epoch fence: only confirm (merge) if the server actually
+                // advanced past our local epoch. An idempotent replay of an
+                // already-answered request returns the prior epoch, so the
+                // fence discards the staged commit and leaves the epoch intact.
+                let current_epoch =
+                    self.mls_context()
+                        .get_epoch(hex::decode(&group_id).map_err(|_| {
+                            OrchestratorError::InvalidInput("Invalid hex group ID".into())
+                        })?)?;
+                if result.new_epoch > current_epoch {
+                    self.confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
+                        .await?;
+                } else {
+                    let _ = self.discard_pending(plan.handle).await;
+                }
+                tracing::info!(convo_id, request_id, "respond_to_welcome_reissue complete");
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.discard_pending(plan.handle).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Best-effort helper that returns the hex-encoded epoch_authenticator for
     /// the group currently bound to `convo_id`.
     ///

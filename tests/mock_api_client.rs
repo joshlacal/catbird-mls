@@ -121,6 +121,18 @@ struct MockState {
     /// (mirrors the real sequencer). Used by equivocation-detection tests.
     issue_external_commit_receipts: bool,
 
+    /// Idempotency keys passed to `add_members_with_idempotency`, in call
+    /// order. The Welcome-reissue responder test asserts the reissue
+    /// `request_id` is forwarded here as the addMembers idempotency key.
+    add_members_idempotency_keys: Vec<String>,
+
+    /// Cached `add_members_with_idempotency` results keyed by idempotency key.
+    /// A repeat call with an already-seen key replays the cached result WITHOUT
+    /// advancing the server epoch — mirroring the DS
+    /// `mark_reissue_request_answered_tx` idempotent replay so the responder's
+    /// epoch fence discards the duplicate instead of double-advancing.
+    idempotent_add_results: HashMap<String, AddMembersServerResult>,
+
     /// Pending Welcomes per (conversation_id, recipient_did). Delivered FIFO by
     /// `get_welcome` for the currently-authenticated DID. A single Welcome blob
     /// from `add_members` or `create_conversation` typically targets multiple
@@ -409,6 +421,17 @@ impl MockDeliveryService {
         guard.conversations.remove(convo_id);
         guard.messages.remove(convo_id);
         guard.group_infos.remove(convo_id);
+    }
+
+    /// Idempotency keys captured from `add_members_with_idempotency` calls, in
+    /// call order. Used by the Welcome-reissue responder test to assert the
+    /// reissue `request_id` is forwarded as the addMembers idempotency key.
+    pub fn add_members_idempotency_keys(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .add_members_idempotency_keys
+            .clone()
     }
 
     /// Number of external commits processed for a conversation.
@@ -792,6 +815,41 @@ impl MLSAPIClient for MockDeliveryService {
             new_epoch,
             receipt: None,
         })
+    }
+
+    async fn add_members_with_idempotency(
+        &self,
+        convo_id: &str,
+        member_dids: &[String],
+        commit_data: &[u8],
+        welcome_data: Option<&[u8]>,
+        idempotency_key: &str,
+    ) -> Result<AddMembersServerResult> {
+        // Record the key, then replay idempotently. A repeat call with a key
+        // we've already answered returns the cached result WITHOUT advancing
+        // the server epoch (mirrors the DS marking the reissue request
+        // answered). The guard is dropped before delegating to `add_members`
+        // so we don't deadlock re-locking the mutex.
+        {
+            let mut guard = self.state.lock().unwrap();
+            guard
+                .add_members_idempotency_keys
+                .push(idempotency_key.to_string());
+            if let Some(cached) = guard.idempotent_add_results.get(idempotency_key) {
+                return Ok(cached.clone());
+            }
+        }
+
+        let result = self
+            .add_members(convo_id, member_dids, commit_data, welcome_data)
+            .await?;
+
+        self.state
+            .lock()
+            .unwrap()
+            .idempotent_add_results
+            .insert(idempotency_key.to_string(), result.clone());
+        Ok(result)
     }
 
     async fn remove_members(
