@@ -4330,7 +4330,14 @@ impl MLSContext {
             crate::debug_log!("[MLS-FFI]   Member count after: {}", member_count_after_merge);
 
             if epoch_after <= epoch_before {
-                crate::error_log!("[MLS-FFI] ❌ CRITICAL: Epoch did not advance! Before: {}, After: {}", epoch_before, epoch_after);
+                // BENIGN no-op, not a data-plane bug: this is the own-commit merge
+                // path. After an External Commit (force_rejoin), OpenMLS `finalize()`
+                // has already merged the commit, so the follow-up `merge_pending_commit`
+                // lands at the same epoch. Logging this as CRITICAL has repeatedly
+                // misdirected epoch-stall debugging. The authoritative "epoch must
+                // advance" invariant for heal-verification (I4) is enforced on the
+                // INCOMING-commit path (`merge_incoming_commit`), which stays ERROR.
+                crate::warn_log!("[MLS-FFI] ⚠️ Epoch did not advance on own-commit merge (benign post-external-commit no-op expected; bug only if a fresh local commit was staged). Before: {}, After: {}", epoch_before, epoch_after);
             }
 
             if member_count_before_merge != member_count_after_merge {
