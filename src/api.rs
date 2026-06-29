@@ -488,6 +488,15 @@ impl Drop for MLSContext {
     }
 }
 
+/// Current group metadata content supplied to `add_members_with_metadata` so the
+/// blob can be re-sealed at the post-add epoch. Internal (not a UniFFI type).
+struct MetadataReseal {
+    title: Option<String>,
+    description: Option<String>,
+    avatar_blob_locator: Option<String>,
+    avatar_content_type: Option<String>,
+}
+
 #[uniffi::export]
 impl MLSContext {
     /// Create a new context with per-DID SQLite storage
@@ -1003,10 +1012,66 @@ impl MLSContext {
         })?
     }
 
+    /// Add members to a group.
+    ///
+    /// Backwards-compatible variant: does NOT re-seal group metadata at the new
+    /// epoch (the three `metadata_*` fields of [`AddMembersResult`] are `None`).
+    /// Prefer [`Self::add_members_with_metadata`] so newly-added members can
+    /// decrypt group metadata at their join epoch.
     pub fn add_members(
         &self,
         group_id: Vec<u8>,
         key_packages: Vec<KeyPackageData>,
+    ) -> Result<AddMembersResult, MLSError> {
+        self.add_members_impl(group_id, key_packages, None)
+    }
+
+    /// Add members to a group AND re-seal the group metadata at the post-add
+    /// epoch so the newly-added member can decrypt it.
+    ///
+    /// The add commit embeds a fresh `MetadataReference` (new blob locator) and
+    /// advances the epoch. Without a re-sealed blob at that locator, a Welcome'd
+    /// member joins at the new epoch but the only metadata blob on the server is
+    /// sealed at the creation epoch — which forward secrecy prevents them from
+    /// decrypting. This variant seals the supplied metadata at `epoch + 1` under
+    /// the same locator/version embedded in the commit. The caller MUST upload
+    /// the returned `metadata_blob_ciphertext` via
+    /// `putGroupMetadataBlob(metadata_blob_locator, metadata_version)`.
+    ///
+    /// Pass the group's CURRENT metadata content (title/description/avatar) —
+    /// this method does not bump the metadata version for a content change, it
+    /// re-seals the existing content at the new epoch.
+    pub fn add_members_with_metadata(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+        title: Option<String>,
+        description: Option<String>,
+        avatar_blob_locator: Option<String>,
+        avatar_content_type: Option<String>,
+    ) -> Result<AddMembersResult, MLSError> {
+        self.add_members_impl(
+            group_id,
+            key_packages,
+            Some(MetadataReseal {
+                title,
+                description,
+                avatar_blob_locator,
+                avatar_content_type,
+            }),
+        )
+    }
+}
+
+// `add_members_impl` takes a non-UniFFI `MetadataReseal` parameter, so it must
+// live OUTSIDE the `#[uniffi::export]` impl block (UniFFI type-checks every
+// method in an exported impl, including private ones).
+impl MLSContext {
+    fn add_members_impl(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+        metadata_reseal: Option<MetadataReseal>,
     ) -> Result<AddMembersResult, MLSError> {
         self.check_suspended()?;
         let mut guard = self
@@ -1134,7 +1199,8 @@ impl MLSContext {
             );
         }
 
-        let (commit_data, welcome_data) = inner.with_group(&gid, |group, provider, signer| {
+        let (commit_data, welcome_data, metadata_reseal_out) =
+            inner.with_group(&gid, |group, provider, signer| {
             // 🔍 DEBUG: List ALL current group members
             crate::debug_log!("[MLS-FFI] 🔍 Current group members:");
             for (idx, member) in group.members().enumerate() {
@@ -1215,6 +1281,11 @@ impl MLSContext {
                 false,
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
+
+            // Keep the planned reference (locator + version) so we can re-seal
+            // the metadata blob at the post-add epoch under the SAME locator
+            // that gets embedded in the commit below.
+            let planned_reference_json_for_reseal = planned_reference_json.clone();
 
             let mut commit_builder = group.commit_builder().propose_adds(kps.iter().cloned());
             if let Some(ref_json) = planned_reference_json.clone() {
@@ -1334,15 +1405,93 @@ impl MLSContext {
             crate::debug_log!("[MLS-FFI]   - Total size: {} bytes", welcome_bytes.len());
             crate::debug_log!("[MLS-FFI]   ✅ Welcome serialized for {} new member(s)", kps.len());
 
-            Ok((commit_bytes, welcome_bytes))
+            // Re-seal group metadata at the post-add epoch (only when the caller
+            // supplied current metadata content AND the group actually carries a
+            // metadata reference). The add commit already embedded a NEW blob
+            // locator (planned_reference_json) and advances the epoch; without a
+            // blob at that locator sealed at the NEW epoch, a Welcome'd member
+            // joins at the new epoch and cannot decrypt the creation-epoch blob
+            // (forward secrecy + AAD epoch mismatch). Seal under the SAME
+            // locator/version embedded in the commit, at next_epoch.
+            let metadata_reseal_out: Option<(String, Vec<u8>, u64)> = match (
+                metadata_reseal.as_ref(),
+                planned_reference_json_for_reseal,
+            ) {
+                (Some(reseal), Some(ref_json)) => {
+                    let reference: crate::metadata::MetadataReference =
+                        serde_json::from_slice(&ref_json).map_err(|e| {
+                            MLSError::Internal(format!(
+                                "parse planned metadata reference: {:?}",
+                                e
+                            ))
+                        })?;
+                    let next_epoch = group.epoch().as_u64() + 1;
+                    let pending = group.pending_commit().ok_or_else(|| {
+                        MLSError::Internal(
+                            "no pending commit after stage_commit — internal invariant violated"
+                                .into(),
+                        )
+                    })?;
+                    let metadata_key = crate::metadata::derive_metadata_key(
+                        pending,
+                        provider.crypto(),
+                        &group_id,
+                        next_epoch,
+                    )
+                    .map_err(|e| {
+                        MLSError::Internal(format!("derive metadata key: {:?}", e))
+                    })?;
+                    let payload = crate::metadata::GroupMetadataV1 {
+                        version: 1,
+                        title: reseal.title.clone().unwrap_or_default(),
+                        description: reseal.description.clone().unwrap_or_default(),
+                        avatar_blob_locator: reseal.avatar_blob_locator.clone(),
+                        avatar_content_type: reseal.avatar_content_type.clone(),
+                    };
+                    let ciphertext = crate::metadata::encrypt_metadata_blob(
+                        &metadata_key,
+                        &group_id,
+                        next_epoch,
+                        reference.metadata_version,
+                        &payload,
+                    )
+                    .map_err(|e| {
+                        MLSError::Internal(format!("encrypt metadata: {:?}", e))
+                    })?;
+                    crate::info_log!(
+                        "[MLS-FFI] ✅ add_members metadata re-sealed (epoch→{}, version={}, locator={})",
+                        next_epoch,
+                        reference.metadata_version,
+                        reference.blob_locator
+                    );
+                    Some((reference.blob_locator, ciphertext, reference.metadata_version))
+                }
+                _ => None,
+            };
+
+            Ok((commit_bytes, welcome_bytes, metadata_reseal_out))
         })?;
+
+        let (metadata_blob_locator, metadata_blob_ciphertext, metadata_version) =
+            match metadata_reseal_out {
+                Some((locator, ciphertext, version)) => {
+                    (Some(locator), Some(ciphertext), Some(version))
+                }
+                None => (None, None, None),
+            };
 
         Ok(AddMembersResult {
             commit_data,
             welcome_data,
+            metadata_blob_locator,
+            metadata_blob_ciphertext,
+            metadata_version,
         })
     }
+}
 
+#[uniffi::export]
+impl MLSContext {
     /// Remove members from the group (cryptographically secure)
     ///
     /// Creates a commit with Remove proposals. Follows send-then-merge pattern:
@@ -1540,6 +1689,9 @@ impl MLSContext {
         Ok(AddMembersResult {
             commit_data,
             welcome_data,
+            metadata_blob_locator: None,
+            metadata_blob_ciphertext: None,
+            metadata_version: None,
         })
     }
 
@@ -1792,6 +1944,9 @@ impl MLSContext {
             Ok(AddMembersResult {
                 commit_data,
                 welcome_data,
+                metadata_blob_locator: None,
+                metadata_blob_ciphertext: None,
+                metadata_version: None,
             })
         })
         .await
@@ -1960,6 +2115,9 @@ impl MLSContext {
         Ok(AddMembersResult {
             commit_data,
             welcome_data: Vec::new(), // Self-updates don't produce welcomes
+            metadata_blob_locator: None,
+            metadata_blob_ciphertext: None,
+            metadata_version: None,
         })
     }
 

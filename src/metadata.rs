@@ -464,6 +464,48 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Regression for the add-members metadata-reseal bug: a metadata blob is
+    /// AAD-bound to a SPECIFIC epoch. A blob sealed at epoch N decrypts only
+    /// with the AAD for epoch N; the SAME ciphertext fails to decrypt with the
+    /// AAD for epoch N+1. This is exactly why `add_members_with_metadata` must
+    /// re-seal the blob at the post-add epoch (`epoch + 1`): a Welcome'd member
+    /// joins at the NEW epoch, and forward secrecy prevents them from deriving
+    /// the creation-epoch key. Sealing at the join epoch is mandatory.
+    ///
+    /// (Full E2E — "added member actually decrypts metadata at join epoch" — is
+    /// verified on-device; this focused test pins the epoch-binding mechanism.)
+    #[test]
+    fn metadata_blob_is_bound_to_seal_epoch() {
+        let key = [42u8; 32];
+        let group_id = b"reseal-on-add-group";
+        let version = 3u64;
+        let meta = sample_metadata();
+
+        // Seal at epoch N.
+        let epoch_n = 5u64;
+        let blob = encrypt_metadata_blob(&key, group_id, epoch_n, version, &meta).unwrap();
+
+        // Decrypt at epoch N with the SAME key + AAD → success.
+        let decrypted = decrypt_metadata_blob(&key, group_id, epoch_n, version, &blob).unwrap();
+        assert_eq!(decrypted, meta);
+
+        // Decrypt the SAME ciphertext at epoch N+1 (the post-add epoch a joining
+        // member would be at if the blob were NOT re-sealed) → AEAD auth failure.
+        let next_epoch = epoch_n + 1;
+        let wrong_epoch = decrypt_metadata_blob(&key, group_id, next_epoch, version, &blob);
+        assert!(
+            wrong_epoch.is_err(),
+            "blob sealed at epoch {epoch_n} must NOT decrypt with epoch {next_epoch} AAD"
+        );
+
+        // And re-sealing the same content at N+1 yields a blob the joining member
+        // CAN decrypt at their join epoch — the fix's invariant.
+        let resealed = encrypt_metadata_blob(&key, group_id, next_epoch, version, &meta).unwrap();
+        let resealed_decrypted =
+            decrypt_metadata_blob(&key, group_id, next_epoch, version, &resealed).unwrap();
+        assert_eq!(resealed_decrypted, meta);
+    }
+
     #[test]
     fn metadata_wrong_version_fails() {
         let key = [42u8; 32];
