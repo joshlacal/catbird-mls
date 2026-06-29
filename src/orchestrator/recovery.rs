@@ -2447,6 +2447,12 @@ where
                             convo_id,
                             epoch
                         );
+                        // Newly-joined members can't derive a past epoch's
+                        // exporter, so fetch + decrypt the encrypted metadata
+                        // blob now to surface the group name/description. The
+                        // enclosing sync builds its snapshot from the cache this
+                        // populates. Best-effort — never fails the join.
+                        self.hydrate_conversation_metadata(convo_id).await;
                         return Ok(epoch);
                     }
                     Err(err) => {

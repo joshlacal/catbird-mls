@@ -31,6 +31,35 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
 
+    /// Export this identity's full signing keypair (serialized) so the platform
+    /// can persist it durably (keychain/keystore) and reuse it across
+    /// reinstalls. Reusing one durable signer prevents signing-key churn that
+    /// strands previously-published key packages on the server (recipients
+    /// would otherwise hit `NoMatchingKeyPackage`).
+    ///
+    /// Default: `OperationNotSupported`. Native `MLSContext` wires this to
+    /// `MLSContext::export_identity_key`; platforms whose crypto context is a
+    /// UniFFI callback can implement it later — the orchestrator degrades
+    /// gracefully (falls back to storing the public key only).
+    fn export_identity_key(&self, _identity: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "export_identity_key not available on this platform".to_string(),
+        })
+    }
+
+    /// Import a previously-exported full signing keypair into local crypto
+    /// storage and register it as this identity's signer, so subsequent key
+    /// packages (and device registration) are signed with the durable key
+    /// rather than a freshly-minted one.
+    ///
+    /// Default: `OperationNotSupported` (orchestrator treats failure as
+    /// warn-only and mints a fresh signer, preserving legacy behavior).
+    fn import_identity_key(&self, _identity: Vec<u8>, _key_data: Vec<u8>) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "import_identity_key not available on this platform".to_string(),
+        })
+    }
+
     fn set_suspended(&self, _value: bool) {}
 
     fn interrupt_storage(&self) -> usize {
@@ -258,6 +287,24 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
             "MlsCryptoContext::update_group_metadata_encrypted is not implemented for this backend"
                 .into(),
         ))
+    }
+
+    /// Return the current epoch's metadata key + `MetadataReference` for a
+    /// group, so the orchestrator can fetch and decrypt the encrypted
+    /// `GroupMetadataV1` blob and surface the group name/description to
+    /// newly-joined members (who can't derive a past epoch's exporter and so
+    /// never cached the plaintext). `metadata_reference_json` is `None` when
+    /// the group has no metadata set yet.
+    ///
+    /// Default returns `Ok(None)` so backends that haven't wired the encrypted
+    /// metadata path degrade gracefully (no name shown) instead of erroring on
+    /// every join. The native `MLSContext` implements this directly.
+    fn get_current_metadata(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Option<crate::types::CurrentMetadataInfo>, MLSError> {
+        let _ = group_id;
+        Ok(None)
     }
 
     fn process_welcome(

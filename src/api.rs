@@ -6578,6 +6578,29 @@ impl MlsCryptoContext for MLSContext {
         self.create_last_resort_key_package(identity)
     }
 
+    fn export_identity_key(&self, identity: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        let id = String::from_utf8(identity)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8 identity"))?;
+        // Inherent MLSContext::export_identity_key(String); inherent wins over
+        // the trait method in resolution (same pattern as create_key_package).
+        self.export_identity_key(id)
+    }
+
+    fn import_identity_key(&self, identity: Vec<u8>, key_data: Vec<u8>) -> Result<(), MLSError> {
+        let id = String::from_utf8(identity)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8 identity"))?;
+        self.import_identity_key(id, key_data)
+    }
+
+    fn get_current_metadata(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Option<crate::types::CurrentMetadataInfo>, MLSError> {
+        // Inherent MLSContext::get_current_metadata(Vec<u8>) wins over the trait
+        // default (same pattern as create_key_package / export_identity_key).
+        self.get_current_metadata(group_id)
+    }
+
     fn set_suspended(&self, value: bool) {
         MLSContext::set_suspended(self, value);
     }

@@ -68,7 +68,7 @@ where
 
         // Create local conversation record
         let create_result = self
-            .create_group_inner(&user_did, &group_id_hex, filtered_members_ref)
+            .create_group_inner(&user_did, &group_id_hex, name, description, filtered_members_ref)
             .await;
 
         // On any failure, clean up the local MLS group and remove from being-created set
@@ -91,6 +91,8 @@ where
         &self,
         user_did: &str,
         group_id_hex: &str,
+        name: &str,
+        description: Option<&str>,
         filtered_members_ref: Option<&[String]>,
     ) -> Result<ConversationView> {
         let group_id_bytes = hex::decode(group_id_hex)
@@ -222,8 +224,41 @@ where
             );
         }
 
-        // Get epoch from FFI (authoritative)
+        // Seal + upload the encrypted group metadata blob so OTHER members can
+        // decrypt the group name/description. `create_group` above only sealed
+        // metadata into the local MLS group context — the encrypted
+        // `GroupMetadataV1` blob is never uploaded to the DS during create, and
+        // after adding initial members the create-epoch seal is stale (joiners
+        // land at the post-add epoch and, by MLS forward secrecy, cannot derive
+        // the create-epoch exporter). Reuse the tested metadata-update path to
+        // reseal at the CURRENT epoch and upload the blob; this advances the
+        // epoch by one commit, which joiners apply through the normal
+        // commit-sync path before rendering the name. Non-fatal: if the
+        // platform hasn't wired `put_group_metadata_blob` yet the update
+        // discards its pending commit (group stays valid) and we warn — the
+        // name simply stays hidden until a later metadata update.
+        if !name.is_empty() || description.is_some() {
+            if let Err(e) = self
+                .update_group_metadata_encrypted(
+                    &convo.conversation_id,
+                    if name.is_empty() { None } else { Some(name) },
+                    description,
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    group_id = %group_id_hex,
+                    "Failed to upload initial group metadata blob; members won't see the group name until the next metadata update"
+                );
+            }
+        }
+
+        // Get epoch from FFI (authoritative; reflects the metadata commit above).
         let ffi_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+        convo.epoch = ffi_epoch;
 
         // Update group state
         let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
@@ -267,6 +302,92 @@ where
         Ok(convo)
     }
 
+    /// Fetch + decrypt the encrypted group metadata blob for a conversation and
+    /// populate the cached `ConversationView.metadata` (name / description), so
+    /// every client renders the group name after joining. Newly-added members
+    /// can't derive a past epoch's exporter and so never cached the plaintext;
+    /// this is how they obtain it.
+    ///
+    /// Best-effort: any failure (no metadata set, platform hasn't wired the
+    /// blob fetch, key/epoch/AAD mismatch) is logged and skipped — the join
+    /// itself is never affected.
+    pub(crate) async fn hydrate_conversation_metadata(&self, conversation_id: &str) {
+        let group_id_hex = self
+            .group_id_hex_for_conversation(conversation_id)
+            .await
+            .unwrap_or_else(|| conversation_id.to_string());
+        let group_id_bytes = match hex::decode(&group_id_hex) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+
+        let info = match self.mls_context().get_current_metadata(group_id_bytes.clone()) {
+            Ok(Some(info)) => info,
+            Ok(None) => return, // no metadata set, or backend not wired
+            Err(e) => {
+                tracing::warn!(error = %e, convo = conversation_id, "hydrate_metadata: get_current_metadata failed");
+                return;
+            }
+        };
+        let Some(reference_json) = info.metadata_reference_json else {
+            return; // group has no MetadataReference yet
+        };
+        let reference: crate::metadata::MetadataReference =
+            match serde_json::from_slice(&reference_json) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(error = %e, convo = conversation_id, "hydrate_metadata: bad MetadataReference JSON");
+                    return;
+                }
+            };
+
+        let blob = match self
+            .api_client()
+            .get_group_metadata_blob(conversation_id, &group_id_hex, &reference.blob_locator)
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, convo = conversation_id, "hydrate_metadata: blob fetch failed");
+                return;
+            }
+        };
+
+        let key: [u8; 32] = match info.metadata_key.as_slice().try_into() {
+            Ok(k) => k,
+            Err(_) => {
+                tracing::warn!(convo = conversation_id, "hydrate_metadata: metadata key wrong length");
+                return;
+            }
+        };
+        let metadata = match crate::metadata::decrypt_metadata_blob(
+            &key,
+            &group_id_bytes,
+            info.epoch,
+            reference.metadata_version,
+            &blob,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, convo = conversation_id, epoch = info.epoch, "hydrate_metadata: decrypt failed");
+                return;
+            }
+        };
+
+        if let Some(view) = self.conversations().lock().await.get_mut(&group_id_hex) {
+            view.metadata = Some(ConversationMetadata {
+                name: Some(metadata.title.clone()),
+                description: if metadata.description.is_empty() {
+                    None
+                } else {
+                    Some(metadata.description.clone())
+                },
+                avatar_url: None,
+            });
+        }
+        tracing::info!(convo = conversation_id, epoch = info.epoch, "hydrate_metadata: group name decrypted");
+    }
+
     /// Join an existing group via a Welcome message.
     pub async fn join_group(&self, welcome_data: &[u8]) -> Result<ConversationView> {
         self.check_shutdown().await?;
@@ -286,7 +407,7 @@ where
 
         // Fetch conversation from server
         let page = self.api_client().get_conversations(100, None).await?;
-        let convo = page
+        let mut convo = page
             .conversations
             .into_iter()
             .find(|c| c.group_id == group_id_hex)
@@ -346,6 +467,13 @@ where
             if let Err(e) = self.storage().store_message(&marker).await {
                 tracing::warn!(error = %e, "Failed to store history boundary marker");
             }
+        }
+
+        // Decrypt the group name/description now that we hold the joined epoch,
+        // and reflect it in the returned view. Best-effort.
+        self.hydrate_conversation_metadata(&convo.conversation_id).await;
+        if let Some(view) = self.conversations().lock().await.get(&group_id_hex) {
+            convo.metadata = view.metadata.clone();
         }
 
         Ok(convo)

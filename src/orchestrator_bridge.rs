@@ -356,6 +356,34 @@ pub trait OrchestratorAPICallback: Send + Sync {
         epoch_authenticator: Option<String>,
         failure_mode: Option<String>,
     ) -> Result<(), OrchestratorBridgeError>;
+
+    /// Upload an encrypted group metadata blob via
+    /// `blue.catbird.mlsChat.putGroupMetadataBlob`. `kind` is `"metadata"` or
+    /// `"avatar"`; `metadata_version` is the monotonic counter from the
+    /// corresponding `MetadataReference`. Platform impls forward the args
+    /// untouched into the XRPC body.
+    fn put_group_metadata_blob(
+        &self,
+        convo_id: String,
+        group_id_hex: String,
+        blob_locator: String,
+        ciphertext: Vec<u8>,
+        kind: String,
+        metadata_version: u64,
+        reset_generation: Option<i32>,
+    ) -> Result<(), OrchestratorBridgeError>;
+
+    /// Download an encrypted group metadata blob via
+    /// `blue.catbird.mlsChat.getGroupMetadataBlob`. Returns the raw ciphertext
+    /// (`nonce || ciphertext || tag`) for `blob_locator`. On `BlobNotFound`
+    /// (GC'd / never uploaded) return `ServerError { status: 404 }` so the
+    /// orchestrator can skip metadata hydration without treating it as fatal.
+    fn get_group_metadata_blob(
+        &self,
+        convo_id: String,
+        group_id_hex: String,
+        blob_locator: String,
+    ) -> Result<Vec<u8>, OrchestratorBridgeError>;
 }
 
 /// Credential store callback interface for Swift/Kotlin.
@@ -2004,6 +2032,44 @@ impl MLSAPIClient for APIAdapter {
     async fn get_group_info(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
         self.0
             .get_group_info(convo_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn put_group_metadata_blob(
+        &self,
+        convo_id: &str,
+        group_id_hex: &str,
+        blob_locator: &str,
+        ciphertext: &[u8],
+        kind: &str,
+        metadata_version: u64,
+        reset_generation: Option<i32>,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .put_group_metadata_blob(
+                convo_id.to_string(),
+                group_id_hex.to_string(),
+                blob_locator.to_string(),
+                ciphertext.to_vec(),
+                kind.to_string(),
+                metadata_version,
+                reset_generation,
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn get_group_metadata_blob(
+        &self,
+        convo_id: &str,
+        group_id_hex: &str,
+        blob_locator: &str,
+    ) -> crate::orchestrator::Result<Vec<u8>> {
+        self.0
+            .get_group_metadata_blob(
+                convo_id.to_string(),
+                group_id_hex.to_string(),
+                blob_locator.to_string(),
+            )
             .map_err(bridge_err)
     }
 
@@ -3757,6 +3823,31 @@ mod tests {
             _failure_mode: Option<String>,
         ) -> Result<(), OrchestratorBridgeError> {
             Ok(())
+        }
+
+        fn put_group_metadata_blob(
+            &self,
+            _convo_id: String,
+            _group_id_hex: String,
+            _blob_locator: String,
+            _ciphertext: Vec<u8>,
+            _kind: String,
+            _metadata_version: u64,
+            _reset_generation: Option<i32>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+
+        fn get_group_metadata_blob(
+            &self,
+            _convo_id: String,
+            _group_id_hex: String,
+            _blob_locator: String,
+        ) -> Result<Vec<u8>, OrchestratorBridgeError> {
+            Err(OrchestratorBridgeError::ServerError {
+                status: 404,
+                body: "no metadata blob in test".into(),
+            })
         }
     }
 

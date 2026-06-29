@@ -381,4 +381,25 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
             "put_group_metadata_blob not implemented".into(),
         ))
     }
+
+    /// Download an encrypted metadata blob from the DS via
+    /// `blue.catbird.mlsChat.getGroupMetadataBlob`. Returns the raw ciphertext
+    /// (`nonce || ciphertext || tag`) for the given `blob_locator`, which the
+    /// orchestrator decrypts with the epoch metadata key from
+    /// [`MlsCryptoContext::get_current_metadata`].
+    ///
+    /// Default fails so backends that haven't wired the encrypted metadata path
+    /// surface the missing impl (the orchestrator catches it and leaves the
+    /// group name un-hydrated rather than breaking the join).
+    async fn get_group_metadata_blob(
+        &self,
+        convo_id: &str,
+        group_id_hex: &str,
+        blob_locator: &str,
+    ) -> Result<Vec<u8>> {
+        let _ = (convo_id, group_id_hex, blob_locator);
+        Err(crate::orchestrator::error::OrchestratorError::Api(
+            "get_group_metadata_blob not implemented".into(),
+        ))
+    }
 }
