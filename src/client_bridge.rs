@@ -636,6 +636,44 @@ impl MLSAPIClient for ClientAPIAdapter {
             .map_err(bridge_err)
     }
 
+    async fn put_group_metadata_blob(
+        &self,
+        convo_id: &str,
+        group_id_hex: &str,
+        blob_locator: &str,
+        ciphertext: &[u8],
+        kind: &str,
+        metadata_version: u64,
+        reset_generation: Option<i32>,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .put_group_metadata_blob(
+                convo_id.to_string(),
+                group_id_hex.to_string(),
+                blob_locator.to_string(),
+                ciphertext.to_vec(),
+                kind.to_string(),
+                metadata_version,
+                reset_generation,
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn get_group_metadata_blob(
+        &self,
+        convo_id: &str,
+        group_id_hex: &str,
+        blob_locator: &str,
+    ) -> crate::orchestrator::Result<Vec<u8>> {
+        self.0
+            .get_group_metadata_blob(
+                convo_id.to_string(),
+                group_id_hex.to_string(),
+                blob_locator.to_string(),
+            )
+            .map_err(bridge_err)
+    }
+
     async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
         self.0.get_welcome(convo_id.to_string()).map_err(bridge_err)
     }
