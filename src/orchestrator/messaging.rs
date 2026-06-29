@@ -100,16 +100,33 @@ where
         self.require_user_did().await?;
 
         let projected = self.project_conversation_recovery_state(convo_id).await;
+        crate::warn_log!(
+            "[REJOIN-DIAG] convo={} ensure_conversation_ready ENTRY projected={:?}",
+            convo_id,
+            projected
+        );
 
         if matches!(
             projected,
             ConversationRecoveryState::Recovering | ConversationRecoveryState::UnrecoverableLocal
         ) {
+            crate::warn_log!(
+                "[REJOIN-DIAG] convo={} ensure_conversation_ready EARLY-RETURN {:?} (Recovering/UnrecoverableLocal) — NOT calling join_or_rejoin",
+                convo_id,
+                projected
+            );
             return Ok(Self::ready_result(projected, None));
         }
 
         let local_epoch = match self.local_group_epoch_result(convo_id).await {
-            Ok(epoch) => epoch,
+            Ok(epoch) => {
+                crate::warn_log!(
+                    "[REJOIN-DIAG] convo={} ensure_conversation_ready local_group_epoch_result Ok(epoch={:?})",
+                    convo_id,
+                    epoch
+                );
+                epoch
+            }
             Err(err)
                 if matches!(
                     projected,
@@ -118,6 +135,12 @@ where
                         | ConversationRecoveryState::EpochBehind
                 ) =>
             {
+                crate::warn_log!(
+                    "[REJOIN-DIAG] convo={} ensure_conversation_ready BAILING to {:?} WITHOUT join_or_rejoin — local_group_epoch_result Err: {:?}",
+                    convo_id,
+                    projected,
+                    err
+                );
                 return Ok(Self::ready_result(projected, None));
             }
             Err(err) => return Err(err.into()),
@@ -127,8 +150,61 @@ where
             return Ok(Self::ready_result(projected, local_epoch));
         }
 
+        // P0.1 (epoch-inflation remediation): close the force_rejoin door at the
+        // authorization layer, not just at startup. A NeedsRejoin projection on a
+        // group that is LOCALLY healthy (present, valid epoch, self is a current
+        // member of the ratchet tree) must NOT drive join_or_rejoin -> force_rejoin
+        // (delete_group + External Commit), which heals nothing and only inflates
+        // the server's cosmetic group_info_epoch counter. Clear the stale flag and
+        // short-circuit to Healthy. The self-membership gate inside the helper means
+        // a genuinely-behind / leaf-lost member (absent from the local tree) still
+        // falls through to recovery below — so this cannot strand them.
+        if local_epoch.is_some()
+            && projected == ConversationRecoveryState::NeedsRejoin
+            && self.clear_needs_rejoin_if_locally_healthy(convo_id).await
+        {
+            let projected = self.project_conversation_recovery_state(convo_id).await;
+            let epoch = self
+                .local_group_epoch_result(convo_id)
+                .await?
+                .or(local_epoch);
+            crate::warn_log!(
+                "[REJOIN-DIAG] convo={} stale NeedsRejoin on locally-healthy group — cleared, returning {:?} (NO force_rejoin)",
+                convo_id,
+                projected
+            );
+            return Ok(Self::ready_result(projected, epoch));
+        }
+
         match self.join_or_rejoin(convo_id).await {
             Ok(epoch) => {
+                // A successful Welcome join or External Commit rejoin means the
+                // group is healthy again — clear the stale NeedsRejoin so the
+                // re-projection below returns Healthy and sends are unblocked.
+                //
+                // Without this the conversation is permanently stuck "needs
+                // repair": force_rejoin's success path clears the RecoveryTracker
+                // failure *counters* (clear_rejoin_failures) but never transitions
+                // `conversation_states` out of NeedsRejoin. So ready_result keeps
+                // reporting send_allowed=false, and every open re-runs an
+                // epoch-inflating External Commit (the spec's forbidden
+                // "force_rejoin in automated recovery" anti-pattern, in a loop).
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .insert(convo_id.to_string(), ConversationState::Active);
+                if let Err(e) = self
+                    .storage()
+                    .set_conversation_state(convo_id, ConversationState::Active)
+                    .await
+                {
+                    tracing::warn!(error = %e, convo_id, "Failed to persist Active state after successful rejoin");
+                }
+                crate::warn_log!(
+                    "[REJOIN-DIAG] convo={} rejoin succeeded — cleared NeedsRejoin -> Active (epoch={})",
+                    convo_id,
+                    epoch
+                );
                 let projected = self.project_conversation_recovery_state(convo_id).await;
                 let epoch = self
                     .local_group_epoch_result(convo_id)

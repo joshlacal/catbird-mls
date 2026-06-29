@@ -63,8 +63,16 @@ where
                     continue;
                 }
                 Some(ConversationState::NeedsRejoin) => {
-                    self.project_startup_needs_rejoin(&convo_id).await;
-                    report.needs_rejoin += 1;
+                    // P0.2: do not re-project NeedsRejoin (which drives
+                    // force_rejoin -> External Commit -> epoch inflation) when
+                    // the local group is cryptographically healthy. Clear the
+                    // stale flag instead.
+                    if self.clear_needs_rejoin_if_locally_healthy(&convo_id).await {
+                        report.healthy += 1;
+                    } else {
+                        self.project_startup_needs_rejoin(&convo_id).await;
+                        report.needs_rejoin += 1;
+                    }
                     continue;
                 }
                 Some(state) => {
@@ -88,8 +96,15 @@ where
                 }
             };
             if needs_rejoin {
-                self.project_startup_needs_rejoin(&convo_id).await;
-                report.needs_rejoin += 1;
+                // P0.2: same health-probe gate for the persisted boolean path —
+                // a sticky needs_rejoin=true on a healthy local group must not
+                // force a rejoin.
+                if self.clear_needs_rejoin_if_locally_healthy(&convo_id).await {
+                    report.healthy += 1;
+                } else {
+                    self.project_startup_needs_rejoin(&convo_id).await;
+                    report.needs_rejoin += 1;
+                }
                 continue;
             }
 

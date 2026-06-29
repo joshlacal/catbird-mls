@@ -1370,6 +1370,113 @@ where
         // Intentionally NO set_last_global_rejoin_attempt_at here.
     }
 
+    /// P0.2 (epoch-inflation remediation): a persisted `NeedsRejoin` enum or
+    /// `needs_rejoin` boolean MUST NOT force a rejoin when the LOCAL group is
+    /// already cryptographically healthy.
+    ///
+    /// Root cause: a sticky `needs_rejoin` flag is re-projected to NeedsRejoin
+    /// at startup with no health probe, dragging a healthy local group through
+    /// `ensure_conversation_ready -> join_or_rejoin -> force_rejoin` (delete_group
+    /// + External Commit) — the ADR-001 anti-pattern. Each no-op EC + GroupInfo
+    /// upload bumps the server's cosmetic `group_info_epoch` counter, producing
+    /// the visible "epoch inflation" with no underlying crypto advance.
+    ///
+    /// "Locally healthy" is gated on a CRYPTOGRAPHIC self-membership check
+    /// (I4 safety), not merely "an epoch exists": the group must be present in
+    /// the MLS context with a readable epoch AND have a populated ratchet tree
+    /// in which THIS device's identity is a current leaf. A locally
+    /// forked/emptied/self-evicted group fails this and still routes to
+    /// recovery, so we never unblock sends peers cannot decrypt.
+    ///
+    /// Returns `true` (and clears the stale enum/boolean/counters, projecting
+    /// `Active`) when the group is healthy; `false` when the caller should
+    /// proceed to project `NeedsRejoin`.
+    pub(crate) async fn clear_needs_rejoin_if_locally_healthy(&self, convo_id: &str) -> bool {
+        let local_epoch = match self.local_group_epoch_result(convo_id).await {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin local_group=ABSENT -> keeping NeedsRejoin",
+                    convo_id
+                );
+                return false;
+            }
+            Err(err) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin local epoch probe FAILED ({}) -> keeping NeedsRejoin",
+                    convo_id, err
+                );
+                return false;
+            }
+        };
+
+        let Some(group_id_bytes) = self.group_id_bytes_for_conversation(convo_id).await else {
+            crate::warn_log!(
+                "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin no local group id -> keeping NeedsRejoin",
+                convo_id
+            );
+            return false;
+        };
+
+        let members = match self.mls_context().group_member_identities(group_id_bytes) {
+            Ok(members) => members,
+            Err(err) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin epoch={} member probe FAILED ({}) -> keeping NeedsRejoin",
+                    convo_id, local_epoch, err
+                );
+                return false;
+            }
+        };
+
+        let self_is_member = match self.require_user_did().await {
+            Ok(user_did) => members
+                .iter()
+                .any(|id| id.as_slice() == user_did.as_bytes()),
+            Err(_) => false,
+        };
+
+        if members.is_empty() || !self_is_member {
+            crate::warn_log!(
+                "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin epoch={} members={} self_is_member={} -> NOT locally healthy, keeping NeedsRejoin",
+                convo_id, local_epoch, members.len(), self_is_member
+            );
+            return false;
+        }
+
+        // Healthy local group carrying a stale flag. Clear enum + boolean +
+        // counters together (the in-session path messaging.rs cleared only the
+        // enum, leaving the boolean to re-arm across restart) and project
+        // Active so the startup scan does NOT drive a force_rejoin.
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(convo_id.to_string(), ConversationState::Active);
+        if let Err(e) = self
+            .storage()
+            .set_conversation_state(convo_id, ConversationState::Active)
+            .await
+        {
+            self.report_recovery_storage_failure(
+                convo_id,
+                "set_conversation_state:active_stale_clear",
+                &e,
+            )
+            .await;
+        }
+        if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
+            self.report_recovery_storage_failure(convo_id, "clear_rejoin_flag:stale", &e)
+                .await;
+        }
+        self.clear_stale_rejoin_state(convo_id).await;
+
+        crate::warn_log!(
+            "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin but LOCAL HEALTHY (epoch={} members={} self_is_member=true) -> cleared stale flag, projected Active (NO force_rejoin)",
+            convo_id, local_epoch, members.len()
+        );
+        true
+    }
+
     async fn record_rejoin_failure(&self, convo_id: &str) {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let (count, max_attempts) = {
@@ -2205,11 +2312,38 @@ where
             }
         };
 
+        // P0.1 (epoch-inflation remediation): authorization-layer chokepoint.
+        // EVERY recovery surface funnels through join_or_rejoin — convo-open
+        // (ensure_conversation_ready), the deferred-recovery loop (which passes
+        // server_epoch=None, bypassing the caught-up clear), the sync-loop init
+        // path, and bootstrap retry. Before attempting any Welcome / External
+        // Commit, refuse to "rejoin" a group that is already LOCALLY healthy
+        // (present, valid epoch, self is a current member of the ratchet tree).
+        // Such a rejoin heals nothing and only inflates the server's cosmetic
+        // group_info_epoch counter — the ADR-001 force_rejoin anti-pattern that
+        // drove the year-long inflation spiral. Closing the door HERE, not
+        // surface-by-surface, is the durable fix. The self-membership gate means
+        // a genuinely leaf-lost / absent-local member still falls through to the
+        // real Welcome/EC recovery below, so this cannot strand anyone.
+        if self.clear_needs_rejoin_if_locally_healthy(convo_id).await {
+            let epoch = self.local_group_epoch(convo_id).await.unwrap_or(0);
+            crate::warn_log!(
+                "[REJOIN-DIAG] convo={} join_or_rejoin SHORT-CIRCUIT: local group already healthy (epoch={}) — NO Welcome/ExternalCommit",
+                convo_id,
+                epoch
+            );
+            return Ok(epoch);
+        }
+
         // Welcome should be tried unconditionally — backoff only applies to
         // External Commit fallback (spec: Welcome is the preferred join path).
         tracing::info!(
             convo_id,
             "Attempting to join group (Welcome first, External Commit fallback)"
+        );
+        crate::warn_log!(
+            "[REJOIN-DIAG] convo={} START join_or_rejoin (Welcome first, EC fallback)",
+            convo_id
         );
 
         // Step 1: Try Welcome.
@@ -2227,6 +2361,11 @@ where
                     convo_id,
                     welcome_len = welcome_data.len(),
                     "Welcome message found, joining via Welcome"
+                );
+                crate::warn_log!(
+                    "[REJOIN-DIAG] convo={} Welcome FOUND len={} — calling process_welcome",
+                    convo_id,
+                    welcome_data.len()
                 );
 
                 let identity_bytes = user_did.as_bytes().to_vec();
@@ -2303,9 +2442,19 @@ where
                         }
 
                         tracing::info!(convo_id, epoch, "Successfully joined via Welcome");
+                        crate::warn_log!(
+                            "[REJOIN-DIAG] convo={} Welcome JOIN OK epoch={}",
+                            convo_id,
+                            epoch
+                        );
                         return Ok(epoch);
                     }
                     Err(err) => {
+                        crate::warn_log!(
+                            "[REJOIN-DIAG] convo={} Welcome process_welcome FAILED: {}",
+                            convo_id,
+                            err
+                        );
                         welcome_recovery_error = classify_welcome_processing_error(&err);
                         // Welcome bytes returned but processing failed — treat
                         // as "expected" for bootstrap eligibility (the welcome
@@ -2333,9 +2482,19 @@ where
                         convo_id,
                         "No Welcome available — will try first-responder bootstrap (if ResetPending) before External Commit"
                     );
+                    crate::warn_log!(
+                        "[REJOIN-DIAG] convo={} Welcome fetch 404/410 (unavailable/expired): {}",
+                        convo_id,
+                        e
+                    );
                     true
                 } else {
                     tracing::warn!(convo_id, error = %e, "Welcome fetch failed with non-404/410 error; skipping bootstrap, falling back to External Commit");
+                    crate::warn_log!(
+                        "[REJOIN-DIAG] convo={} Welcome fetch FAILED (non-404/410, skipping bootstrap): {}",
+                        convo_id,
+                        e
+                    );
                     false
                 }
             }
@@ -2440,20 +2599,46 @@ where
                 .route_welcome_recovery_decision(convo_id, &user_did, last_error)
                 .await?;
             if !allow_external_commit {
+                crate::warn_log!(
+                    "[REJOIN-DIAG] convo={} External Commit NOT AUTHORIZED by welcome-recovery route (e.g. reissue requested/exhausted) — staying NeedsRejoin",
+                    convo_id
+                );
                 return Err(OrchestratorError::RecoveryFailed(format!(
                     "Welcome recovery did not authorize External Commit for {convo_id}"
                 )));
             }
         }
-        self.enforce_rejoin_backoff(convo_id).await?;
+        if let Err(err) = self.enforce_rejoin_backoff(convo_id).await {
+            crate::warn_log!(
+                "[REJOIN-DIAG] convo={} External Commit BLOCKED by rejoin backoff/circuit-breaker — staying NeedsRejoin: {}",
+                convo_id,
+                err
+            );
+            return Err(err);
+        }
+        crate::warn_log!(
+            "[REJOIN-DIAG] convo={} attempting External Commit (force_rejoin)",
+            convo_id
+        );
         let rejoin_result = self.force_rejoin_unlocked(convo_id, &user_did).await;
         match rejoin_result {
             Ok(()) => {
                 self.clear_rejoin_failures(convo_id).await;
-                Ok(self.local_group_epoch(convo_id).await.unwrap_or(0))
+                let epoch = self.local_group_epoch(convo_id).await.unwrap_or(0);
+                crate::warn_log!(
+                    "[REJOIN-DIAG] convo={} External Commit OK epoch={}",
+                    convo_id,
+                    epoch
+                );
+                Ok(epoch)
             }
             Err(err) => {
                 self.record_rejoin_failure(convo_id).await;
+                crate::warn_log!(
+                    "[REJOIN-DIAG] convo={} External Commit FAILED: {}",
+                    convo_id,
+                    err
+                );
                 Err(err)
             }
         }
