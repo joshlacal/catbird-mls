@@ -386,8 +386,30 @@ where
             //
             // Self-heal by treating the persisted state as missing so the
             // init block below re-runs `join_or_rejoin`.
+            //
+            // BUT a *closed* MLS context is NOT a missing group: the context's
+            // DB connections were merely released (iOS suspension / account-switch
+            // teardown) and the group is intact in persistent storage. Treating
+            // `ContextClosed` as "group missing" funnels the convo into the rejoin
+            // machinery, whose post-join success-cooldown then REJECTs it — which
+            // locks a freshly-joined member out of sending for minutes (it needs a
+            // cheap local context reload, not a network rejoin). Detect the
+            // transient close and skip this convo for the cycle; the next sync after
+            // the context reopens sees the group normally. The convo view is already
+            // cached above, so nothing is lost.
             let ffi_has_group = match hex::decode(group_id) {
-                Ok(gid_bytes) => self.mls_context().get_epoch(gid_bytes).is_ok(),
+                Ok(gid_bytes) => match self.mls_context().get_epoch(gid_bytes) {
+                    Ok(_) => true,
+                    Err(crate::MLSError::ContextClosed) => {
+                        crate::info_log!(
+                            "[sync] convo={} group={} SKIP: MLS context closed (transient iOS suspension) — not stale, not rejoining",
+                            conversation_id,
+                            group_id
+                        );
+                        continue;
+                    }
+                    Err(_) => false,
+                },
                 Err(_) => false,
             };
             let has_state_record = {
@@ -445,6 +467,17 @@ where
                                 e
                             );
                             e
+                        }
+                        // The context closed between the check above and here
+                        // (race with a concurrent suspension). Transient — keep the
+                        // server epoch and DON'T engage the rejoin gate.
+                        Err(crate::MLSError::ContextClosed) => {
+                            crate::info_log!(
+                                "[sync] convo={} group={} SKIP: MLS context closed mid-init (transient) — keeping epoch, not rejoining",
+                                conversation_id,
+                                group_id
+                            );
+                            convo.epoch
                         }
                         Err(e) => {
                             crate::info_log!(
