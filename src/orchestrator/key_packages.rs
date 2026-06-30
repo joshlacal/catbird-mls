@@ -58,6 +58,45 @@ where
     pub async fn replenish_if_needed(&self) -> Result<()> {
         self.check_shutdown().await?;
 
+        // Before checking the count, reconcile the server's published pool
+        // against what we actually hold locally. The server only learns a key
+        // package was used when ITS OWN handler seals a Welcome to it; if we
+        // drop a KP's private key for any other reason (consumed on a join the
+        // server didn't broker, a local storage reset, a reinstall), the server
+        // keeps serving it `available` and any recipient who fetches it fails
+        // with `NoMatchingKeyPackage`. `syncKeyPackages` deletes server KPs that
+        // are NOT in our live local set, draining those stale entries; the
+        // count check below then republishes fresh ones if we dropped below
+        // threshold. Best-effort: a failure here must not block replenishment.
+        //
+        // SAFETY: only sync when we have a non-empty local set. An empty list
+        // would make the server treat its ENTIRE pool as orphaned and delete
+        // it; an empty result here means "unknown" (uninitialized/locked
+        // context), not "I hold nothing".
+        match self.mls_context().list_key_package_hashes() {
+            Ok(local_hashes) if !local_hashes.is_empty() => {
+                match self.sync_key_package_hashes(&local_hashes).await {
+                    Ok(result) => tracing::info!(
+                        local = local_hashes.len(),
+                        orphaned = result.orphaned_count,
+                        deleted = result.deleted_count,
+                        "Reconciled server key packages against local store"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "key package orphan-drain (syncKeyPackages) failed; continuing to replenish"
+                    ),
+                }
+            }
+            Ok(_) => tracing::debug!(
+                "Skipping key package orphan-drain: no local hashes (uninitialized?)"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "Could not list local key package hashes; skipping orphan-drain"
+            ),
+        }
+
         let stats = self.api_client().get_key_package_stats().await?;
 
         tracing::debug!(

@@ -60,6 +60,21 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
 
+    /// Return the hex-encoded key-package refs the client currently holds a
+    /// private key for (i.e. the live local bundle set). Used to drain
+    /// server-side orphans via `syncKeyPackages`: any KP the server still lists
+    /// as available but that is NOT in this set has had its private key lost
+    /// locally (consumed by a join, storage reset, reinstall) and would fail a
+    /// recipient with `NoMatchingKeyPackage` if served — the server deletes
+    /// those.
+    ///
+    /// Default returns empty; callers MUST treat an empty result as "unknown"
+    /// and skip the sync, never as "I hold nothing" (that would wipe the
+    /// server pool). The native `MLSContext` implements this.
+    fn list_key_package_hashes(&self) -> Result<Vec<String>, MLSError> {
+        Ok(Vec::new())
+    }
+
     fn set_suspended(&self, _value: bool) {}
 
     fn interrupt_storage(&self) -> usize {

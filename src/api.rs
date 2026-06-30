@@ -6601,6 +6601,13 @@ impl MlsCryptoContext for MLSContext {
         self.get_current_metadata(group_id)
     }
 
+    fn list_key_package_hashes(&self) -> Result<Vec<String>, MLSError> {
+        // Live in-memory bundle keys, kept in sync with the OpenMLS store by
+        // reconcile_key_package_bundles — i.e. the refs we still hold a private
+        // key for. Drives the syncKeyPackages orphan-drain in replenish.
+        self.debug_list_key_package_hashes()
+    }
+
     fn set_suspended(&self, value: bool) {
         MLSContext::set_suspended(self, value);
     }
