@@ -5,7 +5,6 @@
 //! blob on the server; a lightweight `MetadataReference` in the MLS group
 //! context points to the blob by locator and integrity hash.
 
-use crate::orchestrator::constants::SAFE_EXPORT_METADATA_KEY;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     ChaCha20Poly1305,
@@ -202,13 +201,26 @@ pub fn derive_metadata_key(
 /// Derive the metadata encryption key from an existing `MlsGroup`'s current
 /// epoch exporter secret.
 ///
-/// Used for **initial group creation** where no `StagedCommit` exists — the
-/// group is already at its initial epoch and we can call `export_secret`
-/// directly on the group.
+/// Used after creation / after merge (read path, `get_current_metadata`,
+/// `merge_pending_commit`) where the group is already at the target epoch.
+///
+/// **Must derive identically to [`derive_metadata_key`]** (the StagedCommit
+/// variant used by every commit-time *seal*: `add_members_with_metadata`,
+/// `update_group_metadata_encrypted`). Both use the RFC 9420 exporter
+/// (`EXPORTER_LABEL` + `group_id || epoch` context) so that the member that
+/// seals a blob and every member that later reads it derive the SAME key.
+///
+/// Previously this preferred OpenMLS `safe_export_secret` (PPRF) "when
+/// available". But a `StagedCommit` can NOT produce a safe-export secret, so the
+/// seal paths are forced onto `export_secret`; preferring safe-export here
+/// yielded a DIFFERENT key whenever PPRF succeeded → joiners (and post-rename
+/// reads) failed metadata decryption with an AEAD error. Plain `export_secret`
+/// is the only derivation both sides can agree on, so it is the canonical one.
 ///
 /// # Arguments
-/// * `group` — the MLS group (already created, at its initial epoch)
+/// * `group` — the MLS group (at the target epoch)
 /// * `crypto` — an OpenMLS crypto provider
+/// * `storage` — retained for signature stability (was used by safe-export)
 /// * `group_id` — raw MLS group ID bytes
 /// * `epoch` — the current epoch of the group
 pub fn derive_metadata_key_from_group<Crypto: OpenMlsCrypto, Storage: StorageProvider>(
@@ -218,24 +230,11 @@ pub fn derive_metadata_key_from_group<Crypto: OpenMlsCrypto, Storage: StoragePro
     group_id: &[u8],
     epoch: u64,
 ) -> Result<[u8; 32], MetadataError> {
-    let secret = match group.safe_export_secret(crypto, storage, SAFE_EXPORT_METADATA_KEY) {
-        Ok(s) => {
-            crate::info_log!(
-                "[METADATA] Used safe_export_secret (PPRF) for metadata key, epoch {}",
-                epoch
-            );
-            s
-        }
-        Err(_) => {
-            crate::info_log!(
-                "[METADATA] safe_export_secret unavailable, falling back to export_secret for metadata key"
-            );
-            let context = build_exporter_context(group_id, epoch);
-            group
-                .export_secret(crypto, EXPORTER_LABEL, &context, EXPORTER_KEY_LENGTH)
-                .map_err(|e| MetadataError::ExportSecret(format!("{e:?}")))?
-        }
-    };
+    let _ = storage;
+    let context = build_exporter_context(group_id, epoch);
+    let secret = group
+        .export_secret(crypto, EXPORTER_LABEL, &context, EXPORTER_KEY_LENGTH)
+        .map_err(|e| MetadataError::ExportSecret(format!("{e:?}")))?;
 
     let mut key = [0u8; 32];
     key.copy_from_slice(&secret);

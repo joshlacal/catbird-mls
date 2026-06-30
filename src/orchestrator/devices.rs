@@ -200,7 +200,9 @@ where
         // must not block device registration.
         match self.publish_last_resort_key_package().await {
             Ok(()) => tracing::info!("Published last-resort key package"),
-            Err(e) => tracing::warn!(error = %e, "Failed to publish last-resort key package (continuing)"),
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to publish last-resort key package (continuing)")
+            }
         }
 
         tracing::info!(

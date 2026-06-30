@@ -1278,7 +1278,17 @@ impl MLSContext {
             let planned_reference_json = crate::metadata::planned_metadata_reference_json(
                 crate::metadata::current_metadata_reference(group).as_ref(),
                 false /* post-Phase-A: legacy 0xff00 path retired */,
-                false,
+                // An explicit metadata reseal request means we ARE (re)writing
+                // metadata in this commit. Without this, a freshly-created group
+                // (no committed MetadataReference yet) plans no reference, so the
+                // add commit embeds nothing and the reseal branch below is
+                // skipped — added members get neither a reference nor a blob and
+                // see "Secure Chat". Forcing metadata_changed=true makes
+                // `next_metadata_version(None, false, true) -> Some(1)`, so a v1
+                // reference is embedded in the commit (carried in the Welcome) and
+                // the blob is sealed at the post-add epoch. Plain add_members
+                // (reseal=None) is unaffected.
+                metadata_reseal.is_some(),
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
 
@@ -6648,6 +6658,26 @@ impl MlsCryptoContext for MLSContext {
         key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError> {
         self.add_members(group_id, key_packages)
+    }
+
+    fn add_members_with_metadata(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<AddMembersResult, MLSError> {
+        // Disambiguate from the trait method (4-arg) — call the inherent 6-arg
+        // method which performs the add + post-epoch metadata reseal.
+        MLSContext::add_members_with_metadata(
+            self,
+            group_id,
+            key_packages,
+            title,
+            description,
+            None,
+            None,
+        )
     }
 
     fn remove_members(

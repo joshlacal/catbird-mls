@@ -137,6 +137,26 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError>;
 
+    /// Add members AND re-seal the group metadata at the post-add epoch so the
+    /// newly-added members can decrypt the group name/description. The returned
+    /// `AddMembersResult` carries `metadata_blob_locator` / `metadata_blob_ciphertext`
+    /// / `metadata_version`, which the caller MUST upload via
+    /// `MLSAPIClient::put_group_metadata_blob`.
+    ///
+    /// Default impl drops the metadata and behaves exactly like `add_members`
+    /// (for platforms without encrypted-metadata support); the native
+    /// `MLSContext` overrides it.
+    fn add_members_with_metadata(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<AddMembersResult, MLSError> {
+        let _ = (&title, &description);
+        self.add_members(group_id, key_packages)
+    }
+
     fn remove_members(
         &self,
         group_id: Vec<u8>,

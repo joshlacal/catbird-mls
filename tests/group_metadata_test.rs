@@ -195,3 +195,94 @@ fn test_commit_pending_proposals_is_noop_when_nothing_pending_named_group() {
         epoch_before, epoch_after
     );
 }
+
+/// Regression: a member added at group-creation time must be able to decrypt
+/// the group name.
+///
+/// Before the fix, `add_members_with_metadata` on a freshly-created group (which
+/// has no committed `MetadataReference` yet) planned NO reference — the
+/// `metadata_changed` arg to `planned_metadata_reference_json` was hardcoded
+/// `false`, so `next_metadata_version(None, false, false) -> None`. The add
+/// commit (and the Welcome built from it) therefore embedded no reference, and
+/// the reseal branch (gated on that same planned reference) was skipped, so no
+/// blob was produced. Joiners landed with an empty AppDataDictionary and fell
+/// back to "Secure Chat".
+///
+/// The add commit must now embed a v1 `MetadataReference` (delivered to the
+/// joiner via the Welcome) and re-seal the `GroupMetadataV1` blob at the
+/// post-add epoch, so the joiner can derive the metadata key, find the
+/// reference, and decrypt the name/description.
+#[test]
+fn add_members_with_metadata_lets_fresh_group_joiner_decrypt_name() {
+    let (alice, _adir) = make_context();
+    let (bob, _bdir) = make_context();
+
+    // Alice creates a NAMED group (no committed reference exists yet).
+    let config = GroupConfig {
+        group_name: Some("Engineering".to_string()),
+        group_description: Some("the eng team".to_string()),
+        ..Default::default()
+    };
+    let created = alice
+        .create_group(b"did:plc:alice".to_vec(), Some(config))
+        .unwrap();
+    let group_id = created.group_id.clone();
+
+    // Bob publishes a key package; Alice adds him WITH metadata in one commit.
+    let bob_kp = bob.create_key_package(b"did:plc:bob".to_vec()).unwrap();
+    let add = alice
+        .add_members_with_metadata(
+            group_id.clone(),
+            vec![catbird_mls::KeyPackageData {
+                data: bob_kp.key_package_data,
+            }],
+            Some("Engineering".to_string()),
+            Some("the eng team".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // The FIX: a fresh group must produce a re-sealed blob for the caller to
+    // upload. Previously these were all None.
+    let blob_ciphertext = add.metadata_blob_ciphertext.clone().expect(
+        "add_members_with_metadata must re-seal a metadata blob for a freshly-created group",
+    );
+    let blob_version = add.metadata_version.expect("metadata version must be set");
+    assert!(
+        add.metadata_blob_locator.is_some(),
+        "blob locator must be set"
+    );
+
+    // Alice merges; Bob processes the Welcome (which carries the post-add group
+    // context, including the MetadataReference at component 0x8001).
+    alice.merge_pending_commit(group_id.clone()).unwrap();
+    let joined = bob
+        .process_welcome(add.welcome_data.clone(), b"did:plc:bob".to_vec(), None)
+        .unwrap();
+    assert_eq!(joined.group_id, group_id, "bob joined the same group");
+
+    // Bob now sees a MetadataReference at his current epoch (was the bug) and
+    // can derive the metadata key.
+    let info = bob
+        .get_current_metadata(group_id.clone())
+        .unwrap()
+        .expect("joiner must have current metadata info");
+    assert!(
+        info.metadata_reference_json.is_some(),
+        "the add commit must deliver a MetadataReference to the joiner via the Welcome"
+    );
+    let key: [u8; 32] = info.metadata_key.as_slice().try_into().unwrap();
+
+    // Bob decrypts Alice's re-sealed blob at his epoch → recovers the name.
+    let decrypted = catbird_mls::metadata::decrypt_metadata_blob(
+        &key,
+        &group_id,
+        info.epoch,
+        blob_version,
+        &blob_ciphertext,
+    )
+    .expect("joiner must be able to decrypt the group metadata blob");
+    assert_eq!(decrypted.title, "Engineering");
+    assert_eq!(decrypted.description, "the eng team");
+}

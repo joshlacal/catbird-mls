@@ -68,7 +68,13 @@ where
 
         // Create local conversation record
         let create_result = self
-            .create_group_inner(&user_did, &group_id_hex, name, description, filtered_members_ref)
+            .create_group_inner(
+                &user_did,
+                &group_id_hex,
+                name,
+                description,
+                filtered_members_ref,
+            )
             .await;
 
         // On any failure, clean up the local MLS group and remove from being-created set
@@ -149,13 +155,32 @@ where
                     })
                     .collect();
 
-                let add_result = self
-                    .mls_context()
-                    .add_members(group_id_bytes.clone(), kp_data)
-                    .map_err(|e| {
-                        tracing::error!(error = %e, "MLS add_members failed — key package validation or crypto error");
-                        e
-                    })?;
+                // If the group has a name/description, add the members AND
+                // re-seal the metadata at the post-add epoch in the SAME commit,
+                // so the Welcome carries a MetadataReference the joiners can use
+                // and the matching blob is sealed at the epoch they land on.
+                // Plain `add_members` embeds no reference, leaving joiners at
+                // "Secure Chat".
+                let add_result = if !name.is_empty() || description.is_some() {
+                    self.mls_context()
+                        .add_members_with_metadata(
+                            group_id_bytes.clone(),
+                            kp_data,
+                            if name.is_empty() { None } else { Some(name.to_string()) },
+                            description.map(|d| d.to_string()),
+                        )
+                        .map_err(|e| {
+                            tracing::error!(error = %e, "MLS add_members_with_metadata failed — key package validation or crypto error");
+                            e
+                        })?
+                } else {
+                    self.mls_context()
+                        .add_members(group_id_bytes.clone(), kp_data)
+                        .map_err(|e| {
+                            tracing::error!(error = %e, "MLS add_members failed — key package validation or crypto error");
+                            e
+                        })?
+                };
 
                 // Track own commit
                 {
@@ -224,41 +249,44 @@ where
             );
         }
 
-        // Seal + upload the encrypted group metadata blob so OTHER members can
-        // decrypt the group name/description, WITHOUT advancing the epoch.
-        // `create_group` above only sealed a `MetadataReference` (locator +
-        // version) into the local MLS group context — the encrypted
-        // `GroupMetadataV1` blob is never uploaded to the DS during create, and
-        // after adding initial members the create-epoch seal is unreachable by
-        // joiners (they land at the post-add epoch and, by MLS forward secrecy,
-        // cannot derive the create-epoch exporter).
+        // Upload the encrypted group metadata blob so OTHER members can decrypt
+        // the group name/description. The initial `add_members_with_metadata`
+        // commit above (1) embedded a fresh `MetadataReference` (locator +
+        // version) into the group context — which the Welcome carries to every
+        // joiner — and (2) re-sealed the `GroupMetadataV1` blob at the post-add
+        // epoch under that same locator. Joiners land at exactly that epoch, so
+        // they can derive the metadata key, fetch this blob, and decrypt it.
         //
-        // This used to reseal via `update_group_metadata_encrypted`, which
-        // stages a SECOND GroupContextExtensions commit and advances the epoch
-        // by one. That commit is only pushed as a GroupInfo refresh — the
-        // freshly-added members never receive it and the server stays at the
-        // createConvo epoch — so the creator ends up one epoch AHEAD of
-        // everyone and every message it sends is rejected with HTTP 409
-        // ("not delivered"). Instead, derive the current epoch's metadata key
-        // (a read — no commit) and re-encrypt the blob under the SAME
-        // locator/version the group context already advertises, then upload it.
-        // The epoch is untouched, so sends keep working. Non-fatal: on any
-        // failure the name simply stays hidden until a later metadata update.
-        if !name.is_empty() || description.is_some() {
+        // No extra commit / epoch advance happens here (the reseal rode the add
+        // commit), so sends keep working. `put_group_metadata_blob` requires the
+        // conversation row to exist on the DS, hence we upload AFTER createConvo.
+        // Non-fatal: on any failure the name stays hidden until a later update.
+        if let (Some(locator), Some(ciphertext), Some(version)) = (
+            initial_add_result
+                .as_ref()
+                .and_then(|r| r.metadata_blob_locator.clone()),
+            initial_add_result
+                .as_ref()
+                .and_then(|r| r.metadata_blob_ciphertext.clone()),
+            initial_add_result.as_ref().and_then(|r| r.metadata_version),
+        ) {
             if let Err(e) = self
-                .seal_initial_metadata_no_commit(
+                .api_client()
+                .put_group_metadata_blob(
                     &convo.conversation_id,
                     group_id_hex,
-                    group_id_bytes.clone(),
-                    if name.is_empty() { None } else { Some(name) },
-                    description,
+                    &locator,
+                    &ciphertext,
+                    "metadata",
+                    version,
+                    None,
                 )
                 .await
             {
                 tracing::warn!(
                     error = %e,
                     group_id = %group_id_hex,
-                    "Failed to upload initial group metadata blob (no-commit); members won't see the group name until the next metadata update"
+                    "Failed to upload initial group metadata blob; members won't see the group name until the next metadata update"
                 );
             }
         }
@@ -328,7 +356,10 @@ where
             Err(_) => return,
         };
 
-        let info = match self.mls_context().get_current_metadata(group_id_bytes.clone()) {
+        let info = match self
+            .mls_context()
+            .get_current_metadata(group_id_bytes.clone())
+        {
             Ok(Some(info)) => info,
             Ok(None) => return, // no metadata set, or backend not wired
             Err(e) => {
@@ -339,14 +370,15 @@ where
         let Some(reference_json) = info.metadata_reference_json else {
             return; // group has no MetadataReference yet
         };
-        let reference: crate::metadata::MetadataReference =
-            match serde_json::from_slice(&reference_json) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(error = %e, convo = conversation_id, "hydrate_metadata: bad MetadataReference JSON");
-                    return;
-                }
-            };
+        let reference: crate::metadata::MetadataReference = match serde_json::from_slice(
+            &reference_json,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, convo = conversation_id, "hydrate_metadata: bad MetadataReference JSON");
+                return;
+            }
+        };
 
         let blob = match self
             .api_client()
@@ -363,7 +395,10 @@ where
         let key: [u8; 32] = match info.metadata_key.as_slice().try_into() {
             Ok(k) => k,
             Err(_) => {
-                tracing::warn!(convo = conversation_id, "hydrate_metadata: metadata key wrong length");
+                tracing::warn!(
+                    convo = conversation_id,
+                    "hydrate_metadata: metadata key wrong length"
+                );
                 return;
             }
         };
@@ -392,7 +427,11 @@ where
                 avatar_url: None,
             });
         }
-        tracing::info!(convo = conversation_id, epoch = info.epoch, "hydrate_metadata: group name decrypted");
+        tracing::info!(
+            convo = conversation_id,
+            epoch = info.epoch,
+            "hydrate_metadata: group name decrypted"
+        );
     }
 
     /// Join an existing group via a Welcome message.
@@ -478,7 +517,8 @@ where
 
         // Decrypt the group name/description now that we hold the joined epoch,
         // and reflect it in the returned view. Best-effort.
-        self.hydrate_conversation_metadata(&convo.conversation_id).await;
+        self.hydrate_conversation_metadata(&convo.conversation_id)
+            .await;
         if let Some(view) = self.conversations().lock().await.get(&group_id_hex) {
             convo.metadata = view.metadata.clone();
         }
@@ -971,105 +1011,6 @@ where
             blob_locator = %result.metadata_blob_locator,
             "Group metadata updated (encrypted)"
         );
-        Ok(())
-    }
-
-    /// Upload the initial encrypted metadata blob for a freshly-created group at
-    /// the CURRENT epoch, WITHOUT staging an MLS commit.
-    ///
-    /// `create_group` seals a `MetadataReference` (locator + version) into the
-    /// group context but never uploads the encrypted `GroupMetadataV1` blob, and
-    /// after adding initial members the create-epoch seal is unreachable by
-    /// Welcome'd joiners (MLS forward secrecy). This derives the current epoch's
-    /// metadata key (a read — no commit, no epoch advance), re-encrypts the blob
-    /// under the locator/version the group context already advertises, and
-    /// uploads it so joiners can decrypt the group name.
-    ///
-    /// Keeping the epoch fixed is the whole point: a second metadata *commit*
-    /// here (the previous behavior) desyncs the creator's epoch from the
-    /// server's — the freshly-added members never receive that commit — so every
-    /// message the creator sends is rejected with HTTP 409. This path leaves the
-    /// epoch alone, so sends into the just-created group succeed.
-    async fn seal_initial_metadata_no_commit(
-        &self,
-        conversation_id: &str,
-        group_id_hex: &str,
-        group_id_bytes: Vec<u8>,
-        title: Option<&str>,
-        description: Option<&str>,
-    ) -> Result<()> {
-        // Current-epoch metadata key + the reference already embedded in the
-        // group context. `get_current_metadata` is a pure read (no commit).
-        let current = self
-            .mls_context()
-            .get_current_metadata(group_id_bytes.clone())?
-            .ok_or_else(|| {
-                OrchestratorError::InvalidInput(
-                    "no MetadataReference in group context after creation".into(),
-                )
-            })?;
-
-        let key: [u8; 32] = current.metadata_key.as_slice().try_into().map_err(|_| {
-            OrchestratorError::InvalidInput("metadata key is not 32 bytes".into())
-        })?;
-
-        let reference: crate::metadata::MetadataReference = current
-            .metadata_reference_json
-            .as_deref()
-            .ok_or_else(|| {
-                OrchestratorError::InvalidInput(
-                    "group context carries no MetadataReference JSON".into(),
-                )
-            })
-            .and_then(|json| {
-                serde_json::from_slice(json).map_err(|e| {
-                    OrchestratorError::Serialization(format!(
-                        "invalid MetadataReference JSON: {e}"
-                    ))
-                })
-            })?;
-
-        let payload = crate::metadata::GroupMetadataV1 {
-            version: 1,
-            title: title.unwrap_or_default().to_string(),
-            description: description.unwrap_or_default().to_string(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        };
-
-        // Encrypt under the CURRENT epoch — the epoch Welcome'd joiners land on —
-        // and the locator/version the group context already advertises.
-        let ciphertext = crate::metadata::encrypt_metadata_blob(
-            &key,
-            &group_id_bytes,
-            current.epoch,
-            reference.metadata_version,
-            &payload,
-        )
-        .map_err(|e| {
-            OrchestratorError::Serialization(format!("encrypt initial metadata blob: {e:?}"))
-        })?;
-
-        self.api_client()
-            .put_group_metadata_blob(
-                conversation_id,
-                group_id_hex,
-                &reference.blob_locator,
-                &ciphertext,
-                "metadata",
-                reference.metadata_version,
-                None,
-            )
-            .await?;
-
-        tracing::info!(
-            group_id = %group_id_hex,
-            epoch = current.epoch,
-            version = reference.metadata_version,
-            locator = %reference.blob_locator,
-            "Sealed initial group metadata blob at current epoch (no commit)"
-        );
-
         Ok(())
     }
 
