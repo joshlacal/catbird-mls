@@ -764,6 +764,22 @@ where
                 );
                 return Ok(None);
             }
+            Err(e) if e.is_benign_redundant_decrypt() => {
+                // The ciphertext was ALREADY successfully consumed (SecretReuse
+                // from overlapping decrypt pipelines racing past the
+                // `message_exists` dedup before the first run stored the row), or
+                // it is our own message echoed back (CannotDecryptOwnMessage).
+                // Both mean "already handled", NOT a fork. Skip WITHOUT advancing
+                // `decrypt_fail_counts`; otherwise 3 racing re-decrypts trip
+                // DECRYPTION_FAILURE_THRESHOLD → NeedsRejoin (sends blocked,
+                // "Secure session needs repair"). See
+                // MLSError::is_benign_redundant_decrypt.
+                tracing::debug!(
+                    conversation_id = %envelope.conversation_id,
+                    "Skipping message: already-consumed or own-echo (benign redundant decrypt, not a fork)"
+                );
+                return Ok(None);
+            }
             Err(e) => {
                 tracing::error!(
                     error = %e,

@@ -230,6 +230,37 @@ impl MLSError {
             _ => false,
         }
     }
+
+    /// Whether this decrypt error means the ciphertext was ALREADY successfully
+    /// consumed, or is our own outbound message we can never decrypt — i.e. a
+    /// benign redundancy, NOT a fork or corruption signal.
+    ///
+    /// - `SecretReuseError`: OpenMLS punctures each per-message secret-tree leaf
+    ///   on successful decrypt (forward secrecy). A *second* decrypt of the SAME
+    ///   ciphertext fails with SecretReuse. In practice this happens when
+    ///   overlapping fetch / SSE / periodic-sync / catch-up pipelines race past
+    ///   the `message_exists` dedup before the first run has stored the row, so
+    ///   two threads decrypt the same message and the loser hits the punctured
+    ///   leaf. It literally proves we already decrypted the message.
+    /// - `CannotDecryptOwnMessage`: our own application message echoed back by
+    ///   the delivery service; we hold only the encryption side and never the
+    ///   matching ratchet to read it back.
+    ///
+    /// Both are normal. Counting them as "decrypt failures" hits
+    /// `DECRYPTION_FAILURE_THRESHOLD` (3) on active groups, which flips the
+    /// conversation to `NeedsRejoin` (sends blocked + the "Secure session needs
+    /// repair" banner) and historically drove `force_rejoin` epoch-inflation
+    /// spirals. They MUST be skipped silently, exactly like [`Self::is_wrong_epoch`].
+    pub fn is_benign_redundant_decrypt(&self) -> bool {
+        let matches = |msg: &str| {
+            msg.contains("SecretReuse") || msg.contains("CannotDecryptOwnMessage")
+        };
+        match self {
+            Self::OpenMLS(msg) => matches(msg),
+            Self::CommitProcessingFailed { message } => matches(message),
+            _ => false,
+        }
+    }
 }
 
 /// Dedicated error type for the sender-side three-phase commit surface on
@@ -277,5 +308,43 @@ impl From<MLSError> for MLSCommitError {
                 message: other.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod decrypt_class_tests {
+    use super::MLSError;
+
+    // The exact `{:?}` forms `map_process_message_error`'s catch-all arm
+    // produces for OpenMLS `process_message` failures (see api.rs:297).
+    const SECRET_REUSE: &str =
+        "process_message failed: ValidationError(UnableToDecrypt(SecretTreeError(SecretReuseError)))";
+    const OWN_MESSAGE: &str =
+        "process_message failed: ValidationError(CannotDecryptOwnMessage)";
+    const WRONG_EPOCH: &str =
+        "process_message failed: ValidationError(WrongEpoch)";
+
+    #[test]
+    fn secret_reuse_and_own_message_are_benign() {
+        assert!(MLSError::OpenMLS(SECRET_REUSE.into()).is_benign_redundant_decrypt());
+        assert!(MLSError::OpenMLS(OWN_MESSAGE.into()).is_benign_redundant_decrypt());
+        assert!(MLSError::CommitProcessingFailed {
+            message: SECRET_REUSE.into(),
+        }
+        .is_benign_redundant_decrypt());
+    }
+
+    #[test]
+    fn wrong_epoch_and_real_failures_are_not_benign() {
+        // WrongEpoch has its own silent-skip arm — it must NOT also be
+        // claimed by the benign-redundant classifier (different semantics).
+        assert!(!MLSError::OpenMLS(WRONG_EPOCH.into()).is_benign_redundant_decrypt());
+        assert!(MLSError::OpenMLS(WRONG_EPOCH.into()).is_wrong_epoch());
+        // A genuine decrypt failure must still count toward rejoin.
+        assert!(!MLSError::OpenMLS(
+            "process_message failed: ValidationError(UnableToDecrypt(AeadError))".into()
+        )
+        .is_benign_redundant_decrypt());
+        assert!(!MLSError::InvalidCommit.is_benign_redundant_decrypt());
     }
 }
