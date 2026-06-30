@@ -192,6 +192,17 @@ where
             }
         }
 
+        // Publish a reusable last-resort key package so this device always has a
+        // join floor: even if its regular single-use pool is drained (orphan
+        // reconcile) or exhausted (failed joins), the DS can still seal a
+        // Welcome to the last-resort KP. Best-effort — not all platforms'
+        // crypto backends support last-resort generation, and a failure here
+        // must not block device registration.
+        match self.publish_last_resort_key_package().await {
+            Ok(()) => tracing::info!("Published last-resort key package"),
+            Err(e) => tracing::warn!(error = %e, "Failed to publish last-resort key package (continuing)"),
+        }
+
         tracing::info!(
             device_id = %device_info.device_id,
             mls_did = %mls_did,
