@@ -2390,6 +2390,38 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Update a group's encrypted metadata (title / description / avatar) for
+    /// full-authority (rustFull) clients.
+    ///
+    /// Stages a GroupContextExtensions commit that embeds a fresh
+    /// `MetadataReference`, uploads the re-encrypted metadata blob, submits the
+    /// commit, and merges locally. When `avatar_bytes` is provided the avatar
+    /// image is encrypted at the SAME post-commit (epoch, metadata_version) and
+    /// uploaded to `avatar_blob_locator`, so joiners can fetch + decrypt it.
+    ///
+    /// The whole desired metadata state must be supplied on every call (the
+    /// commit replaces the blob): to rename without dropping the avatar, pass
+    /// the current avatar bytes + locator alongside the new title.
+    pub fn update_group_metadata_encrypted(
+        &self,
+        conversation_id: String,
+        title: Option<String>,
+        description: Option<String>,
+        avatar_blob_locator: Option<String>,
+        avatar_content_type: Option<String>,
+        avatar_bytes: Option<Vec<u8>>,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.update_group_metadata_encrypted(
+            &conversation_id,
+            title.as_deref(),
+            description.as_deref(),
+            avatar_blob_locator.as_deref(),
+            avatar_content_type.as_deref(),
+            avatar_bytes.as_deref(),
+        ))?;
+        Ok(())
+    }
+
     /// Fulfill a Welcome-reissue request as an admin member (rustFull mode).
     /// Mirrors `swap_members` (no external commit): removes the recipient's
     /// stale leaf and re-adds them with a fresh key package, threading

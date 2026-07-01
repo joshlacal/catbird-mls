@@ -945,6 +945,7 @@ where
         description: Option<&str>,
         avatar_blob_locator: Option<&str>,
         avatar_content_type: Option<&str>,
+        avatar_bytes: Option<&[u8]>,
     ) -> Result<()> {
         self.check_shutdown().await?;
 
@@ -1002,13 +1003,65 @@ where
 
         // 4. Merge locally (advances epoch and applies the new
         //    MetadataReference in AppDataDictionary).
-        let merge_epoch = self.mls_context().merge_pending_commit(group_id_bytes)?;
+        let merge_epoch = self
+            .mls_context()
+            .merge_pending_commit(group_id_bytes.clone())?;
+
+        // 5. Encrypt + upload the avatar blob at the SAME post-commit
+        //    (epoch, metadata_version) the metadata blob was bound to, so
+        //    joiners — who fetch the avatar via `avatar_blob_locator` from the
+        //    decrypted metadata and decrypt it with their current-epoch key —
+        //    get a matching AAD (`group_id || epoch || metadata_version`). The
+        //    metadata blob references the locator; without this upload the
+        //    locator points at nothing and joiners see no avatar. Best-effort:
+        //    the metadata commit already merged, so a failed avatar upload
+        //    leaves the group named-but-avatarless rather than breaking it.
+        if let (Some(bytes), Some(locator)) = (avatar_bytes, avatar_blob_locator) {
+            match self.mls_context().get_current_metadata(group_id_bytes.clone()) {
+                Ok(Some(info)) => {
+                    match <[u8; 32]>::try_from(info.metadata_key.as_slice()) {
+                        Ok(key) => {
+                            match crate::metadata::encrypt_avatar_blob(
+                                &key,
+                                &group_id_bytes,
+                                info.epoch,
+                                result.metadata_version,
+                                bytes,
+                            ) {
+                                Ok(encrypted_avatar) => {
+                                    if let Err(e) = self
+                                        .api_client()
+                                        .put_group_metadata_blob(
+                                            conversation_id,
+                                            &group_id_hex,
+                                            locator,
+                                            &encrypted_avatar,
+                                            "avatar",
+                                            result.metadata_version,
+                                            None,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(error = %e, conversation_id, "Avatar blob upload failed; group named but avatar unavailable");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(error = %e, conversation_id, "Avatar encryption failed"),
+                            }
+                        }
+                        Err(_) => tracing::warn!(conversation_id, "Avatar upload skipped: metadata key wrong length"),
+                    }
+                }
+                Ok(None) => tracing::warn!(conversation_id, "Avatar upload skipped: no current metadata after merge"),
+                Err(e) => tracing::warn!(error = %e, conversation_id, "Avatar upload skipped: get_current_metadata failed"),
+            }
+        }
 
         tracing::info!(
             conversation_id,
             new_epoch = merge_epoch,
             metadata_version = result.metadata_version,
             blob_locator = %result.metadata_blob_locator,
+            has_avatar = avatar_bytes.is_some(),
             "Group metadata updated (encrypted)"
         );
         Ok(())
