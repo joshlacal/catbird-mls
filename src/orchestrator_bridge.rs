@@ -384,6 +384,25 @@ pub trait OrchestratorAPICallback: Send + Sync {
         group_id_hex: String,
         blob_locator: String,
     ) -> Result<Vec<u8>, OrchestratorBridgeError>;
+
+    /// Submit a non-membership commit (e.g. a metadata update) via
+    /// `blue.catbird.mlsChat.commitGroupChange`. Platform impls POST
+    /// `{ convoId, action, commit }`; on success the server CAS-advances the
+    /// authoritative `current_epoch`. `action` is e.g. `"updateMetadata"`.
+    /// `confirmation_tag` is the optional base64 MLS confirmation tag.
+    ///
+    /// This MUST reach the server before the orchestrator merges the commit
+    /// locally: a local merge without server acceptance advances the client
+    /// epoch past the server and isolates the sender (every `sendMessage`
+    /// 409s). On 409 (stale/raced epoch) return `ServerError { status: 409 }`
+    /// so the orchestrator discards the pending commit instead of merging.
+    fn commit_group_change(
+        &self,
+        convo_id: String,
+        commit_data: Vec<u8>,
+        action: String,
+        confirmation_tag: Option<String>,
+    ) -> Result<(), OrchestratorBridgeError>;
 }
 
 /// Credential store callback interface for Swift/Kotlin.
@@ -2069,6 +2088,23 @@ impl MLSAPIClient for APIAdapter {
                 convo_id.to_string(),
                 group_id_hex.to_string(),
                 blob_locator.to_string(),
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn commit_group_change(
+        &self,
+        convo_id: &str,
+        commit_data: &[u8],
+        action: &str,
+        confirmation_tag: Option<&str>,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .commit_group_change(
+                convo_id.to_string(),
+                commit_data.to_vec(),
+                action.to_string(),
+                confirmation_tag.map(|s| s.to_string()),
             )
             .map_err(bridge_err)
     }
@@ -3880,6 +3916,16 @@ mod tests {
                 status: 404,
                 body: "no metadata blob in test".into(),
             })
+        }
+
+        fn commit_group_change(
+            &self,
+            _convo_id: String,
+            _commit_data: Vec<u8>,
+            _action: String,
+            _confirmation_tag: Option<String>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
         }
     }
 
