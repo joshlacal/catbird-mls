@@ -184,6 +184,32 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         device_id: Option<&str>,
     ) -> Result<()>;
 
+    /// Publish MULTIPLE key packages to the server in a SINGLE request.
+    ///
+    /// Replenishment tops the server pool back up to the target by generating
+    /// dozens of fresh key packages; publishing them one HTTP call at a time is
+    /// N sequential round-trips. The delivery service accepts an array
+    /// (`MAX_BATCH_SIZE = 100`), so a batched publish collapses the whole refill
+    /// into one POST. All packages in a batch share the same cipher suite,
+    /// expiry, and device scope (the replenishment invariant).
+    ///
+    /// The default implementation loops `publish_key_package`, preserving
+    /// behavior for backends (catmos, CLI, WASM) that don't override it; the
+    /// iOS FFI adapter overrides it with a true single-request batch upload.
+    async fn publish_key_packages(
+        &self,
+        key_packages: &[Vec<u8>],
+        cipher_suite: &str,
+        expires_at: &str,
+        device_id: Option<&str>,
+    ) -> Result<()> {
+        for key_package in key_packages {
+            self.publish_key_package(key_package, cipher_suite, expires_at, device_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Get key packages for a set of DIDs.
     async fn get_key_packages(&self, dids: &[String]) -> Result<Vec<KeyPackageRef>>;
 

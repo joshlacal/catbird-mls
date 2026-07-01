@@ -259,6 +259,17 @@ pub trait OrchestratorAPICallback: Send + Sync {
         device_id: Option<String>,
     ) -> Result<(), OrchestratorBridgeError>;
 
+    /// Publish multiple key packages in ONE request. The platform impl POSTs
+    /// the whole array to `blue.catbird.mlsChat.publishKeyPackages` (server cap
+    /// 100), collapsing a full replenishment refill into a single round-trip.
+    fn publish_key_packages(
+        &self,
+        key_packages: Vec<Vec<u8>>,
+        cipher_suite: String,
+        expires_at: String,
+        device_id: Option<String>,
+    ) -> Result<(), OrchestratorBridgeError>;
+
     fn get_key_packages(
         &self,
         dids: Vec<String>,
@@ -1935,6 +1946,23 @@ impl MLSAPIClient for APIAdapter {
         self.0
             .publish_key_package(
                 key_package.to_vec(),
+                cipher_suite.to_string(),
+                expires_at.to_string(),
+                device_id.map(str::to_string),
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn publish_key_packages(
+        &self,
+        key_packages: &[Vec<u8>],
+        cipher_suite: &str,
+        expires_at: &str,
+        device_id: Option<&str>,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .publish_key_packages(
+                key_packages.to_vec(),
                 cipher_suite.to_string(),
                 expires_at.to_string(),
                 device_id.map(str::to_string),
@@ -3795,6 +3823,16 @@ mod tests {
         fn publish_key_package(
             &self,
             _key_package: Vec<u8>,
+            _cipher_suite: String,
+            _expires_at: String,
+            _device_id: Option<String>,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Ok(())
+        }
+
+        fn publish_key_packages(
+            &self,
+            _key_packages: Vec<Vec<u8>>,
             _cipher_suite: String,
             _expires_at: String,
             _device_id: Option<String>,

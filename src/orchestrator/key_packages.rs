@@ -168,12 +168,54 @@ where
             "Replenishing key packages"
         );
 
+        // Generate the whole batch locally first, then publish it in a single
+        // request. Each `create_key_package` call persists the bundle to local
+        // storage as a side effect, so the KPs survive even if the upload
+        // fails. Batching collapses what used to be `needed` SEQUENTIAL HTTP
+        // POSTs (the single-KP callback) into one round-trip — that serial
+        // publish ran on the startup/account-switch critical path and blocked
+        // message loading.
+        let user_did = self.require_user_did().await?;
+        let identity_bytes = user_did.as_bytes().to_vec();
+        let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+        let device_uuid = self.credentials().get_device_uuid(&user_did).await?;
+
+        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(needed as usize);
         for i in 0..needed {
-            if let Err(e) = self.publish_key_package().await {
+            match self
+                .mls_context()
+                .create_key_package(identity_bytes.clone())
+            {
+                Ok(kp) => batch.push(kp.key_package_data),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        generated = i,
+                        "Failed to create key package during replenishment"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Respect the delivery service's MAX_BATCH_SIZE (100). `needed` is
+        // bounded by the target (50 today), so this is a single chunk, but
+        // chunk defensively in case the target ever grows.
+        for chunk in batch.chunks(100) {
+            if let Err(e) = self
+                .api_client()
+                .publish_key_packages(
+                    chunk,
+                    "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                    &expires_at,
+                    device_uuid.as_deref(),
+                )
+                .await
+            {
                 tracing::error!(
                     error = %e,
-                    published = i,
-                    "Failed to publish key package during replenishment"
+                    batch = chunk.len(),
+                    "Failed to publish key package batch during replenishment"
                 );
                 break;
             }
