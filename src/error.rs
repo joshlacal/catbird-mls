@@ -252,9 +252,8 @@ impl MLSError {
     /// repair" banner) and historically drove `force_rejoin` epoch-inflation
     /// spirals. They MUST be skipped silently, exactly like [`Self::is_wrong_epoch`].
     pub fn is_benign_redundant_decrypt(&self) -> bool {
-        let matches = |msg: &str| {
-            msg.contains("SecretReuse") || msg.contains("CannotDecryptOwnMessage")
-        };
+        let matches =
+            |msg: &str| msg.contains("SecretReuse") || msg.contains("CannotDecryptOwnMessage");
         match self {
             Self::OpenMLS(msg) => matches(msg),
             Self::CommitProcessingFailed { message } => matches(message),
@@ -319,10 +318,8 @@ mod decrypt_class_tests {
     // produces for OpenMLS `process_message` failures (see api.rs:297).
     const SECRET_REUSE: &str =
         "process_message failed: ValidationError(UnableToDecrypt(SecretTreeError(SecretReuseError)))";
-    const OWN_MESSAGE: &str =
-        "process_message failed: ValidationError(CannotDecryptOwnMessage)";
-    const WRONG_EPOCH: &str =
-        "process_message failed: ValidationError(WrongEpoch)";
+    const OWN_MESSAGE: &str = "process_message failed: ValidationError(CannotDecryptOwnMessage)";
+    const WRONG_EPOCH: &str = "process_message failed: ValidationError(WrongEpoch)";
 
     #[test]
     fn secret_reuse_and_own_message_are_benign() {

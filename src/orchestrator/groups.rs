@@ -1017,42 +1017,53 @@ where
         //    the metadata commit already merged, so a failed avatar upload
         //    leaves the group named-but-avatarless rather than breaking it.
         if let (Some(bytes), Some(locator)) = (avatar_bytes, avatar_blob_locator) {
-            match self.mls_context().get_current_metadata(group_id_bytes.clone()) {
-                Ok(Some(info)) => {
-                    match <[u8; 32]>::try_from(info.metadata_key.as_slice()) {
-                        Ok(key) => {
-                            match crate::metadata::encrypt_avatar_blob(
-                                &key,
-                                &group_id_bytes,
-                                info.epoch,
-                                result.metadata_version,
-                                bytes,
-                            ) {
-                                Ok(encrypted_avatar) => {
-                                    if let Err(e) = self
-                                        .api_client()
-                                        .put_group_metadata_blob(
-                                            conversation_id,
-                                            &group_id_hex,
-                                            locator,
-                                            &encrypted_avatar,
-                                            "avatar",
-                                            result.metadata_version,
-                                            None,
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(error = %e, conversation_id, "Avatar blob upload failed; group named but avatar unavailable");
-                                    }
+            match self
+                .mls_context()
+                .get_current_metadata(group_id_bytes.clone())
+            {
+                Ok(Some(info)) => match <[u8; 32]>::try_from(info.metadata_key.as_slice()) {
+                    Ok(key) => {
+                        match crate::metadata::encrypt_avatar_blob(
+                            &key,
+                            &group_id_bytes,
+                            info.epoch,
+                            result.metadata_version,
+                            bytes,
+                        ) {
+                            Ok(encrypted_avatar) => {
+                                if let Err(e) = self
+                                    .api_client()
+                                    .put_group_metadata_blob(
+                                        conversation_id,
+                                        &group_id_hex,
+                                        locator,
+                                        &encrypted_avatar,
+                                        "avatar",
+                                        result.metadata_version,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(error = %e, conversation_id, "Avatar blob upload failed; group named but avatar unavailable");
                                 }
-                                Err(e) => tracing::warn!(error = %e, conversation_id, "Avatar encryption failed"),
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, conversation_id, "Avatar encryption failed")
                             }
                         }
-                        Err(_) => tracing::warn!(conversation_id, "Avatar upload skipped: metadata key wrong length"),
                     }
+                    Err(_) => tracing::warn!(
+                        conversation_id,
+                        "Avatar upload skipped: metadata key wrong length"
+                    ),
+                },
+                Ok(None) => tracing::warn!(
+                    conversation_id,
+                    "Avatar upload skipped: no current metadata after merge"
+                ),
+                Err(e) => {
+                    tracing::warn!(error = %e, conversation_id, "Avatar upload skipped: get_current_metadata failed")
                 }
-                Ok(None) => tracing::warn!(conversation_id, "Avatar upload skipped: no current metadata after merge"),
-                Err(e) => tracing::warn!(error = %e, conversation_id, "Avatar upload skipped: get_current_metadata failed"),
             }
         }
 

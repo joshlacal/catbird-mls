@@ -226,12 +226,19 @@ pub trait OrchestratorAPICallback: Send + Sync {
         commit_data: Vec<u8>,
     ) -> Result<(), OrchestratorBridgeError>;
 
+    /// Send an encrypted message. `msg_id` is the orchestrator-generated
+    /// message ID — platform implementations MUST forward it to the server
+    /// (so local storage and server agree on the ID) and MUST return the
+    /// server's `{messageId, seq, epoch}` acknowledgment. Dropping the
+    /// response (or substituting a different msg_id) leaves locally-stored
+    /// own messages with `sequenceNumber = 0`, which breaks display ordering.
     fn send_message(
         &self,
         convo_id: String,
         ciphertext: Vec<u8>,
         epoch: u64,
-    ) -> Result<(), OrchestratorBridgeError>;
+        msg_id: String,
+    ) -> Result<FFISendMessageResponse, OrchestratorBridgeError>;
 
     /// Fetch encrypted envelopes for a conversation.
     ///
@@ -524,6 +531,15 @@ pub struct FFICreateConversationResult {
 pub struct FFIAddMembersResult {
     pub success: bool,
     pub new_epoch: u64,
+}
+
+/// Server acknowledgment for a sent message. `seq` is the server-assigned
+/// conversation-global sequence number — the sole message-ordering authority.
+#[derive(uniffi::Record, Clone)]
+pub struct FFISendMessageResponse {
+    pub message_id: String,
+    pub seq: u64,
+    pub epoch: u64,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1885,15 +1901,35 @@ impl MLSAPIClient for APIAdapter {
         ciphertext: &[u8],
         epoch: u64,
     ) -> crate::orchestrator::Result<SendMessageResponse> {
-        self.0
-            .send_message(convo_id.to_string(), ciphertext.to_vec(), epoch)
-            .map_err(bridge_err)?;
-        // FFI callback doesn't return server response; return defaults.
-        // The Swift side will be updated separately to propagate seq/epoch.
-        Ok(SendMessageResponse {
-            message_id: String::new(),
-            seq: 0,
+        self.send_message_with_id(
+            convo_id,
+            ciphertext,
             epoch,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    async fn send_message_with_id(
+        &self,
+        convo_id: &str,
+        ciphertext: &[u8],
+        epoch: u64,
+        msg_id: &str,
+    ) -> crate::orchestrator::Result<SendMessageResponse> {
+        let resp = self
+            .0
+            .send_message(
+                convo_id.to_string(),
+                ciphertext.to_vec(),
+                epoch,
+                msg_id.to_string(),
+            )
+            .map_err(bridge_err)?;
+        Ok(SendMessageResponse {
+            message_id: resp.message_id,
+            seq: resp.seq,
+            epoch: resp.epoch,
         })
     }
 
@@ -3800,9 +3836,14 @@ mod tests {
             &self,
             _convo_id: String,
             _ciphertext: Vec<u8>,
-            _epoch: u64,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
+            epoch: u64,
+            msg_id: String,
+        ) -> Result<FFISendMessageResponse, OrchestratorBridgeError> {
+            Ok(FFISendMessageResponse {
+                message_id: msg_id,
+                seq: 1,
+                epoch,
+            })
         }
 
         fn get_messages(

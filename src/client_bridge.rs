@@ -457,14 +457,35 @@ impl MLSAPIClient for ClientAPIAdapter {
         ciphertext: &[u8],
         epoch: u64,
     ) -> crate::orchestrator::Result<crate::orchestrator::SendMessageResponse> {
-        self.0
-            .send_message(convo_id.to_string(), ciphertext.to_vec(), epoch)
-            .map_err(bridge_err)?;
-        // FFI callback doesn't return server response; return defaults.
-        Ok(crate::orchestrator::SendMessageResponse {
-            message_id: String::new(),
-            seq: 0,
+        self.send_message_with_id(
+            convo_id,
+            ciphertext,
             epoch,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .await
+    }
+
+    async fn send_message_with_id(
+        &self,
+        convo_id: &str,
+        ciphertext: &[u8],
+        epoch: u64,
+        msg_id: &str,
+    ) -> crate::orchestrator::Result<crate::orchestrator::SendMessageResponse> {
+        let resp = self
+            .0
+            .send_message(
+                convo_id.to_string(),
+                ciphertext.to_vec(),
+                epoch,
+                msg_id.to_string(),
+            )
+            .map_err(bridge_err)?;
+        Ok(crate::orchestrator::SendMessageResponse {
+            message_id: resp.message_id,
+            seq: resp.seq,
+            epoch: resp.epoch,
         })
     }
 
