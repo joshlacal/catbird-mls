@@ -32,7 +32,7 @@ use crate::orchestrator::types::*;
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub(crate) struct ClientStorageAdapter(pub(crate) Arc<dyn OrchestratorStorageCallback>);
-struct ClientAPIAdapter(Arc<dyn OrchestratorAPICallback>);
+pub(crate) struct ClientAPIAdapter(pub(crate) Arc<dyn OrchestratorAPICallback>);
 pub(crate) struct ClientCredentialAdapter(pub(crate) Arc<dyn OrchestratorCredentialCallback>);
 
 // -- Conversion helpers (duplicated from orchestrator_bridge for independence) --

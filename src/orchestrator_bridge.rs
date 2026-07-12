@@ -3717,6 +3717,9 @@ mod tests {
         conversation_states: Mutex<std::collections::HashMap<String, FFIConversationState>>,
         pending_messages: Mutex<std::collections::HashSet<String>>,
         receipts: Mutex<Vec<FFISequencerReceipt>>,
+        reset_payload: Mutex<Option<(String, String, i32, i64)>>,
+        quarantine_payload: Mutex<Option<(String, String, i64)>>,
+        fail_security_writes: std::sync::atomic::AtomicBool,
     }
 
     impl OrchestratorStorageCallback for RecordingStorageCallback {
@@ -3777,11 +3780,22 @@ mod tests {
         }
         fn mark_reset_pending(
             &self,
-            _conversation_id: String,
-            _new_group_id_hex: String,
-            _reset_generation: i32,
-            _notified_at_ms: i64,
+            conversation_id: String,
+            new_group_id_hex: String,
+            reset_generation: i32,
+            notified_at_ms: i64,
         ) -> Result<(), OrchestratorBridgeError> {
+            if self.fail_security_writes.load(Ordering::SeqCst) {
+                return Err(OrchestratorBridgeError::Storage {
+                    message: "injected storage failure".into(),
+                });
+            }
+            *self.reset_payload.lock().unwrap() = Some((
+                conversation_id,
+                new_group_id_hex,
+                reset_generation,
+                notified_at_ms,
+            ));
             Ok(())
         }
         fn clear_reset_pending(
@@ -3796,6 +3810,13 @@ mod tests {
             reason_tag: String,
             since_ms: i64,
         ) -> Result<(), OrchestratorBridgeError> {
+            if self.fail_security_writes.load(Ordering::SeqCst) {
+                return Err(OrchestratorBridgeError::Storage {
+                    message: "injected storage failure".into(),
+                });
+            }
+            *self.quarantine_payload.lock().unwrap() =
+                Some((conversation_id.clone(), reason_tag.clone(), since_ms));
             self.conversation_states.lock().unwrap().insert(
                 conversation_id,
                 FFIConversationState {
@@ -3878,7 +3899,7 @@ mod tests {
                 .iter()
                 .filter(|receipt| {
                     receipt.convo_id == conversation_id
-                        && since_epoch.map_or(true, |epoch| receipt.epoch >= epoch)
+                        && since_epoch.is_none_or(|epoch| receipt.epoch >= epoch)
                 })
                 .cloned()
                 .collect())
@@ -3934,6 +3955,11 @@ mod tests {
             &self,
             entry: FFIPersistedRecoveryBackoff,
         ) -> Result<(), OrchestratorBridgeError> {
+            if self.fail_security_writes.load(Ordering::SeqCst) {
+                return Err(OrchestratorBridgeError::Storage {
+                    message: "injected storage failure".into(),
+                });
+            }
             self.backoff
                 .lock()
                 .unwrap()
@@ -3951,6 +3977,11 @@ mod tests {
             &self,
             at_ms: i64,
         ) -> Result<(), OrchestratorBridgeError> {
+            if self.fail_security_writes.load(Ordering::SeqCst) {
+                return Err(OrchestratorBridgeError::Storage {
+                    message: "injected storage failure".into(),
+                });
+            }
             *self.last_global_ms.lock().unwrap() = Some(at_ms);
             Ok(())
         }
@@ -3959,6 +3990,11 @@ mod tests {
             conversation_id: String,
             group_id_hex: Option<String>,
         ) -> Result<(), OrchestratorBridgeError> {
+            if self.fail_security_writes.load(Ordering::SeqCst) {
+                return Err(OrchestratorBridgeError::Storage {
+                    message: "injected storage failure".into(),
+                });
+            }
             self.pending_deletes.lock().unwrap().insert(
                 conversation_id.clone(),
                 FFIPendingLocalDelete {
@@ -4016,6 +4052,8 @@ mod tests {
     struct WelcomeCountingApiCallback {
         current_did: String,
         welcome_calls: Arc<AtomicUsize>,
+        receipt_response: Mutex<Option<FFISequencerReceipt>>,
+        server_status: std::sync::atomic::AtomicU16,
     }
 
     impl WelcomeCountingApiCallback {
@@ -4023,6 +4061,8 @@ mod tests {
             Self {
                 current_did: current_did.to_string(),
                 welcome_calls,
+                receipt_response: Mutex::new(None),
+                server_status: std::sync::atomic::AtomicU16::new(0),
             }
         }
     }
@@ -4072,8 +4112,10 @@ mod tests {
             _commit_data: Vec<u8>,
             _welcome_data: Option<Vec<u8>>,
         ) -> Result<FFIAddMembersResult, OrchestratorBridgeError> {
-            Err(OrchestratorBridgeError::Api {
-                message: "not used by bridge joinOrRejoin test".to_string(),
+            Ok(FFIAddMembersResult {
+                success: true,
+                new_epoch: 42,
+                receipt: self.receipt_response.lock().unwrap().clone(),
             })
         }
 
@@ -4209,9 +4251,14 @@ mod tests {
 
         fn get_welcome(&self, _convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError> {
             self.welcome_calls.fetch_add(1, Ordering::SeqCst);
+            let status = self.server_status.load(Ordering::SeqCst);
             Err(OrchestratorBridgeError::ServerError {
-                status: 503,
-                body: "bridge joinOrRejoin test Welcome probe".to_string(),
+                status: if status == 0 { 503 } else { status },
+                body: if status == 409 {
+                    r#"{"error":"AlreadyBootstrapped"}"#.to_string()
+                } else {
+                    "bridge server error".to_string()
+                },
             })
         }
 
@@ -4222,8 +4269,10 @@ mod tests {
             _group_info: Option<Vec<u8>>,
             _confirmation_tag: Option<String>,
         ) -> Result<FFIProcessExternalCommitResult, OrchestratorBridgeError> {
-            Err(OrchestratorBridgeError::Api {
-                message: "not used by bridge joinOrRejoin test".to_string(),
+            Ok(FFIProcessExternalCommitResult {
+                epoch: 43,
+                rejoined_at: "2026-07-12T00:00:00Z".into(),
+                receipt: self.receipt_response.lock().unwrap().clone(),
             })
         }
 
@@ -4279,6 +4328,7 @@ mod tests {
         mls_dids: Mutex<HashMap<String, String>>,
         device_uuids: Mutex<HashMap<String, String>>,
         authorized_device_keys: Mutex<Option<Vec<Vec<u8>>>>,
+        authorized_device_error: Mutex<Option<String>>,
     }
 
     impl OrchestratorCredentialCallback for RecordingCredentialCallback {
@@ -4348,6 +4398,9 @@ mod tests {
             &self,
             _user_did: String,
         ) -> Result<Option<Vec<Vec<u8>>>, OrchestratorBridgeError> {
+            if let Some(message) = self.authorized_device_error.lock().unwrap().clone() {
+                return Err(OrchestratorBridgeError::Credential { message });
+            }
             Ok(self.authorized_device_keys.lock().unwrap().clone())
         }
     }
@@ -4396,7 +4449,7 @@ mod tests {
             *credential_callback.authorized_device_keys.lock().unwrap() =
                 Some(vec![vec![9, 8], vec![7, 6]]);
             let normal = CredentialAdapter(credential_callback.clone());
-            let client = crate::client_bridge::ClientCredentialAdapter(credential_callback);
+            let client = crate::client_bridge::ClientCredentialAdapter(credential_callback.clone());
             for adapter in [
                 &normal as &dyn CredentialStore,
                 &client as &dyn CredentialStore,
@@ -4409,6 +4462,186 @@ mod tests {
                     Some(vec![vec![9, 8], vec![7, 6]])
                 );
             }
+
+            *credential_callback.authorized_device_error.lock().unwrap() =
+                Some("keychain locked".into());
+            for adapter in [
+                &normal as &dyn CredentialStore,
+                &client as &dyn CredentialStore,
+            ] {
+                assert!(matches!(
+                    adapter.get_authorized_device_keys("did:plc:alice").await,
+                    Err(OrchestratorError::Credential(message)) if message == "keychain locked"
+                ));
+            }
+        });
+    }
+
+    fn test_receipt() -> FFISequencerReceipt {
+        FFISequencerReceipt {
+            convo_id: "convo-1".into(),
+            epoch: 42,
+            commit_hash: vec![1, 2, 3],
+            sequencer_did: "did:web:sequencer.example".into(),
+            issued_at: 1234,
+            signature: vec![4, 5, 6],
+        }
+    }
+
+    #[test]
+    fn api_adapters_preserve_receipts_for_all_commit_callbacks() {
+        crate::async_runtime::block_on(async {
+            let callback = Arc::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            ));
+            *callback.receipt_response.lock().unwrap() = Some(test_receipt());
+            let normal = APIAdapter(callback.clone());
+            let client = crate::client_bridge::ClientAPIAdapter(callback);
+
+            for adapter in [&normal as &dyn MLSAPIClient, &client as &dyn MLSAPIClient] {
+                let add = adapter
+                    .add_members("convo-1", &["did:plc:bob".into()], &[7], Some(&[8]))
+                    .await
+                    .expect("add members");
+                assert_eq!(add.receipt.expect("add receipt").signature, vec![4, 5, 6]);
+
+                let external = adapter
+                    .process_external_commit("convo-1", &[9], Some(&[10]), Some("tag"))
+                    .await
+                    .expect("external commit");
+                assert_eq!(
+                    external.receipt.expect("external receipt").commit_hash,
+                    vec![1, 2, 3]
+                );
+            }
+
+            let idempotent = normal
+                .add_members_with_idempotency(
+                    "convo-1",
+                    &["did:plc:bob".into()],
+                    &[7],
+                    Some(&[8]),
+                    "idem-1",
+                )
+                .await
+                .expect("idempotent add");
+            assert_eq!(idempotent.receipt.expect("idempotent receipt").epoch, 42);
+        });
+    }
+
+    #[test]
+    fn api_adapters_preserve_security_server_statuses_and_classifiers() {
+        crate::async_runtime::block_on(async {
+            for status in [404_u16, 409, 410, 429] {
+                let callback = Arc::new(WelcomeCountingApiCallback::new(
+                    "did:plc:alice",
+                    Arc::new(AtomicUsize::new(0)),
+                ));
+                callback.server_status.store(status, Ordering::SeqCst);
+                let normal = APIAdapter(callback.clone());
+                let client = crate::client_bridge::ClientAPIAdapter(callback);
+
+                for adapter in [&normal as &dyn MLSAPIClient, &client as &dyn MLSAPIClient] {
+                    let error = adapter
+                        .get_welcome("convo-1")
+                        .await
+                        .expect_err("configured server error");
+                    assert!(matches!(
+                        error,
+                        OrchestratorError::ServerError { status: actual, .. } if actual == status
+                    ));
+                    assert_eq!(error.is_rate_limited(), status == 429);
+                    assert_eq!(error.is_bootstrap_already_bootstrapped(), status == 409);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn client_storage_adapter_forwards_security_arguments_and_write_failures() {
+        crate::async_runtime::block_on(async {
+            let callback = Arc::new(RecordingStorageCallback::default());
+            let adapter = crate::client_bridge::ClientStorageAdapter(callback.clone());
+            adapter
+                .mark_reset_pending("convo-reset", "aabb", 7, 1234)
+                .await
+                .expect("reset payload");
+            adapter
+                .mark_quarantined("convo-quarantine", "peer_bad_commit", 2345)
+                .await
+                .expect("quarantine payload");
+            adapter
+                .set_recovery_backoff(&PersistedRecoveryBackoff {
+                    conversation_id: "convo-backoff".into(),
+                    failed_rejoin_count: 3,
+                    last_attempt_at_ms: 3456,
+                    quarantined_until_ms: Some(4567),
+                })
+                .await
+                .expect("backoff payload");
+            adapter
+                .set_last_global_rejoin_attempt_at(5678)
+                .await
+                .expect("global timestamp");
+            adapter
+                .mark_pending_local_delete("convo-delete", Some("ccdd"))
+                .await
+                .expect("pending delete");
+
+            assert_eq!(
+                callback.reset_payload.lock().unwrap().clone(),
+                Some(("convo-reset".into(), "aabb".into(), 7, 1234))
+            );
+            assert_eq!(
+                callback.quarantine_payload.lock().unwrap().clone(),
+                Some(("convo-quarantine".into(), "peer_bad_commit".into(), 2345))
+            );
+            assert_eq!(
+                callback
+                    .backoff
+                    .lock()
+                    .unwrap()
+                    .get("convo-backoff")
+                    .cloned()
+                    .expect("recorded backoff")
+                    .quarantined_until_ms,
+                Some(4567)
+            );
+            assert_eq!(*callback.last_global_ms.lock().unwrap(), Some(5678));
+            assert_eq!(
+                callback
+                    .pending_deletes
+                    .lock()
+                    .unwrap()
+                    .get("convo-delete")
+                    .cloned()
+                    .expect("recorded delete")
+                    .group_id_hex,
+                Some("ccdd".into())
+            );
+
+            callback.fail_security_writes.store(true, Ordering::SeqCst);
+            let failures = [
+                adapter.mark_reset_pending("convo", "aabb", 1, 1).await,
+                adapter
+                    .mark_quarantined("convo", "peer_bad_commit", 1)
+                    .await,
+                adapter
+                    .set_recovery_backoff(&PersistedRecoveryBackoff {
+                        conversation_id: "convo".into(),
+                        failed_rejoin_count: 1,
+                        last_attempt_at_ms: 1,
+                        quarantined_until_ms: None,
+                    })
+                    .await,
+                adapter.set_last_global_rejoin_attempt_at(1).await,
+                adapter.mark_pending_local_delete("convo", None).await,
+            ];
+            assert!(failures.into_iter().all(|result| matches!(
+                result,
+                Err(OrchestratorError::Storage(message)) if message == "injected storage failure"
+            )));
         });
     }
 
@@ -4456,6 +4689,56 @@ mod tests {
                 declared_version: 1,
             }) if capability == "sequencer_receipts"
         ));
+    }
+
+    #[test]
+    fn catbird_client_construction_and_wrong_contract_version_fail_closed() {
+        for (version, pending_messages, expected) in [
+            (1_u16, false, "pending_message_protection"),
+            (2_u16, true, "contract_version"),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mls_context = MLSContext::new(
+                dir.path()
+                    .join("client-capability.sqlite")
+                    .to_string_lossy()
+                    .to_string(),
+                "client-capability-test-key".to_string(),
+                Box::new(RecordingKeychain::default()),
+            )
+            .expect("test MLSContext");
+            let mut capabilities = full_security_capabilities();
+            capabilities.version = version;
+            capabilities.pending_message_protection = pending_messages;
+
+            let result = crate::client_bridge::CatbirdClientBridge::new(
+                "did:plc:alice".into(),
+                mls_context,
+                Box::new(RecordingStorageCallback::default()),
+                Box::new(WelcomeCountingApiCallback::new(
+                    "did:plc:alice",
+                    Arc::new(AtomicUsize::new(0)),
+                )),
+                Box::new(RecordingCredentialCallback::default()),
+                capabilities,
+                FFIOrchestratorConfig {
+                    max_devices: 5,
+                    target_key_package_count: 1,
+                    key_package_replenish_threshold: 1,
+                    sync_cooldown_seconds: 0,
+                    max_consecutive_sync_failures: 3,
+                    sync_pause_duration_seconds: 1,
+                    rejoin_cooldown_seconds: 0,
+                    max_rejoin_attempts: 3,
+                },
+            );
+
+            assert!(matches!(
+                result,
+                Err(OrchestratorBridgeError::MissingSecurityCapability { capability, .. })
+                    if capability == expected
+            ));
+        }
     }
 
     #[test]
