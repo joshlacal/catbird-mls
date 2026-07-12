@@ -209,6 +209,29 @@ mod tests {
     }
 
     #[test]
+    fn shared_error_mapper_preserves_server_404_as_typed_server_error() {
+        // Regression guard for the client_bridge/orchestrator_bridge drift that
+        // collapsed the Kotlin `ServerException(status, body)` into an untyped
+        // `Api(string)`. A 404 MUST stay a typed `ServerError { status: 404 }`
+        // so recovery.rs first-responder bootstrap (which matches on
+        // `ServerError { status: 404 | 410, .. }`) still fires instead of
+        // falling through to an endless External-Commit / POST storm.
+        let mapped = super::bridge_error_to_internal(OrchestratorBridgeError::ServerError {
+            status: 404,
+            body: "{\"error\":\"NotFound\"}".into(),
+        });
+
+        assert!(
+            matches!(
+                mapped,
+                crate::orchestrator::error::OrchestratorError::ServerError { status: 404, body }
+                    if body == "{\"error\":\"NotFound\"}"
+            ),
+            "ServerException(404) must map to typed ServerError, not Api(String)"
+        );
+    }
+
+    #[test]
     fn shared_error_mapper_preserves_specific_bridge_error_variants() {
         use crate::orchestrator::error::OrchestratorError;
 
