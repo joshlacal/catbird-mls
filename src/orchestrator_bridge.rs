@@ -3722,6 +3722,18 @@ mod tests {
         fail_security_writes: std::sync::atomic::AtomicBool,
     }
 
+    impl RecordingStorageCallback {
+        fn reject_injected_security_failure(&self) -> Result<(), OrchestratorBridgeError> {
+            if self.fail_security_writes.load(Ordering::SeqCst) {
+                Err(OrchestratorBridgeError::Storage {
+                    message: "injected storage failure".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     impl OrchestratorStorageCallback for RecordingStorageCallback {
         fn ensure_conversation_exists(
             &self,
@@ -3802,6 +3814,7 @@ mod tests {
             &self,
             _conversation_id: String,
         ) -> Result<(), OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             Ok(())
         }
         fn mark_quarantined(
@@ -3831,6 +3844,7 @@ mod tests {
             Ok(())
         }
         fn clear_quarantine(&self, conversation_id: String) -> Result<(), OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             self.conversation_states
                 .lock()
                 .unwrap()
@@ -3871,6 +3885,7 @@ mod tests {
             _conversation_id: String,
             message_id: String,
         ) -> Result<(), OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             self.pending_messages.lock().unwrap().insert(message_id);
             Ok(())
         }
@@ -3878,12 +3893,14 @@ mod tests {
             &self,
             message_id: String,
         ) -> Result<bool, OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             Ok(self.pending_messages.lock().unwrap().remove(&message_id))
         }
         fn store_sequencer_receipt(
             &self,
             receipt: FFISequencerReceipt,
         ) -> Result<(), OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             self.receipts.lock().unwrap().push(receipt);
             Ok(())
         }
@@ -3892,6 +3909,7 @@ mod tests {
             conversation_id: String,
             since_epoch: Option<i32>,
         ) -> Result<Vec<FFISequencerReceipt>, OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             Ok(self
                 .receipts
                 .lock()
@@ -3908,6 +3926,7 @@ mod tests {
             &self,
             conversation_id: String,
         ) -> Result<(), OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             self.receipts
                 .lock()
                 .unwrap()
@@ -3970,6 +3989,7 @@ mod tests {
             &self,
             conversation_id: String,
         ) -> Result<(), OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             self.backoff.lock().unwrap().remove(&conversation_id);
             Ok(())
         }
@@ -4008,6 +4028,7 @@ mod tests {
             &self,
             conversation_id: String,
         ) -> Result<(), OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
             self.pending_deletes
                 .lock()
                 .unwrap()
@@ -4643,6 +4664,144 @@ mod tests {
                 Err(OrchestratorError::Storage(message)) if message == "injected storage failure"
             )));
         });
+    }
+
+    #[test]
+    fn both_storage_adapters_decode_complete_and_reject_malformed_restart_state() {
+        crate::async_runtime::block_on(async {
+            let callback = Arc::new(RecordingStorageCallback::default());
+            let adapters: Vec<Box<dyn MLSStorageBackend>> = vec![
+                Box::new(StorageAdapter(callback.clone())),
+                Box::new(crate::client_bridge::ClientStorageAdapter(callback.clone())),
+            ];
+
+            callback.conversation_states.lock().unwrap().insert(
+                "reset".into(),
+                FFIConversationState {
+                    state: "reset_pending".into(),
+                    new_group_id: Some("aabb".into()),
+                    reset_generation: Some(9),
+                    notified_at_ms: Some(1234),
+                    quarantine_reason: None,
+                    quarantined_since_ms: None,
+                },
+            );
+            callback.conversation_states.lock().unwrap().insert(
+                "quarantine".into(),
+                FFIConversationState {
+                    state: "quarantined".into(),
+                    new_group_id: None,
+                    reset_generation: None,
+                    notified_at_ms: None,
+                    quarantine_reason: Some("multi_peer_bad_commits".into()),
+                    quarantined_since_ms: Some(5678),
+                },
+            );
+
+            for adapter in &adapters {
+                assert_eq!(
+                    adapter.get_conversation_state("reset").await.unwrap(),
+                    Some(ConversationState::ResetPending {
+                        new_group_id: "aabb".into(),
+                        reset_generation: 9,
+                        notified_at_ms: 1234,
+                    })
+                );
+                assert_eq!(
+                    adapter.get_conversation_state("quarantine").await.unwrap(),
+                    Some(ConversationState::Quarantined {
+                        reason: crate::orchestrator::types::QuarantineReason::MultiPeerBadCommits,
+                        since_ms: 5678,
+                    })
+                );
+            }
+
+            let malformed = [
+                FFIConversationState {
+                    state: "reset_pending".into(),
+                    new_group_id: None,
+                    reset_generation: Some(1),
+                    notified_at_ms: Some(1),
+                    quarantine_reason: None,
+                    quarantined_since_ms: None,
+                },
+                FFIConversationState {
+                    state: "quarantined".into(),
+                    new_group_id: None,
+                    reset_generation: None,
+                    notified_at_ms: None,
+                    quarantine_reason: None,
+                    quarantined_since_ms: Some(1),
+                },
+                FFIConversationState {
+                    state: "unknown".into(),
+                    new_group_id: None,
+                    reset_generation: None,
+                    notified_at_ms: None,
+                    quarantine_reason: None,
+                    quarantined_since_ms: None,
+                },
+            ];
+            for (index, state) in malformed.into_iter().enumerate() {
+                let key = format!("malformed-{index}");
+                callback
+                    .conversation_states
+                    .lock()
+                    .unwrap()
+                    .insert(key.clone(), state);
+                for adapter in &adapters {
+                    assert!(matches!(
+                        adapter.get_conversation_state(&key).await,
+                        Err(OrchestratorError::Storage(_))
+                    ));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn both_storage_adapters_propagate_pending_receipt_and_clear_failures() {
+        crate::async_runtime::block_on(async {
+            let callback = Arc::new(RecordingStorageCallback::default());
+            callback.fail_security_writes.store(true, Ordering::SeqCst);
+            let adapters: Vec<Box<dyn MLSStorageBackend>> = vec![
+                Box::new(StorageAdapter(callback.clone())),
+                Box::new(crate::client_bridge::ClientStorageAdapter(callback)),
+            ];
+            let receipt = crate::orchestrator::types::SequencerReceipt {
+                convo_id: "convo".into(),
+                epoch: 1,
+                commit_hash: vec![1],
+                sequencer_did: "did:web:sequencer".into(),
+                issued_at: 1,
+                signature: vec![2],
+            };
+
+            for adapter in adapters {
+                assert_storage_failure(adapter.store_pending_message("convo", "message").await);
+                assert!(matches!(
+                    adapter.remove_pending_message("message").await,
+                    Err(OrchestratorError::Storage(_))
+                ));
+                assert_storage_failure(adapter.store_sequencer_receipt(&receipt).await);
+                assert!(matches!(
+                    adapter.get_sequencer_receipts("convo", None).await,
+                    Err(OrchestratorError::Storage(_))
+                ));
+                assert_storage_failure(adapter.clear_sequencer_receipts("convo").await);
+                assert_storage_failure(adapter.clear_reset_pending("convo").await);
+                assert_storage_failure(adapter.clear_quarantine("convo").await);
+                assert_storage_failure(adapter.clear_recovery_backoff("convo").await);
+                assert_storage_failure(adapter.clear_pending_local_delete("convo").await);
+            }
+        });
+    }
+
+    fn assert_storage_failure(result: crate::orchestrator::Result<()>) {
+        assert!(matches!(
+            result,
+            Err(OrchestratorError::Storage(message)) if message == "injected storage failure"
+        ));
     }
 
     #[test]
