@@ -31,31 +31,14 @@ use crate::orchestrator::types::*;
 // but since those are private, we replicate the minimal set needed.
 // ═══════════════════════════════════════════════════════════════════════════
 
-struct ClientStorageAdapter(Arc<dyn OrchestratorStorageCallback>);
+pub(crate) struct ClientStorageAdapter(pub(crate) Arc<dyn OrchestratorStorageCallback>);
 struct ClientAPIAdapter(Arc<dyn OrchestratorAPICallback>);
-struct ClientCredentialAdapter(Arc<dyn OrchestratorCredentialCallback>);
+pub(crate) struct ClientCredentialAdapter(pub(crate) Arc<dyn OrchestratorCredentialCallback>);
 
 // -- Conversion helpers (duplicated from orchestrator_bridge for independence) --
 
 fn bridge_err(e: OrchestratorBridgeError) -> crate::orchestrator::error::OrchestratorError {
-    match e {
-        OrchestratorBridgeError::Storage { message } => {
-            crate::orchestrator::error::OrchestratorError::Storage(message)
-        }
-        OrchestratorBridgeError::Api { message } => {
-            crate::orchestrator::error::OrchestratorError::Api(message)
-        }
-        OrchestratorBridgeError::Credential { message } => {
-            crate::orchestrator::error::OrchestratorError::Credential(message)
-        }
-        OrchestratorBridgeError::NotAuthenticated => {
-            crate::orchestrator::error::OrchestratorError::NotAuthenticated
-        }
-        OrchestratorBridgeError::ShuttingDown => {
-            crate::orchestrator::error::OrchestratorError::ShuttingDown
-        }
-        other => crate::orchestrator::error::OrchestratorError::Api(other.to_string()),
-    }
+    crate::orchestrator_bridge::bridge_mappers::bridge_error_to_internal(e)
 }
 
 fn ffi_to_convo_view(ffi: &crate::orchestrator_bridge::FFIConversationView) -> ConversationView {
@@ -252,6 +235,61 @@ impl MLSStorageBackend for ClientStorageAdapter {
             .map_err(bridge_err)
     }
 
+    async fn get_conversation_state(
+        &self,
+        conversation_id: &str,
+    ) -> crate::orchestrator::Result<Option<ConversationState>> {
+        self.0
+            .get_conversation_state(conversation_id.to_string())
+            .map_err(bridge_err)?
+            .map(crate::orchestrator_bridge::bridge_mappers::ffi_conversation_state_to_internal)
+            .transpose()
+    }
+
+    async fn mark_reset_pending(
+        &self,
+        conversation_id: &str,
+        new_group_id_hex: &str,
+        reset_generation: i32,
+        notified_at_ms: i64,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .mark_reset_pending(
+                conversation_id.to_string(),
+                new_group_id_hex.to_string(),
+                reset_generation,
+                notified_at_ms,
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn clear_reset_pending(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
+        self.0
+            .clear_reset_pending(conversation_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn mark_quarantined(
+        &self,
+        conversation_id: &str,
+        reason_tag: &str,
+        since_ms: i64,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .mark_quarantined(
+                conversation_id.to_string(),
+                reason_tag.to_string(),
+                since_ms,
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn clear_quarantine(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
+        self.0
+            .clear_quarantine(conversation_id.to_string())
+            .map_err(bridge_err)
+    }
+
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
         self.0
             .mark_needs_rejoin(conversation_id.to_string())
@@ -292,6 +330,170 @@ impl MLSStorageBackend for ClientStorageAdapter {
         self.0
             .message_exists(message_id.to_string())
             .map_err(bridge_err)
+    }
+
+    async fn store_pending_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .store_pending_message(conversation_id.to_string(), message_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn remove_pending_message(&self, message_id: &str) -> crate::orchestrator::Result<bool> {
+        self.0
+            .remove_pending_message(message_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn store_sequencer_receipt(
+        &self,
+        receipt: &SequencerReceipt,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .store_sequencer_receipt(crate::orchestrator_bridge::bridge_mappers::receipt_to_ffi(
+                receipt.clone(),
+            ))
+            .map_err(bridge_err)
+    }
+
+    async fn get_sequencer_receipts(
+        &self,
+        convo_id: &str,
+        since_epoch: Option<i32>,
+    ) -> crate::orchestrator::Result<Vec<SequencerReceipt>> {
+        self.0
+            .get_sequencer_receipts(convo_id.to_string(), since_epoch)
+            .map(|receipts| {
+                receipts
+                    .into_iter()
+                    .map(crate::orchestrator_bridge::bridge_mappers::ffi_receipt_to_internal)
+                    .collect()
+            })
+            .map_err(bridge_err)
+    }
+
+    async fn clear_sequencer_receipts(
+        &self,
+        conversation_id: &str,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .clear_sequencer_receipts(conversation_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn get_recovery_state(&self) -> crate::orchestrator::Result<PersistedRecoveryState> {
+        self.0
+            .get_recovery_state()
+            .map(|ffi| PersistedRecoveryState {
+                entries: ffi
+                    .entries
+                    .into_iter()
+                    .map(|entry| PersistedRecoveryBackoff {
+                        conversation_id: entry.conversation_id,
+                        failed_rejoin_count: entry.failed_rejoin_count,
+                        last_attempt_at_ms: entry.last_attempt_at_ms,
+                        quarantined_until_ms: entry.quarantined_until_ms,
+                    })
+                    .collect(),
+                last_global_rejoin_attempt_at_ms: ffi.last_global_rejoin_attempt_at_ms,
+            })
+            .map_err(bridge_err)
+    }
+
+    async fn set_recovery_backoff(
+        &self,
+        entry: &PersistedRecoveryBackoff,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .set_recovery_backoff(crate::orchestrator_bridge::FFIPersistedRecoveryBackoff {
+                conversation_id: entry.conversation_id.clone(),
+                failed_rejoin_count: entry.failed_rejoin_count,
+                last_attempt_at_ms: entry.last_attempt_at_ms,
+                quarantined_until_ms: entry.quarantined_until_ms,
+            })
+            .map_err(bridge_err)
+    }
+
+    async fn clear_recovery_backoff(
+        &self,
+        conversation_id: &str,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .clear_recovery_backoff(conversation_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn set_last_global_rejoin_attempt_at(
+        &self,
+        at_ms: i64,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .set_last_global_rejoin_attempt_at(at_ms)
+            .map_err(bridge_err)
+    }
+
+    async fn mark_pending_local_delete(
+        &self,
+        conversation_id: &str,
+        group_id_hex: Option<&str>,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .mark_pending_local_delete(
+                conversation_id.to_string(),
+                group_id_hex.map(str::to_string),
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn clear_pending_local_delete(
+        &self,
+        conversation_id: &str,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .clear_pending_local_delete(conversation_id.to_string())
+            .map_err(bridge_err)
+    }
+
+    async fn list_pending_local_deletes(
+        &self,
+    ) -> crate::orchestrator::Result<Vec<PendingLocalDelete>> {
+        self.0
+            .list_pending_local_deletes()
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|record| PendingLocalDelete {
+                        conversation_id: record.conversation_id,
+                        group_id_hex: record.group_id_hex,
+                    })
+                    .collect()
+            })
+            .map_err(bridge_err)
+    }
+
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &[
+            "get_conversation_state",
+            "mark_reset_pending",
+            "clear_reset_pending",
+            "mark_quarantined",
+            "clear_quarantine",
+            "store_pending_message",
+            "remove_pending_message",
+            "store_sequencer_receipt",
+            "get_sequencer_receipts",
+            "clear_sequencer_receipts",
+            "get_recovery_state",
+            "set_recovery_backoff",
+            "clear_recovery_backoff",
+            "set_last_global_rejoin_attempt_at",
+            "mark_pending_local_delete",
+            "clear_pending_local_delete",
+            "list_pending_local_deletes",
+        ]
     }
 
     async fn get_sync_cursor(&self, user_did: &str) -> crate::orchestrator::Result<SyncCursor> {
@@ -431,7 +633,9 @@ impl MLSAPIClient for ClientAPIAdapter {
             .map(|ffi| AddMembersServerResult {
                 success: ffi.success,
                 new_epoch: ffi.new_epoch,
-                receipt: None,
+                receipt: ffi
+                    .receipt
+                    .map(crate::orchestrator_bridge::bridge_mappers::ffi_receipt_to_internal),
             })
             .map_err(bridge_err)
     }
@@ -718,7 +922,9 @@ impl MLSAPIClient for ClientAPIAdapter {
         Ok(crate::orchestrator::ProcessExternalCommitResult {
             epoch: result.epoch,
             rejoined_at: result.rejoined_at,
-            receipt: None,
+            receipt: result
+                .receipt
+                .map(crate::orchestrator_bridge::bridge_mappers::ffi_receipt_to_internal),
         })
     }
 }
@@ -793,6 +999,15 @@ impl CredentialStore for ClientCredentialAdapter {
     async fn clear_all(&self, user_did: &str) -> crate::orchestrator::Result<()> {
         self.0.clear_all(user_did.to_string()).map_err(bridge_err)
     }
+
+    async fn get_authorized_device_keys(
+        &self,
+        user_did: &str,
+    ) -> crate::orchestrator::Result<Option<Vec<Vec<u8>>>> {
+        self.0
+            .get_authorized_device_keys(user_did.to_string())
+            .map_err(bridge_err)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -837,8 +1052,10 @@ impl CatbirdClientBridge {
         storage: Box<dyn OrchestratorStorageCallback>,
         api_client: Box<dyn OrchestratorAPICallback>,
         credentials: Box<dyn OrchestratorCredentialCallback>,
+        capabilities: crate::orchestrator_bridge::SecurityStorageCapabilities,
         config: FFIOrchestratorConfig,
     ) -> Result<Arc<Self>, OrchestratorBridgeError> {
+        crate::orchestrator_bridge::bridge_mappers::validate_security_capabilities(&capabilities)?;
         let orch_config = OrchestratorConfig {
             max_devices: config.max_devices,
             target_key_package_count: config.target_key_package_count,
