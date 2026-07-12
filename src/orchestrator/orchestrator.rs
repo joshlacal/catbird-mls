@@ -351,11 +351,12 @@ where
                         }
                         Ok(None) => {}
                         Err(e) => {
-                            tracing::warn!(
+                            tracing::error!(
                                 convo_id = %convo.conversation_id,
                                 error = ?e,
-                                "Failed to rehydrate conversation state"
+                                "Failed to rehydrate security-relevant conversation state; aborting initialization"
                             );
+                            return Err(e);
                         }
                     }
                 }

@@ -130,6 +130,31 @@ fn random_group_id_hex() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn initialize_fails_closed_on_malformed_persisted_security_state() {
+    let fixture = StartupReconcileFixture::new();
+    fixture
+        .persist_missing_group(
+            "convo-malformed",
+            ConversationState::Active,
+            &random_group_id_hex(),
+        )
+        .await;
+    fixture.storage.fail_next_get_conversation_state();
+
+    let error = fixture
+        .engine
+        .initialize_user(fixture.did)
+        .expect_err("malformed reset/quarantine state must abort initialization");
+
+    assert!(
+        error
+            .to_string()
+            .contains("malformed persisted reset/quarantine sidecar"),
+        "initialization must expose the malformed security state: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn startup_reconcile_marks_missing_groups_for_rejoin_without_deleting_healthy_groups() {
     let fixture = StartupReconcileFixture::new();
     let healthy_group_id = fixture

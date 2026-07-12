@@ -82,6 +82,7 @@ struct Inner {
     /// One-shot failure injections for the quarantine persist escalation
     /// tests (E7 follow-up R-2).
     fail_next_set_conversation_state: bool,
+    fail_next_get_conversation_state: bool,
     fail_next_mark_quarantined: bool,
     fail_next_clear_quarantine: bool,
     /// Stored sequencer receipts (WS-3 equivocation detection tests).
@@ -315,6 +316,12 @@ impl MockStorage {
     #[allow(dead_code)]
     pub fn fail_next_set_conversation_state(&self) {
         self.inner.lock().unwrap().fail_next_set_conversation_state = true;
+    }
+
+    /// Simulate a malformed persisted reset/quarantine sidecar that cannot be
+    /// decoded by the platform storage adapter during startup hydration.
+    pub fn fail_next_get_conversation_state(&self) {
+        self.inner.lock().unwrap().fail_next_get_conversation_state = true;
     }
 
     /// Make the next `mark_quarantined` call fail once.
@@ -661,6 +668,12 @@ impl MLSStorageBackend for MockStorage {
     ) -> Result<Option<ConversationState>> {
         let mut inner = self.inner.lock().unwrap();
         inner.startup_probe_counts.get_conversation_state += 1;
+        if inner.fail_next_get_conversation_state {
+            inner.fail_next_get_conversation_state = false;
+            return Err(OrchestratorError::Storage(
+                "malformed persisted reset/quarantine sidecar".to_string(),
+            ));
+        }
         // Prefer the explicit reset_pending row when present so the rehydrated
         // state carries the payload regardless of whether
         // `set_conversation_state` was also called (matches the iOS/GRDB

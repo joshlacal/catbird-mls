@@ -121,6 +121,26 @@ pub(crate) fn bridge_error_to_internal(error: OrchestratorBridgeError) -> Orches
         OrchestratorBridgeError::ServerError { status, body } => {
             OrchestratorError::ServerError { status, body }
         }
+        OrchestratorBridgeError::ConversationNotFound { id } => {
+            OrchestratorError::ConversationNotFound(id)
+        }
+        OrchestratorBridgeError::EpochMismatch { local, remote } => {
+            OrchestratorError::EpochMismatch { local, remote }
+        }
+        OrchestratorBridgeError::DeviceLimitReached => {
+            // The FFI variant predates the internal diagnostic fields. Keep
+            // the semantic error class instead of flattening it into Api.
+            OrchestratorError::DeviceLimitReached { current: 0, max: 0 }
+        }
+        OrchestratorBridgeError::RecoveryFailed { message } => {
+            OrchestratorError::RecoveryFailed(message)
+        }
+        OrchestratorBridgeError::InvalidInput { message } => {
+            OrchestratorError::InvalidInput(message)
+        }
+        OrchestratorBridgeError::ConversationQuarantined { convo_id, reason } => {
+            OrchestratorError::ConversationQuarantined { convo_id, reason }
+        }
         other => OrchestratorError::Api(other.to_string()),
     }
 }
@@ -185,6 +205,79 @@ mod tests {
             mapped,
             crate::orchestrator::error::OrchestratorError::ServerError { status: 429, body }
                 if body == "retry later"
+        ));
+    }
+
+    #[test]
+    fn shared_error_mapper_preserves_specific_bridge_error_variants() {
+        use crate::orchestrator::error::OrchestratorError;
+
+        let cases = [
+            (
+                OrchestratorBridgeError::ConversationNotFound { id: "c1".into() },
+                "conversation-not-found",
+            ),
+            (
+                OrchestratorBridgeError::EpochMismatch {
+                    local: 7,
+                    remote: 9,
+                },
+                "epoch-mismatch",
+            ),
+            (
+                OrchestratorBridgeError::RecoveryFailed {
+                    message: "reset rejected".into(),
+                },
+                "recovery-failed",
+            ),
+            (
+                OrchestratorBridgeError::InvalidInput {
+                    message: "bad group id".into(),
+                },
+                "invalid-input",
+            ),
+            (
+                OrchestratorBridgeError::ConversationQuarantined {
+                    convo_id: "c2".into(),
+                    reason: "peer_bad_commit".into(),
+                },
+                "conversation-quarantined",
+            ),
+        ];
+
+        for (bridge, expected) in cases {
+            let internal = super::bridge_error_to_internal(bridge);
+            let actual = match internal {
+                OrchestratorError::ConversationNotFound(id) if id == "c1" => {
+                    "conversation-not-found"
+                }
+                OrchestratorError::EpochMismatch {
+                    local: 7,
+                    remote: 9,
+                } => "epoch-mismatch",
+                OrchestratorError::RecoveryFailed(message) if message == "reset rejected" => {
+                    "recovery-failed"
+                }
+                OrchestratorError::InvalidInput(message) if message == "bad group id" => {
+                    "invalid-input"
+                }
+                OrchestratorError::ConversationQuarantined { convo_id, reason }
+                    if convo_id == "c2" && reason == "peer_bad_commit" =>
+                {
+                    "conversation-quarantined"
+                }
+                other => panic!("specific bridge error was flattened: {other:?}"),
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn shared_error_mapper_preserves_device_limit_error_class() {
+        let mapped = super::bridge_error_to_internal(OrchestratorBridgeError::DeviceLimitReached);
+        assert!(matches!(
+            mapped,
+            crate::orchestrator::error::OrchestratorError::DeviceLimitReached { .. }
         ));
     }
 }
