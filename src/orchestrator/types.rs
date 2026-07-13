@@ -888,6 +888,8 @@ impl MLSMessagePayload {
 pub struct SequencerReceipt {
     pub convo_id: String,
     pub epoch: i32,
+    /// Lease term of the sequencer that issued this receipt.
+    pub sequencer_term: u64,
     /// SHA-256 hash of the commit ciphertext.
     pub commit_hash: Vec<u8>,
     /// DID of the sequencer that issued this receipt.
@@ -905,11 +907,12 @@ impl SequencerReceipt {
     /// signature. Returns `true` if the signature is valid.
     pub fn verify(&self, verifying_key: &VerifyingKey) -> bool {
         // Same canonical bytes format as mls-ds:
-        // "CATBIRD-RECEIPT-V1:" || len(convo_id) || convo_id || epoch || commit_hash || len(sequencer_did) || sequencer_did || issued_at
+        // "CATBIRD-RECEIPT-V1:" || len(convo_id) || convo_id || epoch || sequencer_term || commit_hash || len(sequencer_did) || sequencer_did || issued_at
         let mut canonical = Vec::with_capacity(
             19 + 4
                 + self.convo_id.len()
                 + 4
+                + 8
                 + self.commit_hash.len()
                 + 4
                 + self.sequencer_did.len()
@@ -919,6 +922,7 @@ impl SequencerReceipt {
         canonical.extend_from_slice(&(self.convo_id.len() as u32).to_le_bytes());
         canonical.extend_from_slice(self.convo_id.as_bytes());
         canonical.extend_from_slice(&self.epoch.to_be_bytes());
+        canonical.extend_from_slice(&self.sequencer_term.to_be_bytes());
         canonical.extend_from_slice(&self.commit_hash);
         canonical.extend_from_slice(&(self.sequencer_did.len() as u32).to_le_bytes());
         canonical.extend_from_slice(self.sequencer_did.as_bytes());
@@ -942,6 +946,52 @@ impl SequencerReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequencer_receipt_verification_binds_server_canonical_term() {
+        use p256::ecdsa::{signature::Signer, SigningKey};
+
+        let signing_key = SigningKey::from_slice(&[7_u8; 32]).expect("valid fixed test key");
+        let convo_id = "convo-term-bound";
+        let epoch = 42_i32;
+        let sequencer_term = 9_u64;
+        let commit_hash = vec![0xAB; 32];
+        let sequencer_did = "did:web:sequencer.example";
+        let issued_at = 1_725_000_000_i64;
+
+        // Independently reproduce the mls-ds receipt signer contract:
+        // domain || len(convo) || convo || epoch || term || hash ||
+        // len(sequencer DID) || sequencer DID || issued-at.
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(b"CATBIRD-RECEIPT-V1:");
+        canonical.extend_from_slice(&(convo_id.len() as u32).to_le_bytes());
+        canonical.extend_from_slice(convo_id.as_bytes());
+        canonical.extend_from_slice(&epoch.to_be_bytes());
+        canonical.extend_from_slice(&sequencer_term.to_be_bytes());
+        canonical.extend_from_slice(&commit_hash);
+        canonical.extend_from_slice(&(sequencer_did.len() as u32).to_le_bytes());
+        canonical.extend_from_slice(sequencer_did.as_bytes());
+        canonical.extend_from_slice(&issued_at.to_be_bytes());
+        let signature: p256::ecdsa::Signature = signing_key.sign(&canonical);
+
+        let mut receipt = SequencerReceipt {
+            convo_id: convo_id.into(),
+            epoch,
+            sequencer_term,
+            commit_hash,
+            sequencer_did: sequencer_did.into(),
+            issued_at,
+            signature: signature.to_bytes().to_vec(),
+        };
+
+        assert!(receipt.verify(signing_key.verifying_key()));
+
+        receipt.sequencer_term += 1;
+        assert!(
+            !receipt.verify(signing_key.verifying_key()),
+            "changing only the sequencer term must invalidate the server signature"
+        );
+    }
 
     #[test]
     fn payload_json_matches_ios_format() {

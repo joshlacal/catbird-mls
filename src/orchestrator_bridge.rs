@@ -593,6 +593,7 @@ pub struct SecurityStorageCapabilities {
 pub struct FFISequencerReceipt {
     pub convo_id: String,
     pub epoch: i32,
+    pub sequencer_term: u64,
     pub commit_hash: Vec<u8>,
     pub sequencer_did: String,
     pub issued_at: i64,
@@ -4433,6 +4434,7 @@ mod tests {
             let receipt = crate::orchestrator::types::SequencerReceipt {
                 convo_id: "convo-1".into(),
                 epoch: 7,
+                sequencer_term: 3,
                 commit_hash: vec![1, 2],
                 sequencer_did: "did:web:sequencer.example".into(),
                 issued_at: 1234,
@@ -4456,14 +4458,12 @@ mod tests {
                     .store_sequencer_receipt(&receipt)
                     .await
                     .expect("store receipt");
-                assert_eq!(
-                    adapter
-                        .get_sequencer_receipts("convo-1", Some(7))
-                        .await
-                        .expect("get receipts")[0]
-                        .signature,
-                    vec![3, 4]
-                );
+                let stored = adapter
+                    .get_sequencer_receipts("convo-1", Some(7))
+                    .await
+                    .expect("get receipts");
+                assert_eq!(stored[0].sequencer_term, 3);
+                assert_eq!(stored[0].signature, vec![3, 4]);
             }
 
             let credential_callback = Arc::new(RecordingCredentialCallback::default());
@@ -4502,6 +4502,7 @@ mod tests {
         FFISequencerReceipt {
             convo_id: "convo-1".into(),
             epoch: 42,
+            sequencer_term: 9,
             commit_hash: vec![1, 2, 3],
             sequencer_did: "did:web:sequencer.example".into(),
             issued_at: 1234,
@@ -4525,16 +4526,17 @@ mod tests {
                     .add_members("convo-1", &["did:plc:bob".into()], &[7], Some(&[8]))
                     .await
                     .expect("add members");
-                assert_eq!(add.receipt.expect("add receipt").signature, vec![4, 5, 6]);
+                let add_receipt = add.receipt.expect("add receipt");
+                assert_eq!(add_receipt.sequencer_term, 9);
+                assert_eq!(add_receipt.signature, vec![4, 5, 6]);
 
                 let external = adapter
                     .process_external_commit("convo-1", &[9], Some(&[10]), Some("tag"))
                     .await
                     .expect("external commit");
-                assert_eq!(
-                    external.receipt.expect("external receipt").commit_hash,
-                    vec![1, 2, 3]
-                );
+                let external_receipt = external.receipt.expect("external receipt");
+                assert_eq!(external_receipt.sequencer_term, 9);
+                assert_eq!(external_receipt.commit_hash, vec![1, 2, 3]);
             }
 
             let idempotent = normal
@@ -4547,7 +4549,9 @@ mod tests {
                 )
                 .await
                 .expect("idempotent add");
-            assert_eq!(idempotent.receipt.expect("idempotent receipt").epoch, 42);
+            let idempotent_receipt = idempotent.receipt.expect("idempotent receipt");
+            assert_eq!(idempotent_receipt.epoch, 42);
+            assert_eq!(idempotent_receipt.sequencer_term, 9);
         });
     }
 
@@ -4771,6 +4775,7 @@ mod tests {
             let receipt = crate::orchestrator::types::SequencerReceipt {
                 convo_id: "convo".into(),
                 epoch: 1,
+                sequencer_term: 2,
                 commit_hash: vec![1],
                 sequencer_did: "did:web:sequencer".into(),
                 issued_at: 1,

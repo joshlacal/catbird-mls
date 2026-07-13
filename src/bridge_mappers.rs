@@ -48,6 +48,7 @@ pub(crate) fn ffi_receipt_to_internal(receipt: FFISequencerReceipt) -> Sequencer
     SequencerReceipt {
         convo_id: receipt.convo_id,
         epoch: receipt.epoch,
+        sequencer_term: receipt.sequencer_term,
         commit_hash: receipt.commit_hash,
         sequencer_did: receipt.sequencer_did,
         issued_at: receipt.issued_at,
@@ -59,6 +60,7 @@ pub(crate) fn receipt_to_ffi(receipt: SequencerReceipt) -> FFISequencerReceipt {
     FFISequencerReceipt {
         convo_id: receipt.convo_id,
         epoch: receipt.epoch,
+        sequencer_term: receipt.sequencer_term,
         commit_hash: receipt.commit_hash,
         sequencer_did: receipt.sequencer_did,
         issued_at: receipt.issued_at,
@@ -182,6 +184,7 @@ mod tests {
         let ffi = FFISequencerReceipt {
             convo_id: "convo-1".into(),
             epoch: 42,
+            sequencer_term: 9,
             commit_hash: vec![1, 2, 3],
             sequencer_did: "did:web:sequencer.example".into(),
             issued_at: 1_725_000_000,
@@ -192,6 +195,7 @@ mod tests {
         let round_trip = super::receipt_to_ffi(internal);
 
         assert_eq!(round_trip, ffi);
+        assert_eq!(round_trip.sequencer_term, 9);
     }
 
     #[test]
