@@ -13,9 +13,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-// Import StorageId to wrap public keys for storage
-use openmls_basic_credential::StorageId;
-
 use crate::error::MLSError;
 use crate::mls_context::MLSContext as MLSContextInner;
 use crate::orchestrator::mls_provider::MlsCryptoContext;
@@ -1997,22 +1994,26 @@ impl MLSContext {
         let signer: SignatureKeyPair =
             serde_json::from_slice(&key_data).map_err(|_| MLSError::SerializationError)?;
 
-        // Store in provider (HybridStorage will route to Keychain)
-        // We need to extract the public key to use as the key
-        // Assuming SignatureKeyPair has a .public() method or similar
-        // OpenMLS SignatureKeyPair usually has .public() returning SignaturePublicKey
-
-        // Use the provider's write method
-        // Wrap the public key bytes in StorageId which implements SignaturePublicKey trait
-        let storage_id = StorageId::from(signer.public().to_vec());
-        inner
-            .provider
-            .storage()
-            .write_signature_key_pair(&storage_id, &signer)
+        // Use OpenMLS's canonical storage key encoding. Writing manually with
+        // a `StorageId` serializes a different lookup key than
+        // `SignatureKeyPair::read` uses for the raw Ed25519 public key, causing
+        // imports to report success while leaving the signer unreadable.
+        signer
+            .store(inner.provider.storage())
             .map_err(|_| MLSError::StorageFailed)?;
 
-        // Register the signer mapping
         let public_key = signer.public().to_vec();
+        if SignatureKeyPair::read(
+            inner.provider.storage(),
+            &public_key,
+            SignatureScheme::ED25519,
+        )
+        .is_none()
+        {
+            return Err(MLSError::StorageFailed);
+        }
+
+        // Register the signer mapping
         inner.register_signer(&identity, public_key)?;
 
         Ok(())

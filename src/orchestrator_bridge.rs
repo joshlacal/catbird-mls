@@ -2479,9 +2479,73 @@ pub struct OrchestratorBridge {
     inner: Arc<ConcreteOrchestrator>,
     engine: Arc<ConcreteEngine>,
     lifecycle_transition: std::sync::Mutex<()>,
+    user_lifecycle_generation: std::sync::atomic::AtomicU64,
+    user_lifecycle_transitions: std::sync::atomic::AtomicUsize,
+}
+
+struct UserLifecycleTransition<'a> {
+    bridge: &'a OrchestratorBridge,
+}
+
+impl Drop for UserLifecycleTransition<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        self.bridge
+            .user_lifecycle_generation
+            .fetch_add(1, Ordering::SeqCst);
+        self.bridge
+            .user_lifecycle_transitions
+            .fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl OrchestratorBridge {
+    fn begin_user_lifecycle_transition(&self) -> UserLifecycleTransition<'_> {
+        use std::sync::atomic::Ordering;
+
+        self.user_lifecycle_transitions
+            .fetch_add(1, Ordering::SeqCst);
+        self.user_lifecycle_generation
+            .fetch_add(1, Ordering::SeqCst);
+        UserLifecycleTransition { bridge: self }
+    }
+
+    fn stable_user_lifecycle_generation(&self) -> Result<u64, OrchestratorBridgeError> {
+        use std::sync::atomic::Ordering;
+
+        if self.user_lifecycle_transitions.load(Ordering::SeqCst) != 0 {
+            return Err(OrchestratorBridgeError::NotAuthenticated);
+        }
+        let generation = self.user_lifecycle_generation.load(Ordering::SeqCst);
+        if self.user_lifecycle_transitions.load(Ordering::SeqCst) != 0 {
+            return Err(OrchestratorBridgeError::NotAuthenticated);
+        }
+        Ok(generation)
+    }
+
+    fn require_stable_user_lifecycle(
+        &self,
+        expected_generation: u64,
+        expected_user_did: &str,
+    ) -> Result<(), OrchestratorBridgeError> {
+        use std::sync::atomic::Ordering;
+
+        if self.user_lifecycle_transitions.load(Ordering::SeqCst) != 0
+            || self.user_lifecycle_generation.load(Ordering::SeqCst) != expected_generation
+        {
+            return Err(OrchestratorBridgeError::NotAuthenticated);
+        }
+        let current_user_did = crate::async_runtime::block_on(self.inner.require_user_did())?;
+        if current_user_did != expected_user_did
+            || self.user_lifecycle_transitions.load(Ordering::SeqCst) != 0
+            || self.user_lifecycle_generation.load(Ordering::SeqCst) != expected_generation
+        {
+            return Err(OrchestratorBridgeError::NotAuthenticated);
+        }
+        Ok(())
+    }
+
     fn lock_lifecycle_transition(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, ()>, OrchestratorBridgeError> {
@@ -2500,23 +2564,43 @@ impl OrchestratorBridge {
     where
         F: FnOnce(),
     {
-        let _lifecycle_transition = self.lock_lifecycle_transition()?;
-
         if challenge.is_empty() {
             return Err(OrchestratorBridgeError::InvalidInput {
                 message: "device authentication challenge must not be empty".to_string(),
             });
         }
 
+        let user_lifecycle_generation = self.stable_user_lifecycle_generation()?;
         let user_did = crate::async_runtime::block_on(self.inner.require_user_did())?;
+        self.require_stable_user_lifecycle(user_lifecycle_generation, &user_did)?;
+
+        // Credential callbacks may re-enter the bridge, so durable signer
+        // reconciliation must happen before taking the non-reentrant mutex.
+        // Any concurrent user transition is detected by the generation checks.
+        if matches!(
+            crate::async_runtime::block_on(self.inner.reconcile_durable_signer(&user_did))?,
+            Some(false)
+        ) {
+            return Err(OrchestratorBridgeError::Mls {
+                message: "durable registered signer could not be reconciled".to_string(),
+            });
+        }
+        self.require_stable_user_lifecycle(user_lifecycle_generation, &user_did)?;
+
+        let _lifecycle_transition = self.lock_lifecycle_transition()?;
+        self.require_stable_user_lifecycle(user_lifecycle_generation, &user_did)?;
         before_sign();
         let signature = self
             .inner
             .mls_context()
-            .sign_with_identity_key(user_did, challenge)
+            .sign_with_identity_key(user_did.clone(), challenge)
             .map_err(|error| OrchestratorBridgeError::Mls {
                 message: error.to_string(),
             })?;
+
+        // Never release a signature produced while the authenticated user or
+        // lifecycle changed, even if the transition completed during signing.
+        self.require_stable_user_lifecycle(user_lifecycle_generation, &user_did)?;
 
         if signature.len() != 64 {
             return Err(OrchestratorBridgeError::Mls {
@@ -2591,11 +2675,14 @@ impl OrchestratorBridge {
             inner,
             engine,
             lifecycle_transition: std::sync::Mutex::new(()),
+            user_lifecycle_generation: std::sync::atomic::AtomicU64::new(0),
+            user_lifecycle_transitions: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
     /// Initialize the orchestrator for a user DID.
     pub fn initialize(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
+        let _user_lifecycle_transition = self.begin_user_lifecycle_transition();
         crate::async_runtime::block_on(self.inner.initialize(&user_did))?;
         Ok(())
     }
@@ -3502,6 +3589,7 @@ impl OrchestratorBridge {
 #[uniffi::export]
 impl OrchestratorBridge {
     pub fn initialize_engine(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
+        let _user_lifecycle_transition = self.begin_user_lifecycle_transition();
         self.engine.initialize_user(&user_did)?;
         Ok(())
     }
@@ -3526,11 +3614,13 @@ impl OrchestratorBridge {
         user_did: String,
         reason: String,
     ) -> Result<(), OrchestratorBridgeError> {
+        let _user_lifecycle_transition = self.begin_user_lifecycle_transition();
         self.engine.reattach_after_suspend(&user_did, &reason)?;
         Ok(())
     }
 
     pub fn resume_from_suspend(&self, reason: String) -> Result<(), OrchestratorBridgeError> {
+        let _user_lifecycle_transition = self.begin_user_lifecycle_transition();
         self.engine.resume_from_suspend(&reason)?;
         Ok(())
     }
@@ -5547,7 +5637,9 @@ mod tests {
         }
     }
 
-    fn device_auth_signing_bridge() -> (tempfile::TempDir, Arc<OrchestratorBridge>) {
+    fn device_auth_signing_bridge_with_credentials(
+        credentials: RecordingCredentialCallback,
+    ) -> (tempfile::TempDir, Arc<OrchestratorBridge>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mls_context = MLSContext::new(
             dir.path()
@@ -5565,7 +5657,7 @@ mod tests {
                 "did:plc:alice",
                 Arc::new(AtomicUsize::new(0)),
             )),
-            Box::new(RecordingCredentialCallback::default()),
+            Box::new(credentials),
             full_security_capabilities(),
             FFIOrchestratorConfig {
                 max_devices: 5,
@@ -5580,6 +5672,10 @@ mod tests {
         )
         .expect("bridge construction");
         (dir, bridge)
+    }
+
+    fn device_auth_signing_bridge() -> (tempfile::TempDir, Arc<OrchestratorBridge>) {
+        device_auth_signing_bridge_with_credentials(RecordingCredentialCallback::default())
     }
 
     #[test]
@@ -5705,6 +5801,138 @@ mod tests {
                 .is_err(),
             "one-byte challenge mutation must invalidate the signature"
         );
+    }
+
+    #[test]
+    fn device_auth_signing_restores_the_durable_registered_signer_after_database_recreation() {
+        use openmls_traits::types::SignatureScheme;
+        use openmls_traits::{crypto::OpenMlsCrypto, OpenMlsProvider};
+
+        let did = "did:plc:alice";
+        let original_dir = tempfile::tempdir().expect("original tempdir");
+        let original_context = MLSContext::new(
+            original_dir
+                .path()
+                .join("original.sqlite")
+                .to_string_lossy()
+                .to_string(),
+            "original-device-auth-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("original MLSContext");
+        let registered_key_package = original_context
+            .create_key_package(did.as_bytes().to_vec())
+            .expect("registered KeyPackage");
+        let durable_signer = original_context
+            .export_identity_key(did.to_string())
+            .expect("export durable signer for simulated credential store");
+
+        let credentials = RecordingCredentialCallback::default();
+        credentials
+            .signing_keys
+            .lock()
+            .expect("credential signing-key lock")
+            .insert(did.to_string(), durable_signer);
+        let (_recreated_dir, bridge) = device_auth_signing_bridge_with_credentials(credentials);
+        bridge
+            .initialize(did.to_string())
+            .expect("initialize recreated bridge");
+
+        let challenge = b"CATBIRD-DEVICE-AUTH-V1:recreated-database".to_vec();
+        let signature = bridge
+            .sign_device_auth_challenge(challenge.clone())
+            .expect("restore and use durable registered signer");
+
+        let provider = openmls_libcrux_crypto::Provider::default();
+        provider
+            .crypto()
+            .verify_signature(
+                SignatureScheme::ED25519,
+                &challenge,
+                &registered_key_package.signature_public_key,
+                &signature,
+            )
+            .expect("signature must use the pre-recreation registered public key");
+    }
+
+    #[test]
+    fn device_auth_signing_refuses_a_drifted_local_signer_when_durable_adoption_fails() {
+        let did = "did:plc:alice";
+        let credentials = RecordingCredentialCallback::default();
+        credentials
+            .signing_keys
+            .lock()
+            .expect("credential signing-key lock")
+            .insert(
+                did.to_string(),
+                b"not-a-serialized-signature-keypair".to_vec(),
+            );
+        let (_dir, bridge) = device_auth_signing_bridge_with_credentials(credentials);
+        bridge
+            .initialize(did.to_string())
+            .expect("initialize bridge");
+        bridge
+            .inner
+            .mls_context()
+            .create_key_package(did.as_bytes().to_vec())
+            .expect("create drifted local signer");
+
+        assert!(matches!(
+            bridge.sign_device_auth_challenge(
+                b"CATBIRD-DEVICE-AUTH-V1:reject-drifted-signer".to_vec()
+            ),
+            Err(OrchestratorBridgeError::Mls { message })
+                if message.contains("durable registered signer could not be reconciled")
+        ));
+    }
+
+    #[test]
+    fn device_auth_signing_discards_a_signature_if_the_initialized_user_changes() {
+        use std::sync::mpsc;
+
+        let (_dir, bridge) = device_auth_signing_bridge();
+        let alice = "did:plc:alice";
+        let bob = "did:plc:bob";
+        bridge
+            .initialize(alice.to_string())
+            .expect("initialize Alice");
+        bridge
+            .inner
+            .mls_context()
+            .create_key_package(alice.as_bytes().to_vec())
+            .expect("register Alice signer");
+
+        let (signing_entered_tx, signing_entered_rx) = mpsc::channel();
+        let (release_signing_tx, release_signing_rx) = mpsc::channel();
+        let signing_bridge = Arc::clone(&bridge);
+        let signer = std::thread::spawn(move || {
+            signing_bridge.sign_device_auth_challenge_with_hook(
+                b"CATBIRD-DEVICE-AUTH-V1:user-change-race".to_vec(),
+                || {
+                    signing_entered_tx
+                        .send(())
+                        .expect("announce signing critical section");
+                    release_signing_rx
+                        .recv()
+                        .expect("release signing critical section");
+                },
+            )
+        });
+        signing_entered_rx
+            .recv()
+            .expect("signing must capture Alice lifecycle");
+
+        bridge
+            .initialize(bob.to_string())
+            .expect("change initialized user to Bob");
+        release_signing_tx
+            .send(())
+            .expect("release Alice signing operation");
+
+        assert!(matches!(
+            signer.join().expect("signer thread"),
+            Err(OrchestratorBridgeError::NotAuthenticated)
+        ));
     }
 
     #[test]
