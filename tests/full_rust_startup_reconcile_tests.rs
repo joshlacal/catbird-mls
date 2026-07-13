@@ -10,7 +10,9 @@ mod mock_storage;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use catbird_mls::orchestrator::{ConversationState, MLSStorageBackend, OrchestratorConfig};
+use catbird_mls::orchestrator::{
+    ConversationState, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, OrchestratorError,
+};
 use catbird_mls::{EngineLifecycle, KeychainAccess, MLSContext, MLSError, MlsEngine};
 
 use mock_api_client::MockDeliveryService;
@@ -108,6 +110,23 @@ impl StartupReconcileFixture {
         created.group_id
     }
 
+    async fn persist_hex_addressable_local_group(&self, state: ConversationState) -> String {
+        let created = self
+            .context
+            .create_group(self.did.as_bytes().to_vec(), None)
+            .expect("create_group");
+        let group_id_hex = hex::encode(&created.group_id);
+        self.storage
+            .ensure_conversation_exists(self.did, &group_id_hex, &group_id_hex)
+            .await
+            .expect("ensure_conversation_exists");
+        self.storage
+            .set_conversation_state(&group_id_hex, state)
+            .await
+            .expect("set_conversation_state");
+        group_id_hex
+    }
+
     async fn persist_missing_group(
         &self,
         conversation_id: &str,
@@ -152,6 +171,263 @@ async fn initialize_fails_closed_on_malformed_persisted_security_state() {
             .contains("malformed persisted reset/quarantine sidecar"),
         "initialization must expose the malformed security state: {error}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_reset_or_quarantine_state_keeps_restarted_orchestrator_unavailable() {
+    for persisted_state in [
+        ConversationState::ResetPending {
+            new_group_id: random_group_id_hex(),
+            reset_generation: 7,
+            notified_at_ms: 1_717_000_000_000,
+        },
+        ConversationState::Quarantined {
+            reason: catbird_mls::orchestrator::QuarantineReason::PeerBadCommit,
+            since_ms: 1_717_000_000_000,
+        },
+    ] {
+        let fixture = StartupReconcileFixture::new();
+        fixture
+            .persist_local_group("convo-malformed", persisted_state)
+            .await;
+        fixture
+            .storage
+            .mark_conversation_state_malformed("convo-malformed");
+
+        let restarted = MLSOrchestrator::new(
+            Arc::clone(&fixture.context),
+            Arc::clone(&fixture.storage),
+            Arc::new(MockDeliveryService::new(fixture.did)),
+            Arc::new(MockCredentials::new()),
+            OrchestratorConfig::default(),
+        );
+
+        restarted
+            .initialize(fixture.did)
+            .await
+            .expect_err("malformed security state must abort restart initialization");
+
+        let readiness = restarted.ensure_conversation_ready("convo-malformed").await;
+        assert!(
+            matches!(
+                readiness,
+                Err(OrchestratorError::NotAuthenticated | OrchestratorError::ShuttingDown)
+            ),
+            "failed initialization must leave the orchestrator unavailable, got {readiness:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_hydration_attempted_resume_cannot_send_surviving_local_group() {
+    let fixture = StartupReconcileFixture::new();
+    let conversation_id = fixture
+        .persist_hex_addressable_local_group(ConversationState::ResetPending {
+            new_group_id: random_group_id_hex(),
+            reset_generation: 11,
+            notified_at_ms: 1_717_000_000_000,
+        })
+        .await;
+    fixture
+        .storage
+        .fail_next_get_conversation_state_for(&conversation_id);
+    let orchestrator = MLSOrchestrator::new(
+        Arc::clone(&fixture.context),
+        Arc::clone(&fixture.storage),
+        Arc::new(MockDeliveryService::new(fixture.did)),
+        Arc::new(MockCredentials::new()),
+        OrchestratorConfig::default(),
+    );
+
+    orchestrator
+        .initialize(fixture.did)
+        .await
+        .expect_err("malformed hydration must fail initialization");
+    assert!(matches!(
+        orchestrator.resume_after_suspend(fixture.did).await,
+        Err(OrchestratorError::ShuttingDown)
+    ));
+
+    let send = orchestrator
+        .send_message(&conversation_id, "must remain blocked")
+        .await;
+    assert!(
+        matches!(
+            send,
+            Err(OrchestratorError::NotAuthenticated | OrchestratorError::ShuttingDown)
+        ),
+        "attempted resume after malformed hydration must not expose send authority: {send:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_rejects_uninitialized_and_terminal_shutdown_phases() {
+    let fixture = StartupReconcileFixture::new();
+    let orchestrator = MLSOrchestrator::new(
+        Arc::clone(&fixture.context),
+        Arc::clone(&fixture.storage),
+        Arc::new(MockDeliveryService::new(fixture.did)),
+        Arc::new(MockCredentials::new()),
+        OrchestratorConfig::default(),
+    );
+
+    assert!(matches!(
+        orchestrator.resume_after_suspend(fixture.did).await,
+        Err(OrchestratorError::InvalidInput(_))
+    ));
+
+    orchestrator
+        .initialize(fixture.did)
+        .await
+        .expect("initialize before terminal shutdown");
+    orchestrator.shutdown().await;
+    assert!(matches!(
+        orchestrator.resume_after_suspend(fixture.did).await,
+        Err(OrchestratorError::ShuttingDown)
+    ));
+}
+
+async fn blocked_malformed_initialize(
+    fixture: &StartupReconcileFixture,
+) -> (
+    Arc<MLSOrchestrator<MockStorage, MockDeliveryService, MockCredentials, MLSContext>>,
+    mock_storage::ConversationStateReadBarrier,
+    tokio::task::JoinHandle<Result<(), OrchestratorError>>,
+) {
+    fixture
+        .persist_local_group(
+            "convo-malformed-race",
+            ConversationState::ResetPending {
+                new_group_id: random_group_id_hex(),
+                reset_generation: 9,
+                notified_at_ms: 1_717_000_000_000,
+            },
+        )
+        .await;
+    fixture
+        .persist_local_group("convo-healthy-race", ConversationState::Active)
+        .await;
+    fixture
+        .storage
+        .fail_next_get_conversation_state_for("convo-malformed-race");
+    let barrier = fixture
+        .storage
+        .pause_next_conversation_state_read("convo-malformed-race");
+    let orchestrator = Arc::new(MLSOrchestrator::new(
+        Arc::clone(&fixture.context),
+        Arc::clone(&fixture.storage),
+        Arc::new(MockDeliveryService::new(fixture.did)),
+        Arc::new(MockCredentials::new()),
+        OrchestratorConfig::default(),
+    ));
+    let initializing = {
+        let orchestrator = Arc::clone(&orchestrator);
+        let did = fixture.did.to_string();
+        tokio::spawn(async move { orchestrator.initialize(&did).await })
+    };
+    barrier.wait_until_entered().await;
+    (orchestrator, barrier, initializing)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_initialize_cannot_revoke_racing_successful_retry() {
+    let fixture = StartupReconcileFixture::new();
+    let (orchestrator, barrier, first_initialize) = blocked_malformed_initialize(&fixture).await;
+    let retry = {
+        let orchestrator = Arc::clone(&orchestrator);
+        let did = fixture.did.to_string();
+        tokio::spawn(async move { orchestrator.initialize(&did).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !retry.is_finished(),
+        "retry must wait for lifecycle ownership"
+    );
+
+    barrier.release();
+    first_initialize
+        .await
+        .expect("first initialize task")
+        .expect_err("first initialize must observe malformed state");
+    retry
+        .await
+        .expect("retry initialize task")
+        .expect("retry initialize must become the lifecycle owner");
+
+    let readiness = orchestrator
+        .ensure_conversation_ready("convo-healthy-race")
+        .await
+        .expect("successful retry must leave an operational orchestrator");
+    assert!(
+        readiness.send_allowed,
+        "retry must publish a ready lifecycle"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_initialize_cannot_revoke_racing_resume() {
+    let fixture = StartupReconcileFixture::new();
+    let (orchestrator, barrier, initializing) = blocked_malformed_initialize(&fixture).await;
+    let resume = {
+        let orchestrator = Arc::clone(&orchestrator);
+        let did = fixture.did.to_string();
+        tokio::spawn(async move { orchestrator.resume_after_suspend(&did).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !resume.is_finished(),
+        "resume must wait for lifecycle ownership"
+    );
+
+    barrier.release();
+    initializing
+        .await
+        .expect("initialize task")
+        .expect_err("initialize must observe malformed state");
+    assert!(matches!(
+        resume.await.expect("resume task"),
+        Err(OrchestratorError::ShuttingDown)
+    ));
+
+    let malformed_readiness = orchestrator
+        .ensure_conversation_ready("convo-malformed-race")
+        .await;
+    assert!(
+        matches!(
+            malformed_readiness,
+            Err(OrchestratorError::NotAuthenticated | OrchestratorError::ShuttingDown)
+        ),
+        "racing resume must not reopen a failed initializer: {malformed_readiness:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_initialize_and_racing_shutdown_end_atomically_shutdown() {
+    let fixture = StartupReconcileFixture::new();
+    let (orchestrator, barrier, initializing) = blocked_malformed_initialize(&fixture).await;
+    let shutdown = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.shutdown().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown must wait for lifecycle ownership"
+    );
+
+    barrier.release();
+    initializing
+        .await
+        .expect("initialize task")
+        .expect_err("initialize must observe malformed state");
+    shutdown.await.expect("shutdown task");
+
+    assert!(matches!(
+        orchestrator
+            .ensure_conversation_ready("convo-malformed-race")
+            .await,
+        Err(OrchestratorError::ShuttingDown)
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]

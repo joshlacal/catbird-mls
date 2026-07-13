@@ -54,6 +54,16 @@ impl Default for OrchestratorConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OrchestratorLifecycleState {
+    Uninitialized,
+    Initializing { user_did: String },
+    Ready { user_did: String },
+    Suspended { user_did: String },
+    FailedInitialization,
+    Shutdown,
+}
+
 /// Platform-agnostic MLS orchestrator.
 ///
 /// Coordinates between the MLS crypto context, storage, API client, and credentials
@@ -81,8 +91,10 @@ where
     credentials: Arc<C>,
     /// Configuration.
     config: OrchestratorConfig,
-    /// The authenticated user's DID.
-    user_did: Mutex<Option<String>>,
+    /// Authentication and shutdown readiness published atomically.
+    lifecycle_state: Mutex<OrchestratorLifecycleState>,
+    /// Owns one complete initialize/resume/shutdown transition.
+    lifecycle_operation: Mutex<()>,
     /// In-memory conversation cache.
     conversations: Mutex<HashMap<ConversationId, ConversationView>>,
     /// In-memory group state cache.
@@ -97,8 +109,6 @@ where
     groups_being_created: Mutex<HashSet<GroupId>>,
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
-    /// Whether the orchestrator is shutting down.
-    shutting_down: Mutex<bool>,
     /// Sync state lock.
     sync_in_progress: Mutex<bool>,
     /// Consecutive sync failures (for circuit breaker).
@@ -197,7 +207,8 @@ where
             api_client,
             credentials,
             config,
-            user_did: Mutex::new(None),
+            lifecycle_state: Mutex::new(OrchestratorLifecycleState::Uninitialized),
+            lifecycle_operation: Mutex::new(()),
             conversations: Mutex::new(HashMap::new()),
             group_states: Mutex::new(HashMap::new()),
             conversation_states: Mutex::new(HashMap::new()),
@@ -205,7 +216,6 @@ where
             own_commits: Mutex::new(HashMap::new()),
             groups_being_created: Mutex::new(HashSet::new()),
             rejoin_locks: Mutex::new(HashMap::new()),
-            shutting_down: Mutex::new(false),
             sync_in_progress: Mutex::new(false),
             consecutive_sync_failures: Mutex::new(0),
             circuit_breaker_tripped_at: Mutex::new(None),
@@ -240,9 +250,11 @@ where
 
     /// Initialize the orchestrator for a user.
     pub async fn initialize(&self, user_did: &str) -> Result<()> {
+        let _lifecycle_owner = self.lifecycle_operation.lock().await;
         tracing::info!(user_did, "Initializing MLS orchestrator");
-        *self.user_did.lock().await = Some(user_did.to_string());
-        *self.shutting_down.lock().await = false;
+        *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Initializing {
+            user_did: user_did.to_string(),
+        };
 
         // WS-5.6: capabilities check — make default no-op storage methods
         // observable so silently-dropped state (e.g. `mark_reset_pending`
@@ -356,6 +368,14 @@ where
                                 error = ?e,
                                 "Failed to rehydrate security-relevant conversation state; aborting initialization"
                             );
+                            // Keep an explicit Failed projection for diagnostics
+                            // and atomically fail the lifecycle closed. Holding
+                            // lifecycle ownership prevents a newer retry,
+                            // resume, or shutdown from being overwritten here.
+                            states.insert(convo.conversation_id.clone(), ConversationState::Failed);
+                            drop(states);
+                            *self.lifecycle_state.lock().await =
+                                OrchestratorLifecycleState::FailedInitialization;
                             return Err(e);
                         }
                     }
@@ -370,21 +390,89 @@ where
             }
         }
 
+        *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Ready {
+            user_did: user_did.to_string(),
+        };
         Ok(())
     }
 
     /// Resume the orchestrator after a lifecycle suspend without replaying the
     /// full startup hydration / recovery path.
-    pub async fn resume_after_suspend(&self, user_did: &str) {
+    pub async fn resume_after_suspend(&self, user_did: &str) -> Result<()> {
+        let _lifecycle_owner = self.lifecycle_operation.lock().await;
         tracing::info!(user_did, "Resuming MLS orchestrator after suspend");
-        *self.user_did.lock().await = Some(user_did.to_string());
-        *self.shutting_down.lock().await = false;
+        let mut lifecycle = self.lifecycle_state.lock().await;
+        match &*lifecycle {
+            OrchestratorLifecycleState::Suspended {
+                user_did: suspended_did,
+            } if suspended_did == user_did => {
+                *lifecycle = OrchestratorLifecycleState::Ready {
+                    user_did: user_did.to_string(),
+                };
+                Ok(())
+            }
+            OrchestratorLifecycleState::Suspended { .. } => {
+                Err(OrchestratorError::NotAuthenticated)
+            }
+            OrchestratorLifecycleState::FailedInitialization
+            | OrchestratorLifecycleState::Shutdown => Err(OrchestratorError::ShuttingDown),
+            _ => Err(OrchestratorError::InvalidInput(
+                "resume requires a suspended orchestrator".to_string(),
+            )),
+        }
+    }
+
+    /// Enter the only lifecycle phase that `resume_after_suspend` accepts.
+    pub async fn suspend(&self) -> Result<()> {
+        let _lifecycle_owner = self.lifecycle_operation.lock().await;
+        let user_did = {
+            let mut lifecycle = self.lifecycle_state.lock().await;
+            let user_did = match &*lifecycle {
+                OrchestratorLifecycleState::Ready { user_did } => user_did.clone(),
+                OrchestratorLifecycleState::Suspended { .. } => return Ok(()),
+                OrchestratorLifecycleState::FailedInitialization
+                | OrchestratorLifecycleState::Shutdown => {
+                    return Err(OrchestratorError::ShuttingDown)
+                }
+                _ => return Err(OrchestratorError::NotAuthenticated),
+            };
+            *lifecycle = OrchestratorLifecycleState::Suspended {
+                user_did: user_did.clone(),
+            };
+            user_did
+        };
+        tracing::info!(user_did, "Suspending MLS orchestrator");
+        self.clear_runtime_state().await;
+        Ok(())
+    }
+
+    /// Attach a fresh runtime to state whose suspension was established by
+    /// the engine lifecycle owner. This is intentionally distinct from resume.
+    pub async fn reattach_after_suspend(&self, user_did: &str) -> Result<()> {
+        let _lifecycle_owner = self.lifecycle_operation.lock().await;
+        let mut lifecycle = self.lifecycle_state.lock().await;
+        match &*lifecycle {
+            OrchestratorLifecycleState::Uninitialized => {
+                *lifecycle = OrchestratorLifecycleState::Ready {
+                    user_did: user_did.to_string(),
+                };
+                Ok(())
+            }
+            _ => Err(OrchestratorError::InvalidInput(
+                "reattach requires a fresh orchestrator".to_string(),
+            )),
+        }
     }
 
     /// Shut down the orchestrator, releasing resources.
     pub async fn shutdown(&self) {
+        let _lifecycle_owner = self.lifecycle_operation.lock().await;
         tracing::info!("Shutting down MLS orchestrator");
-        *self.shutting_down.lock().await = true;
+        *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Shutdown;
+        self.clear_runtime_state().await;
+    }
+
+    async fn clear_runtime_state(&self) {
         self.conversations.lock().await.clear();
         self.group_states.lock().await.clear();
         self.conversation_states.lock().await.clear();
@@ -395,24 +483,23 @@ where
             fds.clear();
         }
         self.pending_staged_commits.lock().await.clear();
-        *self.user_did.lock().await = None;
     }
 
     /// Get the authenticated user DID or return an error.
     pub(crate) async fn require_user_did(&self) -> Result<String> {
-        self.user_did
-            .lock()
-            .await
-            .clone()
-            .ok_or(OrchestratorError::NotAuthenticated)
+        match &*self.lifecycle_state.lock().await {
+            OrchestratorLifecycleState::Ready { user_did } => Ok(user_did.clone()),
+            _ => Err(OrchestratorError::NotAuthenticated),
+        }
     }
 
     /// Check if the orchestrator is shutting down, returning an error if so.
     pub(crate) async fn check_shutdown(&self) -> Result<()> {
-        if *self.shutting_down.lock().await {
-            Err(OrchestratorError::ShuttingDown)
-        } else {
-            Ok(())
+        match &*self.lifecycle_state.lock().await {
+            OrchestratorLifecycleState::Suspended { .. }
+            | OrchestratorLifecycleState::FailedInitialization
+            | OrchestratorLifecycleState::Shutdown => Err(OrchestratorError::ShuttingDown),
+            _ => Ok(()),
         }
     }
 

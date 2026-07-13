@@ -83,6 +83,8 @@ struct Inner {
     /// tests (E7 follow-up R-2).
     fail_next_set_conversation_state: bool,
     fail_next_get_conversation_state: bool,
+    fail_next_conversation_state_for: Option<String>,
+    malformed_conversation_states: std::collections::HashSet<String>,
     fail_next_mark_quarantined: bool,
     fail_next_clear_quarantine: bool,
     /// Stored sequencer receipts (WS-3 equivocation detection tests).
@@ -112,12 +114,34 @@ pub struct StartupProbeCounts {
 #[derive(Debug, Clone)]
 pub struct MockStorage {
     inner: Arc<Mutex<Inner>>,
+    conversation_state_read_barrier: Arc<Mutex<Option<(String, ConversationStateReadBarrier)>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationStateReadBarrier {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl ConversationStateReadBarrier {
+    pub async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("conversation-state barrier entered semaphore closed")
+            .forget();
+    }
+
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 impl MockStorage {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
+            conversation_state_read_barrier: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -322,6 +346,40 @@ impl MockStorage {
     /// decoded by the platform storage adapter during startup hydration.
     pub fn fail_next_get_conversation_state(&self) {
         self.inner.lock().unwrap().fail_next_get_conversation_state = true;
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_next_get_conversation_state_for(&self, conversation_id: &str) {
+        self.inner.lock().unwrap().fail_next_conversation_state_for =
+            Some(conversation_id.to_string());
+    }
+
+    /// Persistently fail decoding the security sidecar for one conversation,
+    /// matching a malformed reset-pending or quarantine record across restart.
+    #[allow(dead_code)]
+    pub fn mark_conversation_state_malformed(&self, conversation_id: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .malformed_conversation_states
+            .insert(conversation_id.to_string());
+    }
+
+    /// Pause the next security-state read for `conversation_id` until the
+    /// returned barrier is released. Used to deterministically exercise
+    /// lifecycle operations racing startup hydration.
+    #[allow(dead_code)]
+    pub fn pause_next_conversation_state_read(
+        &self,
+        conversation_id: &str,
+    ) -> ConversationStateReadBarrier {
+        let barrier = ConversationStateReadBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.conversation_state_read_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), barrier.clone()));
+        barrier
     }
 
     /// Make the next `mark_quarantined` call fail once.
@@ -666,13 +724,47 @@ impl MLSStorageBackend for MockStorage {
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationState>> {
+        let barrier = {
+            let mut installed = self.conversation_state_read_barrier.lock().unwrap();
+            match installed.take() {
+                Some((target, barrier)) if target == conversation_id => Some(barrier),
+                other => {
+                    *installed = other;
+                    None
+                }
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("conversation-state barrier release semaphore closed")
+                .forget();
+        }
+
         let mut inner = self.inner.lock().unwrap();
         inner.startup_probe_counts.get_conversation_state += 1;
+        if inner.fail_next_conversation_state_for.as_deref() == Some(conversation_id) {
+            inner.fail_next_conversation_state_for = None;
+            return Err(OrchestratorError::Storage(
+                "malformed persisted reset/quarantine sidecar".to_string(),
+            ));
+        }
         if inner.fail_next_get_conversation_state {
             inner.fail_next_get_conversation_state = false;
             return Err(OrchestratorError::Storage(
                 "malformed persisted reset/quarantine sidecar".to_string(),
             ));
+        }
+        if inner
+            .malformed_conversation_states
+            .contains(conversation_id)
+        {
+            return Err(OrchestratorError::Storage(format!(
+                "malformed persisted security state for {conversation_id}"
+            )));
         }
         // Prefer the explicit reset_pending row when present so the rehydrated
         // state carries the payload regardless of whether

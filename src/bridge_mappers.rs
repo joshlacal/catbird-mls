@@ -277,6 +277,54 @@ mod tests {
     }
 
     #[test]
+    fn specific_bridge_errors_round_trip_with_exact_payloads() {
+        let round_trip = |bridge| {
+            let internal = super::bridge_error_to_internal(bridge);
+            OrchestratorBridgeError::from(internal)
+        };
+
+        assert!(matches!(
+            round_trip(OrchestratorBridgeError::ConversationNotFound {
+                id: "conversation-123".into()
+            }),
+            OrchestratorBridgeError::ConversationNotFound { id }
+                if id == "conversation-123"
+        ));
+        assert!(matches!(
+            round_trip(OrchestratorBridgeError::EpochMismatch {
+                local: 41,
+                remote: 42
+            }),
+            OrchestratorBridgeError::EpochMismatch {
+                local: 41,
+                remote: 42
+            }
+        ));
+        assert!(matches!(
+            round_trip(OrchestratorBridgeError::RecoveryFailed {
+                message: "reset rejected".into()
+            }),
+            OrchestratorBridgeError::RecoveryFailed { message }
+                if message == "reset rejected"
+        ));
+        assert!(matches!(
+            round_trip(OrchestratorBridgeError::InvalidInput {
+                message: "bad group id".into()
+            }),
+            OrchestratorBridgeError::InvalidInput { message }
+                if message == "bad group id"
+        ));
+        assert!(matches!(
+            round_trip(OrchestratorBridgeError::ConversationQuarantined {
+                convo_id: "conversation-456".into(),
+                reason: "peer_bad_commit".into()
+            }),
+            OrchestratorBridgeError::ConversationQuarantined { convo_id, reason }
+                if convo_id == "conversation-456" && reason == "peer_bad_commit"
+        ));
+    }
+
+    #[test]
     fn shared_error_mapper_preserves_device_limit_error_class() {
         let mapped = super::bridge_error_to_internal(OrchestratorBridgeError::DeviceLimitReached);
         assert!(matches!(
