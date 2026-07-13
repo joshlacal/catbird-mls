@@ -341,6 +341,7 @@ async fn equivocating_receipts_fire_detection_and_recovery_proceeds() {
     let conflicting = SequencerReceipt {
         convo_id: group_id.clone(),
         epoch: next_epoch,
+        sequencer_term: 0,
         commit_hash: vec![0xAA; 32],
         sequencer_did: "did:web:sequencer.test".to_string(),
         issued_at: chrono::Utc::now().timestamp(),
@@ -417,6 +418,7 @@ async fn non_equivocating_receipts_are_silent() {
     let unrelated = SequencerReceipt {
         convo_id: group_id.clone(),
         epoch: next_epoch + 10,
+        sequencer_term: 0,
         commit_hash: vec![0xBB; 32],
         sequencer_did: "did:web:sequencer.test".to_string(),
         issued_at: chrono::Utc::now().timestamp(),
@@ -508,6 +510,7 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
     let pre_reset = SequencerReceipt {
         convo_id: convo_id.clone(),
         epoch: next_epoch,
+        sequencer_term: 0,
         commit_hash: vec![0xAA; 32],
         sequencer_did: "did:web:sequencer.test".to_string(),
         issued_at: chrono::Utc::now().timestamp(),

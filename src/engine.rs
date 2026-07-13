@@ -406,7 +406,14 @@ where
             return Ok(());
         }
 
-        crate::async_runtime::block_on(self.orchestrator.shutdown());
+        match reason {
+            ShutdownReason::AppSuspend => {
+                crate::async_runtime::block_on(self.orchestrator.suspend())?
+            }
+            ShutdownReason::ProcessExit => {
+                crate::async_runtime::block_on(self.orchestrator.shutdown())
+            }
+        }
         self.lifecycle.record_shutdown(reason)?;
         *self.lock_state()? = EngineState {
             phase: next_phase,
@@ -445,7 +452,7 @@ where
             .resume(self.orchestrator.mls_context().as_ref(), reason);
         self.lifecycle
             .record_storage_operation(format!("resume_from_suspend: {reason}"))?;
-        crate::async_runtime::block_on(self.orchestrator.resume_after_suspend(&user_did));
+        crate::async_runtime::block_on(self.orchestrator.resume_after_suspend(&user_did))?;
         *self.lock_state()? = EngineState {
             phase: EnginePhase::Initialized,
             initialized_user_did: Some(user_did),
@@ -467,7 +474,7 @@ where
             .resume(self.orchestrator.mls_context().as_ref(), reason);
         self.lifecycle
             .record_storage_operation(format!("reattach_after_suspend: {reason}"))?;
-        crate::async_runtime::block_on(self.orchestrator.resume_after_suspend(user_did));
+        crate::async_runtime::block_on(self.orchestrator.reattach_after_suspend(user_did))?;
         *self.lock_state()? = EngineState {
             phase: EnginePhase::Initialized,
             initialized_user_did: Some(user_did.to_string()),

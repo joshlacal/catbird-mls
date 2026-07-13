@@ -120,6 +120,10 @@ xcodebuild -create-xcframework \
     -headers build/libs/macos/Headers \
     -output CatbirdMLSFFI.xcframework
 
+# Xcode 27 can emit AvailableLibraries in nondeterministic order. Normalize the
+# generated plist so identical inputs produce byte-identical XCFrameworks.
+python3 scripts/normalize_xcframework_plist.py CatbirdMLSFFI.xcframework/Info.plist
+
 echo ""
 echo "✅ Build complete!"
 echo ""

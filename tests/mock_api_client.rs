@@ -1264,6 +1264,7 @@ impl MLSAPIClient for MockDeliveryService {
             Some(SequencerReceipt {
                 convo_id: convo_id.to_string(),
                 epoch: new_epoch as i32,
+                sequencer_term: 0,
                 commit_hash: Sha256::digest(commit_data).to_vec(),
                 sequencer_did: "did:web:sequencer.test".to_string(),
                 issued_at: Utc::now().timestamp(),
