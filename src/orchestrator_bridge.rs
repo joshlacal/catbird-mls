@@ -2478,6 +2478,69 @@ type ConcreteEngine = MlsEngine<StorageAdapter, APIAdapter, CredentialAdapter, M
 pub struct OrchestratorBridge {
     inner: Arc<ConcreteOrchestrator>,
     engine: Arc<ConcreteEngine>,
+    lifecycle_transition: std::sync::Mutex<()>,
+}
+
+impl OrchestratorBridge {
+    fn lock_lifecycle_transition(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, ()>, OrchestratorBridgeError> {
+        self.lifecycle_transition
+            .lock()
+            .map_err(|_| OrchestratorBridgeError::InvalidInput {
+                message: "orchestrator bridge lifecycle lock poisoned".to_string(),
+            })
+    }
+
+    fn sign_device_auth_challenge_with_hook<F>(
+        &self,
+        challenge: Vec<u8>,
+        before_sign: F,
+    ) -> Result<Vec<u8>, OrchestratorBridgeError>
+    where
+        F: FnOnce(),
+    {
+        let _lifecycle_transition = self.lock_lifecycle_transition()?;
+
+        if challenge.is_empty() {
+            return Err(OrchestratorBridgeError::InvalidInput {
+                message: "device authentication challenge must not be empty".to_string(),
+            });
+        }
+
+        let user_did = crate::async_runtime::block_on(self.inner.require_user_did())?;
+        before_sign();
+        let signature = self
+            .inner
+            .mls_context()
+            .sign_with_identity_key(user_did, challenge)
+            .map_err(|error| OrchestratorBridgeError::Mls {
+                message: error.to_string(),
+            })?;
+
+        if signature.len() != 64 {
+            return Err(OrchestratorBridgeError::Mls {
+                message: format!(
+                    "device authentication signer returned {} bytes; expected 64-byte Ed25519 signature",
+                    signature.len()
+                ),
+            });
+        }
+
+        Ok(signature)
+    }
+
+    fn shutdown_with_hook<F>(&self, before_lock: F)
+    where
+        F: FnOnce(),
+    {
+        before_lock();
+        let _lifecycle_transition = self
+            .lifecycle_transition
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::async_runtime::block_on(self.inner.shutdown());
+    }
 }
 
 #[uniffi::export]
@@ -2524,7 +2587,11 @@ impl OrchestratorBridge {
         ));
         let inner = engine.orchestrator();
 
-        Ok(Arc::new(Self { inner, engine }))
+        Ok(Arc::new(Self {
+            inner,
+            engine,
+            lifecycle_transition: std::sync::Mutex::new(()),
+        }))
     }
 
     /// Initialize the orchestrator for a user DID.
@@ -2533,9 +2600,23 @@ impl OrchestratorBridge {
         Ok(())
     }
 
+    /// Sign a server-issued device-authentication challenge with the
+    /// initialized user's persistent MLS identity key.
+    ///
+    /// The caller cannot select an identity or access key material. The
+    /// signature is bound to the user DID owned by this orchestrator's active
+    /// lifecycle, and is therefore refused before initialization or after
+    /// shutdown.
+    pub fn sign_device_auth_challenge(
+        &self,
+        challenge: Vec<u8>,
+    ) -> Result<Vec<u8>, OrchestratorBridgeError> {
+        self.sign_device_auth_challenge_with_hook(challenge, || {})
+    }
+
     /// Shut down the orchestrator.
     pub fn shutdown(&self) {
-        crate::async_runtime::block_on(self.inner.shutdown());
+        self.shutdown_with_hook(|| {});
     }
 
     // -- Groups --
@@ -3430,6 +3511,7 @@ impl OrchestratorBridge {
         reason: String,
         deadline_ms: u64,
     ) -> Result<FFISuspendResult, OrchestratorBridgeError> {
+        let _lifecycle_transition = self.lock_lifecycle_transition()?;
         let result = self
             .engine
             .prepare_for_suspend(&reason, Duration::from_millis(deadline_ms))?;
@@ -3459,8 +3541,10 @@ impl OrchestratorBridge {
     }
 
     pub fn emergency_close(&self, reason: String) -> Result<(), OrchestratorBridgeError> {
-        self.engine.emergency_close(&reason)?;
-        Ok(())
+        let _lifecycle_transition = self.lock_lifecycle_transition()?;
+        let close_result = self.engine.emergency_close(&reason);
+        crate::async_runtime::block_on(self.inner.shutdown());
+        close_result.map_err(OrchestratorBridgeError::from)
     }
 
     pub fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
@@ -5461,5 +5545,249 @@ mod tests {
                 "StorageAdapter must declare {method} as implemented (WS-5.6 capabilities check)"
             );
         }
+    }
+
+    fn device_auth_signing_bridge() -> (tempfile::TempDir, Arc<OrchestratorBridge>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mls_context = MLSContext::new(
+            dir.path()
+                .join("device-auth-signing.sqlite")
+                .to_string_lossy()
+                .to_string(),
+            "device-auth-signing-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            full_security_capabilities(),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        )
+        .expect("bridge construction");
+        (dir, bridge)
+    }
+
+    #[test]
+    fn device_auth_signing_api_accepts_only_the_challenge() {
+        let _signature_only_api: fn(
+            &OrchestratorBridge,
+            Vec<u8>,
+        ) -> Result<Vec<u8>, OrchestratorBridgeError> =
+            OrchestratorBridge::sign_device_auth_challenge;
+    }
+
+    #[test]
+    fn device_auth_signing_refuses_uninitialized_and_shutdown_bridges() {
+        let (_dir, bridge) = device_auth_signing_bridge();
+        let challenge = b"CATBIRD-DEVICE-AUTH-V1:challenge".to_vec();
+
+        assert!(matches!(
+            bridge.sign_device_auth_challenge(challenge.clone()),
+            Err(OrchestratorBridgeError::NotAuthenticated)
+        ));
+
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("initialize bridge");
+        bridge
+            .inner
+            .mls_context()
+            .create_key_package(b"did:plc:alice".to_vec())
+            .expect("register identity signer");
+        bridge.shutdown();
+
+        assert!(matches!(
+            bridge.sign_device_auth_challenge(challenge),
+            Err(OrchestratorBridgeError::NotAuthenticated)
+        ));
+    }
+
+    #[test]
+    fn device_auth_signing_refuses_emergency_closed_bridge_as_not_authenticated() {
+        let (_dir, bridge) = device_auth_signing_bridge();
+        let did = "did:plc:alice";
+        bridge
+            .initialize(did.to_string())
+            .expect("initialize bridge");
+        bridge
+            .inner
+            .mls_context()
+            .create_key_package(did.as_bytes().to_vec())
+            .expect("register identity signer");
+
+        bridge
+            .emergency_close("device auth lifecycle test".to_string())
+            .expect("emergency close bridge");
+
+        assert!(matches!(
+            bridge.sign_device_auth_challenge(b"after-emergency-close".to_vec()),
+            Err(OrchestratorBridgeError::NotAuthenticated)
+        ));
+    }
+
+    #[test]
+    fn device_auth_signing_rejects_empty_challenge() {
+        let (_dir, bridge) = device_auth_signing_bridge();
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("initialize bridge");
+
+        assert!(matches!(
+            bridge.sign_device_auth_challenge(Vec::new()),
+            Err(OrchestratorBridgeError::InvalidInput { message })
+                if message == "device authentication challenge must not be empty"
+        ));
+    }
+
+    #[test]
+    fn device_auth_signature_is_exact_ed25519_key_package_signature() {
+        use openmls_traits::types::SignatureScheme;
+        use openmls_traits::{crypto::OpenMlsCrypto, OpenMlsProvider};
+
+        let (_dir, bridge) = device_auth_signing_bridge();
+        let did = "did:plc:alice";
+        bridge
+            .initialize(did.to_string())
+            .expect("initialize bridge");
+        let key_package = bridge
+            .inner
+            .mls_context()
+            .create_key_package(did.as_bytes().to_vec())
+            .expect("create registered KeyPackage");
+        let challenge = b"CATBIRD-DEVICE-AUTH-V1:challenge".to_vec();
+
+        let signature = bridge
+            .sign_device_auth_challenge(challenge.clone())
+            .expect("sign device authentication challenge");
+
+        assert_eq!(
+            signature.len(),
+            64,
+            "Ed25519 signatures are exactly 64 bytes"
+        );
+        let provider = openmls_libcrux_crypto::Provider::default();
+        provider
+            .crypto()
+            .verify_signature(
+                SignatureScheme::ED25519,
+                &challenge,
+                &key_package.signature_public_key,
+                &signature,
+            )
+            .expect("signature must verify under the KeyPackage public key");
+
+        let mut mutated = challenge;
+        mutated[0] ^= 1;
+        assert!(
+            provider
+                .crypto()
+                .verify_signature(
+                    SignatureScheme::ED25519,
+                    &mutated,
+                    &key_package.signature_public_key,
+                    &signature,
+                )
+                .is_err(),
+            "one-byte challenge mutation must invalidate the signature"
+        );
+    }
+
+    #[test]
+    fn device_auth_signing_serializes_terminal_shutdown() {
+        use std::sync::mpsc;
+
+        let (_dir, bridge) = device_auth_signing_bridge();
+        let did = "did:plc:alice";
+        bridge
+            .initialize(did.to_string())
+            .expect("initialize bridge");
+        bridge
+            .inner
+            .mls_context()
+            .create_key_package(did.as_bytes().to_vec())
+            .expect("register identity signer");
+
+        let (signing_entered_tx, signing_entered_rx) = mpsc::channel();
+        let (release_signing_tx, release_signing_rx) = mpsc::channel();
+        let signing_bridge = Arc::clone(&bridge);
+        let signer = std::thread::spawn(move || {
+            signing_bridge.sign_device_auth_challenge_with_hook(
+                b"CATBIRD-DEVICE-AUTH-V1:race".to_vec(),
+                || {
+                    signing_entered_tx
+                        .send(())
+                        .expect("announce signing critical section");
+                    release_signing_rx
+                        .recv()
+                        .expect("release signing critical section");
+                },
+            )
+        });
+        signing_entered_rx
+            .recv()
+            .expect("signing must enter critical section");
+
+        let (shutdown_attempting_tx, shutdown_attempting_rx) = mpsc::channel();
+        let (allow_shutdown_lock_tx, allow_shutdown_lock_rx) = mpsc::channel();
+        let (shutdown_complete_tx, shutdown_complete_rx) = mpsc::channel();
+        let shutdown_bridge = Arc::clone(&bridge);
+        let shutdown = std::thread::spawn(move || {
+            shutdown_bridge.shutdown_with_hook(|| {
+                shutdown_attempting_tx
+                    .send(())
+                    .expect("announce shutdown lock attempt");
+                allow_shutdown_lock_rx
+                    .recv()
+                    .expect("allow shutdown lock attempt");
+            });
+            shutdown_complete_tx
+                .send(())
+                .expect("announce completed shutdown");
+        });
+
+        shutdown_attempting_rx
+            .recv()
+            .expect("shutdown must reach the lifecycle transition");
+        allow_shutdown_lock_tx
+            .send(())
+            .expect("allow shutdown to attempt lifecycle lock");
+        assert!(
+            shutdown_complete_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "terminal shutdown must wait while signing owns the lifecycle transition"
+        );
+        release_signing_tx
+            .send(())
+            .expect("release signing operation");
+        let signature = signer
+            .join()
+            .expect("signer thread")
+            .expect("sign before shutdown transition");
+        assert_eq!(signature.len(), 64);
+        shutdown_complete_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown completes after signing releases transition");
+        shutdown.join().expect("shutdown thread");
+
+        assert!(matches!(
+            bridge.sign_device_auth_challenge(b"after-shutdown".to_vec()),
+            Err(OrchestratorBridgeError::NotAuthenticated)
+        ));
     }
 }
