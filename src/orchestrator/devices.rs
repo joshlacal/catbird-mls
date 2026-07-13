@@ -13,6 +13,35 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    /// Reconcile the local MLS signer with the durable signer last persisted
+    /// after successful device registration.
+    ///
+    /// This helper intentionally performs only credential-store access and
+    /// local signer import. Callers that merely need proof-of-possession must
+    /// not trigger device removal, registration, or key-package publication.
+    /// The result preserves all three security-relevant states: `None` means
+    /// no durable signer exists, `Some(true)` means it was adopted, and
+    /// `Some(false)` means durable material existed but could not be adopted.
+    pub(crate) async fn reconcile_durable_signer(&self, user_did: &str) -> Result<Option<bool>> {
+        let Some(stored_key) = self.credentials().get_signing_key(user_did).await? else {
+            return Ok(None);
+        };
+
+        match self
+            .mls_context()
+            .import_identity_key(user_did.as_bytes().to_vec(), stored_key)
+        {
+            Ok(()) => {
+                tracing::info!("Imported durable signing key from credential store");
+                Ok(Some(true))
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Stored signing key could not be adopted as the active signer; reconciliation required");
+                Ok(Some(false))
+            }
+        }
+    }
+
     /// Ensure the current device is registered with the MLS service.
     ///
     /// If already registered, returns the existing MLS DID.
@@ -43,21 +72,10 @@ where
         // must not trust stale server state, or published key packages get
         // rejected (device key != KP leaf key) and members can never open the
         // Welcomes built from the now-stale server key packages.
-        let mut durable_signer_in_sync = false;
-        if let Some(stored_key) = self.credentials().get_signing_key(&user_did).await? {
-            match self
-                .mls_context()
-                .import_identity_key(identity_bytes.clone(), stored_key)
-            {
-                Ok(()) => {
-                    durable_signer_in_sync = true;
-                    tracing::info!("Imported durable signing key from credential store");
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Stored signing key could not be adopted as the active signer; will re-register to reconcile")
-                }
-            }
-        }
+        let durable_signer_in_sync = self
+            .reconcile_durable_signer(&user_did)
+            .await?
+            .unwrap_or(false);
 
         // Check if already registered via credential store
         if self.credentials().has_credentials(&user_did).await? {
