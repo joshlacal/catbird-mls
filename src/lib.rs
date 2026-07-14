@@ -122,3 +122,9 @@ pub(crate) mod async_runtime {
 // UniFFI setup
 #[cfg(not(target_arch = "wasm32"))]
 uniffi::setup_scaffolding!();
+#[cfg(test)]
+extern crate self as catbird_mls;
+
+#[cfg(test)]
+#[path = "../tests/e2e_harness.rs"]
+mod recovery_e2e_harness;

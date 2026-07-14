@@ -54,6 +54,17 @@ pub enum OrchestratorError {
     #[error("Recovery failed: {0}")]
     RecoveryFailed(String),
 
+    /// Server bootstrap succeeded, but the storage compare-and-clear could not
+    /// confirm that this reset generation still owned recovery authority.
+    #[error(
+        "Reset completion not committed for conversation {convo_id}, generation {reset_generation}: {reason}"
+    )]
+    ResetCompletionNotCommitted {
+        convo_id: String,
+        reset_generation: i32,
+        reason: String,
+    },
+
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
@@ -100,6 +111,10 @@ impl OrchestratorError {
     /// Whether this error represents a 429 Too Many Requests response.
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, OrchestratorError::ServerError { status: 429, .. })
+    }
+
+    pub fn is_reset_completion_not_committed(&self) -> bool {
+        matches!(self, OrchestratorError::ResetCompletionNotCommitted { .. })
     }
 
     /// Whether this error represents a first-responder bootstrap race-loss:

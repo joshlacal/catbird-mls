@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 
 use catbird_mls::orchestrator::event_observer::OrchestratorEventObserver;
 use catbird_mls::orchestrator::{
-    extract_key_package_binding, IncomingEnvelope, MLSAPIClient, MLSStorageBackend,
-    SequencerReceipt,
+    extract_key_package_binding, ConversationState, IncomingEnvelope, MLSAPIClient,
+    MLSStorageBackend, SequencerReceipt,
 };
 use e2e_harness::TestWorld;
 
@@ -529,7 +529,7 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
         hex::decode("aabbccddeeff00112233445566778899").expect("test fixture must be valid hex");
     alice
         .orchestrator
-        .record_group_reset(&convo_id, new_group_id, 1)
+        .record_group_reset(&convo_id, new_group_id.clone(), 1)
         .await
         .expect("record_group_reset failed");
 
@@ -544,6 +544,22 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
          the conversation (N44a) — the reset rebuilds the group, so cross-\
          boundary receipt comparison is meaningless"
     );
+
+    // This test isolates receipt-boundary behavior from reset recovery. Model
+    // the generation-bound completion CAS before deliberately using the
+    // internal non-reset force_rejoin path to obtain a fresh receipt. Direct
+    // force_rejoin is prohibited while ResetPending remains authoritative.
+    assert!(alice
+        .storage
+        .complete_reset_pending(&convo_id, 1, &hex::encode(&new_group_id))
+        .await
+        .expect("complete reset boundary for receipt test"));
+    alice
+        .orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .insert(convo_id.clone(), ConversationState::Active);
 
     // Post-reset recovery obtains a genuine sequencer receipt at the SAME
     // epoch number the pre-reset receipt occupied. It must NOT fire

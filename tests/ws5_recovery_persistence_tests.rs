@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use catbird_mls::orchestrator::recovery::RecoveryTracker;
 use catbird_mls::orchestrator::{
-    constants, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, PendingLocalDelete,
-    PersistedRecoveryBackoff, PersistedRecoveryState,
+    constants, ConversationState, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
+    PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState, ResetRecordOutcome,
 };
 use e2e_harness::TestWorld;
 
@@ -544,6 +544,158 @@ async fn startup_sweep_finishes_interrupted_local_delete() {
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_delete_replays_without_conversation_row_and_removes_group_state() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("legacy row already gone", None, None)
+        .await
+        .expect("create group");
+
+    alice.storage.seed_pending_local_delete(PendingLocalDelete {
+        conversation_id: convo.conversation_id.clone(),
+        group_id_hex: Some(convo.group_id.clone()),
+    });
+    alice
+        .storage
+        .delete_conversations(&alice.did, &[&convo.conversation_id])
+        .await
+        .expect("simulate conversation row deleted before crash");
+    assert!(alice.storage.has_group_state(&convo.group_id));
+
+    let (_restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+    assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    assert!(
+        !alice.storage.has_group_state(&convo.group_id),
+        "legacy captured group id must remain cleanup authority after its conversation row is gone"
+    );
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_delete_treats_absent_mls_group_id_as_group_state_key() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("legacy MLS group already gone", None, None)
+        .await
+        .expect("create group");
+
+    alice.storage.seed_pending_local_delete(PendingLocalDelete {
+        conversation_id: convo.conversation_id.clone(),
+        group_id_hex: Some(convo.group_id.clone()),
+    });
+    alice
+        .orchestrator
+        .mls_context()
+        .delete_group(hex::decode(&convo.group_id).expect("group id"))
+        .expect("simulate MLS group deleted before crash");
+    alice
+        .storage
+        .delete_conversations(&alice.did, &[&convo.conversation_id])
+        .await
+        .expect("simulate conversation row deleted before crash");
+    assert!(alice.storage.has_group_state(&convo.group_id));
+
+    let (_restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+    assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    assert!(
+        !alice.storage.has_group_state(&convo.group_id),
+        "GroupNotFound replay must still delete the legacy group-id-keyed state row"
+    );
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_orphan_without_mapping_clears_stale_recovery_rows() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("legacy orphan recovery", None, None)
+        .await
+        .expect("create group");
+    let conversation_id = convo.conversation_id.clone();
+
+    alice.storage.seed_pending_local_delete(PendingLocalDelete {
+        conversation_id: conversation_id.clone(),
+        group_id_hex: Some(convo.group_id.clone()),
+    });
+    alice
+        .storage
+        .delete_conversations(&alice.did, &[&conversation_id])
+        .await
+        .expect("simulate mapping deleted before crash");
+    alice
+        .storage
+        .seed_recovery_backoff(PersistedRecoveryBackoff {
+            conversation_id: conversation_id.clone(),
+            failed_rejoin_count: 3,
+            last_attempt_at_ms: now_ms(),
+            quarantined_until_ms: Some(now_ms() + 60_000),
+        });
+    alice
+        .storage
+        .mark_quarantined(&conversation_id, "legacy-orphan", now_ms())
+        .await
+        .expect("seed quarantine");
+    alice
+        .storage
+        .mark_needs_rejoin(&conversation_id)
+        .await
+        .expect("seed rejoin");
+    alice
+        .storage
+        .mark_reset_pending(&conversation_id, &hex::encode(vec![0x7a; 32]), 11, now_ms())
+        .await
+        .expect("seed reset");
+
+    let (restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+
+    assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    assert!(
+        alice
+            .storage
+            .get_persisted_recovery_backoff(&conversation_id)
+            .is_none(),
+        "no-mapping legacy orphan replay must clear stale recovery backoff"
+    );
+    assert!(
+        alice
+            .storage
+            .get_persisted_quarantine(&conversation_id)
+            .is_none(),
+        "no-mapping legacy orphan replay must clear stale quarantine"
+    );
+    assert!(!alice.storage.has_rejoin_flag(&conversation_id));
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .is_none(),
+        "no-mapping legacy orphan replay must clear stale reset authority"
+    );
+    assert_eq!(
+        restarted
+            .recovery_tracker()
+            .lock()
+            .await
+            .failed_attempts(&conversation_id),
+        0,
+        "hydrated in-memory recovery state must also be forgotten"
+    );
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
 /// Normal force_delete_local path: intent is written and then cleared, so a
 /// healthy run leaves no pending rows behind.
 #[tokio::test(flavor = "multi_thread")]
@@ -585,6 +737,47 @@ async fn force_delete_local_clears_its_intent() {
             .unwrap()
             .is_none(),
         "stale conversation should be locally deleted by sync"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_pending_delete_intent_write_refuses_destructive_cleanup() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("intent write failure", None, None)
+        .await
+        .expect("create group");
+    let conversation_id = conversation.conversation_id.clone();
+    let group_id = hex::decode(&conversation.group_id).expect("group id");
+    alice.storage.fail_next_mark_pending_local_delete();
+    world
+        .delivery_service()
+        .remove_conversation_for_test(&conversation_id);
+
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("sync retains retryable local state");
+
+    assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    assert!(
+        alice.orchestrator.mls_context().group_exists(group_id),
+        "without a durable retry intent, local MLS secrets must not be deleted"
+    );
+    assert!(
+        alice
+            .storage
+            .get_conversation(&alice.did, &conversation_id)
+            .await
+            .expect("read conversation")
+            .is_some(),
+        "without a durable retry intent, the conversation mapping must remain discoverable"
     );
 }
 
@@ -772,9 +965,21 @@ async fn failing_clear_rejoin_flag_escalates_and_skips_tracker_clear() {
 /// failures to `DecryptionFailed`, so the Layer-3 peer-bad classifier can't
 /// be tripped through real crypto in-process; this mock drives the
 /// quarantine-entry path directly through `process_incoming`.
-struct PeerBadCrypto;
+struct FailingCrypto {
+    peer_bad: bool,
+}
 
-impl catbird_mls::orchestrator::MlsCryptoContext for PeerBadCrypto {
+impl FailingCrypto {
+    fn peer_bad() -> Self {
+        Self { peer_bad: true }
+    }
+
+    fn self_bad() -> Self {
+        Self { peer_bad: false }
+    }
+}
+
+impl catbird_mls::orchestrator::MlsCryptoContext for FailingCrypto {
     fn create_key_package(
         &self,
         _identity: Vec<u8>,
@@ -833,7 +1038,13 @@ impl catbird_mls::orchestrator::MlsCryptoContext for PeerBadCrypto {
         _group_id: Vec<u8>,
         _ciphertext: Vec<u8>,
     ) -> Result<catbird_mls::DecryptResult, catbird_mls::MLSError> {
-        Err(catbird_mls::MLSError::InvalidCommit)
+        if self.peer_bad {
+            Err(catbird_mls::MLSError::InvalidCommit)
+        } else {
+            Err(catbird_mls::MLSError::Internal(
+                "self-bad decrypt failure".into(),
+            ))
+        }
     }
     fn create_external_commit(
         &self,
@@ -890,7 +1101,7 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
     let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
 
     let orchestrator = MLSOrchestrator::new(
-        Arc::new(PeerBadCrypto),
+        Arc::new(FailingCrypto::peer_bad()),
         Arc::new(storage.clone()),
         Arc::new(ds.clone_as(did)),
         Arc::new(credentials.clone()),
@@ -950,7 +1161,7 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
         .is_none());
 
     let restarted = MLSOrchestrator::new(
-        Arc::new(PeerBadCrypto),
+        Arc::new(FailingCrypto::peer_bad()),
         Arc::new(storage.clone()),
         Arc::new(ds.clone_as(did)),
         Arc::new(credentials.clone()),
@@ -969,6 +1180,197 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantine_entry_projection_serializes_with_reset_authority() {
+    let did = "did:plc:alice";
+    let convo_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let storage = e2e_harness::mock_storage::MockStorage::new();
+    let credentials = e2e_harness::mock_credentials::MockCredentials::new();
+    let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
+    let orchestrator = MLSOrchestrator::new(
+        Arc::new(FailingCrypto::peer_bad()),
+        Arc::new(storage.clone()),
+        Arc::new(ds.clone_as(did)),
+        Arc::new(credentials),
+        OrchestratorConfig::default(),
+    );
+    orchestrator.initialize(did).await.expect("initialize");
+    storage
+        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .await
+        .expect("seed conversation");
+
+    for i in 0..2 {
+        let _ = orchestrator
+            .process_incoming(&IncomingEnvelope {
+                conversation_id: convo_id.clone(),
+                sender_did: "did:plc:mallory".to_string(),
+                ciphertext: format!("entry-race-{i}").into_bytes(),
+                timestamp: chrono::Utc::now(),
+                server_message_id: Some(format!("entry-race-{i}")),
+                server_epoch: None,
+            })
+            .await;
+    }
+    let state_barrier = storage.pause_next_conversation_state_write_any(&convo_id);
+    let third_frame = IncomingEnvelope {
+        conversation_id: convo_id.clone(),
+        sender_did: "did:plc:mallory".to_string(),
+        ciphertext: b"entry-race-2".to_vec(),
+        timestamp: chrono::Utc::now(),
+        server_message_id: Some("entry-race-2".to_string()),
+        server_epoch: None,
+    };
+    let enter = orchestrator.process_incoming(&third_frame);
+    let reset = async {
+        state_barrier.wait_until_entered().await;
+        let mut recording =
+            Box::pin(orchestrator.record_group_reset_with_outcome(&convo_id, vec![0x7c; 16], 20));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording)
+                .await
+                .is_err(),
+            "reset must wait while quarantine entry owns the transition gate"
+        );
+        state_barrier.release();
+        recording.await
+    };
+    let (_, reset_result) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(enter, reset)
+    })
+    .await
+    .expect("quarantine entry race timed out");
+    assert_eq!(
+        reset_result.expect("record reset"),
+        ResetRecordOutcome::Recorded
+    );
+    assert_eq!(
+        storage
+            .get_persisted_reset_pending(&convo_id)
+            .expect("reset remains authoritative")
+            .reset_generation,
+        20
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quarantine_exit_projection_serializes_with_reset_authority() {
+    let did = "did:plc:alice";
+    let convo_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    let storage = e2e_harness::mock_storage::MockStorage::new();
+    let credentials = e2e_harness::mock_credentials::MockCredentials::new();
+    let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
+    let orchestrator = MLSOrchestrator::new(
+        Arc::new(FailingCrypto::peer_bad()),
+        Arc::new(storage.clone()),
+        Arc::new(ds.clone_as(did)),
+        Arc::new(credentials),
+        OrchestratorConfig::default(),
+    );
+    orchestrator.initialize(did).await.expect("initialize");
+    storage
+        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .await
+        .expect("seed conversation");
+    for i in 0..3 {
+        let _ = orchestrator
+            .process_incoming(&IncomingEnvelope {
+                conversation_id: convo_id.clone(),
+                sender_did: "did:plc:mallory".to_string(),
+                ciphertext: format!("exit-race-{i}").into_bytes(),
+                timestamp: chrono::Utc::now(),
+                server_message_id: Some(format!("exit-race-{i}")),
+                server_epoch: None,
+            })
+            .await;
+    }
+    let state_barrier =
+        storage.pause_next_conversation_state_write(&convo_id, ConversationState::Active);
+    let exit = orchestrator.user_confirmed_manual_reset(&convo_id);
+    let reset = async {
+        state_barrier.wait_until_entered().await;
+        let mut recording =
+            Box::pin(orchestrator.record_group_reset_with_outcome(&convo_id, vec![0x7d; 16], 21));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording)
+                .await
+                .is_err(),
+            "reset must wait while quarantine exit owns the transition gate"
+        );
+        state_barrier.release();
+        recording.await
+    };
+    let (exit_result, reset_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(exit, reset)
+        })
+        .await
+        .expect("quarantine exit race timed out");
+    exit_result.expect("exit quarantine");
+    assert_eq!(
+        reset_result.expect("record reset"),
+        ResetRecordOutcome::Recorded
+    );
+    assert_eq!(
+        storage
+            .get_persisted_reset_pending(&convo_id)
+            .expect("reset remains authoritative")
+            .reset_generation,
+        21
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decrypt_failure_projection_preserves_reset_authority() {
+    let did = "did:plc:alice";
+    let convo_id = "cccccccccccccccccccccccccccccccc".to_string();
+    let storage = e2e_harness::mock_storage::MockStorage::new();
+    let credentials = e2e_harness::mock_credentials::MockCredentials::new();
+    let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
+    let orchestrator = MLSOrchestrator::new(
+        Arc::new(FailingCrypto::self_bad()),
+        Arc::new(storage.clone()),
+        Arc::new(ds.clone_as(did)),
+        Arc::new(credentials),
+        OrchestratorConfig::default(),
+    );
+    orchestrator.initialize(did).await.expect("initialize");
+    storage
+        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .await
+        .expect("seed conversation");
+    orchestrator
+        .record_group_reset(&convo_id, vec![0x7e; 16], 22)
+        .await
+        .expect("record reset");
+
+    for i in 0..3 {
+        let _ = orchestrator
+            .process_incoming(&IncomingEnvelope {
+                conversation_id: convo_id.clone(),
+                sender_did: "did:plc:mallory".to_string(),
+                ciphertext: format!("self-bad-{i}").into_bytes(),
+                timestamp: chrono::Utc::now(),
+                server_message_id: Some(format!("self-bad-{i}")),
+                server_epoch: None,
+            })
+            .await;
+    }
+
+    assert!(matches!(
+        orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&convo_id),
+        Some(ConversationState::ResetPending {
+            reset_generation: 22,
+            ..
+        })
+    ));
+    assert!(storage.has_rejoin_flag(&convo_id));
+}
+
 /// R-2 (E7 follow-up): quarantine state persists are recovery-critical —
 /// `enter_quarantine` / `exit_quarantine` write failures must escalate
 /// through `report_recovery_storage_failure` (event observer + error_log),
@@ -985,7 +1387,7 @@ async fn failing_quarantine_persists_escalate() {
     let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
 
     let orchestrator = MLSOrchestrator::new(
-        Arc::new(PeerBadCrypto),
+        Arc::new(FailingCrypto::peer_bad()),
         Arc::new(storage.clone()),
         Arc::new(ds.clone_as(did)),
         Arc::new(credentials.clone()),
@@ -1167,6 +1569,83 @@ async fn reset_authority_read_failure_keeps_delete_intent_and_committed_reset() 
             .reset_generation,
         2
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_delete_generation_mismatch_keeps_intent_then_retry_clears_without_active() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("generation mismatch delete retry", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    alice
+        .orchestrator
+        .record_group_reset(&convo_id, vec![0xcd; 16], 7)
+        .await
+        .expect("commit reset authority");
+    world
+        .delivery_service()
+        .remove_conversation_for_test(&convo_id);
+    alice
+        .storage
+        .force_next_clear_reset_pending_for_delete_false();
+
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("first delete pass should retain retry intent");
+    assert_eq!(alice.storage.pending_local_delete_count(), 1);
+    assert_eq!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&convo_id)
+            .expect("mismatched delete CAS must preserve reset authority")
+            .reset_generation,
+        7
+    );
+    assert!(
+        !matches!(
+            alice
+                .storage
+                .get_conversation_state(&convo_id)
+                .await
+                .expect("durable reset remains readable"),
+            Some(ConversationState::Active)
+        ),
+        "delete-specific reset cleanup must never project Active"
+    );
+
+    let (_restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+    assert_eq!(
+        alice.storage.pending_local_delete_count(),
+        0,
+        "startup retry must clear the exact reset generation and delete intent"
+    );
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&convo_id)
+            .is_none(),
+        "retry must remove the committed reset payload"
+    );
+    assert!(
+        alice
+            .storage
+            .get_conversation(&alice.did, &convo_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "retry must leave the conversation deleted, not Active"
+    );
+    let _ = std::fs::remove_dir_all(temp_dir);
 }
 
 /// FIX-6: force_delete_local must also delete the conversation's recovery

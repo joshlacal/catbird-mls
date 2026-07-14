@@ -601,6 +601,16 @@ async fn fork_readd_resolves_rotated_stable_conversation_to_active_group() {
         .delivery_service()
         .rekey_conversation_for_test(&group_id, &stable_conversation_id);
     alice
+        .storage
+        .ensure_conversation_exists(&alice.did, &stable_conversation_id, &group_id)
+        .await
+        .expect("migrate stable conversation storage row");
+    alice
+        .storage
+        .set_conversation_state(&stable_conversation_id, ConversationState::Active)
+        .await
+        .expect("persist migrated stable conversation as Active");
+    alice
         .orchestrator
         .sync_with_server(false)
         .await

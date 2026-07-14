@@ -91,9 +91,11 @@ pub trait OrchestratorStorageCallback: Send + Sync {
     /// - `reset_generation`: monotonic reset counter from the DS.
     /// - `notified_at_ms`: Unix millis when the notification was observed.
     ///
-    /// The Rust trait (`MLSStorageBackend::mark_reset_pending`) provides a
-    /// no-op default; platforms that haven't adopted the payload may keep the
-    /// generated callback stub empty and the behavior is unchanged.
+    /// This callback is mandatory. It is the sole authority-publication commit
+    /// point and must atomically persist the state tag, complete tuple, and
+    /// `needs_rejoin = true`, rejecting stale generations while preserving the
+    /// old durable group mapping for restart-safe predecessor cleanup. Missing
+    /// support fails closed.
     fn mark_reset_pending(
         &self,
         conversation_id: String,
@@ -102,13 +104,23 @@ pub trait OrchestratorStorageCallback: Send + Sync {
         notified_at_ms: i64,
     ) -> Result<(), OrchestratorBridgeError>;
 
-    /// Clear any persisted `RESET_PENDING` payload after the conversation has
-    /// successfully adopted the new group.
-    fn clear_reset_pending(
+    /// Atomically complete an exact reset generation and target: project the
+    /// durable group mapping to that target, clear its payload, project durable
+    /// Active, and clear the durable rejoin flag.
+    fn complete_reset_pending(
         &self,
         conversation_id: String,
-        expected_generation: Option<i32>,
-    ) -> Result<(), OrchestratorBridgeError>;
+        expected_generation: i32,
+        expected_new_group_id_hex: String,
+    ) -> Result<bool, OrchestratorBridgeError>;
+
+    /// Clear an exact reset generation for local deletion without projecting
+    /// Active.
+    fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: String,
+        expected_generation: i32,
+    ) -> Result<bool, OrchestratorBridgeError>;
 
     fn mark_quarantined(
         &self,
@@ -1228,6 +1240,15 @@ impl From<OrchestratorError> for OrchestratorBridgeError {
             OrchestratorError::RecoveryFailed(s) => {
                 OrchestratorBridgeError::RecoveryFailed { message: s }
             }
+            OrchestratorError::ResetCompletionNotCommitted {
+                convo_id,
+                reset_generation,
+                reason,
+            } => OrchestratorBridgeError::RecoveryFailed {
+                message: format!(
+                    "Reset completion not committed for conversation {convo_id}, generation {reset_generation}: {reason}"
+                ),
+            },
             OrchestratorError::InvalidInput(s) => {
                 OrchestratorBridgeError::InvalidInput { message: s }
             }
@@ -1606,11 +1627,9 @@ impl MLSStorageBackend for StorageAdapter {
         conversation_id: &str,
         state: ConversationState,
     ) -> crate::orchestrator::Result<()> {
-        // The UniFFI bridge carries only the state *tag* across the boundary.
-        // For the `ResetPending` variant the full payload (new_group_id,
-        // reset_generation, notified_at_ms) is forwarded separately via
-        // `mark_reset_pending`; `persist_reset_pending_state` in `recovery.rs`
-        // is the call site that invokes both in sequence.
+        // This general projection callback never publishes ResetPending.
+        // `mark_reset_pending` is the sole atomic tag + payload + rejoin-route
+        // publication operation for that security authority.
         self.0
             .set_conversation_state(conversation_id.to_string(), state.tag().to_string())
             .map_err(bridge_err)
@@ -1644,13 +1663,28 @@ impl MLSStorageBackend for StorageAdapter {
             .map_err(bridge_err)
     }
 
-    async fn clear_reset_pending(
+    async fn complete_reset_pending(
         &self,
         conversation_id: &str,
-        expected_generation: Option<i32>,
-    ) -> crate::orchestrator::Result<()> {
+        expected_generation: i32,
+        expected_new_group_id_hex: &str,
+    ) -> crate::orchestrator::Result<bool> {
         self.0
-            .clear_reset_pending(conversation_id.to_string(), expected_generation)
+            .complete_reset_pending(
+                conversation_id.to_string(),
+                expected_generation,
+                expected_new_group_id_hex.to_string(),
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+    ) -> crate::orchestrator::Result<bool> {
+        self.0
+            .clear_reset_pending_for_delete(conversation_id.to_string(), expected_generation)
             .map_err(bridge_err)
     }
 
@@ -1682,7 +1716,8 @@ impl MLSStorageBackend for StorageAdapter {
         &[
             "get_conversation_state",
             "mark_reset_pending",
-            "clear_reset_pending",
+            "complete_reset_pending",
+            "clear_reset_pending_for_delete",
             "mark_quarantined",
             "clear_quarantine",
             "store_pending_message",
@@ -2770,7 +2805,17 @@ impl OrchestratorBridge {
         group_id: String,
         member_dids: Vec<String>,
     ) -> Result<(), OrchestratorBridgeError> {
-        crate::async_runtime::block_on(self.inner.add_members(&group_id, &member_dids))?;
+        // The exported parameter name is retained for ABI compatibility with
+        // legacy callers that still pass the mutable MLS group id.
+        crate::async_runtime::block_on(async {
+            let resolved = self
+                .inner
+                .resolve_legacy_group_identifier(&group_id)
+                .await?;
+            self.inner
+                .add_members(&resolved.conversation_id, &member_dids)
+                .await
+        })?;
         Ok(())
     }
 
@@ -2796,7 +2841,17 @@ impl OrchestratorBridge {
         group_id: String,
         member_dids: Vec<String>,
     ) -> Result<(), OrchestratorBridgeError> {
-        crate::async_runtime::block_on(self.inner.remove_members(&group_id, &member_dids))?;
+        // The exported parameter name is retained for ABI compatibility with
+        // legacy callers that still pass the mutable MLS group id.
+        crate::async_runtime::block_on(async {
+            let resolved = self
+                .inner
+                .resolve_legacy_group_identifier(&group_id)
+                .await?;
+            self.inner
+                .remove_members(&resolved.conversation_id, &member_dids)
+                .await
+        })?;
         Ok(())
     }
 
@@ -2823,11 +2878,17 @@ impl OrchestratorBridge {
         remove_dids: Vec<String>,
         add_dids: Vec<String>,
     ) -> Result<(), OrchestratorBridgeError> {
-        crate::async_runtime::block_on(self.inner.swap_members(
-            &group_id,
-            &remove_dids,
-            &add_dids,
-        ))?;
+        // The exported parameter name is retained for ABI compatibility with
+        // legacy callers that still pass the mutable MLS group id.
+        crate::async_runtime::block_on(async {
+            let resolved = self
+                .inner
+                .resolve_legacy_group_identifier(&group_id)
+                .await?;
+            self.inner
+                .swap_members(&resolved.conversation_id, &remove_dids, &add_dids)
+                .await
+        })?;
         Ok(())
     }
 
@@ -3334,8 +3395,8 @@ impl OrchestratorBridge {
     /// This method no longer performs an inline `join_or_rejoin`: the
     /// orchestrator transitions the conversation to `RESET_PENDING`, persists
     /// the payload via `mark_reset_pending`, deletes the old local MLS group,
-    /// clears per-conversation recovery trackers, rebinds the group id, and
-    /// flags `needs_rejoin`. The deferred-recovery loop driven by
+    /// atomically arms `needs_rejoin`, clears per-conversation recovery
+    /// trackers, and rebinds the group id. The deferred-recovery loop driven by
     /// `sync_with_server` performs the actual rejoin on the next cycle —
     /// inline External Commits from event paths are the production
     /// epoch-inflation pattern (spec §8.5).
@@ -3901,7 +3962,8 @@ mod tests {
         pending_messages: Mutex<std::collections::HashSet<String>>,
         receipts: Mutex<Vec<FFISequencerReceipt>>,
         reset_payload: Mutex<Option<(String, String, i32, i64)>>,
-        reset_clear_requests: Mutex<Vec<(String, Option<i32>)>>,
+        reset_clear_requests: Mutex<Vec<(String, Option<i32>, Option<String>)>>,
+        reset_clear_applied: std::sync::atomic::AtomicBool,
         quarantine_payload: Mutex<Option<(String, String, i64)>>,
         fail_security_writes: std::sync::atomic::AtomicBool,
     }
@@ -3994,17 +4056,33 @@ mod tests {
             ));
             Ok(())
         }
-        fn clear_reset_pending(
+        fn complete_reset_pending(
             &self,
             conversation_id: String,
-            expected_generation: Option<i32>,
-        ) -> Result<(), OrchestratorBridgeError> {
+            expected_generation: i32,
+            expected_new_group_id_hex: String,
+        ) -> Result<bool, OrchestratorBridgeError> {
             self.reject_injected_security_failure()?;
-            self.reset_clear_requests
-                .lock()
-                .unwrap()
-                .push((conversation_id, expected_generation));
-            Ok(())
+            self.reset_clear_requests.lock().unwrap().push((
+                conversation_id,
+                Some(expected_generation),
+                Some(expected_new_group_id_hex),
+            ));
+            Ok(self.reset_clear_applied.load(Ordering::SeqCst))
+        }
+
+        fn clear_reset_pending_for_delete(
+            &self,
+            conversation_id: String,
+            expected_generation: i32,
+        ) -> Result<bool, OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
+            self.reset_clear_requests.lock().unwrap().push((
+                conversation_id,
+                Some(expected_generation),
+                None,
+            ));
+            Ok(self.reset_clear_applied.load(Ordering::SeqCst))
         }
         fn mark_quarantined(
             &self,
@@ -4982,7 +5060,11 @@ mod tests {
                     Err(OrchestratorError::Storage(_))
                 ));
                 assert_storage_failure(adapter.clear_sequencer_receipts("convo").await);
-                assert_storage_failure(adapter.clear_reset_pending("convo", Some(1)).await);
+                assert!(matches!(
+                    adapter.complete_reset_pending("convo", 1, "target").await,
+                    Err(OrchestratorError::Storage(message))
+                        if message == "injected storage failure"
+                ));
                 assert_storage_failure(adapter.clear_quarantine("convo").await);
                 assert_storage_failure(adapter.clear_recovery_backoff("convo").await);
                 assert_storage_failure(adapter.clear_pending_local_delete("convo").await);
@@ -4991,7 +5073,7 @@ mod tests {
     }
 
     #[test]
-    fn both_storage_adapters_forward_reset_clear_generation_exactly() {
+    fn both_storage_adapters_forward_reset_outcomes_and_generations_exactly() {
         crate::async_runtime::block_on(async {
             let callback = Arc::new(RecordingStorageCallback::default());
             let adapters: Vec<Box<dyn MLSStorageBackend>> = vec![
@@ -4999,20 +5081,21 @@ mod tests {
                 Box::new(crate::client_bridge::ClientStorageAdapter(callback.clone())),
             ];
 
-            adapters[0]
-                .clear_reset_pending("convo-a", Some(7))
+            assert!(!adapters[0]
+                .complete_reset_pending("convo-a", 7, "target-a")
                 .await
-                .expect("orchestrator adapter clear");
-            adapters[1]
-                .clear_reset_pending("convo-b", None)
+                .expect("orchestrator adapter false completion"));
+            callback.reset_clear_applied.store(true, Ordering::SeqCst);
+            assert!(adapters[1]
+                .clear_reset_pending_for_delete("convo-b", 8)
                 .await
-                .expect("client adapter rollback clear");
+                .expect("client adapter true delete clear"));
 
             assert_eq!(
                 callback.reset_clear_requests.lock().unwrap().as_slice(),
                 &[
-                    ("convo-a".to_string(), Some(7)),
-                    ("convo-b".to_string(), None),
+                    ("convo-a".to_string(), Some(7), Some("target-a".to_string())),
+                    ("convo-b".to_string(), Some(8), None),
                 ]
             );
         });
@@ -5165,6 +5248,183 @@ mod tests {
             1,
             "OrchestratorBridge.joinOrRejoin must call MLSOrchestrator::join_or_rejoin, whose first step probes Welcome"
         );
+    }
+
+    #[test]
+    fn legacy_group_id_member_mutation_entry_points_reach_post_reset_stable_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mls_context = MLSContext::new(
+            dir.path()
+                .join("bridge-legacy-group-id-after-reset.sqlite")
+                .to_string_lossy()
+                .to_string(),
+            "bridge-legacy-group-id-after-reset-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let stable_conversation_id = "stable-conversation-after-reset";
+        let predecessor_group_id = "11".repeat(32);
+        let reset_target_group_id = "22".repeat(32);
+        let storage = RecordingStorageCallback::default();
+        storage.conversation_states.lock().unwrap().insert(
+            stable_conversation_id.into(),
+            FFIConversationState {
+                state: "reset_pending".into(),
+                new_group_id: Some(reset_target_group_id.clone()),
+                reset_generation: Some(7),
+                notified_at_ms: Some(1_700_000_000_000),
+                quarantine_reason: None,
+                quarantined_since_ms: None,
+            },
+        );
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(storage),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            full_security_capabilities(),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        )
+        .expect("bridge construction");
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("bridge initialize");
+
+        crate::async_runtime::block_on(async {
+            bridge.inner.conversations().lock().await.insert(
+                stable_conversation_id.into(),
+                ConversationView {
+                    group_id: predecessor_group_id,
+                    conversation_id: stable_conversation_id.into(),
+                    epoch: 3,
+                    members: vec![],
+                    metadata: None,
+                    sequencer_did: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+            );
+            bridge.inner.conversation_states().lock().await.insert(
+                stable_conversation_id.into(),
+                ConversationState::ResetPending {
+                    new_group_id: reset_target_group_id.clone(),
+                    reset_generation: 7,
+                    notified_at_ms: 1_700_000_000_000,
+                },
+            );
+        });
+
+        let results = [
+            (
+                "add_members",
+                bridge.add_members(reset_target_group_id.clone(), vec![]),
+            ),
+            (
+                "remove_members",
+                bridge.remove_members(reset_target_group_id.clone(), vec![]),
+            ),
+            (
+                "swap_members",
+                bridge.swap_members(reset_target_group_id.clone(), vec![], vec![]),
+            ),
+        ];
+        for (operation, result) in results {
+            assert!(
+                matches!(
+                    result,
+                    Err(OrchestratorBridgeError::Mls { message })
+                        if message.contains(&reset_target_group_id)
+                ),
+                "{operation} must translate the documented post-reset group_id to its stable conversation and reach the target MLS group before failing on this intentionally unmaterialized fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_group_id_bridge_rejects_stable_id_collision_with_another_current_group() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mls_context = MLSContext::new(
+            dir.path()
+                .join("bridge-legacy-group-id-ambiguity.sqlite")
+                .to_string_lossy()
+                .to_string(),
+            "bridge-legacy-group-id-ambiguity-test-key".to_string(),
+            Box::new(RecordingKeychain::default()),
+        )
+        .expect("test MLSContext");
+        let bridge = OrchestratorBridge::new(
+            mls_context,
+            Box::new(RecordingStorageCallback::default()),
+            Box::new(WelcomeCountingApiCallback::new(
+                "did:plc:alice",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(RecordingCredentialCallback::default()),
+            full_security_capabilities(),
+            FFIOrchestratorConfig {
+                max_devices: 5,
+                target_key_package_count: 1,
+                key_package_replenish_threshold: 1,
+                sync_cooldown_seconds: 0,
+                max_consecutive_sync_failures: 3,
+                sync_pause_duration_seconds: 1,
+                rejoin_cooldown_seconds: 0,
+                max_rejoin_attempts: 3,
+            },
+        )
+        .expect("bridge construction");
+        bridge
+            .initialize("did:plc:alice".to_string())
+            .expect("bridge initialize");
+
+        let colliding_identifier = "33".repeat(32);
+        crate::async_runtime::block_on(async {
+            let mut conversations = bridge.inner.conversations().lock().await;
+            conversations.insert(
+                colliding_identifier.clone(),
+                ConversationView {
+                    group_id: "44".repeat(32),
+                    conversation_id: colliding_identifier.clone(),
+                    epoch: 1,
+                    members: vec![],
+                    metadata: None,
+                    sequencer_did: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+            );
+            conversations.insert(
+                "other-stable-conversation".into(),
+                ConversationView {
+                    group_id: colliding_identifier.clone(),
+                    conversation_id: "other-stable-conversation".into(),
+                    epoch: 1,
+                    members: vec![],
+                    metadata: None,
+                    sequencer_did: None,
+                    created_at: None,
+                    updated_at: None,
+                },
+            );
+        });
+
+        assert!(matches!(
+            bridge.add_members(colliding_identifier, vec![]),
+            Err(OrchestratorBridgeError::InvalidInput { message })
+                if message.contains("resolves to 2 stable conversations")
+        ));
     }
 
     #[test]

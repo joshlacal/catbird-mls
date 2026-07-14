@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use tokio::sync::Mutex;
@@ -107,6 +107,9 @@ where
     own_commits: Mutex<HashMap<Vec<u8>, Instant>>,
     /// Groups currently being created (protect from sync deletion).
     groups_being_created: Mutex<HashSet<GroupId>>,
+    /// Monotonic version incremented when creation protection starts or ends.
+    /// Sync uses this to reject stale server/local reconciliation snapshots.
+    creation_generation: AtomicU64,
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
     /// Sync state lock.
@@ -234,6 +237,7 @@ where
             pending_messages: Mutex::new(HashSet::new()),
             own_commits: Mutex::new(HashMap::new()),
             groups_being_created: Mutex::new(HashSet::new()),
+            creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
             sync_in_progress: Mutex::new(false),
             consecutive_sync_failures: Mutex::new(0),
@@ -275,18 +279,18 @@ where
             user_did: user_did.to_string(),
         };
 
-        // WS-5.6: capabilities check — make default no-op storage methods
-        // observable so silently-dropped state (e.g. `mark_reset_pending`
-        // dropping RESET_PENDING across restart) shows up in logs.
+        // WS-5.6: capabilities check — make default storage methods
+        // observable. Security-authority defaults fail closed; legacy
+        // best-effort defaults may still discard state.
         {
             let implemented = self.storage.implemented_optional_methods();
             for method in super::storage::OPTIONAL_STORAGE_METHODS {
                 if !implemented.contains(method) {
                     tracing::warn!(
                         method,
-                        "Storage backend does not declare an override for optional trait \
-                         method — if it is still the default no-op, state routed through \
-                         it is silently dropped (declare via implemented_optional_methods)"
+                        "Storage backend does not declare an override for a defaulted trait \
+                         method — security methods may fail closed and legacy methods may \
+                         discard state (declare via implemented_optional_methods)"
                     );
                 }
             }
@@ -345,9 +349,8 @@ where
         // sync; we only need to recover the persisted state tag + payload
         // (`ResetPending { new_group_id, reset_generation, notified_at_ms }`,
         // `NeedsRejoin`, etc.) so deferred recovery can pick up where it
-        // left off across app restart. Backends that don't override
-        // `get_conversation_state` will return `None` here and the in-memory
-        // map starts empty — same behavior as before this hook existed.
+        // left off across app restart. The read callback is mandatory; missing
+        // or malformed support aborts initialization closed.
         match self.storage.list_conversations(user_did).await {
             Ok(convos) => {
                 let mut states = self.conversation_states.lock().await;
@@ -512,6 +515,18 @@ where
         }
     }
 
+    /// Read the lifecycle-bound user for destructive cleanup that may resume
+    /// during `initialize` before the public authenticated state becomes
+    /// Ready. Callers must already hold the lifecycle/transition ownership
+    /// that prevents account rebinding during the cleanup.
+    pub(crate) async fn cleanup_user_did(&self) -> Result<String> {
+        match &*self.lifecycle_state.lock().await {
+            OrchestratorLifecycleState::Initializing { user_did }
+            | OrchestratorLifecycleState::Ready { user_did } => Ok(user_did.clone()),
+            _ => Err(OrchestratorError::NotAuthenticated),
+        }
+    }
+
     /// Check if the orchestrator is shutting down, returning an error if so.
     pub(crate) async fn check_shutdown(&self) -> Result<()> {
         match &*self.lifecycle_state.lock().await {
@@ -609,6 +624,10 @@ where
     /// Access the groups being created set.
     pub fn groups_being_created(&self) -> &Mutex<HashSet<GroupId>> {
         &self.groups_being_created
+    }
+
+    pub(crate) fn creation_generation(&self) -> &AtomicU64 {
+        &self.creation_generation
     }
 
     /// Acquire the per-conversation join/rejoin lock object.

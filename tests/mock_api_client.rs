@@ -5,7 +5,7 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -81,6 +81,15 @@ struct MockState {
     /// Conversations by ID.
     conversations: HashMap<String, StoredConversation>,
 
+    /// Optional stable conversation id returned by the next create. This lets
+    /// concurrency tests model servers where stable conversation ids differ
+    /// from mutable MLS group ids from the first response onward.
+    next_create_conversation_id: Option<String>,
+
+    /// Conversations temporarily omitted from get_conversations, modeling the
+    /// visibility gap between createConvo acceptance and list projection.
+    hidden_conversation_ids: HashSet<String>,
+
     /// Messages per conversation, in insertion order.
     messages: HashMap<String, Vec<StoredMessage>>,
 
@@ -98,8 +107,17 @@ struct MockState {
     get_welcome_calls: HashMap<String, u32>,
     /// Number of external commits processed per conversation.
     external_commit_counts: HashMap<String, u32>,
+    /// Number of generic commit submissions per conversation and action.
+    commit_group_change_counts: HashMap<(String, String), u32>,
     /// Number of bootstrap_reset_group attempts per conversation.
     bootstrap_reset_group_calls: HashMap<String, u32>,
+    /// Whether bootstrap_reset_group returns a successful race-winner result.
+    bootstrap_reset_group_succeeds: bool,
+    /// After one accepted bootstrap, return authoritative AlreadyBootstrapped
+    /// on later retries for the same conversation.
+    bootstrap_already_bootstrapped_after_success: bool,
+    /// Artificial delay for bootstrap_reset_group concurrency tests.
+    bootstrap_reset_group_delay_ms: u64,
     /// Artificial delay for process_external_commit (used by concurrency tests).
     process_external_commit_delay_ms: u64,
 
@@ -155,8 +173,26 @@ struct MockState {
 #[derive(Debug, Clone)]
 pub struct MockDeliveryService {
     state: Arc<Mutex<MockState>>,
+    publish_group_info_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
+    get_conversations_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     /// Per-instance DID override (allows multiple clients to share one mock server).
     instance_did: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct PublishGroupInfoGate {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl PublishGroupInfoGate {
+    pub async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl MockDeliveryService {
@@ -168,6 +204,8 @@ impl MockDeliveryService {
         };
         Self {
             state: Arc::new(Mutex::new(state)),
+            publish_group_info_gate: Arc::new(Mutex::new(None)),
+            get_conversations_gate: Arc::new(Mutex::new(None)),
             instance_did: None,
         }
     }
@@ -177,8 +215,37 @@ impl MockDeliveryService {
     pub fn clone_as(&self, did: &str) -> Self {
         MockDeliveryService {
             state: Arc::clone(&self.state),
+            publish_group_info_gate: Arc::clone(&self.publish_group_info_gate),
+            get_conversations_gate: Arc::clone(&self.get_conversations_gate),
             instance_did: Some(did.to_string()),
         }
+    }
+
+    pub fn set_next_create_conversation_id(&self, conversation_id: &str) {
+        self.state.lock().unwrap().next_create_conversation_id = Some(conversation_id.to_string());
+    }
+
+    pub fn set_conversation_hidden_from_list(&self, conversation_id: &str, hidden: bool) {
+        let mut state = self.state.lock().unwrap();
+        if hidden {
+            state
+                .hidden_conversation_ids
+                .insert(conversation_id.to_string());
+        } else {
+            state.hidden_conversation_ids.remove(conversation_id);
+        }
+    }
+
+    pub fn pause_next_publish_group_info(&self) -> Arc<PublishGroupInfoGate> {
+        let gate = Arc::new(PublishGroupInfoGate::default());
+        *self.publish_group_info_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub fn pause_next_get_conversations(&self) -> Arc<PublishGroupInfoGate> {
+        let gate = Arc::new(PublishGroupInfoGate::default());
+        *self.get_conversations_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
     }
 
     /// Get the effective DID for this instance.
@@ -456,6 +523,16 @@ impl MockDeliveryService {
             .unwrap_or(0)
     }
 
+    pub fn commit_group_change_count(&self, convo_id: &str, action: &str) -> u32 {
+        self.state
+            .lock()
+            .unwrap()
+            .commit_group_change_counts
+            .get(&(convo_id.to_string(), action.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Number of get_group_info calls for a conversation.
     pub fn get_group_info_call_count(&self, convo_id: &str) -> u32 {
         self.state
@@ -486,6 +563,21 @@ impl MockDeliveryService {
             .get(convo_id)
             .copied()
             .unwrap_or(0)
+    }
+
+    pub fn set_bootstrap_reset_group_success(&self, succeeds: bool) {
+        self.state.lock().unwrap().bootstrap_reset_group_succeeds = succeeds;
+    }
+
+    pub fn set_bootstrap_already_bootstrapped_after_success(&self, enabled: bool) {
+        self.state
+            .lock()
+            .unwrap()
+            .bootstrap_already_bootstrapped_after_success = enabled;
+    }
+
+    pub fn set_bootstrap_reset_group_delay_ms(&self, delay_ms: u64) {
+        self.state.lock().unwrap().bootstrap_reset_group_delay_ms = delay_ms;
     }
 
     pub fn clear_group_info_for_test(&self, convo_id: &str) {
@@ -572,44 +664,57 @@ impl MLSAPIClient for MockDeliveryService {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
-        let mut guard = self.state.lock().unwrap();
-        check_fail(
-            &mut guard.failures.fail_next_get_conversations,
-            "injected get_conversations failure",
-        )?;
-        if guard.failures.fail_get_conversations_count > 0 {
-            guard.failures.fail_get_conversations_count -= 1;
-            return Err(OrchestratorError::Api(
-                "injected get_conversations failure (counted)".to_string(),
-            ));
-        }
-        let did = self
-            .effective_did_from_guard(&guard)
-            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let result = {
+            let mut guard = self.state.lock().unwrap();
+            check_fail(
+                &mut guard.failures.fail_next_get_conversations,
+                "injected get_conversations failure",
+            )?;
+            if guard.failures.fail_get_conversations_count > 0 {
+                guard.failures.fail_get_conversations_count -= 1;
+                return Err(OrchestratorError::Api(
+                    "injected get_conversations failure (counted)".to_string(),
+                ));
+            }
+            let did = self
+                .effective_did_from_guard(&guard)
+                .ok_or(OrchestratorError::NotAuthenticated)?;
 
-        // Return conversations where the authenticated DID is a member.
-        let mut all: Vec<ConversationView> = guard
-            .conversations
-            .values()
-            .filter(|c| c.members.contains(&did))
-            .map(|c| c.view.clone())
-            .collect();
-        all.sort_by_key(|c| c.created_at);
+            // Return conversations where the authenticated DID is a member.
+            let mut all: Vec<ConversationView> = guard
+                .conversations
+                .values()
+                .filter(|c| {
+                    c.members.contains(&did)
+                        && !guard
+                            .hidden_conversation_ids
+                            .contains(&c.view.conversation_id)
+                })
+                .map(|c| c.view.clone())
+                .collect();
+            all.sort_by_key(|c| c.created_at);
 
-        // Cursor-based pagination: cursor is the index (stringified).
-        let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
-        let end = (start + limit as usize).min(all.len());
-        let page = all[start..end].to_vec();
-        let next_cursor = if end < all.len() {
-            Some(end.to_string())
-        } else {
-            None
+            // Cursor-based pagination: cursor is the index (stringified).
+            let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+            let end = (start + limit as usize).min(all.len());
+            let page = all[start..end].to_vec();
+            let next_cursor = if end < all.len() {
+                Some(end.to_string())
+            } else {
+                None
+            };
+
+            ConversationListPage {
+                conversations: page,
+                cursor: next_cursor,
+            }
         };
-
-        Ok(ConversationListPage {
-            conversations: page,
-            cursor: next_cursor,
-        })
+        let gate = self.get_conversations_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(result)
     }
 
     async fn create_conversation(
@@ -653,9 +758,13 @@ impl MLSAPIClient for MockDeliveryService {
             })
             .collect();
 
+        let conversation_id = guard
+            .next_create_conversation_id
+            .take()
+            .unwrap_or_else(|| group_id.to_string());
         let view = ConversationView {
             group_id: group_id.to_string(),
-            conversation_id: group_id.to_string(),
+            conversation_id: conversation_id.clone(),
             epoch: 1,
             members: member_views,
             metadata: metadata.cloned(),
@@ -669,8 +778,8 @@ impl MLSAPIClient for MockDeliveryService {
             members: members.clone(),
         };
 
-        guard.conversations.insert(group_id.to_string(), stored);
-        guard.messages.entry(group_id.to_string()).or_default();
+        guard.conversations.insert(conversation_id.clone(), stored);
+        guard.messages.entry(conversation_id.clone()).or_default();
 
         // Fan out the Welcome (if provided) to each initial member so they can
         // later pull it via `get_welcome`. Also store the commit as a message
@@ -681,7 +790,7 @@ impl MLSAPIClient for MockDeliveryService {
                 for recipient in extra {
                     guard
                         .welcomes
-                        .entry((group_id.to_string(), recipient.clone()))
+                        .entry((conversation_id.clone(), recipient.clone()))
                         .or_default()
                         .push(w.to_vec());
                 }
@@ -690,16 +799,12 @@ impl MLSAPIClient for MockDeliveryService {
         if let Some(c) = commit_data {
             let msg = StoredMessage {
                 id: Uuid::new_v4().to_string(),
-                conversation_id: group_id.to_string(),
+                conversation_id: conversation_id.clone(),
                 sender_did: did.clone(),
                 ciphertext: c.to_vec(),
                 timestamp: Utc::now(),
             };
-            guard
-                .messages
-                .entry(group_id.to_string())
-                .or_default()
-                .push(msg);
+            guard.messages.entry(conversation_id).or_default().push(msg);
         }
 
         Ok(CreateConversationResult {
@@ -712,20 +817,51 @@ impl MLSAPIClient for MockDeliveryService {
     async fn bootstrap_reset_group(
         &self,
         original_convo_id: &str,
-        _new_group_id: &str,
+        new_group_id: &str,
         _cipher_suite: &str,
-        _group_info: &[u8],
+        group_info: &[u8],
         _members: &[String],
         _welcome_message: Option<&[u8]>,
     ) -> Result<CreateConversationResult> {
+        let delay_ms = self.state.lock().unwrap().bootstrap_reset_group_delay_ms;
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
         let mut guard = self.state.lock().unwrap();
-        *guard
+        let calls = guard
             .bootstrap_reset_group_calls
             .entry(original_convo_id.to_string())
-            .or_default() += 1;
-        Err(OrchestratorError::Api(
-            "bootstrap_reset_group not implemented".to_string(),
-        ))
+            .or_default();
+        *calls += 1;
+        let call_number = *calls;
+        if guard.bootstrap_already_bootstrapped_after_success && call_number > 1 {
+            return Err(OrchestratorError::ServerError {
+                status: 409,
+                body: r#"{"error":"AlreadyBootstrapped"}"#.to_string(),
+            });
+        }
+        if guard.bootstrap_reset_group_succeeds {
+            let stored = guard
+                .conversations
+                .get_mut(original_convo_id)
+                .ok_or_else(|| {
+                    OrchestratorError::ConversationNotFound(original_convo_id.to_string())
+                })?;
+            stored.view.group_id = new_group_id.to_string();
+            let conversation = stored.view.clone();
+            guard
+                .group_infos
+                .insert(original_convo_id.to_string(), group_info.to_vec());
+            Ok(CreateConversationResult {
+                conversation,
+                commit_data: None,
+                welcome_data: None,
+            })
+        } else {
+            Err(OrchestratorError::Api(
+                "bootstrap_reset_group not implemented".to_string(),
+            ))
+        }
     }
 
     async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
@@ -740,6 +876,23 @@ impl MLSAPIClient for MockDeliveryService {
             .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))?;
         convo.members.retain(|m| m != &did);
         convo.view.members.retain(|m| m.did != did);
+        Ok(())
+    }
+
+    async fn commit_group_change(
+        &self,
+        convo_id: &str,
+        _commit_data: &[u8],
+        action: &str,
+        _confirmation_tag: Option<&str>,
+    ) -> Result<()> {
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .commit_group_change_counts
+            .entry((convo_id.to_string(), action.to_string()))
+            .or_default() += 1;
         Ok(())
     }
 
@@ -1172,10 +1325,17 @@ impl MLSAPIClient for MockDeliveryService {
     // -- Group Info ----------------------------------------------------------
 
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
-        let mut guard = self.state.lock().unwrap();
-        guard
-            .group_infos
-            .insert(convo_id.to_string(), group_info.to_vec());
+        {
+            let mut guard = self.state.lock().unwrap();
+            guard
+                .group_infos
+                .insert(convo_id.to_string(), group_info.to_vec());
+        }
+        let gate = self.publish_group_info_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
         Ok(())
     }
 

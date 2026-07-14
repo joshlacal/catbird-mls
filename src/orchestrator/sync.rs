@@ -28,6 +28,8 @@ where
 
         for convo in conversations {
             let convo_id = convo.conversation_id.clone();
+            let transition_lock = self.rejoin_lock(&convo_id).await;
+            let transition_guard = transition_lock.lock().await;
             let persisted_state = match self.storage().get_conversation_state(&convo_id).await {
                 Ok(state) => state,
                 Err(e) => {
@@ -45,24 +47,25 @@ where
             };
 
             match persisted_state {
-                Some(state @ ConversationState::ResetPending { .. }) => {
-                    self.conversation_states()
-                        .lock()
-                        .await
-                        .insert(convo_id.clone(), state);
+                Some(ConversationState::ResetPending { .. }) => {
+                    let _ = self.reset_pending_payload_result(&convo_id).await?;
                     report.reset_pending += 1;
                     continue;
                 }
                 Some(state @ ConversationState::Quarantined { .. })
                 | Some(state @ ConversationState::Failed) => {
-                    self.conversation_states()
-                        .lock()
-                        .await
-                        .insert(convo_id.clone(), state);
-                    report.unrecoverable_local += 1;
+                    if self
+                        .project_non_reset_cache_locked(&convo_id, state)
+                        .await?
+                    {
+                        report.unrecoverable_local += 1;
+                    } else {
+                        report.reset_pending += 1;
+                    }
                     continue;
                 }
                 Some(ConversationState::NeedsRejoin) => {
+                    drop(transition_guard);
                     // P0.2: do not re-project NeedsRejoin (which drives
                     // force_rejoin -> External Commit -> epoch inflation) when
                     // the local group is cryptographically healthy. Clear the
@@ -76,13 +79,13 @@ where
                     continue;
                 }
                 Some(state) => {
-                    self.conversation_states()
-                        .lock()
-                        .await
-                        .insert(convo_id.clone(), state);
+                    let _ = self
+                        .project_non_reset_cache_locked(&convo_id, state)
+                        .await?;
                 }
                 None => {}
             }
+            drop(transition_guard);
 
             let needs_rejoin = match self.storage().needs_rejoin(&convo_id).await {
                 Ok(flag) => flag,
@@ -247,6 +250,13 @@ where
 
         tracing::info!("Starting server sync");
 
+        // Fence the server listing against local creation start/completion.
+        // A changed generation means this pass cannot safely conclude that a
+        // newly cached conversation absent from the listing is stale.
+        let creation_generation_before = self
+            .creation_generation()
+            .load(std::sync::atomic::Ordering::Acquire);
+
         // Fetch all conversations with pagination
         let mut all_convos = Vec::new();
         let mut cursor: Option<String> = None;
@@ -306,18 +316,37 @@ where
             }
         }
 
-        // Get set of groups being created (protect from deletion)
-        let creating = self.groups_being_created().lock().await.clone();
-
         // Reconcile: find local conversations not on server
         let server_ids: HashSet<&str> = all_convos
             .iter()
             .map(|c| c.conversation_id.as_str())
             .collect();
-        let local_ids: Vec<String> = self.conversations().lock().await.keys().cloned().collect();
+        let local_conversations: Vec<(String, String)> = self
+            .conversations()
+            .lock()
+            .await
+            .iter()
+            .map(|(conversation_id, view)| (conversation_id.clone(), view.group_id.clone()))
+            .collect();
+        let creating = self.groups_being_created().lock().await.clone();
+        let creation_generation_after = self
+            .creation_generation()
+            .load(std::sync::atomic::Ordering::Acquire);
+        let creation_changed_during_snapshot =
+            creation_generation_before != creation_generation_after;
 
-        for local_id in &local_ids {
-            if !server_ids.contains(local_id.as_str()) && !creating.contains(local_id) {
+        for (local_id, local_group_id) in &local_conversations {
+            // Creation protection is keyed by the locally-created MLS group
+            // id. A server may return a distinct stable conversation id before
+            // that row becomes visible to getConversations, so compare both
+            // identities. The single group-id guard remains balanced by the
+            // create path on every success and error exit.
+            let creation_in_progress =
+                creating.contains(local_id) || creating.contains(local_group_id);
+            if !server_ids.contains(local_id.as_str())
+                && !creation_in_progress
+                && !creation_changed_during_snapshot
+            {
                 tracing::info!(
                     conversation_id = %local_id,
                     "Local conversation not on server, deleting"

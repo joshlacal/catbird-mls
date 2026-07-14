@@ -6723,6 +6723,16 @@ impl MlsCryptoContext for MLSContext {
         MLSContext::group_exists(self, group_id)
     }
 
+    fn list_local_group_ids(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        let _storage_operation = self.begin_storage_operation("list_local_group_ids");
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        Ok(inner.local_group_ids())
+    }
+
     fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         self.get_confirmation_tag(group_id)
     }

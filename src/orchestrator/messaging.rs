@@ -171,28 +171,9 @@ where
 
         match self.join_or_rejoin(convo_id).await {
             Ok(epoch) => {
-                // A successful Welcome join or External Commit rejoin means the
-                // group is healthy again — clear the stale NeedsRejoin so the
-                // re-projection below returns Healthy and sends are unblocked.
-                //
-                // Without this the conversation is permanently stuck "needs
-                // repair": force_rejoin's success path clears the RecoveryTracker
-                // failure *counters* (clear_rejoin_failures) but never transitions
-                // `conversation_states` out of NeedsRejoin. So ready_result keeps
-                // reporting send_allowed=false, and every open re-runs an
-                // epoch-inflating External Commit (the spec's forbidden
-                // "force_rejoin in automated recovery" anti-pattern, in a loop).
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(convo_id.to_string(), ConversationState::Active);
-                if let Err(e) = self
-                    .storage()
-                    .set_conversation_state(convo_id, ConversationState::Active)
-                    .await
-                {
-                    tracing::warn!(error = %e, convo_id, "Failed to persist Active state after successful rejoin");
-                }
+                // join_or_rejoin owns the transition gate through its final
+                // fail-closed Active projection. Never repeat that write after
+                // the gate is released: a newer reset may already own authority.
                 crate::warn_log!(
                     "[REJOIN-DIAG] convo={} rejoin succeeded — cleared NeedsRejoin -> Active (epoch={})",
                     convo_id,
@@ -829,70 +810,45 @@ where
                     return Err(OrchestratorError::from(e));
                 }
                 // Track consecutive decrypt failures for fork detection + divergence recovery
-                {
+                let failure_count = {
                     let mut counts = self.decrypt_fail_counts().lock().await;
                     let count = counts.entry(envelope.conversation_id.clone()).or_insert(0);
                     *count += 1;
-                    if *count >= constants::DECRYPTION_FAILURE_THRESHOLD {
-                        let fa = self
-                            .fork_detection_states()
-                            .lock()
-                            .ok()
-                            .and_then(|fds| fds.get(&envelope.conversation_id).cloned())
-                            .is_some_and(|s| s.readd_attempts < constants::FORK_READD_MAX_ATTEMPTS);
-                        if fa {
-                            tracing::info!(conversation_id = %envelope.conversation_id, "Fork readd in-flight, deferring");
-                        } else {
-                            tracing::error!(conversation_id = %envelope.conversation_id, failures = *count, "Marking for rejoin");
-                            if let Ok(mut fds) = self.fork_detection_states().lock() {
-                                fds.remove(&envelope.conversation_id);
-                            }
-                            self.conversation_states().lock().await.insert(
-                                envelope.conversation_id.clone(),
-                                ConversationState::NeedsRejoin,
-                            );
-                            // WS-5.2: the deferred-recovery loop consumes ONLY
-                            // the persisted flag — a dropped write here would
-                            // silently cancel recovery on the most common
-                            // trigger (persistent decrypt failure). Escalate,
-                            // and reset the counter only after the flag-write
-                            // path has run.
-                            self.mark_needs_rejoin_critical(&envelope.conversation_id)
-                                .await;
-                            *count = 0;
+                    *count
+                };
+                if failure_count >= constants::DECRYPTION_FAILURE_THRESHOLD {
+                    let fa = self
+                        .fork_detection_states()
+                        .lock()
+                        .ok()
+                        .and_then(|fds| fds.get(&envelope.conversation_id).cloned())
+                        .is_some_and(|s| s.readd_attempts < constants::FORK_READD_MAX_ATTEMPTS);
+                    if fa {
+                        tracing::info!(conversation_id = %envelope.conversation_id, "Fork readd in-flight, deferring");
+                    } else {
+                        tracing::error!(conversation_id = %envelope.conversation_id, failures = failure_count, "Marking for rejoin");
+                        if let Ok(mut fds) = self.fork_detection_states().lock() {
+                            fds.remove(&envelope.conversation_id);
                         }
-                    } else if *count == constants::FORK_DETECTION_THRESHOLD {
-                        let cs = self
-                            .conversation_states()
+                        self.project_runtime_needs_rejoin(&envelope.conversation_id)
+                            .await;
+                        self.decrypt_fail_counts()
                             .lock()
                             .await
-                            .get(&envelope.conversation_id)
-                            .cloned()
-                            .unwrap_or(ConversationState::Active);
-                        if cs == ConversationState::Active {
-                            let ep = self
-                                .mls_context()
-                                .get_epoch(group_id_bytes.clone())
-                                .unwrap_or(0);
-                            tracing::info!(conversation_id = %envelope.conversation_id, epoch = ep, "Fork threshold -- readd");
-                            self.conversation_states().lock().await.insert(
-                                envelope.conversation_id.clone(),
-                                ConversationState::ForkDetected,
-                            );
-                            if let Ok(mut fds) = self.fork_detection_states().lock() {
-                                fds.insert(
-                                    envelope.conversation_id.clone(),
-                                    ForkDetectionState {
-                                        detected_at_epoch: ep,
-                                        readd_attempts: 0,
-                                    },
-                                );
-                            }
-                            let cid = envelope.conversation_id.clone();
-                            drop(counts);
-                            let _ = self.attempt_fork_readd(&cid).await;
-                            return Err(OrchestratorError::from(e));
-                        }
+                            .insert(envelope.conversation_id.clone(), 0);
+                    }
+                } else if failure_count == constants::FORK_DETECTION_THRESHOLD {
+                    let ep = self
+                        .mls_context()
+                        .get_epoch(group_id_bytes.clone())
+                        .unwrap_or(0);
+                    if self
+                        .project_fork_detected_if_active(&envelope.conversation_id, ep)
+                        .await
+                    {
+                        tracing::info!(conversation_id = %envelope.conversation_id, epoch = ep, "Fork threshold -- readd");
+                        let _ = self.attempt_fork_readd(&envelope.conversation_id).await;
+                        return Err(OrchestratorError::from(e));
                     }
                 }
                 return Err(OrchestratorError::from(e));
@@ -912,10 +868,7 @@ where
                 .and_then(|mut fds| fds.remove(&envelope.conversation_id))
                 .is_some();
             if was {
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(envelope.conversation_id.clone(), ConversationState::Active);
+                self.project_runtime_active(&envelope.conversation_id).await;
             }
         }
 

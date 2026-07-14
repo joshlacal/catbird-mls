@@ -284,6 +284,18 @@ impl MLSStorageBackend for BotStorage {
             .insert(conversation_id.to_string(), state);
         Ok(())
     }
+    async fn get_conversation_state(
+        &self,
+        conversation_id: &str,
+    ) -> OrcResult<Option<ConversationState>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .conversation_states
+            .get(conversation_id)
+            .cloned())
+    }
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> OrcResult<()> {
         self.inner
             .lock()
@@ -395,7 +407,40 @@ impl MLSStorageBackend for BotStorage {
             .remove(message_id))
     }
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
-        &["store_pending_message", "remove_pending_message"]
+        &[
+            "get_conversation_state",
+            "store_pending_message",
+            "remove_pending_message",
+        ]
+    }
+}
+
+#[cfg(test)]
+mod bot_storage_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bot_storage_definitively_reads_conversation_state_for_normal_resolution() {
+        let storage = BotStorage::new();
+        assert_eq!(
+            storage
+                .get_conversation_state("ordinary-conversation")
+                .await
+                .expect("ordinary resolution requires a definitive absence"),
+            None
+        );
+
+        storage
+            .set_conversation_state("tracked-conversation", ConversationState::NeedsRejoin)
+            .await
+            .expect("store tracked state");
+        assert_eq!(
+            storage
+                .get_conversation_state("tracked-conversation")
+                .await
+                .expect("read tracked state"),
+            Some(ConversationState::NeedsRejoin)
+        );
     }
 }
 

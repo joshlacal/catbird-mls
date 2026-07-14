@@ -204,6 +204,19 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         self.get_epoch(group_id).is_ok()
     }
 
+    /// Enumerate every locally persisted MLS group id.
+    ///
+    /// Destructive recovery uses this to re-associate persisted group-state
+    /// bindings after a process restart, when the orchestrator's in-memory
+    /// cache is empty. Backends that cannot enumerate must fail closed rather
+    /// than let local-delete reconciliation clear the only discoverability
+    /// mapping for unidentified epoch secrets.
+    fn list_local_group_ids(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "local MLS group enumeration not available on this platform".to_string(),
+        })
+    }
+
     fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
 
     /// Return the RFC 9420 §8.7 `epoch_authenticator` for the group's current
