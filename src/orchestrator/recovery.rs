@@ -1706,6 +1706,41 @@ where
         hex::decode(group_id_hex).ok()
     }
 
+    /// Snapshot the locally materialized group bound to a stable conversation
+    /// before destructive force-rejoin cleanup.
+    ///
+    /// The server-authoritative conversation mapping can legitimately advance
+    /// to a reset target that this device has not joined yet. Deleting that
+    /// absent target would leave the old local group (and its epoch secrets)
+    /// behind. Prefer a group-state entry explicitly bound to this stable
+    /// conversation only when its decoded group is still present in the MLS
+    /// context; otherwise retain the normal authoritative-resolution fallback.
+    async fn group_id_bytes_for_force_rejoin_cleanup(&self, convo_id: &str) -> Option<Vec<u8>> {
+        let mut local_candidates = {
+            let states = self.group_states().lock().await;
+            states
+                .values()
+                .filter(|state| state.conversation_id == convo_id)
+                .map(|state| (state.epoch, state.group_id.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        // Prefer the newest locally tracked state when stale cache entries
+        // coexist. The group-existence probe prevents a cache-only row from
+        // overriding the authoritative mapping.
+        local_candidates.sort_unstable_by(|left, right| right.cmp(left));
+        for (_, group_id_hex) in local_candidates {
+            let Ok(group_id_bytes) = hex::decode(group_id_hex) else {
+                continue;
+            };
+            if self.mls_context().group_exists(group_id_bytes.clone()) {
+                return Some(group_id_bytes);
+            }
+        }
+
+        self.group_id_bytes_for_conversation(convo_id).await
+    }
+
     pub(crate) async fn local_group_epoch(&self, convo_id: &str) -> Option<u64> {
         let group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await?;
         self.mls_context().get_epoch(group_id_bytes).ok()
@@ -1959,10 +1994,11 @@ where
         };
 
         // GroupInfo fetched successfully — now delete old local group state.
-        // Resolve the authoritative current group so post-reset conversations
-        // delete the old mutable group without interpreting the stable ID as
-        // MLS group bytes.
-        let old_group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await;
+        // Prefer a locally materialized group bound to this stable conversation;
+        // the authoritative mapping may already name an as-yet-unjoined reset
+        // target. Fall back to authoritative resolution without interpreting
+        // the stable ID as MLS group bytes.
+        let old_group_id_bytes = self.group_id_bytes_for_force_rejoin_cleanup(convo_id).await;
         if let Some(bytes) = old_group_id_bytes {
             let _ = self.mls_context().delete_group(bytes);
         }

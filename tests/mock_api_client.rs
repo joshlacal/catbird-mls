@@ -310,6 +310,17 @@ impl MockDeliveryService {
         }
     }
 
+    /// Test helper: update only the mutable MLS group identifier projected by
+    /// the server while retaining the stable conversation identifier.
+    pub fn set_conversation_group_id_for_test(&self, convo_id: &str, group_id: &str) {
+        let mut guard = self.state.lock().unwrap();
+        let stored = guard
+            .conversations
+            .get_mut(convo_id)
+            .unwrap_or_else(|| panic!("conversation {convo_id} not found"));
+        stored.view.group_id = group_id.to_string();
+    }
+
     // -- introspection --------------------------------------------------------
 
     /// Number of messages stored for a conversation.

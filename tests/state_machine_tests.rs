@@ -934,11 +934,19 @@ async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
         .await
         .expect("create_group failed");
     let group_id = &convo.group_id;
+    let group_id_bytes = hex::decode(group_id).expect("valid group id");
 
     world.delivery_service().fail_next_get_group_info();
 
     let first = alice.orchestrator.force_rejoin(group_id).await;
     assert!(first.is_err(), "First force_rejoin should fail");
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .group_exists(group_id_bytes),
+        "GroupInfo fetch failure must preserve the existing local group"
+    );
 
     let second = alice.orchestrator.force_rejoin(group_id).await;
     match second {

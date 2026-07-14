@@ -149,6 +149,18 @@ impl MockStorage {
         }
     }
 
+    /// Test helper: replace the mutable MLS group projected by a durable
+    /// conversation row without altering its stable conversation identity.
+    pub fn set_conversation_group_id_for_test(&self, conversation_id: &str, group_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner
+            .conversations
+            .get_mut(conversation_id)
+            .unwrap_or_else(|| panic!("conversation {conversation_id} not found"));
+        record.group_id = group_id.to_string();
+        record.view.group_id = group_id.to_string();
+    }
+
     // ── Test helper methods ──────────────────────────────────────────────
 
     /// Returns the total number of stored conversations.

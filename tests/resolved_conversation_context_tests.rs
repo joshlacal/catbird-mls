@@ -148,6 +148,138 @@ async fn authoritative_conversation_mapping_wins_over_stale_legacy_group_state()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn force_rejoin_deletes_locally_present_group_when_server_mapping_has_advanced() {
+    let world = registered_two_client_world().await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+
+    let old = alice
+        .orchestrator
+        .create_group("force rejoin old local group", None, None)
+        .await
+        .expect("create old local group");
+    let old_group_id = old.group_id.clone();
+    let old_group_bytes = hex::decode(&old_group_id).expect("old group id");
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&old.conversation_id, STABLE_CONVERSATION_ID);
+    let stable_view = world
+        .delivery_service()
+        .clone_as(&alice.did)
+        .get_conversations(10, None)
+        .await
+        .expect("fetch stable server mapping")
+        .conversations
+        .into_iter()
+        .find(|view| view.conversation_id == STABLE_CONVERSATION_ID)
+        .expect("stable server conversation");
+    alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .insert(STABLE_CONVERSATION_ID.to_string(), stable_view);
+    alice
+        .storage
+        .ensure_conversation_exists(&alice.did, STABLE_CONVERSATION_ID, &old_group_id)
+        .await
+        .expect("persist stable conversation mapping");
+
+    // The server has already advanced its projected mapping to G2, but this
+    // client has no G2. Its group-state cache and MLSContext still contain G1.
+    let absent_server_group_id = "22".repeat(32);
+    world
+        .delivery_service()
+        .set_conversation_group_id_for_test(STABLE_CONVERSATION_ID, &absent_server_group_id);
+    {
+        let mut conversations = alice.orchestrator.conversations().lock().await;
+        let live = conversations
+            .get_mut(STABLE_CONVERSATION_ID)
+            .expect("live stable conversation");
+        live.group_id = absent_server_group_id.clone();
+    }
+    alice
+        .storage
+        .set_conversation_group_id_for_test(STABLE_CONVERSATION_ID, &absent_server_group_id);
+    let old_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(old_group_bytes.clone())
+        .expect("G1 remains in MLSContext");
+    alice.orchestrator.group_states().lock().await.insert(
+        old_group_id.clone(),
+        GroupState {
+            group_id: old_group_id.clone(),
+            conversation_id: STABLE_CONVERSATION_ID.to_string(),
+            epoch: old_epoch,
+            members: vec![alice.did.clone()],
+        },
+    );
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .group_exists(old_group_bytes.clone()));
+    assert!(!alice
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(&absent_server_group_id).expect("G2 group id")));
+    assert!(alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .values()
+        .any(|state| state.conversation_id == STABLE_CONVERSATION_ID
+            && state.group_id == old_group_id));
+
+    // Supply GroupInfo for a distinct G3 that is not present in Alice's local
+    // context. A successful force rejoin should replace G1 with this target.
+    let target = bob
+        .orchestrator
+        .create_group("force rejoin target", None, None)
+        .await
+        .expect("create remote target group");
+    let target_group_bytes = hex::decode(&target.group_id).expect("target group id");
+    let target_group_info = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_group_info(&target.conversation_id)
+        .await
+        .expect("fetch remote target GroupInfo");
+    world
+        .delivery_service()
+        .clone_as(&alice.did)
+        .publish_group_info(STABLE_CONVERSATION_ID, &target_group_info)
+        .await
+        .expect("publish target GroupInfo under stable conversation");
+    assert!(!alice
+        .orchestrator
+        .mls_context()
+        .group_exists(target_group_bytes.clone()));
+
+    alice
+        .orchestrator
+        .force_rejoin(STABLE_CONVERSATION_ID)
+        .await
+        .expect("force rejoin succeeds");
+
+    assert!(
+        !alice
+            .orchestrator
+            .mls_context()
+            .group_exists(old_group_bytes),
+        "successful force rejoin must delete locally bound G1, not absent authoritative G2"
+    );
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .group_exists(target_group_bytes),
+        "successful force rejoin must preserve the newly joined GroupInfo target"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn reset_pending_target_overrides_stale_live_and_durable_conversation_views() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
