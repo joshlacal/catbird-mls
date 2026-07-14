@@ -108,6 +108,10 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     /// For `ResetPending`, implementations MUST reconstruct the full payload
     /// (`new_group_id`, `reset_generation`, `notified_at_ms`) from the
     /// columns written by `mark_reset_pending`.
+    /// A `reset_pending` tag without that complete payload is not an
+    /// authoritative transition and MUST return an error rather than a partial
+    /// `ResetPending` value. This makes `mark_reset_pending` the durable commit
+    /// point: callers fail closed during the tag-before-payload crash window.
     ///
     /// Default returns `Ok(None)` for backward compatibility; backends that
     /// persist state should override.
@@ -164,6 +168,9 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     /// `reset_pending` and this method to persist the payload so that, after
     /// orchestrator restart, the platform layer can rehydrate a
     /// `ConversationState::ResetPending { .. }` and resume Phase 1 recovery.
+    /// This operation is the authority-publication commit point and MUST make
+    /// the complete payload visible atomically. Before it succeeds,
+    /// `get_conversation_state` must reject an incomplete reset tag.
     ///
     /// Default no-op for backward compatibility; platforms should override
     /// before relying on RESET_PENDING persistence.

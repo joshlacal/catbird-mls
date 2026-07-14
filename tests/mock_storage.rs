@@ -82,6 +82,7 @@ struct Inner {
     /// One-shot failure injections for the quarantine persist escalation
     /// tests (E7 follow-up R-2).
     fail_next_set_conversation_state: bool,
+    fail_next_mark_reset_pending: bool,
     fail_next_get_conversation_state: bool,
     fail_next_conversation_state_for: Option<String>,
     malformed_conversation_states: std::collections::HashSet<String>,
@@ -347,6 +348,11 @@ impl MockStorage {
     #[allow(dead_code)]
     pub fn fail_next_set_conversation_state(&self) {
         self.inner.lock().unwrap().fail_next_set_conversation_state = true;
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_next_mark_reset_pending(&self) {
+        self.inner.lock().unwrap().fail_next_mark_reset_pending = true;
     }
 
     /// Simulate a malformed persisted reset/quarantine sidecar that cannot be
@@ -658,6 +664,12 @@ impl MLSStorageBackend for MockStorage {
         notified_at_ms: i64,
     ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_mark_reset_pending {
+            inner.fail_next_mark_reset_pending = false;
+            return Err(OrchestratorError::Storage(
+                "injected mark_reset_pending failure".to_string(),
+            ));
+        }
         inner.reset_pending.insert(
             conversation_id.to_string(),
             PersistedResetPending {
@@ -784,10 +796,16 @@ impl MLSStorageBackend for MockStorage {
                 notified_at_ms: payload.notified_at_ms,
             }));
         }
-        Ok(inner
+        let state = inner
             .conversations
             .get(conversation_id)
-            .map(|c| c.state.clone()))
+            .map(|c| c.state.clone());
+        if matches!(state, Some(ConversationState::ResetPending { .. })) {
+            return Err(OrchestratorError::Storage(format!(
+                "incomplete reset_pending state for {conversation_id}: payload not committed"
+            )));
+        }
+        Ok(state)
     }
 
     // ── Messages ─────────────────────────────────────────────────────────

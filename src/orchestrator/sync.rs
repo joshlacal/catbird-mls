@@ -414,11 +414,12 @@ where
             };
             let has_state_record = {
                 let states = self.group_states().lock().await;
-                states.get(group_id).is_some_and(|state| {
-                    state.conversation_id == conversation_id && state.group_id == group_id
-                }) || states.get(conversation_id).is_some_and(|state| {
-                    state.conversation_id == conversation_id && state.group_id == group_id
-                })
+                ResolvedConversationContext {
+                    conversation_id: conversation_id.to_string(),
+                    group_id: group_id.to_string(),
+                }
+                .group_state(&states)
+                .is_some()
             };
 
             crate::info_log!(
@@ -556,38 +557,19 @@ where
                 };
                 {
                     let mut states = self.group_states().lock().await;
-                    states.retain(|key, existing| {
-                        key == group_id || existing.conversation_id != conversation_id
-                    });
-                    states.insert(group_id.to_string(), state.clone());
+                    normalize_group_state(&mut states, state.clone());
                 }
                 self.storage().set_group_state(&state).await?;
             } else {
                 // Update member list from server
                 let mut states = self.group_states().lock().await;
-                let exact_identity = |state: &GroupState| {
-                    state.conversation_id == conversation_id && state.group_id == group_id
+                let resolved = ResolvedConversationContext {
+                    conversation_id: conversation_id.to_string(),
+                    group_id: group_id.to_string(),
                 };
-                let state_key = states
-                    .get(group_id)
-                    .filter(|state| exact_identity(state))
-                    .map(|_| group_id.to_string())
-                    .or_else(|| {
-                        states
-                            .get(conversation_id)
-                            .filter(|state| exact_identity(state))
-                            .map(|_| conversation_id.to_string())
-                    });
-                if let Some(state_key) = state_key {
-                    if let Some(mut gs) = states.remove(&state_key) {
-                        gs.conversation_id = conversation_id.to_string();
-                        gs.group_id = group_id.to_string();
-                        gs.members = convo.members.iter().map(|m| m.did.clone()).collect();
-                        states.retain(|key, existing| {
-                            key == group_id || existing.conversation_id != conversation_id
-                        });
-                        states.insert(group_id.to_string(), gs);
-                    }
+                if let Some(mut state) = resolved.group_state(&states).cloned() {
+                    state.members = convo.members.iter().map(|m| m.did.clone()).collect();
+                    normalize_group_state(&mut states, state);
                 }
             }
 
@@ -599,14 +581,13 @@ where
             // Check for epoch reconciliation — fetch and process missing commits
             let local_epoch = {
                 let states = self.group_states().lock().await;
-                states
-                    .get(group_id)
-                    .or_else(|| states.get(conversation_id))
-                    .filter(|state| {
-                        state.conversation_id == conversation_id && state.group_id == group_id
-                    })
-                    .map(|gs| gs.epoch)
-                    .unwrap_or(0)
+                ResolvedConversationContext {
+                    conversation_id: conversation_id.to_string(),
+                    group_id: group_id.to_string(),
+                }
+                .group_state(&states)
+                .map(|state| state.epoch)
+                .unwrap_or(0)
             };
 
             if convo.epoch > local_epoch {
@@ -650,15 +631,13 @@ where
                         // Re-check epoch after processing
                         let new_local = {
                             let states = self.group_states().lock().await;
-                            states
-                                .get(group_id)
-                                .or_else(|| states.get(conversation_id))
-                                .filter(|state| {
-                                    state.conversation_id == conversation_id
-                                        && state.group_id == group_id
-                                })
-                                .map(|gs| gs.epoch)
-                                .unwrap_or(0)
+                            ResolvedConversationContext {
+                                conversation_id: conversation_id.to_string(),
+                                group_id: group_id.to_string(),
+                            }
+                            .group_state(&states)
+                            .map(|state| state.epoch)
+                            .unwrap_or(0)
                         };
                         if convo.epoch > new_local {
                             tracing::warn!(

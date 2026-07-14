@@ -1637,6 +1637,19 @@ where
         &self,
         conversation_id: &str,
     ) -> Result<ResolvedConversationContext> {
+        // A persisted ResetPending payload is the transition authority for a
+        // server-directed group rotation. It must precede both ConversationView
+        // projections: those rows are refreshed by sync and can legitimately
+        // retain the deleted pre-reset group until that refresh completes.
+        // This is deliberately narrow; arbitrary group-state cache entries do
+        // not gain precedence over server-backed conversation mappings.
+        if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
+            return Ok(ResolvedConversationContext {
+                conversation_id: conversation_id.to_string(),
+                group_id: pending.new_group_id,
+            });
+        }
+
         // The server-refreshed conversation cache is the authoritative O(1)
         // mapping during a live session. It must precede legacy group-state
         // entries, which may survive a group rotation under the stable key.
@@ -3062,55 +3075,117 @@ where
         reset_generation: i32,
     ) -> Result<()> {
         let notified_at_ms = chrono::Utc::now().timestamp_millis();
-
-        // 1. Transition to ResetPending + persist the payload.
-        {
-            let mut states = self.conversation_states().lock().await;
-            states.insert(
-                convo_id.to_string(),
-                ConversationState::ResetPending {
-                    new_group_id: new_group_id_hex.to_string(),
-                    reset_generation,
-                    notified_at_ms,
-                },
-            );
+        // Resolve the pre-transition authority before publishing ResetPending.
+        // Once the pending payload is visible, normal resolution intentionally
+        // selects the new target and must never be used to choose the group to
+        // delete.
+        let previous_state = {
+            let states = self.conversation_states().lock().await;
+            states.get(convo_id).cloned()
+        };
+        let previous_state = match previous_state {
+            Some(state) => Some(state),
+            None => self.storage().get_conversation_state(convo_id).await?,
         }
+        .ok_or_else(|| {
+            OrchestratorError::Storage(format!(
+                "Cannot persist reset for {convo_id}: prior conversation state is unavailable"
+            ))
+        })?;
+        let old_context = self.resolve_conversation_context(convo_id).await?;
+        let old_group_id_bytes = old_context.group_id_bytes().ok();
+        let reset_state = ConversationState::ResetPending {
+            new_group_id: new_group_id_hex.to_string(),
+            reset_generation,
+            notified_at_ms,
+        };
+
+        // 1. Persist the complete transition before exposing it in memory.
+        // Either write failing leaves callers on the old authority and returns
+        // an error; publishing a restart-fragile half-transition would make the
+        // selected MLS group depend on process lifetime.
+        // Write the state tag first, then commit the complete transition with
+        // mark_reset_pending. The storage contract requires an incomplete
+        // reset tag (no payload) to fail closed on read; mark_reset_pending is
+        // therefore the single authority-publication point across backends.
         if let Err(e) = self
             .storage()
-            .set_conversation_state(
-                convo_id,
-                ConversationState::ResetPending {
-                    new_group_id: new_group_id_hex.to_string(),
-                    reset_generation,
-                    notified_at_ms,
-                },
-            )
+            .set_conversation_state(convo_id, reset_state.clone())
             .await
         {
-            // WS-5.2: the persisted ResetPending payload is the sole
-            // cross-restart carrier of the first-responder bootstrap gate —
-            // a dropped write here silently cancels Phase 1 recovery after
-            // restart. Escalate like the matching `clear_reset_pending`.
             self.report_recovery_storage_failure(
                 convo_id,
                 "set_conversation_state:reset_pending",
                 &e,
             )
             .await;
+            return Err(e);
         }
         if let Err(e) = self
             .storage()
             .mark_reset_pending(convo_id, new_group_id_hex, reset_generation, notified_at_ms)
             .await
         {
+            // WS-5.2: the complete persisted ResetPending tuple is the sole
+            // cross-restart carrier of the first-responder bootstrap gate.
             self.report_recovery_storage_failure(convo_id, "mark_reset_pending", &e)
                 .await;
+            // The state-tag write succeeded but the authoritative payload
+            // write did not. Restore the complete pre-transition tuple before
+            // returning, including an older ResetPending payload when a newer
+            // generation was being attempted.
+            if let Err(rollback_error) = self.storage().clear_reset_pending(convo_id).await {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "clear_reset_pending:rollback",
+                    &rollback_error,
+                )
+                .await;
+            }
+            if let Err(rollback_error) = self
+                .storage()
+                .set_conversation_state(convo_id, previous_state.clone())
+                .await
+            {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "set_conversation_state:reset_rollback",
+                    &rollback_error,
+                )
+                .await;
+            } else if let ConversationState::ResetPending {
+                new_group_id,
+                reset_generation,
+                notified_at_ms,
+            } = &previous_state
+            {
+                if let Err(rollback_error) = self
+                    .storage()
+                    .mark_reset_pending(convo_id, new_group_id, *reset_generation, *notified_at_ms)
+                    .await
+                {
+                    self.report_recovery_storage_failure(
+                        convo_id,
+                        "mark_reset_pending:rollback",
+                        &rollback_error,
+                    )
+                    .await;
+                }
+            }
+            return Err(e);
+        }
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(convo_id.to_string(), reset_state);
+        if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
+            view.group_id = new_group_id_hex.to_string();
+            view.epoch = 0;
         }
 
         // 2. Delete the old local MLS group through the authoritative mapping.
-        let old_group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await;
-        if let Some(bytes) = old_group_id_bytes {
-            if let Err(e) = self.mls_context().delete_group(bytes) {
+        if let Some(old_group_id_bytes) = old_group_id_bytes {
+            if let Err(e) = self.mls_context().delete_group(old_group_id_bytes) {
                 // Non-fatal: the group may already be gone if a previous reset
                 // attempt partially completed.
                 tracing::warn!(
@@ -3272,6 +3347,16 @@ where
         &self,
         convo_id: &str,
     ) -> Option<ResetPendingPayload> {
+        self.reset_pending_payload_result(convo_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn reset_pending_payload_result(
+        &self,
+        convo_id: &str,
+    ) -> Result<Option<ResetPendingPayload>> {
         {
             let states = self.conversation_states().lock().await;
             if let Some(ConversationState::ResetPending {
@@ -3280,11 +3365,11 @@ where
                 notified_at_ms,
             }) = states.get(convo_id)
             {
-                return Some(ResetPendingPayload {
+                return Ok(Some(ResetPendingPayload {
                     new_group_id: new_group_id.clone(),
                     reset_generation: *reset_generation,
                     notified_at_ms: *notified_at_ms,
-                });
+                }));
             }
         }
         match self.storage().get_conversation_state(convo_id).await {
@@ -3292,12 +3377,13 @@ where
                 new_group_id,
                 reset_generation,
                 notified_at_ms,
-            })) => Some(ResetPendingPayload {
+            })) => Ok(Some(ResetPendingPayload {
                 new_group_id,
                 reset_generation,
                 notified_at_ms,
-            }),
-            _ => None,
+            })),
+            Ok(_) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 

@@ -104,9 +104,25 @@ impl StartupReconcileFixture {
             .await
             .expect("ensure_conversation_exists");
         self.storage
-            .set_conversation_state(conversation_id, state)
+            .set_conversation_state(conversation_id, state.clone())
             .await
             .expect("set_conversation_state");
+        if let ConversationState::ResetPending {
+            new_group_id,
+            reset_generation,
+            notified_at_ms,
+        } = state
+        {
+            self.storage
+                .mark_reset_pending(
+                    conversation_id,
+                    &new_group_id,
+                    reset_generation,
+                    notified_at_ms,
+                )
+                .await
+                .expect("mark_reset_pending");
+        }
         created.group_id
     }
 
@@ -121,9 +137,25 @@ impl StartupReconcileFixture {
             .await
             .expect("ensure_conversation_exists");
         self.storage
-            .set_conversation_state(&group_id_hex, state)
+            .set_conversation_state(&group_id_hex, state.clone())
             .await
             .expect("set_conversation_state");
+        if let ConversationState::ResetPending {
+            new_group_id,
+            reset_generation,
+            notified_at_ms,
+        } = state
+        {
+            self.storage
+                .mark_reset_pending(
+                    &group_id_hex,
+                    &new_group_id,
+                    reset_generation,
+                    notified_at_ms,
+                )
+                .await
+                .expect("mark_reset_pending");
+        }
         group_id_hex
     }
 

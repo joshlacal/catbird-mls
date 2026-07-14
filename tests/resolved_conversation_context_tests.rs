@@ -2,7 +2,10 @@
 
 mod e2e_harness;
 
-use catbird_mls::orchestrator::{GroupState, IncomingEnvelope, MLSAPIClient, MLSStorageBackend};
+use catbird_mls::orchestrator::{
+    CredentialStore, GroupState, IncomingEnvelope, MLSAPIClient, MLSStorageBackend,
+};
+use catbird_mls::GroupConfig;
 use chrono::Utc;
 use e2e_harness::TestWorld;
 use sha2::{Digest, Sha256};
@@ -142,6 +145,308 @@ async fn authoritative_conversation_mapping_wins_over_stale_legacy_group_state()
         .cloned()
         .expect("active group state");
     assert!(active.members.contains(&bob_did));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_pending_target_overrides_stale_live_and_durable_conversation_views() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("reset authority", None, None)
+        .await
+        .expect("create old group");
+    let conversation_id = conversation.conversation_id.clone();
+    let old_group_id = conversation.group_id.clone();
+    let new_group_bytes = vec![0x42; 32];
+    let new_group_id = hex::encode(&new_group_bytes);
+
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, new_group_bytes.clone(), 7)
+        .await
+        .expect("persist reset target");
+
+    let cached = alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .cloned()
+        .expect("live authoritative conversation view");
+    assert_eq!(cached.group_id, new_group_id);
+    assert_ne!(cached.group_id, old_group_id);
+
+    let mls_did = alice
+        .credentials
+        .get_mls_did(&alice.did)
+        .await
+        .expect("read MLS DID")
+        .expect("registered MLS DID");
+    alice
+        .orchestrator
+        .mls_context()
+        .create_group_with_id(
+            mls_did.into_bytes(),
+            new_group_bytes,
+            Some(GroupConfig::default()),
+        )
+        .expect("make reset target locally available");
+
+    let before = world.delivery_service().message_count(&conversation_id);
+    alice
+        .orchestrator
+        .send_message(&conversation_id, "live reset target")
+        .await
+        .expect("live resolver must select reset target");
+    assert_eq!(
+        world.delivery_service().message_count(&conversation_id),
+        before + 1
+    );
+
+    let durable = alice
+        .storage
+        .get_conversation(&alice.did, &conversation_id)
+        .await
+        .expect("read durable conversation")
+        .expect("durable conversation row");
+    assert_eq!(
+        durable.group_id, old_group_id,
+        "regression fixture must retain the independently persisted stale view"
+    );
+    alice.orchestrator.conversations().lock().await.clear();
+    alice
+        .orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .clear();
+
+    alice
+        .orchestrator
+        .send_message(&conversation_id, "durable reset target")
+        .await
+        .expect("persisted ResetPending target must override stale durable view");
+    assert_eq!(
+        world.delivery_service().message_count(&conversation_id),
+        before + 2
+    );
+    assert_eq!(world.delivery_service().message_count(&new_group_id), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_pending_persistence_failure_keeps_old_authority_and_group() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("failed reset persistence", None, None)
+        .await
+        .expect("create old group");
+    let old_group_bytes = hex::decode(&conversation.group_id).expect("old group id");
+    let new_group_bytes = vec![0x24; 32];
+    let new_group_id = hex::encode(&new_group_bytes);
+    alice.storage.fail_next_set_conversation_state();
+
+    let result = alice
+        .orchestrator
+        .record_group_reset(&conversation.conversation_id, new_group_bytes, 8)
+        .await;
+    assert!(
+        result.is_err(),
+        "security state persistence must fail closed"
+    );
+
+    let cached = alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation.conversation_id)
+        .cloned()
+        .expect("old conversation mapping remains");
+    assert_eq!(cached.group_id, conversation.group_id);
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(old_group_bytes)
+            .is_ok(),
+        "old group must not be deleted after a failed reset transition"
+    );
+    assert!(!alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .contains_key(&new_group_id));
+    assert!(alice
+        .storage
+        .get_persisted_reset_pending(&conversation.conversation_id)
+        .is_none());
+    assert!(!matches!(
+        alice
+            .storage
+            .get_current_state(&conversation.conversation_id),
+        Some(catbird_mls::orchestrator::ConversationState::ResetPending { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_pending_payload_failure_never_publishes_new_authority() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("failed reset payload", None, None)
+        .await
+        .expect("create old group");
+    let old_group_bytes = hex::decode(&conversation.group_id).expect("old group id");
+    let new_group_id = hex::encode(vec![0x66; 32]);
+    alice.storage.fail_next_mark_reset_pending();
+
+    let result = alice
+        .orchestrator
+        .record_group_reset(&conversation.conversation_id, vec![0x66; 32], 9)
+        .await;
+    assert!(result.is_err());
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(old_group_bytes)
+        .is_ok());
+    assert!(alice
+        .storage
+        .get_persisted_reset_pending(&conversation.conversation_id)
+        .is_none());
+    assert!(!alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .contains_key(&new_group_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_pending_authority_read_failure_preserves_old_group() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("failed authority read", None, None)
+        .await
+        .expect("create old group");
+    let old_group_bytes = hex::decode(&conversation.group_id).expect("old group id");
+    alice
+        .orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .clear();
+    alice
+        .storage
+        .mark_conversation_state_malformed(&conversation.conversation_id);
+
+    let result = alice
+        .orchestrator
+        .record_group_reset(&conversation.conversation_id, vec![0x77; 32], 10)
+        .await;
+    assert!(
+        result.is_err(),
+        "authority read errors must not be discarded"
+    );
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(old_group_bytes)
+        .is_ok());
+    assert!(alice
+        .storage
+        .get_persisted_reset_pending(&conversation.conversation_id)
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incomplete_reset_tag_fails_closed_before_payload_commit_point() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("reset commit seam", None, None)
+        .await
+        .expect("create old group");
+    let before = world
+        .delivery_service()
+        .message_count(&conversation.conversation_id);
+    alice
+        .storage
+        .set_conversation_state(
+            &conversation.conversation_id,
+            catbird_mls::orchestrator::ConversationState::ResetPending {
+                new_group_id: hex::encode(vec![0x88; 32]),
+                reset_generation: 11,
+                notified_at_ms: 1,
+            },
+        )
+        .await
+        .expect("write pre-commit reset tag");
+    alice
+        .orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .clear();
+
+    assert!(alice
+        .storage
+        .get_conversation_state(&conversation.conversation_id)
+        .await
+        .is_err());
+    let result = alice
+        .orchestrator
+        .send_message(&conversation.conversation_id, "must not cross reset seam")
+        .await;
+    assert!(
+        result.is_err(),
+        "incomplete reset transition must block send"
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .message_count(&conversation.conversation_id),
+        before
+    );
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&conversation.group_id).expect("old group id"))
+        .is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread")]
