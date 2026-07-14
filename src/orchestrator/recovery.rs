@@ -798,11 +798,18 @@ where
                 s.readd_attempts += 1;
             }
         }
-        let gid =
-            hex::decode(convo_id).map_err(|_| OrchestratorError::InvalidInput("bad hex".into()))?;
+        let resolved = match self.resolve_conversation_context(convo_id).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(error);
+            }
+        };
+        let gid = resolved.group_id_bytes()?;
         let mems: Vec<String> = {
             let st = self.group_states().lock().await;
-            st.get(convo_id)
+            resolved
+                .group_state(&st)
                 .map(|g| g.members.clone())
                 .unwrap_or_default()
         };
@@ -824,8 +831,13 @@ where
         // This is an automated Add path a malicious DS can steer clients into
         // via decrypt failures, so it must hit the same verify-on-fetch
         // chokepoint as create_group / add_members / swap_members.
-        self.verify_fetched_key_packages(&mems, &kp_refs, "fork_readd", Some(convo_id))
-            .await;
+        self.verify_fetched_key_packages(
+            &mems,
+            &kp_refs,
+            "fork_readd",
+            Some(&resolved.conversation_id),
+        )
+        .await;
 
         let kps: Vec<Vec<u8>> = kp_refs.iter().map(|r| r.key_package_data.clone()).collect();
         let (commit, _) = match self
@@ -845,7 +857,12 @@ where
             .ok();
         if let Err(e) = self
             .api_client()
-            .commit_group_change(convo_id, &commit, "forkReadd", tag.as_deref())
+            .commit_group_change(
+                &resolved.conversation_id,
+                &commit,
+                "forkReadd",
+                tag.as_deref(),
+            )
             .await
         {
             let _ = self.mls_context().clear_pending_commit(gid);
@@ -855,15 +872,19 @@ where
         match self.mls_context().merge_pending_commit(gid.clone()) {
             Ok(ep) => {
                 // Cleanup old epoch secrets after fork readd
-                let group_id = hex::encode(&gid);
-                self.cleanup_epoch_secrets_if_needed(convo_id, &group_id, ep)
-                    .await;
+                self.cleanup_epoch_secrets_if_needed(
+                    &resolved.conversation_id,
+                    &resolved.group_id,
+                    ep,
+                )
+                .await;
 
                 {
                     let mut st = self.group_states().lock().await;
-                    if let Some(gs) = st.get_mut(&group_id) {
+                    if let Some(mut gs) = resolved.group_state(&st).cloned() {
                         gs.epoch = ep;
                         let sc = gs.clone();
+                        normalize_group_state(&mut st, gs);
                         drop(st);
                         if let Err(e) = self.storage().set_group_state(&sc).await {
                             tracing::warn!(error = %e, convo_id, "Failed to persist group state after fork readd");
@@ -886,7 +907,10 @@ where
                     .mls_context()
                     .export_group_info(gid, user_did.as_bytes().to_vec())
                 {
-                    let _ = self.api_client().publish_group_info(convo_id, &gi).await;
+                    let _ = self
+                        .api_client()
+                        .publish_group_info(&resolved.conversation_id, &gi)
+                        .await;
                 }
                 tracing::info!(convo_id, "Fork readd succeeded");
                 Ok(())
@@ -1024,15 +1048,14 @@ where
         server_group_id: Option<&str>,
     ) -> Result<DeferredRecoveryOutcome> {
         if let Some(server_epoch) = server_epoch {
-            let candidate_group_id = if let Some(server_group_id) = server_group_id {
-                Some(server_group_id.to_string())
-            } else {
-                self.group_states()
-                    .lock()
-                    .await
-                    .get(convo_id)
-                    .map(|state| state.group_id.clone())
-            };
+            let candidate_group_id = self
+                .resolve_conversation_context(convo_id)
+                .await
+                .ok()
+                .and_then(|resolved| match server_group_id {
+                    Some(server_group_id) if server_group_id != resolved.group_id => None,
+                    _ => Some(resolved.group_id),
+                });
             let current_epoch = {
                 candidate_group_id
                     .and_then(|group_id| hex::decode(group_id).ok())
@@ -1224,7 +1247,7 @@ where
             // `is_remote_data_error` below; remaining failures are typically
             // network / OpenMLS storage issues that should self-heal via
             // §6.6 / §8.4 instead of triggering a global reset.
-            let authenticator = self.epoch_authenticator_hex(convo_id);
+            let authenticator = self.epoch_authenticator_hex(convo_id).await;
             if let Err(e) = self
                 .api_client()
                 .report_recovery_failure(
@@ -1597,59 +1620,11 @@ where
         }
     }
 
-    fn cached_group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
-        let states = self.group_states().try_lock().ok()?;
-        states
-            .get(convo_id)
-            .map(|gs| gs.group_id.clone())
-            .or_else(|| {
-                states
-                    .values()
-                    .find(|gs| gs.conversation_id == convo_id)
-                    .map(|gs| gs.group_id.clone())
-            })
-    }
-
     pub(crate) async fn group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
-        {
-            let states = self.group_states().lock().await;
-            if let Some(group_id) = states.get(convo_id).map(|gs| gs.group_id.clone()) {
-                return Some(group_id);
-            }
-            if let Some(group_id) = states
-                .values()
-                .find(|gs| gs.conversation_id == convo_id)
-                .map(|gs| gs.group_id.clone())
-            {
-                return Some(group_id);
-            }
-        }
-
-        {
-            let conversations = self.conversations().lock().await;
-            if let Some(group_id) = conversations.get(convo_id).map(|c| c.group_id.clone()) {
-                return Some(group_id);
-            }
-            if let Some(group_id) = conversations
-                .values()
-                .find(|c| c.conversation_id == convo_id)
-                .map(|c| c.group_id.clone())
-            {
-                return Some(group_id);
-            }
-        }
-
-        if let Ok(user_did) = self.require_user_did().await {
-            if let Ok(Some(convo)) = self.storage().get_conversation(&user_did, convo_id).await {
-                return Some(convo.group_id);
-            }
-        }
-
-        if hex::decode(convo_id).is_ok() {
-            Some(convo_id.to_string())
-        } else {
-            None
-        }
+        self.resolve_conversation_context(convo_id)
+            .await
+            .ok()
+            .map(|resolved| resolved.group_id)
     }
 
     /// Resolve a stable conversation identifier to its current MLS group.
@@ -1764,20 +1739,15 @@ where
     ) -> Result<()> {
         self.check_shutdown().await?;
 
-        // Resolve the group id from the conversation id. NOTE: this returns
-        // `Option`, NOT `Result` — `None` means this device has no local MLS
-        // state for the group, so it cannot seal a Welcome. Map it to a typed
-        // unfulfillable-here error so Swift stops retrying. We deliberately do
-        // NOT fall back to treating `convo_id` as a raw hex group id (the way
-        // `add_members` does), because that would hide the signal Swift needs.
-        let group_id = match self.group_id_hex_for_conversation(convo_id).await {
-            Some(g) => g,
-            None => {
+        let resolved = match self.resolve_conversation_context(convo_id).await {
+            Ok(resolved) => resolved,
+            Err(_) => {
                 return Err(OrchestratorError::RecoveryFailed(format!(
                     "convo {convo_id} not present in local MLS group state"
                 )))
             }
         };
+        let group_id = resolved.group_id.clone();
 
         let recipient_user_did =
             super::credential_binding::credential_root_did(recipient_device_did).to_string();
@@ -1823,7 +1793,7 @@ where
             &[recipient_user_did.clone()],
             &key_packages,
             "respond_to_welcome_reissue",
-            Some(&group_id),
+            Some(&resolved.conversation_id),
         )
         .await;
         let kp_data: Vec<crate::KeyPackageData> = key_packages
@@ -1834,8 +1804,9 @@ where
             .collect();
 
         let plan = self
-            .stage_commit(
-                &group_id,
+            .stage_commit_for_group(
+                &resolved.conversation_id,
+                &resolved.group_id,
                 CommitKind::SwapMembers {
                     remove_dids: remove_dids.clone(),
                     add_dids: vec![recipient_user_did.clone()],
@@ -1893,17 +1864,18 @@ where
     /// Best-effort helper that returns the hex-encoded epoch_authenticator for
     /// the group currently bound to `convo_id`.
     ///
-    /// Walks the orchestrator's `group_states` cache first so that post-reset
-    /// conversations (where `convo_id != group_id_hex`) resolve correctly;
-    /// falls back to `hex::decode(convo_id)` for never-reset groups.
+    /// Resolves through the authoritative stable-conversation mapping before
+    /// asking the MLS context for the active group's authenticator.
     /// Returns `None` if the context can't produce an authenticator (platform
     /// default stub, missing group, or remote-data error) so the caller can
     /// pass the original pre-A7 `None` payload.
-    pub(crate) fn epoch_authenticator_hex(&self, convo_id: &str) -> Option<String> {
+    pub(crate) async fn epoch_authenticator_hex(&self, convo_id: &str) -> Option<String> {
         let group_id_bytes = self
-            .cached_group_id_hex_for_conversation(convo_id)
-            .and_then(|group_id| hex::decode(group_id).ok())
-            .or_else(|| hex::decode(convo_id).ok())?;
+            .resolve_conversation_context(convo_id)
+            .await
+            .ok()?
+            .group_id_bytes()
+            .ok()?;
 
         self.mls_context()
             .epoch_authenticator(group_id_bytes)
@@ -1974,11 +1946,9 @@ where
         };
 
         // GroupInfo fetched successfully — now delete old local group state.
-        // Prefer the currently-bound group id from `group_states` so that
-        // post-reset conversations (convo_id != group_id_hex) delete the
-        // *old* local group rather than whatever hex::decode(convo_id)
-        // happens to produce. Fall back to the convo_id bytes for never-
-        // reset groups where the two are identical.
+        // Resolve the authoritative current group so post-reset conversations
+        // delete the old mutable group without interpreting the stable ID as
+        // MLS group bytes.
         let old_group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await;
         if let Some(bytes) = old_group_id_bytes {
             let _ = self.mls_context().delete_group(bytes);
@@ -2006,7 +1976,7 @@ where
                     // a `remote_data_error` is by definition Mode B (the
                     // server-side ratchet/GroupInfo is malformed), so this
                     // report SHOULD count toward server-side quorum auto-reset.
-                    let authenticator = self.epoch_authenticator_hex(convo_id);
+                    let authenticator = self.epoch_authenticator_hex(convo_id).await;
                     if let Err(report_err) = self
                         .api_client()
                         .report_recovery_failure(
@@ -2238,7 +2208,7 @@ where
     /// whole point is that the client has already given up locally, so failing
     /// the report call serves no recovery purpose.
     pub async fn report_unrecoverable_local(&self, convo_id: &str, reason: &str) {
-        let authenticator = self.epoch_authenticator_hex(convo_id);
+        let authenticator = self.epoch_authenticator_hex(convo_id).await;
         // ADR-008 D1 (spec §8.6.1): default classification by failureType.
         // Callers with richer context can use a more specific path below.
         let failure_mode = match reason {
@@ -3137,8 +3107,7 @@ where
                 .await;
         }
 
-        // 2. Delete the old local MLS group. Prefer group_states lookup; fall
-        // back to hex::decode(convo_id) for never-reset groups.
+        // 2. Delete the old local MLS group through the authoritative mapping.
         let old_group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await;
         if let Some(bytes) = old_group_id_bytes {
             if let Err(e) = self.mls_context().delete_group(bytes) {
@@ -3754,7 +3723,7 @@ where
         self.check_shutdown().await?;
         // Report deliberate user vote so server quorum (spec section 8.6) can
         // include this client. Reason is logged in the structured tracing log.
-        let auth = self.epoch_authenticator_hex(convo_id);
+        let auth = self.epoch_authenticator_hex(convo_id).await;
         if let Err(e) = self
             .api_client()
             .report_recovery_failure(

@@ -347,12 +347,13 @@ where
     /// blob fetch, key/epoch/AAD mismatch) is logged and skipped — the join
     /// itself is never affected.
     pub(crate) async fn hydrate_conversation_metadata(&self, conversation_id: &str) {
-        let group_id_hex = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
+        let resolved = match self.resolve_conversation_context(conversation_id).await {
+            Ok(resolved) => resolved,
+            Err(_) => return,
+        };
+        let group_id_hex = resolved.group_id;
         let group_id_bytes = match hex::decode(&group_id_hex) {
-            Ok(b) => b,
+            Ok(bytes) => bytes,
             Err(_) => return,
         };
 
@@ -544,10 +545,8 @@ where
     /// until all clients have moved over.
     pub async fn add_members(&self, conversation_id: &str, member_dids: &[String]) -> Result<()> {
         self.check_shutdown().await?;
-        let group_id = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let group_id = resolved.group_id;
 
         tracing::info!(
             conversation_id,
@@ -681,10 +680,8 @@ where
         member_dids: &[String],
     ) -> Result<()> {
         self.check_shutdown().await?;
-        let group_id = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let group_id = resolved.group_id;
 
         tracing::info!(
             conversation_id,
@@ -844,18 +841,18 @@ where
 
         tracing::info!(convo_id, "Leaving group via self-remove proposal");
 
-        let group_id_bytes = hex::decode(convo_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        let resolved = self.resolve_conversation_context(convo_id).await?;
+        let group_id_bytes = resolved.group_id_bytes()?;
 
         let proposal_bytes = self.mls_context().propose_self_remove(group_id_bytes)?;
 
-        let epoch = self
-            .group_states()
-            .lock()
-            .await
-            .get(convo_id)
-            .map(|gs| gs.epoch)
-            .unwrap_or(0);
+        let epoch = {
+            let states = self.group_states().lock().await;
+            resolved
+                .group_state(&states)
+                .map(|gs| gs.epoch)
+                .unwrap_or(0)
+        };
 
         let message_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = self
@@ -885,8 +882,8 @@ where
 
         tracing::info!(convo_id, "Committing pending self-remove proposals");
 
-        let group_id_bytes = hex::decode(convo_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        let resolved = self.resolve_conversation_context(convo_id).await?;
+        let group_id_bytes = resolved.group_id_bytes()?;
 
         let commit_bytes = match self
             .mls_context()
@@ -916,9 +913,10 @@ where
         let new_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         {
             let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.get_mut(convo_id) {
+            if let Some(mut gs) = resolved.group_state(&states).cloned() {
                 gs.epoch = new_epoch;
                 let state_clone = gs.clone();
+                normalize_group_state(&mut states, gs);
                 drop(states);
                 if let Err(e) = self.storage().set_group_state(&state_clone).await {
                     tracing::warn!(error = %e, convo_id, "Failed to persist group state");
@@ -967,10 +965,8 @@ where
     ) -> Result<()> {
         self.check_shutdown().await?;
 
-        let group_id_hex = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let group_id_hex = resolved.group_id;
         let group_id_bytes = hex::decode(&group_id_hex).map_err(|_| {
             OrchestratorError::InvalidInput("Invalid hex group ID for metadata update".into())
         })?;

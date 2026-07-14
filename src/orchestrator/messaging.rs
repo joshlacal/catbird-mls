@@ -71,19 +71,12 @@ where
             return projected;
         }
 
-        let group_id = self
-            .group_states()
-            .lock()
-            .await
-            .values()
-            .find(|group| group.conversation_id == conversation_id)
-            .map(|group| group.group_id.clone());
-
-        let Some(group_id) = group_id else {
-            return projected;
+        let resolved = match self.resolve_conversation_context(conversation_id).await {
+            Ok(resolved) => resolved,
+            Err(_) => return ConversationRecoveryState::GroupMissing,
         };
-        let Ok(group_id_bytes) = hex::decode(&group_id) else {
-            return projected;
+        let Ok(group_id_bytes) = resolved.group_id_bytes() else {
+            return ConversationRecoveryState::GroupMissing;
         };
 
         match self.mls_context().get_epoch(group_id_bytes) {

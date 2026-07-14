@@ -2,10 +2,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::orchestrator::{
-    ConversationReadyResult, ConversationRecoveryState, ConversationState, ConversationView,
-    CredentialStore, DebugWipeLocalGroupResult, DeferredRecoveryReport, EngineEvent, GroupState,
-    IncomingEnvelope, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MlsCryptoContext,
-    OrchestratorConfig, OrchestratorError, ResetRecordOutcome, Result, StartupReconcileReport,
+    normalize_group_state, ConversationReadyResult, ConversationRecoveryState, ConversationState,
+    ConversationView, CredentialStore, DebugWipeLocalGroupResult, DeferredRecoveryReport,
+    EngineEvent, GroupState, IncomingEnvelope, MLSAPIClient, MLSOrchestrator, MLSStorageBackend,
+    MlsCryptoContext, OrchestratorConfig, OrchestratorError, ResetRecordOutcome, Result,
+    StartupReconcileReport,
 };
 use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 use crate::{StorageLifecycleState, StorageLifecycleStatus};
@@ -609,11 +610,10 @@ where
                 .lock()
                 .await
                 .insert(conversation.conversation_id.clone(), conversation.clone());
-            self.orchestrator
-                .group_states()
-                .lock()
-                .await
-                .insert(conversation.group_id.clone(), state.clone());
+            {
+                let mut states = self.orchestrator.group_states().lock().await;
+                normalize_group_state(&mut states, state.clone());
+            }
             self.orchestrator.conversation_states().lock().await.insert(
                 conversation.conversation_id.clone(),
                 ConversationState::Active,

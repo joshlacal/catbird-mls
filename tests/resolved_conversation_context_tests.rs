@@ -75,12 +75,15 @@ async fn send_uses_resolved_group_id_but_routes_by_stable_conversation_id() {
 async fn authoritative_conversation_mapping_wins_over_stale_legacy_group_state() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
+    world.add_client("Bob").await;
     world
         .register_device("Alice")
         .await
         .expect("register alice");
+    world.register_device("Bob").await.expect("register bob");
 
     let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
     let conversation = alice
         .orchestrator
         .create_group("stale legacy resolver", None, None)
@@ -124,6 +127,286 @@ async fn authoritative_conversation_mapping_wins_over_stale_legacy_group_state()
         stable_message_count_before_send + 1
     );
     assert_eq!(world.delivery_service().message_count(&active_group_id), 0);
+
+    alice
+        .orchestrator
+        .add_members(STABLE_CONVERSATION_ID, std::slice::from_ref(&bob_did))
+        .await
+        .expect("stale legacy state must not redirect staged group mutation");
+    let active = alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .get(&active_group_id)
+        .cloned()
+        .expect("active group state");
+    assert!(active.members.contains(&bob_did));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn leave_via_self_remove_uses_active_group_for_rotated_stable_conversation() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("rotated self remove", None, None)
+        .await
+        .expect("create group");
+    let group_id = conversation.group_id.clone();
+
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh rotated mapping");
+
+    alice
+        .orchestrator
+        .leave_via_self_remove(STABLE_CONVERSATION_ID)
+        .await
+        .expect("self-remove must use active mutable group");
+
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(group_id).expect("active group id"))
+            .is_err(),
+        "successful leave must delete the active local group"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commit_self_remove_proposals_uses_active_group_for_rotated_stable_conversation() {
+    let world = registered_two_client_world().await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let bob_did = bob.did.clone();
+    let conversation = alice
+        .orchestrator
+        .create_group(
+            "rotated self remove commit",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
+        .await
+        .expect("create group");
+    let group_id = conversation.group_id.clone();
+    let bob_api = world.delivery_service().clone_as(&bob.did);
+    let welcome = bob_api
+        .get_welcome(&conversation.conversation_id)
+        .await
+        .expect("bob welcome");
+    bob.orchestrator
+        .join_group(&welcome)
+        .await
+        .expect("bob join");
+
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh rotated mapping");
+    bob.orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh bob rotated mapping");
+    let group_id_bytes = hex::decode(&group_id).expect("active group id");
+    let proposal = bob
+        .orchestrator
+        .mls_context()
+        .propose_self_remove(group_id_bytes.clone())
+        .expect("bob self-remove proposal");
+    alice
+        .orchestrator
+        .process_incoming_message(&IncomingEnvelope {
+            conversation_id: STABLE_CONVERSATION_ID.to_string(),
+            sender_did: bob.did.clone(),
+            ciphertext: proposal,
+            timestamp: Utc::now(),
+            server_message_id: Some("rotated-self-remove-proposal".to_string()),
+            server_epoch: None,
+        })
+        .await
+        .expect("alice processes self-remove proposal");
+
+    alice
+        .orchestrator
+        .commit_self_remove_proposals(STABLE_CONVERSATION_ID)
+        .await
+        .expect("self-remove commit must use active mutable group");
+
+    let current_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id_bytes)
+        .expect("active group remains addressable");
+    let cached = alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .get(&group_id)
+        .cloned()
+        .expect("active group-keyed cache state");
+    assert_eq!(cached.conversation_id, STABLE_CONVERSATION_ID);
+    assert_eq!(cached.epoch, current_epoch);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_hex_identifier_cannot_be_treated_as_an_authoritative_group_mapping() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    world.register_device("Bob").await.expect("register bob");
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let conversation = alice
+        .orchestrator
+        .create_group("unbound hex identifier", None, None)
+        .await
+        .expect("create group");
+    let hex_identifier = conversation.group_id.clone();
+
+    alice.orchestrator.conversations().lock().await.clear();
+    alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .remove(&hex_identifier);
+    alice
+        .storage
+        .delete_conversations(&alice.did, &[&hex_identifier])
+        .await
+        .expect("remove authoritative mapping");
+
+    let result = alice
+        .orchestrator
+        .add_members(&hex_identifier, std::slice::from_ref(&bob_did))
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(catbird_mls::orchestrator::error::OrchestratorError::ConversationNotFound(_))
+                | Err(catbird_mls::orchestrator::error::OrchestratorError::NotJoined { .. })
+        ),
+        "unbound hex input must fail before any MLS mutation: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_confirm_normalizes_exact_legacy_state_to_active_group_key() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    world.register_device("Bob").await.expect("register bob");
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let conversation = alice
+        .orchestrator
+        .create_group("legacy staged confirm", None, None)
+        .await
+        .expect("create group");
+    let group_id = conversation.group_id.clone();
+
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh stable mapping");
+    {
+        let mut states = alice.orchestrator.group_states().lock().await;
+        let current = states.remove(&group_id).expect("current group state");
+        states.insert(STABLE_CONVERSATION_ID.to_string(), current);
+    }
+
+    alice
+        .orchestrator
+        .add_members(STABLE_CONVERSATION_ID, std::slice::from_ref(&bob_did))
+        .await
+        .expect("confirm staged commit from exact legacy state");
+
+    let states = alice.orchestrator.group_states().lock().await;
+    assert!(!states.contains_key(STABLE_CONVERSATION_ID));
+    let current = states
+        .get(&group_id)
+        .expect("normalized active group state");
+    assert!(current.members.contains(&bob_did));
+    assert_eq!(current.conversation_id, STABLE_CONVERSATION_ID);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn readiness_uses_authoritative_mapping_instead_of_stale_group_state_scan() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("authoritative readiness", None, None)
+        .await
+        .expect("create group");
+    let group_id = conversation.group_id.clone();
+
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh stable mapping");
+    {
+        let mut states = alice.orchestrator.group_states().lock().await;
+        states.remove(&group_id);
+        states.insert(
+            STABLE_CONVERSATION_ID.to_string(),
+            GroupState {
+                group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                conversation_id: STABLE_CONVERSATION_ID.to_string(),
+                epoch: 99,
+                members: vec![alice.did.clone()],
+            },
+        );
+    }
+
+    let ready = alice
+        .orchestrator
+        .ensure_conversation_ready(STABLE_CONVERSATION_ID)
+        .await
+        .expect("readiness projection");
+    assert_eq!(
+        ready.recovery_state,
+        catbird_mls::orchestrator::ConversationRecoveryState::Healthy
+    );
+    assert!(ready.send_allowed);
 }
 
 #[tokio::test(flavor = "multi_thread")]

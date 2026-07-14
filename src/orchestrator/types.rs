@@ -46,6 +46,13 @@ pub(crate) struct ResolvedConversationContext {
     pub group_id: GroupId,
 }
 
+pub(crate) fn normalize_group_state(states: &mut HashMap<GroupId, GroupState>, state: GroupState) {
+    states.retain(|key, existing| {
+        key == &state.group_id || existing.conversation_id != state.conversation_id
+    });
+    states.insert(state.group_id.clone(), state);
+}
+
 impl ResolvedConversationContext {
     pub(crate) fn group_id_bytes(&self) -> crate::orchestrator::error::Result<Vec<u8>> {
         hex::decode(&self.group_id).map_err(|_| {
@@ -1293,5 +1300,40 @@ mod tests {
             .expect("exact legacy state")
             .epoch = 8;
         assert_eq!(states[&context.conversation_id].epoch, 8);
+    }
+
+    #[test]
+    fn normalized_group_state_replaces_all_stale_entries_for_conversation() {
+        let stale = GroupState {
+            conversation_id: "stable-conversation".to_string(),
+            group_id: "old-group".to_string(),
+            epoch: 3,
+            members: vec![],
+        };
+        let current = GroupState {
+            conversation_id: "stable-conversation".to_string(),
+            group_id: "current-group".to_string(),
+            epoch: 7,
+            members: vec![],
+        };
+        let unrelated = GroupState {
+            conversation_id: "other-conversation".to_string(),
+            group_id: "other-group".to_string(),
+            epoch: 1,
+            members: vec![],
+        };
+        let mut states = std::collections::HashMap::from([
+            ("old-group".to_string(), stale),
+            ("stable-conversation".to_string(), current.clone()),
+            ("other-group".to_string(), unrelated),
+        ]);
+
+        normalize_group_state(&mut states, current);
+
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key("current-group"));
+        assert!(states.contains_key("other-group"));
+        assert!(!states.contains_key("old-group"));
+        assert!(!states.contains_key("stable-conversation"));
     }
 }
