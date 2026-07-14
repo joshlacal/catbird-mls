@@ -424,14 +424,9 @@ where
             }
             Err(err) => {
                 tracing::warn!(conversation_id, error = %err, "FFI get_epoch failed, using cached group state");
-                self.group_states()
-                    .lock()
-                    .await
-                    .values()
-                    .find(|state| {
-                        state.conversation_id == resolved.conversation_id
-                            && state.group_id == resolved.group_id
-                    })
+                let states = self.group_states().lock().await;
+                resolved
+                    .group_state(&states)
                     .map(|state| state.epoch)
                     .unwrap_or(0)
             }
@@ -819,17 +814,13 @@ where
                 // NeedsRejoin counters --- those drive auto-External-Commits, which
                 // is exactly the cascade we are trying to break.
                 let local_epoch = self.mls_context().get_epoch(group_id_bytes.clone()).ok();
-                let msg_epoch_for_class = self
-                    .group_states()
-                    .lock()
-                    .await
-                    .values()
-                    .find(|state| {
-                        state.conversation_id == resolved.conversation_id
-                            && state.group_id == resolved.group_id
-                    })
-                    .map(|state| state.epoch)
-                    .unwrap_or(0);
+                let msg_epoch_for_class = {
+                    let states = self.group_states().lock().await;
+                    resolved
+                        .group_state(&states)
+                        .map(|state| state.epoch)
+                        .unwrap_or(0)
+                };
                 if Self::classify_peer_bad(&e, local_epoch, msg_epoch_for_class) {
                     let msg_id = envelope.server_message_id.clone().unwrap_or_else(|| {
                         format!("unknown-{}", chrono::Utc::now().timestamp_millis())
@@ -1067,10 +1058,7 @@ where
             // Still update cached group state epoch
             {
                 let mut states = self.group_states().lock().await;
-                if let Some(gs) = states.values_mut().find(|state| {
-                    state.conversation_id == resolved.conversation_id
-                        && state.group_id == resolved.group_id
-                }) {
+                if let Some(gs) = resolved.group_state_mut(&mut states) {
                     if decrypt_result.epoch > gs.epoch {
                         gs.epoch = decrypt_result.epoch;
                         let state_clone = gs.clone();
@@ -1211,10 +1199,7 @@ where
         // Update group state epoch if it advanced (and persist)
         {
             let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.values_mut().find(|state| {
-                state.conversation_id == resolved.conversation_id
-                    && state.group_id == resolved.group_id
-            }) {
+            if let Some(gs) = resolved.group_state_mut(&mut states) {
                 if decrypt_result.epoch > gs.epoch {
                     gs.epoch = decrypt_result.epoch;
                     let state_clone = gs.clone();

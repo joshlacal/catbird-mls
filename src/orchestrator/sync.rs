@@ -414,10 +414,11 @@ where
             };
             let has_state_record = {
                 let states = self.group_states().lock().await;
-                states.contains_key(conversation_id)
-                    || states
-                        .values()
-                        .any(|gs| gs.conversation_id == conversation_id || gs.group_id == group_id)
+                states.get(group_id).is_some_and(|state| {
+                    state.conversation_id == conversation_id && state.group_id == group_id
+                }) || states.get(conversation_id).is_some_and(|state| {
+                    state.conversation_id == conversation_id && state.group_id == group_id
+                })
             };
 
             crate::info_log!(
@@ -555,30 +556,37 @@ where
                 };
                 {
                     let mut states = self.group_states().lock().await;
-                    if conversation_id != group_id {
-                        states.remove(group_id);
-                    }
-                    states.insert(conversation_id.to_string(), state.clone());
+                    states.retain(|key, existing| {
+                        key == group_id || existing.conversation_id != conversation_id
+                    });
+                    states.insert(group_id.to_string(), state.clone());
                 }
                 self.storage().set_group_state(&state).await?;
             } else {
                 // Update member list from server
                 let mut states = self.group_states().lock().await;
-                let state_key = if states.contains_key(conversation_id) {
-                    Some(conversation_id.to_string())
-                } else {
-                    states
-                        .iter()
-                        .find(|(_, gs)| {
-                            gs.conversation_id == conversation_id || gs.group_id == group_id
-                        })
-                        .map(|(key, _)| key.clone())
+                let exact_identity = |state: &GroupState| {
+                    state.conversation_id == conversation_id && state.group_id == group_id
                 };
+                let state_key = states
+                    .get(group_id)
+                    .filter(|state| exact_identity(state))
+                    .map(|_| group_id.to_string())
+                    .or_else(|| {
+                        states
+                            .get(conversation_id)
+                            .filter(|state| exact_identity(state))
+                            .map(|_| conversation_id.to_string())
+                    });
                 if let Some(state_key) = state_key {
                     if let Some(mut gs) = states.remove(&state_key) {
                         gs.conversation_id = conversation_id.to_string();
+                        gs.group_id = group_id.to_string();
                         gs.members = convo.members.iter().map(|m| m.did.clone()).collect();
-                        states.insert(conversation_id.to_string(), gs);
+                        states.retain(|key, existing| {
+                            key == group_id || existing.conversation_id != conversation_id
+                        });
+                        states.insert(group_id.to_string(), gs);
                     }
                 }
             }
@@ -592,11 +600,10 @@ where
             let local_epoch = {
                 let states = self.group_states().lock().await;
                 states
-                    .get(conversation_id)
-                    .or_else(|| {
-                        states.values().find(|gs| {
-                            gs.conversation_id == conversation_id || gs.group_id == group_id
-                        })
+                    .get(group_id)
+                    .or_else(|| states.get(conversation_id))
+                    .filter(|state| {
+                        state.conversation_id == conversation_id && state.group_id == group_id
                     })
                     .map(|gs| gs.epoch)
                     .unwrap_or(0)
@@ -644,12 +651,11 @@ where
                         let new_local = {
                             let states = self.group_states().lock().await;
                             states
-                                .get(conversation_id)
-                                .or_else(|| {
-                                    states.values().find(|gs| {
-                                        gs.conversation_id == conversation_id
-                                            || gs.group_id == group_id
-                                    })
+                                .get(group_id)
+                                .or_else(|| states.get(conversation_id))
+                                .filter(|state| {
+                                    state.conversation_id == conversation_id
+                                        && state.group_id == group_id
                                 })
                                 .map(|gs| gs.epoch)
                                 .unwrap_or(0)

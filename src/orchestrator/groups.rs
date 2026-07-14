@@ -786,11 +786,19 @@ where
                     self.record_and_check_sequencer_receipt(receipt, "swap_members")
                         .await;
                 }
-                let current_epoch =
-                    self.mls_context()
-                        .get_epoch(hex::decode(group_id).map_err(|_| {
-                            OrchestratorError::InvalidInput("Invalid hex group ID".into())
-                        })?)?;
+                let current_epoch = match hex::decode(&plan.handle.group_id)
+                    .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))
+                    .and_then(|group_id| {
+                        self.mls_context()
+                            .get_epoch(group_id)
+                            .map_err(OrchestratorError::from)
+                    }) {
+                    Ok(epoch) => epoch,
+                    Err(error) => {
+                        let _ = self.discard_pending(plan.handle).await;
+                        return Err(error);
+                    }
+                };
                 if result.new_epoch > current_epoch {
                     self.confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
                         .await?;

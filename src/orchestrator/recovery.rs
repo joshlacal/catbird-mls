@@ -861,7 +861,7 @@ where
 
                 {
                     let mut st = self.group_states().lock().await;
-                    if let Some(gs) = st.get_mut(convo_id) {
+                    if let Some(gs) = st.get_mut(&group_id) {
                         gs.epoch = ep;
                         let sc = gs.clone();
                         drop(st);
@@ -1701,32 +1701,6 @@ where
             });
         }
 
-        {
-            let states = self.group_states().lock().await;
-            if let Some(state) = states
-                .values()
-                .find(|state| state.conversation_id == conversation_id)
-            {
-                return Ok(ResolvedConversationContext {
-                    conversation_id: state.conversation_id.clone(),
-                    group_id: state.group_id.clone(),
-                });
-            }
-        }
-
-        {
-            let conversations = self.conversations().lock().await;
-            if let Some(view) = conversations
-                .values()
-                .find(|view| view.conversation_id == conversation_id)
-            {
-                return Ok(ResolvedConversationContext {
-                    conversation_id: view.conversation_id.clone(),
-                    group_id: view.group_id.clone(),
-                });
-            }
-        }
-
         Err(OrchestratorError::ConversationNotFound(
             conversation_id.to_string(),
         ))
@@ -2127,8 +2101,10 @@ where
         let new_group_id_hex = hex::encode(&ext_commit_result.group_id);
         {
             let mut states = self.group_states().lock().await;
+            states
+                .retain(|key, state| key == &new_group_id_hex || state.conversation_id != convo_id);
             let state = states
-                .entry(convo_id.to_string())
+                .entry(new_group_id_hex.clone())
                 .or_insert_with(|| GroupState {
                     group_id: new_group_id_hex.clone(),
                     conversation_id: convo_id.to_string(),
@@ -2473,9 +2449,12 @@ where
                         let welcome_group_id_hex = hex::encode(&result.group_id);
                         {
                             let mut states = self.group_states().lock().await;
+                            states.retain(|key, state| {
+                                key == &welcome_group_id_hex || state.conversation_id != convo_id
+                            });
                             let state =
                                 states
-                                    .entry(convo_id.to_string())
+                                    .entry(welcome_group_id_hex.clone())
                                     .or_insert_with(|| GroupState {
                                         group_id: welcome_group_id_hex.clone(),
                                         conversation_id: convo_id.to_string(),
@@ -3212,8 +3191,10 @@ where
         // conversation up on the next pass.
         {
             let mut states = self.group_states().lock().await;
+            states
+                .retain(|key, state| key == new_group_id_hex || state.conversation_id != convo_id);
             let entry = states
-                .entry(convo_id.to_string())
+                .entry(new_group_id_hex.to_string())
                 .or_insert_with(|| GroupState {
                     group_id: new_group_id_hex.to_string(),
                     conversation_id: convo_id.to_string(),

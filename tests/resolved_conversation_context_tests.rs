@@ -289,3 +289,52 @@ async fn epoch_cleanup_keeps_crypto_group_and_storage_conversation_id_separate()
         "mutable MLS group id must remain confined to crypto cleanup"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn swap_members_uses_resolved_group_after_server_accepts_stable_conversation_route() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob", "Charlie"] {
+        world.add_client(name).await;
+        world.register_device(name).await.expect("register device");
+    }
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let charlie_did = world.client("Charlie").did.clone();
+    let conversation = alice
+        .orchestrator
+        .create_group("rotated swap", Some(std::slice::from_ref(&bob_did)), None)
+        .await
+        .expect("create group with bob");
+    let group_id = conversation.group_id.clone();
+
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh stable conversation mapping");
+
+    alice
+        .orchestrator
+        .swap_members(
+            STABLE_CONVERSATION_ID,
+            std::slice::from_ref(&bob_did),
+            std::slice::from_ref(&charlie_did),
+        )
+        .await
+        .expect("swap through stable conversation id");
+
+    let state = alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .get(&group_id)
+        .cloned()
+        .expect("current group state");
+    assert!(!state.members.contains(&bob_did));
+    assert!(state.members.contains(&charlie_did));
+    assert_eq!(state.conversation_id, STABLE_CONVERSATION_ID);
+}
