@@ -2,7 +2,7 @@
 
 mod e2e_harness;
 
-use catbird_mls::orchestrator::{IncomingEnvelope, MLSAPIClient, MLSStorageBackend};
+use catbird_mls::orchestrator::{GroupState, IncomingEnvelope, MLSAPIClient, MLSStorageBackend};
 use chrono::Utc;
 use e2e_harness::TestWorld;
 use sha2::{Digest, Sha256};
@@ -69,6 +69,61 @@ async fn send_uses_resolved_group_id_but_routes_by_stable_conversation_id() {
         0,
         "the mutable MLS group id must not replace the server conversation id"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authoritative_conversation_mapping_wins_over_stale_legacy_group_state() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("stale legacy resolver", None, None)
+        .await
+        .expect("create group");
+    let active_group_id = conversation.group_id.clone();
+
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh authoritative conversation mapping");
+
+    alice.orchestrator.group_states().lock().await.insert(
+        STABLE_CONVERSATION_ID.to_string(),
+        GroupState {
+            group_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            conversation_id: STABLE_CONVERSATION_ID.to_string(),
+            epoch: 99,
+            members: vec![alice.did.clone()],
+        },
+    );
+    let stable_message_count_before_send = world
+        .delivery_service()
+        .message_count(STABLE_CONVERSATION_ID);
+
+    let sent = alice
+        .orchestrator
+        .send_message(STABLE_CONVERSATION_ID, "authoritative mapping")
+        .await
+        .expect("stale legacy group state must not override active mapping");
+
+    assert_eq!(sent.conversation_id, STABLE_CONVERSATION_ID);
+    assert_eq!(
+        world
+            .delivery_service()
+            .message_count(STABLE_CONVERSATION_ID),
+        stable_message_count_before_send + 1
+    );
+    assert_eq!(world.delivery_service().message_count(&active_group_id), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

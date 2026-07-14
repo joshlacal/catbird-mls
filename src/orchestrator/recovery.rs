@@ -1662,19 +1662,9 @@ where
         &self,
         conversation_id: &str,
     ) -> Result<ResolvedConversationContext> {
-        {
-            let states = self.group_states().lock().await;
-            if let Some(state) = states
-                .get(conversation_id)
-                .filter(|state| state.conversation_id == conversation_id)
-            {
-                return Ok(ResolvedConversationContext {
-                    conversation_id: state.conversation_id.clone(),
-                    group_id: state.group_id.clone(),
-                });
-            }
-        }
-
+        // The server-refreshed conversation cache is the authoritative O(1)
+        // mapping during a live session. It must precede legacy group-state
+        // entries, which may survive a group rotation under the stable key.
         {
             let conversations = self.conversations().lock().await;
             if let Some(view) = conversations
@@ -1699,6 +1689,23 @@ where
                 conversation_id: view.conversation_id,
                 group_id: view.group_id,
             });
+        }
+
+        // Compatibility fallback for pre-normalization in-memory state. New
+        // group-state entries are keyed by mutable GroupId, so a direct stable
+        // key hit is legacy data and is consulted only when neither current
+        // cache nor durable storage has an authoritative mapping.
+        {
+            let states = self.group_states().lock().await;
+            if let Some(state) = states
+                .get(conversation_id)
+                .filter(|state| state.conversation_id == conversation_id)
+            {
+                return Ok(ResolvedConversationContext {
+                    conversation_id: state.conversation_id.clone(),
+                    group_id: state.group_id.clone(),
+                });
+            }
         }
 
         Err(OrchestratorError::ConversationNotFound(
