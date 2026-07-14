@@ -184,9 +184,17 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         Ok(())
     }
 
-    /// Clear any persisted RESET_PENDING payload for a conversation (called
-    /// after successful adoption of the new group).
-    async fn clear_reset_pending(&self, _conversation_id: &str) -> Result<()> {
+    /// Clear a persisted RESET_PENDING payload with causal generation binding.
+    ///
+    /// `Some(generation)` may clear only an exactly matching committed reset;
+    /// stale or newer generations are successful no-ops. `None` is reserved
+    /// for rolling back an incomplete, uncommitted intent and MUST NOT clear a
+    /// committed payload.
+    async fn clear_reset_pending(
+        &self,
+        _conversation_id: &str,
+        _expected_generation: Option<i32>,
+    ) -> Result<()> {
         Ok(())
     }
 

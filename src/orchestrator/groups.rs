@@ -1223,6 +1223,18 @@ where
     async fn force_delete_local_steps(&self, convo_id: &str, group_id_hex: Option<&str>) -> bool {
         let user_did = self.require_user_did().await.unwrap_or_default();
         let mut all_ok = true;
+        let reset_generation = match self.reset_pending_payload_result(convo_id).await {
+            Ok(payload) => payload.map(|payload| payload.reset_generation),
+            Err(error) => {
+                all_ok = false;
+                tracing::warn!(
+                    error = %error,
+                    convo_id,
+                    "Failed to read reset-pending authority during local delete; keeping delete intent"
+                );
+                None
+            }
+        };
 
         // Delete MLS group from FFI. An already-deleted group is success.
         if let Some(group_id_bytes) = group_id_hex.and_then(|group_id| hex::decode(group_id).ok()) {
@@ -1270,9 +1282,15 @@ where
             all_ok = false;
             tracing::warn!(error = %e, convo_id, "Failed to clear persisted recovery backoff during local delete");
         }
-        if let Err(e) = self.storage().clear_reset_pending(convo_id).await {
-            all_ok = false;
-            tracing::warn!(error = %e, convo_id, "Failed to clear persisted reset-pending payload during local delete");
+        if let Some(reset_generation) = reset_generation {
+            if let Err(e) = self
+                .storage()
+                .clear_reset_pending(convo_id, Some(reset_generation))
+                .await
+            {
+                all_ok = false;
+                tracing::warn!(error = %e, convo_id, reset_generation, "Failed to clear persisted reset-pending payload during local delete");
+            }
         }
         if let Err(e) = self.storage().clear_quarantine(convo_id).await {
             all_ok = false;

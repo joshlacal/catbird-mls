@@ -85,6 +85,7 @@ struct Inner {
     fail_next_mark_reset_pending: bool,
     fail_next_get_conversation_state: bool,
     fail_next_conversation_state_for: Option<String>,
+    fail_conversation_state_after_reads: Option<(String, u32)>,
     malformed_conversation_states: std::collections::HashSet<String>,
     fail_next_mark_quarantined: bool,
     fail_next_clear_quarantine: bool,
@@ -365,6 +366,19 @@ impl MockStorage {
     pub fn fail_next_get_conversation_state_for(&self, conversation_id: &str) {
         self.inner.lock().unwrap().fail_next_conversation_state_for =
             Some(conversation_id.to_string());
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_get_conversation_state_after_successful_reads(
+        &self,
+        conversation_id: &str,
+        successful_reads: u32,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_conversation_state_after_reads =
+            Some((conversation_id.to_string(), successful_reads));
     }
 
     /// Persistently fail decoding the security sidecar for one conversation,
@@ -717,9 +731,20 @@ impl MLSStorageBackend for MockStorage {
         Ok(())
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+    async fn clear_reset_pending(
+        &self,
+        conversation_id: &str,
+        expected_generation: Option<i32>,
+    ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        inner.reset_pending.remove(conversation_id);
+        if expected_generation.is_some_and(|generation| {
+            inner
+                .reset_pending
+                .get(conversation_id)
+                .is_some_and(|pending| pending.reset_generation == generation)
+        }) {
+            inner.reset_pending.remove(conversation_id);
+        }
         Ok(())
     }
 
@@ -776,6 +801,17 @@ impl MLSStorageBackend for MockStorage {
             return Err(OrchestratorError::Storage(
                 "malformed persisted reset/quarantine sidecar".to_string(),
             ));
+        }
+        if let Some((target, remaining)) = inner.fail_conversation_state_after_reads.as_mut() {
+            if target == conversation_id {
+                if *remaining == 0 {
+                    inner.fail_conversation_state_after_reads = None;
+                    return Err(OrchestratorError::Storage(
+                        "malformed persisted reset/quarantine sidecar".to_string(),
+                    ));
+                }
+                *remaining -= 1;
+            }
         }
         if inner
             .malformed_conversation_states

@@ -263,9 +263,13 @@ impl MLSStorageBackend for ClientStorageAdapter {
             .map_err(bridge_err)
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
+    async fn clear_reset_pending(
+        &self,
+        conversation_id: &str,
+        expected_generation: Option<i32>,
+    ) -> crate::orchestrator::Result<()> {
         self.0
-            .clear_reset_pending(conversation_id.to_string())
+            .clear_reset_pending(conversation_id.to_string(), expected_generation)
             .map_err(bridge_err)
     }
 

@@ -104,7 +104,11 @@ pub trait OrchestratorStorageCallback: Send + Sync {
 
     /// Clear any persisted `RESET_PENDING` payload after the conversation has
     /// successfully adopted the new group.
-    fn clear_reset_pending(&self, conversation_id: String) -> Result<(), OrchestratorBridgeError>;
+    fn clear_reset_pending(
+        &self,
+        conversation_id: String,
+        expected_generation: Option<i32>,
+    ) -> Result<(), OrchestratorBridgeError>;
 
     fn mark_quarantined(
         &self,
@@ -1640,9 +1644,13 @@ impl MLSStorageBackend for StorageAdapter {
             .map_err(bridge_err)
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
+    async fn clear_reset_pending(
+        &self,
+        conversation_id: &str,
+        expected_generation: Option<i32>,
+    ) -> crate::orchestrator::Result<()> {
         self.0
-            .clear_reset_pending(conversation_id.to_string())
+            .clear_reset_pending(conversation_id.to_string(), expected_generation)
             .map_err(bridge_err)
     }
 
@@ -3893,6 +3901,7 @@ mod tests {
         pending_messages: Mutex<std::collections::HashSet<String>>,
         receipts: Mutex<Vec<FFISequencerReceipt>>,
         reset_payload: Mutex<Option<(String, String, i32, i64)>>,
+        reset_clear_requests: Mutex<Vec<(String, Option<i32>)>>,
         quarantine_payload: Mutex<Option<(String, String, i64)>>,
         fail_security_writes: std::sync::atomic::AtomicBool,
     }
@@ -3987,9 +3996,14 @@ mod tests {
         }
         fn clear_reset_pending(
             &self,
-            _conversation_id: String,
+            conversation_id: String,
+            expected_generation: Option<i32>,
         ) -> Result<(), OrchestratorBridgeError> {
             self.reject_injected_security_failure()?;
+            self.reset_clear_requests
+                .lock()
+                .unwrap()
+                .push((conversation_id, expected_generation));
             Ok(())
         }
         fn mark_quarantined(
@@ -4968,11 +4982,39 @@ mod tests {
                     Err(OrchestratorError::Storage(_))
                 ));
                 assert_storage_failure(adapter.clear_sequencer_receipts("convo").await);
-                assert_storage_failure(adapter.clear_reset_pending("convo").await);
+                assert_storage_failure(adapter.clear_reset_pending("convo", Some(1)).await);
                 assert_storage_failure(adapter.clear_quarantine("convo").await);
                 assert_storage_failure(adapter.clear_recovery_backoff("convo").await);
                 assert_storage_failure(adapter.clear_pending_local_delete("convo").await);
             }
+        });
+    }
+
+    #[test]
+    fn both_storage_adapters_forward_reset_clear_generation_exactly() {
+        crate::async_runtime::block_on(async {
+            let callback = Arc::new(RecordingStorageCallback::default());
+            let adapters: Vec<Box<dyn MLSStorageBackend>> = vec![
+                Box::new(StorageAdapter(callback.clone())),
+                Box::new(crate::client_bridge::ClientStorageAdapter(callback.clone())),
+            ];
+
+            adapters[0]
+                .clear_reset_pending("convo-a", Some(7))
+                .await
+                .expect("orchestrator adapter clear");
+            adapters[1]
+                .clear_reset_pending("convo-b", None)
+                .await
+                .expect("client adapter rollback clear");
+
+            assert_eq!(
+                callback.reset_clear_requests.lock().unwrap().as_slice(),
+                &[
+                    ("convo-a".to_string(), Some(7)),
+                    ("convo-b".to_string(), None),
+                ]
+            );
         });
     }
 

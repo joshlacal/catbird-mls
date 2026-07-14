@@ -3134,7 +3134,7 @@ where
             // write did not. Restore the complete pre-transition tuple before
             // returning, including an older ResetPending payload when a newer
             // generation was being attempted.
-            if let Err(rollback_error) = self.storage().clear_reset_pending(convo_id).await {
+            if let Err(rollback_error) = self.storage().clear_reset_pending(convo_id, None).await {
                 self.report_recovery_storage_failure(
                     convo_id,
                     "clear_reset_pending:rollback",
@@ -3353,7 +3353,7 @@ where
             .flatten()
     }
 
-    async fn reset_pending_payload_result(
+    pub(crate) async fn reset_pending_payload_result(
         &self,
         convo_id: &str,
     ) -> Result<Option<ResetPendingPayload>> {
@@ -3520,7 +3520,11 @@ where
                 }
                 // A stale reset_pending row would re-trigger bootstrap on a
                 // later restart — escalate a dropped clear.
-                if let Err(e) = self.storage().clear_reset_pending(convo_id).await {
+                if let Err(e) = self
+                    .storage()
+                    .clear_reset_pending(convo_id, Some(payload.reset_generation))
+                    .await
+                {
                     self.report_recovery_storage_failure(convo_id, "clear_reset_pending", &e)
                         .await;
                 }

@@ -1119,6 +1119,56 @@ async fn failed_delete_step_keeps_intent_then_retry_clears_it() {
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
+/// A force-delete pass must not treat a failed reset-authority read as
+/// evidence that no committed reset row exists. Otherwise it can report
+/// success, clear its retry intent, and strand the committed row forever.
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_authority_read_failure_keeps_delete_intent_and_committed_reset() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("generation-bound delete", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    alice
+        .storage
+        .mark_reset_pending(&convo_id, &"ab".repeat(16), 2, now_ms())
+        .await
+        .expect("seed committed reset authority");
+    world
+        .delivery_service()
+        .remove_conversation_for_test(&convo_id);
+    alice
+        .storage
+        .fail_get_conversation_state_after_successful_reads(&convo_id, 1);
+
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("sync should preserve cleanup retry state");
+
+    assert_eq!(
+        alice.storage.pending_local_delete_count(),
+        1,
+        "reset-authority read failure must keep the delete intent"
+    );
+    assert_eq!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&convo_id)
+            .expect("committed reset authority must survive")
+            .reset_generation,
+        2
+    );
+}
+
 /// FIX-6: force_delete_local must also delete the conversation's recovery
 /// state. A maxed-out backoff row left behind would be re-imported by
 /// hydration and gate a re-added conversation with the same server

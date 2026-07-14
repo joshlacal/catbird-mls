@@ -450,6 +450,59 @@ async fn incomplete_reset_tag_fails_closed_before_payload_commit_point() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reset_clear_is_bound_to_the_exact_committed_generation() {
+    let storage = e2e_harness::mock_storage::MockStorage::new();
+    let conversation_id = "generation-bound-clear";
+    storage
+        .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+        .await
+        .expect("conversation row");
+    storage
+        .set_conversation_state(
+            conversation_id,
+            catbird_mls::orchestrator::ConversationState::ResetPending {
+                new_group_id: "group-gen-2".to_string(),
+                reset_generation: 2,
+                notified_at_ms: 2,
+            },
+        )
+        .await
+        .expect("reset intent tag");
+    storage
+        .mark_reset_pending(conversation_id, "group-gen-2", 2, 2)
+        .await
+        .expect("commit generation 2");
+
+    storage
+        .clear_reset_pending(conversation_id, Some(1))
+        .await
+        .expect("stale generation clear is a no-op");
+    assert_eq!(
+        storage
+            .get_persisted_reset_pending(conversation_id)
+            .expect("generation 2 must survive stale clear")
+            .reset_generation,
+        2
+    );
+
+    storage
+        .clear_reset_pending(conversation_id, None)
+        .await
+        .expect("rollback clear cannot erase committed state");
+    assert!(storage
+        .get_persisted_reset_pending(conversation_id)
+        .is_some());
+
+    storage
+        .clear_reset_pending(conversation_id, Some(2))
+        .await
+        .expect("exact generation clear");
+    assert!(storage
+        .get_persisted_reset_pending(conversation_id)
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn leave_via_self_remove_uses_active_group_for_rotated_stable_conversation() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
