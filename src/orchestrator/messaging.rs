@@ -312,8 +312,16 @@ where
             });
         }
 
-        let group_id_bytes = hex::decode(conversation_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        let resolved = self
+            .resolve_conversation_context(conversation_id)
+            .await
+            .map_err(|error| match error {
+                OrchestratorError::ConversationNotFound(_) => OrchestratorError::NotJoined {
+                    convo_id: conversation_id.to_string(),
+                },
+                other => other,
+            })?;
+        let group_id_bytes = resolved.group_id_bytes()?;
 
         let payload_bytes = payload.encode().map_err(|e| {
             OrchestratorError::InvalidInput(format!("Failed to encode message payload: {e}"))
@@ -419,8 +427,12 @@ where
                 self.group_states()
                     .lock()
                     .await
-                    .get(conversation_id)
-                    .map(|gs| gs.epoch)
+                    .values()
+                    .find(|state| {
+                        state.conversation_id == resolved.conversation_id
+                            && state.group_id == resolved.group_id
+                    })
+                    .map(|state| state.epoch)
                     .unwrap_or(0)
             }
         };
@@ -700,6 +712,25 @@ where
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
+        // Resolve the stable conversation identity before touching deduplication or
+        // self-commit replay state. Input for an unknown conversation must fail
+        // closed without consuming state belonging to an authoritative context.
+        let resolved = match self
+            .resolve_conversation_context(&envelope.conversation_id)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(OrchestratorError::ConversationNotFound(_)) => {
+                tracing::debug!(
+                    conversation_id = %envelope.conversation_id,
+                    "process_incoming: no authoritative conversation-to-group mapping"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let group_id_bytes = resolved.group_id_bytes()?;
+
         // Dedup check
         if let Some(ref msg_id) = envelope.server_message_id {
             if self.storage().message_exists(msg_id).await? {
@@ -724,9 +755,6 @@ where
             );
             return Ok(None);
         }
-
-        let group_id_bytes = hex::decode(&envelope.conversation_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
         // Decrypt via MLS FFI.
         //
@@ -795,8 +823,12 @@ where
                     .group_states()
                     .lock()
                     .await
-                    .get(&envelope.conversation_id)
-                    .map(|gs| gs.epoch)
+                    .values()
+                    .find(|state| {
+                        state.conversation_id == resolved.conversation_id
+                            && state.group_id == resolved.group_id
+                    })
+                    .map(|state| state.epoch)
                     .unwrap_or(0);
                 if Self::classify_peer_bad(&e, local_epoch, msg_epoch_for_class) {
                     let msg_id = envelope.server_message_id.clone().unwrap_or_else(|| {
@@ -1035,7 +1067,10 @@ where
             // Still update cached group state epoch
             {
                 let mut states = self.group_states().lock().await;
-                if let Some(gs) = states.get_mut(&envelope.conversation_id) {
+                if let Some(gs) = states.values_mut().find(|state| {
+                    state.conversation_id == resolved.conversation_id
+                        && state.group_id == resolved.group_id
+                }) {
                     if decrypt_result.epoch > gs.epoch {
                         gs.epoch = decrypt_result.epoch;
                         let state_clone = gs.clone();
@@ -1052,8 +1087,12 @@ where
             }
 
             // Cleanup old epoch secrets after commit advances the epoch
-            self.cleanup_epoch_secrets_if_needed(&envelope.conversation_id, decrypt_result.epoch)
-                .await;
+            self.cleanup_epoch_secrets_if_needed(
+                &resolved.conversation_id,
+                &resolved.group_id,
+                decrypt_result.epoch,
+            )
+            .await;
 
             // Phase F: legacy plaintext metadata refresh-after-commit removed.
             // Under the cutover, group metadata is encrypted (see metadata.rs)
@@ -1172,7 +1211,10 @@ where
         // Update group state epoch if it advanced (and persist)
         {
             let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.get_mut(&envelope.conversation_id) {
+            if let Some(gs) = states.values_mut().find(|state| {
+                state.conversation_id == resolved.conversation_id
+                    && state.group_id == resolved.group_id
+            }) {
                 if decrypt_result.epoch > gs.epoch {
                     gs.epoch = decrypt_result.epoch;
                     let state_clone = gs.clone();

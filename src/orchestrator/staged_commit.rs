@@ -319,7 +319,7 @@ where
         };
 
         // Epoch-secret retention (spec §10).
-        self.cleanup_epoch_secrets_if_needed(&handle.group_id, new_epoch)
+        self.cleanup_epoch_secrets_if_needed(&meta.conversation_id, &handle.group_id, new_epoch)
             .await;
 
         // Update in-memory group state based on which kind of commit this

@@ -146,6 +146,25 @@ where
     store_control_messages: AtomicBool,
 }
 
+struct EpochCleanupTargets<'a> {
+    storage_conversation_id: &'a str,
+    crypto_group_id: Option<Vec<u8>>,
+    cutoff_epoch: u64,
+}
+
+fn epoch_cleanup_targets<'a>(
+    conversation_id: &'a str,
+    group_id: &str,
+    current_epoch: u64,
+) -> Option<EpochCleanupTargets<'a>> {
+    let retention = constants::MAX_PAST_EPOCHS_TO_RETAIN;
+    (current_epoch > retention).then(|| EpochCleanupTargets {
+        storage_conversation_id: conversation_id,
+        crypto_group_id: hex::decode(group_id).ok(),
+        cutoff_epoch: current_epoch - retention,
+    })
+}
+
 /// Internal bookkeeping for a staged commit.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingCommitMeta {
@@ -686,16 +705,17 @@ where
     pub(crate) async fn cleanup_epoch_secrets_if_needed(
         &self,
         conversation_id: &str,
+        group_id: &str,
         current_epoch: u64,
     ) {
-        let retention = constants::MAX_PAST_EPOCHS_TO_RETAIN;
-        if current_epoch <= retention {
+        let Some(targets) = epoch_cleanup_targets(conversation_id, group_id, current_epoch) else {
             return;
-        }
-        let cutoff_epoch = current_epoch - retention;
+        };
+        let retention = constants::MAX_PAST_EPOCHS_TO_RETAIN;
+        let cutoff_epoch = targets.cutoff_epoch;
 
         // Clean up via MLS crypto context (EpochSecretManager)
-        if let Ok(group_id_bytes) = hex::decode(conversation_id) {
+        if let Some(group_id_bytes) = targets.crypto_group_id {
             if let Err(e) =
                 self.mls_context()
                     .cleanup_epoch_secrets(group_id_bytes, current_epoch, retention)
@@ -703,6 +723,7 @@ where
                 tracing::warn!(
                     error = %e,
                     conversation_id,
+                    group_id,
                     current_epoch,
                     "Failed to cleanup epoch secrets via MLS context"
                 );
@@ -712,7 +733,7 @@ where
         // Clean up via platform storage backend
         if let Err(e) = self
             .storage()
-            .cleanup_old_epoch_data(conversation_id, cutoff_epoch)
+            .cleanup_old_epoch_data(targets.storage_conversation_id, cutoff_epoch)
             .await
         {
             tracing::warn!(
@@ -731,5 +752,30 @@ where
             cutoff_epoch,
             current_epoch,
         );
+    }
+}
+
+#[cfg(test)]
+mod epoch_cleanup_target_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_targets_mutable_group_for_crypto_and_stable_conversation_for_storage() {
+        let stable_conversation_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mutable_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let current_epoch = constants::MAX_PAST_EPOCHS_TO_RETAIN + 2;
+
+        let targets =
+            epoch_cleanup_targets(stable_conversation_id, mutable_group_id, current_epoch)
+                .expect("epoch exceeds retention");
+
+        assert_eq!(targets.storage_conversation_id, stable_conversation_id);
+        assert_eq!(targets.crypto_group_id, hex::decode(mutable_group_id).ok());
+        assert_ne!(
+            targets.crypto_group_id,
+            hex::decode(stable_conversation_id).ok(),
+            "stable conversation id must never become the MLS cleanup target"
+        );
+        assert_eq!(targets.cutoff_epoch, 2);
     }
 }

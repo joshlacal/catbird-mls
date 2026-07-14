@@ -95,6 +95,8 @@ struct Inner {
     /// Number of times `set_conversation_sequencer` has been called per
     /// conversation (asserts persist-only-on-change behavior).
     set_conversation_sequencer_calls: HashMap<String, u32>,
+    /// Platform epoch-retention calls, recorded as `(conversation_id, cutoff)`.
+    epoch_cleanup_calls: Vec<(String, u64)>,
     startup_probe_counts: StartupProbeCounts,
 }
 
@@ -175,6 +177,11 @@ impl MockStorage {
             .get(conversation_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub fn epoch_cleanup_calls(&self) -> Vec<(String, u64)> {
+        self.inner.lock().unwrap().epoch_cleanup_calls.clone()
     }
 
     /// Whether the conversation has the rejoin flag set.
@@ -913,6 +920,19 @@ impl MLSStorageBackend for MockStorage {
         inner
             .sequencer_receipts
             .retain(|r| r.convo_id != conversation_id);
+        Ok(())
+    }
+
+    async fn cleanup_old_epoch_data(
+        &self,
+        conversation_id: &str,
+        retain_from_epoch: u64,
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .epoch_cleanup_calls
+            .push((conversation_id.to_string(), retain_from_epoch));
         Ok(())
     }
 

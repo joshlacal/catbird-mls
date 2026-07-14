@@ -231,7 +231,7 @@ where
         self.conversations()
             .lock()
             .await
-            .insert(group_id_hex.to_string(), convo.clone());
+            .insert(conversation_id.to_string(), convo.clone());
 
         if initial_add_result.is_some() {
             let merged_epoch = self
@@ -240,7 +240,7 @@ where
 
             convo.epoch = merged_epoch;
 
-            self.cleanup_epoch_secrets_if_needed(group_id_hex, merged_epoch)
+            self.cleanup_epoch_secrets_if_needed(conversation_id, group_id_hex, merged_epoch)
                 .await;
 
             tracing::info!(
@@ -416,7 +416,7 @@ where
             }
         };
 
-        if let Some(view) = self.conversations().lock().await.get_mut(&group_id_hex) {
+        if let Some(view) = self.conversations().lock().await.get_mut(conversation_id) {
             view.metadata = Some(ConversationMetadata {
                 name: Some(metadata.title.clone()),
                 description: if metadata.description.is_empty() {
@@ -463,7 +463,7 @@ where
         self.conversations()
             .lock()
             .await
-            .insert(group_id_hex.clone(), convo.clone());
+            .insert(convo.conversation_id.clone(), convo.clone());
 
         let ffi_epoch = self
             .mls_context()
@@ -485,7 +485,12 @@ where
             .ensure_conversation_exists(&user_did, &convo.conversation_id, &group_id_hex)
             .await?;
         self.storage()
-            .update_join_info(&group_id_hex, &user_did, JoinMethod::Welcome, ffi_epoch)
+            .update_join_info(
+                &convo.conversation_id,
+                &user_did,
+                JoinMethod::Welcome,
+                ffi_epoch,
+            )
             .await?;
 
         // Insert history boundary marker for Welcome joins.
@@ -500,7 +505,7 @@ where
             let payload = MLSMessagePayload::system("history_boundary.new_member");
             let marker = Message {
                 id: marker_id,
-                conversation_id: group_id_hex.clone(),
+                conversation_id: convo.conversation_id.clone(),
                 sender_did: user_did.clone(),
                 text: "history_boundary.new_member".to_string(),
                 timestamp: chrono::Utc::now(),
@@ -519,7 +524,12 @@ where
         // and reflect it in the returned view. Best-effort.
         self.hydrate_conversation_metadata(&convo.conversation_id)
             .await;
-        if let Some(view) = self.conversations().lock().await.get(&group_id_hex) {
+        if let Some(view) = self
+            .conversations()
+            .lock()
+            .await
+            .get(&convo.conversation_id)
+        {
             convo.metadata = view.metadata.clone();
         }
 

@@ -897,6 +897,10 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
+    storage
+        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .await
+        .expect("seed explicit conversation-to-group mapping");
 
     let max = OrchestratorConfig::default().max_rejoin_attempts;
     // Maxed-out persisted row, as accumulated rejoin failures would write it.
@@ -988,6 +992,10 @@ async fn failing_quarantine_persists_escalate() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
+    storage
+        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .await
+        .expect("seed explicit conversation-to-group mapping");
 
     let observer = Arc::new(RecordingObserver::default());
     orchestrator

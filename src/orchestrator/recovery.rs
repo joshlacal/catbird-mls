@@ -855,7 +855,9 @@ where
         match self.mls_context().merge_pending_commit(gid.clone()) {
             Ok(ep) => {
                 // Cleanup old epoch secrets after fork readd
-                self.cleanup_epoch_secrets_if_needed(convo_id, ep).await;
+                let group_id = hex::encode(&gid);
+                self.cleanup_epoch_secrets_if_needed(convo_id, &group_id, ep)
+                    .await;
 
                 {
                     let mut st = self.group_states().lock().await;
@@ -1650,6 +1652,86 @@ where
         }
     }
 
+    /// Resolve a stable conversation identifier to its current MLS group.
+    ///
+    /// Unlike `group_id_hex_for_conversation`, this security boundary never
+    /// treats a hex-looking conversation id as a group id. Callers receive a
+    /// context only when a server-backed cache, durable conversation record,
+    /// or explicit group state binds both identifiers.
+    pub(crate) async fn resolve_conversation_context(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ResolvedConversationContext> {
+        {
+            let states = self.group_states().lock().await;
+            if let Some(state) = states
+                .get(conversation_id)
+                .filter(|state| state.conversation_id == conversation_id)
+            {
+                return Ok(ResolvedConversationContext {
+                    conversation_id: state.conversation_id.clone(),
+                    group_id: state.group_id.clone(),
+                });
+            }
+        }
+
+        {
+            let conversations = self.conversations().lock().await;
+            if let Some(view) = conversations
+                .get(conversation_id)
+                .filter(|view| view.conversation_id == conversation_id)
+            {
+                return Ok(ResolvedConversationContext {
+                    conversation_id: view.conversation_id.clone(),
+                    group_id: view.group_id.clone(),
+                });
+            }
+        }
+
+        let user_did = self.require_user_did().await?;
+        if let Some(view) = self
+            .storage()
+            .get_conversation(&user_did, conversation_id)
+            .await?
+            .filter(|view| view.conversation_id == conversation_id)
+        {
+            return Ok(ResolvedConversationContext {
+                conversation_id: view.conversation_id,
+                group_id: view.group_id,
+            });
+        }
+
+        {
+            let states = self.group_states().lock().await;
+            if let Some(state) = states
+                .values()
+                .find(|state| state.conversation_id == conversation_id)
+            {
+                return Ok(ResolvedConversationContext {
+                    conversation_id: state.conversation_id.clone(),
+                    group_id: state.group_id.clone(),
+                });
+            }
+        }
+
+        {
+            let conversations = self.conversations().lock().await;
+            if let Some(view) = conversations
+                .values()
+                .find(|view| view.conversation_id == conversation_id)
+            {
+                return Ok(ResolvedConversationContext {
+                    conversation_id: view.conversation_id.clone(),
+                    group_id: view.group_id.clone(),
+                });
+            }
+        }
+
+        Err(OrchestratorError::ConversationNotFound(
+            conversation_id.to_string(),
+        ))
+    }
+
     pub(crate) async fn group_id_bytes_for_conversation(&self, convo_id: &str) -> Option<Vec<u8>> {
         let group_id_hex = self.group_id_hex_for_conversation(convo_id).await?;
         hex::decode(group_id_hex).ok()
@@ -2037,7 +2119,9 @@ where
             })?;
 
         // Cleanup old epoch secrets after External Commit rejoin
-        self.cleanup_epoch_secrets_if_needed(convo_id, merged).await;
+        let merged_group_id = hex::encode(&ext_commit_result.group_id);
+        self.cleanup_epoch_secrets_if_needed(convo_id, &merged_group_id, merged)
+            .await;
 
         // Update group state (insert if missing, persist to storage)
         let new_group_id_hex = hex::encode(&ext_commit_result.group_id);

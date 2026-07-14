@@ -35,6 +35,26 @@ pub type GroupId = String;
 /// Stable conversation identifier (survives group resets).
 pub type ConversationId = String;
 
+/// Internal identity pair resolved from an authoritative conversation record.
+///
+/// The stable `conversation_id` is used for delivery-service and persistence
+/// operations. Only `group_id` may cross into MLS cryptographic operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedConversationContext {
+    pub conversation_id: ConversationId,
+    pub group_id: GroupId,
+}
+
+impl ResolvedConversationContext {
+    pub(crate) fn group_id_bytes(&self) -> crate::orchestrator::error::Result<Vec<u8>> {
+        hex::decode(&self.group_id).map_err(|_| {
+            crate::orchestrator::error::OrchestratorError::InvalidInput(
+                "Invalid hex group ID".into(),
+            )
+        })
+    }
+}
+
 /// A view of an MLS conversation, mirroring the server's ConvoView.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationView {
