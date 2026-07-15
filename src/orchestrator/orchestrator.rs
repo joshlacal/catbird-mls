@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use tokio::sync::Mutex;
@@ -107,6 +107,9 @@ where
     own_commits: Mutex<HashMap<Vec<u8>, Instant>>,
     /// Groups currently being created (protect from sync deletion).
     groups_being_created: Mutex<HashSet<GroupId>>,
+    /// Monotonic version incremented when creation protection starts or ends.
+    /// Sync uses this to reject stale server/local reconciliation snapshots.
+    creation_generation: AtomicU64,
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
     /// Sync state lock.
@@ -144,6 +147,25 @@ where
     /// Defaults off so existing clients keep dropping non-displayable control
     /// payloads. Catbird iOS enables this only in Rust-authoritative mode.
     store_control_messages: AtomicBool,
+}
+
+struct EpochCleanupTargets<'a> {
+    storage_conversation_id: &'a str,
+    crypto_group_id: Option<Vec<u8>>,
+    cutoff_epoch: u64,
+}
+
+fn epoch_cleanup_targets<'a>(
+    conversation_id: &'a str,
+    group_id: &str,
+    current_epoch: u64,
+) -> Option<EpochCleanupTargets<'a>> {
+    let retention = constants::MAX_PAST_EPOCHS_TO_RETAIN;
+    (current_epoch > retention).then(|| EpochCleanupTargets {
+        storage_conversation_id: conversation_id,
+        crypto_group_id: hex::decode(group_id).ok(),
+        cutoff_epoch: current_epoch - retention,
+    })
 }
 
 /// Internal bookkeeping for a staged commit.
@@ -215,6 +237,7 @@ where
             pending_messages: Mutex::new(HashSet::new()),
             own_commits: Mutex::new(HashMap::new()),
             groups_being_created: Mutex::new(HashSet::new()),
+            creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
             sync_in_progress: Mutex::new(false),
             consecutive_sync_failures: Mutex::new(0),
@@ -256,18 +279,18 @@ where
             user_did: user_did.to_string(),
         };
 
-        // WS-5.6: capabilities check — make default no-op storage methods
-        // observable so silently-dropped state (e.g. `mark_reset_pending`
-        // dropping RESET_PENDING across restart) shows up in logs.
+        // WS-5.6: capabilities check — make default storage methods
+        // observable. Security-authority defaults fail closed; legacy
+        // best-effort defaults may still discard state.
         {
             let implemented = self.storage.implemented_optional_methods();
             for method in super::storage::OPTIONAL_STORAGE_METHODS {
                 if !implemented.contains(method) {
                     tracing::warn!(
                         method,
-                        "Storage backend does not declare an override for optional trait \
-                         method — if it is still the default no-op, state routed through \
-                         it is silently dropped (declare via implemented_optional_methods)"
+                        "Storage backend does not declare an override for a defaulted trait \
+                         method — security methods may fail closed and legacy methods may \
+                         discard state (declare via implemented_optional_methods)"
                     );
                 }
             }
@@ -326,9 +349,8 @@ where
         // sync; we only need to recover the persisted state tag + payload
         // (`ResetPending { new_group_id, reset_generation, notified_at_ms }`,
         // `NeedsRejoin`, etc.) so deferred recovery can pick up where it
-        // left off across app restart. Backends that don't override
-        // `get_conversation_state` will return `None` here and the in-memory
-        // map starts empty — same behavior as before this hook existed.
+        // left off across app restart. The read callback is mandatory; missing
+        // or malformed support aborts initialization closed.
         match self.storage.list_conversations(user_did).await {
             Ok(convos) => {
                 let mut states = self.conversation_states.lock().await;
@@ -493,6 +515,18 @@ where
         }
     }
 
+    /// Read the lifecycle-bound user for destructive cleanup that may resume
+    /// during `initialize` before the public authenticated state becomes
+    /// Ready. Callers must already hold the lifecycle/transition ownership
+    /// that prevents account rebinding during the cleanup.
+    pub(crate) async fn cleanup_user_did(&self) -> Result<String> {
+        match &*self.lifecycle_state.lock().await {
+            OrchestratorLifecycleState::Initializing { user_did }
+            | OrchestratorLifecycleState::Ready { user_did } => Ok(user_did.clone()),
+            _ => Err(OrchestratorError::NotAuthenticated),
+        }
+    }
+
     /// Check if the orchestrator is shutting down, returning an error if so.
     pub(crate) async fn check_shutdown(&self) -> Result<()> {
         match &*self.lifecycle_state.lock().await {
@@ -592,6 +626,10 @@ where
         &self.groups_being_created
     }
 
+    pub(crate) fn creation_generation(&self) -> &AtomicU64 {
+        &self.creation_generation
+    }
+
     /// Acquire the per-conversation join/rejoin lock object.
     pub(crate) async fn rejoin_lock(&self, conversation_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.rejoin_locks.lock().await;
@@ -686,16 +724,17 @@ where
     pub(crate) async fn cleanup_epoch_secrets_if_needed(
         &self,
         conversation_id: &str,
+        group_id: &str,
         current_epoch: u64,
     ) {
-        let retention = constants::MAX_PAST_EPOCHS_TO_RETAIN;
-        if current_epoch <= retention {
+        let Some(targets) = epoch_cleanup_targets(conversation_id, group_id, current_epoch) else {
             return;
-        }
-        let cutoff_epoch = current_epoch - retention;
+        };
+        let retention = constants::MAX_PAST_EPOCHS_TO_RETAIN;
+        let cutoff_epoch = targets.cutoff_epoch;
 
         // Clean up via MLS crypto context (EpochSecretManager)
-        if let Ok(group_id_bytes) = hex::decode(conversation_id) {
+        if let Some(group_id_bytes) = targets.crypto_group_id {
             if let Err(e) =
                 self.mls_context()
                     .cleanup_epoch_secrets(group_id_bytes, current_epoch, retention)
@@ -703,6 +742,7 @@ where
                 tracing::warn!(
                     error = %e,
                     conversation_id,
+                    group_id,
                     current_epoch,
                     "Failed to cleanup epoch secrets via MLS context"
                 );
@@ -712,7 +752,7 @@ where
         // Clean up via platform storage backend
         if let Err(e) = self
             .storage()
-            .cleanup_old_epoch_data(conversation_id, cutoff_epoch)
+            .cleanup_old_epoch_data(targets.storage_conversation_id, cutoff_epoch)
             .await
         {
             tracing::warn!(
@@ -731,5 +771,30 @@ where
             cutoff_epoch,
             current_epoch,
         );
+    }
+}
+
+#[cfg(test)]
+mod epoch_cleanup_target_tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_targets_mutable_group_for_crypto_and_stable_conversation_for_storage() {
+        let stable_conversation_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mutable_group_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let current_epoch = constants::MAX_PAST_EPOCHS_TO_RETAIN + 2;
+
+        let targets =
+            epoch_cleanup_targets(stable_conversation_id, mutable_group_id, current_epoch)
+                .expect("epoch exceeds retention");
+
+        assert_eq!(targets.storage_conversation_id, stable_conversation_id);
+        assert_eq!(targets.crypto_group_id, hex::decode(mutable_group_id).ok());
+        assert_ne!(
+            targets.crypto_group_id,
+            hex::decode(stable_conversation_id).ok(),
+            "stable conversation id must never become the MLS cleanup target"
+        );
+        assert_eq!(targets.cutoff_epoch, 2);
     }
 }

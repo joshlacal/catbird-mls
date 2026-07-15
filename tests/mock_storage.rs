@@ -55,7 +55,7 @@ struct Inner {
     /// Pending message IDs for self-echo dedup (survives simulated restart)
     pending_messages: std::collections::HashSet<String>,
     /// conversation_id -> persisted RESET_PENDING payload (mirrors real
-    /// platform storage's `mark_reset_pending`/`clear_reset_pending` columns).
+    /// platform storage's reset-pending lifecycle columns).
     reset_pending: HashMap<String, PersistedResetPending>,
     /// Number of times `mark_reset_pending` has been called per conversation.
     /// Used by idempotency tests to assert duplicate calls collapse.
@@ -75,6 +75,8 @@ struct Inner {
     /// When set, the next `delete_conversations` call fails once (WS-5 FIX-5
     /// keep-intent-on-failure tests).
     fail_next_delete_conversations: bool,
+    fail_next_mark_pending_local_delete: bool,
+    fail_clear_pending_local_delete_for: Option<String>,
     /// conversation_id -> persisted quarantine payload `(reason_tag,
     /// since_ms)` (Layer 3; mirrors the platform `mark_quarantined` /
     /// `clear_quarantine` columns).
@@ -82,8 +84,19 @@ struct Inner {
     /// One-shot failure injections for the quarantine persist escalation
     /// tests (E7 follow-up R-2).
     fail_next_set_conversation_state: bool,
+    fail_next_set_group_state: bool,
+    fail_next_mark_reset_pending: bool,
+    fail_next_mark_reset_pending_after_commit: bool,
+    fail_next_mark_reset_pending_after_commit_with_notified_at_offset: Option<i64>,
+    fail_next_adopt_reset_pending_after_commit: bool,
+    fail_next_adopt_reset_pending_after_commit_with_read_failure: bool,
+    force_next_clear_reset_pending_for_delete_false: bool,
+    fail_next_complete_reset_pending: bool,
+    force_next_complete_reset_pending_false_reload: Option<Option<ConversationState>>,
     fail_next_get_conversation_state: bool,
     fail_next_conversation_state_for: Option<String>,
+    next_conversation_state_override: Option<(String, Option<ConversationState>)>,
+    fail_conversation_state_after_reads: Option<(String, u32)>,
     malformed_conversation_states: std::collections::HashSet<String>,
     fail_next_mark_quarantined: bool,
     fail_next_clear_quarantine: bool,
@@ -95,6 +108,8 @@ struct Inner {
     /// Number of times `set_conversation_sequencer` has been called per
     /// conversation (asserts persist-only-on-change behavior).
     set_conversation_sequencer_calls: HashMap<String, u32>,
+    /// Platform epoch-retention calls, recorded as `(conversation_id, cutoff)`.
+    epoch_cleanup_calls: Vec<(String, u64)>,
     startup_probe_counts: StartupProbeCounts,
 }
 
@@ -114,7 +129,16 @@ pub struct StartupProbeCounts {
 #[derive(Debug, Clone)]
 pub struct MockStorage {
     inner: Arc<Mutex<Inner>>,
+    declare_pending_delete_capabilities: Arc<std::sync::atomic::AtomicBool>,
     conversation_state_read_barrier: Arc<Mutex<Option<(String, ConversationStateReadBarrier)>>>,
+    reset_completion_barrier: Arc<Mutex<Option<(String, ResetCompletionBarrier)>>>,
+    reset_record_barrier: Arc<Mutex<Option<(String, ResetCompletionBarrier)>>>,
+    reset_adopt_barrier: Arc<Mutex<Option<(String, ResetCompletionBarrier)>>>,
+    clear_rejoin_barrier: Arc<Mutex<Option<(String, ClearRejoinBarrier)>>>,
+    conversation_state_write_barrier:
+        Arc<Mutex<Option<(String, Option<ConversationState>, ClearRejoinBarrier)>>>,
+    group_state_write_barrier: Arc<Mutex<Option<ClearRejoinBarrier>>>,
+    pending_local_delete_write_barrier: Arc<Mutex<Option<(String, bool, ClearRejoinBarrier)>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,12 +161,77 @@ impl ConversationStateReadBarrier {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ResetCompletionBarrier {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClearRejoinBarrier {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+
+impl ClearRejoinBarrier {
+    pub async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("clear-rejoin barrier entered semaphore closed")
+            .forget();
+    }
+
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
+impl ResetCompletionBarrier {
+    pub async fn wait_until_entered(&self) {
+        self.entered
+            .acquire()
+            .await
+            .expect("reset-completion barrier entered semaphore closed")
+            .forget();
+    }
+
+    pub fn release(&self) {
+        self.release.add_permits(1);
+    }
+}
+
 impl MockStorage {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner::default())),
+            declare_pending_delete_capabilities: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             conversation_state_read_barrier: Arc::new(Mutex::new(None)),
+            reset_completion_barrier: Arc::new(Mutex::new(None)),
+            reset_record_barrier: Arc::new(Mutex::new(None)),
+            reset_adopt_barrier: Arc::new(Mutex::new(None)),
+            clear_rejoin_barrier: Arc::new(Mutex::new(None)),
+            conversation_state_write_barrier: Arc::new(Mutex::new(None)),
+            group_state_write_barrier: Arc::new(Mutex::new(None)),
+            pending_local_delete_write_barrier: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Test helper: replace the mutable MLS group projected by a durable
+    /// conversation row without altering its stable conversation identity.
+    pub fn set_conversation_group_id_for_test(&self, conversation_id: &str, group_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner
+            .conversations
+            .get_mut(conversation_id)
+            .unwrap_or_else(|| panic!("conversation {conversation_id} not found"));
+        record.group_id = group_id.to_string();
+        record.view.group_id = group_id.to_string();
+    }
+
+    pub fn omit_pending_delete_capabilities(&self) {
+        self.declare_pending_delete_capabilities
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     // ── Test helper methods ──────────────────────────────────────────────
@@ -175,6 +264,11 @@ impl MockStorage {
             .get(conversation_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    #[allow(dead_code)]
+    pub fn epoch_cleanup_calls(&self) -> Vec<(String, u64)> {
+        self.inner.lock().unwrap().epoch_cleanup_calls.clone()
     }
 
     /// Whether the conversation has the rejoin flag set.
@@ -323,6 +417,51 @@ impl MockStorage {
         self.inner.lock().unwrap().pending_local_deletes.len()
     }
 
+    pub fn pending_local_delete_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .inner
+            .lock()
+            .unwrap()
+            .pending_local_deletes
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    pub fn join_epoch_for_test(&self, conversation_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .conversations
+            .get(conversation_id)
+            .and_then(|record| record.join_epoch)
+    }
+
+    pub fn set_epoch_pair_for_test(
+        &self,
+        conversation_id: &str,
+        current_epoch: u64,
+        join_epoch: u64,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner
+            .conversations
+            .get_mut(conversation_id)
+            .expect("conversation must exist before seeding epochs");
+        record.view.epoch = current_epoch;
+        record.join_epoch = Some(join_epoch);
+    }
+
+    pub fn remove_conversation_record_for_test(&self, conversation_id: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .conversations
+            .remove(conversation_id);
+    }
+
     /// Make the next `clear_rejoin_flag` call fail once.
     #[allow(dead_code)]
     pub fn fail_next_clear_rejoin_flag(&self) {
@@ -335,11 +474,84 @@ impl MockStorage {
         self.inner.lock().unwrap().fail_next_delete_conversations = true;
     }
 
+    /// Make the next pending local-delete intent write fail once.
+    pub fn fail_next_mark_pending_local_delete(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_mark_pending_local_delete = true;
+    }
+
+    pub fn fail_next_clear_pending_local_delete(&self, conversation_id: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_clear_pending_local_delete_for = Some(conversation_id.to_string());
+    }
+
     /// Make the next `set_conversation_state` call fail once (R-2
     /// quarantine-persist escalation tests).
     #[allow(dead_code)]
     pub fn fail_next_set_conversation_state(&self) {
         self.inner.lock().unwrap().fail_next_set_conversation_state = true;
+    }
+
+    pub fn fail_next_set_group_state(&self) {
+        self.inner.lock().unwrap().fail_next_set_group_state = true;
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_next_mark_reset_pending(&self) {
+        self.inner.lock().unwrap().fail_next_mark_reset_pending = true;
+    }
+
+    pub fn fail_next_mark_reset_pending_after_commit(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_mark_reset_pending_after_commit = true;
+    }
+
+    pub fn fail_next_mark_reset_pending_after_commit_with_notified_at_offset(&self, offset: i64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_mark_reset_pending_after_commit_with_notified_at_offset = Some(offset);
+    }
+
+    pub fn force_next_clear_reset_pending_for_delete_false(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .force_next_clear_reset_pending_for_delete_false = true;
+    }
+
+    pub fn fail_next_complete_reset_pending(&self) {
+        self.inner.lock().unwrap().fail_next_complete_reset_pending = true;
+    }
+
+    pub fn fail_next_adopt_reset_pending_after_commit(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_adopt_reset_pending_after_commit = true;
+    }
+
+    pub fn fail_next_adopt_reset_pending_after_commit_with_read_failure(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_adopt_reset_pending_after_commit_with_read_failure = true;
+    }
+
+    pub fn force_next_complete_reset_pending_false_with_reload(
+        &self,
+        reload: Option<ConversationState>,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .force_next_complete_reset_pending_false_reload = Some(reload);
     }
 
     /// Simulate a malformed persisted reset/quarantine sidecar that cannot be
@@ -352,6 +564,28 @@ impl MockStorage {
     pub fn fail_next_get_conversation_state_for(&self, conversation_id: &str) {
         self.inner.lock().unwrap().fail_next_conversation_state_for =
             Some(conversation_id.to_string());
+    }
+
+    pub fn override_next_conversation_state_read(
+        &self,
+        conversation_id: &str,
+        state: Option<ConversationState>,
+    ) {
+        self.inner.lock().unwrap().next_conversation_state_override =
+            Some((conversation_id.to_string(), state));
+    }
+
+    #[allow(dead_code)]
+    pub fn fail_get_conversation_state_after_successful_reads(
+        &self,
+        conversation_id: &str,
+        successful_reads: u32,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_conversation_state_after_reads =
+            Some((conversation_id.to_string(), successful_reads));
     }
 
     /// Persistently fail decoding the security sidecar for one conversation,
@@ -378,6 +612,105 @@ impl MockStorage {
             release: Arc::new(tokio::sync::Semaphore::new(0)),
         };
         *self.conversation_state_read_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), barrier.clone()));
+        barrier
+    }
+
+    /// Pause the next rejoin-flag clear before it mutates durable state.
+    pub fn pause_next_clear_rejoin_flag(&self, conversation_id: &str) -> ClearRejoinBarrier {
+        let barrier = ClearRejoinBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.clear_rejoin_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), barrier.clone()));
+        barrier
+    }
+
+    pub fn pause_next_conversation_state_write(
+        &self,
+        conversation_id: &str,
+        state: ConversationState,
+    ) -> ClearRejoinBarrier {
+        let barrier = ClearRejoinBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.conversation_state_write_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), Some(state), barrier.clone()));
+        barrier
+    }
+
+    pub fn pause_next_conversation_state_write_any(
+        &self,
+        conversation_id: &str,
+    ) -> ClearRejoinBarrier {
+        let barrier = ClearRejoinBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.conversation_state_write_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), None, barrier.clone()));
+        barrier
+    }
+
+    pub fn pause_next_group_state_write(&self) -> ClearRejoinBarrier {
+        let barrier = ClearRejoinBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.group_state_write_barrier.lock().unwrap() = Some(barrier.clone());
+        barrier
+    }
+
+    pub fn pause_pending_local_delete_write(
+        &self,
+        conversation_id: &str,
+        after_write: bool,
+    ) -> ClearRejoinBarrier {
+        let barrier = ClearRejoinBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.pending_local_delete_write_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), after_write, barrier.clone()));
+        barrier
+    }
+
+    pub fn pause_next_pending_local_delete_write(&self, after_write: bool) -> ClearRejoinBarrier {
+        self.pause_pending_local_delete_write("", after_write)
+    }
+
+    /// Pause the next successful reset-completion callback after its durable
+    /// CAS has committed but before the callback returns to the orchestrator.
+    pub fn pause_next_reset_completion(&self, conversation_id: &str) -> ResetCompletionBarrier {
+        let barrier = ResetCompletionBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.reset_completion_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), barrier.clone()));
+        barrier
+    }
+
+    /// Pause reset recording after ResetPending and needs_rejoin are durable,
+    /// but before the transition-lock owner returns.
+    pub fn pause_next_reset_record(&self, conversation_id: &str) -> ResetCompletionBarrier {
+        let barrier = ResetCompletionBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.reset_record_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), barrier.clone()));
+        barrier
+    }
+
+    pub fn pause_next_reset_adoption(&self, conversation_id: &str) -> ResetCompletionBarrier {
+        let barrier = ResetCompletionBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.reset_adopt_barrier.lock().unwrap() =
             Some((conversation_id.to_string(), barrier.clone()));
         barrier
     }
@@ -505,13 +838,14 @@ impl MLSStorageBackend for MockStorage {
 
     async fn get_conversation(
         &self,
-        _user_did: &str,
+        user_did: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationView>> {
         let inner = self.inner.lock().unwrap();
         Ok(inner
             .conversations
             .get(conversation_id)
+            .filter(|conversation| conversation.user_did == user_did)
             .map(|c| c.view.clone()))
     }
 
@@ -527,7 +861,7 @@ impl MLSStorageBackend for MockStorage {
         Ok(views)
     }
 
-    async fn delete_conversations(&self, _user_did: &str, ids: &[&str]) -> Result<()> {
+    async fn delete_conversations(&self, user_did: &str, ids: &[&str]) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if inner.fail_next_delete_conversations {
             inner.fail_next_delete_conversations = false;
@@ -536,8 +870,14 @@ impl MLSStorageBackend for MockStorage {
             ));
         }
         for id in ids {
-            inner.conversations.remove(*id);
-            inner.messages.remove(*id);
+            let owned = inner
+                .conversations
+                .get(*id)
+                .is_some_and(|conversation| conversation.user_did == user_did);
+            if owned {
+                inner.conversations.remove(*id);
+                inner.messages.remove(*id);
+            }
         }
         Ok(())
     }
@@ -547,6 +887,31 @@ impl MLSStorageBackend for MockStorage {
         conversation_id: &str,
         state: ConversationState,
     ) -> Result<()> {
+        let barrier = {
+            let mut installed = self.conversation_state_write_barrier.lock().unwrap();
+            match installed.take() {
+                Some((target, expected, barrier))
+                    if target == conversation_id
+                        && expected.as_ref().is_none_or(|expected| expected == &state) =>
+                {
+                    Some(barrier)
+                }
+                other => {
+                    *installed = other;
+                    None
+                }
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("conversation-state write barrier release semaphore closed")
+                .forget();
+        }
+
         let mut inner = self.inner.lock().unwrap();
         if inner.fail_next_set_conversation_state {
             inner.fail_next_set_conversation_state = false;
@@ -569,9 +934,8 @@ impl MLSStorageBackend for MockStorage {
             .or_default()
             .push(StateTransition {
                 from: prev,
-                to: state,
+                to: state.clone(),
             });
-
         Ok(())
     }
 
@@ -593,6 +957,26 @@ impl MLSStorageBackend for MockStorage {
     }
 
     async fn clear_rejoin_flag(&self, conversation_id: &str) -> Result<()> {
+        let barrier = {
+            let mut installed = self.clear_rejoin_barrier.lock().unwrap();
+            match installed.take() {
+                Some((target, barrier)) if target == conversation_id => Some(barrier),
+                other => {
+                    *installed = other;
+                    None
+                }
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("clear-rejoin barrier release semaphore closed")
+                .forget();
+        }
+
         let mut inner = self.inner.lock().unwrap();
         if inner.fail_next_clear_rejoin_flag {
             inner.fail_next_clear_rejoin_flag = false;
@@ -650,20 +1034,180 @@ impl MLSStorageBackend for MockStorage {
         reset_generation: i32,
         notified_at_ms: i64,
     ) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.fail_next_mark_reset_pending {
+                inner.fail_next_mark_reset_pending = false;
+                return Err(OrchestratorError::Storage(
+                    "injected mark_reset_pending failure".to_string(),
+                ));
+            }
+            if inner
+                .reset_pending
+                .get(conversation_id)
+                .is_some_and(|pending| pending.reset_generation >= reset_generation)
+            {
+                return Err(OrchestratorError::Storage(format!(
+                    "stale reset generation {reset_generation}"
+                )));
+            }
+            inner.reset_pending.insert(
+                conversation_id.to_string(),
+                PersistedResetPending {
+                    new_group_id_hex: new_group_id_hex.to_string(),
+                    reset_generation,
+                    notified_at_ms,
+                },
+            );
+            *inner
+                .mark_reset_pending_calls
+                .entry(conversation_id.to_string())
+                .or_insert(0) += 1;
+            if let Some(record) = inner.conversations.get_mut(conversation_id) {
+                record.state = ConversationState::ResetPending {
+                    new_group_id: new_group_id_hex.to_string(),
+                    reset_generation,
+                    notified_at_ms,
+                };
+                record.needs_rejoin = true;
+            }
+            if let Some(offset) = inner
+                .fail_next_mark_reset_pending_after_commit_with_notified_at_offset
+                .take()
+            {
+                let durable_notified_at_ms = notified_at_ms.saturating_add(offset);
+                if let Some(pending) = inner.reset_pending.get_mut(conversation_id) {
+                    pending.notified_at_ms = durable_notified_at_ms;
+                }
+                if let Some(record) = inner.conversations.get_mut(conversation_id) {
+                    record.state = ConversationState::ResetPending {
+                        new_group_id: new_group_id_hex.to_string(),
+                        reset_generation,
+                        notified_at_ms: durable_notified_at_ms,
+                    };
+                }
+                return Err(OrchestratorError::Storage(
+                    "injected mark_reset_pending response loss after a non-exact durable commit"
+                        .to_string(),
+                ));
+            }
+            if inner.fail_next_mark_reset_pending_after_commit {
+                inner.fail_next_mark_reset_pending_after_commit = false;
+                return Err(OrchestratorError::Storage(
+                    "injected mark_reset_pending response loss after commit".to_string(),
+                ));
+            }
+        }
+
+        let barrier = {
+            let mut installed = self.reset_record_barrier.lock().unwrap();
+            match installed.take() {
+                Some((target, barrier)) if target == conversation_id => Some(barrier),
+                other => {
+                    *installed = other;
+                    None
+                }
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("reset-record barrier release semaphore closed")
+                .forget();
+        }
+        Ok(())
+    }
+
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        let canonical_hex = |value: &str| {
+            !value.is_empty()
+                && value.len().is_multiple_of(2)
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if !canonical_hex(expected_old_target) || !canonical_hex(authoritative_new_target) {
+            return Err(OrchestratorError::Storage(
+                "reset target must be non-empty canonical hex".to_string(),
+            ));
+        }
+
+        let barrier = {
+            let mut installed = self.reset_adopt_barrier.lock().unwrap();
+            match installed.take() {
+                Some((target, barrier)) if target == conversation_id => Some(barrier),
+                other => {
+                    *installed = other;
+                    None
+                }
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("reset-adoption barrier release semaphore closed")
+                .forget();
+        }
+
         let mut inner = self.inner.lock().unwrap();
+        let matches = inner
+            .reset_pending
+            .get(conversation_id)
+            .is_some_and(|pending| {
+                pending.reset_generation == expected_generation
+                    && pending.new_group_id_hex == expected_old_target
+            });
+        if !matches {
+            return Ok(false);
+        }
+
+        let notified_at_ms = inner
+            .reset_pending
+            .get(conversation_id)
+            .expect("matched reset payload")
+            .notified_at_ms;
         inner.reset_pending.insert(
             conversation_id.to_string(),
             PersistedResetPending {
-                new_group_id_hex: new_group_id_hex.to_string(),
-                reset_generation,
+                new_group_id_hex: authoritative_new_target.to_string(),
+                reset_generation: expected_generation,
                 notified_at_ms,
             },
         );
-        *inner
-            .mark_reset_pending_calls
-            .entry(conversation_id.to_string())
-            .or_insert(0) += 1;
-        Ok(())
+        if let Some(record) = inner.conversations.get_mut(conversation_id) {
+            record.state = ConversationState::ResetPending {
+                new_group_id: authoritative_new_target.to_string(),
+                reset_generation: expected_generation,
+                notified_at_ms,
+            };
+            record.needs_rejoin = true;
+        }
+        if inner.fail_next_adopt_reset_pending_after_commit_with_read_failure {
+            inner.fail_next_adopt_reset_pending_after_commit_with_read_failure = false;
+            inner.fail_next_get_conversation_state = true;
+            return Err(OrchestratorError::Storage(
+                "injected adoption response loss plus authority reread failure".to_string(),
+            ));
+        }
+        if inner.fail_next_adopt_reset_pending_after_commit {
+            inner.fail_next_adopt_reset_pending_after_commit = false;
+            return Err(OrchestratorError::Storage(
+                "injected adopt_reset_pending_target response loss after commit".to_string(),
+            ));
+        }
+        Ok(true)
     }
 
     async fn mark_quarantined(
@@ -698,10 +1242,90 @@ impl MLSStorageBackend for MockStorage {
         Ok(())
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+    async fn complete_reset_pending(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_new_group_id_hex: &str,
+        landed_epoch: u64,
+    ) -> Result<bool> {
+        let cleared = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.fail_next_complete_reset_pending {
+                inner.fail_next_complete_reset_pending = false;
+                return Err(OrchestratorError::Storage(
+                    "injected complete_reset_pending failure".to_string(),
+                ));
+            }
+            if let Some(reload) = inner.force_next_complete_reset_pending_false_reload.take() {
+                inner.next_conversation_state_override =
+                    Some((conversation_id.to_string(), reload));
+                false
+            } else {
+                let cleared = inner.conversations.contains_key(conversation_id)
+                    && inner
+                        .reset_pending
+                        .get(conversation_id)
+                        .is_some_and(|pending| {
+                            pending.reset_generation == expected_generation
+                                && pending.new_group_id_hex == expected_new_group_id_hex
+                        });
+                if cleared {
+                    inner.reset_pending.remove(conversation_id);
+                    let record = inner
+                        .conversations
+                        .get_mut(conversation_id)
+                        .expect("conversation presence was part of the completion CAS");
+                    record.group_id = expected_new_group_id_hex.to_string();
+                    record.view.group_id = expected_new_group_id_hex.to_string();
+                    record.view.epoch = landed_epoch;
+                    record.join_epoch = Some(landed_epoch);
+                    record.state = ConversationState::Active;
+                    record.needs_rejoin = false;
+                }
+                cleared
+            }
+        };
+        let barrier = {
+            let mut installed = self.reset_completion_barrier.lock().unwrap();
+            match installed.take() {
+                Some((target, barrier)) if cleared && target == conversation_id => Some(barrier),
+                other => {
+                    *installed = other;
+                    None
+                }
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("reset-completion barrier release semaphore closed")
+                .forget();
+        }
+        Ok(cleared)
+    }
+
+    async fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+    ) -> Result<bool> {
         let mut inner = self.inner.lock().unwrap();
-        inner.reset_pending.remove(conversation_id);
-        Ok(())
+        if inner.force_next_clear_reset_pending_for_delete_false {
+            inner.force_next_clear_reset_pending_for_delete_false = false;
+            return Ok(false);
+        }
+        let cleared = inner
+            .reset_pending
+            .get(conversation_id)
+            .is_some_and(|pending| pending.reset_generation == expected_generation);
+        if cleared {
+            inner.reset_pending.remove(conversation_id);
+        }
+        Ok(cleared)
     }
 
     async fn set_conversation_sequencer(
@@ -746,6 +1370,16 @@ impl MLSStorageBackend for MockStorage {
 
         let mut inner = self.inner.lock().unwrap();
         inner.startup_probe_counts.get_conversation_state += 1;
+        if inner
+            .next_conversation_state_override
+            .as_ref()
+            .is_some_and(|(target, _)| target == conversation_id)
+        {
+            return Ok(inner
+                .next_conversation_state_override
+                .take()
+                .and_then(|(_, state)| state));
+        }
         if inner.fail_next_conversation_state_for.as_deref() == Some(conversation_id) {
             inner.fail_next_conversation_state_for = None;
             return Err(OrchestratorError::Storage(
@@ -757,6 +1391,17 @@ impl MLSStorageBackend for MockStorage {
             return Err(OrchestratorError::Storage(
                 "malformed persisted reset/quarantine sidecar".to_string(),
             ));
+        }
+        if let Some((target, remaining)) = inner.fail_conversation_state_after_reads.as_mut() {
+            if target == conversation_id {
+                if *remaining == 0 {
+                    inner.fail_conversation_state_after_reads = None;
+                    return Err(OrchestratorError::Storage(
+                        "malformed persisted reset/quarantine sidecar".to_string(),
+                    ));
+                }
+                *remaining -= 1;
+            }
         }
         if inner
             .malformed_conversation_states
@@ -777,10 +1422,16 @@ impl MLSStorageBackend for MockStorage {
                 notified_at_ms: payload.notified_at_ms,
             }));
         }
-        Ok(inner
+        let state = inner
             .conversations
             .get(conversation_id)
-            .map(|c| c.state.clone()))
+            .map(|c| c.state.clone());
+        if matches!(state, Some(ConversationState::ResetPending { .. })) {
+            return Err(OrchestratorError::Storage(format!(
+                "incomplete reset_pending state for {conversation_id}: payload not committed"
+            )));
+        }
+        Ok(state)
     }
 
     // ── Messages ─────────────────────────────────────────────────────────
@@ -855,7 +1506,23 @@ impl MLSStorageBackend for MockStorage {
     // ── Group State ──────────────────────────────────────────────────────
 
     async fn set_group_state(&self, state: &GroupState) -> Result<()> {
+        let barrier = self.group_state_write_barrier.lock().unwrap().take();
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("group-state write barrier release semaphore closed")
+                .forget();
+        }
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_set_group_state {
+            inner.fail_next_set_group_state = false;
+            return Err(OrchestratorError::Storage(
+                "injected set_group_state failure".to_string(),
+            ));
+        }
         inner
             .group_states
             .insert(state.group_id.clone(), state.clone());
@@ -916,6 +1583,19 @@ impl MLSStorageBackend for MockStorage {
         Ok(())
     }
 
+    async fn cleanup_old_epoch_data(
+        &self,
+        conversation_id: &str,
+        retain_from_epoch: u64,
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .epoch_cleanup_calls
+            .push((conversation_id.to_string(), retain_from_epoch));
+        Ok(())
+    }
+
     // ── RecoveryTracker persistence (WS-5.4 / E7) ────────────────────────
 
     async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
@@ -954,19 +1634,66 @@ impl MLSStorageBackend for MockStorage {
         conversation_id: &str,
         group_id_hex: Option<&str>,
     ) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.pending_local_deletes.insert(
-            conversation_id.to_string(),
-            PendingLocalDelete {
-                conversation_id: conversation_id.to_string(),
-                group_id_hex: group_id_hex.map(|g| g.to_string()),
-            },
-        );
+        let barrier = {
+            let mut configured = self.pending_local_delete_write_barrier.lock().unwrap();
+            if configured
+                .as_ref()
+                .is_some_and(|(target, _, _)| target.is_empty() || target == conversation_id)
+            {
+                configured.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, false, barrier)) = barrier.as_ref() {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("pending-delete pre-write barrier release semaphore closed")
+                .forget();
+        }
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.fail_next_mark_pending_local_delete {
+                inner.fail_next_mark_pending_local_delete = false;
+                return Err(OrchestratorError::Storage(
+                    "injected mark_pending_local_delete failure".to_string(),
+                ));
+            }
+            inner.pending_local_deletes.insert(
+                conversation_id.to_string(),
+                PendingLocalDelete {
+                    conversation_id: conversation_id.to_string(),
+                    group_id_hex: group_id_hex.map(|g| g.to_string()),
+                },
+            );
+        }
+        if let Some((_, true, barrier)) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("pending-delete post-write barrier release semaphore closed")
+                .forget();
+        }
         Ok(())
     }
 
     async fn clear_pending_local_delete(&self, conversation_id: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner
+            .fail_clear_pending_local_delete_for
+            .as_deref()
+            .is_some_and(|target| target == conversation_id)
+        {
+            inner.fail_clear_pending_local_delete_for = None;
+            return Err(OrchestratorError::Storage(
+                "injected clear_pending_local_delete failure".to_string(),
+            ));
+        }
         inner.pending_local_deletes.remove(conversation_id);
         Ok(())
     }
@@ -978,12 +1705,35 @@ impl MLSStorageBackend for MockStorage {
     }
 
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
-        &[
+        const WITHOUT_PENDING_DELETE: &[&str] = &[
             "get_conversation_state",
             "get_welcome_reissue_attempt_log",
             "record_welcome_reissue_attempt",
             "mark_reset_pending",
-            "clear_reset_pending",
+            "adopt_reset_pending_target",
+            "complete_reset_pending",
+            "clear_reset_pending_for_delete",
+            "set_conversation_sequencer",
+            "mark_quarantined",
+            "clear_quarantine",
+            "store_pending_message",
+            "remove_pending_message",
+            "store_sequencer_receipt",
+            "get_sequencer_receipts",
+            "clear_sequencer_receipts",
+            "get_recovery_state",
+            "set_recovery_backoff",
+            "clear_recovery_backoff",
+            "set_last_global_rejoin_attempt_at",
+        ];
+        const ALL: &[&str] = &[
+            "get_conversation_state",
+            "get_welcome_reissue_attempt_log",
+            "record_welcome_reissue_attempt",
+            "mark_reset_pending",
+            "adopt_reset_pending_target",
+            "complete_reset_pending",
+            "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
             "mark_quarantined",
             "clear_quarantine",
@@ -999,7 +1749,15 @@ impl MLSStorageBackend for MockStorage {
             "mark_pending_local_delete",
             "clear_pending_local_delete",
             "list_pending_local_deletes",
-        ]
+        ];
+        if self
+            .declare_pending_delete_capabilities
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            ALL
+        } else {
+            WITHOUT_PENDING_DELETE
+        }
     }
 }
 

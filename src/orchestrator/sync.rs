@@ -28,6 +28,8 @@ where
 
         for convo in conversations {
             let convo_id = convo.conversation_id.clone();
+            let transition_lock = self.rejoin_lock(&convo_id).await;
+            let transition_guard = transition_lock.lock().await;
             let persisted_state = match self.storage().get_conversation_state(&convo_id).await {
                 Ok(state) => state,
                 Err(e) => {
@@ -45,24 +47,25 @@ where
             };
 
             match persisted_state {
-                Some(state @ ConversationState::ResetPending { .. }) => {
-                    self.conversation_states()
-                        .lock()
-                        .await
-                        .insert(convo_id.clone(), state);
+                Some(ConversationState::ResetPending { .. }) => {
+                    let _ = self.reset_pending_payload_result(&convo_id).await?;
                     report.reset_pending += 1;
                     continue;
                 }
                 Some(state @ ConversationState::Quarantined { .. })
                 | Some(state @ ConversationState::Failed) => {
-                    self.conversation_states()
-                        .lock()
-                        .await
-                        .insert(convo_id.clone(), state);
-                    report.unrecoverable_local += 1;
+                    if self
+                        .project_non_reset_cache_locked(&convo_id, state)
+                        .await?
+                    {
+                        report.unrecoverable_local += 1;
+                    } else {
+                        report.reset_pending += 1;
+                    }
                     continue;
                 }
                 Some(ConversationState::NeedsRejoin) => {
+                    drop(transition_guard);
                     // P0.2: do not re-project NeedsRejoin (which drives
                     // force_rejoin -> External Commit -> epoch inflation) when
                     // the local group is cryptographically healthy. Clear the
@@ -76,13 +79,13 @@ where
                     continue;
                 }
                 Some(state) => {
-                    self.conversation_states()
-                        .lock()
-                        .await
-                        .insert(convo_id.clone(), state);
+                    let _ = self
+                        .project_non_reset_cache_locked(&convo_id, state)
+                        .await?;
                 }
                 None => {}
             }
+            drop(transition_guard);
 
             let needs_rejoin = match self.storage().needs_rejoin(&convo_id).await {
                 Ok(flag) => flag,
@@ -247,6 +250,13 @@ where
 
         tracing::info!("Starting server sync");
 
+        // Fence the server listing against local creation start/completion.
+        // A changed generation means this pass cannot safely conclude that a
+        // newly cached conversation absent from the listing is stale.
+        let creation_generation_before = self
+            .creation_generation()
+            .load(std::sync::atomic::Ordering::Acquire);
+
         // Fetch all conversations with pagination
         let mut all_convos = Vec::new();
         let mut cursor: Option<String> = None;
@@ -306,18 +316,37 @@ where
             }
         }
 
-        // Get set of groups being created (protect from deletion)
-        let creating = self.groups_being_created().lock().await.clone();
-
         // Reconcile: find local conversations not on server
         let server_ids: HashSet<&str> = all_convos
             .iter()
             .map(|c| c.conversation_id.as_str())
             .collect();
-        let local_ids: Vec<String> = self.conversations().lock().await.keys().cloned().collect();
+        let local_conversations: Vec<(String, String)> = self
+            .conversations()
+            .lock()
+            .await
+            .iter()
+            .map(|(conversation_id, view)| (conversation_id.clone(), view.group_id.clone()))
+            .collect();
+        let creating = self.groups_being_created().lock().await.clone();
+        let creation_generation_after = self
+            .creation_generation()
+            .load(std::sync::atomic::Ordering::Acquire);
+        let creation_changed_during_snapshot =
+            creation_generation_before != creation_generation_after;
 
-        for local_id in &local_ids {
-            if !server_ids.contains(local_id.as_str()) && !creating.contains(local_id) {
+        for (local_id, local_group_id) in &local_conversations {
+            // Creation protection is keyed by the locally-created MLS group
+            // id. A server may return a distinct stable conversation id before
+            // that row becomes visible to getConversations, so compare both
+            // identities. The single group-id guard remains balanced by the
+            // create path on every success and error exit.
+            let creation_in_progress =
+                creating.contains(local_id) || creating.contains(local_group_id);
+            if !server_ids.contains(local_id.as_str())
+                && !creation_in_progress
+                && !creation_changed_during_snapshot
+            {
                 tracing::info!(
                     conversation_id = %local_id,
                     "Local conversation not on server, deleting"
@@ -336,6 +365,11 @@ where
 
             let conversation_id = convo.conversation_id.as_str();
             let group_id = convo.group_id.as_str();
+            // A successful reset recovery may resolve this stale list item to
+            // a different, authoritative group before the item finishes. All
+            // post-recovery projections in this iteration must use that
+            // effective view rather than normalizing the captured page again.
+            let mut effective_convo = convo.clone();
 
             let previous_view = self
                 .conversations()
@@ -414,10 +448,12 @@ where
             };
             let has_state_record = {
                 let states = self.group_states().lock().await;
-                states.contains_key(conversation_id)
-                    || states
-                        .values()
-                        .any(|gs| gs.conversation_id == conversation_id || gs.group_id == group_id)
+                ResolvedConversationContext {
+                    conversation_id: conversation_id.to_string(),
+                    group_id: group_id.to_string(),
+                }
+                .group_state(&states)
+                .is_some()
             };
 
             crate::info_log!(
@@ -449,8 +485,6 @@ where
                     conversation_id,
                     group_id
                 );
-                let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
-
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
                 let epoch = if let Ok(gid_bytes) = hex::decode(group_id) {
                     crate::info_log!(
@@ -522,9 +556,23 @@ where
                                 );
                                 match self.join_or_rejoin(conversation_id).await {
                                     Ok(epoch) => {
+                                        if let Some(resolved) = self
+                                            .conversations()
+                                            .lock()
+                                            .await
+                                            .get(conversation_id)
+                                            .cloned()
+                                        {
+                                            effective_convo = resolved;
+                                        }
+                                        // Keep an authoritative server epoch
+                                        // when it is ahead, but never let the
+                                        // stale page make reconciliation treat
+                                        // the just-landed local epoch as behind.
+                                        effective_convo.epoch = effective_convo.epoch.max(epoch);
                                         tracing::info!(
                                             conversation_id = %conversation_id,
-                                            group_id = %group_id,
+                                            group_id = %effective_convo.group_id,
                                             epoch,
                                             "Successfully joined group"
                                         );
@@ -548,66 +596,60 @@ where
                 };
 
                 let state = GroupState {
-                    group_id: convo.group_id.clone(),
-                    conversation_id: convo.conversation_id.clone(),
+                    group_id: effective_convo.group_id.clone(),
+                    conversation_id: effective_convo.conversation_id.clone(),
                     epoch,
-                    members,
+                    members: effective_convo
+                        .members
+                        .iter()
+                        .map(|member| member.did.clone())
+                        .collect(),
                 };
                 {
                     let mut states = self.group_states().lock().await;
-                    if conversation_id != group_id {
-                        states.remove(group_id);
-                    }
-                    states.insert(conversation_id.to_string(), state.clone());
+                    normalize_group_state(&mut states, state.clone());
                 }
                 self.storage().set_group_state(&state).await?;
             } else {
                 // Update member list from server
                 let mut states = self.group_states().lock().await;
-                let state_key = if states.contains_key(conversation_id) {
-                    Some(conversation_id.to_string())
-                } else {
-                    states
-                        .iter()
-                        .find(|(_, gs)| {
-                            gs.conversation_id == conversation_id || gs.group_id == group_id
-                        })
-                        .map(|(key, _)| key.clone())
+                let resolved = ResolvedConversationContext {
+                    conversation_id: conversation_id.to_string(),
+                    group_id: group_id.to_string(),
                 };
-                if let Some(state_key) = state_key {
-                    if let Some(mut gs) = states.remove(&state_key) {
-                        gs.conversation_id = conversation_id.to_string();
-                        gs.members = convo.members.iter().map(|m| m.did.clone()).collect();
-                        states.insert(conversation_id.to_string(), gs);
-                    }
+                if let Some(mut state) = resolved.group_state(&states).cloned() {
+                    state.members = convo.members.iter().map(|m| m.did.clone()).collect();
+                    normalize_group_state(&mut states, state);
                 }
             }
 
+            let conversation_id = effective_convo.conversation_id.as_str();
+            let group_id = effective_convo.group_id.as_str();
+            let server_epoch = effective_convo.epoch;
+
             // Ensure conversation record exists in storage
             self.storage()
-                .ensure_conversation_exists(user_did, &convo.conversation_id, &convo.group_id)
+                .ensure_conversation_exists(user_did, conversation_id, group_id)
                 .await?;
 
             // Check for epoch reconciliation — fetch and process missing commits
             let local_epoch = {
                 let states = self.group_states().lock().await;
-                states
-                    .get(conversation_id)
-                    .or_else(|| {
-                        states.values().find(|gs| {
-                            gs.conversation_id == conversation_id || gs.group_id == group_id
-                        })
-                    })
-                    .map(|gs| gs.epoch)
-                    .unwrap_or(0)
+                ResolvedConversationContext {
+                    conversation_id: conversation_id.to_string(),
+                    group_id: group_id.to_string(),
+                }
+                .group_state(&states)
+                .map(|state| state.epoch)
+                .unwrap_or(0)
             };
 
-            if convo.epoch > local_epoch {
+            if server_epoch > local_epoch {
                 tracing::info!(
                     conversation_id = %conversation_id,
                     group_id = %group_id,
                     local_epoch,
-                    server_epoch = convo.epoch,
+                    server_epoch,
                     "Server ahead — fetching pending messages to catch up"
                 );
 
@@ -619,7 +661,7 @@ where
                 // falls back to "oldest 50 commits in [0, current_epoch]", which on busy
                 // groups (>50 lifetime commits) strands lagging clients permanently.
                 let from_epoch = Some((local_epoch.saturating_add(1)).min(u32::MAX as u64) as u32);
-                let to_epoch = Some(convo.epoch.min(u32::MAX as u64) as u32);
+                let to_epoch = Some(server_epoch.min(u32::MAX as u64) as u32);
                 match self
                     .fetch_messages(
                         conversation_id,
@@ -643,23 +685,20 @@ where
                         // Re-check epoch after processing
                         let new_local = {
                             let states = self.group_states().lock().await;
-                            states
-                                .get(conversation_id)
-                                .or_else(|| {
-                                    states.values().find(|gs| {
-                                        gs.conversation_id == conversation_id
-                                            || gs.group_id == group_id
-                                    })
-                                })
-                                .map(|gs| gs.epoch)
-                                .unwrap_or(0)
+                            ResolvedConversationContext {
+                                conversation_id: conversation_id.to_string(),
+                                group_id: group_id.to_string(),
+                            }
+                            .group_state(&states)
+                            .map(|state| state.epoch)
+                            .unwrap_or(0)
                         };
-                        if convo.epoch > new_local {
+                        if server_epoch > new_local {
                             tracing::warn!(
                                 conversation_id = %conversation_id,
                                 group_id = %group_id,
                                 local_epoch = new_local,
-                                server_epoch = convo.epoch,
+                                server_epoch,
                                 "Still behind after processing — marking for rejoin"
                             );
                             // WS-5.2: recovery-critical write — escalate drops.
@@ -819,7 +858,7 @@ where
                     match self
                         .consume_deferred_recovery_for_conversation(
                             conversation_id,
-                            Some(convo.epoch),
+                            Some(server_epoch),
                             Some(group_id),
                         )
                         .await

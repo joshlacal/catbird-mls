@@ -794,9 +794,12 @@ async fn test_sync_rejoin_skips_when_attempt_in_flight() {
 async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
+    world.add_client("Bob").await;
     let _did = world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
 
     let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
     let convo = alice
         .orchestrator
         .create_group("Stable Conversation ID Rejoin Test", None, None)
@@ -855,6 +858,67 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
             .is_ok(),
         "External Commit should restore local MLS state for the original group ID"
     );
+
+    // Reproduce the pre-fix cache shape: the current state was stored under
+    // the stable conversation key while a stale old-group entry survived.
+    // A sync must select the exact current identity and normalize to one
+    // mutable-group-keyed entry.
+    {
+        let mut states = alice.orchestrator.group_states().lock().await;
+        let current = states
+            .remove(&group_id)
+            .expect("current group state after rejoin");
+        states.insert(conversation_id.clone(), current);
+        states.insert(
+            "deadbeef".to_string(),
+            catbird_mls::orchestrator::GroupState {
+                group_id: "deadbeef".to_string(),
+                conversation_id: conversation_id.clone(),
+                epoch: 1,
+                members: vec![],
+            },
+        );
+    }
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("normalize legacy dual-entry group-state cache");
+    {
+        let states = alice.orchestrator.group_states().lock().await;
+        let matching: Vec<_> = states
+            .iter()
+            .filter(|(_, state)| state.conversation_id == conversation_id)
+            .collect();
+        assert_eq!(matching.len(), 1, "stale conversation cache entries remain");
+        assert_eq!(matching[0].0, &group_id);
+        assert_eq!(matching[0].1.group_id, group_id);
+    }
+
+    alice
+        .orchestrator
+        .add_members(&conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("post-rejoin staged commit through stable conversation id");
+    let cached = alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .get(&group_id)
+        .cloned()
+        .expect("post-rejoin group state must remain keyed by mutable group id");
+    assert_eq!(cached.conversation_id, conversation_id);
+    assert!(cached.members.contains(&bob_did));
+    assert_eq!(
+        cached.epoch,
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&group_id).expect("group id hex"))
+            .expect("post-confirm crypto epoch"),
+        "staged commit confirmation must update the current group-id-keyed cache entry"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -870,11 +934,19 @@ async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
         .await
         .expect("create_group failed");
     let group_id = &convo.group_id;
+    let group_id_bytes = hex::decode(group_id).expect("valid group id");
 
     world.delivery_service().fail_next_get_group_info();
 
     let first = alice.orchestrator.force_rejoin(group_id).await;
     assert!(first.is_err(), "First force_rejoin should fail");
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .group_exists(group_id_bytes),
+        "GroupInfo fetch failure must preserve the existing local group"
+    );
 
     let second = alice.orchestrator.force_rejoin(group_id).await;
     match second {

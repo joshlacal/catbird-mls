@@ -15,19 +15,21 @@ pub trait MLSStorageBackendBounds {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> MLSStorageBackendBounds for T {}
 
-/// Every `MLSStorageBackend` method that ships a default no-op impl.
+/// Every `MLSStorageBackend` method that ships a default implementation.
 ///
 /// Used by the orchestrator's init-time capabilities check (WS-5.6): any
 /// method in this list that the backend does not report via
-/// [`MLSStorageBackend::implemented_optional_methods`] is logged as a warning,
-/// because state routed through a default no-op is silently dropped (e.g.
-/// `mark_reset_pending` dropping a RESET_PENDING payload across restart).
+/// [`MLSStorageBackend::implemented_optional_methods`] is logged as a warning.
+/// Security-authority defaults fail closed; legacy best-effort methods may
+/// still no-op.
 pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
     "get_conversation_state",
     "get_welcome_reissue_attempt_log",
     "record_welcome_reissue_attempt",
     "mark_reset_pending",
-    "clear_reset_pending",
+    "adopt_reset_pending_target",
+    "complete_reset_pending",
+    "clear_reset_pending_for_delete",
     "set_conversation_sequencer",
     "mark_quarantined",
     "clear_quarantine",
@@ -50,6 +52,11 @@ pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
 ///
 /// Implementations should persist data durably (e.g. SQLite, GRDB, Room).
 /// All methods are async to allow non-blocking I/O.
+///
+/// Reset lifecycle writes require one serialized writer per tenant within a
+/// process. Backends shared by multiple processes must additionally enforce
+/// the documented generation comparisons with an atomic database transaction;
+/// the in-process orchestrator lock cannot serialize another process.
 ///
 /// This trait is not the OpenMLS cryptographic state store. Native Rust
 /// engines keep OpenMLS group state, key packages, ratchets, and manifest
@@ -108,14 +115,21 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     /// For `ResetPending`, implementations MUST reconstruct the full payload
     /// (`new_group_id`, `reset_generation`, `notified_at_ms`) from the
     /// columns written by `mark_reset_pending`.
+    /// A `reset_pending` tag without that complete payload is not an
+    /// authoritative transition and MUST return an error rather than a partial
+    /// `ResetPending` value. This makes `mark_reset_pending` the durable commit
+    /// point: callers fail closed during the tag-before-payload crash window.
     ///
-    /// Default returns `Ok(None)` for backward compatibility; backends that
-    /// persist state should override.
+    /// This read is mandatory for reset authority. The default fails closed so
+    /// a partial adapter cannot silently erase an in-memory RESET_PENDING
+    /// transition by reporting an authoritative absence.
     async fn get_conversation_state(
         &self,
         _conversation_id: &str,
     ) -> Result<Option<ConversationState>> {
-        Ok(None)
+        Err(super::error::OrchestratorError::Storage(
+            "get_conversation_state is required for reset recovery".to_string(),
+        ))
     }
 
     /// Mark a conversation as needing rejoin.
@@ -160,13 +174,18 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     /// counter. `notified_at_ms` is when the event was observed locally
     /// (Unix epoch ms).
     ///
-    /// The orchestrator uses `set_conversation_state` to flip the tag to
-    /// `reset_pending` and this method to persist the payload so that, after
-    /// orchestrator restart, the platform layer can rehydrate a
+    /// This method atomically publishes the `reset_pending` tag, full payload,
+    /// and durable `needs_rejoin = true` route so that, after orchestrator
+    /// restart, the platform layer can rehydrate a
     /// `ConversationState::ResetPending { .. }` and resume Phase 1 recovery.
-    ///
-    /// Default no-op for backward compatibility; platforms should override
-    /// before relying on RESET_PENDING persistence.
+    /// This operation is the sole authority-publication commit point and MUST
+    /// atomically write the tag, complete payload, and rejoin route while
+    /// rejecting stale generations. It MUST preserve the durable conversation-to-current-group
+    /// mapping until strict predecessor deletion succeeds; same-generation
+    /// replay uses that old mapping to resume cleanup after restart. It must
+    /// never expose an incomplete reset tag. A returned
+    /// error is ambiguous, so callers re-read durable state instead of rolling
+    /// back a write that may already have committed.
     async fn mark_reset_pending(
         &self,
         _conversation_id: &str,
@@ -174,13 +193,70 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         _reset_generation: i32,
         _notified_at_ms: i64,
     ) -> Result<()> {
-        Ok(())
+        Err(super::error::OrchestratorError::Storage(
+            "mark_reset_pending is required for reset recovery".to_string(),
+        ))
     }
 
-    /// Clear any persisted RESET_PENDING payload for a conversation (called
-    /// after successful adoption of the new group).
-    async fn clear_reset_pending(&self, _conversation_id: &str) -> Result<()> {
-        Ok(())
+    /// Atomically replace the target of an already committed RESET_PENDING
+    /// transition with the server-verified winner of a reset race.
+    ///
+    /// The backend MUST require the exact stable conversation id, generation,
+    /// and old target, plus a complete committed ResetPending payload. On
+    /// success it changes only the pending target, preserving the generation,
+    /// notification timestamp, ResetPending tag, durable rejoin route, current
+    /// conversation mapping, and generation fences. An exact old/new target is
+    /// an idempotent success. Missing or mismatched authority returns false
+    /// without mutation.
+    ///
+    /// This operation never projects Active, clears reset authority, or deletes
+    /// group state. Returned errors are commit-ambiguous; callers must reread
+    /// durable authority before taking any destructive action (ADR-018).
+    async fn adopt_reset_pending_target(
+        &self,
+        _conversation_id: &str,
+        _expected_generation: i32,
+        _expected_old_target: &str,
+        _authoritative_new_target: &str,
+    ) -> Result<bool> {
+        Err(super::error::OrchestratorError::Storage(
+            "adopt_reset_pending_target is required for reset recovery".to_string(),
+        ))
+    }
+
+    /// Complete a persisted RESET_PENDING transition with causal generation
+    /// binding.
+    ///
+    /// This operation MUST atomically verify the exact committed generation
+    /// and target, project the durable conversation mapping to that target,
+    /// atomically set both the current and join epochs to the authoritative
+    /// landed MLS epoch, clear its payload, transition the durable state tag to
+    /// Active, and clear the durable rejoin flag. It returns true only when that complete
+    /// transaction commits. A generation or target mismatch returns false
+    /// without changing any state.
+    async fn complete_reset_pending(
+        &self,
+        _conversation_id: &str,
+        _expected_generation: i32,
+        _expected_new_group_id_hex: &str,
+        _landed_epoch: u64,
+    ) -> Result<bool> {
+        Err(super::error::OrchestratorError::Storage(
+            "complete_reset_pending is required for reset recovery".to_string(),
+        ))
+    }
+
+    /// Remove an exact RESET_PENDING generation as part of local conversation
+    /// deletion. This MUST NOT project Active. A mismatch returns false and
+    /// leaves the pending-delete intent in place for a retry.
+    async fn clear_reset_pending_for_delete(
+        &self,
+        _conversation_id: &str,
+        _expected_generation: i32,
+    ) -> Result<bool> {
+        Err(super::error::OrchestratorError::Storage(
+            "clear_reset_pending_for_delete is required for reset recovery".to_string(),
+        ))
     }
 
     /// Persist the conversation→sequencer mapping (ADR-010 D4 rule 4 cache).
@@ -377,11 +453,11 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
 
     // -- Capabilities (WS-5.6) --
 
-    /// Names of the optional (default no-op) trait methods this backend
+    /// Names of the trait methods with defaults that this backend
     /// actually overrides. Purely informational: the orchestrator's init-time
     /// capabilities check warns about every method in
     /// [`OPTIONAL_STORAGE_METHODS`] not reported here, so silently-dropped
-    /// state (default no-ops) is observable in logs. Backends that override
+    /// missing persistence support is observable in logs. Backends that override
     /// optional methods should keep this list in sync; a stale list only
     /// produces a spurious warning, never a behavior change.
     fn implemented_optional_methods(&self) -> &'static [&'static str] {

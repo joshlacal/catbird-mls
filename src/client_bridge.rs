@@ -263,9 +263,47 @@ impl MLSStorageBackend for ClientStorageAdapter {
             .map_err(bridge_err)
     }
 
-    async fn clear_reset_pending(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> crate::orchestrator::Result<bool> {
         self.0
-            .clear_reset_pending(conversation_id.to_string())
+            .adopt_reset_pending_target(
+                conversation_id.to_string(),
+                expected_generation,
+                expected_old_target.to_string(),
+                authoritative_new_target.to_string(),
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn complete_reset_pending(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_new_group_id_hex: &str,
+        landed_epoch: u64,
+    ) -> crate::orchestrator::Result<bool> {
+        self.0
+            .complete_reset_pending(
+                conversation_id.to_string(),
+                expected_generation,
+                expected_new_group_id_hex.to_string(),
+                landed_epoch,
+            )
+            .map_err(bridge_err)
+    }
+
+    async fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+    ) -> crate::orchestrator::Result<bool> {
+        self.0
+            .clear_reset_pending_for_delete(conversation_id.to_string(), expected_generation)
             .map_err(bridge_err)
     }
 
@@ -478,7 +516,9 @@ impl MLSStorageBackend for ClientStorageAdapter {
         &[
             "get_conversation_state",
             "mark_reset_pending",
-            "clear_reset_pending",
+            "adopt_reset_pending_target",
+            "complete_reset_pending",
+            "clear_reset_pending_for_delete",
             "mark_quarantined",
             "clear_quarantine",
             "store_pending_message",

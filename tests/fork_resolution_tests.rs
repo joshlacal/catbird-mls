@@ -34,6 +34,7 @@ struct CommitSubmission {
 struct RecordingCommitApi {
     inner: MockDeliveryService,
     submissions: Arc<Mutex<Vec<CommitSubmission>>>,
+    recovery_reports: Arc<Mutex<Vec<(String, Option<String>)>>>,
     fail_commits: bool,
 }
 
@@ -42,12 +43,17 @@ impl RecordingCommitApi {
         Self {
             inner,
             submissions: Arc::new(Mutex::new(Vec::new())),
+            recovery_reports: Arc::new(Mutex::new(Vec::new())),
             fail_commits,
         }
     }
 
     fn submissions(&self) -> Vec<CommitSubmission> {
         self.submissions.lock().unwrap().clone()
+    }
+
+    fn recovery_reports(&self) -> Vec<(String, Option<String>)> {
+        self.recovery_reports.lock().unwrap().clone()
     }
 }
 
@@ -235,6 +241,20 @@ impl MLSAPIClient for RecordingCommitApi {
         }
         Ok(())
     }
+
+    async fn report_recovery_failure(
+        &self,
+        convo_id: &str,
+        _failure_type: &str,
+        epoch_authenticator: Option<&str>,
+        _failure_mode: Option<&str>,
+    ) -> OrchestratorResult<()> {
+        self.recovery_reports.lock().unwrap().push((
+            convo_id.to_string(),
+            epoch_authenticator.map(str::to_string),
+        ));
+        Ok(())
+    }
 }
 
 struct UnsupportedForkCrypto;
@@ -413,17 +433,36 @@ async fn build_recording_orchestrator(
             .cloned()
             .expect("source group state should exist")
     };
+    let source_conversation = {
+        source
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .values()
+            .find(|conversation| conversation.group_id == group_id)
+            .cloned()
+            .expect("source conversation mapping should exist")
+    };
 
     orchestrator
         .group_states()
         .lock()
         .await
         .insert(group_id.to_string(), source_group_state);
+    orchestrator.conversations().lock().await.insert(
+        source_conversation.conversation_id.clone(),
+        source_conversation.clone(),
+    );
     orchestrator
         .conversation_states()
         .lock()
         .await
         .insert(group_id.to_string(), ConversationState::Active);
+    orchestrator.conversation_states().lock().await.insert(
+        source_conversation.conversation_id.clone(),
+        ConversationState::Active,
+    );
 
     orchestrator
 }
@@ -547,6 +586,125 @@ async fn fork_readd_orchestrator_submits_then_merges_and_clears_state() {
             .get(&group_id),
         Some(&ConversationState::Active),
         "successful fork readd should clear ForkDetected state"
+    );
+}
+
+#[cfg(feature = "fork-resolution")]
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_readd_resolves_rotated_stable_conversation_to_active_group() {
+    let (world, group_id) = setup_alice_bob_group("fork-rotated-stable").await;
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let stable_conversation_id = format!("convo-{group_id}");
+
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&group_id, &stable_conversation_id);
+    alice
+        .storage
+        .ensure_conversation_exists(&alice.did, &stable_conversation_id, &group_id)
+        .await
+        .expect("migrate stable conversation storage row");
+    alice
+        .storage
+        .set_conversation_state(&stable_conversation_id, ConversationState::Active)
+        .await
+        .expect("persist migrated stable conversation as Active");
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh rotated stable conversation mapping");
+    let source_epoch = epoch_for(alice, &group_id);
+
+    let api = RecordingCommitApi::new(world.api_service.clone_as(&alice.did), false);
+    let api_probe = api.clone();
+    let orchestrator = build_recording_orchestrator(alice, api, &group_id).await;
+    {
+        let mut states = orchestrator.group_states().lock().await;
+        let current = states.remove(&group_id).expect("current group state");
+        states.insert(stable_conversation_id.clone(), current);
+    }
+
+    trigger_fork_detection(&orchestrator, &stable_conversation_id, &bob_did).await;
+
+    let submissions = api_probe.submissions();
+    assert_eq!(submissions.len(), 1, "fork recovery should submit once");
+    assert_eq!(submissions[0].convo_id, stable_conversation_id);
+    assert_eq!(submissions[0].action, "forkReadd");
+    assert_eq!(
+        orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&group_id).expect("active group id"))
+            .expect("active group epoch"),
+        source_epoch + 1,
+        "fork repair must merge against the active mutable group"
+    );
+    {
+        let states = orchestrator.group_states().lock().await;
+        assert!(!states.contains_key(&stable_conversation_id));
+        let current = states
+            .get(&group_id)
+            .expect("normalized active group state");
+        assert_eq!(current.epoch, source_epoch + 1);
+        assert_eq!(current.conversation_id, stable_conversation_id);
+    }
+    assert_eq!(
+        orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&stable_conversation_id),
+        Some(&ConversationState::Active)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn recovery_vote_authenticator_ignores_stale_legacy_group_state() {
+    let (world, group_id) = setup_alice_bob_group("recovery-vote-active").await;
+    let alice = world.client("Alice");
+    let unrelated = alice
+        .orchestrator
+        .create_group("recovery-vote-unrelated", None, None)
+        .await
+        .expect("create unrelated group");
+    let stable_conversation_id = format!("convo-{group_id}");
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&group_id, &stable_conversation_id);
+    alice
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh rotated mapping");
+
+    let api = RecordingCommitApi::new(world.api_service.clone_as(&alice.did), false);
+    let api_probe = api.clone();
+    let orchestrator = build_recording_orchestrator(alice, api, &group_id).await;
+    orchestrator.group_states().lock().await.insert(
+        stable_conversation_id.clone(),
+        GroupState {
+            group_id: unrelated.group_id.clone(),
+            conversation_id: stable_conversation_id.clone(),
+            epoch: unrelated.epoch,
+            members: vec![alice.did.clone()],
+        },
+    );
+    let expected_authenticator = hex::encode(
+        orchestrator
+            .mls_context()
+            .epoch_authenticator(hex::decode(&group_id).expect("active group id"))
+            .expect("active epoch authenticator"),
+    );
+
+    orchestrator
+        .user_confirmed_manual_reset(&stable_conversation_id)
+        .await
+        .expect("manual reset report");
+
+    assert_eq!(
+        api_probe.recovery_reports(),
+        vec![(stable_conversation_id, Some(expected_authenticator))]
     );
 }
 

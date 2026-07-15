@@ -2883,6 +2883,10 @@ impl MLSContext {
         self.groups.contains_key(group_id)
     }
 
+    pub(crate) fn local_group_ids(&self) -> Vec<Vec<u8>> {
+        self.groups.keys().cloned().collect()
+    }
+
     /// Delete a group from the context, cleaning up all persistent storage.
     /// Returns true if the group was found and removed, false otherwise.
     pub fn delete_group(&mut self, group_id: &[u8]) -> bool {

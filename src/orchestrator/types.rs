@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use super::event_observer::EngineEvent;
 
@@ -34,6 +35,67 @@ pub type GroupId = String;
 
 /// Stable conversation identifier (survives group resets).
 pub type ConversationId = String;
+
+/// Internal identity pair resolved from an authoritative conversation record.
+///
+/// The stable `conversation_id` is used for delivery-service and persistence
+/// operations. Only `group_id` may cross into MLS cryptographic operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedConversationContext {
+    pub conversation_id: ConversationId,
+    pub group_id: GroupId,
+}
+
+pub(crate) fn normalize_group_state(states: &mut HashMap<GroupId, GroupState>, state: GroupState) {
+    states.retain(|key, existing| {
+        key == &state.group_id || existing.conversation_id != state.conversation_id
+    });
+    states.insert(state.group_id.clone(), state);
+}
+
+impl ResolvedConversationContext {
+    pub(crate) fn group_id_bytes(&self) -> crate::orchestrator::error::Result<Vec<u8>> {
+        hex::decode(&self.group_id).map_err(|_| {
+            crate::orchestrator::error::OrchestratorError::InvalidInput(
+                "Invalid hex group ID".into(),
+            )
+        })
+    }
+
+    pub(crate) fn group_state<'a>(
+        &self,
+        states: &'a HashMap<GroupId, GroupState>,
+    ) -> Option<&'a GroupState> {
+        states
+            .get(&self.group_id)
+            .filter(|state| {
+                state.conversation_id == self.conversation_id && state.group_id == self.group_id
+            })
+            .or_else(|| {
+                states.get(&self.conversation_id).filter(|state| {
+                    state.conversation_id == self.conversation_id && state.group_id == self.group_id
+                })
+            })
+    }
+
+    pub(crate) fn group_state_mut<'a>(
+        &self,
+        states: &'a mut HashMap<GroupId, GroupState>,
+    ) -> Option<&'a mut GroupState> {
+        let key = if states.get(&self.group_id).is_some_and(|state| {
+            state.conversation_id == self.conversation_id && state.group_id == self.group_id
+        }) {
+            &self.group_id
+        } else if states.get(&self.conversation_id).is_some_and(|state| {
+            state.conversation_id == self.conversation_id && state.group_id == self.group_id
+        }) {
+            &self.conversation_id
+        } else {
+            return None;
+        };
+        states.get_mut(key)
+    }
+}
 
 /// A view of an MLS conversation, mirroring the server's ConvoView.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1167,5 +1229,111 @@ mod tests {
         let payload = MLSMessagePayload::text_with_embed("", MLSEmbedData::audio(audio).unwrap());
         assert_eq!(payload.display_text(), "🎤 Voice message");
         assert!(payload.is_displayable());
+    }
+
+    fn resolved_context_fixture() -> (ResolvedConversationContext, GroupState) {
+        let context = ResolvedConversationContext {
+            conversation_id: "stable-conversation".to_string(),
+            group_id: "mutable-group".to_string(),
+        };
+        let state = GroupState {
+            conversation_id: context.conversation_id.clone(),
+            group_id: context.group_id.clone(),
+            epoch: 7,
+            members: vec![],
+        };
+        (context, state)
+    }
+
+    #[test]
+    fn resolved_context_finds_exact_state_under_both_supported_cache_keys() {
+        let (context, state) = resolved_context_fixture();
+        for key in [&context.group_id, &context.conversation_id] {
+            let mut states = std::collections::HashMap::new();
+            states.insert(key.clone(), state.clone());
+
+            assert_eq!(
+                context.group_state(&states).map(|state| state.epoch),
+                Some(state.epoch)
+            );
+            context
+                .group_state_mut(&mut states)
+                .expect("exact state")
+                .epoch = 8;
+            assert_eq!(
+                context.group_state(&states).map(|state| state.epoch),
+                Some(8)
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_context_rejects_mismatched_state_at_supported_cache_key() {
+        let (context, mut state) = resolved_context_fixture();
+        state.conversation_id = "attacker-conversation".to_string();
+        let mut states = std::collections::HashMap::from([(context.group_id.clone(), state)]);
+
+        assert!(context.group_state(&states).is_none());
+        assert!(context.group_state_mut(&mut states).is_none());
+    }
+
+    #[test]
+    fn resolved_context_falls_back_to_exact_legacy_state_when_group_key_is_stale() {
+        let (context, state) = resolved_context_fixture();
+        let stale = GroupState {
+            conversation_id: context.conversation_id.clone(),
+            group_id: "stale-group".to_string(),
+            epoch: 3,
+            members: vec![],
+        };
+        let mut states = std::collections::HashMap::from([
+            (context.group_id.clone(), stale),
+            (context.conversation_id.clone(), state),
+        ]);
+
+        assert_eq!(
+            context.group_state(&states).map(|state| state.epoch),
+            Some(7)
+        );
+        context
+            .group_state_mut(&mut states)
+            .expect("exact legacy state")
+            .epoch = 8;
+        assert_eq!(states[&context.conversation_id].epoch, 8);
+    }
+
+    #[test]
+    fn normalized_group_state_replaces_all_stale_entries_for_conversation() {
+        let stale = GroupState {
+            conversation_id: "stable-conversation".to_string(),
+            group_id: "old-group".to_string(),
+            epoch: 3,
+            members: vec![],
+        };
+        let current = GroupState {
+            conversation_id: "stable-conversation".to_string(),
+            group_id: "current-group".to_string(),
+            epoch: 7,
+            members: vec![],
+        };
+        let unrelated = GroupState {
+            conversation_id: "other-conversation".to_string(),
+            group_id: "other-group".to_string(),
+            epoch: 1,
+            members: vec![],
+        };
+        let mut states = std::collections::HashMap::from([
+            ("old-group".to_string(), stale),
+            ("stable-conversation".to_string(), current.clone()),
+            ("other-group".to_string(), unrelated),
+        ]);
+
+        normalize_group_state(&mut states, current);
+
+        assert_eq!(states.len(), 2);
+        assert!(states.contains_key("current-group"));
+        assert!(states.contains_key("other-group"));
+        assert!(!states.contains_key("old-group"));
+        assert!(!states.contains_key("stable-conversation"));
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 use web_time::Instant;
 
@@ -34,6 +34,122 @@ pub(crate) struct ResetPendingPayload {
     pub reset_generation: i32,
     #[allow(dead_code)]
     pub notified_at_ms: i64,
+}
+
+pub(crate) struct LocalDeleteSnapshot {
+    pub group_ids: Vec<Vec<u8>>,
+    pub group_state_keys: Vec<String>,
+    pub reset_pending: Option<ResetPendingPayload>,
+}
+
+const LOCAL_DELETE_AUTHORITY_MAGIC: &[u8] = b"CBLD\x01";
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedLocalDeleteAuthority {
+    owner_user_did: String,
+    group_ids_hex: Vec<String>,
+    group_state_keys: Vec<String>,
+}
+
+pub(crate) enum LocalDeleteAuthority {
+    Versioned {
+        owner_user_did: String,
+        group_ids_hex: Vec<String>,
+        group_state_keys: Vec<String>,
+    },
+    LegacyGroupId(String),
+    LegacyUnbound,
+}
+
+impl LocalDeleteSnapshot {
+    pub(crate) fn encode_authority(&self, owner_user_did: &str) -> Result<String> {
+        let payload = PersistedLocalDeleteAuthority {
+            owner_user_did: owner_user_did.to_string(),
+            group_ids_hex: self.group_ids.iter().map(hex::encode).collect(),
+            group_state_keys: self.group_state_keys.clone(),
+        };
+        let mut encoded = LOCAL_DELETE_AUTHORITY_MAGIC.to_vec();
+        encoded.extend(serde_json::to_vec(&payload).map_err(|error| {
+            OrchestratorError::InvalidInput(format!(
+                "failed to serialize local-delete authority: {error}"
+            ))
+        })?);
+        Ok(hex::encode(encoded))
+    }
+}
+
+pub(crate) fn decode_local_delete_authority(encoded: Option<&str>) -> Result<LocalDeleteAuthority> {
+    let Some(encoded) = encoded else {
+        return Ok(LocalDeleteAuthority::LegacyUnbound);
+    };
+    let bytes = hex::decode(encoded).map_err(|error| {
+        OrchestratorError::InvalidInput(format!(
+            "pending local-delete authority is not valid hex: {error}"
+        ))
+    })?;
+    if !bytes.starts_with(LOCAL_DELETE_AUTHORITY_MAGIC) {
+        return Ok(LocalDeleteAuthority::LegacyGroupId(encoded.to_string()));
+    }
+    let payload: PersistedLocalDeleteAuthority =
+        serde_json::from_slice(&bytes[LOCAL_DELETE_AUTHORITY_MAGIC.len()..]).map_err(|error| {
+            OrchestratorError::InvalidInput(format!(
+                "pending local-delete authority is malformed: {error}"
+            ))
+        })?;
+    if payload.owner_user_did.is_empty() {
+        return Err(OrchestratorError::InvalidInput(
+            "pending local-delete authority has no owner".to_string(),
+        ));
+    }
+    for group_id in &payload.group_ids_hex {
+        hex::decode(group_id).map_err(|error| {
+            OrchestratorError::InvalidInput(format!(
+                "pending local-delete authority contains malformed group id {group_id}: {error}"
+            ))
+        })?;
+    }
+    Ok(LocalDeleteAuthority::Versioned {
+        owner_user_did: payload.owner_user_did,
+        group_ids_hex: payload.group_ids_hex,
+        group_state_keys: payload.group_state_keys,
+    })
+}
+
+fn delete_materialized_force_rejoin_groups<F>(
+    group_ids: Vec<Vec<u8>>,
+    mut delete_group: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> std::result::Result<(), crate::MLSError>,
+{
+    for group_id in group_ids {
+        let group_id_hex = hex::encode(&group_id);
+        match delete_group(group_id) {
+            Ok(()) | Err(crate::MLSError::GroupNotFound { .. }) => {}
+            Err(error) => {
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                "Failed to delete locally materialized group {group_id_hex} before force rejoin: {error}"
+            )))
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_materialized_reset_predecessors<F>(
+    group_ids: Vec<Vec<u8>>,
+    mut delete_group: F,
+) -> Result<()>
+where
+    F: FnMut(Vec<u8>) -> std::result::Result<(), crate::MLSError>,
+{
+    for group_id in group_ids {
+        match delete_group(group_id) {
+            Ok(()) | Err(crate::MLSError::GroupNotFound { .. }) => {}
+            Err(error) => return Err(OrchestratorError::Mls(error)),
+        }
+    }
+    Ok(())
 }
 
 /// One conversation's failed-rejoin bookkeeping (in-memory side of the
@@ -778,6 +894,14 @@ where
                 return Ok(());
             }
         };
+        if self
+            .reset_blocks_non_reset_transition_locked(convo_id)
+            .await?
+        {
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "durable reset authority blocks fork readd for {convo_id}"
+            )));
+        }
         let ok = {
             let fds = self
                 .fork_detection_states()
@@ -798,11 +922,18 @@ where
                 s.readd_attempts += 1;
             }
         }
-        let gid =
-            hex::decode(convo_id).map_err(|_| OrchestratorError::InvalidInput("bad hex".into()))?;
+        let resolved = match self.resolve_conversation_context(convo_id).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(error);
+            }
+        };
+        let gid = resolved.group_id_bytes()?;
         let mems: Vec<String> = {
             let st = self.group_states().lock().await;
-            st.get(convo_id)
+            resolved
+                .group_state(&st)
                 .map(|g| g.members.clone())
                 .unwrap_or_default()
         };
@@ -824,8 +955,13 @@ where
         // This is an automated Add path a malicious DS can steer clients into
         // via decrypt failures, so it must hit the same verify-on-fetch
         // chokepoint as create_group / add_members / swap_members.
-        self.verify_fetched_key_packages(&mems, &kp_refs, "fork_readd", Some(convo_id))
-            .await;
+        self.verify_fetched_key_packages(
+            &mems,
+            &kp_refs,
+            "fork_readd",
+            Some(&resolved.conversation_id),
+        )
+        .await;
 
         let kps: Vec<Vec<u8>> = kp_refs.iter().map(|r| r.key_package_data.clone()).collect();
         let (commit, _) = match self
@@ -845,7 +981,12 @@ where
             .ok();
         if let Err(e) = self
             .api_client()
-            .commit_group_change(convo_id, &commit, "forkReadd", tag.as_deref())
+            .commit_group_change(
+                &resolved.conversation_id,
+                &commit,
+                "forkReadd",
+                tag.as_deref(),
+            )
             .await
         {
             let _ = self.mls_context().clear_pending_commit(gid);
@@ -855,13 +996,19 @@ where
         match self.mls_context().merge_pending_commit(gid.clone()) {
             Ok(ep) => {
                 // Cleanup old epoch secrets after fork readd
-                self.cleanup_epoch_secrets_if_needed(convo_id, ep).await;
+                self.cleanup_epoch_secrets_if_needed(
+                    &resolved.conversation_id,
+                    &resolved.group_id,
+                    ep,
+                )
+                .await;
 
                 {
                     let mut st = self.group_states().lock().await;
-                    if let Some(gs) = st.get_mut(convo_id) {
+                    if let Some(mut gs) = resolved.group_state(&st).cloned() {
                         gs.epoch = ep;
                         let sc = gs.clone();
+                        normalize_group_state(&mut st, gs);
                         drop(st);
                         if let Err(e) = self.storage().set_group_state(&sc).await {
                             tracing::warn!(error = %e, convo_id, "Failed to persist group state after fork readd");
@@ -876,15 +1023,17 @@ where
                     fds.remove(convo_id);
                 }
                 self.decrypt_fail_counts().lock().await.remove(convo_id);
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(convo_id.to_string(), ConversationState::Active);
+                let _ = self
+                    .project_non_reset_cache_locked(convo_id, ConversationState::Active)
+                    .await;
                 if let Ok(gi) = self
                     .mls_context()
                     .export_group_info(gid, user_did.as_bytes().to_vec())
                 {
-                    let _ = self.api_client().publish_group_info(convo_id, &gi).await;
+                    let _ = self
+                        .api_client()
+                        .publish_group_info(&resolved.conversation_id, &gi)
+                        .await;
                 }
                 tracing::info!(convo_id, "Fork readd succeeded");
                 Ok(())
@@ -903,32 +1052,39 @@ where
                 .unwrap_or_else(|e| e.into_inner());
             fds.remove(convo_id);
         }
-        self.conversation_states()
-            .lock()
+        if self
+            .project_non_reset_cache_locked(convo_id, ConversationState::NeedsRejoin)
             .await
-            .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
-        self.mark_needs_rejoin_critical(convo_id).await;
+            .unwrap_or(false)
+        {
+            self.mark_needs_rejoin_critical(convo_id).await;
+        }
         tracing::info!(convo_id, "Fork escalated to NeedsRejoin");
     }
 
     pub(crate) async fn project_startup_needs_rejoin(&self, convo_id: &str) {
-        self.conversation_states()
-            .lock()
-            .await
-            .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
-        if let Err(e) = self
-            .storage()
-            .set_conversation_state(convo_id, ConversationState::NeedsRejoin)
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
+        match self
+            .project_non_reset_state_locked(convo_id, ConversationState::NeedsRejoin)
             .await
         {
-            self.report_recovery_storage_failure(
-                convo_id,
-                "set_conversation_state:needs_rejoin",
-                &e,
-            )
-            .await;
+            Ok(true) => self.mark_needs_rejoin_critical(convo_id).await,
+            Ok(false) => {
+                tracing::info!(
+                    convo_id,
+                    "ResetPending suppressed startup NeedsRejoin projection"
+                )
+            }
+            Err(e) => {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "set_conversation_state:needs_rejoin",
+                    &e,
+                )
+                .await;
+            }
         }
-        self.mark_needs_rejoin_critical(convo_id).await;
     }
 
     pub(crate) async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
@@ -1021,36 +1177,49 @@ where
         server_epoch: Option<u64>,
         server_group_id: Option<&str>,
     ) -> Result<DeferredRecoveryOutcome> {
-        if let Some(server_epoch) = server_epoch {
-            let candidate_group_id = if let Some(server_group_id) = server_group_id {
-                Some(server_group_id.to_string())
-            } else {
-                self.group_states()
-                    .lock()
-                    .await
-                    .get(convo_id)
-                    .map(|state| state.group_id.clone())
-            };
-            let current_epoch = {
-                candidate_group_id
-                    .and_then(|group_id| hex::decode(group_id).ok())
-                    .and_then(|gid_bytes| self.mls_context().get_epoch(gid_bytes).ok())
-            };
+        {
+            // Serialize the authority check, context/epoch decision, and flag
+            // clear with reset recording. Otherwise an SSE reset can commit
+            // ResetPending between the check and clear and lose its durable
+            // recovery route.
+            let transition_lock = self.rejoin_lock(convo_id).await;
+            let _transition_guard = transition_lock.lock().await;
 
-            if current_epoch.is_some_and(|epoch| epoch >= server_epoch) {
-                tracing::info!(
-                    conversation_id = %convo_id,
-                    local_epoch = current_epoch.unwrap_or_default(),
-                    server_epoch,
-                    "Clearing stale needs_rejoin flag; local MLS group is already caught up"
-                );
-                if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
-                    self.report_recovery_storage_failure(convo_id, "clear_rejoin_flag", &e)
-                        .await;
-                } else {
-                    self.clear_stale_rejoin_state(convo_id).await;
+            // ResetPending is authoritative even when the accepted bootstrap
+            // candidate is already at the server epoch. Only the generation-bound
+            // completion transaction may clear its durable rejoin route. A read
+            // failure is fail-closed and must not fall through to stale clearing.
+            let reset_authority = self.reset_pending_payload_result(convo_id).await?;
+            if let (None, Some(server_epoch)) = (reset_authority.as_ref(), server_epoch) {
+                let candidate_group_id = self
+                    .resolve_conversation_context(convo_id)
+                    .await
+                    .ok()
+                    .and_then(|resolved| match server_group_id {
+                        Some(server_group_id) if server_group_id != resolved.group_id => None,
+                        _ => Some(resolved.group_id),
+                    });
+                let current_epoch = {
+                    candidate_group_id
+                        .and_then(|group_id| hex::decode(group_id).ok())
+                        .and_then(|gid_bytes| self.mls_context().get_epoch(gid_bytes).ok())
+                };
+
+                if current_epoch.is_some_and(|epoch| epoch >= server_epoch) {
+                    tracing::info!(
+                        conversation_id = %convo_id,
+                        local_epoch = current_epoch.unwrap_or_default(),
+                        server_epoch,
+                        "Clearing stale needs_rejoin flag; local MLS group is already caught up"
+                    );
+                    if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
+                        self.report_recovery_storage_failure(convo_id, "clear_rejoin_flag", &e)
+                            .await;
+                    } else {
+                        self.clear_stale_rejoin_state(convo_id).await;
+                    }
+                    return Ok(DeferredRecoveryOutcome::ClearedStale);
                 }
-                return Ok(DeferredRecoveryOutcome::ClearedStale);
             }
         }
 
@@ -1222,7 +1391,7 @@ where
             // `is_remote_data_error` below; remaining failures are typically
             // network / OpenMLS storage issues that should self-heal via
             // §6.6 / §8.4 instead of triggering a global reset.
-            let authenticator = self.epoch_authenticator_hex(convo_id);
+            let authenticator = self.epoch_authenticator_hex(convo_id).await;
             if let Err(e) = self
                 .api_client()
                 .report_recovery_failure(
@@ -1317,6 +1486,129 @@ where
         }
     }
 
+    /// Check the reset authority while the caller owns the per-conversation
+    /// transition lock. A cached ResetPending projection is monotonic: only an
+    /// exact completion CAS or explicit delete may clear it.
+    pub(crate) async fn reset_blocks_non_reset_transition_locked(
+        &self,
+        convo_id: &str,
+    ) -> Result<bool> {
+        if self.reset_pending_payload_result(convo_id).await?.is_some() {
+            return Ok(true);
+        }
+        Ok(matches!(
+            self.conversation_states().lock().await.get(convo_id),
+            Some(ConversationState::ResetPending { .. })
+        ))
+    }
+
+    /// Persist and cache a non-reset state while the caller owns the
+    /// transition lock. ResetPending always wins and read failures fail closed.
+    pub(crate) async fn project_non_reset_state_locked(
+        &self,
+        convo_id: &str,
+        state: ConversationState,
+    ) -> Result<bool> {
+        debug_assert!(!matches!(state, ConversationState::ResetPending { .. }));
+        if self
+            .reset_blocks_non_reset_transition_locked(convo_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.storage()
+            .set_conversation_state(convo_id, state.clone())
+            .await?;
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(convo_id.to_string(), state);
+        Ok(true)
+    }
+
+    pub(crate) async fn project_non_reset_cache_locked(
+        &self,
+        convo_id: &str,
+        state: ConversationState,
+    ) -> Result<bool> {
+        debug_assert!(!matches!(state, ConversationState::ResetPending { .. }));
+        if self
+            .reset_blocks_non_reset_transition_locked(convo_id)
+            .await?
+        {
+            return Ok(false);
+        }
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(convo_id.to_string(), state);
+        Ok(true)
+    }
+
+    pub(crate) async fn project_runtime_needs_rejoin(&self, convo_id: &str) {
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
+        match self
+            .project_non_reset_cache_locked(convo_id, ConversationState::NeedsRejoin)
+            .await
+        {
+            Ok(true) => self.mark_needs_rejoin_critical(convo_id).await,
+            Ok(false) => {}
+            Err(e) => {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "project_runtime_needs_rejoin:reset_authority_read",
+                    &e,
+                )
+                .await;
+            }
+        }
+    }
+
+    pub(crate) async fn project_runtime_active(&self, convo_id: &str) {
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
+        if let Err(e) = self
+            .project_non_reset_cache_locked(convo_id, ConversationState::Active)
+            .await
+        {
+            self.report_recovery_storage_failure(
+                convo_id,
+                "project_runtime_active:reset_authority_read",
+                &e,
+            )
+            .await;
+        }
+    }
+
+    pub(crate) async fn project_fork_detected_if_active(&self, convo_id: &str, epoch: u64) -> bool {
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
+        if self
+            .reset_blocks_non_reset_transition_locked(convo_id)
+            .await
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        let mut states = self.conversation_states().lock().await;
+        if !matches!(states.get(convo_id), Some(ConversationState::Active) | None) {
+            return false;
+        }
+        states.insert(convo_id.to_string(), ConversationState::ForkDetected);
+        drop(states);
+        if let Ok(mut fds) = self.fork_detection_states().lock() {
+            fds.insert(
+                convo_id.to_string(),
+                ForkDetectionState {
+                    detected_at_epoch: epoch,
+                    readd_attempts: 0,
+                },
+            );
+        }
+        true
+    }
+
     /// `mark_needs_rejoin` with WS-5.2 escalation: the rejoin flag is what the
     /// deferred-recovery loop consumes, so a dropped write here silently
     /// cancels recovery.
@@ -1392,6 +1684,33 @@ where
     /// `Active`) when the group is healthy; `false` when the caller should
     /// proceed to project `NeedsRejoin`.
     pub(crate) async fn clear_needs_rejoin_if_locally_healthy(&self, convo_id: &str) -> bool {
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
+        self.clear_needs_rejoin_if_locally_healthy_unlocked(convo_id)
+            .await
+    }
+
+    /// Same health check while the caller already owns the transition lock.
+    async fn clear_needs_rejoin_if_locally_healthy_unlocked(&self, convo_id: &str) -> bool {
+        match self.reset_pending_payload_result(convo_id).await {
+            Ok(Some(_)) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} reset authority present -> keeping NeedsRejoin",
+                    convo_id
+                );
+                return false;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} reset authority read FAILED ({}) -> keeping NeedsRejoin",
+                    convo_id,
+                    err
+                );
+                return false;
+            }
+        }
+
         let local_epoch = match self.local_group_epoch_result(convo_id).await {
             Ok(Some(epoch)) => epoch,
             Ok(None) => {
@@ -1448,21 +1767,21 @@ where
         // counters together (the in-session path messaging.rs cleared only the
         // enum, leaving the boolean to re-arm across restart) and project
         // Active so the startup scan does NOT drive a force_rejoin.
-        self.conversation_states()
-            .lock()
-            .await
-            .insert(convo_id.to_string(), ConversationState::Active);
-        if let Err(e) = self
-            .storage()
-            .set_conversation_state(convo_id, ConversationState::Active)
+        match self
+            .project_non_reset_state_locked(convo_id, ConversationState::Active)
             .await
         {
-            self.report_recovery_storage_failure(
-                convo_id,
-                "set_conversation_state:active_stale_clear",
-                &e,
-            )
-            .await;
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "set_conversation_state:active_stale_clear",
+                    &e,
+                )
+                .await;
+                return false;
+            }
         }
         if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
             self.report_recovery_storage_failure(convo_id, "clear_rejoin_flag:stale", &e)
@@ -1595,64 +1914,269 @@ where
         }
     }
 
-    fn cached_group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
-        let states = self.group_states().try_lock().ok()?;
-        states
-            .get(convo_id)
-            .map(|gs| gs.group_id.clone())
-            .or_else(|| {
-                states
-                    .values()
-                    .find(|gs| gs.conversation_id == convo_id)
-                    .map(|gs| gs.group_id.clone())
-            })
+    pub(crate) async fn group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
+        self.resolve_conversation_context(convo_id)
+            .await
+            .ok()
+            .map(|resolved| resolved.group_id)
     }
 
-    pub(crate) async fn group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
-        {
-            let states = self.group_states().lock().await;
-            if let Some(group_id) = states.get(convo_id).map(|gs| gs.group_id.clone()) {
-                return Some(group_id);
-            }
-            if let Some(group_id) = states
-                .values()
-                .find(|gs| gs.conversation_id == convo_id)
-                .map(|gs| gs.group_id.clone())
-            {
-                return Some(group_id);
-            }
+    /// Resolve a stable conversation identifier to its current MLS group.
+    ///
+    /// Unlike `group_id_hex_for_conversation`, this security boundary never
+    /// treats a hex-looking conversation id as a group id. Callers receive a
+    /// context only when a server-backed cache, durable conversation record,
+    /// or explicit group state binds both identifiers.
+    pub(crate) async fn resolve_conversation_context(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ResolvedConversationContext> {
+        // A persisted ResetPending payload is the transition authority for a
+        // server-directed group rotation. It must precede both ConversationView
+        // projections: those rows are refreshed by sync and can legitimately
+        // retain the deleted pre-reset group until that refresh completes.
+        // This is deliberately narrow; arbitrary group-state cache entries do
+        // not gain precedence over server-backed conversation mappings.
+        if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
+            return Ok(ResolvedConversationContext {
+                conversation_id: conversation_id.to_string(),
+                group_id: pending.new_group_id,
+            });
         }
 
+        // The server-refreshed conversation cache is the authoritative O(1)
+        // mapping during a live session. It must precede legacy group-state
+        // entries, which may survive a group rotation under the stable key.
         {
             let conversations = self.conversations().lock().await;
-            if let Some(group_id) = conversations.get(convo_id).map(|c| c.group_id.clone()) {
-                return Some(group_id);
-            }
-            if let Some(group_id) = conversations
-                .values()
-                .find(|c| c.conversation_id == convo_id)
-                .map(|c| c.group_id.clone())
+            if let Some(view) = conversations
+                .get(conversation_id)
+                .filter(|view| view.conversation_id == conversation_id)
             {
-                return Some(group_id);
+                return Ok(ResolvedConversationContext {
+                    conversation_id: view.conversation_id.clone(),
+                    group_id: view.group_id.clone(),
+                });
             }
         }
 
-        if let Ok(user_did) = self.require_user_did().await {
-            if let Ok(Some(convo)) = self.storage().get_conversation(&user_did, convo_id).await {
-                return Some(convo.group_id);
+        let user_did = self.require_user_did().await?;
+        if let Some(view) = self
+            .storage()
+            .get_conversation(&user_did, conversation_id)
+            .await?
+            .filter(|view| view.conversation_id == conversation_id)
+        {
+            return Ok(ResolvedConversationContext {
+                conversation_id: view.conversation_id,
+                group_id: view.group_id,
+            });
+        }
+
+        // Compatibility fallback for pre-normalization in-memory state. New
+        // group-state entries are keyed by mutable GroupId, so a direct stable
+        // key hit is legacy data and is consulted only when neither current
+        // cache nor durable storage has an authoritative mapping.
+        {
+            let states = self.group_states().lock().await;
+            if let Some(state) = states
+                .get(conversation_id)
+                .filter(|state| state.conversation_id == conversation_id)
+            {
+                return Ok(ResolvedConversationContext {
+                    conversation_id: state.conversation_id.clone(),
+                    group_id: state.group_id.clone(),
+                });
             }
         }
 
-        if hex::decode(convo_id).is_ok() {
-            Some(convo_id.to_string())
-        } else {
-            None
+        Err(OrchestratorError::ConversationNotFound(
+            conversation_id.to_string(),
+        ))
+    }
+
+    /// Translate a legacy public bridge identifier documented as `group_id`
+    /// into the stable conversation context required by orchestrator member
+    /// mutations.
+    ///
+    /// New callers pass the stable conversation id directly and take the fast
+    /// path above. Legacy callers may pass the current mutable MLS group id;
+    /// this compatibility path accepts it only when current authoritative
+    /// state resolves exactly one stable conversation back to that same group.
+    /// Ambiguous or stale group ids fail closed rather than selecting a
+    /// conversation by iteration order.
+    pub(crate) async fn resolve_legacy_group_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<ResolvedConversationContext> {
+        let mut candidate_conversation_ids = BTreeSet::new();
+        candidate_conversation_ids.insert(identifier.to_string());
+        {
+            let conversations = self.conversations().lock().await;
+            candidate_conversation_ids.extend(conversations.keys().cloned());
+        }
+        {
+            let states = self.group_states().lock().await;
+            candidate_conversation_ids
+                .extend(states.values().map(|state| state.conversation_id.clone()));
+        }
+        {
+            let states = self.conversation_states().lock().await;
+            candidate_conversation_ids.extend(states.keys().cloned());
+        }
+
+        let user_did = self.require_user_did().await?;
+        candidate_conversation_ids.extend(
+            self.storage()
+                .list_conversations(&user_did)
+                .await?
+                .into_iter()
+                .map(|view| view.conversation_id),
+        );
+
+        let mut matches = std::collections::BTreeMap::new();
+        for conversation_id in candidate_conversation_ids {
+            match self.resolve_conversation_context(&conversation_id).await {
+                Ok(resolved)
+                    if resolved.conversation_id == identifier
+                        || resolved.group_id == identifier =>
+                {
+                    matches.insert(resolved.conversation_id.clone(), resolved);
+                }
+                Ok(_) | Err(OrchestratorError::ConversationNotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        match matches.len() {
+            0 => Err(OrchestratorError::ConversationNotFound(
+                identifier.to_string(),
+            )),
+            1 => Ok(matches.into_values().next().expect("one legacy id match")),
+            count => Err(OrchestratorError::InvalidInput(format!(
+                "mutable MLS group id {identifier} resolves to {count} stable conversations"
+            ))),
         }
     }
 
     pub(crate) async fn group_id_bytes_for_conversation(&self, convo_id: &str) -> Option<Vec<u8>> {
         let group_id_hex = self.group_id_hex_for_conversation(convo_id).await?;
         hex::decode(group_id_hex).ok()
+    }
+
+    /// Snapshot the locally materialized group bound to a stable conversation
+    /// before destructive force-rejoin cleanup.
+    ///
+    /// The server-authoritative conversation mapping can legitimately advance
+    /// to a reset target that this device has not joined yet. Deleting that
+    /// absent target would leave the old local group (and its epoch secrets)
+    /// behind. Prefer a group-state entry explicitly bound to this stable
+    /// conversation only when its decoded group is still present in the MLS
+    /// context; otherwise retain the normal authoritative-resolution fallback.
+    async fn group_ids_for_force_rejoin_cleanup(&self, convo_id: &str) -> Vec<Vec<u8>> {
+        let local_candidates = {
+            let states = self.group_states().lock().await;
+            states
+                .values()
+                .filter(|state| state.conversation_id == convo_id)
+                .map(|state| state.group_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // Distinct MLS groups do not share an epoch space, so no single
+        // candidate can be selected by comparing epochs. Snapshot every
+        // context-resident group explicitly bound to this conversation.
+        let mut materialized = Vec::new();
+        for group_id_hex in local_candidates {
+            let Ok(group_id_bytes) = hex::decode(group_id_hex) else {
+                continue;
+            };
+            if self.mls_context().group_exists(group_id_bytes.clone())
+                && !materialized.contains(&group_id_bytes)
+            {
+                materialized.push(group_id_bytes);
+            }
+        }
+        if let Some(authoritative) = self.group_id_bytes_for_conversation(convo_id).await {
+            if self.mls_context().group_exists(authoritative.clone())
+                && !materialized.contains(&authoritative)
+            {
+                materialized.push(authoritative);
+            }
+        }
+        materialized
+    }
+
+    /// Snapshot every MLS group whose local secrets must be gone before a
+    /// local conversation delete may clear reset authority or its durable
+    /// conversation mapping.
+    pub(crate) async fn snapshot_local_delete_groups(
+        &self,
+        convo_id: &str,
+        captured_group_ids: &[String],
+        captured_group_state_keys: &[String],
+    ) -> Result<LocalDeleteSnapshot> {
+        let reset_pending = self.reset_pending_payload_result(convo_id).await?;
+        let mut group_ids = BTreeSet::new();
+        let mut group_state_keys = BTreeSet::new();
+
+        group_ids.extend(captured_group_ids.iter().cloned());
+        group_state_keys.extend(captured_group_state_keys.iter().cloned());
+        if let Some(pending) = reset_pending.as_ref() {
+            group_ids.insert(pending.new_group_id.clone());
+        }
+        if let Some(view) = self.conversations().lock().await.get(convo_id).cloned() {
+            group_ids.insert(view.group_id);
+        }
+
+        let user_did = self.cleanup_user_did().await?;
+        if let Some(view) = self.storage().get_conversation(&user_did, convo_id).await? {
+            group_ids.insert(view.group_id);
+        }
+
+        // On startup the in-memory group-state cache is intentionally empty.
+        // Enumerate the reopened MLS database and re-associate each group via
+        // its durable GroupState so every predecessor captured before the
+        // crash remains discoverable. Enumeration failure is security
+        // relevant and propagates closed.
+        for local_group_id in self.mls_context().list_local_group_ids()? {
+            let local_group_id_hex = hex::encode(&local_group_id);
+            if let Some(state) = self.storage().get_group_state(&local_group_id_hex).await? {
+                if state.conversation_id == convo_id {
+                    group_state_keys.insert(local_group_id_hex);
+                    group_ids.insert(state.group_id);
+                }
+            }
+        }
+
+        {
+            let states = self.group_states().lock().await;
+            for (key, state) in states
+                .iter()
+                .filter(|(_, state)| state.conversation_id == convo_id)
+            {
+                group_state_keys.insert(key.clone());
+                group_ids.insert(state.group_id.clone());
+            }
+        }
+
+        let mut decoded_group_ids = Vec::with_capacity(group_ids.len());
+        for group_id in group_ids {
+            let decoded = hex::decode(&group_id).map_err(|error| {
+                OrchestratorError::InvalidInput(format!(
+                    "local delete discovered malformed MLS group id {group_id}: {error}"
+                ))
+            })?;
+            if !decoded_group_ids.contains(&decoded) {
+                decoded_group_ids.push(decoded);
+            }
+        }
+
+        Ok(LocalDeleteSnapshot {
+            group_ids: decoded_group_ids,
+            group_state_keys: group_state_keys.into_iter().collect(),
+            reset_pending,
+        })
     }
 
     pub(crate) async fn local_group_epoch(&self, convo_id: &str) -> Option<u64> {
@@ -1701,20 +2225,15 @@ where
     ) -> Result<()> {
         self.check_shutdown().await?;
 
-        // Resolve the group id from the conversation id. NOTE: this returns
-        // `Option`, NOT `Result` — `None` means this device has no local MLS
-        // state for the group, so it cannot seal a Welcome. Map it to a typed
-        // unfulfillable-here error so Swift stops retrying. We deliberately do
-        // NOT fall back to treating `convo_id` as a raw hex group id (the way
-        // `add_members` does), because that would hide the signal Swift needs.
-        let group_id = match self.group_id_hex_for_conversation(convo_id).await {
-            Some(g) => g,
-            None => {
+        let resolved = match self.resolve_conversation_context(convo_id).await {
+            Ok(resolved) => resolved,
+            Err(_) => {
                 return Err(OrchestratorError::RecoveryFailed(format!(
                     "convo {convo_id} not present in local MLS group state"
                 )))
             }
         };
+        let group_id = resolved.group_id.clone();
 
         let recipient_user_did =
             super::credential_binding::credential_root_did(recipient_device_did).to_string();
@@ -1760,7 +2279,7 @@ where
             &[recipient_user_did.clone()],
             &key_packages,
             "respond_to_welcome_reissue",
-            Some(&group_id),
+            Some(&resolved.conversation_id),
         )
         .await;
         let kp_data: Vec<crate::KeyPackageData> = key_packages
@@ -1771,8 +2290,9 @@ where
             .collect();
 
         let plan = self
-            .stage_commit(
-                &group_id,
+            .stage_commit_for_group(
+                &resolved.conversation_id,
+                &resolved.group_id,
                 CommitKind::SwapMembers {
                     remove_dids: remove_dids.clone(),
                     add_dids: vec![recipient_user_did.clone()],
@@ -1830,17 +2350,18 @@ where
     /// Best-effort helper that returns the hex-encoded epoch_authenticator for
     /// the group currently bound to `convo_id`.
     ///
-    /// Walks the orchestrator's `group_states` cache first so that post-reset
-    /// conversations (where `convo_id != group_id_hex`) resolve correctly;
-    /// falls back to `hex::decode(convo_id)` for never-reset groups.
+    /// Resolves through the authoritative stable-conversation mapping before
+    /// asking the MLS context for the active group's authenticator.
     /// Returns `None` if the context can't produce an authenticator (platform
     /// default stub, missing group, or remote-data error) so the caller can
     /// pass the original pre-A7 `None` payload.
-    pub(crate) fn epoch_authenticator_hex(&self, convo_id: &str) -> Option<String> {
+    pub(crate) async fn epoch_authenticator_hex(&self, convo_id: &str) -> Option<String> {
         let group_id_bytes = self
-            .cached_group_id_hex_for_conversation(convo_id)
-            .and_then(|group_id| hex::decode(group_id).ok())
-            .or_else(|| hex::decode(convo_id).ok())?;
+            .resolve_conversation_context(convo_id)
+            .await
+            .ok()?
+            .group_id_bytes()
+            .ok()?;
 
         self.mls_context()
             .epoch_authenticator(group_id_bytes)
@@ -1911,15 +2432,14 @@ where
         };
 
         // GroupInfo fetched successfully — now delete old local group state.
-        // Prefer the currently-bound group id from `group_states` so that
-        // post-reset conversations (convo_id != group_id_hex) delete the
-        // *old* local group rather than whatever hex::decode(convo_id)
-        // happens to produce. Fall back to the convo_id bytes for never-
-        // reset groups where the two are identical.
-        let old_group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await;
-        if let Some(bytes) = old_group_id_bytes {
-            let _ = self.mls_context().delete_group(bytes);
-        }
+        // Prefer a locally materialized group bound to this stable conversation;
+        // the authoritative mapping may already name an as-yet-unjoined reset
+        // target. Fall back to authoritative resolution without interpreting
+        // the stable ID as MLS group bytes.
+        delete_materialized_force_rejoin_groups(
+            self.group_ids_for_force_rejoin_cleanup(convo_id).await,
+            |group_id| self.mls_context().delete_group(group_id),
+        )?;
 
         // Create External Commit
         let identity_bytes = user_did.as_bytes().to_vec();
@@ -1943,7 +2463,7 @@ where
                     // a `remote_data_error` is by definition Mode B (the
                     // server-side ratchet/GroupInfo is malformed), so this
                     // report SHOULD count toward server-side quorum auto-reset.
-                    let authenticator = self.epoch_authenticator_hex(convo_id);
+                    let authenticator = self.epoch_authenticator_hex(convo_id).await;
                     if let Err(report_err) = self
                         .api_client()
                         .report_recovery_failure(
@@ -2037,14 +2557,18 @@ where
             })?;
 
         // Cleanup old epoch secrets after External Commit rejoin
-        self.cleanup_epoch_secrets_if_needed(convo_id, merged).await;
+        let merged_group_id = hex::encode(&ext_commit_result.group_id);
+        self.cleanup_epoch_secrets_if_needed(convo_id, &merged_group_id, merged)
+            .await;
 
         // Update group state (insert if missing, persist to storage)
         let new_group_id_hex = hex::encode(&ext_commit_result.group_id);
         {
             let mut states = self.group_states().lock().await;
+            states
+                .retain(|key, state| key == &new_group_id_hex || state.conversation_id != convo_id);
             let state = states
-                .entry(convo_id.to_string())
+                .entry(new_group_id_hex.clone())
                 .or_insert_with(|| GroupState {
                     group_id: new_group_id_hex.clone(),
                     conversation_id: convo_id.to_string(),
@@ -2171,7 +2695,7 @@ where
     /// whole point is that the client has already given up locally, so failing
     /// the report call serves no recovery purpose.
     pub async fn report_unrecoverable_local(&self, convo_id: &str, reason: &str) {
-        let authenticator = self.epoch_authenticator_hex(convo_id);
+        let authenticator = self.epoch_authenticator_hex(convo_id).await;
         // ADR-008 D1 (spec §8.6.1): default classification by failureType.
         // Callers with richer context can use a more specific path below.
         let failure_mode = match reason {
@@ -2237,6 +2761,15 @@ where
             Err(_) => {
                 tracing::info!(convo_id, "Force rejoin already in-flight, waiting");
                 let _wait_guard = rejoin_lock.lock().await;
+                match self.reset_pending_payload_result(convo_id).await {
+                    Ok(Some(_)) => {
+                        return Err(OrchestratorError::RecoveryFailed(format!(
+                            "ResetPending is authoritative for {convo_id}; use join_or_rejoin"
+                        )));
+                    }
+                    Ok(None) => {}
+                    Err(err) => return Err(err),
+                }
                 return if self.local_group_epoch(convo_id).await.is_some() {
                     Ok(())
                 } else {
@@ -2247,11 +2780,28 @@ where
             }
         };
 
+        // A server-directed reset owns recovery while ResetPending is durable.
+        // Direct Rust callers must not bypass join_or_rejoin's reset-aware
+        // completion path and clear the reset's rejoin route via External Commit.
+        if self.reset_pending_payload_result(convo_id).await?.is_some() {
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "ResetPending is authoritative for {convo_id}; use join_or_rejoin"
+            )));
+        }
+
         self.enforce_rejoin_backoff(convo_id).await?;
 
         let result = self.force_rejoin_unlocked(convo_id, &user_did).await;
         match result {
             Ok(()) => {
+                if !self
+                    .project_non_reset_state_locked(convo_id, ConversationState::Active)
+                    .await?
+                {
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "ResetPending remains authoritative after force rejoin for {convo_id}"
+                    )));
+                }
                 self.clear_rejoin_failures(convo_id).await;
                 Ok(())
             }
@@ -2304,6 +2854,11 @@ where
             Err(_) => {
                 tracing::info!(convo_id, "Join/rejoin already in-flight, waiting");
                 let _wait_guard = rejoin_lock.lock().await;
+                if self.reset_pending_payload_result(convo_id).await?.is_some() {
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "ResetPending remains authoritative for {convo_id}"
+                    )));
+                }
                 return self.local_group_epoch(convo_id).await.ok_or_else(|| {
                     OrchestratorError::RecoveryFailed(format!(
                         "Concurrent join/rejoin did not restore group {convo_id}"
@@ -2311,6 +2866,27 @@ where
                 });
             }
         };
+
+        let epoch = self.join_or_rejoin_locked(convo_id, user_did).await?;
+        if !self
+            .project_non_reset_state_locked(convo_id, ConversationState::Active)
+            .await?
+        {
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "ResetPending remains authoritative after recovery for {convo_id}"
+            )));
+        }
+        Ok(epoch)
+    }
+
+    /// Recovery body for callers that already own the transition lock.
+    async fn join_or_rejoin_locked(&self, convo_id: &str, user_did: String) -> Result<u64> {
+        // Durable reset state is the first recovery authority consulted. A
+        // locally materialized group can be a bootstrap candidate whose
+        // completion response was ambiguous, so local health alone must never
+        // clear Active/rejoin state while ResetPending exists or cannot be
+        // read.
+        let reset_authority_at_start = self.reset_pending_payload_result(convo_id).await?;
 
         // P0.1 (epoch-inflation remediation): authorization-layer chokepoint.
         // EVERY recovery surface funnels through join_or_rejoin — convo-open
@@ -2325,7 +2901,11 @@ where
         // surface-by-surface, is the durable fix. The self-membership gate means
         // a genuinely leaf-lost / absent-local member still falls through to the
         // real Welcome/EC recovery below, so this cannot strand anyone.
-        if self.clear_needs_rejoin_if_locally_healthy(convo_id).await {
+        if reset_authority_at_start.is_none()
+            && self
+                .clear_needs_rejoin_if_locally_healthy_unlocked(convo_id)
+                .await
+        {
             let epoch = self.local_group_epoch(convo_id).await.unwrap_or(0);
             crate::warn_log!(
                 "[REJOIN-DIAG] convo={} join_or_rejoin SHORT-CIRCUIT: local group already healthy (epoch={}) — NO Welcome/ExternalCommit",
@@ -2380,18 +2960,95 @@ where
 
                 match welcome_result {
                     Ok(result) => {
-                        let epoch = self
-                            .mls_context()
-                            .get_epoch(result.group_id.clone())
-                            .unwrap_or(0);
+                        let current_reset_authority =
+                            self.reset_pending_payload_result(convo_id).await?;
+                        let epoch = if let Some(payload) = current_reset_authority.as_ref() {
+                            let expected_group =
+                                hex::decode(&payload.new_group_id).map_err(|e| {
+                                    OrchestratorError::InvalidInput(format!(
+                                        "ResetPending target is invalid hex: {e}"
+                                    ))
+                                })?;
+                            if result.group_id != expected_group {
+                                let welcome_group_id = hex::encode(&result.group_id);
+                                let authoritative =
+                                    self.fetch_conversation_for_convo(convo_id).await;
+                                match authoritative {
+                                    Ok(conversation)
+                                        if conversation.conversation_id == convo_id
+                                            && conversation.group_id == welcome_group_id => {}
+                                    Ok(conversation) => {
+                                        let _ = self
+                                            .mls_context()
+                                            .delete_group(result.group_id.clone());
+                                        return Err(
+                                            OrchestratorError::ResetCompletionNotCommitted {
+                                                convo_id: convo_id.to_string(),
+                                                reset_generation: payload.reset_generation,
+                                                reason: format!(
+                                                    "processed Welcome group {welcome_group_id} does not match authoritative server mapping {}",
+                                                    conversation.group_id
+                                                ),
+                                            },
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let _ = self
+                                            .mls_context()
+                                            .delete_group(result.group_id.clone());
+                                        return Err(
+                                            OrchestratorError::ResetCompletionNotCommitted {
+                                                convo_id: convo_id.to_string(),
+                                                reset_generation: payload.reset_generation,
+                                                reason: format!(
+                                                    "processed Welcome winner could not be verified against the server mapping: {error}"
+                                                ),
+                                            },
+                                        );
+                                    }
+                                }
+                                let adopted_payload = self
+                                    .adopt_verified_welcome_reset_target(
+                                        convo_id,
+                                        payload,
+                                        &welcome_group_id,
+                                    )
+                                    .await?;
+                                self.complete_reset_recovery(
+                                    convo_id,
+                                    &adopted_payload,
+                                    result.group_id.clone(),
+                                    false,
+                                )
+                                .await?
+                            } else {
+                                self.complete_reset_recovery(
+                                    convo_id,
+                                    payload,
+                                    result.group_id.clone(),
+                                    true,
+                                )
+                                .await?
+                            }
+                        } else {
+                            // Legacy non-reset Welcome joins retain their
+                            // historical epoch fallback. Reset completion above
+                            // is generation-bound and always fails closed.
+                            self.mls_context()
+                                .get_epoch(result.group_id.clone())
+                                .unwrap_or(0)
+                        };
 
                         // Update group state
                         let welcome_group_id_hex = hex::encode(&result.group_id);
                         {
                             let mut states = self.group_states().lock().await;
+                            states.retain(|key, state| {
+                                key == &welcome_group_id_hex || state.conversation_id != convo_id
+                            });
                             let state =
                                 states
-                                    .entry(convo_id.to_string())
+                                    .entry(welcome_group_id_hex.clone())
                                     .or_insert_with(|| GroupState {
                                         group_id: welcome_group_id_hex.clone(),
                                         conversation_id: convo_id.to_string(),
@@ -2407,9 +3064,12 @@ where
                             }
                         }
 
-                        // Clear rejoin flag
-                        if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
-                            tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag after Welcome join");
+                        // Outside reset recovery there is no generation-bound
+                        // completion transaction, so retain the legacy clear.
+                        if current_reset_authority.is_none() {
+                            if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
+                                tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag after Welcome join");
+                            }
                         }
                         self.clear_rejoin_failures(convo_id).await;
 
@@ -2542,7 +3202,10 @@ where
         // or two sync cycles (one winner, others see AlreadyBootstrapped 409 →
         // Welcome on the next pass).
         if welcome_unavailable_expected {
-            if let Some(payload) = self.reset_pending_payload(convo_id).await {
+            // Reset persistence is the recovery authority. If it cannot be
+            // read, fail closed instead of treating that failure as “not
+            // pending” and falling through to an unauthorized External Commit.
+            if let Some(payload) = self.reset_pending_payload_result(convo_id).await? {
                 tracing::info!(
                     convo_id,
                     new_group_id = %payload.new_group_id,
@@ -2577,23 +3240,40 @@ where
                         );
                         return Err(boot_err);
                     }
+                    Err(boot_err) if boot_err.is_reset_completion_not_committed() => {
+                        // The server accepted this bootstrap, but a newer
+                        // ResetPending generation won the local storage CAS.
+                        // Retry that authority on the next sync pass; never
+                        // fall through to External Commit for the stale one.
+                        return Err(boot_err);
+                    }
                     Err(boot_err) => {
-                        // Other bootstrap error (network, auth, malformed
-                        // GroupInfo export, etc.). Local pre-bootstrap group
-                        // was already dropped inside try_first_responder_bootstrap.
-                        // Fall through to External Commit so we still get a
-                        // chance to recover via the legacy path.
+                        // ResetPending is durable authority. Any bootstrap
+                        // uncertainty must remain on this path; treating it as
+                        // authorization for legacy External Commit can mutate
+                        // the wrong reset generation.
                         tracing::warn!(
                             convo_id,
                             bootstrap_error = %boot_err,
-                            "first-responder bootstrap failed (non-409); falling back to External Commit"
+                            "first-responder bootstrap failed; preserving ResetPending (no External Commit fallback)"
                         );
+                        return Err(boot_err);
                     }
                 }
             }
         }
 
         // Step 3: External Commit fallback (gated by enforce_rejoin_backoff).
+        // Re-read immediately before authorizing EC: a non-404 Welcome error
+        // skips bootstrap, and another process may also have published reset
+        // authority since the entry snapshot. Either case must fail closed.
+        if let Some(pending) = self.reset_pending_payload_result(convo_id).await? {
+            return Err(OrchestratorError::ResetCompletionNotCommitted {
+                convo_id: convo_id.to_string(),
+                reset_generation: pending.reset_generation,
+                reason: "ResetPending authority prohibits External Commit fallback".to_string(),
+            });
+        }
         //
         // Bootstrap was tried above when applicable; this path is for:
         //   - never-joined convos (state != ResetPending)
@@ -2776,6 +3456,8 @@ where
         reset_generation: i32,
     ) -> Result<ResetRecordOutcome> {
         self.check_shutdown().await?;
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
         let new_group_id_hex = hex::encode(&new_group_id);
         tracing::info!(
             convo_id,
@@ -2783,20 +3465,12 @@ where
             reset_generation,
             "Recording server-initiated GroupReset (deferred adoption)"
         );
-        if self
-            .reset_target_is_current_existing_group(convo_id, &new_group_id_hex)
-            .await
-        {
-            tracing::info!(
-                convo_id,
-                new_group_id = %new_group_id_hex,
-                reset_generation,
-                "GroupResetEvent: target already matches an existing local group, self-echo no-op"
-            );
-            return Ok(ResetRecordOutcome::SelfEchoNoOp);
-        }
-        if let Some(existing) = self.reset_pending_payload(convo_id).await {
-            if existing.reset_generation >= reset_generation {
+        let existing_pending = self.reset_pending_payload_result(convo_id).await?;
+        if let Some(existing) = existing_pending.as_ref() {
+            if existing.reset_generation > reset_generation
+                || (existing.reset_generation == reset_generation
+                    && existing.new_group_id != new_group_id_hex)
+            {
                 tracing::info!(
                     convo_id,
                     existing_reset_generation = existing.reset_generation,
@@ -2807,6 +3481,16 @@ where
                 );
                 return Ok(ResetRecordOutcome::StaleOrDuplicate);
             }
+            if existing.reset_generation == reset_generation {
+                self.persist_reset_pending_state(
+                    convo_id,
+                    &new_group_id_hex,
+                    reset_generation,
+                    Some(existing.clone()),
+                )
+                .await?;
+                return Ok(ResetRecordOutcome::StaleOrDuplicate);
+            }
             tracing::info!(
                 convo_id,
                 old_reset_generation = existing.reset_generation,
@@ -2814,7 +3498,20 @@ where
                 "GroupResetEvent: superseding existing ResetPending at newer generation"
             );
         }
-        self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation)
+        if existing_pending.is_none()
+            && self
+                .reset_target_is_current_existing_group(convo_id, &new_group_id_hex)
+                .await
+        {
+            tracing::info!(
+                convo_id,
+                new_group_id = %new_group_id_hex,
+                reset_generation,
+                "GroupResetEvent: target already matches an existing local group, self-echo no-op"
+            );
+            return Ok(ResetRecordOutcome::SelfEchoNoOp);
+        }
+        self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation, None)
             .await?;
         Ok(ResetRecordOutcome::Recorded)
     }
@@ -2912,12 +3609,15 @@ where
         expected_new_mls_group_id: Option<String>,
     ) -> Result<ResetRecordOutcome> {
         self.check_shutdown().await?;
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
 
         // Idempotency/stale check: if we're already in ResetPending at this
         // generation or newer, drop the duplicate/stale replay before it can
         // overwrite the current target group or delete the current local group.
-        if let Some(existing) = self.reset_pending_payload(convo_id).await {
-            if existing.reset_generation >= reset_generation {
+        let existing_pending = self.reset_pending_payload_result(convo_id).await?;
+        if let Some(existing) = existing_pending.as_ref() {
+            if existing.reset_generation > reset_generation {
                 tracing::info!(
                     convo_id,
                     crypto_session_id,
@@ -2928,6 +3628,16 @@ where
                     existing_new_group_id = %existing.new_group_id,
                     "resetRequestedEvent: stale or duplicate generation, no-op"
                 );
+                return Ok(ResetRecordOutcome::StaleOrDuplicate);
+            }
+            if existing.reset_generation == reset_generation {
+                self.persist_reset_pending_state(
+                    convo_id,
+                    &existing.new_group_id,
+                    reset_generation,
+                    Some(existing.clone()),
+                )
+                .await?;
                 return Ok(ResetRecordOutcome::StaleOrDuplicate);
             }
             tracing::info!(
@@ -2972,9 +3682,10 @@ where
             }
         };
 
-        if self
-            .reset_target_is_current_existing_group(convo_id, &new_group_id_hex)
-            .await
+        if existing_pending.is_none()
+            && self
+                .reset_target_is_current_existing_group(convo_id, &new_group_id_hex)
+                .await
         {
             tracing::info!(
                 convo_id,
@@ -2988,7 +3699,7 @@ where
             return Ok(ResetRecordOutcome::SelfEchoNoOp);
         }
 
-        self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation)
+        self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation, None)
             .await?;
         Ok(ResetRecordOutcome::Recorded)
     }
@@ -3020,67 +3731,149 @@ where
         convo_id: &str,
         new_group_id_hex: &str,
         reset_generation: i32,
+        committed: Option<ResetPendingPayload>,
     ) -> Result<()> {
-        let notified_at_ms = chrono::Utc::now().timestamp_millis();
-
-        // 1. Transition to ResetPending + persist the payload.
-        {
-            let mut states = self.conversation_states().lock().await;
-            states.insert(
-                convo_id.to_string(),
-                ConversationState::ResetPending {
-                    new_group_id: new_group_id_hex.to_string(),
-                    reset_generation,
-                    notified_at_ms,
-                },
-            );
-        }
-        if let Err(e) = self
-            .storage()
-            .set_conversation_state(
-                convo_id,
-                ConversationState::ResetPending {
-                    new_group_id: new_group_id_hex.to_string(),
-                    reset_generation,
-                    notified_at_ms,
-                },
-            )
-            .await
-        {
-            // WS-5.2: the persisted ResetPending payload is the sole
-            // cross-restart carrier of the first-responder bootstrap gate —
-            // a dropped write here silently cancels Phase 1 recovery after
-            // restart. Escalate like the matching `clear_reset_pending`.
-            self.report_recovery_storage_failure(
-                convo_id,
-                "set_conversation_state:reset_pending",
-                &e,
-            )
-            .await;
-        }
-        if let Err(e) = self
-            .storage()
-            .mark_reset_pending(convo_id, new_group_id_hex, reset_generation, notified_at_ms)
-            .await
-        {
-            self.report_recovery_storage_failure(convo_id, "mark_reset_pending", &e)
-                .await;
-        }
-
-        // 2. Delete the old local MLS group. Prefer group_states lookup; fall
-        // back to hex::decode(convo_id) for never-reset groups.
-        let old_group_id_bytes = self.group_id_bytes_for_conversation(convo_id).await;
-        if let Some(bytes) = old_group_id_bytes {
-            if let Err(e) = self.mls_context().delete_group(bytes) {
-                // Non-fatal: the group may already be gone if a previous reset
-                // attempt partially completed.
-                tracing::warn!(
-                    convo_id,
-                    error = %e,
-                    "delete_group for pre-reset group failed (non-fatal)"
-                );
+        let resuming_committed_generation = committed.is_some();
+        let notified_at_ms = committed
+            .as_ref()
+            .map(|payload| payload.notified_at_ms)
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+        // Resolve the pre-transition authority before publishing ResetPending.
+        // Once the pending payload is visible, normal resolution intentionally
+        // selects the new target and must never be used to choose the group to
+        // delete.
+        let mut old_group_ids: Vec<Vec<u8>> = {
+            let states = self.group_states().lock().await;
+            states
+                .values()
+                .filter(|state| {
+                    state.conversation_id == convo_id
+                        && (!resuming_committed_generation || state.group_id != new_group_id_hex)
+                })
+                .filter_map(|state| hex::decode(&state.group_id).ok())
+                .filter(|group_id| self.mls_context().group_exists(group_id.clone()))
+                .collect()
+        };
+        if committed.is_none() {
+            let old_context = self.resolve_conversation_context(convo_id).await?;
+            if old_context.group_id != new_group_id_hex || !resuming_committed_generation {
+                if let Ok(group_id) = old_context.group_id_bytes() {
+                    if self.mls_context().group_exists(group_id.clone()) {
+                        old_group_ids.push(group_id);
+                    }
+                }
+            }
+        } else {
+            let user_did = self.require_user_did().await?;
+            if let Some(view) = self.storage().get_conversation(&user_did, convo_id).await? {
+                if view.group_id != new_group_id_hex {
+                    if let Ok(group_id) = hex::decode(&view.group_id) {
+                        if self.mls_context().group_exists(group_id.clone()) {
+                            old_group_ids.push(group_id);
+                        }
+                    }
+                }
             }
         }
+        old_group_ids.sort();
+        old_group_ids.dedup();
+        let reset_state = ConversationState::ResetPending {
+            new_group_id: new_group_id_hex.to_string(),
+            reset_generation,
+            notified_at_ms,
+        };
+
+        // 1. `mark_reset_pending` is the sole atomic authority-publication
+        // operation: backends commit tag + complete payload together and
+        // reject stale generations. There is deliberately no preparatory tag
+        // write and no rollback. A callback error is ambiguous (the commit may
+        // have succeeded before its response was lost), so re-read durable
+        // authority and continue only when the exact tuple is observable.
+        let durable_state = if let Some(committed) = committed {
+            ConversationState::ResetPending {
+                new_group_id: committed.new_group_id,
+                reset_generation: committed.reset_generation,
+                notified_at_ms: committed.notified_at_ms,
+            }
+        } else {
+            match self
+                .storage()
+                .mark_reset_pending(convo_id, new_group_id_hex, reset_generation, notified_at_ms)
+                .await
+            {
+                Ok(()) => reset_state.clone(),
+                Err(mark_error) => match self.storage().get_conversation_state(convo_id).await {
+                    Ok(Some(ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation: durable_generation,
+                        notified_at_ms: durable_notified_at_ms,
+                    })) if durable_generation == reset_generation
+                        && new_group_id == new_group_id_hex
+                        && durable_notified_at_ms == notified_at_ms =>
+                    {
+                        ConversationState::ResetPending {
+                            new_group_id,
+                            reset_generation: durable_generation,
+                            notified_at_ms: durable_notified_at_ms,
+                        }
+                    }
+                    Ok(Some(ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation: durable_generation,
+                        notified_at_ms: durable_notified_at_ms,
+                    })) if durable_generation > reset_generation => {
+                        self.conversation_states().lock().await.insert(
+                            convo_id.to_string(),
+                            ConversationState::ResetPending {
+                                new_group_id,
+                                reset_generation: durable_generation,
+                                notified_at_ms: durable_notified_at_ms,
+                            },
+                        );
+                        return Err(OrchestratorError::ResetCompletionNotCommitted {
+                        convo_id: convo_id.to_string(),
+                        reset_generation,
+                        reason: format!(
+                            "mark response failed and newer durable generation {durable_generation} owns authority"
+                        ),
+                    });
+                    }
+                    Ok(_) => {
+                        self.report_recovery_storage_failure(
+                            convo_id,
+                            "mark_reset_pending",
+                            &mark_error,
+                        )
+                        .await;
+                        return Err(mark_error);
+                    }
+                    Err(read_error) => {
+                        self.report_recovery_storage_failure(
+                            convo_id,
+                            "mark_reset_pending:ambiguous_read",
+                            &read_error,
+                        )
+                        .await;
+                        return Err(OrchestratorError::Storage(format!(
+                        "mark_reset_pending response failed ({mark_error}); durable authority reread failed ({read_error})"
+                    )));
+                    }
+                },
+            }
+        };
+        self.conversation_states()
+            .lock()
+            .await
+            .insert(convo_id.to_string(), durable_state);
+        if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
+            view.group_id = new_group_id_hex.to_string();
+            view.epoch = 0;
+        }
+
+        // 2. Delete the old local MLS group through the authoritative mapping.
+        delete_materialized_reset_predecessors(old_group_ids, |group_id| {
+            self.mls_context().delete_group(group_id)
+        })?;
 
         // 3. Clear any in-flight rejoin bookkeeping — server reset is a fresh
         // start, not a continuation of our attempt counter. Crucially, this
@@ -3122,14 +3915,15 @@ where
         self.groupinfo_404_tracker().lock().await.clear(convo_id);
 
         // 4. Update group_states to point at the new group id so that any
-        // group-id-derived lookups (including the one inside
-        // force_rejoin_unlocked) see the new target. Also flag `needs_rejoin`
-        // so the deferred-recovery loop in `sync_with_server` picks the
-        // conversation up on the next pass.
+        // group-id-derived lookups see the new target. `mark_reset_pending`
+        // already armed durable `needs_rejoin` in the authority transaction,
+        // so a crash at any point after publication remains restart-routable.
         {
             let mut states = self.group_states().lock().await;
+            states
+                .retain(|key, state| key == new_group_id_hex || state.conversation_id != convo_id);
             let entry = states
-                .entry(convo_id.to_string())
+                .entry(new_group_id_hex.to_string())
                 .or_insert_with(|| GroupState {
                     group_id: new_group_id_hex.to_string(),
                     conversation_id: convo_id.to_string(),
@@ -3148,10 +3942,6 @@ where
                 );
             }
         }
-        // WS-5.2: the needs_rejoin flag is what routes this conversation into
-        // the deferred-recovery loop — escalate a dropped write.
-        self.mark_needs_rejoin_critical(convo_id).await;
-
         Ok(())
     }
 
@@ -3209,55 +3999,290 @@ where
             .await
     }
 
-    /// Snapshot of the `ResetPending` payload for a conversation, or `None`
-    /// if the conversation is not in that state. Used by `join_or_rejoin`'s
-    /// bootstrap gate.
-    ///
-    /// Reads the in-memory `conversation_states` map first, then falls back
-    /// to storage. The fallback covers two production scenarios:
-    ///
-    /// 1. **Cold-start race.** `MLSOrchestrator::initialize` rehydrates
-    ///    persisted state into the in-memory map at startup, but a
-    ///    `groupResetEvent` arriving during that window can land in storage
-    ///    before the in-memory map is rehydrated.
-    /// 2. **Platform WS/SSE handlers that persist without updating the
-    ///    in-memory map.** catmos's `websocket.rs` writes
-    ///    `set_conversation_state(ResetPending{..})` + `mark_reset_pending`
-    ///    on a `groupResetEvent` but cannot reach into the orchestrator's
-    ///    `conversation_states` mutex (workspace-internal surface). Storage
-    ///    fallback closes the gap without forcing every platform to migrate
-    ///    to `record_group_reset` simultaneously.
-    pub(crate) async fn reset_pending_payload(
+    /// Read the durable ResetPending authority and refresh its in-memory
+    /// projection. Callers must propagate read failures; collapsing them to
+    /// `None` can authorize a stale recovery or delete path.
+    pub(crate) async fn reset_pending_payload_result(
         &self,
         convo_id: &str,
-    ) -> Option<ResetPendingPayload> {
-        {
-            let states = self.conversation_states().lock().await;
-            if let Some(ConversationState::ResetPending {
+    ) -> Result<Option<ResetPendingPayload>> {
+        match self.storage().get_conversation_state(convo_id).await? {
+            Some(ConversationState::ResetPending {
                 new_group_id,
                 reset_generation,
                 notified_at_ms,
-            }) = states.get(convo_id)
-            {
-                return Some(ResetPendingPayload {
+            }) => {
+                let mut states = self.conversation_states().lock().await;
+                if let Some(ConversationState::ResetPending {
+                    new_group_id: cached_group_id,
+                    reset_generation: cached_generation,
+                    notified_at_ms: cached_notified_at_ms,
+                }) = states.get(convo_id)
+                {
+                    if *cached_generation > reset_generation
+                        || (*cached_generation == reset_generation
+                            && cached_group_id != &new_group_id)
+                    {
+                        return Ok(Some(ResetPendingPayload {
+                            new_group_id: cached_group_id.clone(),
+                            reset_generation: *cached_generation,
+                            notified_at_ms: *cached_notified_at_ms,
+                        }));
+                    }
+                }
+                let payload = ResetPendingPayload {
                     new_group_id: new_group_id.clone(),
-                    reset_generation: *reset_generation,
-                    notified_at_ms: *notified_at_ms,
+                    reset_generation,
+                    notified_at_ms,
+                };
+                states.insert(
+                    convo_id.to_string(),
+                    ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation,
+                        notified_at_ms,
+                    },
+                );
+                Ok(Some(payload))
+            }
+            // ResetPending is monotonic in memory. A stale None/non-reset read
+            // must never downgrade it; only exact completion CAS or explicit
+            // delete authority clears the projection.
+            Some(_) | None => {
+                let states = self.conversation_states().lock().await;
+                Ok(match states.get(convo_id) {
+                    Some(ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation,
+                        notified_at_ms,
+                    }) => Some(ResetPendingPayload {
+                        new_group_id: new_group_id.clone(),
+                        reset_generation: *reset_generation,
+                        notified_at_ms: *notified_at_ms,
+                    }),
+                    _ => None,
+                })
+            }
+        }
+    }
+
+    /// Commit one reset recovery result against the exact durable generation.
+    /// On a mismatch, refresh the newer authority and remove only the stale
+    /// materialized candidate. Callback errors remain ambiguous and therefore
+    /// preserve local material for a later durable reread.
+    async fn complete_reset_recovery(
+        &self,
+        convo_id: &str,
+        payload: &ResetPendingPayload,
+        completed_group_id: Vec<u8>,
+        delete_completed_group_on_mismatch: bool,
+    ) -> Result<u64> {
+        let landed_epoch = self
+            .mls_context()
+            .get_epoch(completed_group_id.clone())
+            .map_err(|error| OrchestratorError::ResetCompletionNotCommitted {
+                convo_id: convo_id.to_string(),
+                reset_generation: payload.reset_generation,
+                reason: format!("completed reset target epoch is unavailable: {error}"),
+            })?;
+        let cleared = match self
+            .storage()
+            .complete_reset_pending(
+                convo_id,
+                payload.reset_generation,
+                &payload.new_group_id,
+                landed_epoch,
+            )
+            .await
+        {
+            Ok(cleared) => cleared,
+            Err(error) => {
+                self.report_recovery_storage_failure(convo_id, "complete_reset_pending", &error)
+                    .await;
+                return Err(OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: error.to_string(),
+                });
+            }
+        };
+        if cleared {
+            // No I/O await is permitted between the durable CAS and these
+            // cache projections. A newer in-process reset projection must
+            // remain intact.
+            let project_completed_target = {
+                let mut states = self.conversation_states().lock().await;
+                if matches!(
+                    states.get(convo_id),
+                    Some(ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation,
+                        ..
+                    }) if *reset_generation == payload.reset_generation
+                        && new_group_id == &payload.new_group_id
+                ) {
+                    states.insert(convo_id.to_string(), ConversationState::Active);
+                    true
+                } else {
+                    false
+                }
+            };
+            if project_completed_target {
+                if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
+                    view.group_id = payload.new_group_id.clone();
+                    view.epoch = landed_epoch;
+                }
+            }
+            return Ok(landed_epoch);
+        }
+
+        let _latest_reset_authority =
+            self.reset_pending_payload_result(convo_id)
+                .await
+                .map_err(|error| OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: format!("generation mismatch and authority reload failed: {error}"),
+                })?;
+        if delete_completed_group_on_mismatch
+            && self.mls_context().group_exists(completed_group_id.clone())
+        {
+            self.mls_context()
+                .delete_group(completed_group_id)
+                .map_err(|error| OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: format!("stale completed group cleanup failed: {error}"),
+                })?;
+        }
+        Err(OrchestratorError::ResetCompletionNotCommitted {
+            convo_id: convo_id.to_string(),
+            reset_generation: payload.reset_generation,
+            reason: "a newer reset generation owns recovery authority".to_string(),
+        })
+    }
+
+    /// Adopt a server-verified reset winner without weakening ResetPending.
+    /// The caller owns the transition lock and has already bound the processed
+    /// Welcome group to the exact stable server conversation.
+    async fn adopt_verified_welcome_reset_target(
+        &self,
+        convo_id: &str,
+        payload: &ResetPendingPayload,
+        authoritative_new_target: &str,
+    ) -> Result<ResetPendingPayload> {
+        let adopt_result = self
+            .storage()
+            .adopt_reset_pending_target(
+                convo_id,
+                payload.reset_generation,
+                &payload.new_group_id,
+                authoritative_new_target,
+            )
+            .await;
+
+        let adopted = match adopt_result {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(error) => {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "adopt_reset_pending_target",
+                    &error,
+                )
+                .await;
+                false
+            }
+        };
+
+        // False and errors are commit-ambiguous: only an exact durable reread
+        // of the adopted generation/target may authorize loser cleanup and
+        // exact completion.
+        if !adopted {
+            let durable = self.storage().get_conversation_state(convo_id).await.map_err(
+                |error| OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: format!(
+                        "winner-target adoption was not confirmed and authority reread failed: {error}"
+                    ),
+                },
+            )?;
+            if !matches!(
+                durable,
+                Some(ConversationState::ResetPending {
+                    ref new_group_id,
+                    reset_generation,
+                    ..
+                }) if reset_generation == payload.reset_generation
+                    && new_group_id == authoritative_new_target
+            ) {
+                return Err(OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: "winner-target adoption lost to newer or competing reset authority"
+                        .to_string(),
                 });
             }
         }
-        match self.storage().get_conversation_state(convo_id).await {
-            Ok(Some(ConversationState::ResetPending {
-                new_group_id,
-                reset_generation,
-                notified_at_ms,
-            })) => Some(ResetPendingPayload {
-                new_group_id,
-                reset_generation,
-                notified_at_ms,
-            }),
-            _ => None,
+
+        let adopted_payload = ResetPendingPayload {
+            new_group_id: authoritative_new_target.to_string(),
+            reset_generation: payload.reset_generation,
+            notified_at_ms: payload.notified_at_ms,
+        };
+        {
+            let mut states = self.conversation_states().lock().await;
+            match states.get(convo_id) {
+                Some(ConversationState::ResetPending {
+                    reset_generation,
+                    new_group_id,
+                    ..
+                }) if *reset_generation == payload.reset_generation
+                    && (new_group_id == &payload.new_group_id
+                        || new_group_id == authoritative_new_target) =>
+                {
+                    states.insert(
+                        convo_id.to_string(),
+                        ConversationState::ResetPending {
+                            new_group_id: authoritative_new_target.to_string(),
+                            reset_generation: payload.reset_generation,
+                            notified_at_ms: payload.notified_at_ms,
+                        },
+                    );
+                }
+                _ => {
+                    return Err(OrchestratorError::ResetCompletionNotCommitted {
+                        convo_id: convo_id.to_string(),
+                        reset_generation: payload.reset_generation,
+                        reason: "in-memory reset authority changed during winner adoption"
+                            .to_string(),
+                    });
+                }
+            }
         }
+
+        if payload.new_group_id != authoritative_new_target {
+            let loser_group = hex::decode(&payload.new_group_id).map_err(|error| {
+                OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: format!("loser reset target is malformed: {error}"),
+                }
+            })?;
+            match self.mls_context().delete_group(loser_group) {
+                Ok(()) | Err(crate::MLSError::GroupNotFound { .. }) => {}
+                Err(error) => {
+                    return Err(OrchestratorError::ResetCompletionNotCommitted {
+                        convo_id: convo_id.to_string(),
+                        reset_generation: payload.reset_generation,
+                        reason: format!("failed to delete proven loser reset target: {error}"),
+                    });
+                }
+            }
+        }
+
+        Ok(adopted_payload)
     }
 
     /// First-responder bootstrap (spec §8.5 Phase 1).
@@ -3318,11 +4343,21 @@ where
         // 1. Create local MLS group AT the predetermined id.
         let identity_bytes = user_did.as_bytes().to_vec();
         let group_config = self.config().group_config.clone();
-        let _creation_result = self.mls_context().create_group_with_id(
-            identity_bytes.clone(),
-            new_group_id_bytes.clone(),
-            Some(group_config),
-        )?;
+        let resumed_existing_candidate =
+            self.mls_context().group_exists(new_group_id_bytes.clone());
+        if !resumed_existing_candidate {
+            let _creation_result = self.mls_context().create_group_with_id(
+                identity_bytes.clone(),
+                new_group_id_bytes.clone(),
+                Some(group_config),
+            )?;
+        } else {
+            tracing::info!(
+                convo_id,
+                reset_generation = payload.reset_generation,
+                "first-responder bootstrap: resuming existing local candidate"
+            );
+        }
 
         // 2. Export GroupInfo from the freshly-created group — required by
         // bootstrapResetGroup's lexicon `groupInfo` field. On failure, drop
@@ -3339,7 +4374,9 @@ where
                     error = %e,
                     "first-responder bootstrap: export_group_info failed; dropping local pre-bootstrap group"
                 );
-                let _ = self.mls_context().delete_group(new_group_id_bytes);
+                if !resumed_existing_candidate {
+                    let _ = self.mls_context().delete_group(new_group_id_bytes);
+                }
                 return Err(OrchestratorError::Mls(e));
             }
         };
@@ -3380,33 +4417,62 @@ where
                     reset_generation = payload.reset_generation,
                     "first-responder bootstrap won — clearing reset_pending"
                 );
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(convo_id.to_string(), ConversationState::Active);
-                if let Err(e) = self
-                    .storage()
-                    .set_conversation_state(convo_id, ConversationState::Active)
-                    .await
-                {
-                    tracing::warn!(error = %e, convo_id, "Failed to persist Active state after bootstrap win");
-                }
-                // A stale reset_pending row would re-trigger bootstrap on a
-                // later restart — escalate a dropped clear.
-                if let Err(e) = self.storage().clear_reset_pending(convo_id).await {
-                    self.report_recovery_storage_failure(convo_id, "clear_reset_pending", &e)
-                        .await;
-                }
-                if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
-                    tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag after bootstrap win");
-                }
                 let epoch = self
-                    .mls_context()
-                    .get_epoch(new_group_id_bytes)
-                    .unwrap_or(0);
+                    .complete_reset_recovery(convo_id, payload, new_group_id_bytes.clone(), true)
+                    .await?;
                 Ok(epoch)
             }
             Err(err) if err.is_bootstrap_already_bootstrapped() => {
+                let authoritative = self.fetch_conversation_for_convo(convo_id).await;
+                let authoritative_group_info = self.api_client().get_group_info(convo_id).await;
+                match (authoritative, authoritative_group_info) {
+                    (Ok(conversation), Ok(server_group_info))
+                        if conversation.group_id == payload.new_group_id
+                            && server_group_info == group_info =>
+                    {
+                        tracing::info!(
+                            convo_id,
+                            new_group_id = %payload.new_group_id,
+                            reset_generation = payload.reset_generation,
+                            resumed_existing_candidate,
+                            "AlreadyBootstrapped is bound to this accepted local candidate; resuming local reset completion"
+                        );
+                        let epoch = self
+                            .complete_reset_recovery(
+                                convo_id,
+                                payload,
+                                new_group_id_bytes.clone(),
+                                true,
+                            )
+                            .await?;
+                        return Ok(epoch);
+                    }
+                    (Ok(conversation), Ok(server_group_info)) => {
+                        tracing::info!(
+                            convo_id,
+                            local_group_id = %payload.new_group_id,
+                            authoritative_group_id = %conversation.group_id,
+                            group_info_matches = server_group_info == group_info,
+                            resumed_existing_candidate,
+                            "AlreadyBootstrapped is authoritatively bound to a different winner"
+                        );
+                    }
+                    (conversation_result, group_info_result) => {
+                        tracing::warn!(
+                            convo_id,
+                            conversation_error = ?conversation_result.err(),
+                            group_info_error = ?group_info_result.err(),
+                            resumed_existing_candidate,
+                            "Could not bind AlreadyBootstrapped to an authoritative winner; preserving local candidate"
+                        );
+                        return Err(OrchestratorError::ResetCompletionNotCommitted {
+                            convo_id: convo_id.to_string(),
+                            reset_generation: payload.reset_generation,
+                            reason: "AlreadyBootstrapped authority could not be verified"
+                                .to_string(),
+                        });
+                    }
+                }
                 tracing::info!(
                     convo_id,
                     new_group_id = %payload.new_group_id,
@@ -3433,7 +4499,12 @@ where
                     error = %err,
                     "first-responder bootstrap bootstrapResetGroup failed; dropping local group, will retry"
                 );
-                if let Err(e) = self.mls_context().delete_group(new_group_id_bytes) {
+                if resumed_existing_candidate {
+                    tracing::warn!(
+                        convo_id,
+                        "preserving resumed bootstrap candidate after uncertain server error"
+                    );
+                } else if let Err(e) = self.mls_context().delete_group(new_group_id_bytes) {
                     tracing::warn!(
                         convo_id,
                         error = %e,
@@ -3451,6 +4522,11 @@ where
     /// server's reset transaction. Bootstrap rarity (post-quorum-reset
     /// only) makes the network cost acceptable.
     async fn fetch_roster_for_convo(&self, convo_id: &str) -> Result<Vec<String>> {
+        let conversation = self.fetch_conversation_for_convo(convo_id).await?;
+        Ok(conversation.members.iter().map(|m| m.did.clone()).collect())
+    }
+
+    async fn fetch_conversation_for_convo(&self, convo_id: &str) -> Result<ConversationView> {
         let mut cursor: Option<String> = None;
         loop {
             let page = self
@@ -3459,7 +4535,7 @@ where
                 .await?;
             for cv in &page.conversations {
                 if cv.conversation_id == convo_id {
-                    return Ok(cv.members.iter().map(|m| m.did.clone()).collect());
+                    return Ok(cv.clone());
                 }
             }
             cursor = page.cursor;
@@ -3559,6 +4635,24 @@ where
         convo_id: &str,
         reason: crate::orchestrator::types::QuarantineReason,
     ) {
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let transition_guard = transition_lock.lock().await;
+        match self
+            .reset_blocks_non_reset_transition_locked(convo_id)
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(e) => {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "enter_quarantine:reset_authority_read",
+                    &e,
+                )
+                .await;
+                return;
+            }
+        }
         let since_ms = chrono::Utc::now().timestamp_millis();
         let suspected_dids = {
             let tracker = self.recovery_tracker().lock().await;
@@ -3579,23 +4673,14 @@ where
             self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
                 .await;
         }
-        {
-            let mut states = self.conversation_states().lock().await;
-            states.insert(
-                convo_id.to_string(),
-                ConversationState::Quarantined { reason, since_ms },
-            );
-        }
         // WS-5.2: quarantine state is recovery-critical — a dropped write
         // here means the quarantine silently does not survive restart and
         // the conversation re-enters the message flow until Layer 3 trips
         // again. Escalate like the backoff-row clear above.
+        let quarantine_state = ConversationState::Quarantined { reason, since_ms };
         if let Err(e) = self
             .storage()
-            .set_conversation_state(
-                convo_id,
-                ConversationState::Quarantined { reason, since_ms },
-            )
+            .set_conversation_state(convo_id, quarantine_state.clone())
             .await
         {
             self.report_recovery_storage_failure(
@@ -3604,6 +4689,11 @@ where
                 &e,
             )
             .await;
+        } else {
+            self.conversation_states()
+                .lock()
+                .await
+                .insert(convo_id.to_string(), quarantine_state);
         }
         if let Err(e) = self
             .storage()
@@ -3619,6 +4709,7 @@ where
             suspected_count = suspected_dids.len(),
             "[QUARANTINE-ENTER] conversation quarantined"
         );
+        drop(transition_guard);
         self.notify_quarantined(convo_id, reason, suspected_dids)
             .await;
     }
@@ -3629,6 +4720,23 @@ where
         convo_id: &str,
         via: crate::orchestrator::types::QuarantineExitReason,
     ) {
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let transition_guard = transition_lock.lock().await;
+        let reset_blocks_active = match self
+            .reset_blocks_non_reset_transition_locked(convo_id)
+            .await
+        {
+            Ok(blocked) => blocked,
+            Err(e) => {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "exit_quarantine:reset_authority_read",
+                    &e,
+                )
+                .await;
+                return;
+            }
+        };
         let was = {
             let mut tracker = self.recovery_tracker().lock().await;
             tracker.clear_quarantine(convo_id)
@@ -3642,24 +4750,25 @@ where
         if !matches!(
             via,
             crate::orchestrator::types::QuarantineExitReason::ServerReset
-        ) {
-            let mut states = self.conversation_states().lock().await;
-            states.insert(convo_id.to_string(), ConversationState::Active);
-            drop(states);
+        ) && !reset_blocks_active
+        {
             // WS-5.2: a dropped write here leaves the persisted state
             // Quarantined, so restart rehydration re-quarantines a
             // conversation the user/peer already cleared. Escalate.
-            if let Err(e) = self
-                .storage()
-                .set_conversation_state(convo_id, ConversationState::Active)
+            match self
+                .project_non_reset_state_locked(convo_id, ConversationState::Active)
                 .await
             {
-                self.report_recovery_storage_failure(
-                    convo_id,
-                    "set_conversation_state:active_quarantine_exit",
-                    &e,
-                )
-                .await;
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(e) => {
+                    self.report_recovery_storage_failure(
+                        convo_id,
+                        "set_conversation_state:active_quarantine_exit",
+                        &e,
+                    )
+                    .await;
+                }
             }
         }
         // WS-5.2: a surviving quarantine payload row resurrects the
@@ -3673,6 +4782,7 @@ where
             via = via.tag(),
             "[QUARANTINE-CLEAR] conversation quarantine cleared"
         );
+        drop(transition_guard);
         self.notify_quarantine_cleared(convo_id, via).await;
     }
 
@@ -3682,7 +4792,7 @@ where
         self.check_shutdown().await?;
         // Report deliberate user vote so server quorum (spec section 8.6) can
         // include this client. Reason is logged in the structured tracing log.
-        let auth = self.epoch_authenticator_hex(convo_id);
+        let auth = self.epoch_authenticator_hex(convo_id).await;
         if let Err(e) = self
             .api_client()
             .report_recovery_failure(
@@ -3728,6 +4838,199 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "fork-resolution")]
+    async fn fork_readd_fixture(
+        label: &str,
+    ) -> (crate::recovery_e2e_harness::TestWorld, String, String, u64) {
+        let mut world = crate::recovery_e2e_harness::TestWorld::new();
+        world.add_client("Alice").await;
+        world.add_client("Bob").await;
+        world.register_device("Alice").await.unwrap();
+        let bob_did = world.register_device("Bob").await.unwrap();
+        let group = world
+            .client("Alice")
+            .orchestrator
+            .create_group(label, Some(&[bob_did]), None)
+            .await
+            .expect("create fork fixture");
+        let epoch = world
+            .client("Alice")
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&group.group_id).expect("group id hex"))
+            .expect("source epoch");
+        (world, group.conversation_id, group.group_id, epoch)
+    }
+
+    #[cfg(feature = "fork-resolution")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_readd_entry_refuses_reset_recorded_after_fork_projection() {
+        let (world, conversation_id, group_id, source_epoch) =
+            fork_readd_fixture("fork reset inter-call").await;
+        let alice = world.client("Alice");
+        let target = alice
+            .orchestrator
+            .create_group("fork reset target", None, None)
+            .await
+            .expect("materialize reset target");
+        let target_epoch = alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&target.group_id).expect("target group id hex"))
+            .expect("target epoch");
+
+        assert!(
+            alice
+                .orchestrator
+                .project_fork_detected_if_active(&conversation_id, source_epoch)
+                .await
+        );
+        alice
+            .orchestrator
+            .record_group_reset_with_outcome(
+                &conversation_id,
+                hex::decode(&target.group_id).expect("target group id hex"),
+                7,
+            )
+            .await
+            .expect("record reset in the inter-call gap");
+
+        assert!(
+            alice
+                .orchestrator
+                .attempt_fork_readd(&conversation_id)
+                .await
+                .is_err(),
+            "ResetPending must reject fork readd at entry"
+        );
+        assert_eq!(
+            world
+                .delivery_service()
+                .commit_group_change_count(&conversation_id, "forkReadd"),
+            0,
+            "rejected fork readd must not submit a commit"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(hex::decode(&target.group_id).expect("target group id hex"))
+                .expect("target remains materialized"),
+            target_epoch,
+            "rejected fork readd must not merge against the reset target"
+        );
+        let pending = alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .expect("reset remains durable");
+        assert_eq!(pending.reset_generation, 7);
+        assert_eq!(pending.new_group_id_hex, target.group_id);
+        assert!(alice.storage.has_rejoin_flag(&conversation_id));
+        let _ = group_id;
+    }
+
+    #[cfg(feature = "fork-resolution")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_readd_entry_fails_closed_when_reset_authority_is_unreadable() {
+        let (world, conversation_id, group_id, source_epoch) =
+            fork_readd_fixture("fork reset unreadable").await;
+        let alice = world.client("Alice");
+        assert!(
+            alice
+                .orchestrator
+                .project_fork_detected_if_active(&conversation_id, source_epoch)
+                .await
+        );
+        assert_eq!(
+            world
+                .delivery_service()
+                .commit_group_change_count(&conversation_id, "forkReadd"),
+            0,
+            "failed-closed authority read must not submit a commit"
+        );
+        alice
+            .storage
+            .fail_next_get_conversation_state_for(&conversation_id);
+
+        assert!(
+            alice
+                .orchestrator
+                .attempt_fork_readd(&conversation_id)
+                .await
+                .is_err(),
+            "unreadable reset authority must reject fork readd"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(hex::decode(&group_id).expect("group id hex"))
+                .expect("group epoch remains readable"),
+            source_epoch,
+            "failed-closed authority read must not merge a pending commit"
+        );
+    }
+
+    #[test]
+    fn materialized_cleanup_propagates_first_delete_failure() {
+        let groups = vec![vec![1], vec![2]];
+        let mut attempted = Vec::new();
+        let result = delete_materialized_force_rejoin_groups(groups, |group_id| {
+            attempted.push(group_id.clone());
+            Err(crate::MLSError::Internal(format!(
+                "injected delete failure for {}",
+                hex::encode(group_id)
+            )))
+        });
+
+        assert!(
+            result.is_err(),
+            "known-present deletion failure must fail closed"
+        );
+        assert_eq!(
+            attempted,
+            vec![vec![1]],
+            "cleanup must stop at first failure"
+        );
+    }
+
+    #[test]
+    fn materialized_cleanup_treats_missing_group_as_idempotent_and_continues() {
+        let groups = vec![vec![1], vec![2]];
+        let mut attempted = Vec::new();
+        let result = delete_materialized_force_rejoin_groups(groups, |group_id| {
+            attempted.push(group_id.clone());
+            if group_id == vec![1] {
+                Err(crate::MLSError::GroupNotFound {
+                    message: "already removed".into(),
+                })
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(result.is_ok(), "already-absent cleanup is idempotent");
+        assert_eq!(
+            attempted,
+            vec![vec![1], vec![2]],
+            "cleanup must continue after an already-absent group"
+        );
+    }
+
+    #[test]
+    fn reset_predecessor_cleanup_propagates_delete_failure_and_stops() {
+        let groups = vec![vec![1], vec![2]];
+        let mut attempted = Vec::new();
+        let result = delete_materialized_reset_predecessors(groups, |group_id| {
+            attempted.push(group_id.clone());
+            Err(crate::MLSError::Internal(
+                "injected reset cleanup failure".into(),
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(attempted, vec![vec![1]]);
+    }
 
     #[test]
     fn clear_records_success_time_so_cooldown_applies() {

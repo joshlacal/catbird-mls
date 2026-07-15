@@ -9,6 +9,522 @@ use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
+enum LegacyOrphanCleanup {
+    NoLifecycleMapping(String),
+    MismatchedLifecycleMapping(String),
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+    use crate::recovery_e2e_harness::TestWorld;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stable_cleanup_removes_raw_group_conversation_state_alias() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+        let stable_id = "stable-cleanup-raw-state-alias";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(stable_id);
+        let created = alice
+            .orchestrator
+            .create_group("stable cleanup", None, None)
+            .await
+            .expect("create distinct stable conversation");
+        assert_ne!(created.conversation_id, created.group_id);
+        {
+            let states = alice.orchestrator.conversation_states().lock().await;
+            assert!(
+                states.contains_key(stable_id),
+                "Active must be projected under the stable conversation id"
+            );
+            assert!(
+                !states.contains_key(&created.group_id),
+                "Active must not be projected under the mutable raw group id"
+            );
+        }
+
+        alice.orchestrator.force_delete_local(stable_id).await;
+
+        let states = alice.orchestrator.conversation_states().lock().await;
+        assert!(!states.contains_key(stable_id));
+        assert!(
+            !states.contains_key(&created.group_id),
+            "stable cleanup must remove the raw group-id state alias left before export"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_raw_intent_commit_deletes_crypto_and_replay_clears_intent() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+        let before = alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .expect("list groups before create");
+        let barrier = alice.storage.pause_next_pending_local_delete_write(true);
+
+        let mut create = Box::pin(
+            alice
+                .orchestrator
+                .create_group("cancel raw intent", None, None),
+        );
+        tokio::select! {
+            _ = barrier.wait_until_entered() => {}
+            result = &mut create => panic!("create completed before raw intent barrier: {result:?}"),
+        }
+        assert_eq!(alice.storage.pending_local_delete_count(), 1);
+        drop(create);
+
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .list_local_group_ids()
+                .unwrap(),
+            before,
+            "the synchronous guard must delete raw MLS secrets when intent commit is cancelled"
+        );
+        alice.orchestrator.reconcile_pending_local_deletes().await;
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_stable_intent_handoff_leaves_only_replayable_raw_authority() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+        let stable_id = "stable-intent-handoff-cancel";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(stable_id);
+        let barrier = alice
+            .storage
+            .pause_pending_local_delete_write(stable_id, false);
+
+        let mut create = Box::pin(
+            alice
+                .orchestrator
+                .create_group("cancel handoff", None, None),
+        );
+        tokio::select! {
+            _ = barrier.wait_until_entered() => {}
+            result = &mut create => panic!("create completed before stable intent barrier: {result:?}"),
+        }
+        drop(create);
+
+        let pending = alice.storage.pending_local_delete_ids();
+        assert_eq!(pending.len(), 1, "only raw cleanup authority may remain");
+        assert_ne!(pending[0], stable_id);
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, stable_id)
+            .await
+            .expect("read stable row")
+            .is_none());
+        assert!(!alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .contains_key(stable_id));
+
+        alice.orchestrator.reconcile_pending_local_deletes().await;
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .expect("list groups after replay")
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_stable_cancellation_replays_complete_distinct_id_cleanup() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+        let stable_id = "stable-post-create-cancel";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(stable_id);
+        let publish = world.delivery_service().pause_next_publish_group_info();
+
+        let mut create = Box::pin(alice.orchestrator.create_group(
+            "cancel post stable",
+            None,
+            None,
+        ));
+        tokio::select! {
+            _ = publish.wait_until_reached() => {}
+            result = &mut create => panic!("create completed before publish barrier: {result:?}"),
+        }
+        let raw_id = alice
+            .storage
+            .get_conversation(&alice.did, stable_id)
+            .await
+            .expect("read stable row")
+            .expect("stable row exists before cancellation")
+            .group_id;
+        drop(create);
+
+        assert_eq!(
+            alice.storage.pending_local_delete_ids(),
+            vec![stable_id.to_string()]
+        );
+        alice.orchestrator.reconcile_pending_local_deletes().await;
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, stable_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!alice.storage.has_group_state(&raw_id));
+        assert!(!alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .contains_key(stable_id));
+        assert!(!alice
+            .orchestrator
+            .group_states()
+            .lock()
+            .await
+            .contains_key(&raw_id));
+        let states = alice.orchestrator.conversation_states().lock().await;
+        assert!(!states.contains_key(stable_id));
+        assert!(!states.contains_key(&raw_id));
+        drop(states);
+        assert!(!alice
+            .orchestrator
+            .mls_context()
+            .group_exists(hex::decode(raw_id).unwrap()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn equal_id_success_and_cancellation_use_one_intent_key() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+
+        let created = alice
+            .orchestrator
+            .create_group("equal success", None, None)
+            .await
+            .expect("equal-id create");
+        assert_eq!(created.conversation_id, created.group_id);
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+
+        let publish = world.delivery_service().pause_next_publish_group_info();
+        let mut cancelled = Box::pin(alice.orchestrator.create_group("equal cancel", None, None));
+        tokio::select! {
+            _ = publish.wait_until_reached() => {}
+            result = &mut cancelled => panic!("create completed before equal-id cancellation: {result:?}"),
+        }
+        drop(cancelled);
+        assert_eq!(alice.storage.pending_local_delete_count(), 1);
+        alice.orchestrator.reconcile_pending_local_deletes().await;
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, &created.conversation_id)
+            .await
+            .unwrap()
+            .is_some(), "replay for the cancelled equal-id create must not delete the prior successful conversation");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn intent_write_and_clear_errors_return_only_after_local_cleanup() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+
+        alice.storage.fail_next_mark_pending_local_delete();
+        assert!(alice
+            .orchestrator
+            .create_group("raw mark fails", None, None)
+            .await
+            .is_err());
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap()
+            .is_empty());
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+
+        let stable_mark_id = "stable-mark-fails";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(stable_mark_id);
+        let stable_mark = alice
+            .storage
+            .pause_pending_local_delete_write(stable_mark_id, false);
+        let mut create = Box::pin(
+            alice
+                .orchestrator
+                .create_group("stable mark fails", None, None),
+        );
+        tokio::select! {
+            _ = stable_mark.wait_until_entered() => {}
+            result = &mut create => panic!("create completed before stable mark barrier: {result:?}"),
+        }
+        alice.storage.fail_next_mark_pending_local_delete();
+        stable_mark.release();
+        assert!(create.await.is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, stable_mark_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap()
+            .is_empty());
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+
+        let raw_clear_id = "raw-clear-fails";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(raw_clear_id);
+        let stable_written = alice
+            .storage
+            .pause_pending_local_delete_write(raw_clear_id, true);
+        let mut create = Box::pin(
+            alice
+                .orchestrator
+                .create_group("raw clear fails", None, None),
+        );
+        tokio::select! {
+            _ = stable_written.wait_until_entered() => {}
+            result = &mut create => panic!("create completed before stable intent committed: {result:?}"),
+        }
+        let raw_intent = alice
+            .storage
+            .pending_local_delete_ids()
+            .into_iter()
+            .find(|id| id != raw_clear_id)
+            .expect("raw intent remains during handoff");
+        alice
+            .storage
+            .fail_next_clear_pending_local_delete(&raw_intent);
+        stable_written.release();
+        assert!(create.await.is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, raw_clear_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap()
+            .is_empty());
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+
+        let final_clear_id = "final-clear-fails";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(final_clear_id);
+        alice
+            .storage
+            .fail_next_clear_pending_local_delete(final_clear_id);
+        assert!(alice
+            .orchestrator
+            .create_group("final clear fails", None, None)
+            .await
+            .is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, final_clear_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap()
+            .is_empty());
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_fails_before_mls_state_when_pending_delete_defaults_are_undeclared() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+        let before = alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap();
+        alice.storage.omit_pending_delete_capabilities();
+
+        let error = alice
+            .orchestrator
+            .create_group("unsupported cleanup storage", None, None)
+            .await
+            .expect_err("create must fail closed without durable delete capabilities");
+        assert!(error.to_string().contains("pending local-delete"));
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .list_local_group_ids()
+                .unwrap(),
+            before
+        );
+        assert_eq!(alice.storage.conversation_count(), 0);
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    }
+}
+
+/// Internal rollback identity for a group creation attempt. Before createConvo
+/// returns, only the raw MLS group exists. Once the server assigns a stable
+/// conversation id, all storage/cache cleanup must route through that stable
+/// key while still carrying the raw group id as crypto-delete authority.
+struct CreateGroupRollbackContext {
+    raw_group_id: String,
+    stable_conversation_id: Option<String>,
+    encoded_delete_authority: String,
+    durable_intent_id: String,
+}
+
+impl CreateGroupRollbackContext {
+    fn new(
+        raw_group_id: String,
+        raw_group_id_bytes: Vec<u8>,
+        owner_user_did: &str,
+    ) -> Result<Self> {
+        let encoded_delete_authority = super::recovery::LocalDeleteSnapshot {
+            group_ids: vec![raw_group_id_bytes],
+            group_state_keys: vec![raw_group_id.clone()],
+            reset_pending: None,
+        }
+        .encode_authority(owner_user_did)?;
+        Ok(Self {
+            durable_intent_id: raw_group_id.clone(),
+            raw_group_id,
+            stable_conversation_id: None,
+            encoded_delete_authority,
+        })
+    }
+
+    fn bind_stable_conversation(&mut self, conversation_id: &str) {
+        self.stable_conversation_id = Some(conversation_id.to_string());
+    }
+
+    fn cleanup_conversation_id(&self) -> &str {
+        self.stable_conversation_id
+            .as_deref()
+            .unwrap_or(&self.raw_group_id)
+    }
+}
+
+/// Bridges the only cancellation gap that durable storage cannot cover: the
+/// interval after synchronous MLS creation and before the raw delete intent
+/// has durably committed. Once that commit returns, the guard is disarmed and
+/// startup replay owns cleanup instead.
+struct UnpersistedCreatedGroupGuard<M: MlsCryptoContext> {
+    mls_context: std::sync::Arc<M>,
+    raw_group_id: Option<Vec<u8>>,
+}
+
+impl<M: MlsCryptoContext> UnpersistedCreatedGroupGuard<M> {
+    fn new(mls_context: std::sync::Arc<M>, raw_group_id: Vec<u8>) -> Self {
+        Self {
+            mls_context,
+            raw_group_id: Some(raw_group_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.raw_group_id = None;
+    }
+}
+
+impl<M: MlsCryptoContext> Drop for UnpersistedCreatedGroupGuard<M> {
+    fn drop(&mut self) {
+        if let Some(group_id) = self.raw_group_id.take() {
+            if let Err(error) = self.mls_context.delete_group(group_id) {
+                tracing::warn!(error = %error, "Failed to synchronously roll back unpersisted created group");
+            }
+        }
+    }
+}
+
+struct GroupCreationGuard<'a> {
+    groups: tokio::sync::MutexGuard<'a, std::collections::HashSet<GroupId>>,
+    group_id: GroupId,
+    generation: &'a std::sync::atomic::AtomicU64,
+}
+
+impl<'a> GroupCreationGuard<'a> {
+    async fn new(
+        groups: &'a tokio::sync::Mutex<std::collections::HashSet<GroupId>>,
+        generation: &'a std::sync::atomic::AtomicU64,
+        group_id: GroupId,
+    ) -> Self {
+        let mut groups = groups.lock().await;
+        groups.insert(group_id.clone());
+        generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            groups,
+            group_id,
+            generation,
+        }
+    }
+}
+
+impl Drop for GroupCreationGuard<'_> {
+    fn drop(&mut self) {
+        self.groups.remove(&self.group_id);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -30,6 +546,20 @@ where
     ) -> Result<ConversationView> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
+        const REQUIRED_DELETE_CAPABILITIES: [&str; 3] = [
+            "mark_pending_local_delete",
+            "clear_pending_local_delete",
+            "list_pending_local_deletes",
+        ];
+        let implemented = self.storage().implemented_optional_methods();
+        if let Some(missing) = REQUIRED_DELETE_CAPABILITIES
+            .iter()
+            .find(|method| !implemented.contains(method))
+        {
+            return Err(OrchestratorError::Storage(format!(
+                "group creation requires durable pending local-delete storage; backend does not declare {missing}"
+            )));
+        }
 
         tracing::info!(name, member_count = ?initial_members.map(|m| m.len()), "Creating MLS group");
 
@@ -57,34 +587,80 @@ where
             .mls_context()
             .create_group(identity_bytes, Some(group_config))?;
         let group_id_hex = hex::encode(&creation_result.group_id);
+        let mut unpersisted_group = UnpersistedCreatedGroupGuard::new(
+            self.mls_context().clone(),
+            creation_result.group_id.clone(),
+        );
+        let mut rollback = CreateGroupRollbackContext::new(
+            group_id_hex.clone(),
+            creation_result.group_id.clone(),
+            &user_did,
+        )?;
 
         tracing::info!(group_id = %group_id_hex, "Local MLS group created");
 
         // Protect from background sync deletion
-        self.groups_being_created()
-            .lock()
-            .await
-            .insert(group_id_hex.clone());
+        let _creation_guard = GroupCreationGuard::new(
+            self.groups_being_created(),
+            self.creation_generation(),
+            group_id_hex.clone(),
+        )
+        .await;
+
+        // Arm restart cleanup before the first server call. The synchronous
+        // guard remains armed until the storage future confirms this write.
+        self.storage()
+            .mark_pending_local_delete(
+                &rollback.raw_group_id,
+                Some(&rollback.encoded_delete_authority),
+            )
+            .await?;
+        unpersisted_group.disarm();
 
         // Create local conversation record
-        let create_result = self
+        let mut create_result = self
             .create_group_inner(
                 &user_did,
                 &group_id_hex,
                 name,
                 description,
                 filtered_members_ref,
+                &mut rollback,
             )
             .await;
 
-        // On any failure, clean up the local MLS group and remove from being-created set
+        // This is deliberately the final awaited operation on the success
+        // path. Until it completes, dropping the future leaves replayable
+        // owner-bound authority for every local artifact created below.
+        if create_result.is_ok() {
+            if let Err(error) = self
+                .storage()
+                .clear_pending_local_delete(&rollback.durable_intent_id)
+                .await
+            {
+                create_result = Err(error);
+            }
+        }
+
+        // On any failure, clean up the local MLS group. The RAII creation guard
+        // is released on success, error, panic unwinding, or future cancellation.
         if create_result.is_err() {
             tracing::warn!(group_id = %group_id_hex, "Cleaning up local MLS group after create_group failure");
-            self.force_delete_local(&group_id_hex).await;
-            self.groups_being_created()
-                .lock()
-                .await
-                .remove(&group_id_hex);
+            let cleanup_complete = self
+                .force_delete_local_with_group(
+                    rollback.cleanup_conversation_id(),
+                    Some(&rollback.raw_group_id),
+                )
+                .await;
+            if cleanup_complete && rollback.cleanup_conversation_id() != rollback.raw_group_id {
+                if let Err(error) = self
+                    .storage()
+                    .clear_pending_local_delete(&rollback.raw_group_id)
+                    .await
+                {
+                    tracing::warn!(error = %error, group_id = %rollback.raw_group_id, "Stable create rollback completed but redundant raw intent could not be cleared");
+                }
+            }
             return create_result;
         }
 
@@ -100,6 +676,7 @@ where
         name: &str,
         description: Option<&str>,
         filtered_members_ref: Option<&[String]>,
+        rollback: &mut CreateGroupRollbackContext,
     ) -> Result<ConversationView> {
         let group_id_bytes = hex::decode(group_id_hex)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
@@ -218,6 +795,24 @@ where
 
         let mut convo = result.conversation.clone();
         let conversation_id = &convo.conversation_id;
+        rollback.bind_stable_conversation(conversation_id);
+
+        // Handoff cleanup authority before materializing any stable-keyed
+        // local row/cache. Keep the raw intent until the stable write commits.
+        // When both ids are equal this is already the same single intent and
+        // clearing it here would silently disarm cancellation cleanup.
+        if conversation_id != group_id_hex {
+            self.storage()
+                .mark_pending_local_delete(
+                    conversation_id,
+                    Some(&rollback.encoded_delete_authority),
+                )
+                .await?;
+            rollback.durable_intent_id = conversation_id.to_string();
+            self.storage()
+                .clear_pending_local_delete(group_id_hex)
+                .await?;
+        }
 
         self.storage()
             .ensure_conversation_exists(user_did, conversation_id, group_id_hex)
@@ -231,7 +826,7 @@ where
         self.conversations()
             .lock()
             .await
-            .insert(group_id_hex.to_string(), convo.clone());
+            .insert(conversation_id.to_string(), convo.clone());
 
         if initial_add_result.is_some() {
             let merged_epoch = self
@@ -240,7 +835,7 @@ where
 
             convo.epoch = merged_epoch;
 
-            self.cleanup_epoch_secrets_if_needed(group_id_hex, merged_epoch)
+            self.cleanup_epoch_secrets_if_needed(conversation_id, group_id_hex, merged_epoch)
                 .await;
 
             tracing::info!(
@@ -313,7 +908,7 @@ where
         self.conversation_states()
             .lock()
             .await
-            .insert(group_id_hex.to_string(), ConversationState::Active);
+            .insert(conversation_id.to_string(), ConversationState::Active);
 
         // Publish GroupInfo for external joins
         let group_info = self
@@ -321,17 +916,11 @@ where
             .export_group_info(group_id_bytes, user_did.as_bytes().to_vec())?;
         if let Err(e) = self
             .api_client()
-            .publish_group_info(group_id_hex, &group_info)
+            .publish_group_info(conversation_id, &group_info)
             .await
         {
             tracing::warn!(error = %e, "Failed to publish GroupInfo (external joins won't work)");
         }
-
-        // Remove from being-created set
-        self.groups_being_created()
-            .lock()
-            .await
-            .remove(group_id_hex);
 
         tracing::info!(group_id = %group_id_hex, epoch = ffi_epoch, "Group creation complete");
         Ok(convo)
@@ -347,12 +936,13 @@ where
     /// blob fetch, key/epoch/AAD mismatch) is logged and skipped — the join
     /// itself is never affected.
     pub(crate) async fn hydrate_conversation_metadata(&self, conversation_id: &str) {
-        let group_id_hex = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
+        let resolved = match self.resolve_conversation_context(conversation_id).await {
+            Ok(resolved) => resolved,
+            Err(_) => return,
+        };
+        let group_id_hex = resolved.group_id;
         let group_id_bytes = match hex::decode(&group_id_hex) {
-            Ok(b) => b,
+            Ok(bytes) => bytes,
             Err(_) => return,
         };
 
@@ -416,7 +1006,7 @@ where
             }
         };
 
-        if let Some(view) = self.conversations().lock().await.get_mut(&group_id_hex) {
+        if let Some(view) = self.conversations().lock().await.get_mut(conversation_id) {
             view.metadata = Some(ConversationMetadata {
                 name: Some(metadata.title.clone()),
                 description: if metadata.description.is_empty() {
@@ -463,7 +1053,7 @@ where
         self.conversations()
             .lock()
             .await
-            .insert(group_id_hex.clone(), convo.clone());
+            .insert(convo.conversation_id.clone(), convo.clone());
 
         let ffi_epoch = self
             .mls_context()
@@ -485,7 +1075,12 @@ where
             .ensure_conversation_exists(&user_did, &convo.conversation_id, &group_id_hex)
             .await?;
         self.storage()
-            .update_join_info(&group_id_hex, &user_did, JoinMethod::Welcome, ffi_epoch)
+            .update_join_info(
+                &convo.conversation_id,
+                &user_did,
+                JoinMethod::Welcome,
+                ffi_epoch,
+            )
             .await?;
 
         // Insert history boundary marker for Welcome joins.
@@ -500,7 +1095,7 @@ where
             let payload = MLSMessagePayload::system("history_boundary.new_member");
             let marker = Message {
                 id: marker_id,
-                conversation_id: group_id_hex.clone(),
+                conversation_id: convo.conversation_id.clone(),
                 sender_did: user_did.clone(),
                 text: "history_boundary.new_member".to_string(),
                 timestamp: chrono::Utc::now(),
@@ -519,7 +1114,12 @@ where
         // and reflect it in the returned view. Best-effort.
         self.hydrate_conversation_metadata(&convo.conversation_id)
             .await;
-        if let Some(view) = self.conversations().lock().await.get(&group_id_hex) {
+        if let Some(view) = self
+            .conversations()
+            .lock()
+            .await
+            .get(&convo.conversation_id)
+        {
             convo.metadata = view.metadata.clone();
         }
 
@@ -534,10 +1134,8 @@ where
     /// until all clients have moved over.
     pub async fn add_members(&self, conversation_id: &str, member_dids: &[String]) -> Result<()> {
         self.check_shutdown().await?;
-        let group_id = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let group_id = resolved.group_id;
 
         tracing::info!(
             conversation_id,
@@ -671,10 +1269,8 @@ where
         member_dids: &[String],
     ) -> Result<()> {
         self.check_shutdown().await?;
-        let group_id = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let group_id = resolved.group_id;
 
         tracing::info!(
             conversation_id,
@@ -776,11 +1372,19 @@ where
                     self.record_and_check_sequencer_receipt(receipt, "swap_members")
                         .await;
                 }
-                let current_epoch =
-                    self.mls_context()
-                        .get_epoch(hex::decode(group_id).map_err(|_| {
-                            OrchestratorError::InvalidInput("Invalid hex group ID".into())
-                        })?)?;
+                let current_epoch = match hex::decode(&plan.handle.group_id)
+                    .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))
+                    .and_then(|group_id| {
+                        self.mls_context()
+                            .get_epoch(group_id)
+                            .map_err(OrchestratorError::from)
+                    }) {
+                    Ok(epoch) => epoch,
+                    Err(error) => {
+                        let _ = self.discard_pending(plan.handle).await;
+                        return Err(error);
+                    }
+                };
                 if result.new_epoch > current_epoch {
                     self.confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
                         .await?;
@@ -826,18 +1430,18 @@ where
 
         tracing::info!(convo_id, "Leaving group via self-remove proposal");
 
-        let group_id_bytes = hex::decode(convo_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        let resolved = self.resolve_conversation_context(convo_id).await?;
+        let group_id_bytes = resolved.group_id_bytes()?;
 
         let proposal_bytes = self.mls_context().propose_self_remove(group_id_bytes)?;
 
-        let epoch = self
-            .group_states()
-            .lock()
-            .await
-            .get(convo_id)
-            .map(|gs| gs.epoch)
-            .unwrap_or(0);
+        let epoch = {
+            let states = self.group_states().lock().await;
+            resolved
+                .group_state(&states)
+                .map(|gs| gs.epoch)
+                .unwrap_or(0)
+        };
 
         let message_id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = self
@@ -867,8 +1471,8 @@ where
 
         tracing::info!(convo_id, "Committing pending self-remove proposals");
 
-        let group_id_bytes = hex::decode(convo_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        let resolved = self.resolve_conversation_context(convo_id).await?;
+        let group_id_bytes = resolved.group_id_bytes()?;
 
         let commit_bytes = match self
             .mls_context()
@@ -898,9 +1502,10 @@ where
         let new_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         {
             let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.get_mut(convo_id) {
+            if let Some(mut gs) = resolved.group_state(&states).cloned() {
                 gs.epoch = new_epoch;
                 let state_clone = gs.clone();
+                normalize_group_state(&mut states, gs);
                 drop(states);
                 if let Err(e) = self.storage().set_group_state(&state_clone).await {
                     tracing::warn!(error = %e, convo_id, "Failed to persist group state");
@@ -949,10 +1554,8 @@ where
     ) -> Result<()> {
         self.check_shutdown().await?;
 
-        let group_id_hex = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let group_id_hex = resolved.group_id;
         let group_id_bytes = hex::decode(&group_id_hex).map_err(|_| {
             OrchestratorError::InvalidInput("Invalid hex group ID for metadata update".into())
         })?;
@@ -1086,22 +1689,64 @@ where
     /// delete steps ran; `reconcile_pending_local_deletes` (called from
     /// `initialize`) finishes any delete a crash interrupted.
     pub(crate) async fn force_delete_local(&self, convo_id: &str) {
-        let group_id_hex = self.group_id_hex_for_conversation(convo_id).await;
+        let _ = self.force_delete_local_with_group(convo_id, None).await;
+    }
+
+    /// Roll back local state while explicitly carrying a newly-created MLS
+    /// group that has not yet acquired a stable conversation or GroupState
+    /// mapping. The explicit id is persisted in the same owner-bound cleanup
+    /// authority as every discovered predecessor, so crash replay remains
+    /// complete and tenant-bound.
+    async fn force_delete_local_with_group(
+        &self,
+        convo_id: &str,
+        explicit_group_id: Option<&str>,
+    ) -> bool {
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
+        let owner_user_did = match self.cleanup_user_did().await {
+            Ok(user_did) => user_did,
+            Err(error) => {
+                tracing::warn!(error = %error, convo_id, "No lifecycle-bound user during local delete; refusing destructive cleanup");
+                return false;
+            }
+        };
+        let captured_group_ids = explicit_group_id
+            .map(|group_id| vec![group_id.to_string()])
+            .unwrap_or_default();
+        let snapshot = match self
+            .snapshot_local_delete_groups(convo_id, &captured_group_ids, &[])
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(error = %error, convo_id, "Failed to snapshot complete local-delete authority; refusing destructive cleanup");
+                return false;
+            }
+        };
+        let encoded_authority = match snapshot.encode_authority(&owner_user_did) {
+            Ok(authority) => authority,
+            Err(error) => {
+                tracing::warn!(error = %error, convo_id, "Failed to encode local-delete authority; refusing destructive cleanup");
+                return false;
+            }
+        };
 
         // 1. Persist the delete intent BEFORE mutating anything. Carries the
         // resolved group id so the startup sweep can drop the MLS group even
         // after the conversation row (the id mapping) is gone.
         if let Err(e) = self
             .storage()
-            .mark_pending_local_delete(convo_id, group_id_hex.as_deref())
+            .mark_pending_local_delete(convo_id, Some(&encoded_authority))
             .await
         {
-            tracing::warn!(error = %e, convo_id, "Failed to persist local-delete intent (continuing; crash mid-delete may orphan state)");
+            tracing::warn!(error = %e, convo_id, "Failed to persist local-delete intent; refusing destructive cleanup");
+            return false;
         }
 
         // 2. Run the delete steps.
         let all_steps_ok = self
-            .force_delete_local_steps(convo_id, group_id_hex.as_deref())
+            .force_delete_local_steps(convo_id, Some(&encoded_authority))
             .await;
 
         // 3. Clear the intent only after all delete steps succeeded (trait
@@ -1110,12 +1755,15 @@ where
         if all_steps_ok {
             if let Err(e) = self.storage().clear_pending_local_delete(convo_id).await {
                 tracing::warn!(error = %e, convo_id, "Failed to clear local-delete intent (startup sweep will redo an idempotent delete)");
+                return false;
             }
+            true
         } else {
             tracing::warn!(
                 convo_id,
                 "force_delete_local: one or more delete steps failed — keeping pending-delete intent for the startup sweep"
             );
+            false
         }
     }
 
@@ -1131,6 +1779,18 @@ where
     ) -> Result<DebugWipeLocalGroupResult> {
         self.check_shutdown().await?;
         self.require_user_did().await?;
+        let transition_lock = self.rejoin_lock(convo_id).await;
+        let _transition_guard = transition_lock.lock().await;
+        if self
+            .reset_blocks_non_reset_transition_locked(convo_id)
+            .await?
+        {
+            return Err(
+                crate::orchestrator::error::OrchestratorError::RecoveryFailed(format!(
+                    "durable reset authority blocks debug wipe for {convo_id}"
+                )),
+            );
+        }
 
         let group_id_hex = self.group_id_hex_for_conversation(convo_id).await;
         let mut deleted_local_group = false;
@@ -1176,10 +1836,19 @@ where
         }
 
         self.storage().mark_needs_rejoin(convo_id).await?;
-        self.conversation_states()
-            .lock()
+        self.project_non_reset_cache_locked(convo_id, ConversationState::NeedsRejoin)
             .await
-            .insert(convo_id.to_string(), ConversationState::NeedsRejoin);
+            .and_then(|projected| {
+                if projected {
+                    Ok(())
+                } else {
+                    Err(
+                        crate::orchestrator::error::OrchestratorError::RecoveryFailed(format!(
+                            "durable reset authority blocks debug wipe projection for {convo_id}"
+                        )),
+                    )
+                }
+            })?;
 
         {
             let mut states = self.group_states().lock().await;
@@ -1207,22 +1876,236 @@ where
     /// delete). Returns `false` on any real failure so callers keep the
     /// pending-delete intent and the next startup sweep retries.
     async fn force_delete_local_steps(&self, convo_id: &str, group_id_hex: Option<&str>) -> bool {
-        let user_did = self.require_user_did().await.unwrap_or_default();
-        let mut all_ok = true;
+        let user_did = match self.cleanup_user_did().await {
+            Ok(user_did) => user_did,
+            Err(error) => {
+                tracing::warn!(error = %error, convo_id, "No lifecycle-bound user during local delete; keeping delete intent");
+                return false;
+            }
+        };
+        let authority = match super::recovery::decode_local_delete_authority(group_id_hex) {
+            Ok(authority) => authority,
+            Err(error) => {
+                tracing::warn!(error = %error, convo_id, "Invalid local-delete authority; keeping delete intent");
+                return false;
+            }
+        };
+        let (captured_group_ids, captured_group_state_keys, legacy_orphan_cleanup) = match authority
+        {
+            super::recovery::LocalDeleteAuthority::Versioned {
+                owner_user_did,
+                group_ids_hex,
+                group_state_keys,
+            } => {
+                if owner_user_did != user_did {
+                    tracing::warn!(convo_id, "Local-delete authority belongs to another lifecycle user; keeping delete intent");
+                    return false;
+                }
+                (group_ids_hex, group_state_keys, None)
+            }
+            super::recovery::LocalDeleteAuthority::LegacyGroupId(group_id) => {
+                // Pre-versioned rows cannot prove an owner DID. When no
+                // lifecycle-owned mapping remains, their narrow crash
+                // authority is only the exact captured MLS group and matching
+                // GroupState key. A validated current mapping permits the
+                // original full conversation cleanup. Newly-written records
+                // are owner-bound above and never take this compatibility path.
+                match self.storage().get_conversation(&user_did, convo_id).await {
+                    Ok(Some(view)) if view.conversation_id == convo_id => {
+                        let reset_target_matches = match self
+                            .reset_pending_payload_result(convo_id)
+                            .await
+                        {
+                            Ok(Some(pending)) => pending.new_group_id == group_id,
+                            Ok(None) => false,
+                            Err(error) => {
+                                tracing::warn!(error = %error, convo_id, "Failed to validate legacy local-delete reset binding; keeping intent");
+                                return false;
+                            }
+                        };
+                        if view.group_id == group_id || reset_target_matches {
+                            (vec![group_id.clone()], vec![group_id], None)
+                        } else {
+                            (
+                                vec![],
+                                vec![],
+                                Some(LegacyOrphanCleanup::MismatchedLifecycleMapping(group_id)),
+                            )
+                        }
+                    }
+                    Ok(None) => (
+                        vec![],
+                        vec![],
+                        Some(LegacyOrphanCleanup::NoLifecycleMapping(group_id)),
+                    ),
+                    Ok(Some(_)) => {
+                        tracing::warn!(convo_id, "Legacy local-delete mapping did not match its stable conversation id; keeping intent");
+                        return false;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, convo_id, "Failed to determine legacy local-delete ownership; keeping intent");
+                        return false;
+                    }
+                }
+            }
+            super::recovery::LocalDeleteAuthority::LegacyUnbound => {
+                match self.storage().get_conversation(&user_did, convo_id).await {
+                    Ok(Some(view)) if view.conversation_id == convo_id => (vec![], vec![], None),
+                    Ok(_) => {
+                        tracing::warn!(convo_id, "Unbound legacy local-delete intent has no lifecycle-owned conversation; keeping intent");
+                        return false;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, convo_id, "Failed to validate legacy local-delete intent; keeping intent");
+                        return false;
+                    }
+                }
+            }
+        };
 
-        // Delete MLS group from FFI. An already-deleted group is success.
-        if let Some(group_id_bytes) = group_id_hex.and_then(|group_id| hex::decode(group_id).ok()) {
-            match self.mls_context().delete_group(group_id_bytes) {
-                Ok(()) => {}
-                Err(crate::MLSError::GroupNotFound { .. }) => {
-                    tracing::debug!(convo_id, "MLS group already deleted (NotFound — ok)");
+        if let Some(legacy_cleanup) = legacy_orphan_cleanup {
+            let (group_id, clear_orphan_recovery) = match legacy_cleanup {
+                LegacyOrphanCleanup::NoLifecycleMapping(group_id) => (group_id, true),
+                LegacyOrphanCleanup::MismatchedLifecycleMapping(group_id) => (group_id, false),
+            };
+            let group_id_bytes = match hex::decode(&group_id) {
+                Ok(group_id_bytes) => group_id_bytes,
+                Err(error) => {
+                    tracing::warn!(error = %error, convo_id, group_id, "Malformed legacy local-delete group id; keeping intent");
+                    return false;
+                }
+            };
+            if let Err(error) = super::recovery::delete_materialized_reset_predecessors(
+                vec![group_id_bytes],
+                |group_id| self.mls_context().delete_group(group_id),
+            ) {
+                tracing::warn!(error = %error, convo_id, group_id, "Failed exact legacy orphan MLS cleanup; keeping intent");
+                return false;
+            }
+            if let Err(error) = self.storage().delete_group_state(&group_id).await {
+                tracing::warn!(error = %error, convo_id, group_id, "Failed exact legacy orphan GroupState cleanup; keeping intent");
+                return false;
+            }
+            self.group_states().lock().await.remove(&group_id);
+
+            // A present lifecycle mapping whose group differs is current
+            // tenant authority. The legacy row can delete only its exact old
+            // group and identical GroupState key; all conversation, recovery,
+            // reset, and cache state belongs to the current mapping.
+            if !clear_orphan_recovery {
+                return true;
+            }
+
+            // With no lifecycle-owned mapping, the captured legacy group is an
+            // orphan from an interrupted pre-versioned delete. Stale recovery
+            // rows for that same stable id must not survive and gate a future
+            // re-add. Reset cleanup remains generation-CAS bound; failures keep
+            // the pending intent for an idempotent retry.
+            match self.reset_pending_payload_result(convo_id).await {
+                Ok(Some(pending)) => {
+                    match self
+                        .storage()
+                        .clear_reset_pending_for_delete(convo_id, pending.reset_generation)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                convo_id,
+                                reset_generation = pending.reset_generation,
+                                "Legacy orphan reset generation changed; keeping intent"
+                            );
+                            return false;
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, convo_id, "Failed to clear legacy orphan reset state; keeping intent");
+                            return false;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error, convo_id, "Failed to read legacy orphan reset state; keeping intent");
+                    return false;
+                }
+            }
+
+            let mut all_ok = true;
+            self.recovery_tracker()
+                .lock()
+                .await
+                .forget_conversation(convo_id);
+            if let Err(error) = self.storage().clear_recovery_backoff(convo_id).await {
+                all_ok = false;
+                tracing::warn!(error = %error, convo_id, "Failed to clear legacy orphan recovery backoff");
+            }
+            if let Err(error) = self.storage().clear_quarantine(convo_id).await {
+                all_ok = false;
+                tracing::warn!(error = %error, convo_id, "Failed to clear legacy orphan quarantine");
+            }
+            if let Err(error) = self.storage().clear_rejoin_flag(convo_id).await {
+                all_ok = false;
+                tracing::warn!(error = %error, convo_id, "Failed to clear legacy orphan rejoin flag");
+            }
+            self.conversations().lock().await.remove(convo_id);
+            self.conversation_states().lock().await.remove(convo_id);
+            return all_ok;
+        }
+        let snapshot = match self
+            .snapshot_local_delete_groups(convo_id, &captured_group_ids, &captured_group_state_keys)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    convo_id,
+                    "Failed to snapshot reset authority and local groups during local delete; keeping delete intent"
+                );
+                return false;
+            }
+        };
+
+        // Delete the complete snapshot before clearing either reset authority
+        // or the durable conversation mapping that makes predecessors
+        // discoverable after a crash. GroupNotFound is idempotent; every other
+        // MLS deletion failure preserves all authority/mapping state and the
+        // pending-delete intent for retry.
+        if let Err(error) = super::recovery::delete_materialized_reset_predecessors(
+            snapshot.group_ids.clone(),
+            |group_id| self.mls_context().delete_group(group_id),
+        ) {
+            tracing::warn!(
+                error = %error,
+                convo_id,
+                "Failed to delete a locally bound MLS group; preserving delete authority for retry"
+            );
+            return false;
+        }
+
+        // With all discoverable local secrets gone, clear the exact reset
+        // generation. This delete-specific CAS never projects Active; a
+        // generation mismatch keeps mappings and intent for the next retry.
+        if let Some(reset_pending) = snapshot.reset_pending.as_ref() {
+            let reset_generation = reset_pending.reset_generation;
+            match self
+                .storage()
+                .clear_reset_pending_for_delete(convo_id, reset_generation)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(convo_id, reset_generation, "Reset-pending generation changed during local delete; keeping delete intent");
+                    return false;
                 }
                 Err(e) => {
-                    all_ok = false;
-                    tracing::warn!(error = %e, convo_id, "Failed to delete MLS group from FFI");
+                    tracing::warn!(error = %e, convo_id, reset_generation, "Failed to clear persisted reset-pending payload during local delete");
+                    return false;
                 }
             }
         }
+
+        let mut all_ok = true;
 
         // Delete from storage
         if let Err(e) = self
@@ -1237,7 +2120,11 @@ where
             all_ok = false;
             tracing::warn!(error = %e, convo_id, "Failed to delete group state from storage");
         }
-        if let Some(group_id) = group_id_hex.filter(|group_id| *group_id != convo_id) {
+        for group_id in snapshot
+            .group_state_keys
+            .iter()
+            .filter(|group_id| group_id.as_str() != convo_id)
+        {
             if let Err(e) = self.storage().delete_group_state(group_id).await {
                 all_ok = false;
                 tracing::warn!(error = %e, convo_id, group_id, "Failed to delete group state from storage");
@@ -1256,10 +2143,6 @@ where
             all_ok = false;
             tracing::warn!(error = %e, convo_id, "Failed to clear persisted recovery backoff during local delete");
         }
-        if let Err(e) = self.storage().clear_reset_pending(convo_id).await {
-            all_ok = false;
-            tracing::warn!(error = %e, convo_id, "Failed to clear persisted reset-pending payload during local delete");
-        }
         if let Err(e) = self.storage().clear_quarantine(convo_id).await {
             all_ok = false;
             tracing::warn!(error = %e, convo_id, "Failed to clear persisted quarantine during local delete");
@@ -1271,17 +2154,23 @@ where
 
         // Remove from caches
         self.conversations().lock().await.remove(convo_id);
-        if let Some(group_id) = group_id_hex.filter(|group_id| *group_id != convo_id) {
-            self.conversations().lock().await.remove(group_id);
-        }
         {
             let mut states = self.group_states().lock().await;
             states.remove(convo_id);
-            if let Some(group_id) = group_id_hex.filter(|group_id| *group_id != convo_id) {
+            for group_id in &snapshot.group_state_keys {
                 states.remove(group_id);
             }
         }
-        self.conversation_states().lock().await.remove(convo_id);
+        {
+            let mut conversation_states = self.conversation_states().lock().await;
+            conversation_states.remove(convo_id);
+            // Creation historically projected Active under the raw MLS group
+            // id before GroupInfo export. A post-projection failure must not
+            // leave that alias authorizing a group whose secrets were deleted.
+            for group_id in &snapshot.group_ids {
+                conversation_states.remove(&hex::encode(group_id));
+            }
+        }
 
         all_ok
     }
@@ -1298,6 +2187,8 @@ where
             }
         };
         for intent in pending {
+            let transition_lock = self.rejoin_lock(&intent.conversation_id).await;
+            let _transition_guard = transition_lock.lock().await;
             tracing::info!(
                 convo_id = %intent.conversation_id,
                 group_id = ?intent.group_id_hex,

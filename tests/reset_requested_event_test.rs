@@ -26,7 +26,8 @@
 mod e2e_harness;
 
 use catbird_mls::orchestrator::{
-    ConversationState, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, ResetRecordOutcome,
+    ConversationState, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
+    ResetRecordOutcome,
 };
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use std::sync::Arc;
@@ -165,6 +166,159 @@ async fn test_record_group_reset_with_outcome_distinguishes_recorded_stale_and_s
         .await
         .expect("stale record_group_reset_with_outcome should not fail");
     assert_eq!(stale, ResetRecordOutcome::StaleOrDuplicate);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_mark_error_continues_only_after_exact_durable_commit_reread() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("ambiguous reset publication", None, None)
+        .await
+        .expect("create conversation");
+    let old_group = hex::decode(&convo.group_id).expect("valid old group id");
+    let target = vec![0x4a; 16];
+
+    alice.storage.fail_next_mark_reset_pending_after_commit();
+    let outcome = alice
+        .orchestrator
+        .record_group_reset_with_outcome(&convo.conversation_id, target.clone(), 41)
+        .await
+        .expect("an exact durable tuple proves the ambiguous write committed");
+
+    assert_eq!(outcome, ResetRecordOutcome::Recorded);
+    let persisted = alice
+        .storage
+        .get_persisted_reset_pending(&convo.conversation_id)
+        .expect("committed reset authority must remain durable");
+    assert_eq!(persisted.reset_generation, 41);
+    assert_eq!(persisted.new_group_id_hex, hex::encode(target));
+    assert!(persisted.notified_at_ms > 0);
+    assert!(
+        !alice.orchestrator.mls_context().group_exists(old_group),
+        "cleanup may proceed after the exact committed tuple is reread"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn committed_reset_publication_atomically_arms_restart_recovery() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("crash boundary reset publication", None, None)
+        .await
+        .expect("create conversation");
+
+    alice.storage.fail_next_mark_reset_pending_after_commit();
+    let result = alice
+        .storage
+        .mark_reset_pending(&convo.conversation_id, &"4c".repeat(16), 43, 1_234)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "simulate response loss immediately after commit"
+    );
+    assert!(
+        alice.storage.has_rejoin_flag(&convo.conversation_id),
+        "the authority transaction itself must arm restart recovery"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_mark_error_rejects_non_exact_notified_at_tuple() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("non exact reset publication", None, None)
+        .await
+        .expect("create conversation");
+    let old_group = hex::decode(&convo.group_id).expect("valid old group id");
+
+    alice
+        .storage
+        .fail_next_mark_reset_pending_after_commit_with_notified_at_offset(1);
+    let result = alice
+        .orchestrator
+        .record_group_reset_with_outcome(&convo.conversation_id, vec![0x4b; 16], 42)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "same generation and target with a different publication timestamp is not this write"
+    );
+    assert!(
+        alice.orchestrator.mls_context().group_exists(old_group),
+        "non-exact ambiguous authority must fail before destructive cleanup"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn higher_generation_same_target_is_not_misclassified_as_self_echo() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("same target newer reset", None, None)
+        .await
+        .expect("create conversation");
+    let target = vec![0x5b; 16];
+
+    alice
+        .orchestrator
+        .record_group_reset(&convo.conversation_id, target.clone(), 1)
+        .await
+        .expect("record generation one");
+    alice
+        .orchestrator
+        .mls_context()
+        .create_group_with_id(
+            alice.did.as_bytes().to_vec(),
+            target.clone(),
+            Some(catbird_mls::GroupConfig::default()),
+        )
+        .expect("materialize generation-one bootstrap candidate");
+
+    let outcome = alice
+        .orchestrator
+        .record_group_reset_with_outcome(&convo.conversation_id, target.clone(), 2)
+        .await
+        .expect("record newer generation with the same target bytes");
+
+    assert_eq!(outcome, ResetRecordOutcome::Recorded);
+    let persisted = alice
+        .storage
+        .get_persisted_reset_pending(&convo.conversation_id)
+        .expect("newer generation must own reset authority");
+    assert_eq!(persisted.reset_generation, 2);
+    assert_eq!(persisted.new_group_id_hex, hex::encode(&target));
+    assert!(
+        !alice.orchestrator.mls_context().group_exists(target),
+        "the stale generation-one local candidate must be removed even when group bytes are reused"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -360,6 +514,1513 @@ async fn test_record_group_reset_ignores_self_echo_existing_group() {
         0,
         "self-echo reset target matching an existing local group must not write mark_reset_pending"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_bootstrap_completion_cannot_mask_newer_reset_generation() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("bootstrap generation race", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    let generation_one_group = vec![0x31; 16];
+    let generation_two_group = vec![0x32; 16];
+
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, generation_one_group.clone(), 1)
+        .await
+        .expect("commit generation 1 reset");
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_delay_ms(300);
+
+    let stale_completion = alice.orchestrator.join_or_rejoin(&conversation_id);
+    let commit_newer_reset = async {
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+        alice
+            .storage
+            .mark_reset_pending(
+                &conversation_id,
+                &hex::encode(&generation_two_group),
+                2,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await
+            .expect("cross-process generation 2 commit while generation 1 bootstrap is in flight");
+        alice
+            .storage
+            .mark_needs_rejoin(&conversation_id)
+            .await
+            .expect("generation 2 rejoin flag");
+    };
+    let (stale_result, ()) = tokio::join!(stale_completion, commit_newer_reset);
+
+    assert!(
+        stale_result.is_err(),
+        "a generation 1 completion superseded by generation 2 must not report recovery success"
+    );
+    let persisted = alice
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("newer ResetPending must survive stale completion");
+    assert_eq!(persisted.reset_generation, 2);
+    assert_eq!(
+        persisted.new_group_id_hex,
+        hex::encode(&generation_two_group)
+    );
+    assert!(matches!(
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&conversation_id),
+        Some(ConversationState::ResetPending {
+            reset_generation: 2,
+            ..
+        })
+    ));
+    assert!(
+        !alice
+            .orchestrator
+            .mls_context()
+            .group_exists(generation_one_group),
+        "stale generation 1 bootstrap group must not survive after generation 2 wins authority"
+    );
+    assert!(
+        alice.storage.has_rejoin_flag(&conversation_id),
+        "stale completion must not clear generation 2's durable rejoin flag"
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0,
+        "generation mismatch must return directly without External Commit fallback"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completion_error_preserves_reset_and_retry_resumes_without_external_commit() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("ambiguous completion retry", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    let target = vec![0x71; 16];
+
+    alice
+        .storage
+        .set_epoch_pair_for_test(&conversation_id, 741, 742);
+    alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get_mut(&conversation_id)
+        .expect("seed cached predecessor epoch")
+        .epoch = 743;
+
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, target.clone(), 5)
+        .await
+        .expect("record reset");
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
+    world
+        .delivery_service()
+        .set_bootstrap_already_bootstrapped_after_success(true);
+    let durable_before_error = alice
+        .storage
+        .get_conversation(&alice.did, &conversation_id)
+        .await
+        .expect("read pre-completion durable state")
+        .expect("pre-completion durable state");
+    let cached_before_error = alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .expect("read pre-completion cache")
+        .clone();
+    alice.storage.fail_next_complete_reset_pending();
+
+    let first = alice.orchestrator.join_or_rejoin(&conversation_id).await;
+    assert!(first.is_err(), "completion uncertainty must fail closed");
+    assert_eq!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .expect("reset authority must survive completion failure")
+            .reset_generation,
+        5
+    );
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
+    let durable_after_error = alice
+        .storage
+        .get_conversation(&alice.did, &conversation_id)
+        .await
+        .expect("read durable predecessor")
+        .expect("durable predecessor survives");
+    assert_eq!(durable_after_error.group_id, durable_before_error.group_id);
+    assert_eq!(durable_after_error.epoch, durable_before_error.epoch);
+    assert_eq!(
+        alice.storage.join_epoch_for_test(&conversation_id),
+        Some(742)
+    );
+    let cached_after_error = alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .expect("cached predecessor survives")
+        .clone();
+    assert_eq!(cached_after_error.group_id, cached_before_error.group_id);
+    assert_eq!(cached_after_error.epoch, cached_before_error.epoch);
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .group_exists(target.clone()));
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0
+    );
+
+    alice
+        .orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect("retry should resume the materialized bootstrap candidate");
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .group_exists(target.clone()),
+        "accepted bootstrap candidate must survive AlreadyBootstrapped retry"
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .bootstrap_reset_group_call_count(&conversation_id),
+        2,
+        "retry must exercise the accepted-winner AlreadyBootstrapped response"
+    );
+    assert!(alice
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .is_none());
+    assert!(!alice.storage.has_rejoin_flag(&conversation_id));
+    let landed_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(target)
+        .expect("landed target epoch");
+    let durable_after_retry = alice
+        .storage
+        .get_conversation(&alice.did, &conversation_id)
+        .await
+        .expect("read completed reset")
+        .expect("completed reset conversation");
+    assert_eq!(durable_after_retry.epoch, landed_epoch);
+    assert_eq!(
+        alice.storage.join_epoch_for_test(&conversation_id),
+        Some(landed_epoch)
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_equal_epoch_preserves_reset_authority_and_completes_bootstrap_retry() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("sync reset completion retry", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    let target = vec![0x73; 16];
+
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, target.clone(), 8)
+        .await
+        .expect("record reset");
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
+    world
+        .delivery_service()
+        .set_bootstrap_already_bootstrapped_after_success(true);
+    alice.storage.fail_next_complete_reset_pending();
+
+    assert!(
+        alice
+            .orchestrator
+            .join_or_rejoin(&conversation_id)
+            .await
+            .is_err(),
+        "accepted bootstrap with uncertain local completion must fail closed"
+    );
+    assert_eq!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .expect("ResetPending must remain durable")
+            .reset_generation,
+        8
+    );
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
+
+    let target_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(target.clone())
+        .expect("accepted bootstrap target epoch");
+    world
+        .delivery_service()
+        .set_conversation_epoch_for_test(&conversation_id, target_epoch);
+
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("sync must resume generation-bound reset completion");
+
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .is_none(),
+        "equal epoch must not bypass durable reset completion"
+    );
+    assert!(!alice.storage.has_rejoin_flag(&conversation_id));
+    assert_eq!(
+        world
+            .delivery_service()
+            .bootstrap_reset_group_call_count(&conversation_id),
+        2,
+        "sync recovery must re-enter join_or_rejoin and resume the accepted bootstrap"
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_recording_serializes_with_equal_epoch_stale_rejoin_clear() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("stale clear reset race", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    let local_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&conversation.group_id).expect("group id hex"))
+        .expect("local epoch");
+    world
+        .delivery_service()
+        .set_conversation_epoch_for_test(&conversation_id, local_epoch);
+    alice
+        .storage
+        .mark_needs_rejoin(&conversation_id)
+        .await
+        .expect("arm stale rejoin flag");
+
+    let clear_barrier = alice.storage.pause_next_clear_rejoin_flag(&conversation_id);
+    let reset_target = vec![0x74; 16];
+    let sync = alice.orchestrator.sync_with_server(true);
+    let record_reset = async {
+        clear_barrier.wait_until_entered().await;
+        let mut recording = Box::pin(alice.orchestrator.record_group_reset_with_outcome(
+            &conversation_id,
+            reset_target.clone(),
+            9,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording)
+                .await
+                .is_err(),
+            "reset recording must wait while stale-clear owns the transition lock"
+        );
+        clear_barrier.release();
+        recording.await
+    };
+
+    let (sync_result, reset_result) = tokio::join!(sync, record_reset);
+    sync_result.expect("equal-epoch sync");
+    assert_eq!(
+        reset_result.expect("record reset after stale clear"),
+        ResetRecordOutcome::Recorded
+    );
+    let pending = alice
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("racing reset must remain durable");
+    assert_eq!(pending.reset_generation, 9);
+    assert_eq!(pending.new_group_id_hex, hex::encode(reset_target));
+    assert!(
+        alice.storage.has_rejoin_flag(&conversation_id),
+        "stale caught-up clear must not erase the newly recorded reset route"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_force_rejoin_refuses_to_bypass_reset_authority() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("force rejoin reset precedence", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    let reset_target = vec![0x75; 16];
+
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, reset_target, 10)
+        .await
+        .expect("record reset");
+    let error = alice
+        .orchestrator
+        .force_rejoin(&conversation_id)
+        .await
+        .expect_err("direct force_rejoin must defer to reset-aware recovery");
+
+    assert!(error.to_string().contains("ResetPending"));
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0,
+        "direct force_rejoin must not submit an External Commit under reset authority"
+    );
+    assert_eq!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .expect("reset authority must remain durable")
+            .reset_generation,
+        10
+    );
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn healthy_clear_serializes_with_reset_recording() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("healthy clear reset race", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    alice
+        .storage
+        .set_conversation_state(&conversation_id, ConversationState::NeedsRejoin)
+        .await
+        .expect("persist NeedsRejoin");
+    alice
+        .orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .insert(conversation_id.clone(), ConversationState::NeedsRejoin);
+    alice
+        .storage
+        .mark_needs_rejoin(&conversation_id)
+        .await
+        .expect("arm rejoin flag");
+
+    let clear_barrier = alice.storage.pause_next_clear_rejoin_flag(&conversation_id);
+    let reset_target = vec![0x76; 16];
+    let readiness = async {
+        alice
+            .orchestrator
+            .ensure_conversation_ready(&conversation_id)
+            .await
+    };
+    let record_reset = async {
+        clear_barrier.wait_until_entered().await;
+        let mut recording = Box::pin(alice.orchestrator.record_group_reset_with_outcome(
+            &conversation_id,
+            reset_target.clone(),
+            11,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording)
+                .await
+                .is_err(),
+            "reset recording must wait while healthy-clear owns the transition lock"
+        );
+        clear_barrier.release();
+        recording.await
+    };
+
+    let (readiness_result, reset_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(readiness, record_reset)
+        })
+        .await
+        .expect("healthy-clear race milestones timed out");
+    readiness_result.expect("healthy stale-clear readiness");
+    assert_eq!(
+        reset_result.expect("record reset after healthy clear"),
+        ResetRecordOutcome::Recorded
+    );
+    let pending = alice
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("racing reset must remain durable");
+    assert_eq!(pending.reset_generation, 11);
+    assert_eq!(pending.new_group_id_hex, hex::encode(reset_target));
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn contended_force_rejoin_rechecks_reset_authority_after_waiting() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("contended force reset precedence", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    let reset_target = vec![0x77; 16];
+    let record_barrier = alice.storage.pause_next_reset_record(&conversation_id);
+
+    let record_reset =
+        alice
+            .orchestrator
+            .record_group_reset_with_outcome(&conversation_id, reset_target, 12);
+    let force_rejoin = async {
+        record_barrier.wait_until_entered().await;
+        let force = alice.orchestrator.force_rejoin(&conversation_id);
+        record_barrier.release();
+        force.await
+    };
+    let (reset_result, force_result) = tokio::join!(record_reset, force_rejoin);
+
+    assert_eq!(
+        reset_result.expect("record reset"),
+        ResetRecordOutcome::Recorded
+    );
+    let error = force_result.expect_err("contended force must observe ResetPending after waiting");
+    assert!(error.to_string().contains("ResetPending"));
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0
+    );
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_force_rejoin_fails_closed_when_reset_authority_is_unreadable() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("force unreadable reset authority", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    alice
+        .storage
+        .fail_next_get_conversation_state_for(&conversation_id);
+
+    alice
+        .orchestrator
+        .force_rejoin(&conversation_id)
+        .await
+        .expect_err("unreadable reset authority must fail closed");
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_join_active_projection_serializes_with_newer_reset() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("post join projection race", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, vec![0x78; 16], 1)
+        .await
+        .expect("record generation one");
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
+    let active_barrier = alice
+        .storage
+        .pause_next_conversation_state_write(&conversation_id, ConversationState::Active);
+
+    let readiness = alice
+        .orchestrator
+        .ensure_conversation_ready(&conversation_id);
+    let newer_reset = async {
+        active_barrier.wait_until_entered().await;
+        let mut recording = Box::pin(alice.orchestrator.record_group_reset_with_outcome(
+            &conversation_id,
+            vec![0x79; 16],
+            2,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording)
+                .await
+                .is_err(),
+            "newer reset must wait while final Active projection owns the transition gate"
+        );
+        active_barrier.release();
+        recording.await
+    };
+    let (ready_result, reset_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(readiness, newer_reset)
+        })
+        .await
+        .expect("post-join projection race timed out");
+
+    ready_result.expect("generation one recovery");
+    assert_eq!(
+        reset_result.expect("generation two reset"),
+        ResetRecordOutcome::Recorded
+    );
+    assert_eq!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .expect("generation two remains authoritative")
+            .reset_generation,
+        2
+    );
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_needs_rejoin_projection_serializes_with_reset() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("startup projection race", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    alice
+        .orchestrator
+        .mls_context()
+        .delete_group(hex::decode(&conversation.group_id).expect("group id"))
+        .expect("delete local group");
+    alice
+        .storage
+        .set_conversation_state(&conversation_id, ConversationState::NeedsRejoin)
+        .await
+        .expect("seed NeedsRejoin");
+    let write_barrier = alice
+        .storage
+        .pause_next_conversation_state_write(&conversation_id, ConversationState::NeedsRejoin);
+
+    let reconcile = alice.orchestrator.startup_reconcile();
+    let reset = async {
+        write_barrier.wait_until_entered().await;
+        let mut recording = Box::pin(alice.orchestrator.record_group_reset_with_outcome(
+            &conversation_id,
+            vec![0x7a; 16],
+            3,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording)
+                .await
+                .is_err(),
+            "reset must wait while startup projection owns the transition gate"
+        );
+        write_barrier.release();
+        recording.await
+    };
+    let (reconcile_result, reset_result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(reconcile, reset)
+        })
+        .await
+        .expect("startup projection race timed out");
+
+    reconcile_result.expect("startup reconcile");
+    assert_eq!(
+        reset_result.expect("record reset"),
+        ResetRecordOutcome::Recorded
+    );
+    assert_eq!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .expect("reset remains authoritative")
+            .reset_generation,
+        3
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_non_reset_read_cannot_downgrade_cached_reset_authority() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("stale reset authority read", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, vec![0x7b; 16], 4)
+        .await
+        .expect("record reset");
+    alice
+        .storage
+        .override_next_conversation_state_read(&conversation_id, Some(ConversationState::Active));
+
+    let _ = alice.orchestrator.force_rejoin(&conversation_id).await;
+
+    assert!(matches!(
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&conversation_id),
+        Some(ConversationState::ResetPending {
+            reset_generation: 4,
+            ..
+        })
+    ));
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0,
+        "stale non-reset read must not authorize External Commit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_reconcile_stale_failed_read_cannot_downgrade_cached_reset_authority() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("startup stale failed", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, vec![0x7c; 16], 6)
+        .await
+        .expect("record reset");
+    alice
+        .storage
+        .override_next_conversation_state_read(&conversation_id, Some(ConversationState::Failed));
+
+    alice
+        .orchestrator
+        .startup_reconcile()
+        .await
+        .expect("startup reconcile");
+
+    assert!(matches!(
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&conversation_id),
+        Some(ConversationState::ResetPending {
+            reset_generation: 6,
+            ..
+        })
+    ));
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completion_cas_mismatch_stale_active_reload_preserves_cached_reset_authority() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("completion stale reload", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    let target = vec![0x7d; 16];
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, target, 8)
+        .await
+        .expect("record reset");
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
+    alice
+        .storage
+        .force_next_complete_reset_pending_false_with_reload(Some(ConversationState::Active));
+
+    assert!(alice
+        .orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .is_err());
+
+    assert!(matches!(
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&conversation_id),
+        Some(ConversationState::ResetPending {
+            reset_generation: 8,
+            ..
+        })
+    ));
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn welcome_network_error_with_reset_pending_never_authorizes_external_commit() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("welcome network reset boundary", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, vec![0x72; 16], 6)
+        .await
+        .expect("record reset");
+    world.delivery_service().fail_next_get_welcome();
+
+    let result = alice.orchestrator.join_or_rejoin(&conversation_id).await;
+    assert!(result.is_err());
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&conversation_id),
+        0,
+        "non-404 Welcome uncertainty cannot bypass durable reset authority"
+    );
+    assert_eq!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&conversation_id)
+            .expect("reset authority must survive")
+            .reset_generation,
+        6
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completion() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    world.register_device("Bob").await.expect("register Bob");
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+
+    let original = alice
+        .orchestrator
+        .create_group("reset welcome baseline", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("create baseline conversation");
+    let baseline_welcome = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_welcome(&original.conversation_id)
+        .await
+        .expect("baseline Welcome for Bob");
+    bob.orchestrator
+        .join_group(&baseline_welcome)
+        .await
+        .expect("Bob joins baseline conversation");
+    bob.storage
+        .set_epoch_pair_for_test(&original.conversation_id, 741, 742);
+
+    let loser_target = vec![0x91; 16];
+    let loser_target_hex = hex::encode(&loser_target);
+    bob.orchestrator
+        .record_group_reset(&original.conversation_id, loser_target.clone(), 23)
+        .await
+        .expect("record loser reset target");
+    bob.orchestrator
+        .mls_context()
+        .create_group_with_id(
+            bob.did.as_bytes().to_vec(),
+            loser_target.clone(),
+            Some(catbird_mls::GroupConfig::default()),
+        )
+        .expect("materialize loser bootstrap candidate");
+
+    let winner = alice
+        .orchestrator
+        .create_group("reset winner", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("winner creates replacement group and Welcome");
+    assert_ne!(winner.group_id, loser_target_hex);
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&winner.conversation_id, &original.conversation_id);
+    let authoritative = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_conversations(100, None)
+        .await
+        .expect("read authoritative server mapping")
+        .conversations
+        .into_iter()
+        .find(|view| view.conversation_id == original.conversation_id)
+        .expect("stable conversation remains server-authoritative");
+    assert_eq!(authoritative.group_id, winner.group_id);
+
+    bob.orchestrator
+        .join_or_rejoin(&original.conversation_id)
+        .await
+        .expect("verified winner Welcome must replace the losing reset target");
+
+    assert!(
+        !bob.orchestrator
+            .mls_context()
+            .group_exists(loser_target.clone()),
+        "the losing target must already be deleted before the next operation"
+    );
+    assert!(
+        bob.orchestrator.mls_context().group_exists(
+            hex::decode(&winner.group_id).expect("winner group id before immediate send")
+        ),
+        "the committed winner must be locally available before the next operation"
+    );
+    let stable_message_count_before_send = world
+        .delivery_service()
+        .message_count(&original.conversation_id);
+    bob.orchestrator
+        .send_message(
+            &original.conversation_id,
+            "immediate message after winner adoption",
+        )
+        .await
+        .expect("the stable conversation must resolve to the committed winner before sync");
+    assert_eq!(
+        world
+            .delivery_service()
+            .message_count(&original.conversation_id),
+        stable_message_count_before_send + 1,
+        "the first post-adoption operation must succeed through the stable conversation route"
+    );
+
+    assert!(
+        bob.storage
+            .get_persisted_reset_pending(&original.conversation_id)
+            .is_none(),
+        "exact generation/target completion must clear ResetPending"
+    );
+    assert!(!bob.storage.has_rejoin_flag(&original.conversation_id));
+    let completed = bob
+        .storage
+        .get_conversation(&bob.did, &original.conversation_id)
+        .await
+        .expect("read Bob conversation")
+        .expect("Bob stable conversation survives");
+    let winner_epoch = bob
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&winner.group_id).expect("winner group id for epoch"))
+        .expect("winner epoch");
+    assert_eq!(completed.group_id, winner.group_id);
+    assert_eq!(completed.epoch, winner_epoch);
+    assert_eq!(
+        bob.storage.join_epoch_for_test(&original.conversation_id),
+        Some(winner_epoch)
+    );
+    assert!(!bob.orchestrator.mls_context().group_exists(loser_target));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(&winner.group_id).expect("winner group id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_carries_adopted_reset_winner_past_a_stale_listing_snapshot() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x9a, 41).await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+
+    // Give the winner creator the same stable route used by the rekeyed mock
+    // server so it can enqueue a valid winner-epoch application message while
+    // Bob's stale list page is paused.
+    {
+        let mut conversations = alice.orchestrator.conversations().lock().await;
+        let mut winner_view = conversations
+            .remove(&winner_id)
+            .expect("Alice caches the replacement conversation");
+        winner_view.conversation_id = conversation_id.clone();
+        conversations.insert(conversation_id.clone(), winner_view);
+    }
+    alice
+        .storage
+        .set_conversation_group_id_for_test(&conversation_id, &winner_id);
+
+    // Model a sync page captured while the list projection still points at
+    // the losing reset target. The live conversation mapping and Welcome are
+    // switched back to the committed winner before recovery consults them.
+    bob.orchestrator
+        .mls_context()
+        .delete_group(loser.clone())
+        .expect("remove loser so stale sync enters join/rejoin");
+    let loser_hex = hex::encode(&loser);
+    let loser_state_before = bob
+        .storage
+        .get_group_state(&loser_hex)
+        .await
+        .expect("read losing reset projection")
+        .expect("reset recording persists its target projection");
+    world
+        .delivery_service()
+        .set_conversation_group_id_for_test(&conversation_id, &loser_hex);
+    let listing_gate = world.delivery_service().pause_next_get_conversations();
+
+    let sync = bob.orchestrator.sync_with_server(true);
+    let restore_authoritative_winner = async {
+        listing_gate.wait_until_reached().await;
+        world
+            .delivery_service()
+            .set_conversation_group_id_for_test(&conversation_id, &winner_id);
+        alice
+            .orchestrator
+            .send_message(&conversation_id, "winner message queued behind stale page")
+            .await
+            .expect("winner creator queues valid app ciphertext");
+        listing_gate.release();
+    };
+    let (sync_result, ()) = tokio::join!(sync, restore_authoritative_winner);
+    sync_result.expect("sync must recover through the authoritative winner");
+
+    let winner_epoch = bob
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&winner_id).expect("winner group id"))
+        .expect("winner must be locally joined");
+    let stored = bob
+        .storage
+        .get_conversation(&bob.did, &conversation_id)
+        .await
+        .expect("read stable conversation")
+        .expect("stable conversation remains persisted");
+    assert_eq!(stored.group_id, winner_id);
+    assert_eq!(stored.epoch, winner_epoch);
+    assert!(bob.storage.has_group_state(&winner_id));
+    let loser_state_after = bob
+        .storage
+        .get_group_state(&loser_hex)
+        .await
+        .expect("reread losing reset projection")
+        .expect("the pre-existing reset projection may remain for legacy cleanup");
+    assert_eq!(loser_state_after.group_id, loser_state_before.group_id);
+    assert_eq!(
+        loser_state_after.conversation_id,
+        loser_state_before.conversation_id
+    );
+    assert_eq!(loser_state_after.epoch, loser_state_before.epoch);
+    assert_eq!(loser_state_after.members, loser_state_before.members);
+    {
+        let states = bob.orchestrator.group_states().lock().await;
+        let state = states
+            .get(&winner_id)
+            .expect("winner is the sole in-memory group-state projection");
+        assert_eq!(state.conversation_id, conversation_id);
+        assert_eq!(state.group_id, winner_id);
+        assert_eq!(state.epoch, winner_epoch);
+        assert!(!states.contains_key(&loser_hex));
+    }
+    assert!(
+        !bob.storage.has_rejoin_flag(&conversation_id),
+        "successful winner adoption must not schedule a second stale rejoin"
+    );
+    let received = bob
+        .storage
+        .get_messages(&conversation_id, 20, None)
+        .await
+        .expect("read messages decrypted by sync");
+    assert!(
+        received
+            .iter()
+            .any(|message| message.text == "winner message queued behind stale page"),
+        "the same sync item must fetch and decrypt app traffic through winner W"
+    );
+
+    let before = world.delivery_service().message_count(&conversation_id);
+    bob.orchestrator
+        .send_message(
+            &conversation_id,
+            "message immediately after stale-page recovery",
+        )
+        .await
+        .expect("the same sync pass must leave the stable route on the winner");
+    assert_eq!(
+        world.delivery_service().message_count(&conversation_id),
+        before + 1
+    );
+}
+
+async fn setup_winner_welcome_adoption_fixture(
+    loser_byte: u8,
+    generation: i32,
+) -> (TestWorld, String, Vec<u8>, String) {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    world.register_device("Bob").await.expect("register Bob");
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let original = alice
+        .orchestrator
+        .create_group("winner adoption baseline", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("create baseline");
+    let baseline_welcome = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_welcome(&original.conversation_id)
+        .await
+        .expect("baseline Welcome");
+    bob.orchestrator
+        .join_group(&baseline_welcome)
+        .await
+        .expect("Bob joins baseline");
+    let loser = vec![loser_byte; 16];
+    bob.orchestrator
+        .record_group_reset(&original.conversation_id, loser.clone(), generation)
+        .await
+        .expect("record loser authority");
+    bob.orchestrator
+        .mls_context()
+        .create_group_with_id(
+            bob.did.as_bytes().to_vec(),
+            loser.clone(),
+            Some(catbird_mls::GroupConfig::default()),
+        )
+        .expect("materialize loser");
+    let winner = alice
+        .orchestrator
+        .create_group("authoritative winner", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("create winner");
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&winner.conversation_id, &original.conversation_id);
+    (world, original.conversation_id, loser, winner.group_id)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn committed_winner_adoption_response_loss_rereads_then_completes_exactly() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x92, 31).await;
+    let bob = world.client("Bob");
+    bob.storage.fail_next_adopt_reset_pending_after_commit();
+
+    bob.orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect("exact durable reread must recover a committed adoption");
+
+    assert!(bob
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .is_none());
+    assert!(!bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(!bob.orchestrator.mls_context().group_exists(loser));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(winner_id).expect("winner id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_adoption_with_failed_reread_preserves_both_candidates_and_reset_route() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x97, 61).await;
+    let bob = world.client("Bob");
+    bob.storage
+        .fail_next_adopt_reset_pending_after_commit_with_read_failure();
+
+    let error = bob
+        .orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect_err("ambiguous adoption plus failed reread must fail closed");
+    assert!(error.to_string().contains("authority reread failed"));
+    let pending = bob
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("committed adopted authority survives for restart");
+    assert_eq!(pending.reset_generation, 61);
+    assert_eq!(pending.new_group_id_hex, winner_id);
+    assert!(bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(bob.orchestrator.mls_context().group_exists(loser));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(winner_id).expect("winner id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_reset_generation_wins_adoption_cas_without_candidate_cleanup() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x93, 41).await;
+    let bob = world.client("Bob");
+    let newer_target = vec![0x94; 16];
+    let adoption = bob.storage.pause_next_reset_adoption(&conversation_id);
+    let mut recovery = Box::pin(bob.orchestrator.join_or_rejoin(&conversation_id));
+    tokio::select! {
+        _ = adoption.wait_until_entered() => {}
+        result = &mut recovery => panic!("recovery completed before adoption CAS: {result:?}"),
+    }
+    bob.storage
+        .mark_reset_pending(
+            &conversation_id,
+            &hex::encode(&newer_target),
+            42,
+            1_800_000_000_000,
+        )
+        .await
+        .expect("simulate newer cross-process reset authority");
+    adoption.release();
+
+    let error = recovery
+        .await
+        .expect_err("stale generation must not adopt or complete");
+    assert!(error
+        .to_string()
+        .contains("newer or competing reset authority"));
+    let pending = bob
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("newer authority survives");
+    assert_eq!(pending.reset_generation, 42);
+    assert_eq!(pending.new_group_id_hex, hex::encode(newer_target));
+    assert!(bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(bob.orchestrator.mls_context().group_exists(loser));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(winner_id).expect("winner id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_authority_at_exact_completion_preserves_adopted_winner_group() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x98, 71).await;
+    let bob = world.client("Bob");
+    let newer_target = hex::encode(vec![0x99; 16]);
+    bob.storage
+        .set_epoch_pair_for_test(&conversation_id, 741, 742);
+    bob.orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get_mut(&conversation_id)
+        .expect("seed cached predecessor epoch")
+        .epoch = 743;
+    let durable_before_failure = bob
+        .storage
+        .get_conversation(&bob.did, &conversation_id)
+        .await
+        .expect("read pre-failure durable state")
+        .expect("pre-failure durable state");
+    let cached_before_failure = bob
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .expect("read pre-failure cache")
+        .clone();
+    bob.storage
+        .force_next_complete_reset_pending_false_with_reload(Some(
+            ConversationState::ResetPending {
+                new_group_id: newer_target.clone(),
+                reset_generation: 72,
+                notified_at_ms: 1_800_000_000_001,
+            },
+        ));
+
+    let error = bob
+        .orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect_err("newer completion authority must fail closed");
+    assert!(error.to_string().contains("newer reset generation"));
+    assert!(matches!(
+        bob.orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&conversation_id),
+        Some(ConversationState::ResetPending {
+            new_group_id,
+            reset_generation: 72,
+            ..
+        }) if new_group_id == &newer_target
+    ));
+    let cached = bob
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .expect("stable conversation cache survives failed completion")
+        .clone();
+    assert_eq!(cached.group_id, cached_before_failure.group_id);
+    assert_eq!(cached.epoch, cached_before_failure.epoch);
+    let durable = bob
+        .storage
+        .get_conversation(&bob.did, &conversation_id)
+        .await
+        .expect("read durable predecessor")
+        .expect("durable predecessor survives");
+    assert_eq!(durable.group_id, durable_before_failure.group_id);
+    assert_eq!(durable.epoch, durable_before_failure.epoch);
+    assert_eq!(bob.storage.join_epoch_for_test(&conversation_id), Some(742));
+    assert!(bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(!bob.orchestrator.mls_context().group_exists(loser));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(winner_id).expect("winner id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn welcome_not_matching_server_winner_is_deleted_without_touching_loser_authority() {
+    let (world, conversation_id, loser, welcome_group_id) =
+        setup_winner_welcome_adoption_fixture(0x95, 51).await;
+    let bob = world.client("Bob");
+    let competing_server_winner = hex::encode(vec![0x96; 16]);
+    world
+        .delivery_service()
+        .set_conversation_group_id_for_test(&conversation_id, &competing_server_winner);
+
+    let error = bob
+        .orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect_err("unbound Welcome must fail closed");
+    assert!(error.to_string().contains("authoritative server mapping"));
+    let pending = bob
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("loser reset authority remains");
+    assert_eq!(pending.reset_generation, 51);
+    assert_eq!(pending.new_group_id_hex, hex::encode(&loser));
+    assert!(bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(bob.orchestrator.mls_context().group_exists(loser));
+    assert!(!bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(welcome_group_id).expect("Welcome group id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_arriving_after_completion_cas_is_serialized_after_active_projection() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let conversation = alice
+        .orchestrator
+        .create_group("post completion reset serialization", None, None)
+        .await
+        .expect("create conversation");
+    let conversation_id = conversation.conversation_id.clone();
+    let generation_one_group = vec![0x61; 16];
+    let generation_two_group = vec![0x62; 16];
+
+    alice
+        .orchestrator
+        .record_group_reset(&conversation_id, generation_one_group, 1)
+        .await
+        .expect("record generation one");
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
+    let completion_barrier = alice.storage.pause_next_reset_completion(&conversation_id);
+
+    let complete_generation_one = alice.orchestrator.join_or_rejoin(&conversation_id);
+    let record_generation_two = async {
+        completion_barrier.wait_until_entered().await;
+        // The durable generation-one CAS has committed. Releasing its callback
+        // lets the owner finish cache projection and drop the shared transition
+        // lock; this reset must serialize strictly after that lifecycle step.
+        completion_barrier.release();
+        alice
+            .orchestrator
+            .record_group_reset_with_outcome(&conversation_id, generation_two_group.clone(), 2)
+            .await
+    };
+    let (completion, generation_two_outcome) =
+        tokio::join!(complete_generation_one, record_generation_two);
+
+    completion.expect("generation one completion should commit");
+    assert_eq!(
+        generation_two_outcome.expect("generation two should record after completion"),
+        ResetRecordOutcome::Recorded
+    );
+    let persisted = alice
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("generation two must remain the final durable authority");
+    assert_eq!(persisted.reset_generation, 2);
+    assert_eq!(
+        persisted.new_group_id_hex,
+        hex::encode(&generation_two_group)
+    );
+    assert!(matches!(
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&conversation_id),
+        Some(ConversationState::ResetPending {
+            reset_generation: 2,
+            ..
+        })
+    ));
+    assert!(alice.storage.has_rejoin_flag(&conversation_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]

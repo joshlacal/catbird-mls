@@ -54,7 +54,7 @@ pub struct WasmChatMessage {
 
 fn convo_view_to_wasm_conversation(cv: &ConversationView) -> WasmConversation {
     WasmConversation {
-        id: cv.group_id.clone(),
+        id: cv.conversation_id.clone(),
         name: cv.metadata.as_ref().and_then(|m| m.name.clone()),
         participants: cv
             .members
@@ -451,5 +451,28 @@ where
 {
     async fn shutdown(&self, _request: ShutdownRequest) {
         WasmCatbirdClient::shutdown(self).await;
+    }
+}
+
+#[cfg(test)]
+mod stable_identity_tests {
+    use super::*;
+
+    #[test]
+    fn projected_id_remains_stable_for_leave_actions_after_group_rotation() {
+        let view = ConversationView {
+            group_id: "mutable-group-id".to_string(),
+            conversation_id: "stable-conversation-id".to_string(),
+            epoch: 7,
+            members: Vec::new(),
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+        };
+
+        let projected = convo_view_to_wasm_conversation(&view);
+
+        assert_eq!(projected.id, view.conversation_id);
     }
 }

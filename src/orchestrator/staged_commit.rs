@@ -60,11 +60,8 @@ where
         conversation_id: &str,
         kind: CommitKind,
     ) -> Result<CommitPlan> {
-        let group_id = self
-            .group_id_hex_for_conversation(conversation_id)
-            .await
-            .unwrap_or_else(|| conversation_id.to_string());
-        self.stage_commit_for_group(conversation_id, &group_id, kind)
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        self.stage_commit_for_group(&resolved.conversation_id, &resolved.group_id, kind)
             .await
     }
 
@@ -319,7 +316,7 @@ where
         };
 
         // Epoch-secret retention (spec §10).
-        self.cleanup_epoch_secrets_if_needed(&handle.group_id, new_epoch)
+        self.cleanup_epoch_secrets_if_needed(&meta.conversation_id, &handle.group_id, new_epoch)
             .await;
 
         // Update in-memory group state based on which kind of commit this
@@ -327,7 +324,11 @@ where
         // the confirm (the merge already succeeded).
         {
             let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.get_mut(&handle.group_id) {
+            let resolved = ResolvedConversationContext {
+                conversation_id: meta.conversation_id.clone(),
+                group_id: handle.group_id.clone(),
+            };
+            if let Some(mut gs) = resolved.group_state(&states).cloned() {
                 gs.epoch = new_epoch;
                 match &meta.kind {
                     StagedCommitKindSummary::AddMembers { member_dids } => {
@@ -356,6 +357,7 @@ where
                     }
                 }
                 let state_clone = gs.clone();
+                normalize_group_state(&mut states, gs);
                 drop(states);
                 if let Err(e) = self.storage().set_group_state(&state_clone).await {
                     tracing::warn!(

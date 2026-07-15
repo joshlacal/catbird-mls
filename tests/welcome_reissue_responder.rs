@@ -113,6 +113,62 @@ async fn responds_with_swap_and_idempotency_key() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rotated_reissue_keeps_cleanup_bound_to_stable_conversation() {
+    let mut world = TestWorld::new();
+    world.add_client("Admin").await;
+    world.add_client("Recipient").await;
+    world.register_device("Admin").await.unwrap();
+    world.register_device("Recipient").await.unwrap();
+    let recipient_did = world.client("Recipient").did.clone();
+    let admin = world.client("Admin");
+    let convo = admin
+        .orchestrator
+        .create_group(
+            "rotated-reissue-responder",
+            Some(std::slice::from_ref(&recipient_did)),
+            None,
+        )
+        .await
+        .expect("create group");
+    let group_id = convo.group_id.clone();
+    let stable_conversation_id = format!("convo-{group_id}");
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&convo.conversation_id, &stable_conversation_id);
+    admin
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh rotated mapping");
+    let cleanup_count_before = admin.storage.epoch_cleanup_calls().len();
+
+    for attempt in 0..6 {
+        admin
+            .orchestrator
+            .respond_to_welcome_reissue(
+                &stable_conversation_id,
+                &format!("{recipient_did}#stale-device"),
+                &format!("rotated-reissue-request-{attempt}"),
+            )
+            .await
+            .expect("rotated reissue response");
+    }
+
+    let cleanup_calls = admin.storage.epoch_cleanup_calls();
+    let new_calls = &cleanup_calls[cleanup_count_before..];
+    assert!(!new_calls.is_empty(), "expected epoch cleanup after commit");
+    assert!(
+        new_calls
+            .iter()
+            .all(|(conversation_id, _)| conversation_id == &stable_conversation_id),
+        "cleanup must remain stable-conversation keyed: {new_calls:?}"
+    );
+    assert!(new_calls
+        .iter()
+        .all(|(conversation_id, _)| conversation_id != &group_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unknown_conversation_is_unfulfillable() {
     let mut world = TestWorld::new();
     world.add_client("Admin").await;

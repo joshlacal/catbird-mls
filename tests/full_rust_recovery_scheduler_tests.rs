@@ -270,6 +270,102 @@ async fn debug_wipe_local_group_preserves_conversation_and_marks_rejoin() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn debug_wipe_refuses_reset_pending_without_deleting_reset_target() {
+    let shared_server = MockDeliveryService::new("did:plc:bootstrap");
+    let alice = TestClientHarness::new("alice-debug-wipe-reset", &shared_server).await;
+    alice.initialize().await;
+
+    let predecessor = alice
+        .orchestrator
+        .create_group("Debug wipe predecessor", None, None)
+        .await
+        .expect("create predecessor");
+    let target = alice
+        .orchestrator
+        .create_group("Debug wipe reset target", None, None)
+        .await
+        .expect("create reset target");
+    let target_bytes = hex::decode(&target.group_id).expect("target group id hex");
+    let target_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(target_bytes.clone())
+        .expect("materialized target epoch");
+    alice
+        .orchestrator
+        .record_group_reset_with_outcome(&predecessor.conversation_id, target_bytes.clone(), 4)
+        .await
+        .expect("record reset authority");
+
+    let error = alice
+        .orchestrator
+        .debug_wipe_local_group_for_recovery(&predecessor.conversation_id)
+        .await
+        .expect_err("ResetPending must block destructive debug wipe");
+    assert!(error.to_string().to_lowercase().contains("reset"));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(target_bytes)
+            .expect("reset target must remain materialized"),
+        target_epoch
+    );
+    let pending = alice
+        .storage
+        .get_persisted_reset_pending(&predecessor.conversation_id)
+        .expect("reset authority remains durable");
+    assert_eq!(pending.reset_generation, 4);
+    assert!(alice.storage.has_rejoin_flag(&predecessor.conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn debug_wipe_fails_closed_when_reset_authority_is_unreadable() {
+    let shared_server = MockDeliveryService::new("did:plc:bootstrap");
+    let alice = TestClientHarness::new("alice-debug-wipe-read", &shared_server).await;
+    alice.initialize().await;
+
+    let created = alice
+        .orchestrator
+        .create_group("Debug wipe read failure", None, None)
+        .await
+        .expect("create group");
+    let group_bytes = hex::decode(&created.group_id).expect("group id hex");
+    let epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .expect("group epoch before wipe");
+    alice
+        .storage
+        .fail_next_get_conversation_state_for(&created.conversation_id);
+
+    alice
+        .orchestrator
+        .debug_wipe_local_group_for_recovery(&created.conversation_id)
+        .await
+        .expect_err("unreadable reset authority must fail closed");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes)
+            .expect("group must remain after failed authority read"),
+        epoch
+    );
+    assert!(
+        alice
+            .storage
+            .get_group_state(&created.conversation_id)
+            .await
+            .expect("read group state")
+            .is_some(),
+        "group-state projection must remain intact"
+    );
+    assert!(!alice.storage.has_rejoin_flag(&created.conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn deferred_recovery_respects_success_cooldown() {
     let fixture = RecoverySchedulerFixture::with_missing_local_group_and_available_welcome().await;
 

@@ -71,19 +71,12 @@ where
             return projected;
         }
 
-        let group_id = self
-            .group_states()
-            .lock()
-            .await
-            .values()
-            .find(|group| group.conversation_id == conversation_id)
-            .map(|group| group.group_id.clone());
-
-        let Some(group_id) = group_id else {
-            return projected;
+        let resolved = match self.resolve_conversation_context(conversation_id).await {
+            Ok(resolved) => resolved,
+            Err(_) => return ConversationRecoveryState::GroupMissing,
         };
-        let Ok(group_id_bytes) = hex::decode(&group_id) else {
-            return projected;
+        let Ok(group_id_bytes) = resolved.group_id_bytes() else {
+            return ConversationRecoveryState::GroupMissing;
         };
 
         match self.mls_context().get_epoch(group_id_bytes) {
@@ -178,28 +171,9 @@ where
 
         match self.join_or_rejoin(convo_id).await {
             Ok(epoch) => {
-                // A successful Welcome join or External Commit rejoin means the
-                // group is healthy again — clear the stale NeedsRejoin so the
-                // re-projection below returns Healthy and sends are unblocked.
-                //
-                // Without this the conversation is permanently stuck "needs
-                // repair": force_rejoin's success path clears the RecoveryTracker
-                // failure *counters* (clear_rejoin_failures) but never transitions
-                // `conversation_states` out of NeedsRejoin. So ready_result keeps
-                // reporting send_allowed=false, and every open re-runs an
-                // epoch-inflating External Commit (the spec's forbidden
-                // "force_rejoin in automated recovery" anti-pattern, in a loop).
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(convo_id.to_string(), ConversationState::Active);
-                if let Err(e) = self
-                    .storage()
-                    .set_conversation_state(convo_id, ConversationState::Active)
-                    .await
-                {
-                    tracing::warn!(error = %e, convo_id, "Failed to persist Active state after successful rejoin");
-                }
+                // join_or_rejoin owns the transition gate through its final
+                // fail-closed Active projection. Never repeat that write after
+                // the gate is released: a newer reset may already own authority.
                 crate::warn_log!(
                     "[REJOIN-DIAG] convo={} rejoin succeeded — cleared NeedsRejoin -> Active (epoch={})",
                     convo_id,
@@ -312,8 +286,16 @@ where
             });
         }
 
-        let group_id_bytes = hex::decode(conversation_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+        let resolved = self
+            .resolve_conversation_context(conversation_id)
+            .await
+            .map_err(|error| match error {
+                OrchestratorError::ConversationNotFound(_) => OrchestratorError::NotJoined {
+                    convo_id: conversation_id.to_string(),
+                },
+                other => other,
+            })?;
+        let group_id_bytes = resolved.group_id_bytes()?;
 
         let payload_bytes = payload.encode().map_err(|e| {
             OrchestratorError::InvalidInput(format!("Failed to encode message payload: {e}"))
@@ -416,11 +398,10 @@ where
             }
             Err(err) => {
                 tracing::warn!(conversation_id, error = %err, "FFI get_epoch failed, using cached group state");
-                self.group_states()
-                    .lock()
-                    .await
-                    .get(conversation_id)
-                    .map(|gs| gs.epoch)
+                let states = self.group_states().lock().await;
+                resolved
+                    .group_state(&states)
+                    .map(|state| state.epoch)
                     .unwrap_or(0)
             }
         };
@@ -700,6 +681,25 @@ where
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
+        // Resolve the stable conversation identity before touching deduplication or
+        // self-commit replay state. Input for an unknown conversation must fail
+        // closed without consuming state belonging to an authoritative context.
+        let resolved = match self
+            .resolve_conversation_context(&envelope.conversation_id)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(OrchestratorError::ConversationNotFound(_)) => {
+                tracing::debug!(
+                    conversation_id = %envelope.conversation_id,
+                    "process_incoming: no authoritative conversation-to-group mapping"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let group_id_bytes = resolved.group_id_bytes()?;
+
         // Dedup check
         if let Some(ref msg_id) = envelope.server_message_id {
             if self.storage().message_exists(msg_id).await? {
@@ -724,9 +724,6 @@ where
             );
             return Ok(None);
         }
-
-        let group_id_bytes = hex::decode(&envelope.conversation_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
         // Decrypt via MLS FFI.
         //
@@ -791,13 +788,13 @@ where
                 // NeedsRejoin counters --- those drive auto-External-Commits, which
                 // is exactly the cascade we are trying to break.
                 let local_epoch = self.mls_context().get_epoch(group_id_bytes.clone()).ok();
-                let msg_epoch_for_class = self
-                    .group_states()
-                    .lock()
-                    .await
-                    .get(&envelope.conversation_id)
-                    .map(|gs| gs.epoch)
-                    .unwrap_or(0);
+                let msg_epoch_for_class = {
+                    let states = self.group_states().lock().await;
+                    resolved
+                        .group_state(&states)
+                        .map(|state| state.epoch)
+                        .unwrap_or(0)
+                };
                 if Self::classify_peer_bad(&e, local_epoch, msg_epoch_for_class) {
                     let msg_id = envelope.server_message_id.clone().unwrap_or_else(|| {
                         format!("unknown-{}", chrono::Utc::now().timestamp_millis())
@@ -813,70 +810,45 @@ where
                     return Err(OrchestratorError::from(e));
                 }
                 // Track consecutive decrypt failures for fork detection + divergence recovery
-                {
+                let failure_count = {
                     let mut counts = self.decrypt_fail_counts().lock().await;
                     let count = counts.entry(envelope.conversation_id.clone()).or_insert(0);
                     *count += 1;
-                    if *count >= constants::DECRYPTION_FAILURE_THRESHOLD {
-                        let fa = self
-                            .fork_detection_states()
-                            .lock()
-                            .ok()
-                            .and_then(|fds| fds.get(&envelope.conversation_id).cloned())
-                            .is_some_and(|s| s.readd_attempts < constants::FORK_READD_MAX_ATTEMPTS);
-                        if fa {
-                            tracing::info!(conversation_id = %envelope.conversation_id, "Fork readd in-flight, deferring");
-                        } else {
-                            tracing::error!(conversation_id = %envelope.conversation_id, failures = *count, "Marking for rejoin");
-                            if let Ok(mut fds) = self.fork_detection_states().lock() {
-                                fds.remove(&envelope.conversation_id);
-                            }
-                            self.conversation_states().lock().await.insert(
-                                envelope.conversation_id.clone(),
-                                ConversationState::NeedsRejoin,
-                            );
-                            // WS-5.2: the deferred-recovery loop consumes ONLY
-                            // the persisted flag — a dropped write here would
-                            // silently cancel recovery on the most common
-                            // trigger (persistent decrypt failure). Escalate,
-                            // and reset the counter only after the flag-write
-                            // path has run.
-                            self.mark_needs_rejoin_critical(&envelope.conversation_id)
-                                .await;
-                            *count = 0;
+                    *count
+                };
+                if failure_count >= constants::DECRYPTION_FAILURE_THRESHOLD {
+                    let fa = self
+                        .fork_detection_states()
+                        .lock()
+                        .ok()
+                        .and_then(|fds| fds.get(&envelope.conversation_id).cloned())
+                        .is_some_and(|s| s.readd_attempts < constants::FORK_READD_MAX_ATTEMPTS);
+                    if fa {
+                        tracing::info!(conversation_id = %envelope.conversation_id, "Fork readd in-flight, deferring");
+                    } else {
+                        tracing::error!(conversation_id = %envelope.conversation_id, failures = failure_count, "Marking for rejoin");
+                        if let Ok(mut fds) = self.fork_detection_states().lock() {
+                            fds.remove(&envelope.conversation_id);
                         }
-                    } else if *count == constants::FORK_DETECTION_THRESHOLD {
-                        let cs = self
-                            .conversation_states()
+                        self.project_runtime_needs_rejoin(&envelope.conversation_id)
+                            .await;
+                        self.decrypt_fail_counts()
                             .lock()
                             .await
-                            .get(&envelope.conversation_id)
-                            .cloned()
-                            .unwrap_or(ConversationState::Active);
-                        if cs == ConversationState::Active {
-                            let ep = self
-                                .mls_context()
-                                .get_epoch(group_id_bytes.clone())
-                                .unwrap_or(0);
-                            tracing::info!(conversation_id = %envelope.conversation_id, epoch = ep, "Fork threshold -- readd");
-                            self.conversation_states().lock().await.insert(
-                                envelope.conversation_id.clone(),
-                                ConversationState::ForkDetected,
-                            );
-                            if let Ok(mut fds) = self.fork_detection_states().lock() {
-                                fds.insert(
-                                    envelope.conversation_id.clone(),
-                                    ForkDetectionState {
-                                        detected_at_epoch: ep,
-                                        readd_attempts: 0,
-                                    },
-                                );
-                            }
-                            let cid = envelope.conversation_id.clone();
-                            drop(counts);
-                            let _ = self.attempt_fork_readd(&cid).await;
-                            return Err(OrchestratorError::from(e));
-                        }
+                            .insert(envelope.conversation_id.clone(), 0);
+                    }
+                } else if failure_count == constants::FORK_DETECTION_THRESHOLD {
+                    let ep = self
+                        .mls_context()
+                        .get_epoch(group_id_bytes.clone())
+                        .unwrap_or(0);
+                    if self
+                        .project_fork_detected_if_active(&envelope.conversation_id, ep)
+                        .await
+                    {
+                        tracing::info!(conversation_id = %envelope.conversation_id, epoch = ep, "Fork threshold -- readd");
+                        let _ = self.attempt_fork_readd(&envelope.conversation_id).await;
+                        return Err(OrchestratorError::from(e));
                     }
                 }
                 return Err(OrchestratorError::from(e));
@@ -896,10 +868,7 @@ where
                 .and_then(|mut fds| fds.remove(&envelope.conversation_id))
                 .is_some();
             if was {
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(envelope.conversation_id.clone(), ConversationState::Active);
+                self.project_runtime_active(&envelope.conversation_id).await;
             }
         }
 
@@ -1035,7 +1004,7 @@ where
             // Still update cached group state epoch
             {
                 let mut states = self.group_states().lock().await;
-                if let Some(gs) = states.get_mut(&envelope.conversation_id) {
+                if let Some(gs) = resolved.group_state_mut(&mut states) {
                     if decrypt_result.epoch > gs.epoch {
                         gs.epoch = decrypt_result.epoch;
                         let state_clone = gs.clone();
@@ -1052,8 +1021,12 @@ where
             }
 
             // Cleanup old epoch secrets after commit advances the epoch
-            self.cleanup_epoch_secrets_if_needed(&envelope.conversation_id, decrypt_result.epoch)
-                .await;
+            self.cleanup_epoch_secrets_if_needed(
+                &resolved.conversation_id,
+                &resolved.group_id,
+                decrypt_result.epoch,
+            )
+            .await;
 
             // Phase F: legacy plaintext metadata refresh-after-commit removed.
             // Under the cutover, group metadata is encrypted (see metadata.rs)
@@ -1172,7 +1145,7 @@ where
         // Update group state epoch if it advanced (and persist)
         {
             let mut states = self.group_states().lock().await;
-            if let Some(gs) = states.get_mut(&envelope.conversation_id) {
+            if let Some(gs) = resolved.group_state_mut(&mut states) {
                 if decrypt_result.epoch > gs.epoch {
                     gs.epoch = decrypt_result.epoch;
                     let state_clone = gs.clone();
