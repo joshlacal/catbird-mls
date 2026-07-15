@@ -46,10 +46,49 @@ where
             .await
     }
 
+    async fn reject_send_if_reset_pending(&self, conversation_id: &str) -> Result<()> {
+        if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
+            return Err(OrchestratorError::ResetCompletionNotCommitted {
+                convo_id: conversation_id.to_string(),
+                reset_generation: pending.reset_generation,
+                reason: "ResetPending authority prohibits message send".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) async fn project_conversation_recovery_state(
         &self,
         conversation_id: &str,
     ) -> ConversationRecoveryState {
+        match self
+            .project_conversation_recovery_state_result(conversation_id)
+            .await
+        {
+            Ok(projected) => projected,
+            Err(error) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %error,
+                    "recovery-state projection failed closed"
+                );
+                ConversationRecoveryState::UnrecoverableLocal
+            }
+        }
+    }
+
+    async fn project_conversation_recovery_state_result(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ConversationRecoveryState> {
+        if self
+            .reset_pending_payload_result(conversation_id)
+            .await?
+            .is_some()
+        {
+            return Ok(ConversationRecoveryState::ResetPending);
+        }
+
         let state = self
             .conversation_states()
             .lock()
@@ -68,21 +107,21 @@ where
         };
 
         if projected != ConversationRecoveryState::Healthy {
-            return projected;
+            return Ok(projected);
         }
 
         let resolved = match self.resolve_conversation_context(conversation_id).await {
             Ok(resolved) => resolved,
-            Err(_) => return ConversationRecoveryState::GroupMissing,
+            Err(_) => return Ok(ConversationRecoveryState::GroupMissing),
         };
         let Ok(group_id_bytes) = resolved.group_id_bytes() else {
-            return ConversationRecoveryState::GroupMissing;
+            return Ok(ConversationRecoveryState::GroupMissing);
         };
 
-        match self.mls_context().get_epoch(group_id_bytes) {
+        Ok(match self.mls_context().get_epoch(group_id_bytes) {
             Ok(_) => projected,
             Err(_) => ConversationRecoveryState::GroupMissing,
-        }
+        })
     }
 
     pub async fn ensure_conversation_ready(
@@ -92,7 +131,13 @@ where
         self.check_shutdown().await?;
         self.require_user_did().await?;
 
-        let projected = self.project_conversation_recovery_state(convo_id).await;
+        let had_in_memory_reset_authority = matches!(
+            self.conversation_states().lock().await.get(convo_id),
+            Some(ConversationState::ResetPending { .. })
+        );
+        let projected = self
+            .project_conversation_recovery_state_result(convo_id)
+            .await?;
         crate::warn_log!(
             "[REJOIN-DIAG] convo={} ensure_conversation_ready ENTRY projected={:?}",
             convo_id,
@@ -102,7 +147,9 @@ where
         if matches!(
             projected,
             ConversationRecoveryState::Recovering | ConversationRecoveryState::UnrecoverableLocal
-        ) {
+        ) || (projected == ConversationRecoveryState::ResetPending
+            && !had_in_memory_reset_authority)
+        {
             crate::warn_log!(
                 "[REJOIN-DIAG] convo={} ensure_conversation_ready EARLY-RETURN {:?} (Recovering/UnrecoverableLocal) — NOT calling join_or_rejoin",
                 convo_id,
@@ -156,7 +203,9 @@ where
             && projected == ConversationRecoveryState::NeedsRejoin
             && self.clear_needs_rejoin_if_locally_healthy(convo_id).await
         {
-            let projected = self.project_conversation_recovery_state(convo_id).await;
+            let projected = self
+                .project_conversation_recovery_state_result(convo_id)
+                .await?;
             let epoch = self
                 .local_group_epoch_result(convo_id)
                 .await?
@@ -179,7 +228,9 @@ where
                     convo_id,
                     epoch
                 );
-                let projected = self.project_conversation_recovery_state(convo_id).await;
+                let projected = self
+                    .project_conversation_recovery_state_result(convo_id)
+                    .await?;
                 let epoch = self
                     .local_group_epoch_result(convo_id)
                     .await?
@@ -189,7 +240,9 @@ where
             Err(OrchestratorError::NotAuthenticated) => Err(OrchestratorError::NotAuthenticated),
             Err(OrchestratorError::ShuttingDown) => Err(OrchestratorError::ShuttingDown),
             Err(_) => {
-                let projected = self.project_conversation_recovery_state(convo_id).await;
+                let projected = self
+                    .project_conversation_recovery_state_result(convo_id)
+                    .await?;
                 let epoch = match self.local_group_epoch_result(convo_id).await {
                     Ok(epoch) => epoch,
                     Err(err)
@@ -264,6 +317,8 @@ where
     ) -> Result<Message> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
+
+        self.reject_send_if_reset_pending(conversation_id).await?;
 
         tracing::debug!(conversation_id, "Sending message");
 
@@ -356,6 +411,13 @@ where
             }
         }
 
+        // Serialize only the final authorization + encryption + delivery attempt
+        // against reset transitions. Network catch-up above intentionally runs
+        // outside this per-conversation lock.
+        let transition_lock = self.rejoin_lock(conversation_id).await;
+        let transition_guard = transition_lock.lock().await;
+        self.reject_send_if_reset_pending(conversation_id).await?;
+
         // Encrypt via MLS.
         //
         // Task #43: `send` no longer self-heals via `join_or_rejoin` when the group
@@ -420,6 +482,7 @@ where
                 &message_id,
             )
             .await;
+        drop(transition_guard);
 
         // Extract response on success, handle errors
         let send_response = match send_result {
@@ -554,12 +617,17 @@ where
                     }
                 };
 
+                let retry_transition_lock = self.rejoin_lock(conversation_id).await;
+                let retry_transition_guard = retry_transition_lock.lock().await;
+                self.reject_send_if_reset_pending(conversation_id).await?;
+
                 let retry_encrypt = match self
                     .mls_context()
                     .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())
                 {
                     Ok(r) => r,
                     Err(e) => {
+                        drop(retry_transition_guard);
                         tracing::error!(
                             conversation_id,
                             error = %e,
@@ -577,7 +645,7 @@ where
                     .await
                     .insert(retry_commit_hash, web_time::Instant::now());
 
-                match self
+                let retry_send_result = self
                     .api_client()
                     .send_message_with_id(
                         conversation_id,
@@ -585,8 +653,10 @@ where
                         retry_epoch,
                         &message_id,
                     )
-                    .await
-                {
+                    .await;
+                drop(retry_transition_guard);
+
+                match retry_send_result {
                     Ok(resp) => {
                         self.failover_tracker()
                             .lock()
