@@ -3,7 +3,7 @@
 mod e2e_harness;
 
 use catbird_mls::orchestrator::{
-    ConversationReadyResult, ConversationRecoveryState, ConversationState,
+    error::OrchestratorError, ConversationReadyResult, ConversationRecoveryState, ConversationState,
 };
 use e2e_harness::TestWorld;
 
@@ -46,6 +46,102 @@ async fn healthy_local_group_returns_send_allowed_without_recovery_io() {
             .external_commit_count(&convo.conversation_id),
         0
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_reset_pending_existing_target_after_suspend_stays_not_ready() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Reset predecessor", None, None)
+        .await
+        .expect("create predecessor group");
+    let target = alice
+        .orchestrator
+        .create_group("Materialized reset target", None, None)
+        .await
+        .expect("create reset target group");
+
+    alice
+        .orchestrator
+        .record_group_reset(
+            &convo.conversation_id,
+            hex::decode(&target.group_id).expect("target group id must be hex"),
+            41,
+        )
+        .await
+        .expect("persist ResetPending");
+    alice.orchestrator.suspend().await.expect("suspend");
+    alice
+        .orchestrator
+        .resume_after_suspend(&did)
+        .await
+        .expect("resume");
+
+    let result = alice
+        .orchestrator
+        .ensure_conversation_ready(&convo.conversation_id)
+        .await
+        .expect("durable ResetPending should project as not ready");
+
+    assert_eq!(
+        result,
+        ConversationReadyResult {
+            recovery_state: ConversationRecoveryState::ResetPending,
+            epoch: None,
+            send_allowed: false,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_reset_authority_read_failure_after_suspend_propagates_closed() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Unreadable reset predecessor", None, None)
+        .await
+        .expect("create predecessor group");
+    let target = alice
+        .orchestrator
+        .create_group("Unreadable reset target", None, None)
+        .await
+        .expect("create reset target group");
+
+    alice
+        .orchestrator
+        .record_group_reset(
+            &convo.conversation_id,
+            hex::decode(&target.group_id).expect("target group id must be hex"),
+            42,
+        )
+        .await
+        .expect("persist ResetPending");
+    alice.orchestrator.suspend().await.expect("suspend");
+    alice
+        .orchestrator
+        .resume_after_suspend(&did)
+        .await
+        .expect("resume");
+    alice
+        .storage
+        .fail_next_get_conversation_state_for(&convo.conversation_id);
+
+    let error = alice
+        .orchestrator
+        .ensure_conversation_ready(&convo.conversation_id)
+        .await
+        .expect_err("unreadable durable reset authority must fail closed");
+
+    assert!(matches!(error, OrchestratorError::Storage(_)));
 }
 
 #[tokio::test(flavor = "multi_thread")]

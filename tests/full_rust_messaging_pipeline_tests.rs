@@ -8,9 +8,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use catbird_mls::orchestrator::{
     ConversationRecoveryState, EngineEvent, IncomingEnvelope, MLSAPIClient, MLSMessagePayload,
-    MLSOrchestrator, OrchestratorConfig,
+    MLSOrchestrator, OrchestratorConfig, OrchestratorError,
 };
-use catbird_mls::{EngineLifecycle, KeychainAccess, MLSContext, MLSError, MlsEngine};
+use catbird_mls::{
+    CreateConversationRequest, EngineLifecycle, KeychainAccess, MLSContext, MLSError, MlsEngine,
+};
 use e2e_harness::mock_api_client::MockDeliveryService;
 use e2e_harness::mock_credentials::MockCredentials;
 use e2e_harness::mock_storage::MockStorage;
@@ -153,6 +155,71 @@ async fn process_server_event_records_reset_pending_and_emits_recovery_event() {
         event,
         EngineEvent::NeedsUiRefresh { convo_id } if convo_id == &convo.conversation_id
     )));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_after_suspend_rejects_durable_reset_pending_existing_target() {
+    let fixture = FullRustMessagingFixture::new("did:plc:alice").await;
+    let predecessor = fixture
+        .engine
+        .create_conversation(CreateConversationRequest {
+            name: "Reset predecessor".into(),
+            member_dids: vec![],
+            description: None,
+        })
+        .expect("create predecessor conversation")
+        .conversation;
+    let target = fixture
+        .engine
+        .create_conversation(CreateConversationRequest {
+            name: "Materialized reset target".into(),
+            member_dids: vec![],
+            description: None,
+        })
+        .expect("create reset target conversation")
+        .conversation;
+    let reset_generation = 73;
+    let event_json = serde_json::json!({
+        "type": "groupReset",
+        "convoId": predecessor.conversation_id,
+        "newGroupId": target.group_id,
+        "resetGeneration": reset_generation,
+    })
+    .to_string();
+    fixture
+        .engine
+        .process_server_event(&event_json)
+        .expect("persist ResetPending");
+    fixture
+        .engine
+        .prepare_for_suspend("reset-send-gate", std::time::Duration::from_millis(250))
+        .expect("prepare for suspend");
+    fixture
+        .engine
+        .resume_from_suspend("reset-send-gate")
+        .expect("resume from suspend");
+
+    let sends_before = fixture.api.message_count(&predecessor.conversation_id);
+    let payload_json =
+        serde_json::to_string(&MLSMessagePayload::text("must not send")).expect("payload json");
+    let error = fixture
+        .engine
+        .send_payload(&predecessor.conversation_id, &payload_json)
+        .expect_err("durable ResetPending must reject direct send");
+
+    assert!(matches!(
+        error,
+        OrchestratorError::ResetCompletionNotCommitted {
+            ref convo_id,
+            reset_generation: generation,
+            ..
+        } if convo_id == &predecessor.conversation_id && generation == reset_generation
+    ));
+    assert_eq!(
+        fixture.api.message_count(&predecessor.conversation_id),
+        sends_before,
+        "reset-gated send must not reach the delivery service"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

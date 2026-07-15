@@ -50,6 +50,34 @@ where
         &self,
         conversation_id: &str,
     ) -> ConversationRecoveryState {
+        match self
+            .project_conversation_recovery_state_result(conversation_id)
+            .await
+        {
+            Ok(projected) => projected,
+            Err(error) => {
+                tracing::warn!(
+                    conversation_id,
+                    error = %error,
+                    "recovery-state projection failed closed"
+                );
+                ConversationRecoveryState::UnrecoverableLocal
+            }
+        }
+    }
+
+    async fn project_conversation_recovery_state_result(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ConversationRecoveryState> {
+        if self
+            .reset_pending_payload_result(conversation_id)
+            .await?
+            .is_some()
+        {
+            return Ok(ConversationRecoveryState::ResetPending);
+        }
+
         let state = self
             .conversation_states()
             .lock()
@@ -68,21 +96,21 @@ where
         };
 
         if projected != ConversationRecoveryState::Healthy {
-            return projected;
+            return Ok(projected);
         }
 
         let resolved = match self.resolve_conversation_context(conversation_id).await {
             Ok(resolved) => resolved,
-            Err(_) => return ConversationRecoveryState::GroupMissing,
+            Err(_) => return Ok(ConversationRecoveryState::GroupMissing),
         };
         let Ok(group_id_bytes) = resolved.group_id_bytes() else {
-            return ConversationRecoveryState::GroupMissing;
+            return Ok(ConversationRecoveryState::GroupMissing);
         };
 
-        match self.mls_context().get_epoch(group_id_bytes) {
+        Ok(match self.mls_context().get_epoch(group_id_bytes) {
             Ok(_) => projected,
             Err(_) => ConversationRecoveryState::GroupMissing,
-        }
+        })
     }
 
     pub async fn ensure_conversation_ready(
@@ -92,7 +120,13 @@ where
         self.check_shutdown().await?;
         self.require_user_did().await?;
 
-        let projected = self.project_conversation_recovery_state(convo_id).await;
+        let had_in_memory_reset_authority = matches!(
+            self.conversation_states().lock().await.get(convo_id),
+            Some(ConversationState::ResetPending { .. })
+        );
+        let projected = self
+            .project_conversation_recovery_state_result(convo_id)
+            .await?;
         crate::warn_log!(
             "[REJOIN-DIAG] convo={} ensure_conversation_ready ENTRY projected={:?}",
             convo_id,
@@ -102,7 +136,9 @@ where
         if matches!(
             projected,
             ConversationRecoveryState::Recovering | ConversationRecoveryState::UnrecoverableLocal
-        ) {
+        ) || (projected == ConversationRecoveryState::ResetPending
+            && !had_in_memory_reset_authority)
+        {
             crate::warn_log!(
                 "[REJOIN-DIAG] convo={} ensure_conversation_ready EARLY-RETURN {:?} (Recovering/UnrecoverableLocal) — NOT calling join_or_rejoin",
                 convo_id,
@@ -156,7 +192,9 @@ where
             && projected == ConversationRecoveryState::NeedsRejoin
             && self.clear_needs_rejoin_if_locally_healthy(convo_id).await
         {
-            let projected = self.project_conversation_recovery_state(convo_id).await;
+            let projected = self
+                .project_conversation_recovery_state_result(convo_id)
+                .await?;
             let epoch = self
                 .local_group_epoch_result(convo_id)
                 .await?
@@ -179,7 +217,9 @@ where
                     convo_id,
                     epoch
                 );
-                let projected = self.project_conversation_recovery_state(convo_id).await;
+                let projected = self
+                    .project_conversation_recovery_state_result(convo_id)
+                    .await?;
                 let epoch = self
                     .local_group_epoch_result(convo_id)
                     .await?
@@ -189,7 +229,9 @@ where
             Err(OrchestratorError::NotAuthenticated) => Err(OrchestratorError::NotAuthenticated),
             Err(OrchestratorError::ShuttingDown) => Err(OrchestratorError::ShuttingDown),
             Err(_) => {
-                let projected = self.project_conversation_recovery_state(convo_id).await;
+                let projected = self
+                    .project_conversation_recovery_state_result(convo_id)
+                    .await?;
                 let epoch = match self.local_group_epoch_result(convo_id).await {
                     Ok(epoch) => epoch,
                     Err(err)
@@ -264,6 +306,14 @@ where
     ) -> Result<Message> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
+
+        if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
+            return Err(OrchestratorError::ResetCompletionNotCommitted {
+                convo_id: conversation_id.to_string(),
+                reset_generation: pending.reset_generation,
+                reason: "ResetPending authority prohibits message send".to_string(),
+            });
+        }
 
         tracing::debug!(conversation_id, "Sending message");
 

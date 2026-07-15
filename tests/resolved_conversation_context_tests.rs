@@ -1268,7 +1268,7 @@ async fn unbound_legacy_delete_preserves_bob_with_same_conversation_id() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reset_pending_target_overrides_stale_live_and_durable_conversation_views() {
+async fn reset_pending_target_blocks_send_across_live_and_durable_conversation_views() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     world
@@ -1320,14 +1320,22 @@ async fn reset_pending_target_overrides_stale_live_and_durable_conversation_view
         .expect("make reset target locally available");
 
     let before = world.delivery_service().message_count(&conversation_id);
-    alice
+    let live_error = alice
         .orchestrator
         .send_message(&conversation_id, "live reset target")
         .await
-        .expect("live resolver must select reset target");
+        .expect_err("live ResetPending authority must block send until completion");
+    assert!(matches!(
+        live_error,
+        catbird_mls::orchestrator::error::OrchestratorError::ResetCompletionNotCommitted {
+            ref convo_id,
+            reset_generation: 7,
+            ..
+        } if convo_id == &conversation_id
+    ));
     assert_eq!(
         world.delivery_service().message_count(&conversation_id),
-        before + 1
+        before
     );
 
     let durable = alice
@@ -1348,14 +1356,22 @@ async fn reset_pending_target_overrides_stale_live_and_durable_conversation_view
         .await
         .clear();
 
-    alice
+    let durable_error = alice
         .orchestrator
         .send_message(&conversation_id, "durable reset target")
         .await
-        .expect("persisted ResetPending target must override stale durable view");
+        .expect_err("durable ResetPending authority must block send after cache loss");
+    assert!(matches!(
+        durable_error,
+        catbird_mls::orchestrator::error::OrchestratorError::ResetCompletionNotCommitted {
+            ref convo_id,
+            reset_generation: 7,
+            ..
+        } if convo_id == &conversation_id
+    ));
     assert_eq!(
         world.delivery_service().message_count(&conversation_id),
-        before + 2
+        before
     );
     assert_eq!(world.delivery_service().message_count(&new_group_id), 0);
 }
