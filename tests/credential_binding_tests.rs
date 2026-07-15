@@ -1268,6 +1268,83 @@ async fn device_key_mismatch_warns_and_add_still_succeeds() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn legacy_atomic_swap_keeps_device_resolution_warn_only() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob", "Mallory"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let mallory_did = world.client("Mallory").did.clone();
+    let observer = Arc::new(RecordingObserver::default());
+    alice
+        .orchestrator
+        .set_event_observer(Some(observer.clone()))
+        .await;
+
+    alice
+        .credentials
+        .set_authorized_device_keys(&mallory_did, vec![vec![0xEE; 32]]);
+    let mismatch_group = alice
+        .orchestrator
+        .create_group(
+            "legacy swap mismatch",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
+        .await
+        .expect("create mismatch group");
+    alice
+        .orchestrator
+        .swap_members(
+            &mismatch_group.group_id,
+            std::slice::from_ref(&bob_did),
+            std::slice::from_ref(&mallory_did),
+        )
+        .await
+        .expect("Decision B keeps legacy Swap device-key mismatch warn-only");
+
+    let resolver_group = alice
+        .orchestrator
+        .create_group(
+            "legacy swap resolver failure",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
+        .await
+        .expect("create resolver-failure group");
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&mallory_did, true);
+    alice.orchestrator.invalidate_device_key_cache().await;
+    alice
+        .orchestrator
+        .swap_members(
+            &resolver_group.group_id,
+            std::slice::from_ref(&bob_did),
+            std::slice::from_ref(&mallory_did),
+        )
+        .await
+        .expect("Decision B keeps legacy Swap resolver failure warn-only");
+
+    let warnings = observer.credential_warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.reason.contains("authorized device key")),
+        "device-key mismatch must remain observable: {warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.reason.contains("resolution failed")),
+        "resolver failure must remain observable: {warnings:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn device_key_match_is_silent_and_cached_within_ttl() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;

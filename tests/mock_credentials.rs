@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use catbird_mls::orchestrator::credentials::CredentialStore;
-use catbird_mls::orchestrator::error::Result;
+use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 
 /// Per-user credential state.
 #[derive(Debug, Clone, Default)]
@@ -26,6 +26,10 @@ pub struct MockCredentials {
     /// Number of `get_authorized_device_keys` calls per DID — used by the
     /// ADR-009 D6 cache test to prove no repeat resolution within the TTL.
     device_key_lookup_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// DIDs whose authorized-device resolver should fail closed. This models
+    /// transient platform/network failures separately from `Ok(None)`, which
+    /// means the resolver capability is unsupported.
+    authorized_device_key_failures: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl MockCredentials {
@@ -34,6 +38,7 @@ impl MockCredentials {
             state: Arc::new(Mutex::new(HashMap::new())),
             authorized_device_keys: Arc::new(Mutex::new(HashMap::new())),
             device_key_lookup_counts: Arc::new(Mutex::new(HashMap::new())),
+            authorized_device_key_failures: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -55,6 +60,18 @@ impl MockCredentials {
             .get(root_did)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// Make authorized-device resolution return an infrastructure error for
+    /// `root_did` until the test explicitly clears it.
+    #[allow(dead_code)]
+    pub fn set_authorized_device_key_resolution_failure(&self, root_did: &str, fail: bool) {
+        let mut failures = self.authorized_device_key_failures.lock().unwrap();
+        if fail {
+            failures.insert(root_did.to_string());
+        } else {
+            failures.remove(root_did);
+        }
     }
 }
 
@@ -127,6 +144,16 @@ impl CredentialStore for MockCredentials {
             .unwrap()
             .entry(root_did.to_string())
             .or_default() += 1;
+        if self
+            .authorized_device_key_failures
+            .lock()
+            .unwrap()
+            .contains(root_did)
+        {
+            return Err(OrchestratorError::Credential(format!(
+                "authorized-device resolver failed for {root_did}"
+            )));
+        }
         Ok(self
             .authorized_device_keys
             .lock()

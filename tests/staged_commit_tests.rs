@@ -14,7 +14,9 @@
 
 mod e2e_harness;
 
-use catbird_mls::orchestrator::credential_binding::extract_key_package_identity;
+use catbird_mls::orchestrator::credential_binding::{
+    extract_key_package_binding, extract_key_package_identity,
+};
 use catbird_mls::orchestrator::error::OrchestratorError;
 use catbird_mls::orchestrator::types::{CommitKind, CommitPlan};
 use catbird_mls::orchestrator::MlsCryptoContext;
@@ -487,7 +489,7 @@ async fn staged_add_rejects_empty_authority_but_pure_remove_swap_remains_valid()
     let error = alice
         .orchestrator
         .stage_commit(
-            &convo.group_id,
+            &convo.conversation_id,
             CommitKind::AddMembers {
                 member_dids: vec![],
                 key_packages: vec![],
@@ -501,7 +503,7 @@ async fn staged_add_rejects_empty_authority_but_pure_remove_swap_remains_valid()
     let pure_remove = alice
         .orchestrator
         .stage_commit(
-            &convo.group_id,
+            &convo.conversation_id,
             CommitKind::SwapMembers {
                 remove_dids: vec![bob_did],
                 add_dids: vec![],
@@ -582,6 +584,8 @@ async fn staged_add_rejects_non_exact_key_package_batches_atomically() {
     let bob_kp = raw_key_package(alice, &bob_did).await;
     let mallory_kp = raw_key_package(alice, &mallory_did).await;
     let eve_kp = raw_key_package(alice, &eve_did).await;
+    let mut trailing_bob_kp = bob_kp.clone();
+    trailing_bob_kp.data.extend_from_slice(&[0xde, 0xad]);
 
     let cases = vec![
         (
@@ -607,6 +611,11 @@ async fn staged_add_rejects_non_exact_key_package_batches_atomically() {
             }],
         ),
         (
+            "trailing bytes",
+            vec![bob_did.clone()],
+            vec![trailing_bob_kp],
+        ),
+        (
             "mismatched batch",
             vec![bob_did.clone(), mallory_did.clone()],
             vec![bob_kp.clone(), eve_kp],
@@ -625,6 +634,7 @@ async fn staged_add_rejects_non_exact_key_package_batches_atomically() {
             .mls_context()
             .get_epoch(group_bytes.clone())
             .unwrap();
+        let own_commits_before = alice.orchestrator.own_commits().lock().await.len();
 
         let result = alice
             .orchestrator
@@ -653,6 +663,11 @@ async fn staged_add_rejects_non_exact_key_package_batches_atomically() {
             epoch_before,
             "{case} rejection must not change epoch"
         );
+        assert_eq!(
+            alice.orchestrator.own_commits().lock().await.len(),
+            own_commits_before,
+            "{case} rejection must not create own-commit tracking"
+        );
 
         let valid = alice
             .orchestrator
@@ -667,6 +682,10 @@ async fn staged_add_rejects_non_exact_key_package_batches_atomically() {
             .unwrap_or_else(|error| {
                 panic!("{case} rejection must leave no pending commit: {error}")
             });
+        assert!(
+            valid.welcome_bytes.is_some(),
+            "{case} rejection must not consume the package or suppress the valid retry Welcome"
+        );
         alice
             .orchestrator
             .discard_pending(valid.handle)
@@ -678,6 +697,275 @@ async fn staged_add_rejects_non_exact_key_package_batches_atomically() {
 #[tokio::test(flavor = "multi_thread")]
 async fn staged_swap_mismatch_does_neither_removal_nor_addition() {
     let mut world = TestWorld::new();
+    for name in ["Alice", "Bob", "Mallory", "Eve"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let mallory_did = world.client("Mallory").did.clone();
+    let eve_did = world.client("Eve").did.clone();
+    let bob_kp = raw_key_package(alice, &bob_did).await;
+    let mallory_kp = raw_key_package(alice, &mallory_did).await;
+    let eve_kp = raw_key_package(alice, &eve_did).await;
+    let mut trailing_mallory_kp = mallory_kp.clone();
+    trailing_mallory_kp.data.push(0xff);
+    let cases = vec![
+        ("substituted", vec![mallory_did.clone()], vec![bob_kp]),
+        (
+            "appended",
+            vec![mallory_did.clone()],
+            vec![mallory_kp.clone(), eve_kp.clone()],
+        ),
+        (
+            "missing",
+            vec![mallory_did.clone(), eve_did],
+            vec![mallory_kp.clone()],
+        ),
+        (
+            "malformed",
+            vec![mallory_did.clone()],
+            vec![catbird_mls::KeyPackageData {
+                data: vec![0xde, 0xad, 0xbe, 0xef],
+            }],
+        ),
+        (
+            "trailing bytes",
+            vec![mallory_did.clone()],
+            vec![trailing_mallory_kp],
+        ),
+    ];
+
+    for (case, add_dids, add_key_packages) in cases {
+        let convo = alice
+            .orchestrator
+            .create_group(
+                &format!("binding-swap-{case}"),
+                Some(std::slice::from_ref(&bob_did)),
+                None,
+            )
+            .await
+            .expect("create group with Bob");
+        let group_bytes = hex::decode(&convo.group_id).unwrap();
+        let members_before = alice
+            .orchestrator
+            .mls_context()
+            .group_member_identities(group_bytes.clone())
+            .expect("members before");
+        let epoch_before = alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes.clone())
+            .unwrap();
+        let own_commits_before = alice.orchestrator.own_commits().lock().await.len();
+
+        let error = alice
+            .orchestrator
+            .stage_commit(
+                &convo.group_id,
+                CommitKind::SwapMembers {
+                    remove_dids: vec![bob_did.clone()],
+                    add_dids,
+                    add_key_packages,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OrchestratorError::InvalidInput(_)),
+            "{case} must reject as InvalidInput: {error}"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .group_member_identities(group_bytes.clone())
+                .expect("members after"),
+            members_before,
+            "{case} failed swap must neither remove nor add"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(group_bytes)
+                .unwrap(),
+            epoch_before,
+            "{case} failed swap must preserve epoch"
+        );
+        assert_eq!(
+            alice.orchestrator.own_commits().lock().await.len(),
+            own_commits_before,
+            "{case} rejection must not create own-commit tracking"
+        );
+
+        let valid = alice
+            .orchestrator
+            .stage_commit(
+                &convo.group_id,
+                CommitKind::SwapMembers {
+                    remove_dids: vec![bob_did.clone()],
+                    add_dids: vec![mallory_did.clone()],
+                    add_key_packages: vec![mallory_kp.clone()],
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{case} valid retry failed: {error}"));
+        assert!(valid.welcome_bytes.is_some());
+        alice
+            .orchestrator
+            .discard_pending(valid.handle)
+            .await
+            .expect("discard valid retry");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_add_fails_closed_when_authorized_device_resolution_errors() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    world
+        .delivery_service()
+        .set_next_create_conversation_id("staged-add-resolver-error");
+    let convo = alice
+        .orchestrator
+        .create_group("binding-resolver-error", None, None)
+        .await
+        .expect("create group");
+    let group_bytes = hex::decode(&convo.group_id).unwrap();
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .unwrap();
+    let own_commits_before = alice.orchestrator.own_commits().lock().await.len();
+    let bob_kp = raw_key_package(alice, &bob_did).await;
+
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&bob_did, true);
+    let error = alice
+        .orchestrator
+        .stage_commit(
+            &convo.conversation_id,
+            CommitKind::AddMembers {
+                member_dids: vec![bob_did.clone()],
+                key_packages: vec![bob_kp.clone()],
+            },
+        )
+        .await
+        .expect_err("resolver infrastructure failure must fail closed");
+    assert!(matches!(error, OrchestratorError::Credential(_)));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes)
+            .unwrap(),
+        epoch_before,
+        "resolver rejection must preserve the epoch"
+    );
+    assert_eq!(
+        alice.orchestrator.own_commits().lock().await.len(),
+        own_commits_before,
+        "resolver rejection must not record an own commit"
+    );
+
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&bob_did, false);
+    let valid = alice
+        .orchestrator
+        .stage_commit(
+            &convo.conversation_id,
+            CommitKind::AddMembers {
+                member_dids: vec![bob_did],
+                key_packages: vec![bob_kp],
+            },
+        )
+        .await
+        .expect("the exact same package must remain usable after rejection");
+    assert!(
+        valid.welcome_bytes.is_some(),
+        "valid retry must still produce its Welcome"
+    );
+    alice
+        .orchestrator
+        .discard_pending(valid.handle)
+        .await
+        .expect("discard valid retry");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_add_enforces_authorized_device_keys_when_resolver_is_available() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    world
+        .delivery_service()
+        .set_next_create_conversation_id("staged-add-device-authority");
+    let convo = alice
+        .orchestrator
+        .create_group("binding-resolved-device-key", None, None)
+        .await
+        .expect("create group");
+    let bob_kp = raw_key_package(alice, &bob_did).await;
+    let binding = extract_key_package_binding(&bob_kp.data).expect("extract Bob binding");
+
+    alice
+        .credentials
+        .set_authorized_device_keys(&bob_did, vec![]);
+    alice.orchestrator.invalidate_device_key_cache().await;
+    let error = alice
+        .orchestrator
+        .stage_commit(
+            &convo.conversation_id,
+            CommitKind::AddMembers {
+                member_dids: vec![bob_did.clone()],
+                key_packages: vec![bob_kp.clone()],
+            },
+        )
+        .await
+        .expect_err("resolved zero-key authority must reject Bob's package");
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+
+    alice
+        .credentials
+        .set_authorized_device_keys(&bob_did, vec![binding.signature_key]);
+    alice.orchestrator.invalidate_device_key_cache().await;
+    let valid = alice
+        .orchestrator
+        .stage_commit(
+            &convo.conversation_id,
+            CommitKind::AddMembers {
+                member_dids: vec![bob_did],
+                key_packages: vec![bob_kp],
+            },
+        )
+        .await
+        .expect("authorized package must remain compatible");
+    alice
+        .orchestrator
+        .discard_pending(valid.handle)
+        .await
+        .expect("discard valid staged add");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_swap_fails_closed_when_authorized_device_resolution_errors() {
+    let mut world = TestWorld::new();
     for name in ["Alice", "Bob", "Mallory"] {
         world.add_client(name).await;
         world.register_device(name).await.unwrap();
@@ -686,9 +974,16 @@ async fn staged_swap_mismatch_does_neither_removal_nor_addition() {
     let alice = world.client("Alice");
     let bob_did = world.client("Bob").did.clone();
     let mallory_did = world.client("Mallory").did.clone();
+    world
+        .delivery_service()
+        .set_next_create_conversation_id("staged-swap-resolver-error");
     let convo = alice
         .orchestrator
-        .create_group("binding-swap", Some(std::slice::from_ref(&bob_did)), None)
+        .create_group(
+            "binding-swap-resolver-error",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
         .await
         .expect("create group with Bob");
     let group_bytes = hex::decode(&convo.group_id).unwrap();
@@ -702,29 +997,32 @@ async fn staged_swap_mismatch_does_neither_removal_nor_addition() {
         .mls_context()
         .get_epoch(group_bytes.clone())
         .unwrap();
-    let bob_kp = raw_key_package(alice, &bob_did).await;
+    let own_commits_before = alice.orchestrator.own_commits().lock().await.len();
+    let mallory_kp = raw_key_package(alice, &mallory_did).await;
 
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&mallory_did, true);
     let error = alice
         .orchestrator
         .stage_commit(
-            &convo.group_id,
+            &convo.conversation_id,
             CommitKind::SwapMembers {
-                remove_dids: vec![bob_did],
-                add_dids: vec![mallory_did],
-                add_key_packages: vec![bob_kp],
+                remove_dids: vec![bob_did.clone()],
+                add_dids: vec![mallory_did.clone()],
+                add_key_packages: vec![mallory_kp.clone()],
             },
         )
         .await
-        .expect_err("swap with mismatched raw credential must reject");
-    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+        .expect_err("Swap resolver failure must fail before either mutation");
+    assert!(matches!(error, OrchestratorError::Credential(_)));
     assert_eq!(
         alice
             .orchestrator
             .mls_context()
             .group_member_identities(group_bytes.clone())
             .expect("members after"),
-        members_before,
-        "failed swap must neither remove Bob nor add Mallory"
+        members_before
     );
     assert_eq!(
         alice
@@ -732,7 +1030,81 @@ async fn staged_swap_mismatch_does_neither_removal_nor_addition() {
             .mls_context()
             .get_epoch(group_bytes)
             .unwrap(),
-        epoch_before,
-        "failed swap must preserve epoch"
+        epoch_before
+    );
+    assert_eq!(
+        alice.orchestrator.own_commits().lock().await.len(),
+        own_commits_before,
+        "resolver rejection must not record an own commit"
+    );
+
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&mallory_did, false);
+    let valid = alice
+        .orchestrator
+        .stage_commit(
+            &convo.conversation_id,
+            CommitKind::SwapMembers {
+                remove_dids: vec![bob_did],
+                add_dids: vec![mallory_did],
+                add_key_packages: vec![mallory_kp],
+            },
+        )
+        .await
+        .expect("the exact same Swap package must remain usable after rejection");
+    assert!(
+        valid.welcome_bytes.is_some(),
+        "valid Swap retry must still produce its Welcome"
+    );
+    alice
+        .orchestrator
+        .discard_pending(valid.handle)
+        .await
+        .expect("discard valid Swap retry");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_swap_rejects_exact_did_batch_before_device_resolution() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob", "Mallory"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let mallory_did = world.client("Mallory").did.clone();
+    world
+        .delivery_service()
+        .set_next_create_conversation_id("staged-swap-binding-first");
+    let convo = alice
+        .orchestrator
+        .create_group("binding-before-resolution", None, None)
+        .await
+        .expect("create group");
+    let mallory_kp = raw_key_package(alice, &mallory_did).await;
+
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&mallory_did, true);
+    let error = alice
+        .orchestrator
+        .stage_commit(
+            &convo.conversation_id,
+            CommitKind::SwapMembers {
+                remove_dids: vec![],
+                add_dids: vec![bob_did],
+                add_key_packages: vec![mallory_kp],
+            },
+        )
+        .await
+        .expect_err("a substituted DID root must fail before resolver activity");
+
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert_eq!(
+        alice.credentials.device_key_lookup_count(&mallory_did),
+        0,
+        "an attacker-controlled credential root must not be resolved or cached"
     );
 }

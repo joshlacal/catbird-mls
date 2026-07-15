@@ -46,6 +46,46 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    /// Validate staged Add/Swap packages before handing any bytes to OpenMLS.
+    ///
+    /// `Ok(None)` from the optional authorized-device resolver deliberately
+    /// preserves the structural-only compatibility mode: the credential DID
+    /// root is still bound exactly, but complete device-key authorization is
+    /// unavailable until the platform wires that resolver. Once supported,
+    /// resolved keys are enforced and resolver infrastructure errors fail
+    /// closed so neither a pending MLS commit nor own-commit tracking changes.
+    async fn enforce_staged_resolved_device_keys(
+        &self,
+        key_packages: &[crate::KeyPackageData],
+    ) -> Result<()> {
+        use super::credential_binding::{
+            credential_root_did, extract_key_package_binding, DeviceKeyLookup,
+        };
+
+        for (index, key_package) in key_packages.iter().enumerate() {
+            let binding = extract_key_package_binding(&key_package.data).map_err(|reason| {
+                OrchestratorError::InvalidInput(format!(
+                    "staged outbound key package {index} has an unverifiable credential: {reason}"
+                ))
+            })?;
+            let root_did = credential_root_did(&binding.identity);
+            match self.lookup_authorized_device_keys(root_did).await? {
+                DeviceKeyLookup::Unsupported => {}
+                DeviceKeyLookup::Keys(keys)
+                    if keys
+                        .iter()
+                        .any(|key| key.as_slice() == binding.signature_key.as_slice()) => {}
+                DeviceKeyLookup::Keys(_) => {
+                    return Err(OrchestratorError::InvalidInput(format!(
+                        "staged outbound key package {index} is not signed by an authorized device key for {root_did}"
+                    )));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Stage a commit without sending it to the delivery service or merging
     /// it locally. Returns a [`CommitPlan`] that the caller ships to the DS;
     /// the caller then passes the embedded handle back to
@@ -61,6 +101,55 @@ where
         kind: CommitKind,
     ) -> Result<CommitPlan> {
         let resolved = self.resolve_conversation_context(conversation_id).await?;
+
+        // Bind the entire caller-supplied DID batch before resolving any DID.
+        // Besides avoiding unnecessary resolver work, this prevents an
+        // attacker-controlled credential root from entering the resolver
+        // cache when the delivery service substitutes a package.
+        match &kind {
+            CommitKind::AddMembers {
+                member_dids,
+                key_packages,
+            } => super::credential_binding::enforce_outbound_key_package_did_bindings(
+                member_dids,
+                key_packages,
+            )?,
+            CommitKind::SwapMembers {
+                add_dids,
+                add_key_packages,
+                ..
+            } => {
+                super::credential_binding::enforce_outbound_key_package_did_bindings(
+                    add_dids,
+                    add_key_packages,
+                )?;
+            }
+            CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
+        }
+
+        // `groups::swap_members` historically passes the mutable group ID to
+        // this public method. Decision B keeps that legacy atomic route
+        // warn-only for device resolution, while callers using the stable
+        // conversation ID opt into fail-closed staged authorization. When old
+        // data uses the same value for both IDs, conservatively retain legacy
+        // compatibility until the public API/FFI migration lands.
+        let explicit_staged_authority = conversation_id == resolved.conversation_id
+            && resolved.conversation_id != resolved.group_id;
+        if explicit_staged_authority {
+            match &kind {
+                CommitKind::AddMembers { key_packages, .. } => {
+                    self.enforce_staged_resolved_device_keys(key_packages)
+                        .await?;
+                }
+                CommitKind::SwapMembers {
+                    add_key_packages, ..
+                } => {
+                    self.enforce_staged_resolved_device_keys(add_key_packages)
+                        .await?;
+                }
+                CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
+            }
+        }
         self.stage_commit_for_group(&resolved.conversation_id, &resolved.group_id, kind)
             .await
     }
