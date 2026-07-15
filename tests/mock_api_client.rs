@@ -175,6 +175,7 @@ pub struct MockDeliveryService {
     state: Arc<Mutex<MockState>>,
     publish_group_info_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     get_conversations_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
+    get_messages_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     /// Per-instance DID override (allows multiple clients to share one mock server).
     instance_did: Option<String>,
 }
@@ -206,6 +207,7 @@ impl MockDeliveryService {
             state: Arc::new(Mutex::new(state)),
             publish_group_info_gate: Arc::new(Mutex::new(None)),
             get_conversations_gate: Arc::new(Mutex::new(None)),
+            get_messages_gate: Arc::new(Mutex::new(None)),
             instance_did: None,
         }
     }
@@ -217,6 +219,7 @@ impl MockDeliveryService {
             state: Arc::clone(&self.state),
             publish_group_info_gate: Arc::clone(&self.publish_group_info_gate),
             get_conversations_gate: Arc::clone(&self.get_conversations_gate),
+            get_messages_gate: Arc::clone(&self.get_messages_gate),
             instance_did: Some(did.to_string()),
         }
     }
@@ -245,6 +248,12 @@ impl MockDeliveryService {
     pub fn pause_next_get_conversations(&self) -> Arc<PublishGroupInfoGate> {
         let gate = Arc::new(PublishGroupInfoGate::default());
         *self.get_conversations_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    pub fn pause_next_get_messages(&self) -> Arc<PublishGroupInfoGate> {
+        let gate = Arc::new(PublishGroupInfoGate::default());
+        *self.get_messages_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -1134,6 +1143,12 @@ impl MLSAPIClient for MockDeliveryService {
         _from_epoch: Option<u32>,
         _to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
+        let gate = self.get_messages_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+
         let mut guard = self.state.lock().unwrap();
         check_fail(
             &mut guard.failures.fail_next_get_messages,

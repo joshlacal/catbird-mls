@@ -46,6 +46,17 @@ where
             .await
     }
 
+    async fn reject_send_if_reset_pending(&self, conversation_id: &str) -> Result<()> {
+        if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
+            return Err(OrchestratorError::ResetCompletionNotCommitted {
+                convo_id: conversation_id.to_string(),
+                reset_generation: pending.reset_generation,
+                reason: "ResetPending authority prohibits message send".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) async fn project_conversation_recovery_state(
         &self,
         conversation_id: &str,
@@ -307,13 +318,7 @@ where
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
-        if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
-            return Err(OrchestratorError::ResetCompletionNotCommitted {
-                convo_id: conversation_id.to_string(),
-                reset_generation: pending.reset_generation,
-                reason: "ResetPending authority prohibits message send".to_string(),
-            });
-        }
+        self.reject_send_if_reset_pending(conversation_id).await?;
 
         tracing::debug!(conversation_id, "Sending message");
 
@@ -406,6 +411,13 @@ where
             }
         }
 
+        // Serialize only the final authorization + encryption + delivery attempt
+        // against reset transitions. Network catch-up above intentionally runs
+        // outside this per-conversation lock.
+        let transition_lock = self.rejoin_lock(conversation_id).await;
+        let transition_guard = transition_lock.lock().await;
+        self.reject_send_if_reset_pending(conversation_id).await?;
+
         // Encrypt via MLS.
         //
         // Task #43: `send` no longer self-heals via `join_or_rejoin` when the group
@@ -470,6 +482,7 @@ where
                 &message_id,
             )
             .await;
+        drop(transition_guard);
 
         // Extract response on success, handle errors
         let send_response = match send_result {
@@ -604,12 +617,17 @@ where
                     }
                 };
 
+                let retry_transition_lock = self.rejoin_lock(conversation_id).await;
+                let retry_transition_guard = retry_transition_lock.lock().await;
+                self.reject_send_if_reset_pending(conversation_id).await?;
+
                 let retry_encrypt = match self
                     .mls_context()
                     .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())
                 {
                     Ok(r) => r,
                     Err(e) => {
+                        drop(retry_transition_guard);
                         tracing::error!(
                             conversation_id,
                             error = %e,
@@ -627,7 +645,7 @@ where
                     .await
                     .insert(retry_commit_hash, web_time::Instant::now());
 
-                match self
+                let retry_send_result = self
                     .api_client()
                     .send_message_with_id(
                         conversation_id,
@@ -635,8 +653,10 @@ where
                         retry_epoch,
                         &message_id,
                     )
-                    .await
-                {
+                    .await;
+                drop(retry_transition_guard);
+
+                match retry_send_result {
                     Ok(resp) => {
                         self.failover_tracker()
                             .lock()

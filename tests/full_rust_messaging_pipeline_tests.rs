@@ -8,7 +8,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use catbird_mls::orchestrator::{
     ConversationRecoveryState, EngineEvent, IncomingEnvelope, MLSAPIClient, MLSMessagePayload,
-    MLSOrchestrator, OrchestratorConfig, OrchestratorError,
+    MLSOrchestrator, OrchestratorConfig, OrchestratorError, ResetRecordOutcome,
 };
 use catbird_mls::{
     CreateConversationRequest, EngineLifecycle, KeychainAccess, MLSContext, MLSError, MlsEngine,
@@ -219,6 +219,72 @@ async fn send_after_suspend_rejects_durable_reset_pending_existing_target() {
         fixture.api.message_count(&predecessor.conversation_id),
         sends_before,
         "reset-gated send must not reach the delivery service"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_committed_after_send_preflight_blocks_encrypt_and_delivery() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+
+    let alice = world.client("Alice");
+    let predecessor = alice
+        .orchestrator
+        .create_group("Racing reset predecessor", None, None)
+        .await
+        .expect("create predecessor group");
+    let target = alice
+        .orchestrator
+        .create_group("Racing materialized reset target", None, None)
+        .await
+        .expect("create reset target group");
+    let reset_generation = 91;
+    let target_group = hex::decode(&target.group_id).expect("target group id must be hex");
+    let pre_send_sync = world.delivery_service().pause_next_get_messages();
+    let sends_before = world
+        .delivery_service()
+        .message_count(&predecessor.conversation_id);
+
+    let send = alice
+        .orchestrator
+        .send_message(&predecessor.conversation_id, "must lose to reset");
+    let reset = async {
+        pre_send_sync.wait_until_reached().await;
+        let result = alice
+            .orchestrator
+            .record_group_reset_with_outcome(
+                &predecessor.conversation_id,
+                target_group,
+                reset_generation,
+            )
+            .await;
+        pre_send_sync.release();
+        result
+    };
+    let (send_result, reset_result) = tokio::join!(send, reset);
+
+    assert_eq!(
+        reset_result.expect("racing reset must commit"),
+        ResetRecordOutcome::Recorded
+    );
+    assert!(matches!(
+        send_result,
+        Err(OrchestratorError::ResetCompletionNotCommitted {
+            ref convo_id,
+            reset_generation: generation,
+            ..
+        }) if convo_id == &predecessor.conversation_id && generation == reset_generation
+    ));
+    assert_eq!(
+        world
+            .delivery_service()
+            .message_count(&predecessor.conversation_id),
+        sends_before,
+        "reset that commits after preflight must still prevent delivery"
     );
 }
 
