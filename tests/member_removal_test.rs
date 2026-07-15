@@ -11,9 +11,13 @@
 // - Removed members CANNOT decrypt messages after removal
 // - This is the proper MLS cryptographic removal (not server-side soft removal)
 
+use async_trait::async_trait;
+use catbird_mls::{GroupConfig, KeyPackageData, KeychainAccess, MLSContext, MLSError};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tls_codec::{Deserialize, Serialize};
 
 // ============================================================================
@@ -99,6 +103,248 @@ fn find_member_index(group: &MlsGroup, identity: &[u8]) -> Option<LeafNodeIndex>
         }
     }
     None
+}
+
+struct TestKeychain {
+    store: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl TestKeychain {
+    fn new() -> Self {
+        Self {
+            store: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl KeychainAccess for TestKeychain {
+    async fn read(&self, key: String) -> Result<Option<Vec<u8>>, MLSError> {
+        Ok(self.store.lock().unwrap().get(&key).cloned())
+    }
+
+    async fn write(&self, key: String, value: Vec<u8>) -> Result<(), MLSError> {
+        self.store.lock().unwrap().insert(key, value);
+        Ok(())
+    }
+
+    async fn delete(&self, key: String) -> Result<(), MLSError> {
+        self.store.lock().unwrap().remove(&key);
+        Ok(())
+    }
+}
+
+fn new_context() -> (Arc<MLSContext>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let context = MLSContext::new(
+        dir.path().join("mls.db").to_string_lossy().to_string(),
+        "test-key-1234567890123456".to_string(),
+        Box::new(TestKeychain::new()),
+    )
+    .unwrap();
+    (context, dir)
+}
+
+fn key_package_for(context: &MLSContext, identity: &[u8]) -> KeyPackageData {
+    let key_package = context.create_key_package(identity.to_vec()).unwrap();
+    KeyPackageData {
+        data: key_package.key_package_data,
+    }
+}
+
+fn context_group_with_members(
+    member_identities: &[&[u8]],
+) -> (Arc<MLSContext>, Vec<u8>, tempfile::TempDir) {
+    let (context, dir) = new_context();
+    let created = context
+        .create_group(
+            b"did:plc:admin#device-main".to_vec(),
+            Some(GroupConfig::default()),
+        )
+        .unwrap();
+    let key_packages = member_identities
+        .iter()
+        .map(|identity| key_package_for(&context, identity))
+        .collect();
+    context
+        .add_members(created.group_id.clone(), key_packages)
+        .unwrap();
+    context
+        .merge_pending_commit(created.group_id.clone())
+        .unwrap();
+    (context, created.group_id, dir)
+}
+
+fn member_identities(context: &MLSContext, group_id: &[u8]) -> Vec<Vec<u8>> {
+    context
+        .debug_group_members(group_id.to_vec())
+        .unwrap()
+        .members
+        .into_iter()
+        .map(|member| member.credential_identity)
+        .collect()
+}
+
+#[test]
+fn bare_did_removes_all_device_leaves_without_matching_prefix_lookalikes() {
+    let target = b"did:plc:target";
+    let target_phone = b"did:plc:target#phone";
+    let target_laptop = b"did:plc:target#laptop";
+    let prefix_lookalike = b"did:plc:target-extra#phone";
+    let unrelated = b"did:plc:unrelated#phone";
+    let (context, group_id, _dir) =
+        context_group_with_members(&[target_phone, target_laptop, prefix_lookalike, unrelated]);
+
+    context
+        .remove_members(group_id.clone(), vec![target.to_vec()])
+        .expect("a bare DID must match every device leaf with that credential root");
+    context.merge_pending_commit(group_id.clone()).unwrap();
+
+    let identities = member_identities(&context, &group_id);
+    assert!(!identities.iter().any(|identity| identity == target_phone));
+    assert!(!identities.iter().any(|identity| identity == target_laptop));
+    assert!(identities
+        .iter()
+        .any(|identity| identity == prefix_lookalike));
+    assert!(identities.iter().any(|identity| identity == unrelated));
+}
+
+#[test]
+fn fragment_qualified_identity_removes_only_the_exact_device_leaf() {
+    let target_phone = b"did:plc:target#phone";
+    let target_laptop = b"did:plc:target#laptop";
+    let (context, group_id, _dir) = context_group_with_members(&[target_phone, target_laptop]);
+
+    context
+        .remove_members(group_id.clone(), vec![target_phone.to_vec()])
+        .unwrap();
+    context.merge_pending_commit(group_id.clone()).unwrap();
+
+    let identities = member_identities(&context, &group_id);
+    assert!(!identities.iter().any(|identity| identity == target_phone));
+    assert!(identities.iter().any(|identity| identity == target_laptop));
+}
+
+#[test]
+fn swap_with_bare_did_removes_all_device_leaves_without_prefix_lookalikes() {
+    let target = b"did:plc:target";
+    let target_phone = b"did:plc:target#phone";
+    let target_laptop = b"did:plc:target#laptop";
+    let prefix_lookalike = b"did:plc:target-extra#phone";
+    let replacement = b"did:plc:replacement#phone";
+    let (context, group_id, _dir) =
+        context_group_with_members(&[target_phone, target_laptop, prefix_lookalike]);
+
+    context
+        .swap_members(
+            group_id.clone(),
+            vec![target.to_vec()],
+            vec![key_package_for(&context, replacement)],
+        )
+        .expect("a bare-DID swap must select every matching device leaf");
+    context.merge_pending_commit(group_id.clone()).unwrap();
+
+    let identities = member_identities(&context, &group_id);
+    assert!(!identities.iter().any(|identity| identity == target_phone));
+    assert!(!identities.iter().any(|identity| identity == target_laptop));
+    assert!(identities
+        .iter()
+        .any(|identity| identity == prefix_lookalike));
+    assert!(identities.iter().any(|identity| identity == replacement));
+}
+
+#[test]
+fn swap_with_fragment_qualified_identity_removes_only_that_device() {
+    let target_phone = b"did:plc:target#phone";
+    let target_laptop = b"did:plc:target#laptop";
+    let replacement = b"did:plc:replacement#phone";
+    let (context, group_id, _dir) = context_group_with_members(&[target_phone, target_laptop]);
+
+    context
+        .swap_members(
+            group_id.clone(),
+            vec![target_phone.to_vec()],
+            vec![key_package_for(&context, replacement)],
+        )
+        .unwrap();
+    context.merge_pending_commit(group_id.clone()).unwrap();
+
+    let identities = member_identities(&context, &group_id);
+    assert!(!identities.iter().any(|identity| identity == target_phone));
+    assert!(identities.iter().any(|identity| identity == target_laptop));
+    assert!(identities.iter().any(|identity| identity == replacement));
+}
+
+#[test]
+fn swap_no_match_preserves_epoch_membership_and_pending_commit_state() {
+    let member = b"did:plc:member#phone";
+    let replacement = b"did:plc:replacement#phone";
+    let (context, group_id, _dir) = context_group_with_members(&[member]);
+    let epoch_before = context.get_epoch(group_id.clone()).unwrap();
+    let identities_before = member_identities(&context, &group_id);
+
+    assert!(context
+        .swap_members(
+            group_id.clone(),
+            vec![b"did:plc:missing".to_vec()],
+            vec![key_package_for(&context, replacement)],
+        )
+        .is_err());
+    assert_eq!(context.get_epoch(group_id.clone()).unwrap(), epoch_before);
+    assert_eq!(member_identities(&context, &group_id), identities_before);
+    let merge_result = context.merge_pending_commit(group_id.clone()).unwrap();
+    assert_eq!(merge_result.new_epoch, epoch_before);
+    assert_eq!(member_identities(&context, &group_id), identities_before);
+}
+
+#[test]
+fn proposal_with_bare_did_selects_a_single_device_leaf() {
+    let target = b"did:plc:target";
+    let target_phone = b"did:plc:target#phone";
+    let (context, group_id, _dir) = context_group_with_members(&[target_phone]);
+
+    context
+        .propose_remove_member(group_id.clone(), target.to_vec())
+        .expect("a bare DID with one matching device leaf is unambiguous");
+
+    assert_eq!(context.list_pending_proposals(group_id).unwrap().len(), 1);
+}
+
+#[test]
+fn proposal_with_bare_did_rejects_multiple_device_leaves_without_pending_state() {
+    let target = b"did:plc:target";
+    let target_phone = b"did:plc:target#phone";
+    let target_laptop = b"did:plc:target#laptop";
+    let (context, group_id, _dir) = context_group_with_members(&[target_phone, target_laptop]);
+    let epoch_before = context.get_epoch(group_id.clone()).unwrap();
+    let identities_before = member_identities(&context, &group_id);
+
+    assert!(context
+        .propose_remove_member(group_id.clone(), target.to_vec())
+        .is_err());
+    assert_eq!(context.get_epoch(group_id.clone()).unwrap(), epoch_before);
+    assert_eq!(member_identities(&context, &group_id), identities_before);
+    assert!(context.list_pending_proposals(group_id).unwrap().is_empty());
+}
+
+#[test]
+fn no_match_preserves_epoch_membership_and_pending_commit_state() {
+    let member = b"did:plc:member#phone";
+    let (context, group_id, _dir) = context_group_with_members(&[member]);
+    let epoch_before = context.get_epoch(group_id.clone()).unwrap();
+    let identities_before = member_identities(&context, &group_id);
+
+    assert!(context
+        .remove_members(group_id.clone(), vec![b"did:plc:missing".to_vec()],)
+        .is_err());
+    assert_eq!(context.get_epoch(group_id.clone()).unwrap(), epoch_before);
+    assert_eq!(member_identities(&context, &group_id), identities_before);
+    let merge_result = context.merge_pending_commit(group_id.clone()).unwrap();
+    assert_eq!(
+        merge_result.new_epoch, epoch_before,
+        "a no-match removal must not leave a commit capable of advancing the epoch"
+    );
+    assert_eq!(member_identities(&context, &group_id), identities_before);
 }
 
 // ============================================================================

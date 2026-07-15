@@ -3393,16 +3393,26 @@ impl MLSContext {
         }
     }
 
-    /// Find leaf index for a member by credential identity (DID bytes)
-    /// Returns None if member not found in group
-    fn find_member_index(group: &MlsGroup, identity: &[u8]) -> Option<LeafNodeIndex> {
-        for member in group.members() {
-            let credential = member.credential.serialized_content();
-            if credential == identity {
-                return Some(member.index);
-            }
-        }
-        None
+    /// Find every leaf selected by a removal identity.
+    ///
+    /// A fragment-qualified identity names one exact device. A bare DID names
+    /// the root credential and every device credential below that root. The
+    /// explicit `#` boundary prevents prefix lookalikes from matching.
+    pub(crate) fn find_member_indices(group: &MlsGroup, identity: &[u8]) -> Vec<LeafNodeIndex> {
+        let is_bare_did = !identity.contains(&b'#');
+
+        group
+            .members()
+            .filter_map(|member| {
+                let credential = member.credential.serialized_content();
+                let root_match = is_bare_did
+                    && credential
+                        .strip_prefix(identity)
+                        .is_some_and(|suffix| suffix.first() == Some(&b'#'));
+
+                (credential == identity || root_match).then_some(member.index)
+            })
+            .collect()
     }
 
     /// Remove members from the group (internal implementation)
@@ -3420,21 +3430,22 @@ impl MLSContext {
             // 1. Convert identities to leaf indices
             let mut indices_to_remove = Vec::new();
             for identity in member_identities {
-                match Self::find_member_index(group, identity) {
-                    Some(index) => {
+                let matching_indices = Self::find_member_indices(group, identity);
+                if matching_indices.is_empty() {
+                    crate::warn_log!(
+                        "[MLS-CONTEXT] Member not found (may already be removed): {}",
+                        hex::encode(identity)
+                    );
+                } else {
+                    for index in matching_indices {
                         crate::debug_log!(
                             "[MLS-CONTEXT] Found member to remove: {} at index {}",
                             hex::encode(identity),
                             index.u32()
                         );
-                        indices_to_remove.push(index);
-                    }
-                    None => {
-                        crate::warn_log!(
-                            "[MLS-CONTEXT] Member not found (may already be removed): {}",
-                            hex::encode(identity)
-                        );
-                        // Continue - ignore not found (already removed)
+                        if !indices_to_remove.contains(&index) {
+                            indices_to_remove.push(index);
+                        }
                     }
                 }
             }
@@ -3586,15 +3597,31 @@ impl MLSContext {
         let gid = GroupId::from_slice(group_id);
 
         self.with_group(&gid, |group, provider, signer| {
-            // Find member index
-            let member_index =
-                Self::find_member_index(group, member_identity).ok_or_else(|| {
+            // A proposal carries exactly one Remove. Expand a bare DID through
+            // the same selector as direct removal, but fail closed when it is
+            // ambiguous instead of silently leaving additional devices active.
+            let member_indices = Self::find_member_indices(group, member_identity);
+            let member_index = match member_indices.as_slice() {
+                [] => {
                     crate::error_log!(
                         "[MLS-CONTEXT] Member not found: {}",
                         hex::encode(member_identity)
                     );
-                    MLSError::member_not_found(String::from_utf8_lossy(member_identity).to_string())
-                })?;
+                    return Err(MLSError::member_not_found(
+                        String::from_utf8_lossy(member_identity).to_string(),
+                    ));
+                }
+                [member_index] => *member_index,
+                _ => {
+                    crate::error_log!(
+                        "[MLS-CONTEXT] Remove proposal identity matched multiple leaves: {}",
+                        hex::encode(member_identity)
+                    );
+                    return Err(MLSError::invalid_input(
+                        "Remove proposal identity matches multiple device leaves; use fragment-qualified identities or the multi-member removal API",
+                    ));
+                }
+            };
 
             crate::debug_log!(
                 "[MLS-CONTEXT] Creating remove proposal for member at index {}",
