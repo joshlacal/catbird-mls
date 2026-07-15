@@ -1628,10 +1628,9 @@ impl MLSContext {
         let (commit_data, welcome_data) = inner.with_group(&gid, |group, provider, signer| {
             let mut indices = Vec::new();
             for identity in &remove_identities {
-                for member in group.members() {
-                    if member.credential.serialized_content() == identity.as_slice() {
-                        indices.push(member.index);
-                        break;
+                for index in MLSContextInner::find_member_indices(group, identity) {
+                    if !indices.contains(&index) {
+                        indices.push(index);
                     }
                 }
             }
