@@ -102,6 +102,15 @@ where
                 member_dids,
                 key_packages,
             } => {
+                if member_dids.is_empty() {
+                    return Err(OrchestratorError::InvalidInput(
+                        "AddMembers requires non-empty DID authority".to_string(),
+                    ));
+                }
+                super::credential_binding::enforce_outbound_key_package_did_bindings(
+                    &member_dids,
+                    &key_packages,
+                )?;
                 let add_result = self
                     .mls_context()
                     .add_members(group_id_bytes.clone(), key_packages)?;
@@ -130,20 +139,32 @@ where
                 add_dids,
                 add_key_packages,
             } => {
+                super::credential_binding::enforce_outbound_key_package_did_bindings(
+                    &add_dids,
+                    &add_key_packages,
+                )?;
                 let remove_ids: Vec<Vec<u8>> =
                     remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
-                let swap_result = self.mls_context().swap_members(
-                    group_id_bytes.clone(),
-                    remove_ids,
-                    add_key_packages,
-                )?;
-                // Welcome is only meaningful when new members are being
-                // added; for a pure remove-and-shrink swap the Welcome will
-                // still be present but empty of key package references — we
-                // still forward it so the DS sees a consistent payload.
+                let (commit_bytes, welcome_bytes) = if add_dids.is_empty() {
+                    // OpenMLS rejects swap_members with an empty add batch.
+                    // Preserve the public pure-removal Swap operation by
+                    // staging the equivalent removal commit instead.
+                    (
+                        self.mls_context()
+                            .remove_members(group_id_bytes.clone(), remove_ids)?,
+                        None,
+                    )
+                } else {
+                    let swap_result = self.mls_context().swap_members(
+                        group_id_bytes.clone(),
+                        remove_ids,
+                        add_key_packages,
+                    )?;
+                    (swap_result.commit_data, Some(swap_result.welcome_data))
+                };
                 (
-                    swap_result.commit_data,
-                    Some(swap_result.welcome_data),
+                    commit_bytes,
+                    welcome_bytes,
                     StagedCommitKindSummary::SwapMembers {
                         remove_dids,
                         add_dids,

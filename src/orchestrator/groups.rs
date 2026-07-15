@@ -500,6 +500,11 @@ struct GroupCreationGuard<'a> {
     generation: &'a std::sync::atomic::AtomicU64,
 }
 
+struct CreateGroupInitialMembers<'a> {
+    dids: Option<&'a [String]>,
+    key_packages: Option<&'a [KeyPackageRef]>,
+}
+
 impl<'a> GroupCreationGuard<'a> {
     async fn new(
         groups: &'a tokio::sync::Mutex<std::collections::HashSet<GroupId>>,
@@ -574,6 +579,45 @@ where
         });
         let filtered_members_ref = filtered_members.as_deref();
 
+        // Fetch and structurally validate initial-member KeyPackages before
+        // creating any local MLS state or writing rollback authority. The
+        // delivery service's DID labels are not authority; only the embedded
+        // credential roots may authorize this bootstrap Add.
+        let initial_key_packages = if let Some(members) = filtered_members_ref {
+            if members.is_empty() {
+                None
+            } else {
+                let member_dids = members.to_vec();
+                let key_packages = self.api_client().get_key_packages(&member_dids).await?;
+
+                if key_packages.is_empty() {
+                    tracing::error!(
+                        dids = ?member_dids,
+                        "No key packages found for any member — they may not have X-Wing packages registered"
+                    );
+                    return Err(OrchestratorError::KeyPackageExhausted);
+                }
+
+                let kp_data: Vec<crate::KeyPackageData> = key_packages
+                    .iter()
+                    .map(|kp| crate::KeyPackageData {
+                        data: kp.key_package_data.clone(),
+                    })
+                    .collect();
+                super::credential_binding::enforce_outbound_key_package_did_bindings(
+                    &member_dids,
+                    &kp_data,
+                )?;
+                Some(key_packages)
+            }
+        } else {
+            None
+        };
+        let initial_members = CreateGroupInitialMembers {
+            dids: filtered_members_ref,
+            key_packages: initial_key_packages.as_deref(),
+        };
+
         // Create MLS group locally — with encrypted metadata in group context
         let identity_bytes = user_did.as_bytes().to_vec();
         let mut group_config = self.config().group_config.clone();
@@ -624,7 +668,7 @@ where
                 &group_id_hex,
                 name,
                 description,
-                filtered_members_ref,
+                initial_members,
                 &mut rollback,
             )
             .await;
@@ -675,7 +719,7 @@ where
         group_id_hex: &str,
         name: &str,
         description: Option<&str>,
-        filtered_members_ref: Option<&[String]>,
+        initial_members: CreateGroupInitialMembers<'_>,
         rollback: &mut CreateGroupRollbackContext,
     ) -> Result<ConversationView> {
         let group_id_bytes = hex::decode(group_id_hex)
@@ -687,7 +731,7 @@ where
         // we create first and then call commitGroupChange/addMembers, the DS
         // has already seeded the row at epoch 1 and rejects our epoch-0 commit.
         let mut initial_add_result: Option<crate::AddMembersResult> = None;
-        if let Some(members) = filtered_members_ref {
+        if let Some(members) = initial_members.dids {
             if !members.is_empty() {
                 tracing::info!(
                     count = members.len(),
@@ -695,17 +739,13 @@ where
                 );
 
                 let member_dids: Vec<String> = members.to_vec();
-                let key_packages = self.api_client().get_key_packages(&member_dids).await?;
+                let key_packages = initial_members.key_packages.ok_or_else(|| {
+                    OrchestratorError::InvalidInput(
+                        "initial-member KeyPackages were not prevalidated".to_string(),
+                    )
+                })?;
 
-                if key_packages.is_empty() {
-                    tracing::error!(
-                        dids = ?member_dids,
-                        "No key packages found for any member — they may not have X-Wing packages registered"
-                    );
-                    return Err(OrchestratorError::KeyPackageExhausted);
-                }
-
-                for kp in &key_packages {
+                for kp in key_packages {
                     tracing::info!(
                         did = %kp.did,
                         cipher_suite = %kp.cipher_suite,
@@ -719,7 +759,7 @@ where
                 // Warn-and-allow — never alters the operation.
                 self.verify_fetched_key_packages(
                     &member_dids,
-                    &key_packages,
+                    key_packages,
                     "create_group",
                     Some(group_id_hex),
                 )
@@ -778,7 +818,7 @@ where
             .api_client()
             .create_conversation(
                 group_id_hex,
-                filtered_members_ref,
+                initial_members.dids,
                 None,
                 initial_add_result
                     .as_ref()
@@ -1163,6 +1203,11 @@ where
             })
             .collect();
 
+        super::credential_binding::enforce_outbound_key_package_did_bindings(
+            member_dids,
+            &kp_data,
+        )?;
+
         // Stage the commit via the new API.
         let plan = self
             .stage_commit_for_group(
@@ -1339,6 +1384,8 @@ where
             })
             .collect();
 
+        super::credential_binding::enforce_outbound_key_package_did_bindings(add_dids, &kp_data)?;
+
         let plan = self
             .stage_commit(
                 group_id,
@@ -1349,6 +1396,27 @@ where
                 },
             )
             .await?;
+
+        if add_dids.is_empty() {
+            // A pure-removal Swap stages an MLS removal commit. Submitting it
+            // through add_members with an empty add list leaves server-side
+            // membership unchanged, so use the removal-capable route and
+            // preserve the same discard-on-server-failure transaction rule.
+            return match self
+                .api_client()
+                .remove_members(group_id, remove_dids, &plan.commit_bytes)
+                .await
+            {
+                Ok(()) => self
+                    .confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
+                    .await
+                    .map(|_| ()),
+                Err(error) => {
+                    let _ = self.discard_pending(plan.handle).await;
+                    Err(error)
+                }
+            };
+        }
 
         let server_result = self
             .api_client()
