@@ -1566,6 +1566,130 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .group_exists(hex::decode(&winner.group_id).expect("winner group id")));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_carries_adopted_reset_winner_past_a_stale_listing_snapshot() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x9a, 41).await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+
+    // Give the winner creator the same stable route used by the rekeyed mock
+    // server so it can enqueue a valid winner-epoch application message while
+    // Bob's stale list page is paused.
+    {
+        let mut conversations = alice.orchestrator.conversations().lock().await;
+        let mut winner_view = conversations
+            .remove(&winner_id)
+            .expect("Alice caches the replacement conversation");
+        winner_view.conversation_id = conversation_id.clone();
+        conversations.insert(conversation_id.clone(), winner_view);
+    }
+    alice
+        .storage
+        .set_conversation_group_id_for_test(&conversation_id, &winner_id);
+
+    // Model a sync page captured while the list projection still points at
+    // the losing reset target. The live conversation mapping and Welcome are
+    // switched back to the committed winner before recovery consults them.
+    bob.orchestrator
+        .mls_context()
+        .delete_group(loser.clone())
+        .expect("remove loser so stale sync enters join/rejoin");
+    let loser_hex = hex::encode(&loser);
+    let loser_state_before = bob
+        .storage
+        .get_group_state(&loser_hex)
+        .await
+        .expect("read losing reset projection")
+        .expect("reset recording persists its target projection");
+    world
+        .delivery_service()
+        .set_conversation_group_id_for_test(&conversation_id, &loser_hex);
+    let listing_gate = world.delivery_service().pause_next_get_conversations();
+
+    let sync = bob.orchestrator.sync_with_server(true);
+    let restore_authoritative_winner = async {
+        listing_gate.wait_until_reached().await;
+        world
+            .delivery_service()
+            .set_conversation_group_id_for_test(&conversation_id, &winner_id);
+        alice
+            .orchestrator
+            .send_message(&conversation_id, "winner message queued behind stale page")
+            .await
+            .expect("winner creator queues valid app ciphertext");
+        listing_gate.release();
+    };
+    let (sync_result, ()) = tokio::join!(sync, restore_authoritative_winner);
+    sync_result.expect("sync must recover through the authoritative winner");
+
+    let winner_epoch = bob
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&winner_id).expect("winner group id"))
+        .expect("winner must be locally joined");
+    let stored = bob
+        .storage
+        .get_conversation(&bob.did, &conversation_id)
+        .await
+        .expect("read stable conversation")
+        .expect("stable conversation remains persisted");
+    assert_eq!(stored.group_id, winner_id);
+    assert_eq!(stored.epoch, winner_epoch);
+    assert!(bob.storage.has_group_state(&winner_id));
+    let loser_state_after = bob
+        .storage
+        .get_group_state(&loser_hex)
+        .await
+        .expect("reread losing reset projection")
+        .expect("the pre-existing reset projection may remain for legacy cleanup");
+    assert_eq!(loser_state_after.group_id, loser_state_before.group_id);
+    assert_eq!(
+        loser_state_after.conversation_id,
+        loser_state_before.conversation_id
+    );
+    assert_eq!(loser_state_after.epoch, loser_state_before.epoch);
+    assert_eq!(loser_state_after.members, loser_state_before.members);
+    {
+        let states = bob.orchestrator.group_states().lock().await;
+        let state = states
+            .get(&winner_id)
+            .expect("winner is the sole in-memory group-state projection");
+        assert_eq!(state.conversation_id, conversation_id);
+        assert_eq!(state.group_id, winner_id);
+        assert_eq!(state.epoch, winner_epoch);
+        assert!(!states.contains_key(&loser_hex));
+    }
+    assert!(
+        !bob.storage.has_rejoin_flag(&conversation_id),
+        "successful winner adoption must not schedule a second stale rejoin"
+    );
+    let received = bob
+        .storage
+        .get_messages(&conversation_id, 20, None)
+        .await
+        .expect("read messages decrypted by sync");
+    assert!(
+        received
+            .iter()
+            .any(|message| message.text == "winner message queued behind stale page"),
+        "the same sync item must fetch and decrypt app traffic through winner W"
+    );
+
+    let before = world.delivery_service().message_count(&conversation_id);
+    bob.orchestrator
+        .send_message(
+            &conversation_id,
+            "message immediately after stale-page recovery",
+        )
+        .await
+        .expect("the same sync pass must leave the stable route on the winner");
+    assert_eq!(
+        world.delivery_service().message_count(&conversation_id),
+        before + 1
+    );
+}
+
 async fn setup_winner_welcome_adoption_fixture(
     loser_byte: u8,
     generation: i32,

@@ -365,6 +365,11 @@ where
 
             let conversation_id = convo.conversation_id.as_str();
             let group_id = convo.group_id.as_str();
+            // A successful reset recovery may resolve this stale list item to
+            // a different, authoritative group before the item finishes. All
+            // post-recovery projections in this iteration must use that
+            // effective view rather than normalizing the captured page again.
+            let mut effective_convo = convo.clone();
 
             let previous_view = self
                 .conversations()
@@ -480,8 +485,6 @@ where
                     conversation_id,
                     group_id
                 );
-                let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
-
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
                 let epoch = if let Ok(gid_bytes) = hex::decode(group_id) {
                     crate::info_log!(
@@ -553,9 +556,23 @@ where
                                 );
                                 match self.join_or_rejoin(conversation_id).await {
                                     Ok(epoch) => {
+                                        if let Some(resolved) = self
+                                            .conversations()
+                                            .lock()
+                                            .await
+                                            .get(conversation_id)
+                                            .cloned()
+                                        {
+                                            effective_convo = resolved;
+                                        }
+                                        // Keep an authoritative server epoch
+                                        // when it is ahead, but never let the
+                                        // stale page make reconciliation treat
+                                        // the just-landed local epoch as behind.
+                                        effective_convo.epoch = effective_convo.epoch.max(epoch);
                                         tracing::info!(
                                             conversation_id = %conversation_id,
-                                            group_id = %group_id,
+                                            group_id = %effective_convo.group_id,
                                             epoch,
                                             "Successfully joined group"
                                         );
@@ -579,10 +596,14 @@ where
                 };
 
                 let state = GroupState {
-                    group_id: convo.group_id.clone(),
-                    conversation_id: convo.conversation_id.clone(),
+                    group_id: effective_convo.group_id.clone(),
+                    conversation_id: effective_convo.conversation_id.clone(),
                     epoch,
-                    members,
+                    members: effective_convo
+                        .members
+                        .iter()
+                        .map(|member| member.did.clone())
+                        .collect(),
                 };
                 {
                     let mut states = self.group_states().lock().await;
@@ -602,9 +623,13 @@ where
                 }
             }
 
+            let conversation_id = effective_convo.conversation_id.as_str();
+            let group_id = effective_convo.group_id.as_str();
+            let server_epoch = effective_convo.epoch;
+
             // Ensure conversation record exists in storage
             self.storage()
-                .ensure_conversation_exists(user_did, &convo.conversation_id, &convo.group_id)
+                .ensure_conversation_exists(user_did, conversation_id, group_id)
                 .await?;
 
             // Check for epoch reconciliation — fetch and process missing commits
@@ -619,12 +644,12 @@ where
                 .unwrap_or(0)
             };
 
-            if convo.epoch > local_epoch {
+            if server_epoch > local_epoch {
                 tracing::info!(
                     conversation_id = %conversation_id,
                     group_id = %group_id,
                     local_epoch,
-                    server_epoch = convo.epoch,
+                    server_epoch,
                     "Server ahead — fetching pending messages to catch up"
                 );
 
@@ -636,7 +661,7 @@ where
                 // falls back to "oldest 50 commits in [0, current_epoch]", which on busy
                 // groups (>50 lifetime commits) strands lagging clients permanently.
                 let from_epoch = Some((local_epoch.saturating_add(1)).min(u32::MAX as u64) as u32);
-                let to_epoch = Some(convo.epoch.min(u32::MAX as u64) as u32);
+                let to_epoch = Some(server_epoch.min(u32::MAX as u64) as u32);
                 match self
                     .fetch_messages(
                         conversation_id,
@@ -668,12 +693,12 @@ where
                             .map(|state| state.epoch)
                             .unwrap_or(0)
                         };
-                        if convo.epoch > new_local {
+                        if server_epoch > new_local {
                             tracing::warn!(
                                 conversation_id = %conversation_id,
                                 group_id = %group_id,
                                 local_epoch = new_local,
-                                server_epoch = convo.epoch,
+                                server_epoch,
                                 "Still behind after processing — marking for rejoin"
                             );
                             // WS-5.2: recovery-critical write — escalate drops.
@@ -833,7 +858,7 @@ where
                     match self
                         .consume_deferred_recovery_for_conversation(
                             conversation_id,
-                            Some(convo.epoch),
+                            Some(server_epoch),
                             Some(group_id),
                         )
                         .await
