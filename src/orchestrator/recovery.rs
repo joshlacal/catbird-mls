@@ -2960,14 +2960,9 @@ where
 
                 match welcome_result {
                     Ok(result) => {
-                        let epoch = self
-                            .mls_context()
-                            .get_epoch(result.group_id.clone())
-                            .unwrap_or(0);
-
                         let current_reset_authority =
                             self.reset_pending_payload_result(convo_id).await?;
-                        if let Some(payload) = current_reset_authority.as_ref() {
+                        let epoch = if let Some(payload) = current_reset_authority.as_ref() {
                             let expected_group =
                                 hex::decode(&payload.new_group_id).map_err(|e| {
                                     OrchestratorError::InvalidInput(format!(
@@ -3025,7 +3020,7 @@ where
                                     result.group_id.clone(),
                                     false,
                                 )
-                                .await?;
+                                .await?
                             } else {
                                 self.complete_reset_recovery(
                                     convo_id,
@@ -3033,9 +3028,16 @@ where
                                     result.group_id.clone(),
                                     true,
                                 )
-                                .await?;
+                                .await?
                             }
-                        }
+                        } else {
+                            // Legacy non-reset Welcome joins retain their
+                            // historical epoch fallback. Reset completion above
+                            // is generation-bound and always fails closed.
+                            self.mls_context()
+                                .get_epoch(result.group_id.clone())
+                                .unwrap_or(0)
+                        };
 
                         // Update group state
                         let welcome_group_id_hex = hex::encode(&result.group_id);
@@ -4074,10 +4076,23 @@ where
         payload: &ResetPendingPayload,
         completed_group_id: Vec<u8>,
         delete_completed_group_on_mismatch: bool,
-    ) -> Result<()> {
+    ) -> Result<u64> {
+        let landed_epoch = self
+            .mls_context()
+            .get_epoch(completed_group_id.clone())
+            .map_err(|error| OrchestratorError::ResetCompletionNotCommitted {
+                convo_id: convo_id.to_string(),
+                reset_generation: payload.reset_generation,
+                reason: format!("completed reset target epoch is unavailable: {error}"),
+            })?;
         let cleared = match self
             .storage()
-            .complete_reset_pending(convo_id, payload.reset_generation, &payload.new_group_id)
+            .complete_reset_pending(
+                convo_id,
+                payload.reset_generation,
+                &payload.new_group_id,
+                landed_epoch,
+            )
             .await
         {
             Ok(cleared) => cleared,
@@ -4092,19 +4107,33 @@ where
             }
         };
         if cleared {
-            // No I/O await is permitted between the durable CAS and this cache
-            // lock. A newer in-process reset projection must remain intact.
-            let mut states = self.conversation_states().lock().await;
-            if matches!(
-                states.get(convo_id),
-                Some(ConversationState::ResetPending {
-                    reset_generation,
-                    ..
-                }) if *reset_generation == payload.reset_generation
-            ) {
-                states.insert(convo_id.to_string(), ConversationState::Active);
+            // No I/O await is permitted between the durable CAS and these
+            // cache projections. A newer in-process reset projection must
+            // remain intact.
+            let project_completed_target = {
+                let mut states = self.conversation_states().lock().await;
+                if matches!(
+                    states.get(convo_id),
+                    Some(ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation,
+                        ..
+                    }) if *reset_generation == payload.reset_generation
+                        && new_group_id == &payload.new_group_id
+                ) {
+                    states.insert(convo_id.to_string(), ConversationState::Active);
+                    true
+                } else {
+                    false
+                }
+            };
+            if project_completed_target {
+                if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
+                    view.group_id = payload.new_group_id.clone();
+                    view.epoch = landed_epoch;
+                }
             }
-            return Ok(());
+            return Ok(landed_epoch);
         }
 
         let _latest_reset_authority =
@@ -4388,12 +4417,9 @@ where
                     reset_generation = payload.reset_generation,
                     "first-responder bootstrap won — clearing reset_pending"
                 );
-                self.complete_reset_recovery(convo_id, payload, new_group_id_bytes.clone(), true)
-                    .await?;
                 let epoch = self
-                    .mls_context()
-                    .get_epoch(new_group_id_bytes)
-                    .unwrap_or(0);
+                    .complete_reset_recovery(convo_id, payload, new_group_id_bytes.clone(), true)
+                    .await?;
                 Ok(epoch)
             }
             Err(err) if err.is_bootstrap_already_bootstrapped() => {
@@ -4411,17 +4437,14 @@ where
                             resumed_existing_candidate,
                             "AlreadyBootstrapped is bound to this accepted local candidate; resuming local reset completion"
                         );
-                        self.complete_reset_recovery(
-                            convo_id,
-                            payload,
-                            new_group_id_bytes.clone(),
-                            true,
-                        )
-                        .await?;
                         let epoch = self
-                            .mls_context()
-                            .get_epoch(new_group_id_bytes)
-                            .unwrap_or(0);
+                            .complete_reset_recovery(
+                                convo_id,
+                                payload,
+                                new_group_id_bytes.clone(),
+                                true,
+                            )
+                            .await?;
                         return Ok(epoch);
                     }
                     (Ok(conversation), Ok(server_group_info)) => {

@@ -285,12 +285,14 @@ impl MLSStorageBackend for ClientStorageAdapter {
         conversation_id: &str,
         expected_generation: i32,
         expected_new_group_id_hex: &str,
+        landed_epoch: u64,
     ) -> crate::orchestrator::Result<bool> {
         self.0
             .complete_reset_pending(
                 conversation_id.to_string(),
                 expected_generation,
                 expected_new_group_id_hex.to_string(),
+                landed_epoch,
             )
             .map_err(bridge_err)
     }

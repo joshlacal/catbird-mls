@@ -229,8 +229,9 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     ///
     /// This operation MUST atomically verify the exact committed generation
     /// and target, project the durable conversation mapping to that target,
-    /// clear its payload, transition the durable state tag to Active, and clear
-    /// the durable rejoin flag. It returns true only when that complete
+    /// atomically set both the current and join epochs to the authoritative
+    /// landed MLS epoch, clear its payload, transition the durable state tag to
+    /// Active, and clear the durable rejoin flag. It returns true only when that complete
     /// transaction commits. A generation or target mismatch returns false
     /// without changing any state.
     async fn complete_reset_pending(
@@ -238,6 +239,7 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         _conversation_id: &str,
         _expected_generation: i32,
         _expected_new_group_id_hex: &str,
+        _landed_epoch: u64,
     ) -> Result<bool> {
         Err(super::error::OrchestratorError::Storage(
             "complete_reset_pending is required for reset recovery".to_string(),

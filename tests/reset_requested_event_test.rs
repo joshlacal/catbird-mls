@@ -630,6 +630,18 @@ async fn completion_error_preserves_reset_and_retry_resumes_without_external_com
     let target = vec![0x71; 16];
 
     alice
+        .storage
+        .set_epoch_pair_for_test(&conversation_id, 741, 742);
+    alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get_mut(&conversation_id)
+        .expect("seed cached predecessor epoch")
+        .epoch = 743;
+
+    alice
         .orchestrator
         .record_group_reset(&conversation_id, target.clone(), 5)
         .await
@@ -640,6 +652,20 @@ async fn completion_error_preserves_reset_and_retry_resumes_without_external_com
     world
         .delivery_service()
         .set_bootstrap_already_bootstrapped_after_success(true);
+    let durable_before_error = alice
+        .storage
+        .get_conversation(&alice.did, &conversation_id)
+        .await
+        .expect("read pre-completion durable state")
+        .expect("pre-completion durable state");
+    let cached_before_error = alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .expect("read pre-completion cache")
+        .clone();
     alice.storage.fail_next_complete_reset_pending();
 
     let first = alice.orchestrator.join_or_rejoin(&conversation_id).await;
@@ -653,6 +679,28 @@ async fn completion_error_preserves_reset_and_retry_resumes_without_external_com
         5
     );
     assert!(alice.storage.has_rejoin_flag(&conversation_id));
+    let durable_after_error = alice
+        .storage
+        .get_conversation(&alice.did, &conversation_id)
+        .await
+        .expect("read durable predecessor")
+        .expect("durable predecessor survives");
+    assert_eq!(durable_after_error.group_id, durable_before_error.group_id);
+    assert_eq!(durable_after_error.epoch, durable_before_error.epoch);
+    assert_eq!(
+        alice.storage.join_epoch_for_test(&conversation_id),
+        Some(742)
+    );
+    let cached_after_error = alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .expect("cached predecessor survives")
+        .clone();
+    assert_eq!(cached_after_error.group_id, cached_before_error.group_id);
+    assert_eq!(cached_after_error.epoch, cached_before_error.epoch);
     assert!(alice
         .orchestrator
         .mls_context()
@@ -688,6 +736,22 @@ async fn completion_error_preserves_reset_and_retry_resumes_without_external_com
         .get_persisted_reset_pending(&conversation_id)
         .is_none());
     assert!(!alice.storage.has_rejoin_flag(&conversation_id));
+    let landed_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(target)
+        .expect("landed target epoch");
+    let durable_after_retry = alice
+        .storage
+        .get_conversation(&alice.did, &conversation_id)
+        .await
+        .expect("read completed reset")
+        .expect("completed reset conversation");
+    assert_eq!(durable_after_retry.epoch, landed_epoch);
+    assert_eq!(
+        alice.storage.join_epoch_for_test(&conversation_id),
+        Some(landed_epoch)
+    );
     assert_eq!(
         world
             .delivery_service()
@@ -1397,6 +1461,8 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .join_group(&baseline_welcome)
         .await
         .expect("Bob joins baseline conversation");
+    bob.storage
+        .set_epoch_pair_for_test(&original.conversation_id, 741, 742);
 
     let loser_target = vec![0x91; 16];
     let loser_target_hex = hex::encode(&loser_target);
@@ -1440,20 +1506,58 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .expect("verified winner Welcome must replace the losing reset target");
 
     assert!(
+        !bob.orchestrator
+            .mls_context()
+            .group_exists(loser_target.clone()),
+        "the losing target must already be deleted before the next operation"
+    );
+    assert!(
+        bob.orchestrator.mls_context().group_exists(
+            hex::decode(&winner.group_id).expect("winner group id before immediate send")
+        ),
+        "the committed winner must be locally available before the next operation"
+    );
+    let stable_message_count_before_send = world
+        .delivery_service()
+        .message_count(&original.conversation_id);
+    bob.orchestrator
+        .send_message(
+            &original.conversation_id,
+            "immediate message after winner adoption",
+        )
+        .await
+        .expect("the stable conversation must resolve to the committed winner before sync");
+    assert_eq!(
+        world
+            .delivery_service()
+            .message_count(&original.conversation_id),
+        stable_message_count_before_send + 1,
+        "the first post-adoption operation must succeed through the stable conversation route"
+    );
+
+    assert!(
         bob.storage
             .get_persisted_reset_pending(&original.conversation_id)
             .is_none(),
         "exact generation/target completion must clear ResetPending"
     );
     assert!(!bob.storage.has_rejoin_flag(&original.conversation_id));
+    let completed = bob
+        .storage
+        .get_conversation(&bob.did, &original.conversation_id)
+        .await
+        .expect("read Bob conversation")
+        .expect("Bob stable conversation survives");
+    let winner_epoch = bob
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&winner.group_id).expect("winner group id for epoch"))
+        .expect("winner epoch");
+    assert_eq!(completed.group_id, winner.group_id);
+    assert_eq!(completed.epoch, winner_epoch);
     assert_eq!(
-        bob.storage
-            .get_conversation(&bob.did, &original.conversation_id)
-            .await
-            .expect("read Bob conversation")
-            .expect("Bob stable conversation survives")
-            .group_id,
-        winner.group_id
+        bob.storage.join_epoch_for_test(&original.conversation_id),
+        Some(winner_epoch)
     );
     assert!(!bob.orchestrator.mls_context().group_exists(loser_target));
     assert!(bob
@@ -1617,6 +1721,29 @@ async fn newer_authority_at_exact_completion_preserves_adopted_winner_group() {
     let bob = world.client("Bob");
     let newer_target = hex::encode(vec![0x99; 16]);
     bob.storage
+        .set_epoch_pair_for_test(&conversation_id, 741, 742);
+    bob.orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get_mut(&conversation_id)
+        .expect("seed cached predecessor epoch")
+        .epoch = 743;
+    let durable_before_failure = bob
+        .storage
+        .get_conversation(&bob.did, &conversation_id)
+        .await
+        .expect("read pre-failure durable state")
+        .expect("pre-failure durable state");
+    let cached_before_failure = bob
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .expect("read pre-failure cache")
+        .clone();
+    bob.storage
         .force_next_complete_reset_pending_false_with_reload(Some(
             ConversationState::ResetPending {
                 new_group_id: newer_target.clone(),
@@ -1643,6 +1770,25 @@ async fn newer_authority_at_exact_completion_preserves_adopted_winner_group() {
             ..
         }) if new_group_id == &newer_target
     ));
+    let cached = bob
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get(&conversation_id)
+        .expect("stable conversation cache survives failed completion")
+        .clone();
+    assert_eq!(cached.group_id, cached_before_failure.group_id);
+    assert_eq!(cached.epoch, cached_before_failure.epoch);
+    let durable = bob
+        .storage
+        .get_conversation(&bob.did, &conversation_id)
+        .await
+        .expect("read durable predecessor")
+        .expect("durable predecessor survives");
+    assert_eq!(durable.group_id, durable_before_failure.group_id);
+    assert_eq!(durable.epoch, durable_before_failure.epoch);
+    assert_eq!(bob.storage.join_epoch_for_test(&conversation_id), Some(742));
     assert!(bob.storage.has_rejoin_flag(&conversation_id));
     assert!(!bob.orchestrator.mls_context().group_exists(loser));
     assert!(bob

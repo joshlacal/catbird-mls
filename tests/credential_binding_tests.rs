@@ -551,7 +551,7 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
     // force_rejoin is prohibited while ResetPending remains authoritative.
     assert!(alice
         .storage
-        .complete_reset_pending(&convo_id, 1, &hex::encode(&new_group_id))
+        .complete_reset_pending(&convo_id, 1, &hex::encode(&new_group_id), 0)
         .await
         .expect("complete reset boundary for receipt test"));
     alice

@@ -4,7 +4,7 @@ use crate::orchestrator_bridge::{
     FFIConversationState, FFISequencerReceipt, OrchestratorBridgeError, SecurityStorageCapabilities,
 };
 
-pub(crate) const SECURITY_STORAGE_CAPABILITIES_VERSION: u16 = 2;
+pub(crate) const SECURITY_STORAGE_CAPABILITIES_VERSION: u16 = 3;
 
 pub(crate) fn validate_security_capabilities(
     capabilities: &SecurityStorageCapabilities,
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn missing_enabled_capability_is_a_typed_construction_error() {
         let capabilities = SecurityStorageCapabilities {
-            version: 2,
+            version: 3,
             reset_state: true,
             quarantine: true,
             pending_message_protection: false,
@@ -173,8 +173,8 @@ mod tests {
             error,
             OrchestratorBridgeError::MissingSecurityCapability {
                 capability,
-                required_version: 2,
-                declared_version: 2,
+                required_version: 3,
+                declared_version: 3,
             } if capability == "pending_message_protection"
         ));
     }

@@ -122,6 +122,7 @@ pub trait OrchestratorStorageCallback: Send + Sync {
         conversation_id: String,
         expected_generation: i32,
         expected_new_group_id_hex: String,
+        landed_epoch: u64,
     ) -> Result<bool, OrchestratorBridgeError>;
 
     /// Clear an exact reset generation for local deletion without projecting
@@ -1695,12 +1696,14 @@ impl MLSStorageBackend for StorageAdapter {
         conversation_id: &str,
         expected_generation: i32,
         expected_new_group_id_hex: &str,
+        landed_epoch: u64,
     ) -> crate::orchestrator::Result<bool> {
         self.0
             .complete_reset_pending(
                 conversation_id.to_string(),
                 expected_generation,
                 expected_new_group_id_hex.to_string(),
+                landed_epoch,
             )
             .map_err(bridge_err)
     }
@@ -3990,7 +3993,7 @@ mod tests {
         pending_messages: Mutex<std::collections::HashSet<String>>,
         receipts: Mutex<Vec<FFISequencerReceipt>>,
         reset_payload: Mutex<Option<(String, String, i32, i64)>>,
-        reset_clear_requests: Mutex<Vec<(String, Option<i32>, Option<String>)>>,
+        reset_clear_requests: Mutex<Vec<(String, Option<i32>, Option<String>, Option<u64>)>>,
         reset_clear_applied: std::sync::atomic::AtomicBool,
         quarantine_payload: Mutex<Option<(String, String, i64)>>,
         fail_security_writes: std::sync::atomic::AtomicBool,
@@ -4117,12 +4120,14 @@ mod tests {
             conversation_id: String,
             expected_generation: i32,
             expected_new_group_id_hex: String,
+            landed_epoch: u64,
         ) -> Result<bool, OrchestratorBridgeError> {
             self.reject_injected_security_failure()?;
             self.reset_clear_requests.lock().unwrap().push((
                 conversation_id,
                 Some(expected_generation),
                 Some(expected_new_group_id_hex),
+                Some(landed_epoch),
             ));
             Ok(self.reset_clear_applied.load(Ordering::SeqCst))
         }
@@ -4136,6 +4141,7 @@ mod tests {
             self.reset_clear_requests.lock().unwrap().push((
                 conversation_id,
                 Some(expected_generation),
+                None,
                 None,
             ));
             Ok(self.reset_clear_applied.load(Ordering::SeqCst))
@@ -5127,7 +5133,7 @@ mod tests {
                 ));
                 assert_storage_failure(adapter.clear_sequencer_receipts("convo").await);
                 assert!(matches!(
-                    adapter.complete_reset_pending("convo", 1, "target").await,
+                    adapter.complete_reset_pending("convo", 1, "target", 9).await,
                     Err(OrchestratorError::Storage(message))
                         if message == "injected storage failure"
                 ));
@@ -5148,7 +5154,7 @@ mod tests {
             ];
 
             assert!(!adapters[0]
-                .complete_reset_pending("convo-a", 7, "target-a")
+                .complete_reset_pending("convo-a", 7, "target-a", 42)
                 .await
                 .expect("orchestrator adapter false completion"));
             callback.reset_clear_applied.store(true, Ordering::SeqCst);
@@ -5160,8 +5166,13 @@ mod tests {
             assert_eq!(
                 callback.reset_clear_requests.lock().unwrap().as_slice(),
                 &[
-                    ("convo-a".to_string(), Some(7), Some("target-a".to_string())),
-                    ("convo-b".to_string(), Some(8), None),
+                    (
+                        "convo-a".to_string(),
+                        Some(7),
+                        Some("target-a".to_string()),
+                        Some(42),
+                    ),
+                    ("convo-b".to_string(), Some(8), None, None),
                 ]
             );
         });
@@ -5214,8 +5225,8 @@ mod tests {
             result,
             Err(OrchestratorBridgeError::MissingSecurityCapability {
                 capability,
-                required_version: 2,
-                declared_version: 2,
+                required_version: 3,
+                declared_version: 3,
             }) if capability == "sequencer_receipts"
         ));
     }
@@ -5223,8 +5234,8 @@ mod tests {
     #[test]
     fn catbird_client_construction_and_wrong_contract_version_fail_closed() {
         for (version, pending_messages, expected) in [
-            (2_u16, false, "pending_message_protection"),
-            (1_u16, true, "contract_version"),
+            (3_u16, false, "pending_message_protection"),
+            (2_u16, true, "contract_version"),
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let mls_context = MLSContext::new(

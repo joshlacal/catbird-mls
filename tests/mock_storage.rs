@@ -430,6 +430,38 @@ impl MockStorage {
         ids
     }
 
+    pub fn join_epoch_for_test(&self, conversation_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .conversations
+            .get(conversation_id)
+            .and_then(|record| record.join_epoch)
+    }
+
+    pub fn set_epoch_pair_for_test(
+        &self,
+        conversation_id: &str,
+        current_epoch: u64,
+        join_epoch: u64,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner
+            .conversations
+            .get_mut(conversation_id)
+            .expect("conversation must exist before seeding epochs");
+        record.view.epoch = current_epoch;
+        record.join_epoch = Some(join_epoch);
+    }
+
+    pub fn remove_conversation_record_for_test(&self, conversation_id: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .conversations
+            .remove(conversation_id);
+    }
+
     /// Make the next `clear_rejoin_flag` call fail once.
     #[allow(dead_code)]
     pub fn fail_next_clear_rejoin_flag(&self) {
@@ -1215,6 +1247,7 @@ impl MLSStorageBackend for MockStorage {
         conversation_id: &str,
         expected_generation: i32,
         expected_new_group_id_hex: &str,
+        landed_epoch: u64,
     ) -> Result<bool> {
         let cleared = {
             let mut inner = self.inner.lock().unwrap();
@@ -1229,21 +1262,26 @@ impl MLSStorageBackend for MockStorage {
                     Some((conversation_id.to_string(), reload));
                 false
             } else {
-                let cleared = inner
-                    .reset_pending
-                    .get(conversation_id)
-                    .is_some_and(|pending| {
-                        pending.reset_generation == expected_generation
-                            && pending.new_group_id_hex == expected_new_group_id_hex
-                    });
+                let cleared = inner.conversations.contains_key(conversation_id)
+                    && inner
+                        .reset_pending
+                        .get(conversation_id)
+                        .is_some_and(|pending| {
+                            pending.reset_generation == expected_generation
+                                && pending.new_group_id_hex == expected_new_group_id_hex
+                        });
                 if cleared {
                     inner.reset_pending.remove(conversation_id);
-                    if let Some(record) = inner.conversations.get_mut(conversation_id) {
-                        record.group_id = expected_new_group_id_hex.to_string();
-                        record.view.group_id = expected_new_group_id_hex.to_string();
-                        record.state = ConversationState::Active;
-                        record.needs_rejoin = false;
-                    }
+                    let record = inner
+                        .conversations
+                        .get_mut(conversation_id)
+                        .expect("conversation presence was part of the completion CAS");
+                    record.group_id = expected_new_group_id_hex.to_string();
+                    record.view.group_id = expected_new_group_id_hex.to_string();
+                    record.view.epoch = landed_epoch;
+                    record.join_epoch = Some(landed_epoch);
+                    record.state = ConversationState::Active;
+                    record.needs_rejoin = false;
                 }
                 cleared
             }

@@ -1633,6 +1633,7 @@ async fn reset_clear_is_bound_to_the_exact_committed_generation() {
         .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
         .await
         .expect("conversation row");
+    storage.set_epoch_pair_for_test(conversation_id, 741, 742);
     storage
         .set_conversation_state(
             conversation_id,
@@ -1650,7 +1651,7 @@ async fn reset_clear_is_bound_to_the_exact_committed_generation() {
         .expect("commit generation 2");
 
     assert!(!storage
-        .complete_reset_pending(conversation_id, 1, "group-gen-2")
+        .complete_reset_pending(conversation_id, 1, "group-gen-2", 901)
         .await
         .expect("stale generation clear is a no-op"));
     assert_eq!(
@@ -1662,29 +1663,75 @@ async fn reset_clear_is_bound_to_the_exact_committed_generation() {
     );
 
     assert!(!storage
-        .complete_reset_pending(conversation_id, 2, "wrong-target")
+        .complete_reset_pending(conversation_id, 2, "wrong-target", 902)
         .await
         .expect("target mismatch is a no-op"));
     assert!(storage
         .get_persisted_reset_pending(conversation_id)
         .is_some());
-
-    assert!(storage
-        .complete_reset_pending(conversation_id, 2, "group-gen-2")
-        .await
-        .expect("exact generation clear"));
-    assert!(storage
-        .get_persisted_reset_pending(conversation_id)
-        .is_none());
     assert_eq!(
         storage
             .get_conversation("did:plc:alice", conversation_id)
             .await
             .unwrap()
             .unwrap()
-            .group_id,
-        "group-gen-2"
+            .epoch,
+        741,
+        "mismatched completion must not publish the supplied landed epoch"
     );
+    assert_eq!(storage.join_epoch_for_test(conversation_id), Some(742));
+
+    assert!(storage
+        .complete_reset_pending(conversation_id, 2, "group-gen-2", 3)
+        .await
+        .expect("exact generation clear"));
+    assert!(storage
+        .get_persisted_reset_pending(conversation_id)
+        .is_none());
+    let completed = storage
+        .get_conversation("did:plc:alice", conversation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.group_id, "group-gen-2");
+    assert_eq!(completed.epoch, 3);
+    assert_eq!(storage.join_epoch_for_test(conversation_id), Some(3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reset_completion_requires_the_stable_conversation_row() {
+    let storage = e2e_harness::mock_storage::MockStorage::new();
+    let conversation_id = "missing-row-completion";
+    storage
+        .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+        .await
+        .expect("conversation row");
+    storage
+        .set_conversation_state(
+            conversation_id,
+            ConversationState::ResetPending {
+                new_group_id: "winner-group".to_string(),
+                reset_generation: 9,
+                notified_at_ms: 9,
+            },
+        )
+        .await
+        .expect("reset tag");
+    storage
+        .mark_reset_pending(conversation_id, "winner-group", 9, 9)
+        .await
+        .expect("reset payload");
+    storage.remove_conversation_record_for_test(conversation_id);
+
+    assert!(!storage
+        .complete_reset_pending(conversation_id, 9, "winner-group", 3)
+        .await
+        .expect("missing stable row is a CAS mismatch"));
+    let pending = storage
+        .get_persisted_reset_pending(conversation_id)
+        .expect("failed completion preserves reset authority");
+    assert_eq!(pending.reset_generation, 9);
+    assert_eq!(pending.new_group_id_hex, "winner-group");
 }
 
 #[tokio::test(flavor = "multi_thread")]
