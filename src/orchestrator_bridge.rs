@@ -104,6 +104,16 @@ pub trait OrchestratorStorageCallback: Send + Sync {
         notified_at_ms: i64,
     ) -> Result<(), OrchestratorBridgeError>;
 
+    /// Atomically adopt the server-verified winner of a reset race while
+    /// preserving the exact committed ResetPending generation and payload.
+    fn adopt_reset_pending_target(
+        &self,
+        conversation_id: String,
+        expected_generation: i32,
+        expected_old_target: String,
+        authoritative_new_target: String,
+    ) -> Result<bool, OrchestratorBridgeError>;
+
     /// Atomically complete an exact reset generation and target: project the
     /// durable group mapping to that target, clear its payload, project durable
     /// Active, and clear the durable rejoin flag.
@@ -1663,6 +1673,23 @@ impl MLSStorageBackend for StorageAdapter {
             .map_err(bridge_err)
     }
 
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> crate::orchestrator::Result<bool> {
+        self.0
+            .adopt_reset_pending_target(
+                conversation_id.to_string(),
+                expected_generation,
+                expected_old_target.to_string(),
+                authoritative_new_target.to_string(),
+            )
+            .map_err(bridge_err)
+    }
+
     async fn complete_reset_pending(
         &self,
         conversation_id: &str,
@@ -1716,6 +1743,7 @@ impl MLSStorageBackend for StorageAdapter {
         &[
             "get_conversation_state",
             "mark_reset_pending",
+            "adopt_reset_pending_target",
             "complete_reset_pending",
             "clear_reset_pending_for_delete",
             "mark_quarantined",
@@ -4056,6 +4084,34 @@ mod tests {
             ));
             Ok(())
         }
+        fn adopt_reset_pending_target(
+            &self,
+            conversation_id: String,
+            expected_generation: i32,
+            expected_old_target: String,
+            authoritative_new_target: String,
+        ) -> Result<bool, OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
+            let mut payload = self.reset_payload.lock().unwrap();
+            let Some((stored_conversation, stored_target, stored_generation, notified_at_ms)) =
+                payload.as_ref()
+            else {
+                return Ok(false);
+            };
+            if stored_conversation != &conversation_id
+                || stored_generation != &expected_generation
+                || stored_target != &expected_old_target
+            {
+                return Ok(false);
+            }
+            *payload = Some((
+                conversation_id,
+                authoritative_new_target,
+                expected_generation,
+                *notified_at_ms,
+            ));
+            Ok(true)
+        }
         fn complete_reset_pending(
             &self,
             conversation_id: String,
@@ -4858,6 +4914,10 @@ mod tests {
                 .mark_reset_pending("convo-reset", "aabb", 7, 1234)
                 .await
                 .expect("reset payload");
+            assert!(adapter
+                .adopt_reset_pending_target("convo-reset", 7, "aabb", "ccdd")
+                .await
+                .expect("reset winner adoption"));
             adapter
                 .mark_quarantined("convo-quarantine", "peer_bad_commit", 2345)
                 .await
@@ -4882,7 +4942,7 @@ mod tests {
 
             assert_eq!(
                 callback.reset_payload.lock().unwrap().clone(),
-                Some(("convo-reset".into(), "aabb".into(), 7, 1234))
+                Some(("convo-reset".into(), "ccdd".into(), 7, 1234))
             );
             assert_eq!(
                 callback.quarantine_payload.lock().unwrap().clone(),
@@ -4913,6 +4973,12 @@ mod tests {
             );
 
             callback.fail_security_writes.store(true, Ordering::SeqCst);
+            assert!(matches!(
+                adapter
+                    .adopt_reset_pending_target("convo", 1, "aabb", "ccdd")
+                    .await,
+                Err(OrchestratorError::Storage(message)) if message == "injected storage failure"
+            ));
             let failures = [
                 adapter.mark_reset_pending("convo", "aabb", 1, 1).await,
                 adapter
@@ -5148,8 +5214,8 @@ mod tests {
             result,
             Err(OrchestratorBridgeError::MissingSecurityCapability {
                 capability,
-                required_version: 1,
-                declared_version: 1,
+                required_version: 2,
+                declared_version: 2,
             }) if capability == "sequencer_receipts"
         ));
     }
@@ -5157,8 +5223,8 @@ mod tests {
     #[test]
     fn catbird_client_construction_and_wrong_contract_version_fail_closed() {
         for (version, pending_messages, expected) in [
-            (1_u16, false, "pending_message_protection"),
-            (2_u16, true, "contract_version"),
+            (2_u16, false, "pending_message_protection"),
+            (1_u16, true, "contract_version"),
         ] {
             let dir = tempfile::tempdir().expect("tempdir");
             let mls_context = MLSContext::new(
@@ -5924,6 +5990,7 @@ mod tests {
         let adapter = StorageAdapter(callback as Arc<dyn OrchestratorStorageCallback>);
         let declared = adapter.implemented_optional_methods();
         for method in [
+            "adopt_reset_pending_target",
             "get_recovery_state",
             "set_recovery_backoff",
             "clear_recovery_backoff",

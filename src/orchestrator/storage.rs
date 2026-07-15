@@ -27,6 +27,7 @@ pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
     "get_welcome_reissue_attempt_log",
     "record_welcome_reissue_attempt",
     "mark_reset_pending",
+    "adopt_reset_pending_target",
     "complete_reset_pending",
     "clear_reset_pending_for_delete",
     "set_conversation_sequencer",
@@ -194,6 +195,32 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     ) -> Result<()> {
         Err(super::error::OrchestratorError::Storage(
             "mark_reset_pending is required for reset recovery".to_string(),
+        ))
+    }
+
+    /// Atomically replace the target of an already committed RESET_PENDING
+    /// transition with the server-verified winner of a reset race.
+    ///
+    /// The backend MUST require the exact stable conversation id, generation,
+    /// and old target, plus a complete committed ResetPending payload. On
+    /// success it changes only the pending target, preserving the generation,
+    /// notification timestamp, ResetPending tag, durable rejoin route, current
+    /// conversation mapping, and generation fences. An exact old/new target is
+    /// an idempotent success. Missing or mismatched authority returns false
+    /// without mutation.
+    ///
+    /// This operation never projects Active, clears reset authority, or deletes
+    /// group state. Returned errors are commit-ambiguous; callers must reread
+    /// durable authority before taking any destructive action (ADR-018).
+    async fn adopt_reset_pending_target(
+        &self,
+        _conversation_id: &str,
+        _expected_generation: i32,
+        _expected_old_target: &str,
+        _authoritative_new_target: &str,
+    ) -> Result<bool> {
+        Err(super::error::OrchestratorError::Storage(
+            "adopt_reset_pending_target is required for reset recovery".to_string(),
         ))
     }
 

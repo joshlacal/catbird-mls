@@ -26,7 +26,8 @@
 mod e2e_harness;
 
 use catbird_mls::orchestrator::{
-    ConversationState, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, ResetRecordOutcome,
+    ConversationState, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
+    ResetRecordOutcome,
 };
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use std::sync::Arc;
@@ -1366,6 +1367,318 @@ async fn welcome_network_error_with_reset_pending_never_authorizes_external_comm
             .reset_generation,
         6
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completion() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    world.register_device("Bob").await.expect("register Bob");
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+
+    let original = alice
+        .orchestrator
+        .create_group("reset welcome baseline", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("create baseline conversation");
+    let baseline_welcome = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_welcome(&original.conversation_id)
+        .await
+        .expect("baseline Welcome for Bob");
+    bob.orchestrator
+        .join_group(&baseline_welcome)
+        .await
+        .expect("Bob joins baseline conversation");
+
+    let loser_target = vec![0x91; 16];
+    let loser_target_hex = hex::encode(&loser_target);
+    bob.orchestrator
+        .record_group_reset(&original.conversation_id, loser_target.clone(), 23)
+        .await
+        .expect("record loser reset target");
+    bob.orchestrator
+        .mls_context()
+        .create_group_with_id(
+            bob.did.as_bytes().to_vec(),
+            loser_target.clone(),
+            Some(catbird_mls::GroupConfig::default()),
+        )
+        .expect("materialize loser bootstrap candidate");
+
+    let winner = alice
+        .orchestrator
+        .create_group("reset winner", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("winner creates replacement group and Welcome");
+    assert_ne!(winner.group_id, loser_target_hex);
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&winner.conversation_id, &original.conversation_id);
+    let authoritative = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_conversations(100, None)
+        .await
+        .expect("read authoritative server mapping")
+        .conversations
+        .into_iter()
+        .find(|view| view.conversation_id == original.conversation_id)
+        .expect("stable conversation remains server-authoritative");
+    assert_eq!(authoritative.group_id, winner.group_id);
+
+    bob.orchestrator
+        .join_or_rejoin(&original.conversation_id)
+        .await
+        .expect("verified winner Welcome must replace the losing reset target");
+
+    assert!(
+        bob.storage
+            .get_persisted_reset_pending(&original.conversation_id)
+            .is_none(),
+        "exact generation/target completion must clear ResetPending"
+    );
+    assert!(!bob.storage.has_rejoin_flag(&original.conversation_id));
+    assert_eq!(
+        bob.storage
+            .get_conversation(&bob.did, &original.conversation_id)
+            .await
+            .expect("read Bob conversation")
+            .expect("Bob stable conversation survives")
+            .group_id,
+        winner.group_id
+    );
+    assert!(!bob.orchestrator.mls_context().group_exists(loser_target));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(&winner.group_id).expect("winner group id")));
+}
+
+async fn setup_winner_welcome_adoption_fixture(
+    loser_byte: u8,
+    generation: i32,
+) -> (TestWorld, String, Vec<u8>, String) {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    world.register_device("Bob").await.expect("register Bob");
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let original = alice
+        .orchestrator
+        .create_group("winner adoption baseline", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("create baseline");
+    let baseline_welcome = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_welcome(&original.conversation_id)
+        .await
+        .expect("baseline Welcome");
+    bob.orchestrator
+        .join_group(&baseline_welcome)
+        .await
+        .expect("Bob joins baseline");
+    let loser = vec![loser_byte; 16];
+    bob.orchestrator
+        .record_group_reset(&original.conversation_id, loser.clone(), generation)
+        .await
+        .expect("record loser authority");
+    bob.orchestrator
+        .mls_context()
+        .create_group_with_id(
+            bob.did.as_bytes().to_vec(),
+            loser.clone(),
+            Some(catbird_mls::GroupConfig::default()),
+        )
+        .expect("materialize loser");
+    let winner = alice
+        .orchestrator
+        .create_group("authoritative winner", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("create winner");
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(&winner.conversation_id, &original.conversation_id);
+    (world, original.conversation_id, loser, winner.group_id)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn committed_winner_adoption_response_loss_rereads_then_completes_exactly() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x92, 31).await;
+    let bob = world.client("Bob");
+    bob.storage.fail_next_adopt_reset_pending_after_commit();
+
+    bob.orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect("exact durable reread must recover a committed adoption");
+
+    assert!(bob
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .is_none());
+    assert!(!bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(!bob.orchestrator.mls_context().group_exists(loser));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(winner_id).expect("winner id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_adoption_with_failed_reread_preserves_both_candidates_and_reset_route() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x97, 61).await;
+    let bob = world.client("Bob");
+    bob.storage
+        .fail_next_adopt_reset_pending_after_commit_with_read_failure();
+
+    let error = bob
+        .orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect_err("ambiguous adoption plus failed reread must fail closed");
+    assert!(error.to_string().contains("authority reread failed"));
+    let pending = bob
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("committed adopted authority survives for restart");
+    assert_eq!(pending.reset_generation, 61);
+    assert_eq!(pending.new_group_id_hex, winner_id);
+    assert!(bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(bob.orchestrator.mls_context().group_exists(loser));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(winner_id).expect("winner id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_reset_generation_wins_adoption_cas_without_candidate_cleanup() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x93, 41).await;
+    let bob = world.client("Bob");
+    let newer_target = vec![0x94; 16];
+    let adoption = bob.storage.pause_next_reset_adoption(&conversation_id);
+    let mut recovery = Box::pin(bob.orchestrator.join_or_rejoin(&conversation_id));
+    tokio::select! {
+        _ = adoption.wait_until_entered() => {}
+        result = &mut recovery => panic!("recovery completed before adoption CAS: {result:?}"),
+    }
+    bob.storage
+        .mark_reset_pending(
+            &conversation_id,
+            &hex::encode(&newer_target),
+            42,
+            1_800_000_000_000,
+        )
+        .await
+        .expect("simulate newer cross-process reset authority");
+    adoption.release();
+
+    let error = recovery
+        .await
+        .expect_err("stale generation must not adopt or complete");
+    assert!(error
+        .to_string()
+        .contains("newer or competing reset authority"));
+    let pending = bob
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("newer authority survives");
+    assert_eq!(pending.reset_generation, 42);
+    assert_eq!(pending.new_group_id_hex, hex::encode(newer_target));
+    assert!(bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(bob.orchestrator.mls_context().group_exists(loser));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(winner_id).expect("winner id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn newer_authority_at_exact_completion_preserves_adopted_winner_group() {
+    let (world, conversation_id, loser, winner_id) =
+        setup_winner_welcome_adoption_fixture(0x98, 71).await;
+    let bob = world.client("Bob");
+    let newer_target = hex::encode(vec![0x99; 16]);
+    bob.storage
+        .force_next_complete_reset_pending_false_with_reload(Some(
+            ConversationState::ResetPending {
+                new_group_id: newer_target.clone(),
+                reset_generation: 72,
+                notified_at_ms: 1_800_000_000_001,
+            },
+        ));
+
+    let error = bob
+        .orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect_err("newer completion authority must fail closed");
+    assert!(error.to_string().contains("newer reset generation"));
+    assert!(matches!(
+        bob.orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&conversation_id),
+        Some(ConversationState::ResetPending {
+            new_group_id,
+            reset_generation: 72,
+            ..
+        }) if new_group_id == &newer_target
+    ));
+    assert!(bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(!bob.orchestrator.mls_context().group_exists(loser));
+    assert!(bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(winner_id).expect("winner id")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn welcome_not_matching_server_winner_is_deleted_without_touching_loser_authority() {
+    let (world, conversation_id, loser, welcome_group_id) =
+        setup_winner_welcome_adoption_fixture(0x95, 51).await;
+    let bob = world.client("Bob");
+    let competing_server_winner = hex::encode(vec![0x96; 16]);
+    world
+        .delivery_service()
+        .set_conversation_group_id_for_test(&conversation_id, &competing_server_winner);
+
+    let error = bob
+        .orchestrator
+        .join_or_rejoin(&conversation_id)
+        .await
+        .expect_err("unbound Welcome must fail closed");
+    assert!(error.to_string().contains("authoritative server mapping"));
+    let pending = bob
+        .storage
+        .get_persisted_reset_pending(&conversation_id)
+        .expect("loser reset authority remains");
+    assert_eq!(pending.reset_generation, 51);
+    assert_eq!(pending.new_group_id_hex, hex::encode(&loser));
+    assert!(bob.storage.has_rejoin_flag(&conversation_id));
+    assert!(bob.orchestrator.mls_context().group_exists(loser));
+    assert!(!bob
+        .orchestrator
+        .mls_context()
+        .group_exists(hex::decode(welcome_group_id).expect("Welcome group id")));
 }
 
 #[tokio::test(flavor = "multi_thread")]

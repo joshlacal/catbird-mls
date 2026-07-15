@@ -2975,20 +2975,66 @@ where
                                     ))
                                 })?;
                             if result.group_id != expected_group {
-                                let _ = self.mls_context().delete_group(result.group_id.clone());
-                                return Err(OrchestratorError::ResetCompletionNotCommitted {
-                                    convo_id: convo_id.to_string(),
-                                    reset_generation: payload.reset_generation,
-                                    reason: "processed Welcome group does not match current reset target"
-                                        .to_string(),
-                                });
+                                let welcome_group_id = hex::encode(&result.group_id);
+                                let authoritative =
+                                    self.fetch_conversation_for_convo(convo_id).await;
+                                match authoritative {
+                                    Ok(conversation)
+                                        if conversation.conversation_id == convo_id
+                                            && conversation.group_id == welcome_group_id => {}
+                                    Ok(conversation) => {
+                                        let _ = self
+                                            .mls_context()
+                                            .delete_group(result.group_id.clone());
+                                        return Err(
+                                            OrchestratorError::ResetCompletionNotCommitted {
+                                                convo_id: convo_id.to_string(),
+                                                reset_generation: payload.reset_generation,
+                                                reason: format!(
+                                                    "processed Welcome group {welcome_group_id} does not match authoritative server mapping {}",
+                                                    conversation.group_id
+                                                ),
+                                            },
+                                        );
+                                    }
+                                    Err(error) => {
+                                        let _ = self
+                                            .mls_context()
+                                            .delete_group(result.group_id.clone());
+                                        return Err(
+                                            OrchestratorError::ResetCompletionNotCommitted {
+                                                convo_id: convo_id.to_string(),
+                                                reset_generation: payload.reset_generation,
+                                                reason: format!(
+                                                    "processed Welcome winner could not be verified against the server mapping: {error}"
+                                                ),
+                                            },
+                                        );
+                                    }
+                                }
+                                let adopted_payload = self
+                                    .adopt_verified_welcome_reset_target(
+                                        convo_id,
+                                        payload,
+                                        &welcome_group_id,
+                                    )
+                                    .await?;
+                                self.complete_reset_recovery(
+                                    convo_id,
+                                    &adopted_payload,
+                                    result.group_id.clone(),
+                                    false,
+                                )
+                                .await?;
+                            } else {
+                                self.complete_reset_recovery(
+                                    convo_id,
+                                    payload,
+                                    result.group_id.clone(),
+                                    true,
+                                )
+                                .await?;
                             }
-                            self.complete_reset_recovery(
-                                convo_id,
-                                payload,
-                                result.group_id.clone(),
-                            )
-                            .await?;
                         }
 
                         // Update group state
@@ -4027,6 +4073,7 @@ where
         convo_id: &str,
         payload: &ResetPendingPayload,
         completed_group_id: Vec<u8>,
+        delete_completed_group_on_mismatch: bool,
     ) -> Result<()> {
         let cleared = match self
             .storage()
@@ -4068,7 +4115,9 @@ where
                     reset_generation: payload.reset_generation,
                     reason: format!("generation mismatch and authority reload failed: {error}"),
                 })?;
-        if self.mls_context().group_exists(completed_group_id.clone()) {
+        if delete_completed_group_on_mismatch
+            && self.mls_context().group_exists(completed_group_id.clone())
+        {
             self.mls_context()
                 .delete_group(completed_group_id)
                 .map_err(|error| OrchestratorError::ResetCompletionNotCommitted {
@@ -4082,6 +4131,129 @@ where
             reset_generation: payload.reset_generation,
             reason: "a newer reset generation owns recovery authority".to_string(),
         })
+    }
+
+    /// Adopt a server-verified reset winner without weakening ResetPending.
+    /// The caller owns the transition lock and has already bound the processed
+    /// Welcome group to the exact stable server conversation.
+    async fn adopt_verified_welcome_reset_target(
+        &self,
+        convo_id: &str,
+        payload: &ResetPendingPayload,
+        authoritative_new_target: &str,
+    ) -> Result<ResetPendingPayload> {
+        let adopt_result = self
+            .storage()
+            .adopt_reset_pending_target(
+                convo_id,
+                payload.reset_generation,
+                &payload.new_group_id,
+                authoritative_new_target,
+            )
+            .await;
+
+        let adopted = match adopt_result {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(error) => {
+                self.report_recovery_storage_failure(
+                    convo_id,
+                    "adopt_reset_pending_target",
+                    &error,
+                )
+                .await;
+                false
+            }
+        };
+
+        // False and errors are commit-ambiguous: only an exact durable reread
+        // of the adopted generation/target may authorize loser cleanup and
+        // exact completion.
+        if !adopted {
+            let durable = self.storage().get_conversation_state(convo_id).await.map_err(
+                |error| OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: format!(
+                        "winner-target adoption was not confirmed and authority reread failed: {error}"
+                    ),
+                },
+            )?;
+            if !matches!(
+                durable,
+                Some(ConversationState::ResetPending {
+                    ref new_group_id,
+                    reset_generation,
+                    ..
+                }) if reset_generation == payload.reset_generation
+                    && new_group_id == authoritative_new_target
+            ) {
+                return Err(OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: "winner-target adoption lost to newer or competing reset authority"
+                        .to_string(),
+                });
+            }
+        }
+
+        let adopted_payload = ResetPendingPayload {
+            new_group_id: authoritative_new_target.to_string(),
+            reset_generation: payload.reset_generation,
+            notified_at_ms: payload.notified_at_ms,
+        };
+        {
+            let mut states = self.conversation_states().lock().await;
+            match states.get(convo_id) {
+                Some(ConversationState::ResetPending {
+                    reset_generation,
+                    new_group_id,
+                    ..
+                }) if *reset_generation == payload.reset_generation
+                    && (new_group_id == &payload.new_group_id
+                        || new_group_id == authoritative_new_target) =>
+                {
+                    states.insert(
+                        convo_id.to_string(),
+                        ConversationState::ResetPending {
+                            new_group_id: authoritative_new_target.to_string(),
+                            reset_generation: payload.reset_generation,
+                            notified_at_ms: payload.notified_at_ms,
+                        },
+                    );
+                }
+                _ => {
+                    return Err(OrchestratorError::ResetCompletionNotCommitted {
+                        convo_id: convo_id.to_string(),
+                        reset_generation: payload.reset_generation,
+                        reason: "in-memory reset authority changed during winner adoption"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+
+        if payload.new_group_id != authoritative_new_target {
+            let loser_group = hex::decode(&payload.new_group_id).map_err(|error| {
+                OrchestratorError::ResetCompletionNotCommitted {
+                    convo_id: convo_id.to_string(),
+                    reset_generation: payload.reset_generation,
+                    reason: format!("loser reset target is malformed: {error}"),
+                }
+            })?;
+            match self.mls_context().delete_group(loser_group) {
+                Ok(()) | Err(crate::MLSError::GroupNotFound { .. }) => {}
+                Err(error) => {
+                    return Err(OrchestratorError::ResetCompletionNotCommitted {
+                        convo_id: convo_id.to_string(),
+                        reset_generation: payload.reset_generation,
+                        reason: format!("failed to delete proven loser reset target: {error}"),
+                    });
+                }
+            }
+        }
+
+        Ok(adopted_payload)
     }
 
     /// First-responder bootstrap (spec §8.5 Phase 1).
@@ -4216,7 +4388,7 @@ where
                     reset_generation = payload.reset_generation,
                     "first-responder bootstrap won — clearing reset_pending"
                 );
-                self.complete_reset_recovery(convo_id, payload, new_group_id_bytes.clone())
+                self.complete_reset_recovery(convo_id, payload, new_group_id_bytes.clone(), true)
                     .await?;
                 let epoch = self
                     .mls_context()
@@ -4239,8 +4411,13 @@ where
                             resumed_existing_candidate,
                             "AlreadyBootstrapped is bound to this accepted local candidate; resuming local reset completion"
                         );
-                        self.complete_reset_recovery(convo_id, payload, new_group_id_bytes.clone())
-                            .await?;
+                        self.complete_reset_recovery(
+                            convo_id,
+                            payload,
+                            new_group_id_bytes.clone(),
+                            true,
+                        )
+                        .await?;
                         let epoch = self
                             .mls_context()
                             .get_epoch(new_group_id_bytes)

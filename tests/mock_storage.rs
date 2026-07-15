@@ -88,6 +88,8 @@ struct Inner {
     fail_next_mark_reset_pending: bool,
     fail_next_mark_reset_pending_after_commit: bool,
     fail_next_mark_reset_pending_after_commit_with_notified_at_offset: Option<i64>,
+    fail_next_adopt_reset_pending_after_commit: bool,
+    fail_next_adopt_reset_pending_after_commit_with_read_failure: bool,
     force_next_clear_reset_pending_for_delete_false: bool,
     fail_next_complete_reset_pending: bool,
     force_next_complete_reset_pending_false_reload: Option<Option<ConversationState>>,
@@ -131,6 +133,7 @@ pub struct MockStorage {
     conversation_state_read_barrier: Arc<Mutex<Option<(String, ConversationStateReadBarrier)>>>,
     reset_completion_barrier: Arc<Mutex<Option<(String, ResetCompletionBarrier)>>>,
     reset_record_barrier: Arc<Mutex<Option<(String, ResetCompletionBarrier)>>>,
+    reset_adopt_barrier: Arc<Mutex<Option<(String, ResetCompletionBarrier)>>>,
     clear_rejoin_barrier: Arc<Mutex<Option<(String, ClearRejoinBarrier)>>>,
     conversation_state_write_barrier:
         Arc<Mutex<Option<(String, Option<ConversationState>, ClearRejoinBarrier)>>>,
@@ -206,6 +209,7 @@ impl MockStorage {
             conversation_state_read_barrier: Arc::new(Mutex::new(None)),
             reset_completion_barrier: Arc::new(Mutex::new(None)),
             reset_record_barrier: Arc::new(Mutex::new(None)),
+            reset_adopt_barrier: Arc::new(Mutex::new(None)),
             clear_rejoin_barrier: Arc::new(Mutex::new(None)),
             conversation_state_write_barrier: Arc::new(Mutex::new(None)),
             group_state_write_barrier: Arc::new(Mutex::new(None)),
@@ -494,6 +498,20 @@ impl MockStorage {
         self.inner.lock().unwrap().fail_next_complete_reset_pending = true;
     }
 
+    pub fn fail_next_adopt_reset_pending_after_commit(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_adopt_reset_pending_after_commit = true;
+    }
+
+    pub fn fail_next_adopt_reset_pending_after_commit_with_read_failure(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_adopt_reset_pending_after_commit_with_read_failure = true;
+    }
+
     pub fn force_next_complete_reset_pending_false_with_reload(
         &self,
         reload: Option<ConversationState>,
@@ -651,6 +669,16 @@ impl MockStorage {
             release: Arc::new(tokio::sync::Semaphore::new(0)),
         };
         *self.reset_record_barrier.lock().unwrap() =
+            Some((conversation_id.to_string(), barrier.clone()));
+        barrier
+    }
+
+    pub fn pause_next_reset_adoption(&self, conversation_id: &str) -> ResetCompletionBarrier {
+        let barrier = ResetCompletionBarrier {
+            entered: Arc::new(tokio::sync::Semaphore::new(0)),
+            release: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        *self.reset_adopt_barrier.lock().unwrap() =
             Some((conversation_id.to_string(), barrier.clone()));
         barrier
     }
@@ -1059,6 +1087,95 @@ impl MLSStorageBackend for MockStorage {
                 .forget();
         }
         Ok(())
+    }
+
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        let canonical_hex = |value: &str| {
+            !value.is_empty()
+                && value.len().is_multiple_of(2)
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if !canonical_hex(expected_old_target) || !canonical_hex(authoritative_new_target) {
+            return Err(OrchestratorError::Storage(
+                "reset target must be non-empty canonical hex".to_string(),
+            ));
+        }
+
+        let barrier = {
+            let mut installed = self.reset_adopt_barrier.lock().unwrap();
+            match installed.take() {
+                Some((target, barrier)) if target == conversation_id => Some(barrier),
+                other => {
+                    *installed = other;
+                    None
+                }
+            }
+        };
+        if let Some(barrier) = barrier {
+            barrier.entered.add_permits(1);
+            barrier
+                .release
+                .acquire()
+                .await
+                .expect("reset-adoption barrier release semaphore closed")
+                .forget();
+        }
+
+        let mut inner = self.inner.lock().unwrap();
+        let matches = inner
+            .reset_pending
+            .get(conversation_id)
+            .is_some_and(|pending| {
+                pending.reset_generation == expected_generation
+                    && pending.new_group_id_hex == expected_old_target
+            });
+        if !matches {
+            return Ok(false);
+        }
+
+        let notified_at_ms = inner
+            .reset_pending
+            .get(conversation_id)
+            .expect("matched reset payload")
+            .notified_at_ms;
+        inner.reset_pending.insert(
+            conversation_id.to_string(),
+            PersistedResetPending {
+                new_group_id_hex: authoritative_new_target.to_string(),
+                reset_generation: expected_generation,
+                notified_at_ms,
+            },
+        );
+        if let Some(record) = inner.conversations.get_mut(conversation_id) {
+            record.state = ConversationState::ResetPending {
+                new_group_id: authoritative_new_target.to_string(),
+                reset_generation: expected_generation,
+                notified_at_ms,
+            };
+            record.needs_rejoin = true;
+        }
+        if inner.fail_next_adopt_reset_pending_after_commit_with_read_failure {
+            inner.fail_next_adopt_reset_pending_after_commit_with_read_failure = false;
+            inner.fail_next_get_conversation_state = true;
+            return Err(OrchestratorError::Storage(
+                "injected adoption response loss plus authority reread failure".to_string(),
+            ));
+        }
+        if inner.fail_next_adopt_reset_pending_after_commit {
+            inner.fail_next_adopt_reset_pending_after_commit = false;
+            return Err(OrchestratorError::Storage(
+                "injected adopt_reset_pending_target response loss after commit".to_string(),
+            ));
+        }
+        Ok(true)
     }
 
     async fn mark_quarantined(
@@ -1555,6 +1672,7 @@ impl MLSStorageBackend for MockStorage {
             "get_welcome_reissue_attempt_log",
             "record_welcome_reissue_attempt",
             "mark_reset_pending",
+            "adopt_reset_pending_target",
             "complete_reset_pending",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
@@ -1575,6 +1693,7 @@ impl MLSStorageBackend for MockStorage {
             "get_welcome_reissue_attempt_log",
             "record_welcome_reissue_attempt",
             "mark_reset_pending",
+            "adopt_reset_pending_target",
             "complete_reset_pending",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",

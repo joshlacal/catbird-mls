@@ -263,6 +263,23 @@ impl MLSStorageBackend for ClientStorageAdapter {
             .map_err(bridge_err)
     }
 
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> crate::orchestrator::Result<bool> {
+        self.0
+            .adopt_reset_pending_target(
+                conversation_id.to_string(),
+                expected_generation,
+                expected_old_target.to_string(),
+                authoritative_new_target.to_string(),
+            )
+            .map_err(bridge_err)
+    }
+
     async fn complete_reset_pending(
         &self,
         conversation_id: &str,
@@ -497,6 +514,7 @@ impl MLSStorageBackend for ClientStorageAdapter {
         &[
             "get_conversation_state",
             "mark_reset_pending",
+            "adopt_reset_pending_target",
             "complete_reset_pending",
             "clear_reset_pending_for_delete",
             "mark_quarantined",
