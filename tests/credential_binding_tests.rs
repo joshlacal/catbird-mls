@@ -1,4 +1,4 @@
-//! WS-3 stage 1+2 integration tests: warn-only credential binding (ADR-009
+//! WS-3 stage 1+2 integration tests: credential binding (ADR-009
 //! D3/D4), sequencer equivocation detection (ADR-009 D8 / backlog E3),
 //! receipt clearing across server resets (N44a), inbound envelope-sender
 //! spoofing (N44b), and the authorized-device-key seam (N44c).
@@ -13,9 +13,8 @@
 //!   - `MockCredentials::set_authorized_device_keys` — resolve the optional
 //!     `get_authorized_device_keys` capability (ADR-009 full check).
 //!
-//! Contract under test in every case: mismatches/equivocations are LOGGED and
-//! ESCALATED via `OrchestratorEventObserver`, and the operation still
-//! succeeds (warn-and-allow; no enforcement).
+//! The historical observer checks remain warn-only. Outbound Add/Swap paths
+//! additionally enforce structural DID binding before MLS mutation.
 
 #![allow(dead_code)]
 
@@ -26,9 +25,58 @@ use std::sync::{Arc, Mutex};
 use catbird_mls::orchestrator::event_observer::OrchestratorEventObserver;
 use catbird_mls::orchestrator::{
     extract_key_package_binding, ConversationState, IncomingEnvelope, MLSAPIClient,
-    MLSStorageBackend, SequencerReceipt,
+    MLSStorageBackend, MlsCryptoContext, OrchestratorError, SequencerReceipt,
 };
 use e2e_harness::TestWorld;
+
+async fn replace_available_packages_with_one_wrapped(
+    world: &TestWorld,
+    requester_name: &str,
+    publisher_name: &str,
+    did: &str,
+) {
+    use openmls::prelude::{tls_codec::DeserializeBytes as _, tls_codec::Serialize as _, *};
+    use openmls_rust_crypto::OpenMlsRustCrypto;
+    use openmls_traits::OpenMlsProvider;
+
+    let requester = world.client(requester_name);
+    let mut last_package = None;
+    loop {
+        let fetched = requester
+            .orchestrator
+            .api_client()
+            .get_key_packages(&[did.to_string()])
+            .await
+            .expect("drain raw key packages");
+        let Some(package) = fetched.into_iter().next() else {
+            break;
+        };
+        last_package = Some(package);
+    }
+    let package = last_package.expect("registered device publishes key packages");
+    let (package_in, remaining) = KeyPackageIn::tls_deserialize_bytes(&package.key_package_data)
+        .expect("decode raw published key package");
+    assert!(remaining.is_empty());
+    let provider = OpenMlsRustCrypto::default();
+    let validated = package_in
+        .validate(provider.crypto(), ProtocolVersion::default())
+        .expect("validate published key package");
+    let wrapped = MlsMessageOut::from(validated)
+        .tls_serialize_detached()
+        .expect("serialize wrapped key package");
+    world
+        .client(publisher_name)
+        .orchestrator
+        .api_client()
+        .publish_key_package(
+            &wrapped,
+            &package.cipher_suite,
+            "2099-01-01T00:00:00Z",
+            None,
+        )
+        .await
+        .expect("republish wrapped key package");
+}
 
 // ---------------------------------------------------------------------------
 // Recording observer
@@ -149,11 +197,11 @@ async fn matching_credential_produces_no_warning() {
 }
 
 // ---------------------------------------------------------------------------
-// (b) Mismatched DID in fetched key package → warn + escalate, op succeeds
+// (b) Mismatched DID in fetched key package → reject before MLS mutation
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn mismatched_key_package_warns_and_operation_succeeds() {
+async fn mismatched_key_package_rejects_add_without_epoch_or_pending_commit() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     world.add_client("Bob").await;
@@ -184,32 +232,437 @@ async fn mismatched_key_package_warns_and_operation_succeeds() {
         .delivery_service()
         .redirect_key_packages_for_test(&bob_did, &mallory_did);
 
-    // Warn-and-allow: the add must still succeed (Mallory's package is a
-    // structurally valid MLS key package).
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&convo.group_id).unwrap())
+        .unwrap();
+
+    let error = world
+        .client("Alice")
+        .orchestrator
+        .add_members(&convo.group_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect_err("substituted raw credential root must reject the complete add");
+    assert!(
+        error.to_string().contains("credential") || error.to_string().contains("DID"),
+        "rejection must identify credential/DID binding: {error}"
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&convo.group_id).unwrap())
+            .unwrap(),
+        epoch_before,
+        "rejected add must not advance the epoch"
+    );
+
+    // No pending commit may have been created: restoring the genuine package
+    // response and retrying on the same group must stage and complete.
+    world
+        .delivery_service()
+        .redirect_key_packages_for_test(&bob_did, &bob_did);
     world
         .client("Alice")
         .orchestrator
-        .add_members(&convo.group_id, &[bob_did.clone()])
+        .add_members(&convo.group_id, &[bob_did])
         .await
-        .expect("stage-1 warn-and-allow: add_members must still succeed on mismatch");
+        .expect("valid retry proves the rejected add left no pending commit");
+}
 
-    let warnings = observer.credential_warnings();
-    assert!(
-        !warnings.is_empty(),
-        "expected a credential-binding warning for the substituted key package"
+#[tokio::test(flavor = "multi_thread")]
+async fn create_group_rejects_substituted_initial_package_before_create_or_persist() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob", "Mallory"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let mallory_did = world.client("Mallory").did.clone();
+    world
+        .delivery_service()
+        .redirect_key_packages_for_test(&bob_did, &mallory_did);
+
+    let groups_before = alice
+        .orchestrator
+        .mls_context()
+        .list_local_group_ids()
+        .expect("list local groups");
+    let conversations_before = alice.storage.conversation_count();
+    let pending_deletes_before = alice.storage.pending_local_delete_count();
+
+    // This sentinel must remain unconsumed: credential validation is required
+    // to finish before group creation reaches its first persistence mutation.
+    alice.storage.fail_next_mark_pending_local_delete();
+    let error = alice
+        .orchestrator
+        .create_group(
+            "preflight initial binding",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
+        .await
+        .expect_err("substituted initial KeyPackage must fail preflight");
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert!(error.to_string().contains("credential") || error.to_string().contains("DID"));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .expect("list groups after rejection"),
+        groups_before,
+        "preflight rejection must not invoke local MLS group creation"
     );
-    let w = warnings
+    assert_eq!(alice.storage.conversation_count(), conversations_before);
+    assert_eq!(
+        alice.storage.pending_local_delete_count(),
+        pending_deletes_before
+    );
+    assert!(alice
+        .orchestrator
+        .groups_being_created()
+        .lock()
+        .await
+        .is_empty());
+
+    let persistence_error = alice
+        .orchestrator
+        .create_group("consume untouched sentinel", None, None)
+        .await
+        .expect_err("the untouched persistence sentinel must fail this valid create");
+    assert!(matches!(persistence_error, OrchestratorError::Storage(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn public_swap_rejects_substitution_atomically_then_valid_retry_mutates() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob", "Mallory"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let mallory_did = world.client("Mallory").did.clone();
+    let convo = alice
+        .orchestrator
+        .create_group(
+            "public swap binding",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
+        .await
+        .expect("create group with Bob");
+    let group_bytes = hex::decode(&convo.group_id).unwrap();
+    let members_before = alice
+        .orchestrator
+        .mls_context()
+        .group_member_identities(group_bytes.clone())
+        .expect("members before substitution");
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .expect("epoch before substitution");
+
+    world
+        .delivery_service()
+        .redirect_key_packages_for_test(&mallory_did, &bob_did);
+    let error = alice
+        .orchestrator
+        .swap_members(
+            &convo.group_id,
+            std::slice::from_ref(&bob_did),
+            std::slice::from_ref(&mallory_did),
+        )
+        .await
+        .expect_err("public Swap must reject a substituted raw credential root");
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .group_member_identities(group_bytes.clone())
+            .expect("members after substitution"),
+        members_before,
+        "wrapper rejection must perform neither removal nor addition"
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes.clone())
+            .expect("epoch after substitution"),
+        epoch_before,
+        "wrapper rejection must not advance the epoch"
+    );
+
+    world
+        .delivery_service()
+        .redirect_key_packages_for_test(&mallory_did, &mallory_did);
+    alice
+        .orchestrator
+        .swap_members(
+            &convo.group_id,
+            std::slice::from_ref(&bob_did),
+            std::slice::from_ref(&mallory_did),
+        )
+        .await
+        .expect("valid retry proves the rejected wrapper call left no pending commit");
+    let members_after = alice
+        .orchestrator
+        .mls_context()
+        .group_member_identities(group_bytes.clone())
+        .expect("members after valid retry");
+    assert!(!members_after
         .iter()
-        .find(|w| w.expected_did == bob_did)
-        .unwrap_or_else(|| panic!("no warning for expected DID {bob_did}, got {warnings:?}"));
-    assert_eq!(w.operation, "fetch");
-    assert_eq!(w.claimed_identity, mallory_did);
+        .any(|identity| identity == bob_did.as_bytes()));
+    assert!(members_after
+        .iter()
+        .any(|identity| identity == mallory_did.as_bytes()));
     assert!(
-        w.reason.contains("does not match"),
-        "reason should describe the DID mismatch, got: {}",
-        w.reason
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes)
+            .expect("epoch after valid retry")
+            > epoch_before
     );
-    assert_eq!(w.convo_id, convo.group_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn public_pure_remove_server_failure_discards_then_retry_succeeds() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group(
+            "public pure removal retry",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
+        .await
+        .expect("create group with Bob");
+    let group_bytes = hex::decode(&convo.group_id).unwrap();
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .expect("epoch before failed server call");
+
+    world.delivery_service().fail_next_remove_members();
+    alice
+        .orchestrator
+        .swap_members(&convo.group_id, std::slice::from_ref(&bob_did), &[])
+        .await
+        .expect_err("server removal failure must reject the public pure-remove Swap");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes.clone())
+            .expect("epoch after failed server call"),
+        epoch_before
+    );
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .group_member_identities(group_bytes.clone())
+        .expect("members after failed server call")
+        .iter()
+        .any(|identity| identity == bob_did.as_bytes()));
+    let failed_server_page = alice
+        .orchestrator
+        .api_client()
+        .get_conversations(100, None)
+        .await
+        .expect("read server projection after failed removal");
+    assert!(failed_server_page
+        .conversations
+        .iter()
+        .find(|conversation| conversation.conversation_id == convo.conversation_id)
+        .expect("conversation remains visible after failed removal")
+        .members
+        .iter()
+        .any(|member| member.did == bob_did));
+
+    alice
+        .orchestrator
+        .swap_members(&convo.group_id, std::slice::from_ref(&bob_did), &[])
+        .await
+        .expect("valid retry proves the failed server call discarded its pending commit");
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes)
+            .expect("epoch after valid retry")
+            > epoch_before
+    );
+
+    let server_page = alice
+        .orchestrator
+        .api_client()
+        .get_conversations(100, None)
+        .await
+        .expect("read fake delivery-service projection after retry");
+    let server_conversation = server_page
+        .conversations
+        .iter()
+        .find(|conversation| conversation.conversation_id == convo.conversation_id)
+        .expect("conversation remains visible to Alice");
+    assert!(!server_conversation
+        .members
+        .iter()
+        .any(|member| member.did == bob_did));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wrapped_key_packages_work_through_create_add_and_swap_wrappers() {
+    let mut create_world = TestWorld::new();
+    create_world.add_client("Alice").await;
+    create_world.add_client("Bob").await;
+    create_world.register_device("Alice").await.unwrap();
+    let create_bob_did = create_world.register_device("Bob").await.unwrap();
+    replace_available_packages_with_one_wrapped(&create_world, "Alice", "Bob", &create_bob_did)
+        .await;
+    create_world
+        .client("Alice")
+        .orchestrator
+        .create_group(
+            "wrapped create",
+            Some(std::slice::from_ref(&create_bob_did)),
+            None,
+        )
+        .await
+        .expect("create_group accepts a wrapped KeyPackage");
+
+    let mut add_world = TestWorld::new();
+    add_world.add_client("Alice").await;
+    add_world.add_client("Bob").await;
+    add_world.register_device("Alice").await.unwrap();
+    let add_bob_did = add_world.register_device("Bob").await.unwrap();
+    let add_convo = add_world
+        .client("Alice")
+        .orchestrator
+        .create_group("wrapped add", None, None)
+        .await
+        .expect("create empty group");
+    replace_available_packages_with_one_wrapped(&add_world, "Alice", "Bob", &add_bob_did).await;
+    add_world
+        .client("Alice")
+        .orchestrator
+        .add_members(
+            &add_convo.conversation_id,
+            std::slice::from_ref(&add_bob_did),
+        )
+        .await
+        .expect("add_members accepts a wrapped KeyPackage");
+
+    let mut swap_world = TestWorld::new();
+    for name in ["Alice", "Bob", "Mallory"] {
+        swap_world.add_client(name).await;
+        swap_world.register_device(name).await.unwrap();
+    }
+    let swap_alice = swap_world.client("Alice");
+    let swap_bob_did = swap_world.client("Bob").did.clone();
+    let swap_mallory_did = swap_world.client("Mallory").did.clone();
+    let swap_convo = swap_alice
+        .orchestrator
+        .create_group(
+            "wrapped swap",
+            Some(std::slice::from_ref(&swap_bob_did)),
+            None,
+        )
+        .await
+        .expect("create group with Bob");
+    replace_available_packages_with_one_wrapped(&swap_world, "Alice", "Mallory", &swap_mallory_did)
+        .await;
+    swap_alice
+        .orchestrator
+        .swap_members(
+            &swap_convo.conversation_id,
+            std::slice::from_ref(&swap_bob_did),
+            std::slice::from_ref(&swap_mallory_did),
+        )
+        .await
+        .expect("swap_members accepts a wrapped KeyPackage");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn public_swap_preserves_pure_removal_compatibility() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group(
+            "public pure removal",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
+        .await
+        .expect("create group with Bob");
+    let group_bytes = hex::decode(&convo.group_id).unwrap();
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .expect("epoch before pure removal");
+
+    alice
+        .orchestrator
+        .swap_members(&convo.group_id, std::slice::from_ref(&bob_did), &[])
+        .await
+        .expect("public Swap must support a pure-removal operation");
+
+    let members_after = alice
+        .orchestrator
+        .mls_context()
+        .group_member_identities(group_bytes.clone())
+        .expect("members after pure removal");
+    assert!(!members_after
+        .iter()
+        .any(|identity| identity == bob_did.as_bytes()));
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes)
+            .expect("epoch after pure removal")
+            > epoch_before
+    );
+    let server_page = alice
+        .orchestrator
+        .api_client()
+        .get_conversations(100, None)
+        .await
+        .expect("read fake delivery-service projection");
+    let server_conversation = server_page
+        .conversations
+        .iter()
+        .find(|conversation| conversation.conversation_id == convo.conversation_id)
+        .expect("conversation remains visible to Alice");
+    assert!(
+        !server_conversation
+            .members
+            .iter()
+            .any(|member| member.did == bob_did),
+        "pure-removal Swap must remove Bob from the server projection too"
+    );
 }
 
 // ---------------------------------------------------------------------------

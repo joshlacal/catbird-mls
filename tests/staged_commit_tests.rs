@@ -14,8 +14,10 @@
 
 mod e2e_harness;
 
+use catbird_mls::orchestrator::credential_binding::extract_key_package_identity;
 use catbird_mls::orchestrator::error::OrchestratorError;
 use catbird_mls::orchestrator::types::{CommitKind, CommitPlan};
+use catbird_mls::orchestrator::MlsCryptoContext;
 use e2e_harness::TestWorld;
 
 /// Drive `stage_commit` on Alice's side for a fresh add-members operation.
@@ -457,4 +459,280 @@ async fn test_stage_while_pending_errors() {
         .discard_pending(plan1.handle)
         .await
         .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Structural outbound DID binding
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_add_rejects_empty_authority_but_pure_remove_swap_remains_valid() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group(
+            "empty-add-authority",
+            Some(std::slice::from_ref(&bob_did)),
+            None,
+        )
+        .await
+        .expect("create group with Bob");
+
+    let error = alice
+        .orchestrator
+        .stage_commit(
+            &convo.group_id,
+            CommitKind::AddMembers {
+                member_dids: vec![],
+                key_packages: vec![],
+            },
+        )
+        .await
+        .expect_err("an Add operation needs non-empty authority");
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert!(error.to_string().contains("empty"));
+
+    let pure_remove = alice
+        .orchestrator
+        .stage_commit(
+            &convo.group_id,
+            CommitKind::SwapMembers {
+                remove_dids: vec![bob_did],
+                add_dids: vec![],
+                add_key_packages: vec![],
+            },
+        )
+        .await
+        .expect("an empty add-side must remain valid for a pure-removal Swap");
+    alice
+        .orchestrator
+        .discard_pending(pure_remove.handle)
+        .await
+        .expect("discard pure-remove compatibility commit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn key_package_extractor_rejects_mls_message_with_welcome_body() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("wrong body", None, None)
+        .await
+        .expect("create group");
+    let plan = stage_add_members(&alice, &convo.conversation_id, &[bob_did]).await;
+    let welcome = plan
+        .welcome_bytes
+        .as_deref()
+        .expect("Add plan carries a Welcome message");
+    assert!(
+        extract_key_package_identity(welcome).is_err(),
+        "a valid MLS message with a non-KeyPackage body must reject"
+    );
+    alice
+        .orchestrator
+        .discard_pending(plan.handle)
+        .await
+        .expect("discard staged add");
+}
+
+async fn raw_key_package(
+    client: &e2e_harness::TestClient,
+    did: &str,
+) -> catbird_mls::KeyPackageData {
+    use catbird_mls::orchestrator::MLSAPIClient;
+    let mut packages = client
+        .orchestrator
+        .api_client()
+        .get_key_packages(&[did.to_string()])
+        .await
+        .expect("fetch key package");
+    assert_eq!(
+        packages.len(),
+        1,
+        "test fixture expects one package per DID"
+    );
+    catbird_mls::KeyPackageData {
+        data: packages.remove(0).key_package_data,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_add_rejects_non_exact_key_package_batches_atomically() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob", "Mallory", "Eve"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let mallory_did = world.client("Mallory").did.clone();
+    let eve_did = world.client("Eve").did.clone();
+    let bob_kp = raw_key_package(alice, &bob_did).await;
+    let mallory_kp = raw_key_package(alice, &mallory_did).await;
+    let eve_kp = raw_key_package(alice, &eve_did).await;
+
+    let cases = vec![
+        (
+            "substituted",
+            vec![bob_did.clone()],
+            vec![mallory_kp.clone()],
+        ),
+        (
+            "appended",
+            vec![bob_did.clone()],
+            vec![bob_kp.clone(), mallory_kp.clone()],
+        ),
+        (
+            "missing",
+            vec![bob_did.clone(), mallory_did.clone()],
+            vec![bob_kp.clone()],
+        ),
+        (
+            "malformed",
+            vec![bob_did.clone()],
+            vec![catbird_mls::KeyPackageData {
+                data: vec![0xde, 0xad, 0xbe, 0xef],
+            }],
+        ),
+        (
+            "mismatched batch",
+            vec![bob_did.clone(), mallory_did.clone()],
+            vec![bob_kp.clone(), eve_kp],
+        ),
+    ];
+
+    for (case, expected_dids, key_packages) in cases {
+        let convo = alice
+            .orchestrator
+            .create_group(&format!("binding-{case}"), None, None)
+            .await
+            .expect("create group");
+        let group_bytes = hex::decode(&convo.group_id).unwrap();
+        let epoch_before = alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes.clone())
+            .unwrap();
+
+        let result = alice
+            .orchestrator
+            .stage_commit(
+                &convo.group_id,
+                CommitKind::AddMembers {
+                    member_dids: expected_dids,
+                    key_packages,
+                },
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("{case} batch must reject"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, OrchestratorError::InvalidInput(_)),
+            "{case} must fail as InvalidInput, got {error:?}"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(group_bytes)
+                .unwrap(),
+            epoch_before,
+            "{case} rejection must not change epoch"
+        );
+
+        let valid = alice
+            .orchestrator
+            .stage_commit(
+                &convo.group_id,
+                CommitKind::AddMembers {
+                    member_dids: vec![bob_did.clone()],
+                    key_packages: vec![bob_kp.clone()],
+                },
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{case} rejection must leave no pending commit: {error}")
+            });
+        alice
+            .orchestrator
+            .discard_pending(valid.handle)
+            .await
+            .expect("discard validation commit");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_swap_mismatch_does_neither_removal_nor_addition() {
+    let mut world = TestWorld::new();
+    for name in ["Alice", "Bob", "Mallory"] {
+        world.add_client(name).await;
+        world.register_device(name).await.unwrap();
+    }
+
+    let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
+    let mallory_did = world.client("Mallory").did.clone();
+    let convo = alice
+        .orchestrator
+        .create_group("binding-swap", Some(std::slice::from_ref(&bob_did)), None)
+        .await
+        .expect("create group with Bob");
+    let group_bytes = hex::decode(&convo.group_id).unwrap();
+    let members_before = alice
+        .orchestrator
+        .mls_context()
+        .group_member_identities(group_bytes.clone())
+        .expect("members before");
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .unwrap();
+    let bob_kp = raw_key_package(alice, &bob_did).await;
+
+    let error = alice
+        .orchestrator
+        .stage_commit(
+            &convo.group_id,
+            CommitKind::SwapMembers {
+                remove_dids: vec![bob_did],
+                add_dids: vec![mallory_did],
+                add_key_packages: vec![bob_kp],
+            },
+        )
+        .await
+        .expect_err("swap with mismatched raw credential must reject");
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .group_member_identities(group_bytes.clone())
+            .expect("members after"),
+        members_before,
+        "failed swap must neither remove Bob nor add Mallory"
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes)
+            .unwrap(),
+        epoch_before,
+        "failed swap must preserve epoch"
+    );
 }

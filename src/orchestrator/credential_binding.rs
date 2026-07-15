@@ -132,10 +132,40 @@ pub fn extract_key_package_binding(
     key_package_data: &[u8],
 ) -> Result<KeyPackageBindingInfo, String> {
     use openmls::prelude::tls_codec::DeserializeBytes;
-    use openmls::prelude::KeyPackageIn;
+    use openmls::prelude::{KeyPackageIn, MlsMessageBodyIn, MlsMessageIn};
 
-    let (kp_in, _rest) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
-        .map_err(|e| format!("key package TLS decode failed: {e:?}"))?;
+    let wrapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        MlsMessageIn::tls_deserialize_bytes(key_package_data)
+    }));
+    let kp_in = match wrapped {
+        Ok(Ok((message, remaining))) => {
+            if !remaining.is_empty() {
+                return Err(format!(
+                    "wrapped key package has {} trailing bytes",
+                    remaining.len()
+                ));
+            }
+            match message.extract() {
+                MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+                _ => return Err("MLS message body is not a key package".to_string()),
+            }
+        }
+        Ok(Err(_)) | Err(_) => {
+            let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                KeyPackageIn::tls_deserialize_bytes(key_package_data)
+            }))
+            .map_err(|_| "raw key package TLS decoder panicked on malformed input".to_string())?;
+            let (key_package, remaining) =
+                raw.map_err(|e| format!("key package TLS decode failed: {e:?}"))?;
+            if !remaining.is_empty() {
+                return Err(format!(
+                    "raw key package has {} trailing bytes",
+                    remaining.len()
+                ));
+            }
+            key_package
+        }
+    };
     let credential_with_key = kp_in.unverified_credential();
     let identity = String::from_utf8(credential_with_key.credential.serialized_content().to_vec())
         .map_err(|_| "credential identity is not UTF-8".to_string())?;
@@ -150,6 +180,60 @@ pub fn extract_key_package_binding(
 /// for the variant that also returns the leaf signature key.
 pub fn extract_key_package_identity(key_package_data: &[u8]) -> Result<String, String> {
     extract_key_package_binding(key_package_data).map(|info| info.identity)
+}
+
+/// Fail-closed structural gate for outbound Add/Swap key-package batches.
+///
+/// Unlike [`MLSOrchestrator::verify_fetched_key_packages`], this helper is an
+/// enforcing precondition. It derives authority from the credential embedded
+/// in each raw KeyPackage, not from a delivery-service label, and requires the
+/// resulting DID-root multiset to exactly equal the requested DID multiset.
+/// Callers must invoke it before any MLS add/swap operation so a substituted,
+/// appended, missing, malformed, or mismatched package cannot create a pending
+/// commit or partially mutate a swap.
+pub(crate) fn enforce_outbound_key_package_did_bindings(
+    expected_dids: &[String],
+    key_packages: &[crate::KeyPackageData],
+) -> super::error::Result<()> {
+    use std::collections::BTreeMap;
+
+    let mut expected = BTreeMap::<String, usize>::new();
+    for did in expected_dids {
+        if !did.starts_with("did:")
+            || credential_root_did(did) != did
+            || catbird_atproto::types::string::Did::new(did).is_err()
+        {
+            return Err(super::error::OrchestratorError::InvalidInput(
+                "outbound key-package authority must contain syntactically valid bare DIDs"
+                    .to_string(),
+            ));
+        }
+        *expected.entry(did.clone()).or_default() += 1;
+    }
+
+    let mut claimed = BTreeMap::<String, usize>::new();
+    for (index, key_package) in key_packages.iter().enumerate() {
+        let identity = extract_key_package_identity(&key_package.data).map_err(|reason| {
+            super::error::OrchestratorError::InvalidInput(format!(
+                "outbound key package {index} has an unverifiable credential: {reason}"
+            ))
+        })?;
+        let root = credential_root_did(&identity);
+        if !root.starts_with("did:") || catbird_atproto::types::string::Did::new(root).is_err() {
+            return Err(super::error::OrchestratorError::InvalidInput(format!(
+                "outbound key package {index} does not claim a syntactically valid credential DID root"
+            )));
+        }
+        *claimed.entry(root.to_string()).or_default() += 1;
+    }
+
+    if claimed != expected {
+        return Err(super::error::OrchestratorError::InvalidInput(format!(
+            "outbound key-package credential DID roots do not exactly match requested DIDs (expected {expected:?}, claimed {claimed:?})"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Cached outcome of an authorized-device-key resolution (ADR-009 D6).
@@ -717,6 +801,46 @@ where
 mod tests {
     use super::*;
 
+    fn key_package_bundle(identity: &str) -> openmls::prelude::KeyPackageBundle {
+        use openmls::prelude::*;
+        use openmls_basic_credential::SignatureKeyPair;
+        use openmls_rust_crypto::OpenMlsRustCrypto;
+
+        let provider = OpenMlsRustCrypto::default();
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let credential = BasicCredential::new(identity.as_bytes().to_vec());
+        let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+        let credential_with_key = CredentialWithKey {
+            credential: credential.into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+        KeyPackage::builder()
+            .build(ciphersuite, &provider, &signer, credential_with_key)
+            .unwrap()
+    }
+
+    fn serialized_key_package(identity: &str) -> crate::KeyPackageData {
+        use openmls::prelude::tls_codec::Serialize as _;
+
+        let bundle = key_package_bundle(identity);
+        crate::KeyPackageData {
+            data: bundle
+                .key_package()
+                .tls_serialize_detached()
+                .expect("serialize key package"),
+        }
+    }
+
+    fn serialized_wrapped_key_package(identity: &str) -> crate::KeyPackageData {
+        use openmls::prelude::{tls_codec::Serialize as _, MlsMessageOut};
+
+        crate::KeyPackageData {
+            data: MlsMessageOut::from(key_package_bundle(identity))
+                .tls_serialize_detached()
+                .expect("serialize wrapped key package"),
+        }
+    }
+
     #[test]
     fn root_did_bare() {
         assert_eq!(credential_root_did("did:plc:alice"), "did:plc:alice");
@@ -783,32 +907,69 @@ mod tests {
         assert!(extract_key_package_identity(&[]).is_err());
     }
 
+    #[test]
+    fn outbound_binding_accepts_raw_and_mls_message_wrapped_key_packages() {
+        for package in [
+            serialized_key_package("did:plc:alice#device-1"),
+            serialized_wrapped_key_package("did:plc:alice#device-1"),
+        ] {
+            enforce_outbound_key_package_did_bindings(&["did:plc:alice".to_string()], &[package])
+                .expect("both supported KeyPackage encodings must bind identically");
+        }
+    }
+
+    #[test]
+    fn outbound_binding_rejects_trailing_bytes_for_both_encodings() {
+        for mut package in [
+            serialized_key_package("did:plc:alice#device-1"),
+            serialized_wrapped_key_package("did:plc:alice#device-1"),
+        ] {
+            package.data.extend_from_slice(&[0xde, 0xad]);
+            enforce_outbound_key_package_did_bindings(&["did:plc:alice".to_string()], &[package])
+                .expect_err("trailing bytes must not be ignored");
+        }
+    }
+
+    #[test]
+    fn outbound_binding_rejects_matching_non_did_authority() {
+        let error = enforce_outbound_key_package_did_bindings(
+            &["alice".to_string()],
+            &[serialized_key_package("alice")],
+        )
+        .expect_err("matching arbitrary strings are not DID authority");
+        assert!(matches!(
+            error,
+            super::super::error::OrchestratorError::InvalidInput(_)
+        ));
+        assert!(error.to_string().contains("DID"));
+    }
+
+    #[test]
+    fn outbound_binding_does_not_globally_fold_method_specific_id_case() {
+        use catbird_atproto::types::string::Did;
+
+        assert!(Did::new("did:method:Value").is_ok());
+        assert!(Did::new("did:method:value").is_ok());
+        assert!(Did::new("did:METHOD:value").is_err());
+
+        let error = enforce_outbound_key_package_did_bindings(
+            &["did:method:Value".to_string()],
+            &[serialized_key_package("did:method:value")],
+        )
+        .expect_err("method-specific identifier case cannot be globally normalized");
+        assert!(matches!(
+            error,
+            super::super::error::OrchestratorError::InvalidInput(_)
+        ));
+    }
+
     /// Round-trip: build a real OpenMLS key package with a DID-rooted
     /// identity and confirm the structural extractor recovers it.
     #[test]
     fn extract_identity_round_trip() {
-        use openmls::prelude::{tls_codec::Serialize as _, *};
-        use openmls_basic_credential::SignatureKeyPair;
-        use openmls_rust_crypto::OpenMlsRustCrypto;
-
-        let provider = OpenMlsRustCrypto::default();
-        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
         let identity = "did:plc:alice#device-1";
 
-        let credential = BasicCredential::new(identity.as_bytes().to_vec());
-        let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
-        let credential_with_key = CredentialWithKey {
-            credential: credential.into(),
-            signature_key: signer.to_public_vec().into(),
-        };
-
-        let bundle = KeyPackage::builder()
-            .build(ciphersuite, &provider, &signer, credential_with_key)
-            .unwrap();
-        let kp_bytes = bundle
-            .key_package()
-            .tls_serialize_detached()
-            .expect("serialize key package");
+        let kp_bytes = serialized_key_package(identity).data;
 
         let extracted = extract_key_package_identity(&kp_bytes).expect("extract identity");
         assert_eq!(extracted, identity);
