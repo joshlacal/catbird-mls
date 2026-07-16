@@ -2146,8 +2146,8 @@ impl MLSContext {
 
         crate::info_log!("[MLS-FFI] delete_group: Deleting group {}", group_id_hex);
 
-        // Remove from groups HashMap using MLSContextInner method
-        if inner.delete_group(gid.as_slice()) {
+        // Remove from groups HashMap only after durable cleanup succeeds.
+        if inner.delete_group(gid.as_slice())? {
             crate::info_log!("[MLS-FFI] ✅ Removed group from context: {}", group_id_hex);
             Ok(())
         } else {
