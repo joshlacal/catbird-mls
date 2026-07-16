@@ -2888,44 +2888,50 @@ impl MLSContext {
     }
 
     /// Delete a group from the context, cleaning up all persistent storage.
-    /// Returns true if the group was found and removed, false otherwise.
-    pub fn delete_group(&mut self, group_id: &[u8]) -> bool {
-        let existed = self.groups.remove(group_id).is_some();
-        if !existed {
-            return false;
+    /// Returns true if the group was found and durably removed, false when it
+    /// was already absent. Persistence and flush failures are returned before
+    /// the live in-memory group is removed so callers can retain a retryable
+    /// pending-delete intent.
+    pub fn delete_group(&mut self, group_id: &[u8]) -> Result<bool, MLSError> {
+        if !self.groups.contains_key(group_id) {
+            return Ok(false);
         }
 
-        // Remove from OpenMLS storage (best-effort, matching discard_pending_external_join)
+        // Delete every OpenMLS row before publishing absence in memory. The
+        // operations are idempotent, so a retry after a partial failure can
+        // safely finish the remaining cleanup.
         let gid = GroupId::from_slice(group_id);
-        let storage = self.provider.storage_mut();
-        let _ = storage.delete_group_state(&gid);
-        let _ = storage.delete_tree(&gid);
-        let _ = storage.delete_confirmation_tag(&gid);
-        let _ = storage.delete_interim_transcript_hash(&gid);
-        let _ = storage.delete_context(&gid);
-        let _ = storage.delete_message_secrets(&gid);
-        let _ = storage.delete_all_resumption_psk_secrets(&gid);
-        let _ = storage.delete_own_leaf_index(&gid);
-        let _ = storage.delete_group_epoch_secrets(&gid);
-        let _ = storage.delete_own_leaf_nodes(&gid);
-        let _ = storage.delete_group_config(&gid);
+        {
+            let storage = self.provider.storage_mut();
+            storage.delete_group_state(&gid)?;
+            storage.delete_tree(&gid)?;
+            storage.delete_confirmation_tag(&gid)?;
+            storage.delete_interim_transcript_hash(&gid)?;
+            storage.delete_context(&gid)?;
+            storage.delete_message_secrets(&gid)?;
+            storage.delete_all_resumption_psk_secrets(&gid)?;
+            storage.delete_own_leaf_index(&gid)?;
+            storage.delete_group_epoch_secrets(&gid)?;
+            storage.delete_own_leaf_nodes(&gid)?;
+            storage.delete_group_config(&gid)?;
+        }
 
         // Remove from manifest
         let hex_id = hex::encode(group_id);
-        if let Ok(Some(mut group_ids)) = self
+        if let Some(mut group_ids) = self
             .manifest_storage
-            .read_manifest::<Vec<String>>("group_ids")
+            .read_manifest::<Vec<String>>("group_ids")?
         {
             group_ids.retain(|id| id != &hex_id);
-            let _ = self
-                .manifest_storage
-                .write_manifest("group_ids", &group_ids);
+            self.manifest_storage
+                .write_manifest("group_ids", &group_ids)?;
         }
 
         // Flush to ensure cleanup is persisted
-        let _ = self.flush_database();
+        self.flush_database()?;
 
-        true
+        self.groups.remove(group_id);
+        Ok(true)
     }
 
     /// Stage a metadata-update commit using the legacy `metadata_json` shape

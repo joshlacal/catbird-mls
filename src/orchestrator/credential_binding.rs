@@ -201,7 +201,7 @@ pub(crate) fn enforce_outbound_key_package_did_bindings(
     for did in expected_dids {
         if !did.starts_with("did:")
             || credential_root_did(did) != did
-            || catbird_atproto::types::string::Did::new(did).is_err()
+            || catbird_atproto::types::string::Did::new(did.as_str()).is_err()
         {
             return Err(super::error::OrchestratorError::InvalidInput(
                 "outbound key-package authority must contain syntactically valid bare DIDs"

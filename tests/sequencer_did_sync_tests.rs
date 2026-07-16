@@ -211,7 +211,7 @@ fn typed_convo_view_sequencer_did_flows_through() {
         "sequencerDid": "did:web:ds-b.example"
     }"#;
 
-    let typed: TypedConvoView<'_> = serde_json::from_str(wire).expect("typed wire parse");
+    let typed: TypedConvoView = serde_json::from_str(wire).expect("typed wire parse");
     assert_eq!(
         typed.sequencer_did.as_ref().map(|d| d.as_str()),
         Some("did:web:ds-b.example"),
@@ -248,6 +248,6 @@ fn typed_convo_view_parses_without_sequencer_did() {
         "createdAt": "2026-06-12T00:00:00.000Z"
     }"#;
 
-    let typed: TypedConvoView<'_> = serde_json::from_str(wire).expect("typed wire parse");
+    let typed: TypedConvoView = serde_json::from_str(wire).expect("typed wire parse");
     assert!(typed.sequencer_did.is_none());
 }
