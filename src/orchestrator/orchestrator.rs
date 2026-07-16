@@ -343,7 +343,8 @@ where
                     error = %e,
                     "Failed to read persisted RecoveryTracker state — initialization rejected"
                 );
-                *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Uninitialized;
+                *self.lifecycle_state.lock().await =
+                    OrchestratorLifecycleState::FailedInitialization;
                 return Err(e);
             }
         }

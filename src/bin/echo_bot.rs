@@ -10,6 +10,8 @@
 //!   BOT_DID=did:plc:echobot DS_URL=http://localhost:3001 cargo run --features echo-bot --bin echo-bot
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use async_trait::async_trait;
@@ -52,6 +54,10 @@ struct Args {
     /// Delay before echoing in milliseconds
     #[arg(long, env = "ECHO_DELAY_MS", default_value_t = 1000)]
     echo_delay_ms: u64,
+
+    /// Persistent directory for MLS and recovery state
+    #[arg(long, env = "BOT_STATE_DIR")]
+    state_dir: Option<PathBuf>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -195,18 +201,143 @@ struct BotStorageInner {
     sync_cursors: HashMap<String, SyncCursor>,
     conversation_states: HashMap<String, ConversationState>,
     pending_messages: HashSet<String>,
+    recovery_backoff: HashMap<String, PersistedRecoveryBackoff>,
+    last_global_rejoin_attempt_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
 struct BotStorage {
     inner: Arc<StdMutex<BotStorageInner>>,
+    recovery_path: Arc<PathBuf>,
+    fail_next_directory_sync: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BotStorage {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(StdMutex::new(BotStorageInner::default())),
+    fn with_recovery_path(recovery_path: PathBuf) -> OrcResult<Self> {
+        let persisted = Self::read_recovery_state(&recovery_path)?;
+        let inner = BotStorageInner {
+            recovery_backoff: persisted
+                .entries
+                .into_iter()
+                .map(|entry| (entry.conversation_id.clone(), entry))
+                .collect(),
+            last_global_rejoin_attempt_at_ms: persisted.last_global_rejoin_attempt_at_ms,
+            ..BotStorageInner::default()
+        };
+        Ok(Self {
+            inner: Arc::new(StdMutex::new(inner)),
+            recovery_path: Arc::new(recovery_path),
+            fail_next_directory_sync: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    fn read_recovery_state(path: &Path) -> OrcResult<PersistedRecoveryState> {
+        match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                OrchestratorError::Storage(format!(
+                    "invalid echo-bot recovery state {}: {error}",
+                    path.display()
+                ))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(PersistedRecoveryState::default())
+            }
+            Err(error) => Err(OrchestratorError::Storage(format!(
+                "read echo-bot recovery state {}: {error}",
+                path.display()
+            ))),
         }
+    }
+
+    fn persist_recovery_state(
+        &self,
+        state: &PersistedRecoveryState,
+        inner: &mut BotStorageInner,
+    ) -> OrcResult<()> {
+        if let Some(parent) = self.recovery_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                OrchestratorError::Storage(format!(
+                    "create echo-bot recovery directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let bytes = serde_json::to_vec(state).map_err(|error| {
+            OrchestratorError::Storage(format!("serialize echo-bot recovery state: {error}"))
+        })?;
+        let temporary = self
+            .recovery_path
+            .with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = std::fs::File::create(&temporary).map_err(|error| {
+            OrchestratorError::Storage(format!(
+                "create echo-bot recovery state {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        file.write_all(&bytes).map_err(|error| {
+            OrchestratorError::Storage(format!(
+                "write echo-bot recovery state {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            OrchestratorError::Storage(format!(
+                "sync echo-bot recovery state {}: {error}",
+                temporary.display()
+            ))
+        })?;
+        std::fs::rename(&temporary, self.recovery_path.as_ref()).map_err(|error| {
+            OrchestratorError::Storage(format!(
+                "commit echo-bot recovery state {}: {error}",
+                self.recovery_path.display()
+            ))
+        })?;
+        // Rename publishes the new authoritative file. Install the same
+        // snapshot in memory before directory fsync can report durability
+        // uncertainty, so a later whole-file update cannot erase it.
+        Self::install_recovery_state(inner, state);
+        if self
+            .fail_next_directory_sync
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(OrchestratorError::Storage(
+                "injected echo-bot recovery directory sync failure".to_string(),
+            ));
+        }
+        if let Some(parent) = self.recovery_path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    OrchestratorError::Storage(format!(
+                        "sync echo-bot recovery directory {}: {error}",
+                        parent.display()
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    fn recovery_state(inner: &BotStorageInner) -> PersistedRecoveryState {
+        PersistedRecoveryState {
+            entries: inner.recovery_backoff.values().cloned().collect(),
+            last_global_rejoin_attempt_at_ms: inner.last_global_rejoin_attempt_at_ms,
+        }
+    }
+
+    fn install_recovery_state(inner: &mut BotStorageInner, state: &PersistedRecoveryState) {
+        inner.recovery_backoff = state
+            .entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.conversation_id.clone(), entry))
+            .collect();
+        inner.last_global_rejoin_attempt_at_ms = state.last_global_rejoin_attempt_at_ms;
+    }
+
+    #[cfg(test)]
+    fn fail_next_directory_sync(&self) {
+        self.fail_next_directory_sync
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -406,11 +537,41 @@ impl MLSStorageBackend for BotStorage {
             .pending_messages
             .remove(message_id))
     }
+    async fn get_recovery_state(&self) -> OrcResult<PersistedRecoveryState> {
+        Ok(Self::recovery_state(&self.inner.lock().unwrap()))
+    }
+    async fn set_recovery_backoff(&self, entry: &PersistedRecoveryBackoff) -> OrcResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut candidate = Self::recovery_state(&inner);
+        candidate
+            .entries
+            .retain(|persisted| persisted.conversation_id != entry.conversation_id);
+        candidate.entries.push(entry.clone());
+        self.persist_recovery_state(&candidate, &mut inner)
+    }
+    async fn clear_recovery_backoff(&self, conversation_id: &str) -> OrcResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut candidate = Self::recovery_state(&inner);
+        candidate
+            .entries
+            .retain(|entry| entry.conversation_id != conversation_id);
+        self.persist_recovery_state(&candidate, &mut inner)
+    }
+    async fn set_last_global_rejoin_attempt_at(&self, at_ms: i64) -> OrcResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let mut candidate = Self::recovery_state(&inner);
+        candidate.last_global_rejoin_attempt_at_ms = Some(at_ms);
+        self.persist_recovery_state(&candidate, &mut inner)
+    }
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
             "get_conversation_state",
             "store_pending_message",
             "remove_pending_message",
+            "get_recovery_state",
+            "set_recovery_backoff",
+            "clear_recovery_backoff",
+            "set_last_global_rejoin_attempt_at",
         ]
     }
 }
@@ -419,9 +580,20 @@ impl MLSStorageBackend for BotStorage {
 mod bot_storage_tests {
     use super::*;
 
+    fn test_mls_context(path: &std::path::Path, label: &str) -> Arc<MLSContext> {
+        MLSContext::new(
+            path.to_string_lossy().to_string(),
+            format!("echo-bot-storage-test-{label}"),
+            Box::new(InMemoryKeychain::new()),
+        )
+        .expect("create test MLS context")
+    }
+
     #[tokio::test]
     async fn bot_storage_definitively_reads_conversation_state_for_normal_resolution() {
-        let storage = BotStorage::new();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let storage = BotStorage::with_recovery_path(directory.path().join("recovery-state.json"))
+            .expect("create bot storage");
         assert_eq!(
             storage
                 .get_conversation_state("ordinary-conversation")
@@ -441,6 +613,83 @@ mod bot_storage_tests {
                 .expect("read tracked state"),
             Some(ConversationState::NeedsRejoin)
         );
+    }
+
+    #[tokio::test]
+    async fn bot_storage_recovery_state_survives_restart_and_allows_initialization() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let recovery_path = directory.path().join("recovery-state.json");
+        let did = "did:plc:echo-storage-test";
+        let conversation_id = "durable-recovery-conversation";
+
+        let storage = BotStorage::with_recovery_path(recovery_path.clone())
+            .expect("create durable bot storage");
+        storage
+            .set_recovery_backoff(&PersistedRecoveryBackoff {
+                conversation_id: conversation_id.to_string(),
+                failed_rejoin_count: 2,
+                last_attempt_at_ms: Utc::now().timestamp_millis(),
+                quarantined_until_ms: None,
+            })
+            .await
+            .expect("persist recovery backoff");
+        drop(storage);
+
+        let restarted =
+            BotStorage::with_recovery_path(recovery_path).expect("reopen durable bot storage");
+        let orchestrator = MLSOrchestrator::new(
+            test_mls_context(&directory.path().join("restart.db"), "restart"),
+            Arc::new(restarted),
+            Arc::new(HttpDSClient::new("http://127.0.0.1:9", did, "test-token")),
+            Arc::new(BotCredentials::new()),
+            OrchestratorConfig::default(),
+        );
+
+        orchestrator
+            .initialize(did)
+            .await
+            .expect("echo-bot storage must satisfy mandatory recovery persistence");
+        let tracker = orchestrator.recovery_tracker().lock().await;
+        assert_eq!(tracker.failed_attempts(conversation_id), 2);
+        assert!(tracker.cooldown_remaining(conversation_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn post_rename_sync_failure_cannot_be_erased_by_later_write() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let recovery_path = directory.path().join("recovery-state.json");
+        let storage = BotStorage::with_recovery_path(recovery_path.clone())
+            .expect("create durable bot storage");
+        let entry = |conversation_id: &str| PersistedRecoveryBackoff {
+            conversation_id: conversation_id.to_string(),
+            failed_rejoin_count: 1,
+            last_attempt_at_ms: Utc::now().timestamp_millis(),
+            quarantined_until_ms: None,
+        };
+
+        storage.fail_next_directory_sync();
+        storage
+            .set_recovery_backoff(&entry("conversation-a"))
+            .await
+            .expect_err("post-rename directory sync failure must propagate");
+        storage
+            .set_recovery_backoff(&entry("conversation-b"))
+            .await
+            .expect("later write must preserve the renamed snapshot");
+        drop(storage);
+
+        let restarted =
+            BotStorage::with_recovery_path(recovery_path).expect("reopen durable bot storage");
+        let persisted = restarted
+            .get_recovery_state()
+            .await
+            .expect("read recovery state");
+        let ids: HashSet<_> = persisted
+            .entries
+            .iter()
+            .map(|entry| entry.conversation_id.as_str())
+            .collect();
+        assert_eq!(ids, HashSet::from(["conversation-a", "conversation-b"]));
     }
 }
 
@@ -1170,15 +1419,22 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "Starting MLS echo bot"
     );
 
-    // Create temp dir for MLS database
-    let temp_dir = std::env::temp_dir().join(format!(
-        "echo_bot_mls_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis()
-    ));
-    std::fs::create_dir_all(&temp_dir)?;
-    let db_path = temp_dir.join("echo-bot.db");
+    let state_dir = args.state_dir.unwrap_or_else(|| {
+        let safe_did: String = args
+            .bot_did
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        std::env::temp_dir().join(format!("echo_bot_mls_{safe_did}"))
+    });
+    std::fs::create_dir_all(&state_dir)?;
+    let db_path = state_dir.join("echo-bot.db");
 
     info!(db_path = %db_path.display(), "MLS database location");
 
@@ -1192,7 +1448,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| format!("Failed to create MLSContext: {e}"))?;
 
     // Create backend implementations
-    let storage = BotStorage::new();
+    let storage = BotStorage::with_recovery_path(state_dir.join("recovery-state.json"))
+        .map_err(|e| format!("Failed to create durable BotStorage: {e}"))?;
     let credentials = BotCredentials::new();
     let api_client = HttpDSClient::new(&args.ds_url, &args.bot_did, &args.auth_token);
 
@@ -1322,8 +1579,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Cleanup temp directory
-    let _ = std::fs::remove_dir_all(&temp_dir);
     info!("Echo bot stopped");
     Ok(())
 }

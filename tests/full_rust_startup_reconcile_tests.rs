@@ -206,6 +206,39 @@ async fn initialize_fails_closed_on_malformed_persisted_security_state() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn recovery_state_read_failure_cannot_be_bypassed_by_reattach() {
+    let fixture = StartupReconcileFixture::new();
+    fixture.storage.fail_next_get_recovery_state();
+    let orchestrator = MLSOrchestrator::new(
+        Arc::clone(&fixture.context),
+        Arc::clone(&fixture.storage),
+        Arc::new(MockDeliveryService::new(fixture.did)),
+        Arc::new(MockCredentials::new()),
+        OrchestratorConfig::default(),
+    );
+
+    orchestrator
+        .initialize(fixture.did)
+        .await
+        .expect_err("recovery-state read failure must abort initialization");
+    assert!(matches!(
+        orchestrator.reattach_after_suspend(fixture.did).await,
+        Err(OrchestratorError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        orchestrator
+            .ensure_conversation_ready("unavailable-after-failed-init")
+            .await,
+        Err(OrchestratorError::ShuttingDown)
+    ));
+
+    orchestrator
+        .initialize(fixture.did)
+        .await
+        .expect("an explicit serialized initialize retry may recover");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn malformed_reset_or_quarantine_state_keeps_restarted_orchestrator_unavailable() {
     for persisted_state in [
         ConversationState::ResetPending {

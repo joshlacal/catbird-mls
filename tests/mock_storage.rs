@@ -66,6 +66,7 @@ struct Inner {
     recovery_backoff: HashMap<String, PersistedRecoveryBackoff>,
     /// Persisted global last-rejoin-attempt timestamp (epoch ms).
     last_global_rejoin_attempt_at_ms: Option<i64>,
+    fail_next_get_recovery_state: bool,
     /// One-shot partial-write injection for recovery persistence ordering.
     fail_next_set_last_global_rejoin_attempt_at: bool,
     /// conversation_id -> pending local-delete intent (WS-5.3).
@@ -241,6 +242,10 @@ impl MockStorage {
             .lock()
             .unwrap()
             .fail_next_set_last_global_rejoin_attempt_at = true;
+    }
+
+    pub fn fail_next_get_recovery_state(&self) {
+        self.inner.lock().unwrap().fail_next_get_recovery_state = true;
     }
 
     // ── Test helper methods ──────────────────────────────────────────────
@@ -1610,6 +1615,12 @@ impl MLSStorageBackend for MockStorage {
     async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
         let mut inner = self.inner.lock().unwrap();
         inner.startup_probe_counts.get_recovery_state += 1;
+        if inner.fail_next_get_recovery_state {
+            inner.fail_next_get_recovery_state = false;
+            return Err(OrchestratorError::Storage(
+                "injected recovery state read failure".to_string(),
+            ));
+        }
         Ok(PersistedRecoveryState {
             entries: inner.recovery_backoff.values().cloned().collect(),
             last_global_rejoin_attempt_at_ms: inner.last_global_rejoin_attempt_at_ms,
