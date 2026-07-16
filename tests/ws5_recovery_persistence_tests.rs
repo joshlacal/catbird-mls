@@ -228,6 +228,57 @@ async fn rejoin_backoff_survives_orchestrator_restart() {
     let _ = std::fs::remove_dir_all(temp_dir);
 }
 
+/// A partial write must commit the stricter per-conversation backoff before
+/// the shorter global stamp. If the global write then fails, restart must
+/// still hydrate the escalating 2m/10m/24h gate instead of permitting one
+/// attempt every global-minimum interval.
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_global_write_failure_preserves_per_conversation_backoff_on_restart() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("WS-5.4 partial write", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    alice.storage.fail_next_set_last_global_rejoin_attempt_at();
+    world.delivery_service().fail_next_get_group_info();
+    let error = alice
+        .orchestrator
+        .force_rejoin(&convo_id)
+        .await
+        .expect_err("the injected global persistence failure must propagate");
+    assert!(error.to_string().contains("global recovery timestamp"));
+
+    let persisted = alice
+        .storage
+        .get_persisted_recovery_backoff(&convo_id)
+        .expect("the stricter per-conversation row must commit before the global stamp");
+    assert_eq!(persisted.failed_rejoin_count, 1);
+    assert!(
+        alice
+            .storage
+            .get_persisted_last_global_rejoin_at_ms()
+            .is_none(),
+        "test precondition: injected global write must not commit"
+    );
+
+    let (restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
+    let tracker = restarted.recovery_tracker().lock().await;
+    assert_eq!(tracker.failed_attempts(&convo_id), 1);
+    assert!(
+        tracker.cooldown_remaining(&convo_id).is_some(),
+        "restart must retain the stricter per-conversation cooldown after partial write"
+    );
+    drop(tracker);
+    drop(temp_dir);
+}
+
 /// Successful rejoin clears the conversation's persisted entry (E7 rule).
 /// Exercised via the server-reset path, which must also clear the entry —
 /// both call sites share the same storage write.
