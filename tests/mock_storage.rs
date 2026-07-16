@@ -66,6 +66,8 @@ struct Inner {
     recovery_backoff: HashMap<String, PersistedRecoveryBackoff>,
     /// Persisted global last-rejoin-attempt timestamp (epoch ms).
     last_global_rejoin_attempt_at_ms: Option<i64>,
+    /// One-shot partial-write injection for recovery persistence ordering.
+    fail_next_set_last_global_rejoin_attempt_at: bool,
     /// conversation_id -> pending local-delete intent (WS-5.3).
     pending_local_deletes: HashMap<String, PendingLocalDelete>,
     /// When set, the next `clear_rejoin_flag` call fails once (WS-5 FIX-1
@@ -232,6 +234,13 @@ impl MockStorage {
     pub fn omit_pending_delete_capabilities(&self) {
         self.declare_pending_delete_capabilities
             .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn fail_next_set_last_global_rejoin_attempt_at(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_set_last_global_rejoin_attempt_at = true;
     }
 
     // ── Test helper methods ──────────────────────────────────────────────
@@ -1623,6 +1632,12 @@ impl MLSStorageBackend for MockStorage {
 
     async fn set_last_global_rejoin_attempt_at(&self, at_ms: i64) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_set_last_global_rejoin_attempt_at {
+            inner.fail_next_set_last_global_rejoin_attempt_at = false;
+            return Err(OrchestratorError::Storage(
+                "injected global recovery timestamp failure".to_string(),
+            ));
+        }
         inner.last_global_rejoin_attempt_at_ms = Some(at_ms);
         Ok(())
     }

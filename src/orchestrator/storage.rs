@@ -48,6 +48,31 @@ pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
     "list_pending_local_deletes",
 ];
 
+/// Recovery persistence methods that are optional at the Rust trait level for
+/// source compatibility, but mandatory before an orchestrator may initialize.
+/// Without all four, a process restart can erase the recovery rate limit.
+pub const REQUIRED_RECOVERY_PERSISTENCE_METHODS: &[&str] = &[
+    "get_recovery_state",
+    "set_recovery_backoff",
+    "clear_recovery_backoff",
+    "set_last_global_rejoin_attempt_at",
+];
+
+pub(crate) fn require_recovery_persistence_capabilities<S: MLSStorageBackend + ?Sized>(
+    storage: &S,
+) -> Result<()> {
+    let implemented = storage.implemented_optional_methods();
+    if let Some(missing) = REQUIRED_RECOVERY_PERSISTENCE_METHODS
+        .iter()
+        .find(|method| !implemented.contains(method))
+    {
+        return Err(super::error::OrchestratorError::Storage(format!(
+            "recovery rate limiting requires durable storage; backend does not declare {missing}"
+        )));
+    }
+    Ok(())
+}
+
 /// Platform-agnostic storage backend for MLS orchestration state.
 ///
 /// Implementations should persist data durably (e.g. SQLite, GRDB, Room).
@@ -398,30 +423,46 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     ///
     /// Hydration ignores entries whose `last_attempt_at_ms` is older than
     /// `constants::RECOVERY_BACKOFF_TTL` (24 h) and honors — never extends —
-    /// remaining cooldown/quarantine. Default empty state preserves the
-    /// pre-WS-5.4 "restart resets backoff" behavior for backends that have
-    /// not added the table yet.
+    /// remaining cooldown/quarantine. Returning an authoritative empty state
+    /// from an omitted implementation would reset attacker-triggered backoff
+    /// on every restart, so the default fails closed.
     async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
-        Ok(PersistedRecoveryState::default())
+        Err(super::error::OrchestratorError::Storage(
+            "get_recovery_state is required for recovery rate limiting".to_string(),
+        ))
     }
 
     /// Write-through one conversation's rejoin-backoff snapshot. Called on
-    /// every failed rejoin attempt (and on quarantine-lockout entry). Default
-    /// no-op for backward compatibility.
+    /// every failed rejoin attempt (and on quarantine-lockout entry).
+    ///
+    /// This is security-relevant restart state. The default fails closed so a
+    /// direct Rust backend cannot silently report durable success while
+    /// dropping the rate-limit snapshot.
     async fn set_recovery_backoff(&self, _entry: &PersistedRecoveryBackoff) -> Result<()> {
-        Ok(())
+        Err(super::error::OrchestratorError::Storage(
+            "set_recovery_backoff is required for recovery rate limiting".to_string(),
+        ))
     }
 
     /// Remove a conversation's persisted backoff entry. Called on successful
-    /// rejoin and on server-initiated reset (fresh start). Default no-op.
+    /// rejoin and on server-initiated reset (fresh start).
+    ///
+    /// The default fails closed for the same reason as
+    /// [`Self::set_recovery_backoff`]: callers must never mistake an omitted
+    /// native implementation for a committed durable mutation.
     async fn clear_recovery_backoff(&self, _conversation_id: &str) -> Result<()> {
-        Ok(())
+        Err(super::error::OrchestratorError::Storage(
+            "clear_recovery_backoff is required for recovery rate limiting".to_string(),
+        ))
     }
 
     /// Persist the global last-rejoin-attempt timestamp (epoch ms), which
-    /// backs `MIN_REJOIN_INTERVAL` across restarts. Default no-op.
+    /// backs `MIN_REJOIN_INTERVAL` across restarts. The default fails closed;
+    /// silently dropping this write would let restart bypass the global gate.
     async fn set_last_global_rejoin_attempt_at(&self, _at_ms: i64) -> Result<()> {
-        Ok(())
+        Err(super::error::OrchestratorError::Storage(
+            "set_last_global_rejoin_attempt_at is required for recovery rate limiting".to_string(),
+        ))
     }
 
     // -- Pending local deletes (WS-5.3 crash-safe force_delete_local) --
@@ -453,14 +494,155 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
 
     // -- Capabilities (WS-5.6) --
 
-    /// Names of the trait methods with defaults that this backend
-    /// actually overrides. Purely informational: the orchestrator's init-time
-    /// capabilities check warns about every method in
-    /// [`OPTIONAL_STORAGE_METHODS`] not reported here, so silently-dropped
-    /// missing persistence support is observable in logs. Backends that override
-    /// optional methods should keep this list in sync; a stale list only
-    /// produces a spurious warning, never a behavior change.
+    /// Names of the trait methods with defaults that this backend actually
+    /// overrides. Most entries are informational and produce an init-time
+    /// warning when absent. Entries in
+    /// [`REQUIRED_RECOVERY_PERSISTENCE_METHODS`] are security capabilities:
+    /// initialization is rejected when any are absent.
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[]
+    }
+}
+
+#[cfg(test)]
+mod fail_closed_default_tests {
+    use super::*;
+
+    struct MissingRecoveryBackoffStorage;
+
+    #[async_trait]
+    impl MLSStorageBackend for MissingRecoveryBackoffStorage {
+        async fn ensure_conversation_exists(
+            &self,
+            _user_did: &str,
+            _conversation_id: &str,
+            _group_id: &str,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn update_join_info(
+            &self,
+            _conversation_id: &str,
+            _user_did: &str,
+            _join_method: JoinMethod,
+            _join_epoch: u64,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn get_conversation(
+            &self,
+            _user_did: &str,
+            _conversation_id: &str,
+        ) -> Result<Option<ConversationView>> {
+            unreachable!()
+        }
+
+        async fn list_conversations(&self, _user_did: &str) -> Result<Vec<ConversationView>> {
+            unreachable!()
+        }
+
+        async fn delete_conversations(&self, _user_did: &str, _ids: &[&str]) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn set_conversation_state(
+            &self,
+            _conversation_id: &str,
+            _state: ConversationState,
+        ) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn mark_needs_rejoin(&self, _conversation_id: &str) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn needs_rejoin(&self, _conversation_id: &str) -> Result<bool> {
+            unreachable!()
+        }
+
+        async fn clear_rejoin_flag(&self, _conversation_id: &str) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn store_message(&self, _message: &Message) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn get_messages(
+            &self,
+            _conversation_id: &str,
+            _limit: u32,
+            _before_sequence: Option<u64>,
+        ) -> Result<Vec<Message>> {
+            unreachable!()
+        }
+
+        async fn message_exists(&self, _message_id: &str) -> Result<bool> {
+            unreachable!()
+        }
+
+        async fn get_sync_cursor(&self, _user_did: &str) -> Result<SyncCursor> {
+            unreachable!()
+        }
+
+        async fn set_sync_cursor(&self, _user_did: &str, _cursor: &SyncCursor) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn set_group_state(&self, _state: &GroupState) -> Result<()> {
+            unreachable!()
+        }
+
+        async fn get_group_state(&self, _group_id: &str) -> Result<Option<GroupState>> {
+            unreachable!()
+        }
+
+        async fn delete_group_state(&self, _group_id: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_recovery_backoff_persistence_fails_closed() {
+        let storage = MissingRecoveryBackoffStorage;
+        let entry = PersistedRecoveryBackoff {
+            conversation_id: "convo-security".to_string(),
+            failed_rejoin_count: 3,
+            last_attempt_at_ms: 1234,
+            quarantined_until_ms: Some(5678),
+        };
+
+        let read_error = storage
+            .get_recovery_state()
+            .await
+            .expect_err("omitted get_recovery_state must not report authoritative empty state");
+        let set_error = storage
+            .set_recovery_backoff(&entry)
+            .await
+            .expect_err("omitted set_recovery_backoff must not report durable success");
+        let clear_error = storage
+            .clear_recovery_backoff(&entry.conversation_id)
+            .await
+            .expect_err("omitted clear_recovery_backoff must not report durable success");
+        let global_error = storage
+            .set_last_global_rejoin_attempt_at(entry.last_attempt_at_ms)
+            .await
+            .expect_err("omitted global rejoin timestamp write must not report durable success");
+
+        assert!(read_error.to_string().contains("get_recovery_state"));
+        assert!(set_error.to_string().contains("set_recovery_backoff"));
+        assert!(clear_error.to_string().contains("clear_recovery_backoff"));
+        assert!(global_error
+            .to_string()
+            .contains("set_last_global_rejoin_attempt_at"));
+
+        let initialization_error = require_recovery_persistence_capabilities(&storage)
+            .expect_err("an omitted recovery persistence backend must be rejected at startup");
+        assert!(initialization_error
+            .to_string()
+            .contains("get_recovery_state"));
     }
 }

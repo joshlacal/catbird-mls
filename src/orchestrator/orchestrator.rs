@@ -275,6 +275,12 @@ where
     pub async fn initialize(&self, user_did: &str) -> Result<()> {
         let _lifecycle_owner = self.lifecycle_operation.lock().await;
         tracing::info!(user_did, "Initializing MLS orchestrator");
+
+        // Recovery backoff is a security boundary, not a best-effort cache.
+        // Reject backends that inherit any of its default implementations so
+        // restart can never silently reset process-local enforcement.
+        super::storage::require_recovery_persistence_capabilities(self.storage.as_ref())?;
+
         *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Initializing {
             user_did: user_did.to_string(),
         };
@@ -335,8 +341,10 @@ where
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "Failed to read persisted RecoveryTracker state — backoff starts fresh"
+                    "Failed to read persisted RecoveryTracker state — initialization rejected"
                 );
+                *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Uninitialized;
+                return Err(e);
             }
         }
 

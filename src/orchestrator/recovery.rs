@@ -1336,9 +1336,10 @@ where
         // max-1), mirroring the hydration clamp and the Swift twin's
         // runtime quarantine removal. Update the persisted row to match so
         // a restart sees the same clamped state.
-        let clamp = {
+        let (clamp, pre_clamp_entry) = {
             let mut tracker = self.recovery_tracker().lock().await;
-            tracker.expire_lapsed_lockout(convo_id)
+            let prior = tracker.failed_rejoins.get(convo_id).cloned();
+            (tracker.expire_lapsed_lockout(convo_id), prior)
         };
         if let Some((clamped_count, last_attempt_at_ms)) = clamp {
             tracing::info!(
@@ -1348,8 +1349,14 @@ where
             );
             if clamped_count == 0 {
                 if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
+                    let mut tracker = self.recovery_tracker().lock().await;
+                    if let Some(prior) = pre_clamp_entry.clone() {
+                        tracker.failed_rejoins.insert(convo_id.to_string(), prior);
+                    }
+                    drop(tracker);
                     self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
                         .await;
+                    return Err(e);
                 }
             } else {
                 let entry = PersistedRecoveryBackoff {
@@ -1359,8 +1366,14 @@ where
                     quarantined_until_ms: None,
                 };
                 if let Err(e) = self.storage().set_recovery_backoff(&entry).await {
+                    let mut tracker = self.recovery_tracker().lock().await;
+                    if let Some(prior) = pre_clamp_entry.clone() {
+                        tracker.failed_rejoins.insert(convo_id.to_string(), prior);
+                    }
+                    drop(tracker);
                     self.report_recovery_storage_failure(convo_id, "set_recovery_backoff", &e)
                         .await;
+                    return Err(e);
                 }
             }
         }
@@ -1619,15 +1632,12 @@ where
         }
     }
 
-    pub(crate) async fn clear_rejoin_failures(&self, convo_id: &str) {
-        self.recovery_tracker().lock().await.clear(convo_id);
+    pub(crate) async fn clear_rejoin_failures(&self, convo_id: &str) -> Result<()> {
         // WS-5.4 write-through: successful rejoin clears the persisted entry;
-        // `clear` arms the global gate, so persist that too.
+        // `clear` arms the global gate, so persist that too. Do not publish the
+        // in-memory success until both durable mutations complete.
         let now_ms = chrono::Utc::now().timestamp_millis();
-        if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
-            self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
-                .await;
-        }
+        self.recovery_tracker().lock().await.last_global_rejoin_at = Some(Instant::now());
         if let Err(e) = self
             .storage()
             .set_last_global_rejoin_attempt_at(now_ms)
@@ -1635,7 +1645,15 @@ where
         {
             self.report_recovery_storage_failure(convo_id, "set_last_global_rejoin_attempt_at", &e)
                 .await;
+            return Err(e);
         }
+        if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
+            self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
+                .await;
+            return Err(e);
+        }
+        self.recovery_tracker().lock().await.clear(convo_id);
+        Ok(())
     }
 
     /// Stale-flag housekeeping twin of [`clear_rejoin_failures`]
@@ -1796,7 +1814,7 @@ where
         true
     }
 
-    async fn record_rejoin_failure(&self, convo_id: &str) {
+    async fn record_rejoin_failure(&self, convo_id: &str) -> Result<()> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let (count, max_attempts) = {
             let mut tracker = self.recovery_tracker().lock().await;
@@ -1819,6 +1837,7 @@ where
         if let Err(e) = self.storage().set_recovery_backoff(&entry).await {
             self.report_recovery_storage_failure(convo_id, "set_recovery_backoff", &e)
                 .await;
+            return Err(e);
         }
         if let Err(e) = self
             .storage()
@@ -1827,7 +1846,9 @@ where
         {
             self.report_recovery_storage_failure(convo_id, "set_last_global_rejoin_attempt_at", &e)
                 .await;
+            return Err(e);
         }
+        Ok(())
     }
 
     async fn route_welcome_recovery_decision(
@@ -2802,7 +2823,7 @@ where
                         "ResetPending remains authoritative after force rejoin for {convo_id}"
                     )));
                 }
-                self.clear_rejoin_failures(convo_id).await;
+                self.clear_rejoin_failures(convo_id).await?;
                 Ok(())
             }
             Err(ref err) if err.is_rate_limited() => {
@@ -2825,7 +2846,7 @@ where
                 result
             }
             Err(_) => {
-                self.record_rejoin_failure(convo_id).await;
+                self.record_rejoin_failure(convo_id).await?;
                 result
             }
         }
@@ -3071,7 +3092,7 @@ where
                                 tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag after Welcome join");
                             }
                         }
-                        self.clear_rejoin_failures(convo_id).await;
+                        self.clear_rejoin_failures(convo_id).await?;
 
                         // Insert history boundary marker for Welcome join.
                         // On iOS, Swift inserts first — message_exists prevents duplicates.
@@ -3221,7 +3242,7 @@ where
                         // Active inside try_first_responder_bootstrap; just
                         // clear the rejoin failure tracker (idempotent if no
                         // prior failures).
-                        self.clear_rejoin_failures(convo_id).await;
+                        self.clear_rejoin_failures(convo_id).await?;
                         return Ok(epoch);
                     }
                     Err(boot_err) if boot_err.is_bootstrap_already_bootstrapped() => {
@@ -3309,7 +3330,7 @@ where
         let rejoin_result = self.force_rejoin_unlocked(convo_id, &user_did).await;
         match rejoin_result {
             Ok(()) => {
-                self.clear_rejoin_failures(convo_id).await;
+                self.clear_rejoin_failures(convo_id).await?;
                 let epoch = self.local_group_epoch(convo_id).await.unwrap_or(0);
                 crate::warn_log!(
                     "[REJOIN-DIAG] convo={} External Commit OK epoch={}",
@@ -3319,7 +3340,7 @@ where
                 Ok(epoch)
             }
             Err(err) => {
-                self.record_rejoin_failure(convo_id).await;
+                self.record_rejoin_failure(convo_id).await?;
                 crate::warn_log!(
                     "[REJOIN-DIAG] convo={} External Commit FAILED: {}",
                     convo_id,
