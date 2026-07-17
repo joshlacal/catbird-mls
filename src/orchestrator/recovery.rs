@@ -152,6 +152,66 @@ where
     Ok(())
 }
 
+/// Witness that a destructive reset's target group-id hex was validated for
+/// shape/hex/length at record time, before any state transition referenced it.
+///
+/// ADR-021 Part A (ledger residual `csf_d0d5fab7fefe6dd96602ebe7`): a
+/// destructive reset must never delete the pre-reset MLS group on the strength
+/// of an unvalidated, server-asserted target id. The only constructor is
+/// [`ValidatedResetTarget::parse`], which fails closed with
+/// [`OrchestratorError::InvalidInput`]. Because `persist_reset_pending_state`
+/// takes this witness by reference — and it is the only path that reaches
+/// `delete_group` for a reset — the destructive delete is unreachable unless
+/// target validation has already succeeded. Threading the witness (rather than
+/// a bare `&str`) makes that ordering a property of the type, not of call-site
+/// discipline.
+#[derive(Debug, Clone)]
+struct ValidatedResetTarget {
+    hex: String,
+}
+
+impl ValidatedResetTarget {
+    /// Smallest MLS group id this stack produces: a client-minted UUIDv4
+    /// candidate (`format!("{:032x}", ..)`) and an OpenMLS random group id are
+    /// both 16 bytes.
+    const MIN_GROUP_ID_BYTES: usize = 16;
+    /// Generous upper bound. Admin/legacy targets have been observed at 32
+    /// bytes; anything beyond this band signals a malformed assertion rather
+    /// than a real group id.
+    const MAX_GROUP_ID_BYTES: usize = 64;
+
+    /// Validate a reset target's hex identifier at record time. Fails closed —
+    /// the caller must abort the reset and leave the pre-reset group intact.
+    fn parse(new_group_id_hex: &str) -> Result<Self> {
+        if new_group_id_hex.is_empty() {
+            return Err(OrchestratorError::InvalidInput(
+                "reset target group id is empty".to_string(),
+            ));
+        }
+        let bytes = hex::decode(new_group_id_hex).map_err(|error| {
+            OrchestratorError::InvalidInput(format!(
+                "reset target group id {new_group_id_hex} is not valid hex: {error}"
+            ))
+        })?;
+        if !(Self::MIN_GROUP_ID_BYTES..=Self::MAX_GROUP_ID_BYTES).contains(&bytes.len()) {
+            return Err(OrchestratorError::InvalidInput(format!(
+                "reset target group id length {} bytes is outside the valid MLS group-id range [{}, {}]",
+                bytes.len(),
+                Self::MIN_GROUP_ID_BYTES,
+                Self::MAX_GROUP_ID_BYTES,
+            )));
+        }
+        Ok(Self {
+            hex: new_group_id_hex.to_string(),
+        })
+    }
+
+    /// The validated target's hex identifier.
+    fn hex(&self) -> &str {
+        &self.hex
+    }
+}
+
 /// One conversation's failed-rejoin bookkeeping (in-memory side of the
 /// persisted `PersistedRecoveryBackoff` schema, WS-5.4 / invariant E7).
 #[derive(Debug, Clone)]
@@ -3480,6 +3540,11 @@ where
         let transition_lock = self.rejoin_lock(convo_id).await;
         let _transition_guard = transition_lock.lock().await;
         let new_group_id_hex = hex::encode(&new_group_id);
+        // ADR-021 Part A: validate the reset target's shape/hex at record time,
+        // before any idempotency/self-echo check or state transition references
+        // it. A malformed target fails closed here and never reaches the
+        // destructive delete in `persist_reset_pending_state`.
+        let validated_target = ValidatedResetTarget::parse(&new_group_id_hex)?;
         tracing::info!(
             convo_id,
             new_group_id = %new_group_id_hex,
@@ -3505,7 +3570,7 @@ where
             if existing.reset_generation == reset_generation {
                 self.persist_reset_pending_state(
                     convo_id,
-                    &new_group_id_hex,
+                    &validated_target,
                     reset_generation,
                     Some(existing.clone()),
                 )
@@ -3532,7 +3597,7 @@ where
             );
             return Ok(ResetRecordOutcome::SelfEchoNoOp);
         }
-        self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation, None)
+        self.persist_reset_pending_state(convo_id, &validated_target, reset_generation, None)
             .await?;
         Ok(ResetRecordOutcome::Recorded)
     }
@@ -3652,9 +3717,13 @@ where
                 return Ok(ResetRecordOutcome::StaleOrDuplicate);
             }
             if existing.reset_generation == reset_generation {
+                // Resume of an already-committed target. It was validated when
+                // first recorded; re-validate at record time so the delete path
+                // is never reachable with an unvalidated target (ADR-021 Part A).
+                let validated_existing = ValidatedResetTarget::parse(&existing.new_group_id)?;
                 self.persist_reset_pending_state(
                     convo_id,
-                    &existing.new_group_id,
+                    &validated_existing,
                     reset_generation,
                     Some(existing.clone()),
                 )
@@ -3703,6 +3772,12 @@ where
             }
         };
 
+        // ADR-021 Part A: validate the resolved target's shape/hex at record
+        // time, before the self-echo check or any state transition references
+        // it. A malformed server-supplied `expectedNewMlsGroupId` fails closed
+        // here and never reaches the destructive delete.
+        let validated_target = ValidatedResetTarget::parse(&new_group_id_hex)?;
+
         if existing_pending.is_none()
             && self
                 .reset_target_is_current_existing_group(convo_id, &new_group_id_hex)
@@ -3720,7 +3795,7 @@ where
             return Ok(ResetRecordOutcome::SelfEchoNoOp);
         }
 
-        self.persist_reset_pending_state(convo_id, &new_group_id_hex, reset_generation, None)
+        self.persist_reset_pending_state(convo_id, &validated_target, reset_generation, None)
             .await?;
         Ok(ResetRecordOutcome::Recorded)
     }
@@ -3750,10 +3825,17 @@ where
     async fn persist_reset_pending_state(
         &self,
         convo_id: &str,
-        new_group_id_hex: &str,
+        target: &ValidatedResetTarget,
         reset_generation: i32,
         committed: Option<ResetPendingPayload>,
     ) -> Result<()> {
+        // `target` is a `ValidatedResetTarget`, so its shape/hex/length were
+        // checked at record time (ADR-021 Part A). The destructive delete
+        // below (`delete_materialized_reset_predecessors`) is therefore
+        // unreachable for an unvalidated target — the type is the gate — and it
+        // additionally runs only after the durable `mark_reset_pending`
+        // publication succeeds, so `delete_group` cannot precede durable intent.
+        let new_group_id_hex = target.hex();
         let resuming_committed_generation = committed.is_some();
         let notified_at_ms = committed
             .as_ref()

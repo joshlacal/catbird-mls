@@ -27,7 +27,7 @@ mod e2e_harness;
 
 use catbird_mls::orchestrator::{
     ConversationState, MLSAPIClient, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
-    ResetRecordOutcome,
+    OrchestratorError, ResetRecordOutcome,
 };
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use std::sync::Arc;
@@ -2379,4 +2379,292 @@ async fn test_record_reset_requested_survives_orchestrator_restart() {
     // Cleanup: shutdown + temp dir.
     orchestrator2.shutdown().await;
     let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// ---------------------------------------------------------------------------
+// 5. ADR-021 Part A — reset-target validation before destructive delete.
+//
+// Ledger residual `csf_d0d5fab7fefe6dd96602ebe7`: a destructive reset used to
+// validate only generation monotonicity + self-echo before deleting the old
+// MLS group, with no shape/hex validation of the (server-asserted) reset
+// target. A malformed target could therefore publish a garbage RESET_PENDING
+// AND delete the old group — unrecoverable. Part A validates the target's
+// shape/hex at record time, fails closed with a typed error, and preserves the
+// old group; the delete path is unreachable until durable intent + target
+// validation both succeed.
+// ---------------------------------------------------------------------------
+
+/// A non-empty but non-hex `expectedNewMlsGroupId` from the server must be
+/// rejected at record time with a typed `InvalidInput` error — no RESET_PENDING
+/// row, no state transition, and the pre-reset MLS group left intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_hex_reset_target_is_rejected_without_deleting_old_group() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Malformed Hex Target", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+    let old_group = hex::decode(&convo.group_id).expect("created group id must be valid hex");
+    assert!(
+        alice
+            .orchestrator
+            .mls_context()
+            .group_exists(old_group.clone()),
+        "precondition: the pre-reset group must exist"
+    );
+
+    // 32 non-hex characters: non-empty (so the None-path mint is NOT taken),
+    // but `hex::decode` fails.
+    let malformed = "z".repeat(32);
+    let error = alice
+        .orchestrator
+        .record_reset_requested(
+            &convo_id,
+            "crypto-session-prior",
+            7,
+            "adminRequest",
+            "req-admin:malformed-hex",
+            Some(malformed),
+        )
+        .await
+        .expect_err("malformed-hex reset target must fail closed");
+    assert!(
+        matches!(error, OrchestratorError::InvalidInput(_)),
+        "malformed-hex target must yield InvalidInput, got {error:?}"
+    );
+
+    assert_eq!(
+        alice.storage.mark_reset_pending_call_count(&convo_id),
+        0,
+        "a malformed target must not write a durable RESET_PENDING row"
+    );
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&convo_id)
+            .is_none(),
+        "a malformed target must not persist RESET_PENDING"
+    );
+    assert!(
+        !matches!(
+            alice.storage.get_current_state(&convo_id),
+            Some(ConversationState::ResetPending { .. })
+        ),
+        "a malformed target must not transition the conversation to ResetPending"
+    );
+    assert!(
+        alice.orchestrator.mls_context().group_exists(old_group),
+        "the pre-reset group must survive a rejected reset target"
+    );
+}
+
+/// A syntactically valid hex target of the wrong length (too short to be an
+/// MLS group id) must be rejected at record time, old group intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn wrong_length_reset_target_is_rejected_without_deleting_old_group() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Wrong Length Target", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+    let old_group = hex::decode(&convo.group_id).expect("created group id must be valid hex");
+
+    // Valid hex, but only 8 bytes — below the smallest MLS group id this stack
+    // ever produces (16-byte client mint / OpenMLS random).
+    let too_short = hex::encode(vec![0xab; 8]);
+    let error = alice
+        .orchestrator
+        .record_reset_requested(
+            &convo_id,
+            "crypto-session-prior",
+            7,
+            "adminRequest",
+            "req-admin:wrong-length",
+            Some(too_short),
+        )
+        .await
+        .expect_err("wrong-length reset target must fail closed");
+    assert!(
+        matches!(error, OrchestratorError::InvalidInput(_)),
+        "wrong-length target must yield InvalidInput, got {error:?}"
+    );
+
+    assert_eq!(
+        alice.storage.mark_reset_pending_call_count(&convo_id),
+        0,
+        "a wrong-length target must not write a durable RESET_PENDING row"
+    );
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&convo_id)
+            .is_none(),
+        "a wrong-length target must not persist RESET_PENDING"
+    );
+    assert!(
+        alice.orchestrator.mls_context().group_exists(old_group),
+        "the pre-reset group must survive a rejected reset target"
+    );
+}
+
+/// An empty reset target via the direct `record_group_reset` path (an empty
+/// group-id byte vector encodes to `""`) must be rejected at record time, old
+/// group intact.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_reset_target_is_rejected_without_deleting_old_group() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Empty Target", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+    let old_group = hex::decode(&convo.group_id).expect("created group id must be valid hex");
+
+    let error = alice
+        .orchestrator
+        .record_group_reset(&convo_id, Vec::new(), 7)
+        .await
+        .expect_err("empty reset target must fail closed");
+    assert!(
+        matches!(error, OrchestratorError::InvalidInput(_)),
+        "empty target must yield InvalidInput, got {error:?}"
+    );
+
+    assert_eq!(
+        alice.storage.mark_reset_pending_call_count(&convo_id),
+        0,
+        "an empty target must not write a durable RESET_PENDING row"
+    );
+    assert!(
+        alice
+            .storage
+            .get_persisted_reset_pending(&convo_id)
+            .is_none(),
+        "an empty target must not persist RESET_PENDING"
+    );
+    assert!(
+        alice.orchestrator.mls_context().group_exists(old_group),
+        "the pre-reset group must survive a rejected reset target"
+    );
+}
+
+/// Ordering guarantee: `delete_group` cannot run before the durable reset
+/// intent has committed. A valid target whose durable `mark_reset_pending`
+/// write fails must fail closed with the old group intact — proving the delete
+/// is gated on durable intent, not merely on target validation.
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_is_gated_on_durable_intent_committing_first() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Durable Intent Gate", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+    let old_group = hex::decode(&convo.group_id).expect("created group id must be valid hex");
+
+    // Valid, well-formed target — validation passes. The durable write is what
+    // fails here, so any delete must be suppressed.
+    let valid_target = vec![0x5c; 16];
+    alice.storage.fail_next_mark_reset_pending();
+
+    let error = alice
+        .orchestrator
+        .record_group_reset(&convo_id, valid_target, 7)
+        .await
+        .expect_err("failed durable intent must fail closed");
+    assert!(
+        matches!(
+            error,
+            OrchestratorError::Storage(_) | OrchestratorError::ResetCompletionNotCommitted { .. }
+        ),
+        "failed durable intent must surface a storage/uncommitted error, got {error:?}"
+    );
+
+    assert!(
+        alice.orchestrator.mls_context().group_exists(old_group),
+        "the pre-reset group must survive when durable intent fails to commit"
+    );
+}
+
+/// Restart-durability across the persist/delete gap: once the durable reset
+/// intent has committed for a well-formed target, the RESET_PENDING payload
+/// survives an orchestrator restart even though the local delete + rejoin have
+/// not completed — the reset resumes from durable state, not from the deleted
+/// group.
+#[tokio::test(flavor = "multi_thread")]
+async fn valid_reset_intent_survives_restart_across_persist_delete_gap() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Restart Across Gap", None, None)
+        .await
+        .expect("create_group failed");
+    let convo_id = convo.conversation_id.clone();
+
+    let target = vec![0x6d; 16];
+    let target_hex = hex::encode(&target);
+    alice
+        .orchestrator
+        .record_group_reset(&convo_id, target, 12)
+        .await
+        .expect("well-formed reset must record");
+
+    // The durable intent is on disk and readable exactly as recorded — this is
+    // the cross-restart carrier the deferred-recovery loop resumes from.
+    let persisted = alice
+        .storage
+        .get_persisted_reset_pending(&convo_id)
+        .expect("durable RESET_PENDING must be persisted for a well-formed target");
+    assert_eq!(persisted.reset_generation, 12);
+    assert_eq!(persisted.new_group_id_hex, target_hex);
+    assert!(
+        alice.storage.has_rejoin_flag(&convo_id),
+        "durable intent must arm needs_rejoin so restart resumes the reset"
+    );
+    assert!(
+        matches!(
+            alice.storage.get_current_state(&convo_id),
+            Some(ConversationState::ResetPending {
+                reset_generation: 12,
+                ..
+            })
+        ),
+        "durable state must be ResetPending at the recorded generation"
+    );
 }
