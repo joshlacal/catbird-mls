@@ -6059,6 +6059,31 @@ mod tests {
     }
 
     #[test]
+    fn both_public_voice_decode_entrypoints_preserve_input_limit_errors() {
+        // Deliberately exceed voice.rs's 8 MiB compressed-input ceiling. Both
+        // UniFFI surfaces must preserve the fail-closed decoder result rather
+        // than bypassing it or returning attacker-controlled output.
+        let oversized = vec![0u8; 8 * 1024 * 1024 + 1];
+        let free_function_error =
+            ffi_decode_opus_to_pcm(oversized.clone()).expect_err("free function must reject");
+        assert!(matches!(
+            free_function_error,
+            OrchestratorBridgeError::Voice { ref message }
+                if message.contains("input exceeds maximum size")
+        ));
+
+        let (_dir, bridge) = device_auth_signing_bridge();
+        let method_error = bridge
+            .decode_opus_to_pcm(oversized)
+            .expect_err("bridge method must reject");
+        assert!(matches!(
+            method_error,
+            OrchestratorBridgeError::Voice { ref message }
+                if message.contains("input exceeds maximum size")
+        ));
+    }
+
+    #[test]
     fn device_auth_signing_api_accepts_only_the_challenge() {
         let _signature_only_api: fn(
             &OrchestratorBridge,

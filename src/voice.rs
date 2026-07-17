@@ -13,6 +13,38 @@ const WAVEFORM_SAMPLES: usize = 64;
 const MAX_DURATION_SECS: u64 = 300; // 5 minutes
 const OPUS_BITRATE: i32 = 64_000; // 64kbps for crisp voice quality
 
+// ── Decode-side DoS bounds ────────────────────────────────────────────
+// `decode_opus_to_pcm` consumes attacker-supplied Opus/OGG bytes (voice
+// attachments received from other members). Without bounds a tiny crafted
+// file can drive unbounded work and memory allocation (decompression bomb).
+// The byte, packet, and playable-output caps fail closed before/within decode.
+//
+// Input cap: a legitimate voice message is <= MAX_DURATION_SECS at
+// OPUS_BITRATE. 300 s * 64_000 bit/s / 8 = 2_400_000 bytes of Opus payload.
+// We allow generous headroom for OGG container framing (page headers +
+// segment tables, one page per 20 ms packet ~= 15_000 pages) and VBR/bitrate
+// spikes (an attacker file need not honor our 64 kbps encoder setting), then
+// round up to a clean 8 MiB ceiling (~3.3x the nominal payload).
+const MAX_OPUS_INPUT_BYTES: usize = 8 * 1024 * 1024;
+//
+// Decoded-output cap: reject once accumulated PCM would exceed
+// MAX_DURATION_SECS of 48 kHz mono i16 audio. 48_000 * 300 = 14_400_000
+// samples (= 28.8 MB as i16). Enforced inside the packet loop so allocation
+// stops at the bound, not after.
+const MAX_DECODED_SAMPLES: usize = OPUS_SAMPLE_RATE as usize * MAX_DURATION_SECS as usize;
+// Opus packets may legally be as short as 2.5 ms. OpusHead encodes pre-skip
+// as an unsigned 16-bit sample count, so the absolute work budget must cover
+// five playable minutes plus every representable pre-skip sample. A tighter
+// per-stream limit is derived from the actual header after it is parsed.
+const MIN_OPUS_PACKET_SAMPLES: usize = OPUS_SAMPLE_RATE as usize / 400;
+const MAX_PRE_SKIP_SAMPLES: usize = u16::MAX as usize;
+const MAX_DECODE_PACKETS: usize =
+    (MAX_DECODED_SAMPLES + MAX_PRE_SKIP_SAMPLES).div_ceil(MIN_OPUS_PACKET_SAMPLES);
+// RFC 6716 permits up to 120 ms in one Opus packet. The reusable decode
+// scratch buffer and the sole allowed terminal-padding allowance share this
+// bound, so EOS trimming never requires unbounded speculative output.
+const MAX_OPUS_PACKET_SAMPLES: usize = OPUS_SAMPLE_RATE as usize * 120 / 1000;
+
 // DSP constants
 const NOISE_GATE_THRESHOLD_DB: f32 = -50.0; // Gate floor in dB
 const NOISE_GATE_ATTACK_MS: f32 = 1.0; // Fast open
@@ -45,6 +77,12 @@ pub enum VoiceError {
     EmptyInput,
     #[error("recording exceeds maximum duration of {MAX_DURATION_SECS} seconds")]
     TooLong,
+    #[error("Opus input exceeds maximum size of {MAX_OPUS_INPUT_BYTES} bytes")]
+    InputTooLarge,
+    #[error("decoded audio exceeds maximum duration of {MAX_DURATION_SECS} seconds")]
+    DecodedTooLong,
+    #[error("Opus packet count exceeds maximum of {limit}")]
+    TooManyPackets { limit: usize },
     #[error("Opus encoding failed: {0}")]
     OpusEncode(String),
     #[error("Opus decoding failed: {0}")]
@@ -458,24 +496,70 @@ pub fn prepare_voice_message(
 /// Decode Opus-in-OGG back to 16-bit LE mono PCM at 48kHz.
 /// iOS can't play Opus OGG natively, so this decodes to PCM for AVAudioPlayer.
 pub fn decode_opus_to_pcm(opus_ogg: &[u8]) -> Result<Vec<u8>, VoiceError> {
+    // Fail closed on an oversized compressed input before touching the decoder.
+    if opus_ogg.len() > MAX_OPUS_INPUT_BYTES {
+        return Err(VoiceError::InputTooLarge);
+    }
+
     let mut reader = PacketReader::new(Cursor::new(opus_ogg));
     let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono)
         .map_err(|e| VoiceError::OpusDecode(e.to_string()))?;
 
     let mut all_pcm: Vec<i16> = Vec::new();
     let mut skipped_headers = 0;
+    let mut pre_skip = 0usize;
+    let mut pre_skip_remaining = 0usize;
+    let mut stream_packet_limit = MAX_DECODE_PACKETS;
+    let mut packet_count = 0usize;
+    let mut decoded_stream_samples = 0usize;
+    let mut saw_eos = false;
+    let mut decode_buf = vec![0i16; MAX_OPUS_PACKET_SAMPLES];
 
     while let Some(packet) = reader
         .read_packet()
         .map_err(|e| VoiceError::OggError(e.to_string()))?
     {
-        // Skip OpusHead and OpusTags header packets
-        if skipped_headers < 2 {
+        // Parse OpusHead rather than merely skipping it: its pre-skip is part
+        // of the Ogg/Opus timeline and must not consume the playable-duration
+        // budget. This decoder supports the mono mapping emitted by Catbird.
+        if skipped_headers == 0 {
+            if packet.data.len() < 19
+                || !packet.data.starts_with(b"OpusHead")
+                || packet.data[8] != 1
+            {
+                return Err(VoiceError::OggError(
+                    "invalid or unsupported OpusHead".to_string(),
+                ));
+            }
+            pre_skip = u16::from_le_bytes([packet.data[10], packet.data[11]]) as usize;
+            pre_skip_remaining = pre_skip;
+            stream_packet_limit =
+                (MAX_DECODED_SAMPLES + pre_skip).div_ceil(MIN_OPUS_PACKET_SAMPLES);
+            skipped_headers += 1;
+            continue;
+        }
+        if skipped_headers == 1 {
+            if !packet.data.starts_with(b"OpusTags") {
+                return Err(VoiceError::OggError("missing OpusTags".to_string()));
+            }
             skipped_headers += 1;
             continue;
         }
 
-        let mut decode_buf = vec![0i16; OPUS_FRAME_SIZE];
+        // Count before invoking the codec or growing output. The compressed
+        // byte limit alone does not bound work because valid 2.5 ms packets
+        // can be only a few bytes each.
+        packet_count = packet_count
+            .checked_add(1)
+            .ok_or(VoiceError::TooManyPackets {
+                limit: stream_packet_limit,
+            })?;
+        if packet_count > stream_packet_limit {
+            return Err(VoiceError::TooManyPackets {
+                limit: stream_packet_limit,
+            });
+        }
+
         let output_signals: MutSignals<'_, i16> = (&mut decode_buf)
             .try_into()
             .map_err(|e: audiopus::Error| VoiceError::OpusDecode(e.to_string()))?;
@@ -486,7 +570,65 @@ pub fn decode_opus_to_pcm(opus_ogg: &[u8]) -> Result<Vec<u8>, VoiceError> {
             .decode(Some(input_packet), output_signals, false)
             .map_err(|e| VoiceError::OpusDecode(e.to_string()))?;
 
-        all_pcm.extend_from_slice(&decode_buf[..decoded_samples]);
+        decoded_stream_samples = decoded_stream_samples
+            .checked_add(decoded_samples)
+            .ok_or(VoiceError::DecodedTooLong)?;
+        let skip_now = pre_skip_remaining.min(decoded_samples);
+        pre_skip_remaining -= skip_now;
+        let playable = &decode_buf[skip_now..decoded_samples];
+
+        // The EOS granule can trim encoder delay/end padding from the final
+        // packet. Buffer no more than one legal packet beyond the playable
+        // limit while waiting for that authoritative timeline value.
+        let buffered_limit = MAX_DECODED_SAMPLES + MAX_OPUS_PACKET_SAMPLES;
+        if all_pcm
+            .len()
+            .checked_add(playable.len())
+            .is_none_or(|len| len > buffered_limit)
+        {
+            return Err(VoiceError::DecodedTooLong);
+        }
+
+        all_pcm.extend_from_slice(playable);
+
+        if packet.last_in_stream() {
+            let playable_samples = packet
+                .absgp_page()
+                .checked_sub(pre_skip as u64)
+                .ok_or_else(|| {
+                    VoiceError::OggError("EOS granule precedes Opus pre-skip".to_string())
+                })?;
+            let playable_samples =
+                usize::try_from(playable_samples).map_err(|_| VoiceError::DecodedTooLong)?;
+            if playable_samples > MAX_DECODED_SAMPLES {
+                return Err(VoiceError::DecodedTooLong);
+            }
+            if packet.absgp_page() > decoded_stream_samples as u64
+                || playable_samples > all_pcm.len()
+            {
+                return Err(VoiceError::OggError(
+                    "EOS granule exceeds decoded Opus timeline".to_string(),
+                ));
+            }
+            let trimmed_samples = all_pcm.len() - playable_samples;
+            if trimmed_samples > decoded_samples {
+                return Err(VoiceError::OggError(
+                    "EOS granule trims more than the last Opus packet".to_string(),
+                ));
+            }
+            all_pcm.truncate(playable_samples);
+            saw_eos = true;
+            break;
+        }
+    }
+
+    // This API materializes a complete attachment, not a live stream. A
+    // truncated/header-only Ogg stream has no authoritative final duration
+    // and must never be accepted, even when its decoded output is short.
+    if !saw_eos {
+        return Err(VoiceError::OggError(
+            "missing Ogg Opus EOS page".to_string(),
+        ));
     }
 
     // Convert i16 samples to LE bytes
@@ -502,6 +644,8 @@ pub fn decode_opus_to_pcm(opus_ogg: &[u8]) -> Result<Vec<u8>, VoiceError> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    const OPUS_TEST_PRE_SKIP: u16 = 312;
 
     fn generate_sine_pcm(freq_hz: f32, duration_secs: f32, sample_rate: u32) -> Vec<i16> {
         let num_samples = (sample_rate as f32 * duration_secs) as usize;
@@ -520,6 +664,75 @@ mod tests {
         }
         file.flush().unwrap();
         file
+    }
+
+    /// Build a standards-shaped Ogg/Opus stream whose EOS granule selects
+    /// the exact playable duration independently from decoder padding.
+    fn encode_ogg_with_timeline(
+        playable_samples: usize,
+        pre_skip: u16,
+        packet_samples: usize,
+        packet_count: usize,
+        end_stream: bool,
+    ) -> Vec<u8> {
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+        let frame = vec![0i16; packet_samples];
+        let mut encoded = vec![0u8; 4000];
+        let encoded_len = encoder.encode(&frame, &mut encoded).unwrap();
+        let encoded = encoded[..encoded_len].to_vec();
+
+        let mut ogg_buf = Vec::new();
+        let serial = 0xC47B_1A0D;
+        let mut writer = PacketWriter::new(Cursor::new(&mut ogg_buf));
+
+        let mut opus_head = Vec::with_capacity(19);
+        opus_head.extend_from_slice(b"OpusHead");
+        opus_head.push(1);
+        opus_head.push(1);
+        opus_head.extend_from_slice(&pre_skip.to_le_bytes());
+        opus_head.extend_from_slice(&OPUS_SAMPLE_RATE.to_le_bytes());
+        opus_head.extend_from_slice(&0i16.to_le_bytes());
+        opus_head.push(0);
+        writer
+            .write_packet(opus_head, serial, ogg::PacketWriteEndInfo::EndPage, 0)
+            .unwrap();
+
+        let mut opus_tags = Vec::new();
+        opus_tags.extend_from_slice(b"OpusTags");
+        opus_tags.extend_from_slice(&0u32.to_le_bytes());
+        opus_tags.extend_from_slice(&0u32.to_le_bytes());
+        writer
+            .write_packet(opus_tags, serial, ogg::PacketWriteEndInfo::EndPage, 0)
+            .unwrap();
+
+        let eos_granule = pre_skip as u64 + playable_samples as u64;
+        for packet_index in 0..packet_count {
+            let is_last = packet_index + 1 == packet_count;
+            let granule = if is_last {
+                eos_granule
+            } else {
+                ((packet_index + 1) * packet_samples) as u64
+            };
+            writer
+                .write_packet(
+                    encoded.clone(),
+                    serial,
+                    if is_last {
+                        if end_stream {
+                            ogg::PacketWriteEndInfo::EndStream
+                        } else {
+                            ogg::PacketWriteEndInfo::EndPage
+                        }
+                    } else {
+                        ogg::PacketWriteEndInfo::NormalPacket
+                    },
+                    granule,
+                )
+                .unwrap();
+        }
+
+        drop(writer);
+        ogg_buf
     }
 
     #[test]
@@ -618,5 +831,216 @@ mod tests {
         .unwrap();
 
         assert_eq!(decrypted, result.opus_data);
+    }
+
+    #[test]
+    fn test_decode_rejects_oversized_input() {
+        // A compressed input larger than the ceiling must be rejected before
+        // any decoding work happens.
+        let oversized = vec![0u8; MAX_OPUS_INPUT_BYTES + 1];
+        let err = decode_opus_to_pcm(&oversized);
+        assert!(matches!(err, Err(VoiceError::InputTooLarge)));
+    }
+
+    #[test]
+    fn test_decode_accepts_input_at_exact_byte_limit() {
+        let exact_limit = vec![0u8; MAX_OPUS_INPUT_BYTES];
+        let err = decode_opus_to_pcm(&exact_limit).unwrap_err();
+        assert!(!matches!(err, VoiceError::InputTooLarge));
+    }
+
+    #[test]
+    fn test_decode_rejects_malformed_ogg() {
+        let err = decode_opus_to_pcm(b"not an Ogg container").unwrap_err();
+        assert!(matches!(err, VoiceError::OggError(_)));
+    }
+
+    #[test]
+    fn test_decode_accepts_exact_playable_duration_with_preskip_and_eos_padding() {
+        let raw_samples = MAX_DECODED_SAMPLES + OPUS_TEST_PRE_SKIP as usize;
+        let packet_count = raw_samples.div_ceil(OPUS_FRAME_SIZE);
+        let opus_data = encode_ogg_with_timeline(
+            MAX_DECODED_SAMPLES,
+            OPUS_TEST_PRE_SKIP,
+            OPUS_FRAME_SIZE,
+            packet_count,
+            true,
+        );
+
+        let decoded = decode_opus_to_pcm(&opus_data).unwrap();
+        assert_eq!(decoded.len(), MAX_DECODED_SAMPLES * 2);
+    }
+
+    #[test]
+    fn test_decode_rejects_first_playable_sample_over_duration_limit() {
+        let playable_samples = MAX_DECODED_SAMPLES + 1;
+        let raw_samples = playable_samples + OPUS_TEST_PRE_SKIP as usize;
+        let packet_count = raw_samples.div_ceil(OPUS_FRAME_SIZE);
+        assert!(
+            packet_count * OPUS_FRAME_SIZE - OPUS_TEST_PRE_SKIP as usize
+                <= MAX_DECODED_SAMPLES + MAX_OPUS_PACKET_SAMPLES,
+            "fixture must fit the bounded EOS-padding allowance before its granule rejects it"
+        );
+        let opus_data = encode_ogg_with_timeline(
+            playable_samples,
+            OPUS_TEST_PRE_SKIP,
+            OPUS_FRAME_SIZE,
+            packet_count,
+            true,
+        );
+
+        assert!(matches!(
+            decode_opus_to_pcm(&opus_data),
+            Err(VoiceError::DecodedTooLong)
+        ));
+    }
+
+    #[test]
+    fn test_decode_accepts_exact_legal_minimum_duration_packet_count() {
+        let packet_samples = 120; // Opus minimum duration: 2.5 ms at 48 kHz.
+        let packet_count = MAX_DECODED_SAMPLES / packet_samples;
+        let opus_data =
+            encode_ogg_with_timeline(MAX_DECODED_SAMPLES, 0, packet_samples, packet_count, true);
+
+        let decoded = decode_opus_to_pcm(&opus_data).unwrap();
+        assert_eq!(decoded.len(), MAX_DECODED_SAMPLES * 2);
+    }
+
+    #[test]
+    fn test_decode_packet_budget_includes_actual_preskip_at_exact_limit() {
+        let packet_samples = 120;
+        let packet_count =
+            (MAX_DECODED_SAMPLES + OPUS_TEST_PRE_SKIP as usize).div_ceil(packet_samples);
+        assert_eq!(packet_count, 120_003);
+        let opus_data = encode_ogg_with_timeline(
+            MAX_DECODED_SAMPLES,
+            OPUS_TEST_PRE_SKIP,
+            packet_samples,
+            packet_count,
+            true,
+        );
+
+        let decoded = decode_opus_to_pcm(&opus_data).unwrap();
+        assert_eq!(decoded.len(), MAX_DECODED_SAMPLES * 2);
+    }
+
+    #[test]
+    fn test_decode_rejects_first_packet_over_preskip_adjusted_budget() {
+        let packet_samples = 120;
+        let packet_count =
+            (MAX_DECODED_SAMPLES + OPUS_TEST_PRE_SKIP as usize).div_ceil(packet_samples) + 1;
+        let opus_data = encode_ogg_with_timeline(
+            MAX_DECODED_SAMPLES,
+            OPUS_TEST_PRE_SKIP,
+            packet_samples,
+            packet_count,
+            true,
+        );
+
+        let err = decode_opus_to_pcm(&opus_data).unwrap_err();
+        assert!(err.to_string().contains("packet count"));
+    }
+
+    #[test]
+    fn test_decode_rejects_first_packet_over_work_budget_before_decode() {
+        let packet_samples = 120;
+        let packet_count = MAX_DECODED_SAMPLES / packet_samples + 1;
+        let opus_data =
+            encode_ogg_with_timeline(MAX_DECODED_SAMPLES, 0, packet_samples, packet_count, true);
+
+        let err = decode_opus_to_pcm(&opus_data).unwrap_err();
+        assert!(err.to_string().contains("packet count"));
+    }
+
+    #[test]
+    fn test_decode_missing_eos_cannot_claim_terminal_padding_allowance() {
+        let raw_samples = MAX_DECODED_SAMPLES + OPUS_TEST_PRE_SKIP as usize;
+        let packet_count = raw_samples.div_ceil(OPUS_FRAME_SIZE);
+        let opus_data = encode_ogg_with_timeline(
+            MAX_DECODED_SAMPLES,
+            OPUS_TEST_PRE_SKIP,
+            OPUS_FRAME_SIZE,
+            packet_count,
+            false,
+        );
+
+        assert!(matches!(
+            decode_opus_to_pcm(&opus_data),
+            Err(VoiceError::OggError(message)) if message.contains("EOS")
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_short_stream_without_eos() {
+        let opus_data = encode_ogg_with_timeline(120, 0, 120, 1, false);
+        assert!(matches!(
+            decode_opus_to_pcm(&opus_data),
+            Err(VoiceError::OggError(message)) if message.contains("EOS")
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_header_only_stream_without_eos() {
+        let opus_data = encode_ogg_with_timeline(0, 0, 120, 0, false);
+        assert!(matches!(
+            decode_opus_to_pcm(&opus_data),
+            Err(VoiceError::OggError(message)) if message.contains("EOS")
+        ));
+    }
+
+    #[test]
+    fn test_decode_allows_eos_to_trim_exactly_one_last_packet() {
+        let opus_data = encode_ogg_with_timeline(OPUS_FRAME_SIZE, 0, OPUS_FRAME_SIZE, 2, true);
+        let decoded = decode_opus_to_pcm(&opus_data).unwrap();
+        assert_eq!(decoded.len(), OPUS_FRAME_SIZE * 2);
+    }
+
+    #[test]
+    fn test_decode_rejects_eos_trimming_more_than_last_packet() {
+        let opus_data = encode_ogg_with_timeline(OPUS_FRAME_SIZE - 1, 0, OPUS_FRAME_SIZE, 2, true);
+        assert!(matches!(
+            decode_opus_to_pcm(&opus_data),
+            Err(VoiceError::OggError(message)) if message.contains("last Opus packet")
+        ));
+    }
+
+    #[test]
+    fn test_decode_rejects_eos_granule_beyond_decoded_timeline() {
+        let opus_data = encode_ogg_with_timeline(OPUS_FRAME_SIZE * 2, 0, OPUS_FRAME_SIZE, 1, true);
+
+        let err = decode_opus_to_pcm(&opus_data).unwrap_err();
+        assert!(matches!(err, VoiceError::OggError(_)));
+    }
+
+    #[test]
+    fn test_decode_rejects_output_bomb() {
+        // Encode a stream longer than MAX_DURATION_SECS. The compressed bytes
+        // stay well under the input cap (silence compresses tiny), so the
+        // stream passes the input check and must be rejected mid-loop by the
+        // decoded-output bound. The encode path itself imposes no duration cap
+        // (that lives in prepare_voice_message), so this is a valid OGG Opus
+        // stream whose decoded PCM exceeds the duration ceiling.
+        let over_limit_secs = MAX_DURATION_SECS as f32 + 5.0;
+        let pcm = generate_sine_pcm(440.0, over_limit_secs, 48000);
+        let opus_data = encode_opus_ogg(&pcm).unwrap();
+        assert!(
+            opus_data.len() <= MAX_OPUS_INPUT_BYTES,
+            "crafted stream must stay under the input cap to exercise the output bound"
+        );
+
+        let err = decode_opus_to_pcm(&opus_data);
+        assert!(matches!(err, Err(VoiceError::DecodedTooLong)));
+    }
+
+    #[test]
+    fn test_decode_within_bounds_ok() {
+        // A legitimate short clip stays under both bounds and round-trips.
+        let pcm = generate_sine_pcm(440.0, 1.0, 48000);
+        let opus_data = encode_opus_ogg(&pcm).unwrap();
+        assert!(opus_data.len() <= MAX_OPUS_INPUT_BYTES);
+
+        let decoded = decode_opus_to_pcm(&opus_data).unwrap();
+        assert!(!decoded.is_empty());
+        assert!(decoded.len() / 2 <= MAX_DECODED_SAMPLES);
     }
 }
