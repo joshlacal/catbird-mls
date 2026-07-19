@@ -33,6 +33,43 @@ impl EpochSecretManager {
         Ok(())
     }
 
+    async fn persist_epoch_secret(
+        &self,
+        group_id_hex: String,
+        epoch: u64,
+        secret_data: Vec<u8>,
+    ) -> Result<(), MLSError> {
+        // Clone the storage Arc and release the lock before awaiting a host
+        // callback. Absence is a configuration failure, not a best-effort
+        // mode: callers rely on this method as their durable commit point.
+        let storage = {
+            let guard = self
+                .storage
+                .read()
+                .map_err(|_| MLSError::lock_poisoned("EpochSecretManager storage"))?;
+            guard.clone().ok_or(MLSError::StorageFailed)?
+        };
+
+        if !storage
+            .store_epoch_secret(group_id_hex.clone(), epoch, secret_data)
+            .await
+        {
+            crate::error_log!(
+                "[EPOCH-STORAGE] Failed to durably store epoch secret: group={}, epoch={}",
+                group_id_hex,
+                epoch
+            );
+            return Err(MLSError::StorageFailed);
+        }
+
+        crate::info_log!(
+            "[EPOCH-STORAGE] ✅ Stored epoch secret: group={}, epoch={}",
+            group_id_hex,
+            epoch
+        );
+        Ok(())
+    }
+
     /// Export epoch secret for a group before epoch advance
     ///
     /// This should be called BEFORE processing a commit that advances the epoch.
@@ -93,33 +130,10 @@ impl EpochSecretManager {
             current_epoch
         );
 
-        // Clone the storage Arc and release lock before awaiting
-        let storage_clone = {
-            let guard = self
-                .storage
-                .read()
-                .map_err(|_| MLSError::lock_poisoned("EpochSecretManager storage"))?;
-            guard.clone()
-        }; // Lock released here
-
-        // Now safe to await without holding the lock
-        if let Some(storage) = storage_clone {
-            let result = storage
-                .store_epoch_secret(group_id_hex.clone(), current_epoch, secret.to_vec())
-                .await;
-
-            if result {
-                crate::info_log!(
-                    "[EPOCH-STORAGE] ✅ Stored epoch secret: group={}, epoch={}",
-                    group_id_hex,
-                    current_epoch
-                );
-            } else {
-                crate::warn_log!("[EPOCH-STORAGE] ⚠️ Failed to store epoch secret");
-            }
-        }
-
-        Ok(secret.to_vec())
+        let secret = secret.to_vec();
+        self.persist_epoch_secret(group_id_hex, current_epoch, secret.clone())
+            .await?;
+        Ok(secret)
     }
 
     /// Delete epoch secrets older than the retention window.
@@ -168,10 +182,153 @@ impl EpochSecretManager {
             Err(MLSError::StorageFailed)
         }
     }
+
+    /// Delete one exact externally stored epoch secret during compensating
+    /// rollback. Welcome adoption exports before publishing the group, so any
+    /// later failure must remove that Tier-0 secret rather than orphaning it.
+    pub async fn delete_exact_epoch_secret(
+        &self,
+        group_id: &[u8],
+        epoch: u64,
+    ) -> Result<(), MLSError> {
+        let storage = {
+            let guard = self
+                .storage
+                .read()
+                .map_err(|_| MLSError::lock_poisoned("EpochSecretManager storage"))?;
+            guard.clone().ok_or(MLSError::StorageFailed)?
+        };
+        let group_id_hex = hex::encode(group_id);
+        if !storage
+            .delete_epoch_secret(group_id_hex.clone(), epoch)
+            .await
+        {
+            crate::error_log!(
+                "[EPOCH-STORAGE] Failed to delete exact rollback secret: group={}, epoch={}",
+                group_id_hex,
+                epoch
+            );
+            return Err(MLSError::StorageFailed);
+        }
+        crate::info_log!(
+            "[EPOCH-STORAGE] Deleted exact rollback secret: group={}, epoch={}",
+            group_id_hex,
+            epoch
+        );
+        Ok(())
+    }
 }
 
 impl Default for EpochSecretManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestEpochSecretStorage {
+        store_result: bool,
+        store_calls: AtomicUsize,
+        delete_result: bool,
+        delete_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl EpochSecretStorage for TestEpochSecretStorage {
+        async fn store_epoch_secret(
+            &self,
+            _conversation_id: String,
+            _epoch: u64,
+            _secret_data: Vec<u8>,
+        ) -> bool {
+            self.store_calls.fetch_add(1, Ordering::SeqCst);
+            self.store_result
+        }
+
+        async fn get_epoch_secret(&self, _conversation_id: String, _epoch: u64) -> Option<Vec<u8>> {
+            None
+        }
+
+        async fn delete_epoch_secret(&self, _conversation_id: String, _epoch: u64) -> bool {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            self.delete_result
+        }
+
+        async fn delete_epochs_before(&self, _conversation_id: String, _cutoff_epoch: u64) -> u32 {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_epoch_secret_storage_fails_closed() {
+        let manager = EpochSecretManager::new();
+
+        let error = manager
+            .persist_epoch_secret("group".to_string(), 7, vec![1, 2, 3])
+            .await
+            .expect_err("an absent durable store must reject the epoch transition");
+
+        assert!(matches!(error, MLSError::StorageFailed));
+    }
+
+    #[tokio::test]
+    async fn false_epoch_secret_storage_result_fails_closed() {
+        let manager = EpochSecretManager::new();
+        let storage = Arc::new(TestEpochSecretStorage {
+            store_result: false,
+            store_calls: AtomicUsize::new(0),
+            delete_result: false,
+            delete_calls: AtomicUsize::new(0),
+        });
+        manager.set_storage(storage.clone()).unwrap();
+
+        let error = manager
+            .persist_epoch_secret("group".to_string(), 7, vec![1, 2, 3])
+            .await
+            .expect_err("a rejected durable write must reject the epoch transition");
+
+        assert!(matches!(error, MLSError::StorageFailed));
+        assert_eq!(storage.store_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_epoch_secret_storage_result_is_accepted() {
+        let manager = EpochSecretManager::new();
+        let storage = Arc::new(TestEpochSecretStorage {
+            store_result: true,
+            store_calls: AtomicUsize::new(0),
+            delete_result: true,
+            delete_calls: AtomicUsize::new(0),
+        });
+        manager.set_storage(storage.clone()).unwrap();
+
+        manager
+            .persist_epoch_secret("group".to_string(), 7, vec![1, 2, 3])
+            .await
+            .expect("a confirmed durable write must remain supported");
+
+        assert_eq!(storage.store_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_epoch_secret_delete_propagates_backend_result() {
+        let manager = EpochSecretManager::new();
+        let storage = Arc::new(TestEpochSecretStorage {
+            store_result: true,
+            store_calls: AtomicUsize::new(0),
+            delete_result: true,
+            delete_calls: AtomicUsize::new(0),
+        });
+        manager.set_storage(storage.clone()).unwrap();
+
+        manager
+            .delete_exact_epoch_secret(b"group", 7)
+            .await
+            .expect("confirmed exact delete must succeed");
+        assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
     }
 }

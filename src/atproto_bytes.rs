@@ -91,7 +91,6 @@ pub mod option {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize)]

@@ -93,6 +93,23 @@ pub struct DecryptResult {
     pub epoch: u64,
     pub sequence_number: u64,
     pub sender_credential: CredentialData,
+    /// Authenticated MLS content class. Plaintext length is not a safe
+    /// discriminator: valid application messages may be empty, while Proposal
+    /// and Commit frames both carry no application plaintext.
+    pub content_type: DecryptContentType,
+    /// Exact TLS-serialized OpenMLS ProposalRef for a staged standalone
+    /// proposal. The orchestrator accepts or discards this handle only after
+    /// envelope-to-credential authorization succeeds.
+    pub proposal_ref: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
+pub enum DecryptContentType {
+    Application,
+    Proposal,
+    ExternalJoinProposal,
+    Commit,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]

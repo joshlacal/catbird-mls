@@ -17,6 +17,9 @@
 //!    production "lost sync" case: Bob was a member at epoch 5, misses commits,
 //!    uses External Commit to rejoin while Alice is at epoch 10).
 
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
+
 use async_trait::async_trait;
 use catbird_mls::{GroupConfig, KeyPackageData, KeychainAccess, MLSContext, MLSError};
 use std::collections::HashMap;
@@ -56,12 +59,14 @@ impl KeychainAccess for TestKeychain {
 
 fn new_ctx(dir: &tempfile::TempDir) -> std::sync::Arc<MLSContext> {
     let db = dir.path().join("mls.db");
-    MLSContext::new(
+    let context = MLSContext::new(
         db.to_str().unwrap().to_string(),
         "test-encryption-key!".to_string(),
         Box::new(TestKeychain::new()),
     )
-    .expect("MLSContext::new failed")
+    .expect("MLSContext::new failed");
+    epoch_secret_test_support::install(&context);
+    context
 }
 
 /// Helper: push Alice's epoch forward by N self-commits (adds a throwaway
@@ -268,7 +273,16 @@ fn external_commit_from_stale_member_advances_past_stale_epoch() {
         .export_group_info(group_id.clone(), alice_id.to_vec())
         .expect("alice export_group_info failed");
 
-    // Bob does an External Commit using the fresh GroupInfo.
+    // Required-Now protocol §8.4 fetches GroupInfo first, then deletes any
+    // stale local group before constructing the half-built external-join
+    // candidate.  Keeping the stale group live here would make rejection
+    // rollback ambiguous because OpenMLS persists both states under the same
+    // GroupId.
+    bob_ctx
+        .delete_group(group_id.clone())
+        .expect("bob delete stale group before external rejoin failed");
+
+    // Bob does an External Commit using the already-fetched fresh GroupInfo.
     let ext_commit = bob_ctx
         .create_external_commit(fresh_group_info, bob_id.to_vec())
         .expect("bob create_external_commit (rejoin) failed");

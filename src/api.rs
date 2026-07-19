@@ -9,11 +9,18 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
 use openmls_traits::storage::StorageProvider;
 use openmls_traits::{crypto::OpenMlsCrypto, OpenMlsProvider};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::MLSError;
+#[cfg(test)]
+use crate::message_limits::MAX_INBOUND_MLS_MESSAGE_BYTES;
+use crate::message_limits::{
+    validate_inbound_mls_message_len, validate_outbound_key_package_data_batch,
+    validate_outbound_key_package_lengths,
+};
 use crate::mls_context::MLSContext as MLSContextInner;
 use crate::orchestrator::mls_provider::MlsCryptoContext;
 use crate::types::*;
@@ -21,6 +28,34 @@ use crate::types::*;
 use crate::keychain::KeychainAccess;
 #[cfg(feature = "storage-driver-prototype")]
 use crate::storage_driver_prototype::OpenMlsStorageDriver;
+
+const DEFAULT_EPOCH_SECRET_RETENTION: u64 = 5;
+/// Standalone proposals remain in this short-lived authorization staging area
+/// only until the envelope DID has been bound to the authenticated MLS
+/// credential. Bound the queue so an authenticated-but-malicious member cannot
+/// grow process memory without limit by withholding outer-layer acceptance.
+const MAX_STAGED_INCOMING_PROPOSALS_PER_GROUP: usize = 128;
+
+fn validate_outbound_raw_key_package_batch(key_packages: &[Vec<u8>]) -> Result<(), MLSError> {
+    validate_outbound_key_package_lengths(key_packages.len(), key_packages.iter().map(Vec::len))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCommitEpochFence {
+    source_epoch: u64,
+    target_epoch: u64,
+    allow_target_retry: bool,
+}
+
+fn validate_projected_epoch(actual_epoch: u64, projected_epoch: u64) -> Result<(), MLSError> {
+    if actual_epoch != projected_epoch {
+        return Err(MLSError::EpochMismatch {
+            local: actual_epoch,
+            remote: projected_epoch,
+        });
+    }
+    Ok(())
+}
 
 // Helper function to safely truncate strings for display
 fn truncate_str(s: &str, max_len: usize) -> &str {
@@ -50,7 +85,11 @@ fn strip_padding(data: &[u8]) -> Vec<u8> {
         );
         data[4..4 + claimed_len].to_vec()
     } else {
-        crate::debug_log!("[PADDING] strip_padding: no padding detected (claimed_len={}, total={}, byte4=0x{:02x}), returning as-is", claimed_len, data.len(), data.get(4).copied().unwrap_or(0xff));
+        crate::debug_log!(
+            "[PADDING] strip_padding: no padding detected (claimed_len={}, total={}), returning as-is",
+            claimed_len,
+            data.len()
+        );
         data.to_vec()
     }
 }
@@ -357,11 +396,17 @@ pub struct MLSContext {
     /// caller confirms. The legacy auto-merge path is still available via
     /// [`process_message_legacy_automerge`] during the cross-platform migration.
     ///
-    /// **Duplicate delivery policy:** if a staged commit already exists for the same
-    /// `(group_id, target_epoch)` when a new one arrives (duplicate/retransmit), the
-    /// new entry **overwrites** the prior one and a warning is logged. This is
-    /// idempotent: OpenMLS produces the same StagedCommit for the same wire message.
-    pending_incoming_merges: Arc<Mutex<HashMap<(Vec<u8>, u64), Box<StagedCommit>>>>,
+    /// **Duplicate delivery policy:** the first staged commit for a
+    /// `(group_id, target_epoch)` is retained. An exact wire retransmission is
+    /// idempotent; a different valid commit for the same epoch is rejected.
+    pending_incoming_merges: Arc<Mutex<PendingIncomingCommitMap>>,
+    /// Authenticated standalone proposals awaiting application-level sender
+    /// authorization. These are deliberately kept out of OpenMLS's proposal
+    /// store until `accept_incoming_proposal` is called, closing the race where
+    /// another sync task could commit a proposal before DID binding completed.
+    /// The second key component is the exact TLS-serialized OpenMLS
+    /// `ProposalRef`, not a locally recomputed proposal-body hash.
+    pending_incoming_proposals: Arc<Mutex<PendingIncomingProposalMap>>,
     /// Staged-but-not-yet-confirmed **outgoing** commits produced by
     /// [`MLSContext::stage_commit`] (task #62). Keyed by hex group id — MLS
     /// allows at most one pending commit per group, so a second stage call
@@ -396,6 +441,142 @@ struct PendingOutgoingCommitMeta {
     source_epoch: u64,
     /// Epoch the group will advance to on confirm (`source_epoch + 1`).
     target_epoch: u64,
+    /// Set when this exact handle advanced crypto but the durability barrier
+    /// failed. It authorizes an idempotent barrier-only retry at target_epoch.
+    merge_started: bool,
+}
+
+#[derive(Clone)]
+struct PendingIncomingCommit {
+    staged: Box<StagedCommit>,
+    /// SHA-256 of the normalized MLS wire message that produced `staged`.
+    /// The epoch alone is not an authorization handle: two different valid
+    /// commits can target the same next epoch. Preserve the first object and
+    /// accept only an exact retransmission while it is pending.
+    wire_fingerprint: [u8; 32],
+    /// True only after this exact staged object advanced crypto state. This
+    /// distinguishes a durability-barrier retry from a different commit that
+    /// happened to reach the same epoch.
+    merge_started: bool,
+}
+
+type PendingIncomingCommitMap = HashMap<(Vec<u8>, u64), PendingIncomingCommit>;
+type PendingIncomingProposalMap = HashMap<(Vec<u8>, Vec<u8>), QueuedProposal>;
+type IncomingDecryptStage = (
+    Vec<u8>,
+    u64,
+    CredentialData,
+    DecryptContentType,
+    Option<QueuedProposal>,
+    Option<Box<StagedCommit>>,
+);
+type IncomingProcessCommitStage = (
+    Vec<UpdateProposalInfo>,
+    Vec<AddProposalInfo>,
+    Vec<RemoveProposalInfo>,
+    Option<CommitMetadataInfo>,
+    u64,
+    Option<Box<StagedCommit>>,
+);
+
+fn incoming_commit_wire_fingerprint(message: &[u8]) -> [u8; 32] {
+    Sha256::digest(strip_padding(message)).into()
+}
+
+fn stage_pending_incoming_commit(
+    pending_incoming_merges: &Mutex<PendingIncomingCommitMap>,
+    group_id: &[u8],
+    target_epoch: u64,
+    wire_fingerprint: [u8; 32],
+    staged: Box<StagedCommit>,
+    context: &str,
+) -> Result<(), MLSError> {
+    use std::collections::hash_map::Entry;
+
+    let mut pending = pending_incoming_merges.lock().map_err(|_| {
+        crate::error_log!("[{}] pending_incoming_merges mutex poisoned", context);
+        MLSError::ContextNotInitialized
+    })?;
+    let key = (group_id.to_vec(), target_epoch);
+
+    match pending.entry(key) {
+        Entry::Vacant(entry) => {
+            entry.insert(PendingIncomingCommit {
+                staged,
+                wire_fingerprint,
+                merge_started: false,
+            });
+            Ok(())
+        }
+        Entry::Occupied(entry) if entry.get().wire_fingerprint == wire_fingerprint => {
+            crate::debug_log!(
+                "[{}] Exact retransmission retained existing staged commit for group {} epoch {}",
+                context,
+                hex::encode(group_id),
+                target_epoch
+            );
+            Ok(())
+        }
+        Entry::Occupied(_) => {
+            crate::warn_log!(
+                "[{}] Rejected distinct staged commit for group {} already pending at epoch {}",
+                context,
+                hex::encode(group_id),
+                target_epoch
+            );
+            Err(MLSError::InvalidCommit)
+        }
+    }
+}
+
+fn serialize_proposal_reference(proposal: &QueuedProposal) -> Result<Vec<u8>, MLSError> {
+    proposal
+        .proposal_reference_ref()
+        .tls_serialize_detached()
+        .map_err(|error| {
+            crate::error_log!(
+                "[MLS-FFI] Failed to serialize authenticated proposal reference: {:?}",
+                error
+            );
+            MLSError::SerializationError
+        })
+}
+
+fn stage_pending_incoming_proposal(
+    pending_incoming_proposals: &Mutex<PendingIncomingProposalMap>,
+    group_id: &[u8],
+    proposal: QueuedProposal,
+    context: &str,
+) -> Result<Vec<u8>, MLSError> {
+    let proposal_ref = serialize_proposal_reference(&proposal)?;
+    let key = (group_id.to_vec(), proposal_ref.clone());
+    let mut pending = pending_incoming_proposals.lock().map_err(|_| {
+        crate::error_log!("[{}] pending_incoming_proposals mutex poisoned", context);
+        MLSError::ContextNotInitialized
+    })?;
+
+    if !pending.contains_key(&key)
+        && pending
+            .keys()
+            .filter(|(pending_group_id, _)| pending_group_id.as_slice() == group_id)
+            .count()
+            >= MAX_STAGED_INCOMING_PROPOSALS_PER_GROUP
+    {
+        return Err(MLSError::InvalidState(format!(
+            "incoming proposal authorization queue is full for group {}",
+            hex::encode(group_id)
+        )));
+    }
+
+    if pending.insert(key, proposal).is_some() {
+        crate::debug_log!(
+            "[{}] Replaced duplicate staged proposal for group {} ref {}",
+            context,
+            hex::encode(group_id),
+            hex::encode(&proposal_ref)
+        );
+    }
+    Ok(proposal_ref)
 }
 
 struct StorageConnectionRegistry {
@@ -543,6 +724,7 @@ impl MLSContext {
             storage_registry,
             is_suspended: Arc::new(AtomicBool::new(false)),
             pending_incoming_merges: Arc::new(Mutex::new(HashMap::new())),
+            pending_incoming_proposals: Arc::new(Mutex::new(HashMap::new())),
             pending_outgoing_commits: Arc::new(Mutex::new(HashMap::new())),
             staged_commit_nonce: Arc::new(AtomicU64::new(0)),
         }))
@@ -790,6 +972,7 @@ impl MLSContext {
         identity_bytes: Vec<u8>,
     ) -> Result<ExternalCommitResult, MLSError> {
         self.check_suspended()?;
+        validate_inbound_mls_message_len(group_info_bytes.len(), "group_info")?;
         let mut guard = self
             .inner
             .lock()
@@ -816,6 +999,7 @@ impl MLSContext {
         psk_bytes: Vec<u8>,
     ) -> Result<ExternalCommitResult, MLSError> {
         self.check_suspended()?;
+        validate_inbound_mls_message_len(group_info_bytes.len(), "group_info")?;
         let mut guard = self
             .inner
             .lock()
@@ -1071,6 +1255,7 @@ impl MLSContext {
         metadata_reseal: Option<MetadataReseal>,
     ) -> Result<AddMembersResult, MLSError> {
         self.check_suspended()?;
+        validate_outbound_key_package_data_batch(&key_packages)?;
         let mut guard = self
             .inner
             .lock()
@@ -1091,8 +1276,11 @@ impl MLSContext {
             .iter()
             .enumerate()
             .map(|(idx, kp_data)| {
-                crate::debug_log!("[MLS] Deserializing key package {}: {} bytes, first 16 bytes = {:02x?}",
-                    idx, kp_data.data.len(), &kp_data.data[..kp_data.data.len().min(16)]);
+                crate::debug_log!(
+                    "[MLS] Deserializing key package {}: {} bytes",
+                    idx,
+                    kp_data.data.len()
+                );
 
                 // First try: MlsMessage-wrapped format (server might send this)
                 if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
@@ -1145,18 +1333,13 @@ impl MLSContext {
             let mut deduped = Vec::new();
             for kp in kps {
                 let sig_key_hex = hex::encode(kp.leaf_node().signature_key().as_slice());
-                let identity_str =
-                    String::from_utf8_lossy(kp.leaf_node().credential().serialized_content());
                 if seen_sig_keys.insert(sig_key_hex.clone()) {
-                    crate::debug_log!(
-                        "[MLS-FFI] KeyPackage kept: identity={}, sig_key={}...",
-                        identity_str,
-                        &sig_key_hex[..sig_key_hex.len().min(16)]
-                    );
+                    crate::debug_log!("[MLS-FFI] KeyPackage kept");
                     deduped.push(kp);
                 } else {
-                    crate::warn_log!("[MLS-FFI] Dedup: dropping key package with duplicate signature key for {} (sig: {}...)",
-                        identity_str, &sig_key_hex[..sig_key_hex.len().min(16)]);
+                    crate::warn_log!(
+                        "[MLS-FFI] Dedup: dropping key package with duplicate signature key"
+                    );
                 }
             }
             deduped
@@ -1198,22 +1381,26 @@ impl MLSContext {
 
         let (commit_data, welcome_data, metadata_reseal_out) =
             inner.with_group(&gid, |group, provider, signer| {
-            // 🔍 DEBUG: List ALL current group members
-            crate::debug_log!("[MLS-FFI] 🔍 Current group members:");
+            // Log only structural metadata. Credentials can contain user
+            // identifiers and must not be copied into diagnostics.
+            crate::debug_log!("[MLS-FFI] Current group member metadata:");
             for (idx, member) in group.members().enumerate() {
                 let credential = member.credential.serialized_content();
-                let identity = String::from_utf8_lossy(credential);
-                crate::debug_log!("[MLS-FFI]   Member[{}]: {}", idx, identity);
-                crate::debug_log!("[MLS-FFI]            Raw credential: {}", hex::encode(credential));
+                crate::debug_log!(
+                    "[MLS-FFI]   Member[{}] credential length: {} bytes",
+                    idx,
+                    credential.len()
+                );
             }
 
-            // 🔍 DEBUG: Show FULL credentials of incoming key packages
-            crate::debug_log!("[MLS-FFI] 🔍 Incoming key packages full credentials:");
+            crate::debug_log!("[MLS-FFI] Incoming key package metadata:");
             for (idx, kp) in kps.iter().enumerate() {
                 let credential = kp.leaf_node().credential().serialized_content();
-                let identity = String::from_utf8_lossy(credential);
-                crate::debug_log!("[MLS-FFI]   KeyPackage[{}]: {}", idx, identity);
-                crate::debug_log!("[MLS-FFI]                 Raw: {}", hex::encode(credential));
+                crate::debug_log!(
+                    "[MLS-FFI]   KeyPackage[{}] credential length: {} bytes",
+                    idx,
+                    credential.len()
+                );
             }
 
             // 🔍 DEBUG: Check for duplicate credentials (self-add or duplicate member)
@@ -1390,8 +1577,11 @@ impl MLSContext {
                     crate::info_log!("[MLS-WELCOME-DEBUG]   Recipient[{}] key_package hash_ref (computed) = {}",
                         idx, hex::encode(href.as_slice()));
                 }
-                let identity = String::from_utf8_lossy(kp.leaf_node().credential().serialized_content());
-                crate::info_log!("[MLS-WELCOME-DEBUG]   Recipient[{}] identity = {}", idx, identity);
+                crate::info_log!(
+                    "[MLS-WELCOME-DEBUG]   Recipient[{}] credential length = {} bytes",
+                    idx,
+                    kp.leaf_node().credential().serialized_content().len()
+                );
                 crate::info_log!("[MLS-WELCOME-DEBUG]   Recipient[{}] cipher_suite = {:?}", idx, kp.ciphersuite());
             }
 
@@ -1564,6 +1754,7 @@ impl MLSContext {
         add_key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError> {
         self.check_suspended()?;
+        validate_outbound_key_package_data_batch(&add_key_packages)?;
         crate::info_log!(
             "[MLS-FFI] swap_members: {} removals + {} adds in group {}",
             remove_identities.len(),
@@ -2147,13 +2338,29 @@ impl MLSContext {
         crate::info_log!("[MLS-FFI] delete_group: Deleting group {}", group_id_hex);
 
         // Remove from groups HashMap only after durable cleanup succeeds.
-        if inner.delete_group(gid.as_slice())? {
-            crate::info_log!("[MLS-FFI] ✅ Removed group from context: {}", group_id_hex);
-            Ok(())
-        } else {
+        if !inner.delete_group(gid.as_slice())? {
             crate::warn_log!("[MLS-FFI] ⚠️ Group not found in context: {}", group_id_hex);
-            Err(MLSError::group_not_found(group_id_hex))
+            return Err(MLSError::group_not_found(group_id_hex));
         }
+        drop(guard);
+
+        // A deleted group must not leave authorization or commit handles that
+        // could be applied if the same group id is imported again later.
+        self.pending_incoming_proposals
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?
+            .retain(|(pending_group_id, _), _| pending_group_id != &group_id);
+        self.pending_incoming_merges
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?
+            .retain(|(pending_group_id, _), _| pending_group_id != &group_id);
+        self.pending_outgoing_commits
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?
+            .remove(&group_id_hex);
+
+        crate::info_log!("[MLS-FFI] ✅ Removed group from context: {}", group_id_hex);
+        Ok(())
     }
 
     /// Propose self-removal from a group.
@@ -2370,10 +2577,13 @@ impl MLSContext {
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
         self.check_suspended()?;
+        validate_inbound_mls_message_len(ciphertext.len(), "ciphertext")?;
+        let wire_fingerprint = incoming_commit_wire_fingerprint(&ciphertext);
         let inner = self.inner.clone();
         // Task #33: also carry the pending-merges map so we can stash incoming StagedCommits
         // from the worker thread.
         let pending_incoming_merges = self.pending_incoming_merges.clone();
+        let pending_incoming_proposals = self.pending_incoming_proposals.clone();
         let storage_registry = Arc::clone(&self.storage_registry);
 
         tokio::task::spawn_blocking(move || {
@@ -2406,13 +2616,16 @@ impl MLSContext {
             let inner_ctx = guard.as_mut().ok_or(MLSError::ContextClosed)?;
 
             let gid = GroupId::from_slice(&group_id);
+            let epoch_manager = inner_ctx.epoch_secret_manager().clone();
 
-            let (plaintext, epoch, sender_credential, staged_commit_opt): (
-                Vec<u8>,
-                u64,
-                CredentialData,
-                Option<Box<StagedCommit>>,
-            ) = inner_ctx.with_group(&gid, |group, provider, _signer| {
+            let (
+                plaintext,
+                epoch,
+                sender_credential,
+                content_type,
+                queued_proposal_opt,
+                staged_commit_opt,
+            ): IncomingDecryptStage = inner_ctx.with_group(&gid, |group, provider, _signer| {
                     let current_epoch = group.epoch().as_u64();
                     crate::info_log!("[DECRYPT-ASYNC] 📊 PRE-PROCESSING STATE:");
                     crate::info_log!("[DECRYPT-ASYNC]   Group: {}", hex::encode(&group_id));
@@ -2462,11 +2675,36 @@ impl MLSContext {
 
                     match processed.into_content() {
                         ProcessedMessageContent::ApplicationMessage(app_msg) => {
-                            Ok((app_msg.into_bytes(), message_epoch, sender_credential, None))
+                            Ok((
+                                app_msg.into_bytes(),
+                                message_epoch,
+                                sender_credential,
+                                DecryptContentType::Application,
+                                None,
+                                None,
+                            ))
                         }
-                        ProcessedMessageContent::ProposalMessage(_)
-                        | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
-                            Ok((vec![], message_epoch, sender_credential, None))
+                        ProcessedMessageContent::ProposalMessage(proposal) => {
+                            // Do not publish this proposal to OpenMLS yet. The
+                            // orchestrator must first bind the authenticated MLS
+                            // credential to the envelope DID, then explicitly
+                            // accept this short-lived authorization handle.
+                            Ok((
+                                vec![],
+                                message_epoch,
+                                sender_credential,
+                                DecryptContentType::Proposal,
+                                Some(*proposal),
+                                None,
+                            ))
+                        }
+                        ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                            // An external sender is not a current group member.
+                            // Until the configured ExternalJoinAuthorizer is
+                            // actually invoked with its signing identity, queueing
+                            // this proposal would let an outsider reach the
+                            // auto-commit path.
+                            Err(MLSError::external_join_proposal_authorization_required())
                         }
                         ProcessedMessageContent::StagedCommitMessage(staged) => {
                             // Task #33: stage incoming commits for caller-driven merge.
@@ -2477,7 +2715,24 @@ impl MLSContext {
                                 "[DECRYPT-ASYNC] StagedCommitMessage received - STAGING for explicit merge (target epoch {})",
                                 target_epoch
                             );
-                            Ok((vec![], target_epoch, sender_credential, Some(staged)))
+                            crate::async_runtime::block_on(
+                                epoch_manager.export_current_epoch_secret(group, provider),
+                            )
+                            .map_err(|error| {
+                                crate::error_log!(
+                                    "[DECRYPT-ASYNC] Failed to durably export epoch secret before staging: {:?}",
+                                    error
+                                );
+                                error
+                            })?;
+                            Ok((
+                                vec![],
+                                target_epoch,
+                                sender_credential,
+                                DecryptContentType::Commit,
+                                None,
+                                Some(staged),
+                            ))
                         }
                     }
                 })?;
@@ -2497,20 +2752,27 @@ impl MLSContext {
             // holding two locks at once.
             drop(guard);
 
+            let proposal_ref = if let Some(proposal) = queued_proposal_opt {
+                Some(stage_pending_incoming_proposal(
+                    &pending_incoming_proposals,
+                    &group_id,
+                    proposal,
+                    "DECRYPT-ASYNC",
+                )?)
+            } else {
+                None
+            };
+
             // Task #33: stash incoming StagedCommit for explicit platform confirmation.
             if let Some(staged) = staged_commit_opt {
-                let mut pending = pending_incoming_merges.lock().map_err(|_| {
-                    crate::error_log!("[DECRYPT-ASYNC] ❌ pending_incoming_merges mutex poisoned");
-                    MLSError::ContextNotInitialized
-                })?;
-                let key = (group_id.clone(), epoch);
-                if pending.insert(key, staged).is_some() {
-                    crate::warn_log!(
-                        "[DECRYPT-ASYNC] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
-                        hex::encode(&group_id),
-                        epoch
-                    );
-                }
+                stage_pending_incoming_commit(
+                    &pending_incoming_merges,
+                    &group_id,
+                    epoch,
+                    wire_fingerprint,
+                    staged,
+                    "DECRYPT-ASYNC",
+                )?;
             }
 
             let total_duration = timestamp.elapsed().unwrap_or_default();
@@ -2521,6 +2783,8 @@ impl MLSContext {
                 epoch,
                 sequence_number,
                 sender_credential,
+                content_type,
+                proposal_ref,
             })
         })
         .await
@@ -2536,6 +2800,8 @@ impl MLSContext {
         message_data: Vec<u8>,
     ) -> Result<ProcessedContent, MLSError> {
         self.check_suspended()?;
+        validate_inbound_mls_message_len(message_data.len(), "message_data")?;
+        let wire_fingerprint = incoming_commit_wire_fingerprint(&message_data);
         crate::debug_log!("[MLS-FFI] process_message: Starting");
         crate::debug_log!(
             "[MLS-FFI] Group ID: {} ({} bytes)",
@@ -2543,10 +2809,6 @@ impl MLSContext {
             group_id.len()
         );
         crate::debug_log!("[MLS-FFI] Message data size: {} bytes", message_data.len());
-        crate::debug_log!(
-            "[MLS-FFI] Message data first 32 bytes: {:02x?}",
-            &message_data[..message_data.len().min(32)]
-        );
 
         let mut guard = self.inner.lock().map_err(|e| {
             crate::error_log!("[MLS-FFI] ERROR: Failed to acquire write lock: {:?}", e);
@@ -2684,21 +2946,11 @@ impl MLSContext {
                     crate::debug_log!("[MLS-FFI] ProposalMessage received, processing...");
                     let proposal = proposal_msg.proposal();
 
-                    // Compute proposal reference by hashing the proposal
-                    // Since proposal_reference() is pub(crate), we compute our own identifier
-                    let proposal_bytes = proposal
-                        .tls_serialize_detached()
-                        .map_err(|e| {
-                            crate::error_log!("[MLS-FFI] ERROR: Failed to serialize proposal: {:?}", e);
-                            MLSError::SerializationError
-                        })?;
-
-                    let proposal_ref_bytes = provider.crypto()
-                        .hash(group.ciphersuite().hash_algorithm(), &proposal_bytes)
-                        .map_err(|e| {
-                            crate::error_log!("[MLS-FFI] ERROR: Failed to hash proposal: {:?}", e);
-                            MLSError::OpenMLSError
-                        })?;
+                    // OpenMLS derives ProposalRef from the full authenticated
+                    // content, not merely the proposal body. Return that exact
+                    // TLS-serialized reference so later accept/remove calls
+                    // address the same proposal OpenMLS will store.
+                    let proposal_ref_bytes = serialize_proposal_reference(&proposal_msg)?;
 
                     crate::debug_log!("[MLS-FFI] Proposal ref computed: {}", hex::encode(&proposal_ref_bytes));
 
@@ -2759,6 +3011,13 @@ impl MLSContext {
                     };
 
                     crate::debug_log!("[MLS-FFI] Proposal processed successfully");
+                    let staged_ref = stage_pending_incoming_proposal(
+                        &self.pending_incoming_proposals,
+                        &group_id,
+                        *proposal_msg,
+                        "MLS-FFI",
+                    )?;
+                    debug_assert_eq!(staged_ref, proposal_ref_bytes);
                     Ok((ProcessedContent::Proposal {
                         proposal: proposal_info,
                         proposal_ref: ProposalRef {
@@ -2807,11 +3066,13 @@ impl MLSContext {
                     // window covers the pre-merge epoch, and once we stage + release the
                     // lock, the next caller could in principle mutate the group before
                     // merge happens. Export here, while we still hold the group mutably.
-                    if let Err(e) = crate::async_runtime::block_on(
+                    crate::async_runtime::block_on(
                         epoch_manager.export_current_epoch_secret(group, provider)
-                    ) {
-                        crate::warn_log!("[MLS-FFI] ⚠️ Failed to export epoch secret before staging: {:?}", e);
-                    }
+                    )
+                    .map_err(|error| {
+                        crate::error_log!("[MLS-FFI] Failed to durably export epoch secret before staging: {:?}", error);
+                        error
+                    })?;
 
                     // NB: metadata_reference_json reflects the *pre-merge* group context.
                     // We persist it here so the platform can reconcile after merge. It will be
@@ -2832,8 +3093,8 @@ impl MLSContext {
         });
 
         // Task #33: if an incoming StagedCommit was produced, stash it for explicit confirmation.
-        // Overwrites any prior pending entry for the same (group_id, epoch) — OpenMLS produces
-        // deterministic StagedCommits for the same wire message, so overwrite is idempotent.
+        // The first distinct wire message targeting an epoch wins; only its exact
+        // retransmission is idempotent while the handle is pending.
         let processed = match result {
             Ok((content, staged_opt)) => {
                 if let Some(staged) = staged_opt {
@@ -2845,18 +3106,14 @@ impl MLSContext {
                             return Err(MLSError::ContextNotInitialized);
                         }
                     };
-                    let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
-                        crate::error_log!("[MLS-FFI] ❌ pending_incoming_merges mutex poisoned");
-                        MLSError::ContextNotInitialized
-                    })?;
-                    let key = (group_id.clone(), target_epoch);
-                    if pending.insert(key, staged).is_some() {
-                        crate::warn_log!(
-                            "[MLS-FFI] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
-                            hex::encode(&group_id),
-                            target_epoch
-                        );
-                    }
+                    stage_pending_incoming_commit(
+                        &self.pending_incoming_merges,
+                        &group_id,
+                        target_epoch,
+                        wire_fingerprint,
+                        staged,
+                        "MLS-FFI",
+                    )?;
                 }
                 content
             }
@@ -2873,9 +3130,12 @@ impl MLSContext {
         message_data: Vec<u8>,
     ) -> Result<ProcessedContent, MLSError> {
         self.check_suspended()?;
+        validate_inbound_mls_message_len(message_data.len(), "message_data")?;
+        let wire_fingerprint = incoming_commit_wire_fingerprint(&message_data);
         let inner = self.inner.clone();
         // Task #33: carry the pending-merges map into the worker thread.
         let pending_incoming_merges = self.pending_incoming_merges.clone();
+        let pending_incoming_proposals = self.pending_incoming_proposals.clone();
         let storage_registry = Arc::clone(&self.storage_registry);
 
         tokio::task::spawn_blocking(move || {
@@ -2948,13 +3208,7 @@ impl MLSContext {
                     },
                     ProcessedMessageContent::ProposalMessage(proposal_msg) => {
                         let proposal = proposal_msg.proposal();
-                        let proposal_bytes = proposal
-                            .tls_serialize_detached()
-                            .map_err(|_| MLSError::SerializationError)?;
-
-                        let proposal_ref_bytes = provider.crypto()
-                            .hash(group.ciphersuite().hash_algorithm(), &proposal_bytes)
-                            .map_err(|_| MLSError::OpenMLSError)?;
+                        let proposal_ref_bytes = serialize_proposal_reference(&proposal_msg)?;
 
                         // Simplified proposal handling for async variant
                         let proposal_info = match proposal {
@@ -3004,6 +3258,13 @@ impl MLSContext {
                             }
                         };
 
+                        let staged_ref = stage_pending_incoming_proposal(
+                            &pending_incoming_proposals,
+                            &group_id,
+                            *proposal_msg,
+                            "MLS-FFI-ASYNC",
+                        )?;
+                        debug_assert_eq!(staged_ref, proposal_ref_bytes);
                         Ok((ProcessedContent::Proposal {
                             proposal: proposal_info,
                             proposal_ref: ProposalRef {
@@ -3043,12 +3304,16 @@ impl MLSContext {
                         };
 
                         // Export the pre-merge epoch secret now (forward-secrecy window).
-                        // Post-merge cleanup moves into `merge_incoming_commit`.
-                        if let Err(e) = crate::async_runtime::block_on(
+                        // Post-merge cleanup is intentionally separate: the
+                        // orchestrator first persists its new GroupState, then
+                        // invokes the explicit cleanup hook.
+                        crate::async_runtime::block_on(
                             epoch_manager.export_current_epoch_secret(group, provider)
-                        ) {
-                            crate::warn_log!("[MLS-FFI-ASYNC] ⚠️ Failed to export epoch secret before staging: {:?}", e);
-                        }
+                        )
+                        .map_err(|error| {
+                            crate::error_log!("[MLS-FFI-ASYNC] Failed to durably export epoch secret before staging: {:?}", error);
+                            error
+                        })?;
 
                         let metadata_reference_json = current_metadata_reference_json(group);
                         let metadata_info = metadata_key_bytes.map(|metadata_key| CommitMetadataInfo {
@@ -3079,18 +3344,14 @@ impl MLSContext {
                                 return Err(MLSError::ContextNotInitialized);
                             }
                         };
-                        let mut pending = pending_incoming_merges.lock().map_err(|_| {
-                            crate::error_log!("[MLS-FFI-ASYNC] ❌ pending_incoming_merges mutex poisoned");
-                            MLSError::ContextNotInitialized
-                        })?;
-                        let key = (group_id.clone(), target_epoch);
-                        if pending.insert(key, staged).is_some() {
-                            crate::warn_log!(
-                                "[MLS-FFI-ASYNC] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
-                                hex::encode(&group_id),
-                                target_epoch
-                            );
-                        }
+                        stage_pending_incoming_commit(
+                            &pending_incoming_merges,
+                            &group_id,
+                            target_epoch,
+                            wire_fingerprint,
+                            staged,
+                            "MLS-FFI-ASYNC",
+                        )?;
                     }
                     Ok(content)
                 }
@@ -3156,6 +3417,7 @@ impl MLSContext {
     ) -> Result<Vec<KeyPackageResult>, MLSError> {
         // Early bail-out if suspension is in progress (0xdead10cc prevention).
         self.check_suspended()?;
+        crate::message_limits::validate_key_package_batch_count(count)?;
         if count == 0 {
             return Ok(Vec::new());
         }
@@ -3247,6 +3509,7 @@ impl MLSContext {
         config: Option<GroupConfig>,
     ) -> Result<WelcomeResult, MLSError> {
         self.check_suspended()?;
+        validate_inbound_mls_message_len(welcome_bytes.len(), "welcome")?;
         crate::info_log!(
             "[MLS-FFI] process_welcome: Starting with {} byte Welcome message",
             welcome_bytes.len()
@@ -3261,6 +3524,16 @@ impl MLSContext {
         let identity = String::from_utf8(identity_bytes)
             .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
         crate::info_log!("[MLS-FFI] process_welcome: Identity = {}", identity);
+
+        // Verify the manifest mapping and Tier-0 signing key before OpenMLS
+        // consumes the Welcome KeyPackage. A warning-only or post-consumption
+        // signer failure can otherwise leave a half-adopted group.
+        if inner.get_signer_for_identity(&identity).is_none() {
+            crate::error_log!(
+                "[MLS-FFI] process_welcome: signer mapping/keypair unavailable for identity"
+            );
+            return Err(MLSError::StorageFailed);
+        }
 
         let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(&welcome_bytes).map_err(|e| {
             crate::error_log!(
@@ -3465,110 +3738,116 @@ impl MLSContext {
             "[MLS-FFI] process_welcome: Group joined at epoch {}",
             group.epoch().as_u64()
         );
-        if let Err(e) = crate::async_runtime::block_on(
+        if let Err(export_error) = crate::async_runtime::block_on(
             epoch_manager.export_current_epoch_secret(&mut group, &inner.provider),
         ) {
-            crate::warn_log!(
-                "[MLS-FFI] ⚠️ WARNING: Failed to export epoch secret after Welcome: {:?}",
-                e
-            );
-        } else {
-            crate::info_log!(
-                "[MLS-FFI] ✅ Exported epoch {} secret after processing Welcome",
-                group.epoch().as_u64()
-            );
-        }
-
-        inner.add_group(group, &identity)?;
-
-        // OpenMLS just consumed the matched KP from `openmls_key_packages`.
-        // Sweep our manifest cache to drop the corresponding entry (and
-        // any other already-stale entries) so the next cold-start sync
-        // doesn't re-publish dead hashes.
-        match inner.reconcile_key_package_bundles() {
-            Ok(0) => {}
-            Ok(removed) => {
-                crate::info_log!(
-                    "[MLS-FFI] [KP-RECONCILE] post-Welcome cleanup: removed {} stale entries",
-                    removed
-                );
-            }
-            Err(e) => {
-                crate::warn_log!(
-                    "[MLS-FFI] [KP-RECONCILE] post-Welcome cleanup failed (non-fatal): {:?}",
-                    e
-                );
-            }
-        }
-
-        // 🔍 DIAGNOSTIC: Verify the group was successfully added and is accessible
-        crate::info_log!(
-            "[MLS-FFI] process_welcome: 🔍 Verifying group was stored successfully..."
-        );
-        let gid = GroupId::from_slice(&group_id);
-
-        // Try to access the group to verify it's accessible
-        // Note: OpenMLS SqliteStorageProvider automatically persists group state to SQLite
-        inner.with_group_ref(&gid, |group, provider| {
-            let stored_epoch = group.epoch().as_u64();
-            crate::info_log!("[MLS-FFI] ✅ Group successfully stored and accessible in memory - epoch: {}", stored_epoch);
-
-            // 🔍 DIAGNOSTIC: Immediately reload from storage to verify persistence
-            crate::info_log!("[MLS-FFI] 🔍 Verifying storage round-trip...");
-            match MlsGroup::load(provider.storage(), &gid) {
-                Ok(Some(loaded_group)) => {
-                    let loaded_epoch = loaded_group.epoch().as_u64();
-                    if loaded_epoch == stored_epoch {
-                        crate::info_log!("[MLS-FFI] ✅ Storage verification PASSED: Reloaded group at epoch {}", loaded_epoch);
-                    } else {
-                        crate::error_log!("[MLS-FFI] ❌ STORAGE MISMATCH: Memory epoch {} != Storage epoch {}",
-                            stored_epoch, loaded_epoch);
-                    }
-
-                    // 🔍 DIAGNOSTIC: Verify member count matches
-                    let memory_members = group.members().count();
-                    let storage_members = loaded_group.members().count();
-                    if memory_members == storage_members {
-                        crate::info_log!("[MLS-FFI] ✅ Member count matches: {} members", memory_members);
-                    } else {
-                        crate::error_log!("[MLS-FFI] ❌ MEMBER COUNT MISMATCH: Memory {} != Storage {}",
-                            memory_members, storage_members);
-                    }
-                }
-                Ok(None) => {
-                    crate::error_log!("[MLS-FFI] ❌ CRITICAL: Group NOT found in storage immediately after add!");
-                    crate::error_log!("[MLS-FFI]   This indicates storage.save() may have failed silently");
-                }
-                Err(e) => {
-                    crate::error_log!("[MLS-FFI] ❌ CRITICAL: Failed to reload group from storage: {:?}", e);
-                }
-            }
-
-            Ok(())
-        }).map_err(|e| {
-            crate::error_log!("[MLS-FFI] ❌ CRITICAL: Group was not stored after Welcome processing!");
-            crate::error_log!("[MLS-FFI] ERROR: {:?}", e);
-            MLSError::StorageFailed
-        })?;
-
-        crate::info_log!("[MLS-FFI] process_welcome: Group storage verified successfully");
-
-        // 🔒 CRITICAL FIX: Force database flush to ensure secret tree state is durably persisted
-        // Without this, SQLite WAL entries may not be checkpointed to the main database file,
-        // causing SecretReuseError after app restart when the group state is incomplete.
-        self.check_suspended()?;
-        crate::info_log!("[MLS-FFI] process_welcome: Flushing database to ensure persistence...");
-        inner.flush_database().map_err(|e| {
             crate::error_log!(
-                "[MLS-FFI] ❌ CRITICAL: Failed to flush database after Welcome processing!"
+                "[MLS-FFI] Failed to durably export the joined epoch secret; rolling back Welcome adoption: {:?}",
+                export_error
             );
-            crate::error_log!("[MLS-FFI] ERROR: {:?}", e);
-            e
-        })?;
 
-        // Signal-style budget checkpoint: keep WAL perpetually small
-        inner.maybe_truncate_checkpoint();
-        crate::info_log!("[MLS-FFI] ✅ Database flushed successfully - group state is durable");
+            let rollback_error = inner
+                .rollback_unpublished_group(&mut group, &group_id, "Welcome secret export")
+                .err();
+            let reconcile_error = inner.reconcile_key_package_bundles().err();
+            if rollback_error.is_some() || reconcile_error.is_some() {
+                return Err(MLSError::Internal(format!(
+                    "Welcome secret export failed ({export_error}); rollback incomplete (group={rollback_error:?}, key_package={reconcile_error:?})"
+                )));
+            }
+            return Err(export_error);
+        }
+        crate::info_log!(
+            "[MLS-FFI] ✅ Exported epoch {} secret after processing Welcome",
+            group.epoch().as_u64()
+        );
+
+        let gid = GroupId::from_slice(&group_id);
+        let expected_epoch = group.epoch().as_u64();
+        let expected_members: Vec<Member> = group.members().collect();
+        let preparation = (|| -> Result<usize, MLSError> {
+            let loaded_group = MlsGroup::load(inner.provider.storage(), &gid)
+                .map_err(|error| {
+                    crate::error_log!(
+                        "[MLS-FFI] process_welcome: storage reload failed: {:?}",
+                        error
+                    );
+                    MLSError::StorageFailed
+                })?
+                .ok_or_else(|| {
+                    crate::error_log!(
+                        "[MLS-FFI] process_welcome: group absent from storage before publication"
+                    );
+                    MLSError::StorageFailed
+                })?;
+
+            let loaded_epoch = loaded_group.epoch().as_u64();
+            if loaded_epoch != expected_epoch {
+                return Err(MLSError::EpochMismatch {
+                    local: loaded_epoch,
+                    remote: expected_epoch,
+                });
+            }
+            let loaded_members: Vec<Member> = loaded_group.members().collect();
+            if loaded_members != expected_members {
+                crate::error_log!(
+                    "[MLS-FFI] process_welcome: exact member-set storage verification failed"
+                );
+                return Err(MLSError::StorageFailed);
+            }
+
+            let removed = inner.reconcile_key_package_bundles()?;
+            self.check_suspended()?;
+            Ok(removed)
+        })();
+
+        let reconciled = match preparation {
+            Ok(removed) => removed,
+            Err(primary_error) => {
+                let rollback_error = inner
+                    .rollback_unpublished_group(&mut group, &group_id, "Welcome verification")
+                    .err();
+                let reconcile_error = inner.reconcile_key_package_bundles().err();
+                let secret_cleanup_error = crate::async_runtime::block_on(
+                    epoch_manager.delete_exact_epoch_secret(&group_id, expected_epoch),
+                )
+                .err();
+                if rollback_error.is_some()
+                    || reconcile_error.is_some()
+                    || secret_cleanup_error.is_some()
+                {
+                    return Err(MLSError::Internal(format!(
+                        "Welcome verification failed ({primary_error}); rollback incomplete (group={rollback_error:?}, key_package={reconcile_error:?}, epoch_secret={secret_cleanup_error:?})"
+                    )));
+                }
+                return Err(primary_error);
+            }
+        };
+        if reconciled > 0 {
+            crate::info_log!(
+                "[MLS-FFI] [KP-RECONCILE] post-Welcome cleanup removed {} stale entries",
+                reconciled
+            );
+        }
+
+        // add_group persists the manifest and passes the checked durability
+        // barrier before publishing into the live map. Nothing fallible follows.
+        if let Err(primary_error) = inner.add_group(group, &identity) {
+            let secret_cleanup_error = crate::async_runtime::block_on(
+                epoch_manager.delete_exact_epoch_secret(&group_id, expected_epoch),
+            )
+            .err();
+            if let Some(cleanup_error) = secret_cleanup_error {
+                return Err(MLSError::Internal(format!(
+                    "Welcome publication failed ({primary_error}); epoch-secret rollback failed ({cleanup_error})"
+                )));
+            }
+            return Err(primary_error);
+        }
+        crate::info_log!(
+            "[MLS-FFI] process_welcome: durable group publication complete at epoch {}",
+            expected_epoch
+        );
 
         Ok(WelcomeResult { group_id })
     }
@@ -3988,6 +4267,8 @@ impl MLSContext {
         commit_data: Vec<u8>,
     ) -> Result<ProcessCommitResult, MLSError> {
         self.check_suspended()?;
+        validate_inbound_mls_message_len(commit_data.len(), "commit")?;
+        let wire_fingerprint = incoming_commit_wire_fingerprint(&commit_data);
         let mut guard = self
             .inner
             .lock()
@@ -4010,14 +4291,7 @@ impl MLSContext {
             metadata_info,
             target_epoch,
             staged_commit_opt,
-        ): (
-            Vec<UpdateProposalInfo>,
-            Vec<AddProposalInfo>,
-            Vec<RemoveProposalInfo>,
-            Option<CommitMetadataInfo>,
-            u64,
-            Option<Box<StagedCommit>>,
-        ) = inner.with_group(&gid, |group, provider, _signer| {
+        ): IncomingProcessCommitStage = inner.with_group(&gid, |group, provider, _signer| {
                 let (mls_msg, _) =
                     MlsMessageIn::tls_deserialize_bytes(&commit_data).map_err(|e| {
                         crate::error_log!(
@@ -4163,16 +4437,19 @@ impl MLSContext {
                         };
 
                         // Task #33: export the pre-merge epoch secret now (forward-secrecy
-                        // window). Merge itself is deferred to `merge_incoming_commit` —
-                        // which also runs post-merge `cleanup_old_epochs`.
-                        if let Err(e) = crate::async_runtime::block_on(
+                        // window). Merge itself is deferred to `merge_incoming_commit`;
+                        // pruning remains a separate post-projection step after the
+                        // orchestrator durably records the new GroupState.
+                        crate::async_runtime::block_on(
                             epoch_manager.export_current_epoch_secret(group, provider),
-                        ) {
-                            crate::warn_log!(
-                                "[MLS-FFI] ⚠️ process_commit: Failed to export epoch secret: {:?}",
-                                e
+                        )
+                        .map_err(|error| {
+                            crate::error_log!(
+                                "[MLS-FFI] process_commit: Failed to durably export epoch secret before staging: {:?}",
+                                error
                             );
-                        }
+                            error
+                        })?;
 
                         let metadata_reference_json = current_metadata_reference_json(group);
                         let metadata_derived =
@@ -4217,20 +4494,14 @@ impl MLSContext {
         drop(guard);
 
         if let Some(staged) = staged_commit_opt {
-            let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
-                crate::error_log!(
-                    "[MLS-FFI] ❌ process_commit: pending_incoming_merges mutex poisoned"
-                );
-                MLSError::ContextNotInitialized
-            })?;
-            let key = (group_id.clone(), target_epoch);
-            if pending.insert(key, staged).is_some() {
-                crate::warn_log!(
-                    "[MLS-FFI] ⚠️ process_commit: Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
-                    hex::encode(&group_id),
-                    target_epoch
-                );
-            }
+            stage_pending_incoming_commit(
+                &self.pending_incoming_merges,
+                &group_id,
+                target_epoch,
+                wire_fingerprint,
+                staged,
+                "MLS-FFI process_commit",
+            )?;
         }
 
         Ok(ProcessCommitResult {
@@ -4268,24 +4539,9 @@ impl MLSContext {
     pub fn store_proposal(
         &self,
         group_id: Vec<u8>,
-        _proposal_ref: ProposalRef,
+        proposal_ref: ProposalRef,
     ) -> Result<(), MLSError> {
-        self.check_suspended()?;
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| MLSError::ContextNotInitialized)?;
-        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
-
-        let gid = GroupId::from_slice(&group_id);
-
-        inner.with_group(&gid, |_group, _provider, _signer| {
-            // In OpenMLS, proposals are already stored when processed
-            // This function is a placeholder for explicit application control
-            // The proposal was stored during process_message call
-            // Application can maintain its own list of approved proposals
-            Ok(())
-        })
+        self.accept_incoming_proposal(group_id, proposal_ref.data)
     }
 
     /// List all pending proposals for a group
@@ -4298,22 +4554,12 @@ impl MLSContext {
 
         let gid = GroupId::from_slice(&group_id);
 
-        inner.with_group_ref(&gid, |group, provider| {
+        inner.with_group_ref(&gid, |group, _provider| {
             let proposal_refs: Vec<ProposalRef> = group
                 .pending_proposals()
                 .filter_map(|queued_proposal| {
-                    // Compute proposal reference by hashing the proposal
-                    // Since proposal_reference() is pub(crate), we compute our own identifier
-                    let proposal = queued_proposal.proposal();
-                    let proposal_bytes = proposal.tls_serialize_detached().ok()?;
-
-                    let proposal_ref_bytes = provider
-                        .crypto()
-                        .hash(group.ciphersuite().hash_algorithm(), &proposal_bytes)
-                        .ok()?;
-
                     Some(ProposalRef {
-                        data: proposal_ref_bytes,
+                        data: serialize_proposal_reference(queued_proposal).ok()?,
                     })
                 })
                 .collect();
@@ -4427,25 +4673,28 @@ impl MLSContext {
 
             let (commit_msg, _welcome, _group_info) = commit_bundle.into_contents();
 
-            // Merge the pending commit
-            group
-                .merge_pending_commit(provider)
-                .map_err(|_| MLSError::OpenMLSError)?;
-
             // Serialize the commit
             let commit_data = commit_msg
                 .tls_serialize_detached()
                 .map_err(|_| MLSError::SerializationError)?;
 
+            // Leave the OpenMLS commit staged. The caller must send it to the
+            // delivery service and invoke merge_pending_commit only after an
+            // authenticated acceptance.
             Ok(commit_data)
         })
     }
+}
 
-    /// Merge a pending commit after validation
-    /// This should be called after the commit has been accepted by the delivery service
-    pub fn merge_pending_commit(
+// Internal merge primitive. The optional fence is used by the direct staged
+// commit API, where a server acceptance must advance exactly source -> target.
+// Generic merge callers retain the OpenMLS no-op behavior needed after an
+// External Commit has already been finalized locally.
+impl MLSContext {
+    fn merge_pending_commit_with_epoch_fence(
         &self,
         group_id: Vec<u8>,
+        epoch_fence: Option<PendingCommitEpochFence>,
     ) -> Result<MergePendingCommitResult, MLSError> {
         self.check_suspended()?;
         let mut guard = self
@@ -4460,10 +4709,35 @@ impl MLSContext {
         // This allows decrypting messages from the current epoch after the group advances
         let epoch_manager = inner.epoch_secret_manager().clone();
 
-        inner.with_group(&gid, |group, provider, _signer| {
+        let merged_epoch = inner.with_group(&gid, |group, provider, _signer| {
             // Secret tree state logging BEFORE merge
             let epoch_before = group.epoch().as_u64();
             let member_count_before_merge = group.members().count();
+
+            // A prior attempt may have merged successfully and then failed its
+            // durability checkpoint. In that case the retry handle is still
+            // present and the only safe action is to retry the barrier below.
+            if let Some(fence) = epoch_fence {
+                if epoch_before == fence.target_epoch {
+                    if !fence.allow_target_retry {
+                        return Err(MLSError::EpochMismatch {
+                            local: epoch_before,
+                            remote: fence.source_epoch,
+                        });
+                    }
+                    crate::info_log!(
+                        "[MLS-FFI] merge_pending_commit: retrying durability barrier at target epoch {}",
+                        fence.target_epoch
+                    );
+                    return Ok(epoch_before);
+                }
+                if epoch_before != fence.source_epoch {
+                    return Err(MLSError::EpochMismatch {
+                        local: epoch_before,
+                        remote: fence.source_epoch,
+                    });
+                }
+            }
 
             crate::debug_log!("[MLS-FFI] 🔐 SECRET TREE STATE - merge_pending_commit");
             crate::debug_log!("[MLS-FFI]   Group: {}", hex::encode(&group_id));
@@ -4474,16 +4748,18 @@ impl MLSContext {
             crate::debug_log!("[MLS-FFI] merge_pending_commit: Exporting current epoch secret before advancing");
 
             // Export current epoch secret before the commit advances the epoch
-            if let Err(e) = crate::async_runtime::block_on(
+            crate::async_runtime::block_on(
                 epoch_manager.export_current_epoch_secret(group, provider)
-            ) {
-                crate::warn_log!("[MLS-FFI] ⚠️ WARNING: Failed to export epoch secret: {:?}", e);
-                crate::debug_log!("[MLS-FFI]   This may cause decryption failures for delayed messages from current epoch");
-                // Continue with merge - epoch secret export is best-effort
-            }
+            )
+            .map_err(|error| {
+                crate::error_log!(
+                    "[MLS-FFI] Failed to durably export epoch secret before merging pending commit: {:?}",
+                    error
+                );
+                error
+            })?;
 
-            group.merge_pending_commit(provider)
-                .map_err(|e| {
+            group.merge_pending_commit(provider).map_err(|e| {
                     crate::error_log!("[MLS-FFI] 🔐 SECRET TREE ERROR - merge failed: {:?}", e);
                     MLSError::MergeFailed
                 })?;
@@ -4497,7 +4773,19 @@ impl MLSContext {
             crate::debug_log!("[MLS-FFI]   Epoch change: {} -> {}", epoch_before, epoch_after);
             crate::debug_log!("[MLS-FFI]   Member count after: {}", member_count_after_merge);
 
-            if epoch_after <= epoch_before {
+            if let Some(fence) = epoch_fence {
+                if epoch_after != fence.target_epoch {
+                    crate::error_log!(
+                        "[MLS-FFI] pending commit reached unexpected epoch: expected {}, got {}",
+                        fence.target_epoch,
+                        epoch_after
+                    );
+                    return Err(MLSError::EpochMismatch {
+                        local: epoch_after,
+                        remote: fence.target_epoch,
+                    });
+                }
+            } else if epoch_after <= epoch_before {
                 // BENIGN no-op, not a data-plane bug: this is the own-commit merge
                 // path. After an External Commit (force_rejoin), OpenMLS `finalize()`
                 // has already merged the commit, so the follow-up `merge_pending_commit`
@@ -4552,18 +4840,7 @@ impl MLSContext {
 
             Ok((epoch, metadata_info))
         })?;
-
-        // Cleanup old epoch secrets for forward secrecy
-        // We retain the last 5 epochs to handle delayed messages/reordering
-        let retention_epochs = 5u64;
-        if let Err(e) = crate::async_runtime::block_on(epoch_manager.cleanup_old_epochs(
-            gid.as_slice(),
-            new_epoch,
-            retention_epochs,
-        )) {
-            crate::warn_log!("[MLS-FFI] ⚠️ Failed to cleanup old epochs: {:?}", e);
-            // Non-fatal - continue
-        }
+        debug_assert_eq!(merged_epoch, new_epoch);
 
         // 🔒 CRITICAL: Force database flush after commit merge
         // Epoch advancement creates new secret tree state that must be persisted
@@ -4578,12 +4855,68 @@ impl MLSContext {
 
         // Signal-style budget checkpoint: keep WAL perpetually small
         inner.maybe_truncate_checkpoint();
+        inner.mark_external_join_accepted(&group_id)?;
         crate::debug_log!("[MLS-FFI] ✅ Database flushed after commit merge");
+        drop(guard);
+
+        // Never prune here. The caller cannot persist its stable GroupState
+        // projection until this method returns the resulting epoch. Cleanup is
+        // an explicit, epoch-fenced post-projection step.
+        crate::debug_log!(
+            "[MLS-FFI] merge_pending_commit: deferring epoch-secret cleanup until projection is durable at epoch {}",
+            new_epoch
+        );
 
         Ok(MergePendingCommitResult {
             new_epoch,
             commit_metadata,
         })
+    }
+}
+
+#[uniffi::export]
+impl MLSContext {
+    /// Merge a pending commit after validation.
+    ///
+    /// The merged OpenMLS state is durably flushed before return. Epoch-secret
+    /// pruning is deliberately deferred until the host has persisted its
+    /// stable GroupState projection and calls finalize_epoch_transition.
+    pub fn merge_pending_commit(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<MergePendingCommitResult, MLSError> {
+        self.merge_pending_commit_with_epoch_fence(group_id, None)
+    }
+
+    /// Finalize an epoch transition after the host's stable projection is
+    /// durable. The caller-provided epoch must exactly match current crypto
+    /// state; stale or speculative projections cannot trigger secret pruning.
+    pub fn finalize_epoch_transition(
+        &self,
+        group_id: Vec<u8>,
+        projected_epoch: u64,
+    ) -> Result<u32, MLSError> {
+        self.check_suspended()?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        let current_epoch =
+            inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))?;
+        validate_projected_epoch(current_epoch, projected_epoch)?;
+        let epoch_manager = inner.epoch_secret_manager().clone();
+        drop(guard);
+
+        if projected_epoch <= DEFAULT_EPOCH_SECRET_RETENTION {
+            return Ok(0);
+        }
+        crate::async_runtime::block_on(epoch_manager.cleanup_old_epochs(
+            &group_id,
+            projected_epoch,
+            DEFAULT_EPOCH_SECRET_RETENTION,
+        ))
     }
 
     /// Merge a staged commit after validation
@@ -4604,14 +4937,21 @@ impl MLSContext {
     ///
     /// Returns the new (post-merge) epoch.
     ///
+    /// This method durably flushes the OpenMLS merge before returning, but it
+    /// deliberately does not prune retained epoch secrets. The caller must
+    /// first persist its own GroupState/projection for `target_epoch`, then use
+    /// `finalize_epoch_transition` (or the in-process cleanup hook). Pruning
+    /// inside this method could destroy recovery material before the outer
+    /// transaction is durable.
+    ///
     /// Errors:
     ///   - `MLSError::invalid_input` if no staged commit exists for
     ///     `(group_id, target_epoch)` — the entry was never staged, or
     ///     `discard_incoming_commit` already cleared it.
-    ///   - `MLSError::MergeFailed` if OpenMLS `merge_staged_commit` fails; the
-    ///     StagedCommit is dropped (caller must re-fetch from the DS if recovery
-    ///     is needed). This matches the pre-refactor behavior where a failed
-    ///     merge left no resumable state.
+    ///   - `MLSError::MergeFailed`, epoch mismatch, or storage failure while
+    ///     applying the transition. The staged handle is preserved. If OpenMLS
+    ///     advanced before a barrier failure, retrying completes the barrier
+    ///     idempotently and only then consumes the handle.
     pub fn merge_incoming_commit(
         &self,
         group_id: Vec<u8>,
@@ -4619,16 +4959,23 @@ impl MLSContext {
     ) -> Result<u64, MLSError> {
         self.check_suspended()?;
 
-        // Pop the staged commit under the pending-map lock, then release
-        // before touching the inner MLS context — never hold both at once.
-        let staged = {
-            let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
-                crate::error_log!("[MLS-FFI] ❌ merge_incoming_commit: pending_incoming_merges mutex poisoned");
-                MLSError::ContextNotInitialized
-            })?;
-            pending.remove(&(group_id.clone(), target_epoch))
-        }
-        .ok_or_else(|| {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        // Preserve the original StagedCommit as a retry/recovery token until
+        // exact epoch advancement and the durability barrier both succeed.
+        // Message-processing paths release the inner lock before registering a
+        // staged commit, so this inner -> pending lock order is acyclic.
+        let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
+            crate::error_log!(
+                "[MLS-FFI] ❌ merge_incoming_commit: pending_incoming_merges mutex poisoned"
+            );
+            MLSError::ContextNotInitialized
+        })?;
+        let pending_key = (group_id.clone(), target_epoch);
+        let pending_entry = pending.get(&pending_key).ok_or_else(|| {
             crate::warn_log!(
                 "[MLS-FFI] ⚠️ merge_incoming_commit: no pending staged commit for group {} epoch {}",
                 hex::encode(&group_id),
@@ -4639,17 +4986,45 @@ impl MLSContext {
                 target_epoch
             ))
         })?;
-
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| MLSError::ContextNotInitialized)?;
-        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let staged = pending_entry.staged.clone();
+        let merge_started = pending_entry.merge_started;
         let gid = GroupId::from_slice(&group_id);
-        let epoch_manager = inner.epoch_secret_manager().clone();
+        let expected_source = target_epoch.checked_sub(1).ok_or_else(|| {
+            MLSError::invalid_input("incoming commit target epoch must be greater than zero")
+        })?;
+
+        let epoch_before =
+            inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))?;
+        if epoch_before == target_epoch {
+            if !merge_started {
+                // Reaching the same epoch is insufficient proof that this exact
+                // staged commit was applied; another fork commit may have won.
+                return Err(MLSError::EpochMismatch {
+                    local: epoch_before,
+                    remote: expected_source,
+                });
+            }
+            // A prior attempt can mutate OpenMLS and then fail the checkpoint.
+            // Retry the barrier and consume the handle only after it succeeds.
+            inner.flush_database()?;
+            inner.maybe_truncate_checkpoint();
+            pending.remove(&pending_key).ok_or_else(|| {
+                MLSError::Internal(format!(
+                    "incoming staged commit disappeared after durable retry for group {} epoch {}",
+                    hex::encode(&group_id),
+                    target_epoch
+                ))
+            })?;
+            return Ok(target_epoch);
+        }
+        if epoch_before != expected_source {
+            return Err(MLSError::EpochMismatch {
+                local: epoch_before,
+                remote: expected_source,
+            });
+        }
 
         let new_epoch = inner.with_group(&gid, |group, provider, _signer| {
-            let epoch_before = group.epoch().as_u64();
             group.merge_staged_commit(provider, *staged).map_err(|e| {
                 crate::error_log!(
                     "[MLS-FFI] ❌ merge_incoming_commit: merge_staged_commit failed: {:?}",
@@ -4666,33 +5041,30 @@ impl MLSContext {
                 epoch_after
             );
 
-            if epoch_after <= epoch_before {
+            if epoch_after != target_epoch {
                 crate::error_log!(
-                    "[MLS-FFI] ❌ CRITICAL: merge_incoming_commit did not advance epoch! {} -> {}",
-                    epoch_before,
+                    "[MLS-FFI] ❌ CRITICAL: merge_incoming_commit target mismatch: expected {}, got {}",
+                    target_epoch,
                     epoch_after
                 );
-            }
-
-            // Cleanup old epoch secrets after incoming commit advances the epoch.
-            // This was previously done in the auto-merge path; we move it here so
-            // the retention policy still runs when the platform confirms the merge.
-            let retention_epochs = 5u64;
-            if let Err(e) = crate::async_runtime::block_on(
-                epoch_manager.cleanup_old_epochs(
-                    group.group_id().as_slice(),
-                    epoch_after,
-                    retention_epochs,
-                ),
-            ) {
-                crate::warn_log!(
-                    "[MLS-FFI] ⚠️ merge_incoming_commit: cleanup_old_epochs failed: {:?}",
-                    e
-                );
+                return Err(MLSError::EpochMismatch {
+                    local: epoch_after,
+                    remote: target_epoch,
+                });
             }
 
             Ok(epoch_after)
         })?;
+        pending
+            .get_mut(&pending_key)
+            .ok_or_else(|| {
+                MLSError::Internal(format!(
+                    "incoming staged commit disappeared after merge for group {} epoch {}",
+                    hex::encode(&group_id),
+                    target_epoch
+                ))
+            })?
+            .merge_started = true;
 
         // Persist merge result.
         inner.flush_database().map_err(|e| {
@@ -4704,6 +5076,13 @@ impl MLSContext {
         })?;
         inner.maybe_truncate_checkpoint();
 
+        pending.remove(&pending_key).ok_or_else(|| {
+            MLSError::Internal(format!(
+                "incoming staged commit disappeared after durable merge for group {} epoch {}",
+                hex::encode(&group_id),
+                target_epoch
+            ))
+        })?;
         Ok(new_epoch)
     }
 
@@ -5349,10 +5728,6 @@ impl MLSContext {
                         );
                         crate::error_log!("[MLS-FFI]   MlsMessage wrapper error: {:?}", e);
                         crate::error_log!("[MLS-FFI]   Raw GroupInfo error: {:?}", e2);
-                        crate::error_log!(
-                            "[MLS-FFI]   First 16 bytes: {:02x?}",
-                            &group_info_bytes[..group_info_bytes.len().min(16)]
-                        );
                         false
                     }
                 }
@@ -5430,6 +5805,107 @@ impl MLSContext {
 }
 
 impl MLSContext {
+    /// Move an authenticated standalone proposal from the short-lived
+    /// authorization staging area into OpenMLS's durable proposal store.
+    ///
+    /// The handle is retained until the storage checkpoint succeeds. If the
+    /// OpenMLS write succeeds but the checkpoint fails, a retry observes the
+    /// exact proposal already queued, retries durability, and only then
+    /// consumes the handle.
+    fn accept_incoming_proposal(
+        &self,
+        group_id: Vec<u8>,
+        proposal_ref: Vec<u8>,
+    ) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        let parsed_ref =
+            openmls::prelude::hash_ref::ProposalRef::tls_deserialize_exact_bytes(&proposal_ref)
+                .map_err(|_| MLSError::InvalidProposalRef)?;
+        let key = (group_id.clone(), proposal_ref.clone());
+        let _storage_operation = self.begin_storage_operation("accept_incoming_proposal");
+
+        // Keep one lock order everywhere: OpenMLS context first, short-lived
+        // proposal staging second. Decrypt paths use the same order.
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let mut pending = self.pending_incoming_proposals.lock().map_err(|_| {
+            crate::error_log!(
+                "[MLS-FFI] accept_incoming_proposal: pending proposal mutex poisoned"
+            );
+            MLSError::ContextNotInitialized
+        })?;
+        let staged = pending.get(&key).cloned();
+        let gid = GroupId::from_slice(&group_id);
+
+        let already_queued = inner.with_group_ref(&gid, |group, _provider| {
+            Ok(group
+                .pending_proposals()
+                .any(|proposal| proposal.proposal_reference_ref() == &parsed_ref))
+        })?;
+
+        match staged {
+            Some(proposal) => {
+                if proposal.proposal_reference_ref() != &parsed_ref {
+                    return Err(MLSError::Internal(
+                        "staged proposal key does not match its authenticated reference"
+                            .to_string(),
+                    ));
+                }
+                if !already_queued {
+                    inner.with_group(&gid, |group, provider, _signer| {
+                        group
+                            .store_pending_proposal(provider.storage(), proposal)
+                            .map_err(|error| {
+                                crate::error_log!(
+                                    "[MLS-FFI] Failed to store authorized incoming proposal: {:?}",
+                                    error
+                                );
+                                MLSError::StorageFailed
+                            })
+                    })?;
+                }
+            }
+            None if !already_queued => {
+                return Err(MLSError::InvalidProposalRef);
+            }
+            None => {
+                // Idempotent retry after a prior acceptance completed and its
+                // staging handle was already consumed.
+            }
+        }
+
+        inner.flush_database()?;
+        inner.maybe_truncate_checkpoint();
+        pending.remove(&key);
+        Ok(())
+    }
+
+    /// Drop a proposal that has not passed application-level sender
+    /// authorization. Since staged proposals are not yet visible to OpenMLS,
+    /// discarding is an in-memory operation and cannot race with auto-commit.
+    fn discard_incoming_proposal(
+        &self,
+        group_id: Vec<u8>,
+        proposal_ref: Vec<u8>,
+    ) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        // Reject malformed/crafted handles even though the map lookup itself
+        // is byte-exact.
+        openmls::prelude::hash_ref::ProposalRef::tls_deserialize_exact_bytes(&proposal_ref)
+            .map_err(|_| MLSError::InvalidProposalRef)?;
+        let mut pending = self.pending_incoming_proposals.lock().map_err(|_| {
+            crate::error_log!(
+                "[MLS-FFI] discard_incoming_proposal: pending proposal mutex poisoned"
+            );
+            MLSError::ContextNotInitialized
+        })?;
+        pending.remove(&(group_id, proposal_ref));
+        Ok(())
+    }
+
     fn begin_storage_operation(&self, label: &str) -> StorageOperationGuard {
         self.storage_registry.begin_operation(label)
     }
@@ -5636,6 +6112,8 @@ impl MLSContext {
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
         self.check_suspended()?;
+        validate_inbound_mls_message_len(ciphertext.len(), "ciphertext")?;
+        let wire_fingerprint = incoming_commit_wire_fingerprint(&ciphertext);
         // 🔍 DIAGNOSTIC: Thread tracking
         let thread_id = std::thread::current().id();
         let timestamp = std::time::SystemTime::now();
@@ -5651,10 +6129,6 @@ impl MLSContext {
             group_id.len()
         );
         crate::debug_log!("[DECRYPT] Ciphertext size: {} bytes", ciphertext.len());
-        crate::debug_log!(
-            "[DECRYPT] Ciphertext first 32 bytes: {:02x?}",
-            &ciphertext[..ciphertext.len().min(32)]
-        );
 
         // 🔍 DIAGNOSTIC: Lock acquisition tracking
         crate::debug_log!(
@@ -5739,7 +6213,14 @@ impl MLSContext {
             );
         }
 
-        let (plaintext, epoch, sender_credential, staged_commit_opt): (Vec<u8>, u64, CredentialData, Option<Box<StagedCommit>>) = inner.with_group(&gid, |group, provider, _signer| {
+        let (
+            plaintext,
+            epoch,
+            sender_credential,
+            content_type,
+            queued_proposal_opt,
+            staged_commit_opt,
+        ): IncomingDecryptStage = inner.with_group(&gid, |group, provider, _signer| {
             // 🔍 DIAGNOSTIC: Get current epoch and estimated generation BEFORE processing
             let current_epoch = group.epoch().as_u64();
             crate::info_log!("[DECRYPT] 📊 PRE-PROCESSING STATE:");
@@ -5814,18 +6295,29 @@ impl MLSContext {
                 ProcessedMessageContent::ApplicationMessage(app_msg) => {
                     let bytes = app_msg.into_bytes();
                     crate::debug_log!("[DECRYPT] ApplicationMessage processed: {} bytes", bytes.len());
-                    if !bytes.is_empty() {
-                        crate::debug_log!("[DECRYPT] Plaintext preview: {:?}", String::from_utf8_lossy(&bytes[..bytes.len().min(200)]));
-                    }
-                    Ok((bytes, message_epoch, sender_credential, None))
+                    Ok((
+                        bytes,
+                        message_epoch,
+                        sender_credential,
+                        DecryptContentType::Application,
+                        None,
+                        None,
+                    ))
                 },
                 ProcessedMessageContent::ProposalMessage(prop) => {
                     crate::debug_log!("[DECRYPT] ProposalMessage received: {:?}", std::any::type_name_of_val(&prop));
-                    Ok((vec![], message_epoch, sender_credential, None))
+                    Ok((
+                        vec![],
+                        message_epoch,
+                        sender_credential,
+                        DecryptContentType::Proposal,
+                        Some(*prop),
+                        None,
+                    ))
                 },
-                ProcessedMessageContent::ExternalJoinProposalMessage(ext) => {
-                    crate::debug_log!("[DECRYPT] ExternalJoinProposalMessage received: {:?}", std::any::type_name_of_val(&ext));
-                    Ok((vec![], message_epoch, sender_credential, None))
+                ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                    crate::warn_log!("[DECRYPT] ExternalJoinProposalMessage rejected: explicit authorization is not wired");
+                    Err(MLSError::external_join_proposal_authorization_required())
                 },
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
                     // Task #33: stage the incoming commit instead of auto-merging.
@@ -5838,35 +6330,51 @@ impl MLSContext {
                     );
 
                     // Export current epoch secret now (forward-secrecy window includes pre-merge epoch)
-                    if let Err(e) = crate::async_runtime::block_on(
+                    crate::async_runtime::block_on(
                         epoch_manager.export_current_epoch_secret(group, provider)
-                    ) {
-                        crate::warn_log!("[DECRYPT] ⚠️ Failed to export epoch secret before staging: {:?}", e);
-                    }
+                    )
+                    .map_err(|error| {
+                        crate::error_log!("[DECRYPT] Failed to durably export epoch secret before staging: {:?}", error);
+                        error
+                    })?;
 
                     // Return the staged commit in the 4th tuple slot; the caller (decrypt_message)
                     // will stash it in `pending_incoming_merges` keyed by (group_id, target_epoch).
-                    Ok((vec![], target_epoch, sender_credential, Some(staged)))
+                    Ok((
+                        vec![],
+                        target_epoch,
+                        sender_credential,
+                        DecryptContentType::Commit,
+                        None,
+                        Some(staged),
+                    ))
                 },
             }
         })?;
 
+        let proposal_ref = if let Some(proposal) = queued_proposal_opt {
+            Some(stage_pending_incoming_proposal(
+                &self.pending_incoming_proposals,
+                &group_id,
+                proposal,
+                "DECRYPT",
+            )?)
+        } else {
+            None
+        };
+
         // Task #33: if an incoming StagedCommit was produced, stash it for explicit confirmation.
-        // Overwrites any prior pending entry for the same (group_id, epoch) — OpenMLS produces
-        // deterministic StagedCommits for the same wire message, so overwrite is idempotent.
+        // Preserve the first distinct commit for the epoch; only the same wire
+        // message may be retried idempotently.
         if let Some(staged) = staged_commit_opt {
-            let mut pending = self.pending_incoming_merges.lock().map_err(|_| {
-                crate::error_log!("[DECRYPT] ❌ pending_incoming_merges mutex poisoned");
-                MLSError::ContextNotInitialized
-            })?;
-            let key = (group_id.clone(), epoch);
-            if pending.insert(key, staged).is_some() {
-                crate::warn_log!(
-                    "[DECRYPT] ⚠️ Overwrote existing pending staged commit for group {} epoch {} (duplicate delivery)",
-                    hex::encode(&group_id),
-                    epoch
-                );
-            }
+            stage_pending_incoming_commit(
+                &self.pending_incoming_merges,
+                &group_id,
+                epoch,
+                wire_fingerprint,
+                staged,
+                "DECRYPT",
+            )?;
         }
 
         let total_duration = timestamp.elapsed().unwrap_or_default();
@@ -5916,6 +6424,8 @@ impl MLSContext {
             epoch,
             sequence_number,
             sender_credential,
+            content_type,
+            proposal_ref,
         })
     }
 }
@@ -5951,6 +6461,29 @@ pub fn mls_skip_server_epoch_fence() -> u64 {
 /// in-crate callers.
 pub const SKIP_SERVER_EPOCH_FENCE: u64 = 0;
 
+impl MLSContext {
+    /// Export GroupInfo for a newly-constructed direct staged commit, rolling
+    /// back the OpenMLS pending commit on every export failure. The registry
+    /// nonce is allocated only after this succeeds, so neither failure branch
+    /// can publish a caller-visible handle for an unusable plan.
+    fn export_staged_group_info_or_cleanup(
+        &self,
+        group_id: Vec<u8>,
+        signer_identity_bytes: Vec<u8>,
+    ) -> Result<Vec<u8>, crate::MLSCommitError> {
+        match self.export_group_info(group_id.clone(), signer_identity_bytes) {
+            Ok(group_info) => Ok(group_info),
+            Err(primary_error) => match self.clear_pending_commit(group_id) {
+                Ok(()) => Err(primary_error.into()),
+                Err(cleanup_error) => Err(MLSError::Internal(format!(
+                    "recovery-critical staged GroupInfo export failure ({primary_error}); pending commit cleanup also failed ({cleanup_error})"
+                ))
+                .into()),
+            },
+        }
+    }
+}
+
 #[uniffi::export]
 impl MLSContext {
     /// Stage a commit without sending it to the delivery service or merging
@@ -5966,6 +6499,12 @@ impl MLSContext {
     /// Only one pending commit may exist per group at a time (OpenMLS
     /// constraint). Staging a second commit while one is already pending
     /// returns `MLSError::InvalidInput`.
+    ///
+    /// Add/Swap authority is derived from the exact multiset of bare DID roots
+    /// embedded in the supplied KeyPackage credentials. The direct context has
+    /// no platform credential resolver, so authorized-device-key resolution
+    /// remains the responsibility of the higher-level orchestrator; callers
+    /// that need that policy must use `OrchestratorBridge::stage_commit`.
     pub fn stage_commit(
         &self,
         conversation_id: String,
@@ -5973,6 +6512,21 @@ impl MLSContext {
         signer_identity_bytes: Vec<u8>,
     ) -> Result<crate::orchestrator_bridge::FFICommitPlan, crate::MLSCommitError> {
         use crate::orchestrator_bridge::{FFICommitKind, FFICommitPlan, FFIStagedCommitHandle};
+
+        // Enforce count, per-package, and aggregate byte ceilings before
+        // converting the raw FFI vectors or asking a TLS parser to inspect
+        // attacker-controlled bytes.
+        match &kind {
+            FFICommitKind::AddMembers { key_packages, .. } => {
+                validate_outbound_raw_key_package_batch(key_packages)?;
+            }
+            FFICommitKind::SwapMembers {
+                add_key_packages, ..
+            } => {
+                validate_outbound_raw_key_package_batch(add_key_packages)?;
+            }
+            FFICommitKind::RemoveMembers { .. } | FFICommitKind::UpdateMetadata { .. } => {}
+        }
 
         let group_id_bytes = hex::decode(&conversation_id)
             .map_err(|_| MLSError::invalid_input("Invalid hex group ID"))?;
@@ -5997,13 +6551,18 @@ impl MLSContext {
 
         let (commit_bytes, welcome_bytes) = match kind {
             FFICommitKind::AddMembers {
-                member_dids: _,
+                member_dids,
                 key_packages,
             } => {
                 let kp_data: Vec<KeyPackageData> = key_packages
                     .into_iter()
                     .map(|data| KeyPackageData { data })
                     .collect();
+                crate::orchestrator::credential_binding::enforce_outbound_key_package_did_bindings(
+                    &member_dids,
+                    &kp_data,
+                )
+                .map_err(|error| MLSError::invalid_input(error.to_string()))?;
                 let add_result = self.add_members(group_id_bytes.clone(), kp_data)?;
                 (add_result.commit_data, Some(add_result.welcome_data))
             }
@@ -6017,7 +6576,7 @@ impl MLSContext {
             }
             FFICommitKind::SwapMembers {
                 remove_dids,
-                add_dids: _,
+                add_dids,
                 add_key_packages,
             } => {
                 let remove_ids: Vec<Vec<u8>> =
@@ -6026,6 +6585,10 @@ impl MLSContext {
                     .into_iter()
                     .map(|data| KeyPackageData { data })
                     .collect();
+                crate::orchestrator::credential_binding::enforce_outbound_key_package_did_bindings(
+                    &add_dids, &kp_data,
+                )
+                .map_err(|error| MLSError::invalid_input(error.to_string()))?;
                 let swap_result = self.swap_members(group_id_bytes.clone(), remove_ids, kp_data)?;
                 (swap_result.commit_data, Some(swap_result.welcome_data))
             }
@@ -6041,7 +6604,8 @@ impl MLSContext {
         // Export GroupInfo from the pre-merge group state. OpenMLS will
         // re-export after merge; platforms that batch operations may want
         // to ship this pre-merge blob alongside the commit.
-        let group_info = self.export_group_info(group_id_bytes.clone(), signer_identity_bytes)?;
+        let group_info = self
+            .export_staged_group_info_or_cleanup(group_id_bytes.clone(), signer_identity_bytes)?;
 
         let nonce = self
             .staged_commit_nonce
@@ -6058,6 +6622,7 @@ impl MLSContext {
                     nonce,
                     source_epoch,
                     target_epoch,
+                    merge_started: false,
                 },
             );
 
@@ -6103,43 +6668,32 @@ impl MLSContext {
     ) -> Result<crate::orchestrator_bridge::FFIConfirmedCommit, crate::MLSCommitError> {
         use crate::orchestrator_bridge::FFIConfirmedCommit;
 
-        // Validate and pop the pending entry atomically to prevent a second
-        // `confirm_commit` (or concurrent `discard_pending`) from operating
-        // on the same handle.
-        let meta = {
-            let mut pending = self
-                .pending_outgoing_commits
-                .lock()
-                .map_err(|_| MLSError::ContextNotInitialized)?;
-            match pending.get(&handle.group_id) {
-                Some(existing) if existing.nonce == handle.nonce => {
-                    pending.remove(&handle.group_id).expect("just matched")
-                }
-                Some(_) => {
-                    return Err(MLSError::invalid_input(format!(
-                        "Staged commit handle nonce mismatch for conversation {} (already confirmed or superseded)",
-                        handle.group_id
-                    ))
-                    .into());
-                }
-                None => {
-                    return Err(MLSError::invalid_input(format!(
-                        "No staged commit found for conversation {} (already confirmed or discarded)",
-                        handle.group_id
-                    ))
-                    .into());
-                }
+        // Preserve the exact handle until the epoch fence, merge, and durability
+        // barrier all succeed. Holding the map lock serializes confirm/discard.
+        let mut pending = self
+            .pending_outgoing_commits
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let meta = match pending.get(&handle.group_id) {
+            Some(existing) if existing.nonce == handle.nonce => existing.clone(),
+            Some(_) => {
+                return Err(MLSError::invalid_input(format!(
+                    "Staged commit handle nonce mismatch for conversation {} (already confirmed or superseded)",
+                    handle.group_id
+                ))
+                .into());
+            }
+            None => {
+                return Err(MLSError::invalid_input(format!(
+                    "No staged commit found for conversation {} (already confirmed or discarded)",
+                    handle.group_id
+                ))
+                .into());
             }
         };
 
         // Server epoch fence. Skipped when caller passes the sentinel.
         if server_epoch != SKIP_SERVER_EPOCH_FENCE && server_epoch != meta.target_epoch {
-            // Re-insert so the caller can still `discard_pending` to clean
-            // the OpenMLS-side state.
-            self.pending_outgoing_commits
-                .lock()
-                .map_err(|_| MLSError::ContextNotInitialized)?
-                .insert(handle.group_id.clone(), meta.clone());
             return Err(crate::MLSCommitError::EpochMismatch {
                 local: meta.target_epoch,
                 remote: server_epoch,
@@ -6149,31 +6703,57 @@ impl MLSContext {
         let group_id_bytes = hex::decode(&handle.group_id)
             .map_err(|_| MLSError::invalid_input("Invalid hex group ID"))?;
 
-        // Merge the pending commit. If this fails the local state is behind
-        // the server — clear the stale pending commit so future sends don't
-        // hit OpenMLS's "pending commit exists" assertion, and surface the
-        // error. Platform-layer code owns marking the conversation for
-        // rejoin (the orchestrator does `storage.mark_needs_rejoin(...)`
-        // here; MLSContext has no storage reference).
-        let new_epoch = match self.merge_pending_commit(group_id_bytes.clone()) {
+        let current_before = self.get_epoch(group_id_bytes.clone())?;
+        if current_before == meta.target_epoch && !meta.merge_started {
+            return Err(crate::MLSCommitError::EpochMismatch {
+                local: current_before,
+                remote: meta.source_epoch,
+            });
+        }
+        if current_before != meta.source_epoch && current_before != meta.target_epoch {
+            return Err(crate::MLSCommitError::EpochMismatch {
+                local: current_before,
+                remote: meta.source_epoch,
+            });
+        }
+
+        let merge_result = self.merge_pending_commit_with_epoch_fence(
+            group_id_bytes.clone(),
+            Some(PendingCommitEpochFence {
+                source_epoch: meta.source_epoch,
+                target_epoch: meta.target_epoch,
+                allow_target_retry: meta.merge_started,
+            }),
+        );
+        let new_epoch = match merge_result {
             Ok(result) => result.new_epoch,
-            Err(e) => {
+            Err(error) => {
+                // If this exact source-epoch attempt advanced crypto before the
+                // barrier failed, authorize only a barrier-only retry.
+                if current_before == meta.source_epoch
+                    && self.get_epoch(group_id_bytes).ok() == Some(meta.target_epoch)
+                {
+                    if let Some(entry) = pending.get_mut(&handle.group_id) {
+                        entry.merge_started = true;
+                    }
+                }
                 crate::error_log!(
-                    "[MLS-FFI] confirm_commit: merge_pending_commit failed for conversation={}, target_epoch={}: {:?}",
+                    "[MLS-FFI] confirm_commit: merge/durability failed for conversation={}, target_epoch={}: {:?}; preserving handle",
                     handle.group_id,
                     meta.target_epoch,
-                    e
+                    error
                 );
-                if let Err(clear_err) = self.clear_pending_commit(group_id_bytes) {
-                    crate::warn_log!(
-                        "[MLS-FFI] confirm_commit: failed to clear stale pending commit for conversation={}: {:?}",
-                        handle.group_id,
-                        clear_err
-                    );
-                }
-                return Err(e.into());
+                return Err(crate::MLSCommitError::from(error));
             }
         };
+
+        pending.remove(&handle.group_id).ok_or_else(|| {
+            crate::MLSCommitError::from(MLSError::Internal(format!(
+                "Staged commit handle disappeared after durable confirmation for conversation {}",
+                handle.group_id
+            )))
+        })?;
+        drop(pending);
 
         crate::debug_log!(
             "[MLS-FFI] confirm_commit: conversation_id={}, new_epoch={}",
@@ -6201,51 +6781,56 @@ impl MLSContext {
         &self,
         handle: crate::orchestrator_bridge::FFIStagedCommitHandle,
     ) -> Result<(), crate::MLSCommitError> {
-        let removed = {
-            let mut pending = self
-                .pending_outgoing_commits
-                .lock()
-                .map_err(|_| MLSError::ContextNotInitialized)?;
-            match pending.get(&handle.group_id) {
-                Some(existing) if existing.nonce == handle.nonce => {
-                    pending.remove(&handle.group_id)
-                }
-                Some(_) => {
-                    return Err(MLSError::invalid_input(format!(
-                        "Staged commit handle nonce mismatch for conversation {} (already discarded or confirmed)",
-                        handle.group_id
-                    ))
-                    .into());
-                }
-                None => {
-                    return Err(MLSError::invalid_input(format!(
-                        "No staged commit found for conversation {} (already discarded or confirmed)",
-                        handle.group_id
-                    ))
-                    .into());
-                }
+        // Keep the exact handle registered until OpenMLS confirms its pending
+        // state is cleared. Holding this map lock serializes a concurrent
+        // confirm/discard for the same handle; neither can consume the handle
+        // while crypto cleanup is in flight.
+        let mut pending = self
+            .pending_outgoing_commits
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let meta = match pending.get(&handle.group_id) {
+            Some(existing) if existing.nonce == handle.nonce => existing.clone(),
+            Some(_) => {
+                return Err(MLSError::invalid_input(format!(
+                    "Staged commit handle nonce mismatch for conversation {} (already discarded or confirmed)",
+                    handle.group_id
+                ))
+                .into());
+            }
+            None => {
+                return Err(MLSError::invalid_input(format!(
+                    "No staged commit found for conversation {} (already discarded or confirmed)",
+                    handle.group_id
+                ))
+                .into());
             }
         };
 
-        // Tell MLS to forget the pending commit so future operations can
-        // construct new ones. If hex-decode or the crypto layer fails we
-        // still consider the discard "succeeded" from the caller's
-        // perspective — the handle is gone from the pending map.
-        if let Ok(group_id_bytes) = hex::decode(&handle.group_id) {
-            if let Err(e) = self.clear_pending_commit(group_id_bytes) {
-                crate::warn_log!(
-                    "[MLS-FFI] discard_pending: clear_pending_commit failed for conversation={}: {:?}",
-                    handle.group_id,
-                    e
-                );
-            }
-        }
+        let group_id_bytes = hex::decode(&handle.group_id)
+            .map_err(|_| MLSError::invalid_input("Invalid hex group ID"))?;
+        self.clear_pending_commit(group_id_bytes).map_err(|error| {
+            crate::error_log!(
+                "[MLS-FFI] discard_pending: clear_pending_commit failed for conversation={}: {:?}; preserving handle",
+                handle.group_id,
+                error
+            );
+            crate::MLSCommitError::from(error)
+        })?;
+
+        pending.remove(&handle.group_id).ok_or_else(|| {
+            crate::MLSCommitError::from(MLSError::Internal(format!(
+                "Staged commit handle disappeared after crypto cleanup for conversation {}",
+                handle.group_id
+            )))
+        })?;
+        drop(pending);
 
         crate::debug_log!(
             "[MLS-FFI] discard_pending: conversation_id={}, nonce={}, source_epoch={}",
             handle.group_id,
             handle.nonce,
-            removed.as_ref().map(|m| m.source_epoch).unwrap_or(0)
+            meta.source_epoch
         );
 
         Ok(())
@@ -6327,8 +6912,9 @@ pub fn mls_classify_key_package_binding(
     };
     let claimed_root =
         crate::orchestrator::credential_binding::credential_root_did(&claimed_identity).to_string();
-    let identity_matches =
-        !claimed_root.is_empty() && claimed_root.eq_ignore_ascii_case(&expected_root);
+    // DID method-specific identifiers are case-sensitive unless the method
+    // specification says otherwise. Never normalize a principal boundary.
+    let identity_matches = !claimed_root.is_empty() && claimed_root == expected_root;
 
     let signature_public_key =
         match mls_extract_key_package_signature_public_key(key_package_bytes.clone()) {
@@ -6631,6 +7217,10 @@ impl MlsCryptoContext for MLSContext {
         MLSContext::flush_and_prepare_close(self)
     }
 
+    fn ensure_storage_durable(&self) -> Result<(), MLSError> {
+        MLSContext::flush_storage(self)
+    }
+
     fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
         MLSContext::storage_lifecycle_status(self)
     }
@@ -6707,7 +7297,8 @@ impl MlsCryptoContext for MLSContext {
     }
 
     fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
-        self.merge_pending_commit(group_id).map(|r| r.new_epoch)
+        self.merge_pending_commit_with_epoch_fence(group_id, None)
+            .map(|result| result.new_epoch)
     }
 
     fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
@@ -6781,6 +7372,22 @@ impl MlsCryptoContext for MLSContext {
         self.discard_incoming_commit(group_id, target_epoch)
     }
 
+    fn accept_incoming_proposal(
+        &self,
+        group_id: Vec<u8>,
+        proposal_ref: Vec<u8>,
+    ) -> Result<(), MLSError> {
+        MLSContext::accept_incoming_proposal(self, group_id, proposal_ref)
+    }
+
+    fn discard_incoming_proposal(
+        &self,
+        group_id: Vec<u8>,
+        proposal_ref: Vec<u8>,
+    ) -> Result<(), MLSError> {
+        MLSContext::discard_incoming_proposal(self, group_id, proposal_ref)
+    }
+
     fn create_external_commit(
         &self,
         group_info: Vec<u8>,
@@ -6837,29 +7444,27 @@ impl MlsCryptoContext for MLSContext {
         current_epoch: u64,
         retention_epochs: u64,
     ) -> Result<(), MLSError> {
-        if current_epoch <= retention_epochs {
-            return Ok(());
-        }
         let guard = self
             .inner
             .lock()
             .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        let actual_epoch =
+            inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))?;
+        validate_projected_epoch(actual_epoch, current_epoch)?;
         let epoch_manager = inner.epoch_secret_manager().clone();
         drop(guard);
 
-        if let Err(e) = crate::async_runtime::block_on(epoch_manager.cleanup_old_epochs(
+        if current_epoch <= retention_epochs {
+            return Ok(());
+        }
+        crate::async_runtime::block_on(epoch_manager.cleanup_old_epochs(
             &group_id,
             current_epoch,
             retention_epochs,
-        )) {
-            crate::warn_log!(
-                "[MLS-FFI] cleanup_epoch_secrets: failed for group {}: {:?}",
-                hex::encode(&group_id),
-                e
-            );
-        }
-        Ok(())
+        ))
+        .map(|_| ())
     }
 
     /// Fork resolution via readd -- gated behind fork-resolution feature.
@@ -7223,6 +7828,23 @@ impl MLSContext {
 mod padding_tests {
     use super::*;
 
+    #[test]
+    fn inbound_mls_message_limit_accepts_boundary_without_allocating_it() {
+        assert!(
+            validate_inbound_mls_message_len(MAX_INBOUND_MLS_MESSAGE_BYTES, "ciphertext").is_ok()
+        );
+    }
+
+    #[test]
+    fn inbound_mls_message_limit_rejects_over_boundary_without_allocating_it() {
+        let error =
+            validate_inbound_mls_message_len(MAX_INBOUND_MLS_MESSAGE_BYTES + 1, "ciphertext")
+                .expect_err("an oversized inbound MLS message must fail closed");
+
+        assert!(matches!(error, MLSError::InvalidInput { .. }));
+        assert!(error.to_string().contains("ciphertext length"));
+    }
+
     /// Build a fake MLS ciphertext of the given size starting with wire format byte 0x02.
     /// Real MLS ciphertexts start with a wire format byte in 0x00..=0x04;
     /// strip_padding requires this to recognise the padding envelope.
@@ -7310,5 +7932,30 @@ mod padding_tests {
         let empty: &[u8] = b"";
         let stripped = strip_padding(empty);
         assert_eq!(stripped, empty);
+    }
+}
+
+#[cfg(test)]
+mod epoch_projection_tests {
+    use super::validate_projected_epoch;
+    use crate::error::MLSError;
+
+    #[test]
+    fn epoch_cleanup_requires_exact_durable_projection() {
+        assert!(validate_projected_epoch(8, 8).is_ok());
+        assert!(matches!(
+            validate_projected_epoch(8, 7),
+            Err(MLSError::EpochMismatch {
+                local: 8,
+                remote: 7
+            })
+        ));
+        assert!(matches!(
+            validate_projected_epoch(8, 9),
+            Err(MLSError::EpochMismatch {
+                local: 8,
+                remote: 9
+            })
+        ));
     }
 }

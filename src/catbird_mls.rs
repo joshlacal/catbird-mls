@@ -411,17 +411,11 @@ impl CatbirdMls {
         identity_bytes: Vec<u8>,
         count: u32,
     ) -> Result<Vec<KeyPackageResult>, OrchestratorBridgeError> {
-        let mut results = Vec::with_capacity(count as usize);
-        for _ in 0..count {
-            let kp = self
-                .mls_context
-                .create_key_package(identity_bytes.clone())
-                .map_err(|e| OrchestratorBridgeError::Mls {
-                    message: e.to_string(),
-                })?;
-            results.push(kp);
-        }
-        Ok(results)
+        self.mls_context
+            .create_key_packages(identity_bytes, count)
+            .map_err(|e| OrchestratorBridgeError::Mls {
+                message: e.to_string(),
+            })
     }
 
     /// Check and replenish key packages if below threshold (orchestrator).

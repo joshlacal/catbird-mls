@@ -1,6 +1,6 @@
 use chrono::Utc;
 use sha2::Digest;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::api_client::MLSAPIClient;
 use super::constants;
@@ -11,6 +11,47 @@ use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
+#[derive(Debug, PartialEq, Eq)]
+enum SendSyncCursorProgress {
+    Complete,
+    Continue(String),
+}
+
+/// Bound duplicate-proof reads so an attacker-controlled server ID cannot
+/// force an unbounded conversation-history allocation on the exceptional
+/// replay path. A matching row outside this recent window fails closed.
+const INBOUND_DEDUP_PROOF_LOOKBACK: u32 = 1_024;
+
+/// Validate a delivery-service cursor before following it during the bounded
+/// pre-send commit catch-up loop.
+///
+/// A page may contain only MLS commits, so `fetch_messages` can legitimately
+/// return no displayable messages while still returning a continuation cursor.
+/// The cursor, not the display-message count, is therefore authoritative.
+fn next_send_sync_cursor(
+    current_cursor: Option<&str>,
+    next_cursor: Option<String>,
+    seen_cursors: &mut HashSet<String>,
+) -> Result<SendSyncCursorProgress> {
+    let Some(next_cursor) = next_cursor else {
+        return Ok(SendSyncCursorProgress::Complete);
+    };
+
+    if next_cursor.is_empty() {
+        return Err(OrchestratorError::Api(
+            "delivery service returned an empty cursor during send commit catch-up".to_string(),
+        ));
+    }
+
+    if current_cursor == Some(next_cursor.as_str()) || !seen_cursors.insert(next_cursor.clone()) {
+        return Err(OrchestratorError::Api(
+            "delivery service returned a repeated cursor during send commit catch-up".to_string(),
+        ));
+    }
+
+    Ok(SendSyncCursorProgress::Continue(next_cursor))
+}
+
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -18,6 +59,217 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    /// Prove that a globally indexed server message ID belongs to this stable
+    /// conversation. `message_exists` alone is insufficient because an
+    /// attacker-controlled DS can reuse an ID from another conversation.
+    async fn durable_message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool> {
+        if !self.storage().message_exists(message_id).await? {
+            return Ok(false);
+        }
+        Ok(self
+            .storage()
+            .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
+            .await?
+            .iter()
+            .any(|message| message.id == message_id))
+    }
+
+    async fn catch_up_pending_commits_for_send(
+        &self,
+        conversation_id: &str,
+        phase: &'static str,
+    ) -> Result<()> {
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
+
+        for round in 0..constants::SEND_SYNC_MAX_ROUNDS {
+            let (displayable_messages, next_cursor) = self
+                .fetch_messages(
+                    conversation_id,
+                    cursor.as_deref(),
+                    constants::SEND_SYNC_BATCH_SIZE,
+                    Some("commit"),
+                    None,
+                    None,
+                )
+                .await?;
+
+            tracing::debug!(
+                conversation_id,
+                phase,
+                round,
+                displayable_message_count = displayable_messages.len(),
+                has_next_cursor = next_cursor.is_some(),
+                "Processed bounded send commit catch-up page"
+            );
+
+            match next_send_sync_cursor(cursor.as_deref(), next_cursor, &mut seen_cursors)? {
+                SendSyncCursorProgress::Complete => return Ok(()),
+                SendSyncCursorProgress::Continue(next_cursor) => {
+                    cursor = Some(next_cursor);
+                }
+            }
+        }
+
+        Err(OrchestratorError::Api(format!(
+            "delivery service send commit catch-up exceeded the {}-page safety limit",
+            constants::SEND_SYNC_MAX_ROUNDS
+        )))
+    }
+
+    /// Persist an inbound epoch advance before publishing it to the in-memory
+    /// cache or allowing the caller to return a delivery-service cursor.
+    ///
+    /// The per-conversation transition lock serializes inbound epoch writes in
+    /// this module. The shared cache is deliberately left untouched until the
+    /// storage write succeeds, so a failed durable write cannot masquerade as
+    /// a processed page in the current process.
+    async fn persist_inbound_epoch_advance(
+        &self,
+        resolved: &ResolvedConversationContext,
+        target_epoch: u64,
+    ) -> Result<()> {
+        let transition_lock = self.rejoin_lock(&resolved.conversation_id).await;
+        let _transition_guard = transition_lock.lock().await;
+
+        let state_to_persist = {
+            let states = self.group_states().lock().await;
+            let state = resolved
+                .group_state(&states)
+                .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?;
+            if target_epoch <= state.epoch {
+                None
+            } else {
+                let mut advanced = state.clone();
+                advanced.epoch = target_epoch;
+                Some(advanced)
+            }
+        };
+
+        let Some(state_to_persist) = state_to_persist else {
+            return Ok(());
+        };
+
+        self.storage().set_group_state(&state_to_persist).await?;
+
+        let mut states = self.group_states().lock().await;
+        let state = resolved
+            .group_state_mut(&mut states)
+            .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?;
+        if state_to_persist.epoch > state.epoch {
+            state.epoch = state_to_persist.epoch;
+        }
+        Ok(())
+    }
+
+    /// Reconcile a `WrongEpoch` redelivery against both durable and cached
+    /// epoch projections.
+    ///
+    /// `merge_incoming_commit` may advance the OpenMLS group before its
+    /// storage flush reports failure. On redelivery, decrypt then reports
+    /// `WrongEpoch` even though the matching `GroupState` write never ran. A
+    /// plain duplicate skip would return the delivery-service cursor and make
+    /// that partial transition permanent. When crypto is ahead, retry its
+    /// durability barrier first, then write the durable projection, and only
+    /// then update the cache. Any disagreement that crypto cannot safely
+    /// dominate fails closed for recovery instead of being acknowledged.
+    ///
+    /// Returns the repaired epoch when a projection repair was required, so
+    /// callers can perform post-durability secret cleanup after the transition
+    /// lock is released.
+    async fn reconcile_wrong_epoch_durability(
+        &self,
+        resolved: &ResolvedConversationContext,
+        group_id_bytes: &[u8],
+    ) -> Result<Option<u64>> {
+        let transition_lock = self.rejoin_lock(&resolved.conversation_id).await;
+        let _transition_guard = transition_lock.lock().await;
+
+        let mut observed_epoch = self
+            .mls_context()
+            .get_epoch(group_id_bytes.to_vec())
+            .map_err(OrchestratorError::from)?;
+
+        // Epoch equality alone cannot prove durability: an application message
+        // may already have projected the post-merge epoch after an earlier
+        // crypto flush failed. Run the barrier for every WrongEpoch, and
+        // stabilize across a concurrent crypto advance before publishing any
+        // projection or cursor.
+        let mut durable_crypto_epoch = None;
+        for _ in 0..3 {
+            self.mls_context()
+                .ensure_storage_durable()
+                .map_err(OrchestratorError::from)?;
+            let after_barrier = self
+                .mls_context()
+                .get_epoch(group_id_bytes.to_vec())
+                .map_err(OrchestratorError::from)?;
+            if after_barrier == observed_epoch {
+                durable_crypto_epoch = Some(after_barrier);
+                break;
+            }
+            observed_epoch = after_barrier;
+        }
+        let crypto_epoch = durable_crypto_epoch.ok_or_else(|| {
+            OrchestratorError::RecoveryFailed(format!(
+                "MLS epoch did not stabilize across durability barriers for conversation {}",
+                resolved.conversation_id
+            ))
+        })?;
+
+        let cached_state = {
+            let states = self.group_states().lock().await;
+            resolved
+                .group_state(&states)
+                .cloned()
+                .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?
+        };
+
+        let persisted_state = self
+            .storage()
+            .get_group_state(&resolved.group_id)
+            .await?
+            .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?;
+
+        if persisted_state.group_id != resolved.group_id
+            || persisted_state.conversation_id != resolved.conversation_id
+        {
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "persisted group projection identity mismatch for conversation {}",
+                resolved.conversation_id
+            )));
+        }
+
+        let cached_epoch = cached_state.epoch;
+        let persisted_epoch = persisted_state.epoch;
+        if crypto_epoch == cached_epoch && crypto_epoch == persisted_epoch {
+            return Ok(None);
+        }
+
+        if crypto_epoch < cached_epoch || crypto_epoch < persisted_epoch {
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "MLS epoch projection is ahead of crypto for conversation {} (crypto={}, cached={}, persisted={})",
+                resolved.conversation_id, crypto_epoch, cached_epoch, persisted_epoch
+            )));
+        }
+
+        let mut repaired_state = cached_state;
+        repaired_state.epoch = crypto_epoch;
+        self.storage().set_group_state(&repaired_state).await?;
+
+        let mut states = self.group_states().lock().await;
+        let cached = resolved
+            .group_state_mut(&mut states)
+            .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?;
+        cached.epoch = crypto_epoch;
+
+        Ok(Some(crypto_epoch))
+    }
+
     fn ready_result(
         recovery_state: ConversationRecoveryState,
         epoch: Option<u64>,
@@ -245,7 +497,7 @@ where
                     .await?;
                 let epoch = match self.local_group_epoch_result(convo_id).await {
                     Ok(epoch) => epoch,
-                    Err(err)
+                    Err(_err)
                         if matches!(
                             projected,
                             ConversationRecoveryState::NeedsRejoin
@@ -363,53 +615,14 @@ where
         tracing::info!(
             conversation_id,
             payload_len = payload_bytes.len(),
-            payload_preview = %String::from_utf8_lossy(&payload_bytes[..payload_bytes.len().min(200)]),
             "Encoded MLSMessagePayload for send"
         );
 
         // Pre-send sync: catch up on any missed epoch-advancing commits (spec §5.1 step 1).
         // Fetch pending *commits* (not app messages) to advance the local epoch before
         // encrypting, avoiding 409 epoch mismatches on send.
-        {
-            let mut cursor: Option<String> = None;
-            for round in 0..constants::SEND_SYNC_MAX_ROUNDS {
-                match self
-                    .fetch_messages(
-                        conversation_id,
-                        cursor.as_deref(),
-                        constants::SEND_SYNC_BATCH_SIZE,
-                        Some("commit"),
-                        None,
-                        None,
-                    )
-                    .await
-                {
-                    Ok((msgs, next_cursor)) => {
-                        if !msgs.is_empty() {
-                            tracing::info!(
-                                conversation_id,
-                                round,
-                                count = msgs.len(),
-                                "Pre-send sync processed pending messages"
-                            );
-                        }
-                        if msgs.is_empty() || next_cursor.is_none() {
-                            break;
-                        }
-                        cursor = next_cursor;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            conversation_id,
-                            round,
-                            error = %e,
-                            "Pre-send sync failed, proceeding anyway"
-                        );
-                        break;
-                    }
-                }
-            }
-        }
+        self.catch_up_pending_commits_for_send(conversation_id, "pre_send")
+            .await?;
 
         // Serialize only the final authorization + encryption + delivery attempt
         // against reset transitions. Network catch-up above intentionally runs
@@ -543,66 +756,21 @@ where
                     "Epoch mismatch (409) — attempting Approach B lightweight sync"
                 );
 
-                // Lightweight sync: fetch pending commits to advance local epoch
-                let mut any_processed = false;
-                let mut all_failed = true;
+                // Lightweight sync: fetch pending commits to advance local epoch.
+                // A commit-only page intentionally returns no displayable
+                // messages, so cursor progression is handled independently of
+                // the returned message vector.
+                if let Err(error) = self
+                    .catch_up_pending_commits_for_send(conversation_id, "retry_after_409")
+                    .await
                 {
-                    let mut cursor: Option<String> = None;
-                    for round in 0..constants::SEND_SYNC_MAX_ROUNDS {
-                        match self
-                            .fetch_messages(
-                                conversation_id,
-                                cursor.as_deref(),
-                                constants::SEND_SYNC_BATCH_SIZE,
-                                Some("commit"),
-                                None,
-                                None,
-                            )
-                            .await
-                        {
-                            Ok((msgs, next_cursor)) => {
-                                if !msgs.is_empty() {
-                                    any_processed = true;
-                                    all_failed = false;
-                                    tracing::info!(
-                                        conversation_id,
-                                        round,
-                                        count = msgs.len(),
-                                        "409 recovery: processed pending commits"
-                                    );
-                                } else if !any_processed {
-                                    // Empty batch on first round — nothing to catch up on
-                                    all_failed = false;
-                                }
-                                if msgs.is_empty() || next_cursor.is_none() {
-                                    break;
-                                }
-                                cursor = next_cursor;
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    conversation_id,
-                                    round,
-                                    error = %e,
-                                    "409 recovery: sync round failed"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if all_failed {
-                    // All commit processing failed (WrongEpoch on all) — flag NEEDS_REJOIN
                     tracing::error!(
                         conversation_id,
-                        "409 recovery: all commits failed to process — flagging NEEDS_REJOIN"
+                        error = %error,
+                        "409 recovery: commit catch-up failed — flagging NEEDS_REJOIN"
                     );
                     self.mark_needs_rejoin_critical(conversation_id).await;
-                    return Err(OrchestratorError::EpochMismatch {
-                        local: epoch,
-                        remote,
-                    });
+                    return Err(error);
                 }
 
                 // Re-encrypt with updated epoch and retry ONCE
@@ -751,6 +919,11 @@ where
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
+        crate::message_limits::validate_inbound_mls_message_len(
+            envelope.ciphertext.len(),
+            "orchestrator incoming ciphertext",
+        )?;
+
         // Resolve the stable conversation identity before touching deduplication or
         // self-commit replay state. Input for an unknown conversation must fail
         // closed without consuming state belonging to an authoritative context.
@@ -760,11 +933,43 @@ where
         {
             Ok(resolved) => resolved,
             Err(OrchestratorError::ConversationNotFound(_)) => {
-                tracing::debug!(
+                tracing::warn!(
                     conversation_id = %envelope.conversation_id,
-                    "process_incoming: no authoritative conversation-to-group mapping"
+                    "process_incoming: no authoritative conversation-to-group mapping; refusing cursor advancement"
                 );
-                return Ok(None);
+                return Err(OrchestratorError::NotJoined {
+                    convo_id: envelope.conversation_id.clone(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        // HTTP polling, push delivery, and send catch-up can all present the
+        // same ordered frame concurrently. Serialize by stable conversation
+        // through the final crypto/application durability barrier so one
+        // pipeline cannot puncture an OpenMLS generation while another races
+        // past `message_exists` and acknowledges an unpersisted envelope.
+        // This is deliberately independent from `rejoin_lock`: recovery paths
+        // never acquire this lock, so receive-side transition helpers can keep
+        // their established lock ordering without a self-deadlock.
+        let inbound_lock = self
+            .inbound_processing_lock(&resolved.conversation_id)
+            .await;
+        let _inbound_guard = inbound_lock.lock().await;
+
+        // A reset may have changed the stable-conversation -> group mapping
+        // while this delivery waited for an earlier pipeline. Re-resolve only
+        // after owning the inbound lock; decrypting against the stale group
+        // would consume state outside the authoritative context.
+        let resolved = match self
+            .resolve_conversation_context(&envelope.conversation_id)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(OrchestratorError::ConversationNotFound(_)) => {
+                return Err(OrchestratorError::NotJoined {
+                    convo_id: envelope.conversation_id.clone(),
+                });
             }
             Err(error) => return Err(error),
         };
@@ -772,7 +977,10 @@ where
 
         // Dedup check
         if let Some(ref msg_id) = envelope.server_message_id {
-            if self.storage().message_exists(msg_id).await? {
+            if self
+                .durable_message_exists_in_conversation(&resolved.conversation_id, msg_id)
+                .await?
+            {
                 tracing::debug!(message_id = %msg_id, "Duplicate message, skipping");
                 return Ok(None);
             }
@@ -780,14 +988,75 @@ where
 
         // Check if this is our own commit (self-commit detection)
         let commit_hash = sha2::Sha256::digest(&envelope.ciphertext).to_vec();
-        let is_own_commit = self
-            .own_commits()
-            .lock()
-            .await
-            .remove(&commit_hash)
-            .is_some();
+        let is_own_commit = self.own_commits().lock().await.contains_key(&commit_hash);
 
         if is_own_commit {
+            let expectation = self
+                .own_commit_expectations()
+                .lock()
+                .await
+                .get(&commit_hash)
+                .cloned();
+            if let Some(expectation) = expectation {
+                let identity_matches = expectation.conversation_id == resolved.conversation_id
+                    && expectation.group_id == resolved.group_id;
+                let proof = if identity_matches {
+                    self.mls_context()
+                        .ensure_storage_durable()
+                        .map_err(OrchestratorError::from)
+                        .and_then(|_| {
+                            self.mls_context()
+                                .get_epoch(group_id_bytes.clone())
+                                .map_err(OrchestratorError::from)
+                        })
+                } else {
+                    Err(OrchestratorError::RecoveryFailed(format!(
+                        "self-commit expectation identity mismatch for conversation {}",
+                        resolved.conversation_id
+                    )))
+                };
+
+                let crypto_epoch = match proof {
+                    Ok(epoch) => epoch,
+                    Err(error) => {
+                        self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                            .await;
+                        return Err(error);
+                    }
+                };
+                let durable_state = match self.storage().get_group_state(&resolved.group_id).await {
+                    Ok(Some(state)) => state,
+                    Ok(None) => {
+                        self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                            .await;
+                        return Err(OrchestratorError::RecoveryFailed(format!(
+                            "self-commit echo arrived before durable GroupState for conversation {}",
+                            resolved.conversation_id
+                        )));
+                    }
+                    Err(error) => {
+                        self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                            .await;
+                        return Err(error);
+                    }
+                };
+                if durable_state.conversation_id != expectation.conversation_id
+                    || durable_state.group_id != expectation.group_id
+                    || durable_state.epoch < expectation.target_epoch
+                    || crypto_epoch < expectation.target_epoch
+                {
+                    self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                        .await;
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "self-commit echo arrived before durable confirmation for conversation {} (target epoch {})",
+                        resolved.conversation_id, expectation.target_epoch
+                    )));
+                }
+            }
+
+            // Consume the hash only after any epoch-changing expectation has
+            // been proven against both crypto storage and durable GroupState.
+            self.remove_own_commit_tracking(&commit_hash).await;
             tracing::debug!(
                 conversation_id = %envelope.conversation_id,
                 "Skipping own commit"
@@ -798,54 +1067,140 @@ where
         // Decrypt via MLS FFI.
         //
         // Task #43: `process_incoming` no longer auto-External-Commits when the
-        // group is missing locally. Silently skip such messages — the server will
-        // re-deliver on the next normal sync, or the platform will see the
-        // conversation appear via Welcome/group-reset recovery and re-fetch. This
-        // eliminates the hot-path External Commit spiral.
+        // group is missing locally. Surface NotJoined so the current page
+        // cursor cannot be acknowledged before Welcome/reset recovery makes
+        // the ciphertext processable. This eliminates the hot-path External
+        // Commit spiral without silently skipping ordered server frames.
         let decrypt_result = match self
             .mls_context()
             .decrypt_message(group_id_bytes.clone(), envelope.ciphertext.clone())
         {
             Ok(r) => r,
             Err(crate::MLSError::GroupNotFound { .. }) => {
-                tracing::debug!(
+                tracing::warn!(
                     convo_id = %envelope.conversation_id,
-                    "process_incoming: group not found locally, skipping; platform will pick up via sync",
+                    "process_incoming: group not found locally; refusing cursor advancement until recovery",
                 );
-                return Ok(None);
+                return Err(OrchestratorError::NotJoined {
+                    convo_id: envelope.conversation_id.clone(),
+                });
             }
             Err(e) if e.is_wrong_epoch() => {
-                // WrongEpoch is the NORMAL outcome for:
-                //   - commits from BEFORE our external-commit join (history we never had keys for)
-                //   - replayed/duplicate commits we already applied locally
-                //   - messages from epochs we've already advanced past
-                // None of these indicate a fork or corrupt local state. Counting them as
-                // "decrypt failures" hits DECRYPTION_FAILURE_THRESHOLD (3) on active groups,
-                // which marks the convo for rejoin, which calls `force_rejoin_unlocked` —
-                // that deletes the local group, external-commits to a new epoch, and breaks
-                // every other device's `sendMessage` with 409s. The entire epoch-inflation
-                // spiral starts with this classification. Skip silently.
-                tracing::debug!(
-                    conversation_id = %envelope.conversation_id,
-                    "Skipping message: WrongEpoch (out-of-band epoch, not a fork)"
-                );
-                return Ok(None);
+                // WrongEpoch is normally an old/replayed message, but it can
+                // also be redelivery after OpenMLS mutated the group and its
+                // durability flush failed before GroupState was projected. Do
+                // not acknowledge until crypto, durable projection, and cache
+                // are reconciled in that order.
+                match self
+                    .reconcile_wrong_epoch_durability(&resolved, &group_id_bytes)
+                    .await
+                {
+                    Ok(repaired_epoch) => {
+                        if let Some(repaired_epoch) = repaired_epoch {
+                            tracing::info!(
+                                conversation_id = %envelope.conversation_id,
+                                repaired_epoch,
+                                "Repaired durable epoch projection after WrongEpoch redelivery"
+                            );
+                            self.cleanup_epoch_secrets_if_needed(
+                                &resolved.conversation_id,
+                                &resolved.group_id,
+                                repaired_epoch,
+                            )
+                            .await;
+                        } else {
+                            tracing::debug!(
+                                conversation_id = %envelope.conversation_id,
+                                "Skipping old or replayed message after verifying durable epoch projection"
+                            );
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            conversation_id = %envelope.conversation_id,
+                            "WrongEpoch durability reconciliation failed — refusing cursor advancement"
+                        );
+                        self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                            .await;
+                        return Err(error);
+                    }
+                }
             }
-            Err(e) if e.is_benign_redundant_decrypt() => {
-                // The ciphertext was ALREADY successfully consumed (SecretReuse
-                // from overlapping decrypt pipelines racing past the
-                // `message_exists` dedup before the first run stored the row), or
-                // it is our own message echoed back (CannotDecryptOwnMessage).
-                // Both mean "already handled", NOT a fork. Skip WITHOUT advancing
-                // `decrypt_fail_counts`; otherwise 3 racing re-decrypts trip
-                // DECRYPTION_FAILURE_THRESHOLD → NeedsRejoin (sends blocked,
-                // "Secure session needs repair"). See
-                // MLSError::is_benign_redundant_decrypt.
-                tracing::debug!(
+            Err(e) if e.is_secret_reuse() => {
+                // SecretReuse proves only that the OpenMLS generation was
+                // consumed. It does not prove that the exact DS envelope made
+                // it through application storage: the earlier pipeline may
+                // have failed after decrypt. A durable message row keyed to
+                // this server ID is the only safe duplicate proof available.
+                // Missing proof fails closed without attributing a fork or
+                // advancing rejoin counters.
+                let durable_duplicate = match envelope.server_message_id.as_deref() {
+                    Some(message_id) => {
+                        self.durable_message_exists_in_conversation(
+                            &resolved.conversation_id,
+                            message_id,
+                        )
+                        .await?
+                    }
+                    None => false,
+                };
+                if durable_duplicate {
+                    tracing::debug!(
+                        conversation_id = %envelope.conversation_id,
+                        "Skipping SecretReuse redelivery with durable envelope evidence"
+                    );
+                    return Ok(None);
+                }
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "SecretReuse without durable envelope evidence for conversation {}",
+                    resolved.conversation_id
+                )));
+            }
+            Err(e) if e.is_cannot_decrypt_own_message() => {
+                // CannotDecryptOwnMessage authenticates the sending leaf but
+                // does not prove that this server envelope corresponds to a
+                // locally accepted outbox item. Require durable evidence for
+                // the exact server ID. `remove_pending_message` both proves and
+                // consumes that outbox record; its storage error must withhold
+                // the page cursor.
+                let Some(message_id) = envelope.server_message_id.as_deref() else {
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "CannotDecryptOwnMessage without durable outbox evidence for conversation {}",
+                        resolved.conversation_id
+                    )));
+                };
+                if self
+                    .durable_message_exists_in_conversation(&resolved.conversation_id, message_id)
+                    .await?
+                {
+                    return Ok(None);
+                }
+                if self.storage().remove_pending_message(message_id).await? {
+                    self.pending_messages().lock().await.remove(message_id);
+                    tracing::debug!(
+                        message_id,
+                        conversation_id = %envelope.conversation_id,
+                        "Skipping own-message echo with durable outbox evidence"
+                    );
+                    return Ok(None);
+                }
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "CannotDecryptOwnMessage without durable outbox evidence for conversation {}",
+                    resolved.conversation_id
+                )));
+            }
+            Err(e) if e.is_external_join_proposal_authorization_rejection() => {
+                // This authenticated control frame was deliberately rejected
+                // because no outsider authorization decision is wired. It is
+                // neither a local fork nor crypto corruption: refuse cursor
+                // advancement while leaving recovery counters untouched.
+                tracing::warn!(
                     conversation_id = %envelope.conversation_id,
-                    "Skipping message: already-consumed or own-echo (benign redundant decrypt, not a fork)"
+                    "Rejected unauthorized external-join proposal without attributing local divergence"
                 );
-                return Ok(None);
+                return Err(OrchestratorError::from(e));
             }
             Err(e) => {
                 tracing::error!(
@@ -946,54 +1301,106 @@ where
         let sender_did = String::from_utf8(decrypt_result.sender_credential.identity.clone())
             .unwrap_or_else(|_| envelope.sender_did.clone());
 
-        // WS-3 stage 1 (ADR-009 D4): cross-check the MLS sender credential
-        // against the envelope's claimed sender DID. The envelope is a
-        // routing hint, not proof. Warn-and-allow — processing continues
-        // unchanged on mismatch. Covers application messages AND inbound
-        // commit frames (including External-Commit joiners), since both pass
-        // through this decrypt path before the empty-plaintext branch below.
-        self.verify_inbound_sender_credential(
-            &envelope.conversation_id,
-            &envelope.sender_did,
-            &decrypt_result.sender_credential.identity,
-        )
-        .await;
-
-        let is_own = sender_did.to_lowercase() == user_did.to_lowercase();
-
-        // Check if this is an own message that we already sent
-        if is_own {
-            if let Some(ref msg_id) = envelope.server_message_id {
-                // Fast path: in-memory pending_messages
-                if self.pending_messages().lock().await.remove(msg_id) {
-                    // Also clean up persistent entry
-                    if let Err(e) = self.storage().remove_pending_message(msg_id).await {
-                        tracing::warn!(error = %e, message_id = %msg_id, "Failed to remove persisted pending-message entry");
-                    }
-                    tracing::debug!(
-                        message_id = %msg_id,
-                        "Received own message back from server, skipping (in-memory)"
-                    );
-                    return Ok(None);
-                }
-                // Slow path: persistent storage (survives app restart)
-                if self
-                    .storage()
-                    .remove_pending_message(msg_id)
-                    .await
-                    .unwrap_or(false)
+        // ADR-009 D4: enforce the available DID-root binding between the MLS
+        // sender credential and the envelope's claimed sender DID. The
+        // envelope is a routing hint, not proof. This covers application
+        // messages and inbound commit frames (including External-Commit
+        // joiners), since both pass through this decrypt path before the
+        // empty-plaintext branch below.
+        if let Err(binding_error) = self
+            .verify_inbound_sender_credential(
+                &envelope.conversation_id,
+                &envelope.sender_did,
+                &decrypt_result.sender_credential.identity,
+            )
+            .await
+        {
+            // `decrypt_message` stages incoming commits before returning the
+            // sender credential. A rejected credential must not leave that
+            // staged commit available for a later envelope to merge.
+            if decrypt_result.content_type == crate::DecryptContentType::Commit {
+                if let Err(cleanup_error) = self
+                    .mls_context()
+                    .discard_incoming_commit(group_id_bytes.clone(), decrypt_result.epoch)
                 {
-                    tracing::debug!(
-                        message_id = %msg_id,
-                        "Received own message back from server, skipping (persistent)"
+                    tracing::error!(
+                        error = %cleanup_error,
+                        conversation_id = %envelope.conversation_id,
+                        target_epoch = decrypt_result.epoch,
+                        "Credential rejection cleanup failed for staged incoming commit"
                     );
-                    return Ok(None);
+                    self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                        .await;
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "inbound credential rejected and staged commit cleanup failed: {cleanup_error}"
+                    )));
                 }
             }
+            if decrypt_result.content_type == crate::DecryptContentType::Proposal {
+                let Some(proposal_ref) = decrypt_result.proposal_ref.clone() else {
+                    self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                        .await;
+                    return Err(OrchestratorError::RecoveryFailed(
+                        "rejected MLS proposal omitted its cleanup handle".to_string(),
+                    ));
+                };
+                if let Err(cleanup_error) = self
+                    .mls_context()
+                    .discard_incoming_proposal(group_id_bytes.clone(), proposal_ref)
+                {
+                    self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                        .await;
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "inbound proposal credential rejected and staged proposal cleanup failed: {cleanup_error}"
+                    )));
+                }
+            }
+            return Err(binding_error);
         }
 
-        // Empty plaintext indicates a commit/control message (epoch advance) — not a user message.
-        if decrypt_result.plaintext.is_empty() {
+        // DID method-specific identifiers are case-sensitive.  Compare the
+        // validated root DIDs exactly; ASCII case-folding can alias two
+        // distinct identities and incorrectly classify an attacker's message
+        // as our own echo.
+        let is_own = super::credential_binding::credential_root_did(&sender_did)
+            == super::credential_binding::credential_root_did(&user_did);
+
+        // Proposals are authenticated control frames but do not advance the
+        // epoch. The crypto layer has queued them in OpenMLS storage; require a
+        // durability barrier before allowing the delivery cursor to advance.
+        if matches!(
+            decrypt_result.content_type,
+            crate::DecryptContentType::Proposal | crate::DecryptContentType::ExternalJoinProposal
+        ) {
+            if decrypt_result.content_type == crate::DecryptContentType::ExternalJoinProposal {
+                return Err(OrchestratorError::InvalidInput(
+                    "external join proposals require an explicit authorization path".to_string(),
+                ));
+            }
+            let Some(proposal_ref) = decrypt_result.proposal_ref.clone() else {
+                self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                    .await;
+                return Err(OrchestratorError::RecoveryFailed(
+                    "decrypted MLS proposal omitted its authorization handle".to_string(),
+                ));
+            };
+            self.mls_context()
+                .accept_incoming_proposal(group_id_bytes.clone(), proposal_ref)
+                .map_err(OrchestratorError::from)?;
+            if let Err(error) = self.mls_context().ensure_storage_durable() {
+                self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                    .await;
+                return Err(OrchestratorError::from(error));
+            }
+            tracing::debug!(
+                conversation_id = %envelope.conversation_id,
+                epoch = decrypt_result.epoch,
+                "Durably queued incoming MLS proposal"
+            );
+            return Ok(None);
+        }
+
+        if decrypt_result.content_type == crate::DecryptContentType::Commit {
             tracing::debug!(
                 conversation_id = %envelope.conversation_id,
                 epoch = decrypt_result.epoch,
@@ -1011,7 +1418,7 @@ where
             // Platforms consuming WebSocket push (iOS) already perform the
             // merge themselves; this closes the gap for orchestrator-driven
             // sync (catmos Tauri, catmos-cli, catbird-mls-web, Android).
-            match self
+            let merged_epoch = match self
                 .mls_context()
                 .merge_incoming_commit(group_id_bytes.clone(), decrypt_result.epoch)
             {
@@ -1022,24 +1429,7 @@ where
                         merged_epoch,
                         "Merged incoming staged commit"
                     );
-                    // Layer 3: a healthy peer commit clears the rolling peer-bad
-                    // observation buffer and (if quarantined) auto-exits quarantine.
-                    {
-                        let mut tracker = self.recovery_tracker().lock().await;
-                        tracker.record_healthy_peer_commit(&envelope.conversation_id);
-                    }
-                    if self
-                        .recovery_tracker()
-                        .lock()
-                        .await
-                        .is_quarantined(&envelope.conversation_id)
-                    {
-                        self.exit_quarantine(
-                            &envelope.conversation_id,
-                            crate::orchestrator::types::QuarantineExitReason::PeerCommitSucceeded,
-                        )
-                        .await;
-                    }
+                    merged_epoch
                 }
                 Err(e) => {
                     // Merge failure: the staged commit was popped from
@@ -1064,37 +1454,113 @@ where
                     // warn-and-forget.
                     self.mark_needs_rejoin_critical(&envelope.conversation_id)
                         .await;
-                    // Don't return an error — the commit has been processed
-                    // to the extent we can, and surfacing an error here would
-                    // propagate out of `fetch_messages` and abort downstream
-                    // message processing for messages we CAN still decrypt.
+                    // Fail this page before cached epoch advancement,
+                    // persistence, secret pruning, or cursor return. The DS
+                    // can redeliver after recovery has restored a mergeable
+                    // state; acknowledging this envelope would create a
+                    // durable gap between MLS state and the sync cursor.
+                    return Err(OrchestratorError::from(e));
                 }
+            };
+
+            if merged_epoch != decrypt_result.epoch {
+                let error = OrchestratorError::EpochMismatch {
+                    local: merged_epoch,
+                    remote: decrypt_result.epoch,
+                };
+                tracing::error!(
+                    error = %error,
+                    conversation_id = %envelope.conversation_id,
+                    target_epoch = decrypt_result.epoch,
+                    merged_epoch,
+                    "Incoming commit merged to an unexpected epoch — refusing cursor advancement"
+                );
+                self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                    .await;
+                return Err(error);
             }
 
-            // Still update cached group state epoch
-            {
-                let mut states = self.group_states().lock().await;
-                if let Some(gs) = resolved.group_state_mut(&mut states) {
-                    if decrypt_result.epoch > gs.epoch {
-                        gs.epoch = decrypt_result.epoch;
-                        let state_clone = gs.clone();
-                        drop(states);
-                        if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                            tracing::warn!(
-                                error = %e,
-                                conversation_id = %envelope.conversation_id,
-                                "Failed to persist epoch after commit"
-                            );
-                        }
-                    }
+            if let Err(error) = self.mls_context().ensure_storage_durable() {
+                tracing::error!(
+                    error = %error,
+                    conversation_id = %envelope.conversation_id,
+                    merged_epoch,
+                    "Failed to make merged MLS state durable — refusing cursor advancement"
+                );
+                self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                    .await;
+                return Err(OrchestratorError::from(error));
+            }
+
+            let crypto_epoch = match self.mls_context().get_epoch(group_id_bytes.clone()) {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
+                        conversation_id = %envelope.conversation_id,
+                        "Failed to verify durable MLS epoch — refusing cursor advancement"
+                    );
+                    self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                        .await;
+                    return Err(OrchestratorError::from(error));
                 }
+            };
+            if crypto_epoch != merged_epoch {
+                let error = OrchestratorError::EpochMismatch {
+                    local: crypto_epoch,
+                    remote: merged_epoch,
+                };
+                tracing::error!(
+                    error = %error,
+                    conversation_id = %envelope.conversation_id,
+                    merged_epoch,
+                    crypto_epoch,
+                    "Durable MLS epoch does not match merged epoch — refusing cursor advancement"
+                );
+                self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                    .await;
+                return Err(error);
+            }
+
+            if let Err(error) = self
+                .persist_inbound_epoch_advance(&resolved, crypto_epoch)
+                .await
+            {
+                tracing::error!(
+                    error = %error,
+                    conversation_id = %envelope.conversation_id,
+                    target_epoch = crypto_epoch,
+                    "Failed to durably persist epoch after commit — refusing cursor advancement"
+                );
+                self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                    .await;
+                return Err(error);
+            }
+
+            // Layer 3: only a fully durable peer commit clears the rolling
+            // peer-bad observation buffer or exits quarantine.
+            {
+                let mut tracker = self.recovery_tracker().lock().await;
+                tracker.record_healthy_peer_commit(&envelope.conversation_id);
+            }
+            if self
+                .recovery_tracker()
+                .lock()
+                .await
+                .is_quarantined(&envelope.conversation_id)
+            {
+                self.exit_quarantine(
+                    &envelope.conversation_id,
+                    crate::orchestrator::types::QuarantineExitReason::PeerCommitSucceeded,
+                )
+                .await;
             }
 
             // Cleanup old epoch secrets after commit advances the epoch
             self.cleanup_epoch_secrets_if_needed(
                 &resolved.conversation_id,
                 &resolved.group_id,
-                decrypt_result.epoch,
+                crypto_epoch,
             )
             .await;
 
@@ -1108,6 +1574,58 @@ where
             // peeks at MLS state for plaintext metadata after commit merge.
 
             return Ok(None);
+        }
+
+        debug_assert_eq!(
+            decrypt_result.content_type,
+            crate::DecryptContentType::Application
+        );
+
+        // Application decrypt consumes secret-tree state even when the decoded
+        // payload is non-displayable. Make the crypto state and epoch
+        // projection durable before any own-echo/control early return or page
+        // cursor can escape this serialized receive section.
+        if let Err(error) = self.mls_context().ensure_storage_durable() {
+            tracing::error!(
+                error = %error,
+                conversation_id = %envelope.conversation_id,
+                "Failed to make inbound application crypto state durable — refusing cursor advancement"
+            );
+            self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                .await;
+            return Err(OrchestratorError::from(error));
+        }
+        if let Err(error) = self
+            .persist_inbound_epoch_advance(&resolved, decrypt_result.epoch)
+            .await
+        {
+            tracing::error!(
+                error = %error,
+                conversation_id = %envelope.conversation_id,
+                target_epoch = decrypt_result.epoch,
+                "Failed to durably persist epoch after application message — refusing cursor advancement"
+            );
+            self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                .await;
+            return Err(error);
+        }
+
+        // A successfully decrypted own-device Application may still be an
+        // outbox echo (for example, another local device pipeline). In-memory
+        // pending state is only a hint. Skip only when the exact server ID has
+        // a durable pending record, and propagate a storage failure rather than
+        // acknowledging an unproven echo.
+        if is_own {
+            if let Some(message_id) = envelope.server_message_id.as_deref() {
+                if self.storage().remove_pending_message(message_id).await? {
+                    self.pending_messages().lock().await.remove(message_id);
+                    tracing::debug!(
+                        message_id,
+                        "Received own message back from server with durable outbox evidence"
+                    );
+                    return Ok(None);
+                }
+            }
         }
 
         let (plaintext, payload_json) = match MLSMessagePayload::decode(&decrypt_result.plaintext) {
@@ -1175,7 +1693,6 @@ where
                     tracing::error!(
                         conversation_id = %envelope.conversation_id,
                         plaintext_len = decrypt_result.plaintext.len(),
-                        plaintext_preview = %String::from_utf8_lossy(&decrypt_result.plaintext[..decrypt_result.plaintext.len().min(200)]),
                         "Invalid non-UTF8 MLS message payload"
                     );
                     OrchestratorError::InvalidInput("Invalid message payload".into())
@@ -1211,25 +1728,6 @@ where
             delivery_status: None,
             payload_json,
         };
-
-        // Update group state epoch if it advanced (and persist)
-        {
-            let mut states = self.group_states().lock().await;
-            if let Some(gs) = resolved.group_state_mut(&mut states) {
-                if decrypt_result.epoch > gs.epoch {
-                    gs.epoch = decrypt_result.epoch;
-                    let state_clone = gs.clone();
-                    drop(states);
-                    if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                        tracing::warn!(
-                            error = %e,
-                            conversation_id = %envelope.conversation_id,
-                            "Failed to persist epoch after app message"
-                        );
-                    }
-                }
-            }
-        }
 
         // Store message
         self.storage().store_message(&message).await?;
@@ -1326,12 +1824,13 @@ where
             match self.process_incoming(envelope).await {
                 Ok(Some(msg)) => messages.push(msg),
                 Ok(None) => {} // duplicate or own commit
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
+                Err(error) => {
+                    tracing::error!(
+                        error = %error,
                         conversation_id,
-                        "Failed to process incoming message"
+                        "Failed to process incoming message; refusing page cursor advancement"
                     );
+                    return Err(error);
                 }
             }
         }
@@ -1404,5 +1903,44 @@ where
         }
 
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commit_only_page_follows_continuation_cursor() {
+        let mut seen = HashSet::new();
+        assert_eq!(
+            next_send_sync_cursor(None, Some("page-2".to_string()), &mut seen)
+                .expect("new cursor must be followed"),
+            SendSyncCursorProgress::Continue("page-2".to_string())
+        );
+    }
+
+    #[test]
+    fn send_sync_rejects_immediately_repeated_cursor() {
+        let mut seen = HashSet::from(["page-2".to_string()]);
+        let error = next_send_sync_cursor(Some("page-2"), Some("page-2".to_string()), &mut seen)
+            .expect_err("a stuck delivery-service cursor must fail closed");
+        assert!(error.to_string().contains("repeated cursor"));
+    }
+
+    #[test]
+    fn send_sync_rejects_cursor_cycle() {
+        let mut seen = HashSet::from(["page-2".to_string(), "page-3".to_string()]);
+        let error = next_send_sync_cursor(Some("page-3"), Some("page-2".to_string()), &mut seen)
+            .expect_err("a delivery-service cursor cycle must fail closed");
+        assert!(error.to_string().contains("repeated cursor"));
+    }
+
+    #[test]
+    fn send_sync_rejects_empty_continuation_cursor() {
+        let mut seen = HashSet::new();
+        let error = next_send_sync_cursor(None, Some(String::new()), &mut seen)
+            .expect_err("an empty delivery-service cursor must fail closed");
+        assert!(error.to_string().contains("empty cursor"));
     }
 }

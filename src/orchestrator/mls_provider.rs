@@ -249,6 +249,23 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError>;
 
+    /// Make all MLS storage mutations performed by the current operation
+    /// durable before the orchestrator publishes a matching epoch projection
+    /// or advances a delivery-service cursor.
+    ///
+    /// Incoming commit merge can mutate the in-memory/OpenMLS group before a
+    /// database flush reports failure. A redelivery then observes
+    /// `WrongEpoch`; without an explicit durability retry, treating that as a
+    /// duplicate could acknowledge a commit whose MLS state is not durable.
+    /// Backends must therefore implement this as a real storage durability
+    /// barrier. The fail-closed default prevents an unwired backend from
+    /// silently weakening ordered commit processing.
+    fn ensure_storage_durable(&self) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "MLS storage durability barrier not available on this platform".to_string(),
+        })
+    }
+
     /// Merge an incoming `StagedCommit` that was previously staged by
     /// `decrypt_message` (task #33 receiver-side three-phase commit).
     ///
@@ -280,6 +297,30 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         _target_epoch: u64,
     ) -> Result<(), MLSError> {
         Ok(())
+    }
+
+    /// Publish a previously decrypted standalone proposal into the OpenMLS
+    /// proposal store after application-level sender authorization succeeds.
+    fn accept_incoming_proposal(
+        &self,
+        _group_id: Vec<u8>,
+        _proposal_ref: Vec<u8>,
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "staged incoming proposal acceptance is unavailable".to_string(),
+        })
+    }
+
+    /// Discard a previously decrypted standalone proposal after sender
+    /// authorization fails or the caller abandons processing.
+    fn discard_incoming_proposal(
+        &self,
+        _group_id: Vec<u8>,
+        _proposal_ref: Vec<u8>,
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "staged incoming proposal discard is unavailable".to_string(),
+        })
     }
 
     fn create_external_commit(

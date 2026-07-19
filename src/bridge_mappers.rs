@@ -213,6 +213,22 @@ mod tests {
     }
 
     #[test]
+    fn shared_error_mapper_preserves_server_404_as_typed_server_error() {
+        // Recovery matches typed 404/410 responses to enter first-responder
+        // bootstrap. Flattening this to Api(String) would bypass that path.
+        let mapped = super::bridge_error_to_internal(OrchestratorBridgeError::ServerError {
+            status: 404,
+            body: "{\"error\":\"NotFound\"}".into(),
+        });
+
+        assert!(matches!(
+            mapped,
+            crate::orchestrator::error::OrchestratorError::ServerError { status: 404, body }
+                if body == "{\"error\":\"NotFound\"}"
+        ));
+    }
+
+    #[test]
     fn shared_error_mapper_preserves_specific_bridge_error_variants() {
         use crate::orchestrator::error::OrchestratorError;
 

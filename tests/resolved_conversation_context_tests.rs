@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 mod e2e_harness;
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
 
 use std::sync::Arc;
 
@@ -15,6 +17,122 @@ use e2e_harness::TestWorld;
 use sha2::{Digest, Sha256};
 
 const STABLE_CONVERSATION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_projection_failure_does_not_publish_an_undurable_cache_entry() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+
+    let convo = alice
+        .orchestrator
+        .create_group("sync-persist-first", None, None)
+        .await
+        .expect("create group");
+    alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .remove(&convo.group_id);
+    alice
+        .storage
+        .delete_group_state(&convo.group_id)
+        .await
+        .expect("remove durable projection");
+
+    alice.storage.fail_next_set_group_state();
+    let error = alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect_err("projection failure must fail the sync");
+    assert!(error
+        .to_string()
+        .contains("injected set_group_state failure"));
+    assert!(
+        !alice
+            .orchestrator
+            .group_states()
+            .lock()
+            .await
+            .contains_key(&convo.group_id),
+        "failed durable write must not publish the state to the cache"
+    );
+
+    alice
+        .orchestrator
+        .sync_with_server(true)
+        .await
+        .expect("next sync retries the durable projection");
+    assert!(alice
+        .storage
+        .get_group_state(&convo.group_id)
+        .await
+        .expect("read projection")
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_projection_failure_withholds_cache_cleanup_and_success() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register Alice");
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("metadata-persist-first", None, None)
+        .await
+        .expect("create group");
+
+    let epoch_before = alice
+        .storage
+        .get_group_state(&convo.group_id)
+        .await
+        .expect("read initial state")
+        .expect("initial state")
+        .epoch;
+    alice.storage.fail_next_set_group_state();
+
+    let error = alice
+        .orchestrator
+        .update_group_metadata_encrypted(
+            &convo.conversation_id,
+            Some("new title"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("durable projection failure must withhold metadata success");
+    assert!(error
+        .to_string()
+        .contains("injected set_group_state failure"));
+    assert_eq!(
+        alice
+            .orchestrator
+            .group_states()
+            .lock()
+            .await
+            .get(&convo.group_id)
+            .expect("cached state remains")
+            .epoch,
+        epoch_before,
+        "failed persistence must not publish the merged epoch to the cache"
+    );
+    assert!(
+        alice.storage.has_rejoin_flag(&convo.conversation_id),
+        "post-acceptance projection failure must enter durable recovery"
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_create_rolls_back_the_unmapped_local_mls_group() {
@@ -401,6 +519,65 @@ async fn registered_two_client_world() -> TestWorld {
     world
 }
 
+/// Model the app-side half of a stable conversation-ID migration before the
+/// delivery-service roster starts returning only the replacement ID.
+///
+/// The server-only rekey helper deliberately cannot authorize deletion of the
+/// superseded local row. Production migration must first preserve the durable
+/// history/state under the replacement ID and explicitly retire the old row;
+/// otherwise sync correctly treats the roster omission as suspicious.
+async fn migrate_stable_conversation_id_for_test(
+    client: &e2e_harness::TestClient,
+    old_conversation_id: &str,
+    new_conversation_id: &str,
+) {
+    let old_view = client
+        .storage
+        .get_conversation(&client.did, old_conversation_id)
+        .await
+        .expect("read superseded conversation projection")
+        .expect("superseded conversation projection exists");
+    let old_state = client
+        .storage
+        .get_conversation_state(old_conversation_id)
+        .await
+        .expect("read superseded conversation state")
+        .expect("superseded conversation state exists");
+    let old_messages = client
+        .storage
+        .get_conversation_messages(old_conversation_id);
+
+    client
+        .storage
+        .ensure_conversation_exists(&client.did, new_conversation_id, &old_view.group_id)
+        .await
+        .expect("persist replacement conversation projection");
+    client
+        .storage
+        .set_conversation_state(new_conversation_id, old_state)
+        .await
+        .expect("preserve replacement conversation state");
+    for mut message in old_messages {
+        message.conversation_id = new_conversation_id.to_string();
+        client
+            .storage
+            .store_message(&message)
+            .await
+            .expect("migrate conversation history to replacement ID");
+    }
+    client
+        .storage
+        .delete_conversations(&client.did, &[old_conversation_id])
+        .await
+        .expect("retire superseded conversation projection");
+    client
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .remove(old_conversation_id);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn send_uses_resolved_group_id_but_routes_by_stable_conversation_id() {
     let mut world = TestWorld::new();
@@ -421,6 +598,12 @@ async fn send_uses_resolved_group_id_but_routes_by_stable_conversation_id() {
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)
@@ -474,6 +657,12 @@ async fn authoritative_conversation_mapping_wins_over_stale_legacy_group_state()
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)
@@ -563,9 +752,8 @@ async fn force_rejoin_deletes_locally_present_group_when_server_mapping_has_adva
         .expect("persist stable conversation mapping");
 
     // The server has already advanced its projected mapping to G2. G2 is also
-    // locally materialized, but its group-state cache binding is absent; the
-    // cleanup set must still include it alongside every explicitly C-bound
-    // predecessor.
+    // locally materialized and bound to the stable conversation so the later
+    // target transition must clean it alongside every predecessor.
     let absent_server_group_id = "22".repeat(32);
     let authoritative_group_bytes = hex::decode(&absent_server_group_id).expect("G2 group id");
     world
@@ -596,6 +784,20 @@ async fn force_rejoin_deletes_locally_present_group_when_server_mapping_has_adva
             Some(GroupConfig::default()),
         )
         .expect("materialize authoritative G2 without a cache binding");
+    let authoritative_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(authoritative_group_bytes.clone())
+        .expect("read authoritative G2 epoch");
+    alice.orchestrator.group_states().lock().await.insert(
+        absent_server_group_id.clone(),
+        GroupState {
+            group_id: absent_server_group_id.clone(),
+            conversation_id: STABLE_CONVERSATION_ID.to_string(),
+            epoch: authoritative_epoch,
+            members: vec![alice.did.clone()],
+        },
+    );
     let old_epoch = alice
         .orchestrator
         .mls_context()
@@ -667,6 +869,20 @@ async fn force_rejoin_deletes_locally_present_group_when_server_mapping_has_adva
         .expect("fetch remote target GroupInfo");
     world
         .delivery_service()
+        .set_conversation_group_id_for_test(STABLE_CONVERSATION_ID, &target.group_id);
+    alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .get_mut(STABLE_CONVERSATION_ID)
+        .expect("live stable conversation")
+        .group_id = target.group_id.clone();
+    alice
+        .storage
+        .set_conversation_group_id_for_test(STABLE_CONVERSATION_ID, &target.group_id);
+    world
+        .delivery_service()
         .clone_as(&alice.did)
         .publish_group_info(STABLE_CONVERSATION_ID, &target_group_info)
         .await
@@ -709,6 +925,48 @@ async fn force_rejoin_deletes_locally_present_group_when_server_mapping_has_adva
             .mls_context()
             .group_exists(target_group_bytes),
         "successful force rejoin must preserve the newly joined GroupInfo target"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mismatched_group_info_is_rejected_before_destructive_rejoin_cleanup() {
+    let world = registered_two_client_world().await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+
+    let local = alice
+        .orchestrator
+        .create_group("bound recovery source", None, None)
+        .await
+        .expect("create local conversation");
+    let local_group = hex::decode(&local.group_id).expect("local group id");
+    let unrelated = bob
+        .orchestrator
+        .create_group("unrelated recovery target", None, None)
+        .await
+        .expect("create unrelated group");
+    let unrelated_group_info = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_group_info(&unrelated.conversation_id)
+        .await
+        .expect("fetch unrelated GroupInfo");
+    world
+        .delivery_service()
+        .clone_as(&alice.did)
+        .publish_group_info(&local.conversation_id, &unrelated_group_info)
+        .await
+        .expect("misroute unrelated GroupInfo under local conversation");
+
+    let error = alice
+        .orchestrator
+        .force_rejoin(&local.conversation_id)
+        .await
+        .expect_err("GroupInfo for another group must fail before cleanup");
+    assert!(error.to_string().contains("group binding mismatch"));
+    assert!(
+        alice.orchestrator.mls_context().group_exists(local_group),
+        "binding rejection must preserve the usable predecessor group"
     );
 }
 
@@ -795,14 +1053,11 @@ async fn reset_pending_local_delete_removes_every_materialized_predecessor_and_t
         .mls_context()
         .group_exists(reset_target.clone()));
 
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&conversation_id);
     alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&conversation_id)
         .await
-        .expect("stale conversation cleanup must remain retryable");
+        .expect("explicit leave must clean every lifecycle-bound local group");
 
     for (label, group_id) in [
         ("mapped predecessor", predecessor_group),
@@ -900,24 +1155,30 @@ async fn startup_delete_rediscovers_all_persisted_predecessors_after_intent_cras
         .mark_reset_pending(&conversation_id, &reset_target_id, 9, 1_700_000_000_000)
         .await
         .expect("commit reset authority");
-    // Force the exact reset clear CAS to lose its race after all local MLS
-    // groups were deleted. This preserves the pending intent, reset authority,
-    // durable conversation mapping, and group-state rows at the crash point.
-    // The retry intent must therefore carry the complete cleanup set even
-    // though the reopened MLS manifest no longer enumerates those groups.
+    // Force the exact reset clear CAS to lose its race after the captured MLS
+    // groups and group-state rows were deleted. This preserves the pending
+    // intent, reset authority, and durable conversation mapping at the crash
+    // point. The retry intent must therefore remain complete and idempotent
+    // even though no live projection can rediscover the captured groups.
     alice
         .storage
         .force_next_clear_reset_pending_for_delete_false();
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&conversation_id);
-    alice
+    let deletion_error = alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&conversation_id)
         .await
-        .expect("first local-delete pass remains retryable");
+        .expect_err("explicit leave must surface incomplete lifecycle-bound deletion");
+    assert!(
+        deletion_error
+            .to_string()
+            .contains("durable retry intent retained"),
+        "unexpected incomplete deletion error: {deletion_error}"
+    );
     assert_eq!(alice.storage.pending_local_delete_count(), 1);
-    assert!(alice.storage.has_group_state(&extra_predecessor_id));
+    assert!(
+        !alice.storage.has_group_state(&extra_predecessor_id),
+        "exact group-state cleanup completes before the reset-generation CAS"
+    );
     for group_id in [&mapped_predecessor, &extra_predecessor, &reset_target] {
         assert!(!alice
             .orchestrator
@@ -925,9 +1186,10 @@ async fn startup_delete_rediscovers_all_persisted_predecessors_after_intent_cras
             .group_exists(group_id.clone()));
     }
 
-    // Crash before group-state/conversation cleanup. A fresh process has no
+    // Crash before reset/conversation cleanup. A fresh process has no
     // in-memory group-state cache and the groups are already absent from its
-    // MLS manifest, so only the durable intent can name every stale key.
+    // MLS manifest, so only the durable intent can complete the exact
+    // lifecycle-bound cleanup.
     alice
         .orchestrator
         .mls_context()
@@ -1008,14 +1270,17 @@ async fn pending_local_delete_from_alice_never_replays_in_bob_lifecycle() {
     alice
         .storage
         .force_next_clear_reset_pending_for_delete_false();
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&conversation_id);
-    alice
+    let deletion_error = alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&conversation_id)
         .await
-        .expect("leave Alice delete pending");
+        .expect_err("Alice's explicit incomplete deletion must remain visible to her lifecycle");
+    assert!(
+        deletion_error
+            .to_string()
+            .contains("durable retry intent retained"),
+        "unexpected incomplete deletion error: {deletion_error}"
+    );
     assert_eq!(alice.storage.pending_local_delete_count(), 1);
 
     struct NoopKeychain;
@@ -1039,6 +1304,7 @@ async fn pending_local_delete_from_alice_never_replays_in_bob_lifecycle() {
         Box::new(NoopKeychain),
     )
     .expect("Bob MLS context");
+    epoch_secret_test_support::install(&bob_context);
     bob_context
         .create_group_with_id(
             b"did:plc:bob".to_vec(),
@@ -1112,6 +1378,7 @@ async fn unbound_legacy_delete_preserves_bob_with_same_conversation_id() {
         Box::new(BobKeychain),
     )
     .expect("Bob MLS context");
+    epoch_secret_test_support::install(&bob_context);
     bob_context
         .create_group_with_id(
             bob_did.as_bytes().to_vec(),
@@ -1769,6 +2036,12 @@ async fn leave_via_self_remove_uses_active_group_for_rotated_stable_conversation
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)
@@ -1820,6 +2093,18 @@ async fn commit_self_remove_proposals_uses_active_group_for_rotated_stable_conve
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
+    migrate_stable_conversation_id_for_test(
+        bob,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)
@@ -1869,6 +2154,245 @@ async fn commit_self_remove_proposals_uses_active_group_for_rotated_stable_conve
         .expect("active group-keyed cache state");
     assert_eq!(cached.conversation_id, STABLE_CONVERSATION_ID);
     assert_eq!(cached.epoch, current_epoch);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_proposal_commit_merges_only_after_server_acceptance() {
+    let world = registered_two_client_world().await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    world
+        .delivery_service()
+        .set_next_create_conversation_id(STABLE_CONVERSATION_ID);
+    let conversation = alice
+        .orchestrator
+        .create_group(
+            "pending proposal acceptance fence",
+            Some(std::slice::from_ref(&bob.did)),
+            None,
+        )
+        .await
+        .expect("create group");
+    let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
+    let welcome = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_welcome(&conversation.conversation_id)
+        .await
+        .expect("Bob Welcome");
+    bob.orchestrator
+        .join_group(&welcome)
+        .await
+        .expect("Bob joins");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())
+            .expect("Alice pre-proposal epoch"),
+        bob.orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())
+            .expect("Bob pre-proposal epoch"),
+        "proposal sender and receiver must be at the same epoch"
+    );
+    let proposal = bob
+        .orchestrator
+        .mls_context()
+        .propose_self_remove(group_id_bytes.clone())
+        .expect("Bob self-remove proposal");
+    alice
+        .orchestrator
+        .process_incoming_message(&IncomingEnvelope {
+            conversation_id: STABLE_CONVERSATION_ID.to_string(),
+            sender_did: bob.did.clone(),
+            ciphertext: proposal,
+            timestamp: Utc::now(),
+            server_message_id: Some("pending-proposal-acceptance-fence".to_string()),
+            server_epoch: None,
+        })
+        .await
+        .expect("Alice authorizes and queues the proposal");
+    assert!(
+        !alice
+            .orchestrator
+            .mls_context()
+            .list_pending_proposals(group_id_bytes.clone())
+            .expect("list accepted proposals")
+            .is_empty(),
+        "authorized proposal must enter the exact OpenMLS group proposal store"
+    );
+
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id_bytes.clone())
+        .expect("source epoch");
+    world.delivery_service().fail_next_commit_group_change();
+    let error = alice
+        .orchestrator
+        .commit_self_remove_proposals(STABLE_CONVERSATION_ID)
+        .await
+        .expect_err("DS rejection must reject local confirmation");
+    assert!(error
+        .to_string()
+        .contains("injected commit_group_change failure"));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())
+            .expect("epoch after rejection"),
+        epoch_before,
+        "server rejection must not advance the local epoch"
+    );
+
+    alice
+        .orchestrator
+        .commit_self_remove_proposals(STABLE_CONVERSATION_ID)
+        .await
+        .expect("proposal remains retryable after pending-commit cleanup");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes)
+            .expect("epoch after acceptance"),
+        epoch_before + 1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_application_message_is_not_treated_as_an_epoch_commit() {
+    let world = registered_two_client_world().await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    world
+        .delivery_service()
+        .set_next_create_conversation_id(STABLE_CONVERSATION_ID);
+    let conversation = alice
+        .orchestrator
+        .create_group(
+            "empty application discriminator",
+            Some(std::slice::from_ref(&bob.did)),
+            None,
+        )
+        .await
+        .expect("create group");
+    let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
+    let welcome = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_welcome(&conversation.conversation_id)
+        .await
+        .expect("Bob Welcome");
+    bob.orchestrator
+        .join_group(&welcome)
+        .await
+        .expect("Bob joins");
+
+    let epoch_before = bob
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id_bytes.clone())
+        .expect("Bob source epoch");
+    let ciphertext = alice
+        .orchestrator
+        .mls_context()
+        .encrypt_message(group_id_bytes.clone(), Vec::new())
+        .expect("encrypt empty application message")
+        .ciphertext;
+    let result = bob
+        .orchestrator
+        .process_incoming_message(&IncomingEnvelope {
+            conversation_id: STABLE_CONVERSATION_ID.to_string(),
+            sender_did: alice.did.clone(),
+            ciphertext,
+            timestamp: Utc::now(),
+            server_message_id: Some("empty-application-discriminator".to_string()),
+            server_epoch: Some(epoch_before),
+        })
+        .await
+        .expect("empty application message must decrypt without commit processing");
+    assert!(
+        result.message.is_none(),
+        "the legacy presentation layer may ignore empty application text"
+    );
+    assert_eq!(
+        bob.orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes)
+            .expect("Bob epoch after empty application message"),
+        epoch_before,
+        "empty application content must not enter commit merge processing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sender_binding_rejection_discards_staged_proposal_before_commit() {
+    let world = registered_two_client_world().await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    world
+        .delivery_service()
+        .set_next_create_conversation_id(STABLE_CONVERSATION_ID);
+    let conversation = alice
+        .orchestrator
+        .create_group(
+            "proposal sender binding",
+            Some(std::slice::from_ref(&bob.did)),
+            None,
+        )
+        .await
+        .expect("create group");
+    let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
+    let welcome = world
+        .delivery_service()
+        .clone_as(&bob.did)
+        .get_welcome(&conversation.conversation_id)
+        .await
+        .expect("Bob Welcome");
+    bob.orchestrator
+        .join_group(&welcome)
+        .await
+        .expect("Bob joins");
+
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id_bytes.clone())
+        .expect("source epoch");
+    let proposal = bob
+        .orchestrator
+        .mls_context()
+        .propose_self_remove(group_id_bytes.clone())
+        .expect("Bob self-remove proposal");
+    alice
+        .orchestrator
+        .process_incoming_message(&IncomingEnvelope {
+            conversation_id: STABLE_CONVERSATION_ID.to_string(),
+            sender_did: "did:plc:mallory".to_string(),
+            ciphertext: proposal,
+            timestamp: Utc::now(),
+            server_message_id: Some("proposal-spoofed-envelope".to_string()),
+            server_epoch: None,
+        })
+        .await
+        .expect_err("envelope/credential mismatch must reject the proposal");
+
+    alice
+        .orchestrator
+        .commit_self_remove_proposals(STABLE_CONVERSATION_ID)
+        .await
+        .expect("rejected proposal must not remain in the OpenMLS proposal store");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes)
+            .expect("epoch after rejected proposal"),
+        epoch_before
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1939,6 +2463,12 @@ async fn staged_confirm_normalizes_exact_legacy_state_to_active_group_key() {
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)
@@ -1984,19 +2514,12 @@ async fn readiness_uses_authoritative_mapping_instead_of_stale_group_state_scan(
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
-    // The server-only rekey helper does not migrate the app projection. Model
-    // that production migration explicitly so this test isolates resolved
-    // group mapping rather than a genuinely durable Initializing state.
-    alice
-        .storage
-        .ensure_conversation_exists(&alice.did, STABLE_CONVERSATION_ID, &group_id)
-        .await
-        .expect("migrate stable conversation storage row");
-    alice
-        .storage
-        .set_conversation_state(STABLE_CONVERSATION_ID, ConversationState::Active)
-        .await
-        .expect("persist migrated stable conversation as Active");
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)
@@ -2055,6 +2578,18 @@ async fn receive_uses_resolved_group_id_but_stores_under_stable_conversation_id(
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
+    migrate_stable_conversation_id_for_test(
+        bob,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)
@@ -2169,7 +2704,7 @@ async fn unknown_conversation_fails_closed_before_consuming_own_commit_state() {
         .await
         .insert(commit_hash.clone(), web_time::Instant::now());
 
-    let result = alice
+    let error = alice
         .orchestrator
         .process_incoming_message(&IncomingEnvelope {
             conversation_id: STABLE_CONVERSATION_ID.to_string(),
@@ -2180,9 +2715,13 @@ async fn unknown_conversation_fails_closed_before_consuming_own_commit_state() {
             server_epoch: None,
         })
         .await
-        .expect("unknown conversation is ignored");
+        .expect_err("unknown conversation must fail closed");
 
-    assert!(result.message.is_none());
+    assert!(matches!(
+        error,
+        catbird_mls::orchestrator::error::OrchestratorError::NotJoined { ref convo_id }
+            if convo_id == STABLE_CONVERSATION_ID
+    ));
     assert!(
         alice
             .orchestrator
@@ -2209,6 +2748,12 @@ async fn epoch_cleanup_keeps_crypto_group_and_storage_conversation_id_separate()
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)
@@ -2267,6 +2812,12 @@ async fn swap_members_uses_resolved_group_after_server_accepts_stable_conversati
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
+    migrate_stable_conversation_id_for_test(
+        alice,
+        &conversation.conversation_id,
+        STABLE_CONVERSATION_ID,
+    )
+    .await;
     alice
         .orchestrator
         .sync_with_server(false)

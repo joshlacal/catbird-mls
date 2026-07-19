@@ -1,6 +1,8 @@
 use std::str::Utf8Error;
 use thiserror::Error;
 
+const EXTERNAL_JOIN_PROPOSAL_AUTHORIZATION_OPERATION: &str = "external_join_proposal";
+
 /// P2: Comprehensive error enum with detailed variants for better debugging
 #[derive(Error, Debug)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Error))]
@@ -216,6 +218,26 @@ impl MLSError {
         }
     }
 
+    /// A valid MLS ExternalJoinProposal was rejected because the application
+    /// has not supplied an authorization decision for the outsider. This is a
+    /// fail-closed policy result, not evidence that local crypto state forked.
+    pub fn external_join_proposal_authorization_required() -> Self {
+        Self::InsufficientPermissions {
+            operation: EXTERNAL_JOIN_PROPOSAL_AUTHORIZATION_OPERATION.to_string(),
+        }
+    }
+
+    /// Distinguish the deterministic ExternalJoinProposal policy rejection
+    /// from unrelated permission and unsupported-operation errors. Recovery
+    /// classifiers must not count this rejection as local MLS divergence.
+    pub fn is_external_join_proposal_authorization_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::InsufficientPermissions { operation }
+                if operation == EXTERNAL_JOIN_PROPOSAL_AUTHORIZATION_OPERATION
+        )
+    }
+
     /// Whether this error is an OpenMLS `ValidationError(WrongEpoch)` — i.e. the
     /// ciphertext belongs to an MLS epoch we cannot decrypt (typically a commit
     /// from before our external-commit join, a stale replay, or a message from
@@ -231,29 +253,25 @@ impl MLSError {
         }
     }
 
-    /// Whether this decrypt error means the ciphertext was ALREADY successfully
-    /// consumed, or is our own outbound message we can never decrypt — i.e. a
-    /// benign redundancy, NOT a fork or corruption signal.
-    ///
-    /// - `SecretReuseError`: OpenMLS punctures each per-message secret-tree leaf
-    ///   on successful decrypt (forward secrecy). A *second* decrypt of the SAME
-    ///   ciphertext fails with SecretReuse. In practice this happens when
-    ///   overlapping fetch / SSE / periodic-sync / catch-up pipelines race past
-    ///   the `message_exists` dedup before the first run has stored the row, so
-    ///   two threads decrypt the same message and the loser hits the punctured
-    ///   leaf. It literally proves we already decrypted the message.
-    /// - `CannotDecryptOwnMessage`: our own application message echoed back by
-    ///   the delivery service; we hold only the encryption side and never the
-    ///   matching ratchet to read it back.
-    ///
-    /// Both are normal. Counting them as "decrypt failures" hits
-    /// `DECRYPTION_FAILURE_THRESHOLD` (3) on active groups, which flips the
-    /// conversation to `NeedsRejoin` (sends blocked + the "Secure session needs
-    /// repair" banner) and historically drove `force_rejoin` epoch-inflation
-    /// spirals. They MUST be skipped silently, exactly like [`Self::is_wrong_epoch`].
-    pub fn is_benign_redundant_decrypt(&self) -> bool {
-        let matches =
-            |msg: &str| msg.contains("SecretReuse") || msg.contains("CannotDecryptOwnMessage");
+    /// Whether OpenMLS rejected a decrypt because the generation secret was
+    /// already punctured. This is not, by itself, proof that the corresponding
+    /// delivery-service envelope reached durable application storage: an
+    /// overlapping pipeline may have consumed the secret and then failed its
+    /// final storage write.
+    pub fn is_secret_reuse(&self) -> bool {
+        let matches = |msg: &str| msg.contains("SecretReuse");
+        match self {
+            Self::OpenMLS(msg) => matches(msg),
+            Self::CommitProcessingFailed { message } => matches(message),
+            _ => false,
+        }
+    }
+
+    /// Whether OpenMLS rejected an outbound ciphertext echoed back to its own
+    /// sending leaf. Callers may treat this as handled only after proving a
+    /// durable outbox or message record for the exact server message ID.
+    pub fn is_cannot_decrypt_own_message(&self) -> bool {
+        let matches = |msg: &str| msg.contains("CannotDecryptOwnMessage");
         match self {
             Self::OpenMLS(msg) => matches(msg),
             Self::CommitProcessingFailed { message } => matches(message),
@@ -322,26 +340,41 @@ mod decrypt_class_tests {
     const WRONG_EPOCH: &str = "process_message failed: ValidationError(WrongEpoch)";
 
     #[test]
-    fn secret_reuse_and_own_message_are_benign() {
-        assert!(MLSError::OpenMLS(SECRET_REUSE.into()).is_benign_redundant_decrypt());
-        assert!(MLSError::OpenMLS(OWN_MESSAGE.into()).is_benign_redundant_decrypt());
+    fn secret_reuse_and_own_message_have_distinct_classifiers() {
+        assert!(MLSError::OpenMLS(SECRET_REUSE.into()).is_secret_reuse());
+        assert!(!MLSError::OpenMLS(SECRET_REUSE.into()).is_cannot_decrypt_own_message());
+        assert!(MLSError::OpenMLS(OWN_MESSAGE.into()).is_cannot_decrypt_own_message());
+        assert!(!MLSError::OpenMLS(OWN_MESSAGE.into()).is_secret_reuse());
         assert!(MLSError::CommitProcessingFailed {
             message: SECRET_REUSE.into(),
         }
-        .is_benign_redundant_decrypt());
+        .is_secret_reuse());
     }
 
     #[test]
     fn wrong_epoch_and_real_failures_are_not_benign() {
         // WrongEpoch has its own silent-skip arm — it must NOT also be
         // claimed by the benign-redundant classifier (different semantics).
-        assert!(!MLSError::OpenMLS(WRONG_EPOCH.into()).is_benign_redundant_decrypt());
+        assert!(!MLSError::OpenMLS(WRONG_EPOCH.into()).is_secret_reuse());
+        assert!(!MLSError::OpenMLS(WRONG_EPOCH.into()).is_cannot_decrypt_own_message());
         assert!(MLSError::OpenMLS(WRONG_EPOCH.into()).is_wrong_epoch());
         // A genuine decrypt failure must still count toward rejoin.
         assert!(!MLSError::OpenMLS(
             "process_message failed: ValidationError(UnableToDecrypt(AeadError))".into()
         )
-        .is_benign_redundant_decrypt());
-        assert!(!MLSError::InvalidCommit.is_benign_redundant_decrypt());
+        .is_secret_reuse());
+        assert!(!MLSError::InvalidCommit.is_secret_reuse());
+    }
+
+    #[test]
+    fn external_join_policy_rejection_has_a_narrow_typed_classifier() {
+        assert!(MLSError::external_join_proposal_authorization_required()
+            .is_external_join_proposal_authorization_rejection());
+        assert!(!MLSError::insufficient_permissions("remove_member")
+            .is_external_join_proposal_authorization_rejection());
+        assert!(!MLSError::OperationNotSupported {
+            reason: "unrelated backend capability".to_string(),
+        }
+        .is_external_join_proposal_authorization_rejection());
     }
 }

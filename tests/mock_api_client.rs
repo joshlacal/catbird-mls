@@ -67,10 +67,14 @@ struct FailureFlags {
     fail_next_publish_key_package: bool,
     fail_next_register_device: bool,
     fail_next_get_conversations: bool,
+    fail_next_commit_group_change: bool,
     /// When > 0, fail the next N get_conversations calls.
     fail_get_conversations_count: u32,
     /// When true, next add_members returns success=false (server rejection).
     reject_next_add_members: bool,
+    /// When true, next add_members reports success with a stale zero epoch
+    /// without applying the commit. Models a stale/idempotent DS ACK.
+    no_advance_next_add_members: bool,
 }
 
 #[derive(Debug, Default)]
@@ -328,6 +332,14 @@ impl MockDeliveryService {
             .fail_next_get_conversations = true;
     }
 
+    pub fn fail_next_commit_group_change(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .fail_next_commit_group_change = true;
+    }
+
     /// Make the next `n` get_conversations calls fail.
     pub fn fail_get_conversations_n_times(&self, n: u32) {
         self.state
@@ -340,6 +352,30 @@ impl MockDeliveryService {
     /// Make the next add_members call return success=false (server rejection).
     pub fn reject_next_add_members(&self) {
         self.state.lock().unwrap().failures.reject_next_add_members = true;
+    }
+
+    /// Make the next add_members call return success=true without advancing
+    /// the server epoch or changing its roster.
+    pub fn no_advance_next_add_members(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .no_advance_next_add_members = true;
+    }
+
+    /// Force deterministic conversation ordering in pagination tests.
+    pub fn set_conversation_created_at_for_test(
+        &self,
+        convo_id: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) {
+        let mut guard = self.state.lock().unwrap();
+        let conversation = guard
+            .conversations
+            .get_mut(convo_id)
+            .unwrap_or_else(|| panic!("conversation {convo_id} not found"));
+        conversation.view.created_at = Some(created_at);
     }
 
     /// Test helper: change the stable conversation ID while preserving the
@@ -774,7 +810,10 @@ impl MLSAPIClient for MockDeliveryService {
         let view = ConversationView {
             group_id: group_id.to_string(),
             conversation_id: conversation_id.clone(),
-            epoch: 1,
+            // A fresh creator-only MLS group is epoch 0. createConvo reaches
+            // epoch 1 only when it atomically accepts the optional bootstrap
+            // Add commit supplied below.
+            epoch: u64::from(commit_data.is_some()),
             members: member_views,
             metadata: metadata.cloned(),
             created_at: Some(now),
@@ -895,13 +934,28 @@ impl MLSAPIClient for MockDeliveryService {
         action: &str,
         _confirmation_tag: Option<&str>,
     ) -> Result<()> {
-        *self
-            .state
-            .lock()
-            .unwrap()
+        let mut guard = self.state.lock().unwrap();
+        check_fail(
+            &mut guard.failures.fail_next_commit_group_change,
+            "injected commit_group_change failure",
+        )?;
+        *guard
             .commit_group_change_counts
             .entry((convo_id.to_string(), action.to_string()))
             .or_default() += 1;
+        Ok(())
+    }
+
+    async fn put_group_metadata_blob(
+        &self,
+        _convo_id: &str,
+        _group_id_hex: &str,
+        _blob_locator: &str,
+        _ciphertext: &[u8],
+        _kind: &str,
+        _metadata_version: u64,
+        _reset_generation: Option<i32>,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -928,6 +982,19 @@ impl MLSAPIClient for MockDeliveryService {
             return Ok(AddMembersServerResult {
                 success: false,
                 new_epoch: convo.view.epoch,
+                receipt: None,
+            });
+        }
+
+        if guard.failures.no_advance_next_add_members {
+            guard.failures.no_advance_next_add_members = false;
+            guard
+                .conversations
+                .get(convo_id)
+                .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))?;
+            return Ok(AddMembersServerResult {
+                success: true,
+                new_epoch: 0,
                 receipt: None,
             });
         }

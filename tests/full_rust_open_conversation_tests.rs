@@ -240,7 +240,7 @@ async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stale_needs_rejoin_on_healthy_group_returns_active_without_recovery_io() {
+async fn stale_needs_rejoin_on_healthy_local_group_clears_without_recovery_io() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     let _did = world.register_device("Alice").await.unwrap();
@@ -266,7 +266,7 @@ async fn stale_needs_rejoin_on_healthy_group_returns_active_without_recovery_io(
         .orchestrator
         .ensure_conversation_ready(&convo.conversation_id)
         .await
-        .expect("healthy local group should clear stale needs-rejoin state");
+        .expect("stale needs_rejoin on a healthy local group should clear");
 
     assert_eq!(
         result,

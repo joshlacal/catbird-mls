@@ -58,13 +58,11 @@ pub trait CredentialStore: CredentialStoreBounds {
     ///
     /// The default implementation is the **stage-1 structural check**: the
     /// credential's DID root must equal the expected DID (fragment-aware).
-    /// Platforms override this to add the second half of the ADR-009 proof —
-    /// resolving the root DID's ATProto repo and matching the leaf signature
-    /// key against an active `blue.catbird.mlsChat.device` record, with D6
-    /// caching/revocation semantics. Overrides should return
-    /// `CredentialVerification` outcomes, reserving `Err` for verifier
-    /// infrastructure failures (network/storage), which callers treat as
-    /// warn-only in the warn-and-allow rollout stage.
+    /// The orchestrator separately enforces the second half of the ADR-009
+    /// proof by resolving the leaf signature key through
+    /// `get_authorized_device_keys`. Overrides may add platform-specific
+    /// identity policy here. `Err` is reserved for verifier infrastructure
+    /// failures and is propagated fail-closed before MLS state changes.
     async fn verify_member_credential(
         &self,
         expected_did: &str,
@@ -79,20 +77,17 @@ pub trait CredentialStore: CredentialStoreBounds {
     /// signing key published as an authorized device key).
     ///
     /// Return values:
-    /// - `Ok(None)` — **default**: this platform provides no DID-resolution
-    ///   surface. The orchestrator logs at debug level and skips the
-    ///   device-key half of the check; the structural DID-root check from
-    ///   stage 1 still runs. The orchestrator itself has no DID-document /
-    ///   ATProto-repo access (`MLSAPIClient` only reaches the DS), so this
-    ///   stays `None` until the platform wires its ATProto client in.
+    /// - `Ok(None)` — this platform provides no DID-resolution surface. This
+    ///   is a configuration error for any operation that consumes a remote
+    ///   KeyPackage; the orchestrator rejects before state changes.
     /// - `Ok(Some(keys))` — resolution succeeded; `keys` are the raw signing
     ///   public keys authorized for `root_did` (per ADR-009 D1: active
     ///   `blue.catbird.mlsChat.device` records in the DID's ATProto repo,
     ///   or equivalently the DID document's `#atproto_mls` verification
     ///   method key). An EMPTY vec means "resolved, zero authorized keys" —
-    ///   every presented key then fails the (warn-only) check.
+    ///   every presented key then fails the enforced check.
     /// - `Err(_)` — verifier infrastructure failure (network/storage).
-    ///   Warn-only in the ADR-009 D5 rollout stage; never blocks.
+    ///   The orchestrator fails closed and the next operation may retry.
     ///
     /// Implementations do NOT need their own cache: the orchestrator caches
     /// results per root DID for `constants::DEVICE_KEY_CACHE_TTL` (ADR-009

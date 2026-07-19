@@ -1,4 +1,4 @@
-//! WS-3 stage 1: credential binding checks (ADR-009, warn-and-allow).
+//! Credential binding enforcement (ADR-009).
 //!
 //! Binds MLS leaf credentials to ATProto DIDs at the two trust boundaries
 //! that previously had none:
@@ -15,16 +15,13 @@
 //! (ADR-009 D8 / backlog invariant E3) into the receipt-storage chokepoint
 //! used by the External-Commit recovery path and member-change commits.
 //!
-//! ## Rollout mode (ADR-009 D5)
+//! ## Enforcement mode (ADR-009 D5)
 //!
-//! Stage 1 is hard-wired **warn-and-allow**: every check logs a structured
-//! warning through the platform logging facility (`error_log!` → `MLSLogger`,
-//! so Android/iOS/catmos all see it) and escalates through
-//! `OrchestratorEventObserver`, then continues exactly as before. The later
-//! enforce flip is an ADR-gated change confined to the `emit_*` chokepoints
-//! in this file — callers already receive the structured outcome, so flipping
-//! to enforcement means returning an error from the chokepoint instead of
-//! logging, not rewriting call sites.
+//! Every failed check is logged through the platform logging facility and
+//! escalated through `OrchestratorEventObserver`, then returned as an error.
+//! Delivery-service labels are never treated as credential authority, and an
+//! unavailable authorized-device resolver is a hard failure rather than a
+//! structural-only compatibility mode.
 //!
 //! ## Verification depth (stage 1 vs stage 2)
 //!
@@ -35,18 +32,19 @@
 //! Stage 2 adds the **device-key** half on the fetch path: the leaf signature
 //! public key must be an authorized MLS device key for the credential's root
 //! DID (ADR-009 D1 part 2). The orchestrator has no DID-resolution surface of
-//! its own (`MLSAPIClient` only reaches the DS), so resolution is the optional
-//! `CredentialStore::get_authorized_device_keys` capability — default
-//! "unsupported" (skip with debug log) until a platform wires its ATProto
-//! client in. Results are cached per root DID for
+//! its own (`MLSAPIClient` only reaches the DS), so platforms must implement
+//! `CredentialStore::get_authorized_device_keys`; the default unsupported
+//! result fails closed. Results are cached per root DID for
 //! `constants::DEVICE_KEY_CACHE_TTL` (ADR-009 D6); positive, negative, and
-//! unsupported outcomes share the TTL so revocation propagates and the
-//! default path logs once per DID per window, not once per package.
+//! unsupported outcomes share the TTL so revocation propagates and repeated
+//! misconfigured operations do not call the platform seam once per package.
 //!
 //! The device-key half does NOT yet run on the inbound path:
 //! `DecryptResult.sender_credential` (`CredentialData`) carries only the
 //! identity, not the leaf signature key, and extending that UniFFI record is
-//! out of scope for this stage (backlog N44d). Inbound remains structural.
+//! out of scope for this stage (backlog N44d). Inbound DID-root binding is
+//! enforced, while OpenMLS remains responsible for authenticating the sender
+//! credential and frame signature.
 
 use web_time::Instant;
 
@@ -57,6 +55,21 @@ use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::{KeyPackageRef, SequencerReceipt};
+
+/// Maximum number of KeyPackages accepted from one DS fetch. This matches the
+/// delivery-service batch ceiling and bounds per-item validation work even if
+/// an untrusted caller supplies an oversized DID list.
+pub(crate) const MAX_FETCHED_KEY_PACKAGE_COUNT: usize = 100;
+
+/// A serialized hybrid/PQ KeyPackage is normally only a few KiB. One MiB is a
+/// deliberately generous compatibility ceiling that still prevents a single
+/// DS-controlled element from reaching TLS decoding with attacker-selected
+/// multi-megabyte input.
+pub(crate) const MAX_FETCHED_KEY_PACKAGE_BYTES: usize = 1024 * 1024;
+
+/// Aggregate bound aligned with the existing C FFI Add-members input ceiling.
+/// This is checked before cloning KeyPackage bytes into `KeyPackageData`.
+pub(crate) const MAX_FETCHED_KEY_PACKAGE_BATCH_BYTES: usize = 10 * 1024 * 1024;
 
 /// Outcome of verifying a member's MLS credential against an expected
 /// ATProto DID (ADR-009).
@@ -94,13 +107,13 @@ pub fn credential_root_did(identity: &str) -> &str {
 /// Structural identity-claim consistency check (stage-1 default verifier).
 ///
 /// Compares the DID root of `claimed_identity` against the DID root of
-/// `expected_did` (fragment-aware on both sides). ASCII-case-insensitive to
-/// match the orchestrator's existing own-DID comparison semantics
-/// (`messaging.rs` lowercases before comparing).
+/// `expected_did` (fragment-aware on both sides). DID method-specific
+/// identifiers may be case-sensitive, so authorization uses exact equality;
+/// display/routing normalization must not collapse distinct DID authorities.
 pub fn check_identity_claim(expected_did: &str, claimed_identity: &str) -> CredentialVerification {
     let claimed_root = credential_root_did(claimed_identity);
     let expected_root = credential_root_did(expected_did);
-    if !claimed_root.is_empty() && claimed_root.eq_ignore_ascii_case(expected_root) {
+    if !claimed_root.is_empty() && claimed_root == expected_root {
         CredentialVerification::Verified
     } else {
         CredentialVerification::DidMismatch {
@@ -182,6 +195,80 @@ pub fn extract_key_package_identity(key_package_data: &[u8]) -> Result<String, S
     extract_key_package_binding(key_package_data).map(|info| info.identity)
 }
 
+/// Validate the untrusted DS response shape before parsing or cloning any
+/// serialized KeyPackage bytes.
+///
+/// The response labels are routing metadata rather than credential authority,
+/// but requiring their exact multiset to match the request prevents appended,
+/// missing, duplicate, or unrelated response elements from reaching more
+/// expensive credential decoding. Embedded credential roots are checked
+/// separately by [`MLSOrchestrator::verify_fetched_key_packages`].
+pub(crate) fn validate_fetched_key_package_batch(
+    requested_dids: &[String],
+    key_packages: &[KeyPackageRef],
+) -> super::error::Result<()> {
+    use std::collections::BTreeMap;
+
+    if requested_dids.len() > MAX_FETCHED_KEY_PACKAGE_COUNT {
+        return Err(super::error::OrchestratorError::InvalidInput(format!(
+            "key-package request count {} exceeds maximum {}",
+            requested_dids.len(),
+            MAX_FETCHED_KEY_PACKAGE_COUNT
+        )));
+    }
+    if key_packages.len() != requested_dids.len() {
+        return Err(super::error::OrchestratorError::InvalidInput(format!(
+            "delivery service returned {} key packages for {} requested DIDs",
+            key_packages.len(),
+            requested_dids.len()
+        )));
+    }
+
+    let mut expected_labels = BTreeMap::<String, usize>::new();
+    for did in requested_dids {
+        if !did.starts_with("did:")
+            || credential_root_did(did) != did
+            || catbird_atproto::types::string::Did::new(did.as_str()).is_err()
+        {
+            return Err(super::error::OrchestratorError::InvalidInput(
+                "key-package request authority must contain syntactically valid bare DIDs"
+                    .to_string(),
+            ));
+        }
+        *expected_labels.entry(did.clone()).or_default() += 1;
+    }
+
+    let mut returned_labels = BTreeMap::<String, usize>::new();
+    let mut aggregate_bytes = 0usize;
+    for (index, key_package) in key_packages.iter().enumerate() {
+        let package_bytes = key_package.key_package_data.len();
+        if package_bytes > MAX_FETCHED_KEY_PACKAGE_BYTES {
+            return Err(super::error::OrchestratorError::InvalidInput(format!(
+                "delivery-service key package {index} is {package_bytes} bytes, exceeding the {MAX_FETCHED_KEY_PACKAGE_BYTES}-byte maximum"
+            )));
+        }
+        aggregate_bytes = aggregate_bytes.checked_add(package_bytes).ok_or_else(|| {
+            super::error::OrchestratorError::InvalidInput(
+                "delivery-service key-package byte count overflowed".to_string(),
+            )
+        })?;
+        if aggregate_bytes > MAX_FETCHED_KEY_PACKAGE_BATCH_BYTES {
+            return Err(super::error::OrchestratorError::InvalidInput(format!(
+                "delivery-service key-package batch is {aggregate_bytes} bytes, exceeding the {MAX_FETCHED_KEY_PACKAGE_BATCH_BYTES}-byte maximum"
+            )));
+        }
+        *returned_labels.entry(key_package.did.clone()).or_default() += 1;
+    }
+
+    if returned_labels != expected_labels {
+        return Err(super::error::OrchestratorError::InvalidInput(format!(
+            "delivery-service key-package labels do not exactly match requested DIDs (expected {expected_labels:?}, returned {returned_labels:?})"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Fail-closed structural gate for outbound Add/Swap key-package batches.
 ///
 /// Unlike [`MLSOrchestrator::verify_fetched_key_packages`], this helper is an
@@ -240,9 +327,9 @@ pub(crate) fn enforce_outbound_key_package_did_bindings(
 ///
 /// All three variants share the same `constants::DEVICE_KEY_CACHE_TTL` bound:
 /// positive (`Keys`), negative (`Keys(empty)`), and capability-missing
-/// (`Unsupported`). Caching `Unsupported` keeps the default-no-capability
-/// path at exactly one debug-logged seam call per DID per TTL window instead
-/// of one per key package.
+/// (`Unsupported`). Caching `Unsupported` keeps a misconfigured platform from
+/// repeatedly invoking the seam once per package; every consuming operation
+/// still rejects.
 #[derive(Debug, Clone)]
 pub enum DeviceKeyLookup {
     /// `CredentialStore::get_authorized_device_keys` returned `None`: this
@@ -274,7 +361,7 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
-    /// ADR-009 D3 (verify-on-fetch), stage-1 warn-and-allow.
+    /// ADR-009 D3 (verify-on-fetch), enforced before MLS state changes.
     ///
     /// Runs the credential-binding check against every key package returned
     /// by `getKeyPackages` before the packages are used in an Add/Welcome
@@ -286,58 +373,44 @@ where
     ///    (via `CredentialStore::verify_member_credential`, so platforms
     ///    that override it also get device-key binding here).
     ///
-    /// Warn-only: every failure is logged/escalated and the operation
-    /// continues unchanged. Never returns an error.
+    /// The untrusted response count and byte bounds are checked before any
+    /// KeyPackage is parsed. Every credential or resolver failure is then
+    /// logged/escalated and returned to the caller before bytes are cloned
+    /// into `KeyPackageData` or handed to OpenMLS.
     pub(crate) async fn verify_fetched_key_packages(
         &self,
         requested_dids: &[String],
         key_packages: &[KeyPackageRef],
         context: &str,
         conversation_id: Option<&str>,
-    ) {
+    ) -> super::error::Result<()> {
+        validate_fetched_key_package_batch(requested_dids, key_packages)?;
+
         for kp in key_packages {
             let hash_prefix = sha256_prefix(&kp.key_package_data);
 
-            // 1. Response DID must be one the caller actually requested.
-            if !requested_dids
-                .iter()
-                .any(|d| d.eq_ignore_ascii_case(&kp.did))
-            {
-                // The credential hasn't been parsed yet at this point, so
-                // there is no claimed identity to report — only the DS label.
-                self.emit_credential_binding_warning(
-                    conversation_id,
-                    "fetch",
-                    context,
-                    &kp.did,
-                    "<unparsed>",
-                    &hash_prefix,
-                    "key package returned for a DID that was not requested",
-                )
-                .await;
-                // Still run the credential check below against the labeled DID.
-            }
-
-            // 2. Structural decode of the leaf credential + signature key.
+            // Structural decode of the leaf credential + signature key. This
+            // is not OpenMLS authentication; it extracts application-binding
+            // material before OpenMLS is allowed to validate/stage the package.
             let binding = match extract_key_package_binding(&kp.key_package_data) {
                 Ok(info) => info,
                 Err(reason) => {
-                    self.emit_credential_binding_warning(
-                        conversation_id,
-                        "fetch",
-                        context,
-                        &kp.did,
-                        "<unparsable>",
-                        &hash_prefix,
-                        &reason,
-                    )
-                    .await;
-                    continue;
+                    return Err(self
+                        .emit_credential_binding_rejection(
+                            conversation_id,
+                            "fetch",
+                            context,
+                            &kp.did,
+                            "<unparsable>",
+                            &hash_prefix,
+                            &reason,
+                        )
+                        .await);
                 }
             };
             let claimed_identity = binding.identity.clone();
 
-            // 3. Identity-claim consistency via the CredentialStore seam.
+            // Identity-claim consistency via the CredentialStore seam.
             match self
                 .credentials()
                 .verify_member_credential(&kp.did, &claimed_identity)
@@ -349,11 +422,11 @@ where
                         context,
                         "key package credential binding verified"
                     );
-                    // 4. WS-3 stage 2: device-key half of the ADR-009 proof —
+                    // Device-key half of the ADR-009 proof —
                     // the leaf signing key must be an authorized device key
-                    // for the credential's root DID. Warn-only; skipped with
-                    // a debug log when the platform provides no resolution
-                    // surface (`get_authorized_device_keys` default).
+                    // for the credential's root DID. Unsupported resolution,
+                    // an empty/mismatched key set, and resolver errors all fail
+                    // closed before OpenMLS sees the package.
                     self.verify_leaf_device_key_binding(
                         conversation_id,
                         "fetch",
@@ -363,7 +436,7 @@ where
                         &binding.signature_key,
                         &hash_prefix,
                     )
-                    .await;
+                    .await?;
                 }
                 Ok(CredentialVerification::DidMismatch {
                     expected_did,
@@ -373,47 +446,49 @@ where
                     let reason = format!(
                         "credential root DID `{claimed_root_did}` does not match expected DID `{expected_did}`"
                     );
-                    self.emit_credential_binding_warning(
-                        conversation_id,
-                        "fetch",
-                        context,
-                        &expected_did,
-                        &claimed_identity,
-                        &hash_prefix,
-                        &reason,
-                    )
-                    .await;
+                    return Err(self
+                        .emit_credential_binding_rejection(
+                            conversation_id,
+                            "fetch",
+                            context,
+                            &expected_did,
+                            &claimed_identity,
+                            &hash_prefix,
+                            &reason,
+                        )
+                        .await);
                 }
                 Ok(CredentialVerification::Unverifiable { reason }) => {
-                    self.emit_credential_binding_warning(
-                        conversation_id,
-                        "fetch",
-                        context,
-                        &kp.did,
-                        &claimed_identity,
-                        &hash_prefix,
-                        &reason,
-                    )
-                    .await;
+                    return Err(self
+                        .emit_credential_binding_rejection(
+                            conversation_id,
+                            "fetch",
+                            context,
+                            &kp.did,
+                            &claimed_identity,
+                            &hash_prefix,
+                            &reason,
+                        )
+                        .await);
                 }
                 Err(e) => {
-                    // Verifier infrastructure failure (platform override hit
-                    // a network/storage error). Warn-only — never block the
-                    // operation on the verifier itself in stage 1.
                     let reason = format!("credential verifier error: {e}");
-                    self.emit_credential_binding_warning(
-                        conversation_id,
-                        "fetch",
-                        context,
-                        &kp.did,
-                        &claimed_identity,
-                        &hash_prefix,
-                        &reason,
-                    )
-                    .await;
+                    return Err(self
+                        .emit_credential_binding_rejection(
+                            conversation_id,
+                            "fetch",
+                            context,
+                            &kp.did,
+                            &claimed_identity,
+                            &hash_prefix,
+                            &reason,
+                        )
+                        .await);
                 }
             }
         }
+
+        Ok(())
     }
 
     /// Resolve (with ADR-009 D6 caching) the authorized device signing keys
@@ -422,12 +497,13 @@ where
     /// Cache semantics: positive, negative, and `Unsupported` outcomes are
     /// all cached for `constants::DEVICE_KEY_CACHE_TTL`; seam **errors are
     /// not cached** (the next check retries). Keyed by ASCII-lowercased root
-    /// DID to match the orchestrator's DID comparison semantics.
+    /// DID exactly; method-specific identifiers may be case-sensitive and
+    /// must not share authorization cache entries.
     pub(crate) async fn lookup_authorized_device_keys(
         &self,
         root_did: &str,
     ) -> super::error::Result<DeviceKeyLookup> {
-        let cache_key = root_did.to_ascii_lowercase();
+        let cache_key = root_did.to_string();
         {
             let cache = self.device_key_cache().lock().await;
             if let Some(entry) = cache.get(&cache_key) {
@@ -457,18 +533,16 @@ where
         Ok(lookup)
     }
 
-    /// ADR-009 full check, device-key half (WS-3 stage 2, warn-and-allow):
+    /// ADR-009 full check, device-key half (enforced):
     /// verify that a leaf's signature public key is currently published as
     /// an authorized MLS device key for the credential's root DID.
     ///
     /// Outcomes:
-    /// - platform has no DID-resolution surface → `debug!` and skip (the
-    ///   structural stage-1 check has already run);
+    /// - platform has no DID-resolution surface → reject;
     /// - key found in the authorized set → `debug!`;
     /// - key NOT in the authorized set (including "resolved, zero keys") →
-    ///   structured warning through the stage-1 chokepoint, operation
-    ///   continues (D5 warn-and-allow);
-    /// - resolution infrastructure error → warning, operation continues.
+    ///   structured rejection;
+    /// - resolution infrastructure error → reject.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn verify_leaf_device_key_binding(
         &self,
@@ -479,16 +553,21 @@ where
         claimed_identity: &str,
         leaf_signature_key: &[u8],
         kp_hash_prefix: &str,
-    ) {
+    ) -> super::error::Result<()> {
         match self.lookup_authorized_device_keys(root_did).await {
             Ok(DeviceKeyLookup::Unsupported) => {
-                tracing::debug!(
-                    root_did,
-                    context,
-                    "device-key binding skipped: platform provides no \
-                     get_authorized_device_keys resolution surface (ADR-009 \
-                     full check unavailable; structural check already ran)"
-                );
+                let reason = "authorized-device-key resolution is required but unsupported";
+                Err(self
+                    .emit_credential_binding_rejection(
+                        conversation_id,
+                        operation,
+                        context,
+                        root_did,
+                        claimed_identity,
+                        kp_hash_prefix,
+                        reason,
+                    )
+                    .await)
             }
             Ok(DeviceKeyLookup::Keys(keys)) => {
                 if keys.iter().any(|k| k.as_slice() == leaf_signature_key) {
@@ -497,6 +576,7 @@ where
                         context,
                         "leaf signature key verified against authorized device keys"
                     );
+                    Ok(())
                 } else {
                     let key_hash_prefix = sha256_prefix(leaf_signature_key);
                     let reason = format!(
@@ -504,7 +584,23 @@ where
                          authorized device key for `{root_did}` ({} authorized key(s) resolved)",
                         keys.len()
                     );
-                    self.emit_credential_binding_warning(
+                    Err(self
+                        .emit_credential_binding_rejection(
+                            conversation_id,
+                            operation,
+                            context,
+                            root_did,
+                            claimed_identity,
+                            kp_hash_prefix,
+                            &reason,
+                        )
+                        .await)
+                }
+            }
+            Err(e) => {
+                let reason = format!("authorized-device-key resolution failed: {e}");
+                Err(self
+                    .emit_credential_binding_rejection(
                         conversation_id,
                         operation,
                         context,
@@ -513,32 +609,20 @@ where
                         kp_hash_prefix,
                         &reason,
                     )
-                    .await;
-                }
-            }
-            Err(e) => {
-                let reason = format!("authorized-device-key resolution failed: {e}");
-                self.emit_credential_binding_warning(
-                    conversation_id,
-                    operation,
-                    context,
-                    root_did,
-                    claimed_identity,
-                    kp_hash_prefix,
-                    &reason,
-                )
-                .await;
+                    .await)
             }
         }
     }
 
-    /// ADR-009 D4 (verify inbound), stage-1 warn-and-allow.
+    /// ADR-009 D4 (verify inbound), enforced before commit merge/application
+    /// delivery.
     ///
     /// Cross-checks the MLS sender credential extracted from a decrypted
     /// message/commit against the envelope's claimed sender DID. The envelope
     /// `senderDid` is a routing hint, not proof — a mismatch means either the
     /// DS mislabeled the envelope or the leaf credential does not belong to
-    /// the claimed sender. Warn-only; the message continues to be processed.
+    /// the claimed sender. A mismatch is returned to the caller so the frame
+    /// is not applied under a false application identity.
     ///
     /// Scope note (documented limitation): at the orchestrator layer only the
     /// *sender* credential is visible per inbound frame
@@ -555,45 +639,43 @@ where
     /// (`verify_leaf_device_key_binding`) cannot run here either —
     /// `CredentialData` carries the identity but not the sender's leaf
     /// signature public key, and extending that UniFFI record is out of
-    /// scope for this stage (backlog N44d). Inbound stays structural.
+    /// scope for this stage (backlog N44d). Inbound therefore enforces the
+    /// available DID-root binding. OpenMLS separately authenticates the MLS
+    /// frame; this check does not replace that cryptographic validation.
     pub(crate) async fn verify_inbound_sender_credential(
         &self,
         conversation_id: &str,
         envelope_sender_did: &str,
         credential_identity: &[u8],
-    ) {
+    ) -> super::error::Result<()> {
         if envelope_sender_did.is_empty() {
-            // No expected DID available — nothing to bind against. Structural
-            // UTF-8 validity is still checkable.
-            if String::from_utf8(credential_identity.to_vec()).is_err() {
-                self.emit_credential_binding_warning(
+            return Err(self
+                .emit_credential_binding_rejection(
                     Some(conversation_id),
                     "message",
                     "process_incoming",
                     "<unknown>",
                     "<non-utf8>",
                     "",
-                    "sender credential identity is not UTF-8 and envelope carries no sender DID",
+                    "envelope carries no sender DID, so application credential binding is unavailable",
                 )
-                .await;
-            }
-            return;
+                .await);
         }
 
         let claimed_identity = match String::from_utf8(credential_identity.to_vec()) {
             Ok(s) => s,
             Err(_) => {
-                self.emit_credential_binding_warning(
-                    Some(conversation_id),
-                    "message",
-                    "process_incoming",
-                    envelope_sender_did,
-                    "<non-utf8>",
-                    "",
-                    "sender credential identity is not UTF-8",
-                )
-                .await;
-                return;
+                return Err(self
+                    .emit_credential_binding_rejection(
+                        Some(conversation_id),
+                        "message",
+                        "process_incoming",
+                        envelope_sender_did,
+                        "<non-utf8>",
+                        "",
+                        "sender credential identity is not UTF-8",
+                    )
+                    .await);
             }
         };
 
@@ -602,7 +684,7 @@ where
             .verify_member_credential(envelope_sender_did, &claimed_identity)
             .await
         {
-            Ok(CredentialVerification::Verified) => {}
+            Ok(CredentialVerification::Verified) => Ok(()),
             Ok(CredentialVerification::DidMismatch {
                 expected_did,
                 claimed_identity,
@@ -611,19 +693,20 @@ where
                 let reason = format!(
                     "MLS sender credential root `{claimed_root_did}` does not match envelope sender DID `{expected_did}`"
                 );
-                self.emit_credential_binding_warning(
-                    Some(conversation_id),
-                    "message",
-                    "process_incoming",
-                    &expected_did,
-                    &claimed_identity,
-                    "",
-                    &reason,
-                )
-                .await;
+                Err(self
+                    .emit_credential_binding_rejection(
+                        Some(conversation_id),
+                        "message",
+                        "process_incoming",
+                        &expected_did,
+                        &claimed_identity,
+                        "",
+                        &reason,
+                    )
+                    .await)
             }
-            Ok(CredentialVerification::Unverifiable { reason }) => {
-                self.emit_credential_binding_warning(
+            Ok(CredentialVerification::Unverifiable { reason }) => Err(self
+                .emit_credential_binding_rejection(
                     Some(conversation_id),
                     "message",
                     "process_incoming",
@@ -632,33 +715,29 @@ where
                     "",
                     &reason,
                 )
-                .await;
-            }
+                .await),
             Err(e) => {
                 let reason = format!("credential verifier error: {e}");
-                self.emit_credential_binding_warning(
-                    Some(conversation_id),
-                    "message",
-                    "process_incoming",
-                    envelope_sender_did,
-                    &claimed_identity,
-                    "",
-                    &reason,
-                )
-                .await;
+                Err(self
+                    .emit_credential_binding_rejection(
+                        Some(conversation_id),
+                        "message",
+                        "process_incoming",
+                        envelope_sender_did,
+                        &claimed_identity,
+                        "",
+                        &reason,
+                    )
+                    .await)
             }
         }
     }
 
-    /// Single chokepoint for credential-binding failures (ADR-009 D5).
-    ///
-    /// Stage 1: structured `error_log!` (platform logging — Android/iOS see
-    /// it, unlike bare `tracing`) + `OrchestratorEventObserver` escalation,
-    /// then return — callers continue unchanged. The future enforce flip
-    /// converts this chokepoint into an error return; call sites already
-    /// pass everything an enforcement decision needs.
+    /// Single enforcing chokepoint for credential-binding failures (ADR-009
+    /// D5). It emits platform-visible telemetry, then constructs the error the
+    /// caller must propagate before any state-changing MLS operation.
     #[allow(clippy::too_many_arguments)]
-    async fn emit_credential_binding_warning(
+    async fn emit_credential_binding_rejection(
         &self,
         conversation_id: Option<&str>,
         operation: &str,
@@ -667,11 +746,11 @@ where
         claimed_identity: &str,
         kp_hash_prefix: &str,
         reason: &str,
-    ) {
+    ) -> super::error::OrchestratorError {
         let convo = conversation_id.unwrap_or("<none>");
         let claimed_root = credential_root_did(claimed_identity);
         crate::error_log!(
-            "[CREDENTIAL-BINDING] mode=warn_only operation={} context={} conversation={} expected_did={} claimed_identity={} claimed_root_did={} kp_hash_prefix={} path=rust-orchestrator reason={}",
+            "[CREDENTIAL-BINDING] mode=enforce operation={} context={} conversation={} expected_did={} claimed_identity={} claimed_root_did={} kp_hash_prefix={} path=rust-orchestrator reason={}",
             operation,
             context,
             convo,
@@ -690,7 +769,7 @@ where
             claimed_root_did = claimed_root,
             kp_hash_prefix,
             reason,
-            "credential binding check failed (warn-and-allow — continuing)"
+            "credential binding check rejected the operation"
         );
         if let Some(observer) = self.current_event_observer().await {
             observer.on_credential_binding_warning(
@@ -701,6 +780,9 @@ where
                 reason,
             );
         }
+        super::error::OrchestratorError::InvalidInput(format!(
+            "application DID/device credential binding rejected during {context}: {reason}"
+        ))
     }
 
     /// ADR-009 D8 / backlog E3: store a sequencer receipt, first comparing it
@@ -801,6 +883,15 @@ where
 mod tests {
     use super::*;
 
+    fn key_package_ref(did: &str, byte_len: usize) -> KeyPackageRef {
+        KeyPackageRef {
+            did: did.to_string(),
+            key_package_data: vec![0xA5; byte_len],
+            hash: None,
+            cipher_suite: "test".to_string(),
+        }
+    }
+
     fn key_package_bundle(identity: &str) -> openmls::prelude::KeyPackageBundle {
         use openmls::prelude::*;
         use openmls_basic_credential::SignatureKeyPair;
@@ -871,11 +962,11 @@ mod tests {
     }
 
     #[test]
-    fn claim_check_is_ascii_case_insensitive() {
-        assert_eq!(
-            check_identity_claim("did:web:Example.Com", "did:web:example.com"),
-            CredentialVerification::Verified
-        );
+    fn claim_check_does_not_fold_method_specific_identifier_case() {
+        assert!(matches!(
+            check_identity_claim("did:method:Value", "did:method:value"),
+            CredentialVerification::DidMismatch { .. }
+        ));
     }
 
     #[test]
@@ -905,6 +996,66 @@ mod tests {
     fn extract_identity_rejects_garbage() {
         assert!(extract_key_package_identity(&[0xFF, 0x00, 0x13]).is_err());
         assert!(extract_key_package_identity(&[]).is_err());
+    }
+
+    #[test]
+    fn fetched_batch_rejects_missing_or_appended_packages_before_parsing() {
+        let requested = vec!["did:plc:alice".to_string()];
+        let missing = Vec::new();
+        let appended = vec![
+            key_package_ref("did:plc:alice", 1),
+            key_package_ref("did:plc:mallory", 1),
+        ];
+
+        let missing_error = validate_fetched_key_package_batch(&requested, &missing)
+            .expect_err("missing package must fail exact cardinality");
+        let appended_error = validate_fetched_key_package_batch(&requested, &appended)
+            .expect_err("appended package must fail exact cardinality");
+        assert!(missing_error.to_string().contains("returned 0"));
+        assert!(appended_error.to_string().contains("returned 2"));
+    }
+
+    #[test]
+    fn fetched_batch_rejects_duplicate_labels_with_exact_count() {
+        let requested = vec!["did:plc:alice".to_string(), "did:plc:bob".to_string()];
+        let duplicated = vec![
+            key_package_ref("did:plc:alice", 1),
+            key_package_ref("did:plc:alice", 1),
+        ];
+
+        let error = validate_fetched_key_package_batch(&requested, &duplicated)
+            .expect_err("duplicate label must not substitute for a missing DID");
+        assert!(error.to_string().contains("do not exactly match"));
+    }
+
+    #[test]
+    fn fetched_batch_rejects_oversized_element_before_tls_decode() {
+        let requested = vec!["did:plc:alice".to_string()];
+        let oversized = vec![key_package_ref(
+            "did:plc:alice",
+            MAX_FETCHED_KEY_PACKAGE_BYTES + 1,
+        )];
+
+        let error = validate_fetched_key_package_batch(&requested, &oversized)
+            .expect_err("oversized invalid bytes must fail at the size gate");
+        assert!(error.to_string().contains("exceeding"));
+    }
+
+    #[test]
+    fn fetched_batch_rejects_oversized_aggregate() {
+        let count = (MAX_FETCHED_KEY_PACKAGE_BATCH_BYTES / MAX_FETCHED_KEY_PACKAGE_BYTES) + 1;
+        let requested: Vec<String> = (0..count)
+            .map(|index| format!("did:plc:user{index}"))
+            .collect();
+        let packages: Vec<KeyPackageRef> = requested
+            .iter()
+            .map(|did| key_package_ref(did, MAX_FETCHED_KEY_PACKAGE_BYTES))
+            .collect();
+
+        let error = validate_fetched_key_package_batch(&requested, &packages)
+            .expect_err("aggregate bytes must be bounded before parsing");
+        assert!(error.to_string().contains("batch"));
+        assert!(error.to_string().contains("exceeding"));
     }
 
     #[test]

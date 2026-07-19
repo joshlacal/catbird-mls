@@ -1,3 +1,6 @@
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
+
 use async_trait::async_trait;
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use sha2::{Digest, Sha256};
@@ -73,6 +76,7 @@ fn delete_group_preserves_live_group_and_reports_manifest_write_failure() {
         Box::new(TestKeychain::new()),
     )
     .expect("context");
+    epoch_secret_test_support::install(&context);
     let created = context
         .create_group(b"did:plc:delete-test".to_vec(), None)
         .expect("create group");

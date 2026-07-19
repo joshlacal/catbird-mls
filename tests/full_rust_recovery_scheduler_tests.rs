@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 mod e2e_harness;
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -86,6 +88,7 @@ impl TestClientHarness {
             Box::new(InMemoryKeychain::new()),
         )
         .expect("failed to create MLSContext");
+        epoch_secret_test_support::install(&context);
         let storage = Arc::new(MockStorage::new());
         let credentials = Arc::new(MockCredentials::new());
         let api = Arc::new(shared_server.clone_as(&did));
@@ -130,6 +133,21 @@ impl TestClientHarness {
             .ensure_device_registered()
             .await
             .expect("ensure_device_registered failed");
+        self.install_authorized_peer(self);
+    }
+
+    /// Bind a peer DID to the signing key from that peer's local fixture
+    /// context. This is explicit test authority and does not trust a package
+    /// returned by the delivery service under validation.
+    fn install_authorized_peer(&self, peer: &Self) {
+        let public_key = peer
+            .orchestrator
+            .mls_context()
+            .create_key_package(peer.did.as_bytes().to_vec())
+            .expect("mint authoritative fixture key package")
+            .signature_public_key;
+        self.credentials
+            .set_authorized_device_keys(&peer.did, vec![public_key]);
     }
 }
 
@@ -152,6 +170,8 @@ impl RecoverySchedulerFixture {
 
         alice.initialize().await;
         bob.initialize().await;
+        alice.install_authorized_peer(&bob);
+        bob.install_authorized_peer(&alice);
 
         let convo = bob
             .orchestrator

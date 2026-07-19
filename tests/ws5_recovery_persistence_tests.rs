@@ -14,6 +14,8 @@
 #![allow(dead_code)]
 
 mod e2e_harness;
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
 
 use std::sync::Arc;
 
@@ -26,6 +28,28 @@ use e2e_harness::TestWorld;
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Encode the current owner- and lifecycle-bound local-delete authority used
+/// by production. Integration tests cannot access the crate-private encoder,
+/// so keep this fixture deliberately explicit and versioned.
+fn encode_local_delete_authority_v2(owner_user_did: &str, group_id: &str, epoch: u64) -> String {
+    let payload = serde_json::json!({
+        "owner_user_did": owner_user_did,
+        "groups": [{
+            "group_id_hex": group_id,
+            "epoch": epoch,
+        }],
+        "group_state_keys": [group_id],
+        "conversation": {
+            "group_id": group_id,
+            "epoch": epoch,
+        },
+        "reset": null,
+    });
+    let mut encoded = b"CBLD\x02".to_vec();
+    encoded.extend(serde_json::to_vec(&payload).expect("encode v2 delete authority fixture"));
+    hex::encode(encoded)
 }
 
 /// Build a "restarted" orchestrator over the SAME mock storage / DS /
@@ -76,6 +100,7 @@ async fn restart_orchestrator(
         Box::new(NoopKeychain),
     )
     .expect("failed to create restart MLSContext");
+    epoch_secret_test_support::install(&mls_context);
 
     let orchestrator = MLSOrchestrator::new(
         mls_context,
@@ -565,7 +590,11 @@ async fn startup_sweep_finishes_interrupted_local_delete() {
     // Simulate a crash mid-delete: intent persisted, deletes never ran.
     alice.storage.seed_pending_local_delete(PendingLocalDelete {
         conversation_id: convo_id.clone(),
-        group_id_hex: Some(convo.group_id.clone()),
+        group_id_hex: Some(encode_local_delete_authority_v2(
+            &alice.did,
+            &convo.group_id,
+            convo.epoch,
+        )),
     });
     assert!(
         alice.storage.has_group_state(&convo.group_id) || alice.storage.conversation_count() > 0
@@ -709,6 +738,7 @@ async fn legacy_orphan_without_mapping_clears_stale_recovery_rows() {
         .mark_reset_pending(&conversation_id, &hex::encode(vec![0x7a; 32]), 11, now_ms())
         .await
         .expect("seed reset");
+    let rejoin_flag_before_restart = alice.storage.has_rejoin_flag(&conversation_id);
 
     let (restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
 
@@ -717,23 +747,27 @@ async fn legacy_orphan_without_mapping_clears_stale_recovery_rows() {
         alice
             .storage
             .get_persisted_recovery_backoff(&conversation_id)
-            .is_none(),
-        "no-mapping legacy orphan replay must clear stale recovery backoff"
+            .is_some(),
+        "unfenced legacy authority must not clear a newer recovery lifecycle"
     );
     assert!(
         alice
             .storage
             .get_persisted_quarantine(&conversation_id)
-            .is_none(),
-        "no-mapping legacy orphan replay must clear stale quarantine"
+            .is_some(),
+        "unfenced legacy authority must not clear quarantine"
     );
-    assert!(!alice.storage.has_rejoin_flag(&conversation_id));
+    assert_eq!(
+        alice.storage.has_rejoin_flag(&conversation_id),
+        rejoin_flag_before_restart,
+        "legacy orphan cleanup must not rewrite the current conversation state"
+    );
     assert!(
         alice
             .storage
             .get_persisted_reset_pending(&conversation_id)
-            .is_none(),
-        "no-mapping legacy orphan replay must clear stale reset authority"
+            .is_some(),
+        "unfenced legacy authority must not clear reset-generation state"
     );
     assert_eq!(
         restarted
@@ -741,8 +775,8 @@ async fn legacy_orphan_without_mapping_clears_stale_recovery_rows() {
             .lock()
             .await
             .failed_attempts(&conversation_id),
-        0,
-        "hydrated in-memory recovery state must also be forgotten"
+        3,
+        "preserved recovery state must hydrate after legacy orphan cleanup"
     );
     let _ = std::fs::remove_dir_all(temp_dir);
 }
@@ -763,17 +797,13 @@ async fn force_delete_local_clears_its_intent() {
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
 
-    // Reach force_delete_local through the public leave path is overkill;
-    // drive it via sync's stale-conversation cleanup by deleting the convo
-    // on the DS and syncing.
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&convo_id);
+    // Exercise the explicit leave path. A delivery-service roster omission is
+    // not deletion authority and must no longer drive destructive cleanup.
     alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&convo_id)
         .await
-        .expect("sync should succeed");
+        .expect("leave should succeed");
 
     assert_eq!(
         alice.storage.pending_local_delete_count(),
@@ -787,7 +817,7 @@ async fn force_delete_local_clears_its_intent() {
             .await
             .unwrap()
             .is_none(),
-        "stale conversation should be locally deleted by sync"
+        "explicit leave should delete the local conversation"
     );
 }
 
@@ -806,15 +836,17 @@ async fn failed_pending_delete_intent_write_refuses_destructive_cleanup() {
     let conversation_id = conversation.conversation_id.clone();
     let group_id = hex::decode(&conversation.group_id).expect("group id");
     alice.storage.fail_next_mark_pending_local_delete();
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&conversation_id);
 
-    alice
+    let deletion_error = alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&conversation_id)
         .await
-        .expect("sync retains retryable local state");
+        .expect_err("intent-write failure must surface incomplete cleanup");
+    assert!(
+        deletion_error.to_string().contains("local deletion")
+            && deletion_error.to_string().contains("incomplete"),
+        "unexpected cleanup error: {deletion_error}"
+    );
 
     assert_eq!(alice.storage.pending_local_delete_count(), 0);
     assert!(
@@ -1536,17 +1568,19 @@ async fn failed_delete_step_keeps_intent_then_retry_clears_it() {
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
 
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&convo_id);
-
     // First pass: storage delete fails — the intent must survive.
     alice.storage.fail_next_delete_conversations();
-    alice
+    let deletion_error = alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&convo_id)
         .await
-        .expect("sync should succeed");
+        .expect_err("leave must surface incomplete local deletion");
+    assert!(
+        deletion_error
+            .to_string()
+            .contains("durable retry intent retained"),
+        "unexpected deletion failure: {deletion_error}"
+    );
     assert_eq!(
         alice.storage.pending_local_delete_count(),
         1,
@@ -1594,18 +1628,19 @@ async fn reset_authority_read_failure_keeps_delete_intent_and_committed_reset() 
         .mark_reset_pending(&convo_id, &"ab".repeat(16), 2, now_ms())
         .await
         .expect("seed committed reset authority");
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&convo_id);
     alice
         .storage
         .fail_get_conversation_state_after_successful_reads(&convo_id, 1);
 
-    alice
+    let deletion_error = alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&convo_id)
         .await
-        .expect("sync should preserve cleanup retry state");
+        .expect_err("unreadable reset authority must surface incomplete cleanup");
+    assert!(
+        deletion_error.to_string().contains("incomplete"),
+        "unexpected cleanup error: {deletion_error}"
+    );
 
     assert_eq!(
         alice.storage.pending_local_delete_count(),
@@ -1641,18 +1676,19 @@ async fn reset_delete_generation_mismatch_keeps_intent_then_retry_clears_without
         .record_group_reset(&convo_id, vec![0xcd; 16], 7)
         .await
         .expect("commit reset authority");
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&convo_id);
     alice
         .storage
         .force_next_clear_reset_pending_for_delete_false();
 
-    alice
+    let deletion_error = alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&convo_id)
         .await
-        .expect("first delete pass should retain retry intent");
+        .expect_err("generation mismatch must surface retained cleanup work");
+    assert!(
+        deletion_error.to_string().contains("incomplete"),
+        "unexpected cleanup error: {deletion_error}"
+    );
     assert_eq!(alice.storage.pending_local_delete_count(), 1);
     assert_eq!(
         alice
@@ -1729,15 +1765,13 @@ async fn local_delete_clears_recovery_state_no_ghost_after_restart() {
             ),
         });
 
-    // Drive force_delete_local via sync's stale-conversation cleanup.
-    world
-        .delivery_service()
-        .remove_conversation_for_test(&convo_id);
+    // Use the explicit leave authority. Roster omission alone is deliberately
+    // non-destructive after the security hardening.
     alice
         .orchestrator
-        .sync_with_server(true)
+        .leave_group(&convo_id)
         .await
-        .expect("sync should succeed");
+        .expect("leave should succeed");
 
     assert!(
         alice

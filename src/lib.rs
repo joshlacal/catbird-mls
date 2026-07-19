@@ -16,6 +16,7 @@ mod hybrid_storage;
 #[cfg(not(target_arch = "wasm32"))]
 mod keychain;
 pub mod logging;
+mod message_limits;
 pub mod metadata;
 #[cfg(not(target_arch = "wasm32"))]
 mod mls_context;

@@ -9,6 +9,8 @@
 //!      `EpochMismatch` and leaves the pending commit recoverable.
 //!   5. `discard_pending` after `confirm_commit` returns `InvalidInput`
 //!      (handle is stale).
+//!   6. Projection persistence failure withholds confirmation, preserves the
+//!      last durable/cache projection, and marks the conversation for rejoin.
 
 #![allow(dead_code)]
 
@@ -18,8 +20,8 @@ use catbird_mls::orchestrator::credential_binding::{
     extract_key_package_binding, extract_key_package_identity,
 };
 use catbird_mls::orchestrator::error::OrchestratorError;
-use catbird_mls::orchestrator::types::{CommitKind, CommitPlan};
-use catbird_mls::orchestrator::MlsCryptoContext;
+use catbird_mls::orchestrator::types::{CommitKind, CommitPlan, IncomingEnvelope};
+use catbird_mls::orchestrator::{MLSStorageBackend, MlsCryptoContext};
 use e2e_harness::TestWorld;
 
 /// Drive `stage_commit` on Alice's side for a fresh add-members operation.
@@ -173,6 +175,130 @@ async fn test_stage_then_confirm_advances_epoch() {
     assert_eq!(
         confirmed.new_epoch, epoch_after_confirm,
         "ConfirmedCommit.new_epoch must match MLS-reported epoch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_commit_echo_requires_durable_local_confirmation() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("own-echo-durable-fence", None, None)
+        .await
+        .expect("create group");
+    let plan = stage_add_members(&alice, &convo.group_id, &[bob.did.clone()]).await;
+    let tracked_before = alice.orchestrator.own_commits().lock().await.len();
+
+    let error = alice
+        .orchestrator
+        .process_incoming(&IncomingEnvelope {
+            conversation_id: convo.conversation_id.clone(),
+            sender_did: alice.did.clone(),
+            ciphertext: plan.commit_bytes.clone(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some("accepted-response-lost".to_string()),
+            server_epoch: Some(plan.target_epoch),
+        })
+        .await
+        .expect_err("an unconfirmed own commit must withhold success/cursor advancement");
+
+    assert!(error.to_string().contains("before durable confirmation"));
+    assert_eq!(
+        alice.orchestrator.own_commits().lock().await.len(),
+        tracked_before,
+        "failed proof must retain the hash for a retry"
+    );
+    assert!(
+        alice.storage.has_rejoin_flag(&convo.conversation_id),
+        "ambiguous server acceptance must enter durable recovery"
+    );
+
+    alice
+        .orchestrator
+        .discard_pending(plan.handle)
+        .await
+        .expect("test cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_confirm_projection_failure_withholds_success_and_cache_advance() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("confirm-projection-failure", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id = convo.group_id.clone();
+    let epoch_before = epoch_for_group(alice, &group_id);
+    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+
+    use catbird_mls::orchestrator::MLSAPIClient;
+    alice
+        .orchestrator
+        .api_client()
+        .add_members(
+            &group_id,
+            &[bob.did.clone()],
+            &plan.commit_bytes,
+            plan.welcome_bytes.as_deref(),
+        )
+        .await
+        .expect("server add_members should succeed");
+
+    alice.storage.fail_next_set_group_state();
+    let error = alice
+        .orchestrator
+        .confirm_commit(plan.handle, 0)
+        .await
+        .expect_err("projection failure must withhold confirmation");
+    assert!(matches!(error, OrchestratorError::Storage(_)));
+    assert!(
+        epoch_for_group(alice, &group_id) > epoch_before,
+        "the test must exercise a post-merge projection failure"
+    );
+
+    let cached = alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .values()
+        .find(|state| state.group_id == group_id)
+        .cloned()
+        .expect("pre-merge cache projection must remain available");
+    assert_eq!(cached.epoch, epoch_before);
+    assert!(!cached.members.contains(&bob.did));
+
+    let persisted = alice
+        .storage
+        .get_group_state(&group_id)
+        .await
+        .expect("read persisted group state")
+        .expect("pre-merge persisted group state must remain available");
+    assert_eq!(persisted.epoch, epoch_before);
+    assert!(!persisted.members.contains(&bob.did));
+    assert!(
+        alice
+            .storage
+            .needs_rejoin(&convo.conversation_id)
+            .await
+            .expect("read durable needs-rejoin flag"),
+        "post-merge projection failure must route the conversation to recovery"
     );
 }
 

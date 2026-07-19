@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::epoch_storage::EpochSecretManager;
 use crate::error::MLSError;
+use crate::message_limits::validate_inbound_mls_message_len;
 use crate::metadata;
 use openmls::component::ComponentData;
 use uuid::Uuid;
@@ -152,6 +153,25 @@ fn derive_cipher_salt_hex(encryption_key: &str) -> String {
 /// This prevents the 0xdead10cc crash by ensuring WAL never grows large enough to cause
 /// long checkpoint operations during suspension.
 const CHECKPOINT_BUDGET: u64 = 32;
+const NORMAL_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DURABILITY_CHECKPOINT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+fn validate_durability_checkpoint(
+    busy: i64,
+    log_frames: i64,
+    checkpointed_frames: i64,
+) -> Result<(), MLSError> {
+    if busy != 0 || log_frames < 0 || checkpointed_frames < 0 || checkpointed_frames != log_frames {
+        crate::error_log!(
+            "[MANIFEST-STORAGE] Incomplete durability checkpoint: busy={}, log={}, checkpointed={}",
+            busy,
+            log_frames,
+            checkpointed_frames
+        );
+        return Err(MLSError::StorageFailed);
+    }
+    Ok(())
+}
 
 /// Maximum age for a stored key package bundle before it is pruned (90 days).
 /// Matches the OpenMLS KeyPackage lifetime — older bundles are unusable by
@@ -257,16 +277,23 @@ impl ManifestStorage {
                 MLSError::StorageFailed
             })?;
 
-        // Enable WAL mode for better concurrent performance
-        conn.pragma_update(None, "journal_mode", "WAL")
+        // Require WAL rather than assuming the requested mode was accepted.
+        let journal_mode: String = conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
             .map_err(|e| {
                 crate::error_log!("[MANIFEST-STORAGE] Failed to set WAL mode: {:?}", e);
                 MLSError::StorageFailed
             })?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            crate::error_log!(
+                "[MANIFEST-STORAGE] Database rejected WAL mode: {}",
+                journal_mode
+            );
+            return Err(MLSError::StorageFailed);
+        }
 
-        // Use NORMAL synchronous mode for faster writes (still safe with WAL)
-        // NORMAL is faster than FULL and provides adequate durability
-        conn.pragma_update(None, "synchronous", "NORMAL")
+        // MLS epoch transitions and key material require power-loss durability.
+        conn.pragma_update(None, "synchronous", "FULL")
             .map_err(|e| {
                 crate::error_log!("[MANIFEST-STORAGE] Failed to set synchronous mode: {:?}", e);
                 MLSError::StorageFailed
@@ -289,11 +316,10 @@ impl ManifestStorage {
         })?;
 
         // Retry on contention (matches MLSContext connection settings)
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| {
-                crate::error_log!("[MANIFEST-STORAGE] Failed to set busy_timeout: {:?}", e);
-                MLSError::StorageFailed
-            })?;
+        conn.busy_timeout(NORMAL_BUSY_TIMEOUT).map_err(|e| {
+            crate::error_log!("[MANIFEST-STORAGE] Failed to set busy_timeout: {:?}", e);
+            MLSError::StorageFailed
+        })?;
 
         let storage = Self {
             conn,
@@ -403,21 +429,42 @@ impl ManifestStorage {
 
     /// Force database flush to ensure all pending writes are committed to disk
     ///
-    /// This executes a WAL checkpoint (if in WAL mode) and ensures durability.
-    /// Uses PASSIVE mode to avoid blocking - SQLite will checkpoint what it can without waiting.
-    /// This is faster than FULL mode while still providing reasonable durability guarantees.
+    /// This performs a bounded FULL checkpoint and validates SQLite's
+    /// busy/log/checkpointed result. Partial checkpoints are failures: callers
+    /// must not advance an ACK/cursor or prune recovery secrets afterward.
     pub(crate) fn flush_database(&self) -> Result<(), MLSError> {
-        // Use PASSIVE checkpoint which is non-blocking
-        // It checkpoints as many frames as possible without waiting for readers/writers
-        // This avoids the main thread stalls caused by FULL checkpoints
         self.conn
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
-            .map_err(|e| {
-                crate::error_log!("[MANIFEST-STORAGE] Failed to WAL checkpoint: {:?}", e);
-                map_sqlite_error("wal_checkpoint(PASSIVE)", &e)
-            })?;
+            .busy_timeout(DURABILITY_CHECKPOINT_TIMEOUT)
+            .map_err(|e| map_sqlite_error("durability_checkpoint.busy_timeout", &e))?;
 
-        crate::debug_log!("[MANIFEST-STORAGE] ✅ Database checkpoint (PASSIVE) completed");
+        let checkpoint_result = self
+            .conn
+            .query_row("PRAGMA main.wal_checkpoint(FULL);", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|e| {
+                crate::error_log!(
+                    "[MANIFEST-STORAGE] Failed to run FULL WAL checkpoint: {:?}",
+                    e
+                );
+                map_sqlite_error("wal_checkpoint(FULL)", &e)
+            })
+            .and_then(|(busy, log, checkpointed)| {
+                validate_durability_checkpoint(busy, log, checkpointed)
+            });
+
+        let restore_result = self
+            .conn
+            .busy_timeout(NORMAL_BUSY_TIMEOUT)
+            .map_err(|e| map_sqlite_error("durability_checkpoint.restore_timeout", &e));
+
+        checkpoint_result?;
+        restore_result?;
+        crate::debug_log!("[MANIFEST-STORAGE] ✅ Database durability checkpoint (FULL) completed");
         Ok(())
     }
 
@@ -849,10 +896,6 @@ impl SqliteLibcruxProvider {
             storage,
         })
     }
-
-    pub fn storage_mut(&mut self) -> &mut HybridStorageProvider<JsonCodec> {
-        &mut self.storage
-    }
 }
 
 impl OpenMlsProvider for SqliteLibcruxProvider {
@@ -875,9 +918,19 @@ impl OpenMlsProvider for SqliteLibcruxProvider {
 
 // MlsProvider enum removed - use MLSContextVariant instead
 
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct PendingExternalJoin {
+    signer_public_key: Vec<u8>,
+    minted_signer_identity: Option<Vec<u8>>,
+}
+
 pub struct GroupState {
     pub group: MlsGroup,
     pub signer_public_key: Vec<u8>,
+    /// Present until the locally finalized External Commit is accepted by the
+    /// server. The nested identity exists only when this candidate minted its
+    /// signer and therefore owns signer cleanup on rejection.
+    pending_external_join: Option<PendingExternalJoin>,
 }
 
 pub struct MLSContext {
@@ -1035,15 +1088,19 @@ impl MLSContext {
                 MLSError::StorageFailed
             })?;
 
-        // Match manifest storage settings: WAL + fast sync + retry on contention
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
+        // Match manifest storage settings and require WAL to be active.
+        let journal_mode: String = connection
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
             .map_err(|e| {
                 crate::error_log!("[MLS-CONTEXT] Failed to set WAL mode: {:?}", e);
                 MLSError::StorageFailed
             })?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            crate::error_log!("[MLS-CONTEXT] Database rejected WAL mode: {}", journal_mode);
+            return Err(MLSError::StorageFailed);
+        }
         connection
-            .pragma_update(None, "synchronous", "NORMAL")
+            .pragma_update(None, "synchronous", "FULL")
             .map_err(|e| {
                 crate::error_log!("[MLS-CONTEXT] Failed to set synchronous mode: {:?}", e);
                 MLSError::StorageFailed
@@ -1065,12 +1122,10 @@ impl MLSContext {
                 MLSError::StorageFailed
             })?;
 
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| {
-                crate::error_log!("[MLS-CONTEXT] Failed to set busy_timeout: {:?}", e);
-                MLSError::StorageFailed
-            })?;
+        connection.busy_timeout(NORMAL_BUSY_TIMEOUT).map_err(|e| {
+            crate::error_log!("[MLS-CONTEXT] Failed to set busy_timeout: {:?}", e);
+            MLSError::StorageFailed
+        })?;
 
         // Create storage provider with JsonCodec
         let mut sqlite_storage = SqliteStorageProvider::<JsonCodec, Connection>::new(connection);
@@ -1209,16 +1264,22 @@ impl MLSContext {
                     {
                         // 🔍 CRITICAL FIX: Verify the SignatureKeyPair actually exists in OpenMLS storage
                         // Stale manifest entries (where keypair was lost) will be detected and cleaned up
-                        match SignatureKeyPair::read(
+                        let signer_available = SignatureKeyPair::read(
                             provider.storage(),
                             &public_key,
                             SignatureScheme::ED25519,
-                        ) {
-                            Some(_) => {
+                        )
+                        .is_some()
+                            || provider.storage().migrate_legacy_signature_key_pair(
+                                &public_key,
+                                SignatureScheme::ED25519,
+                            )?;
+                        match signer_available {
+                            true => {
                                 // Keypair exists in storage, this mapping is valid
                                 signers_by_identity.insert(identity, public_key);
                             }
-                            None => {
+                            false => {
                                 // Keypair NOT in storage - this is a stale mapping
                                 let identity_str = String::from_utf8_lossy(&identity);
                                 crate::error_log!("[MLS-CONTEXT] ⚠️ STALE SIGNER: {} -> {} (keypair not in storage, will be removed)", 
@@ -1264,6 +1325,10 @@ impl MLSContext {
         // 🔄 GROUP LOADING: Load all persisted groups from storage
         crate::info_log!("[MLS-CONTEXT] 🔄 Loading persisted groups...");
         let mut groups = HashMap::new();
+        let mut recovered_legacy_signers = false;
+        let mut pending_external_joins: HashMap<String, PendingExternalJoin> = manifest_storage
+            .read_manifest("pending_external_joins")?
+            .unwrap_or_default();
 
         match manifest_storage.read_manifest::<Vec<String>>("group_ids")? {
             Some(group_id_list) => {
@@ -1290,40 +1355,82 @@ impl MLSContext {
                                 crate::info_log!("[MLS-CONTEXT]   Epoch: {}", loaded_epoch);
                                 crate::info_log!("[MLS-CONTEXT]   Members: {}", loaded_members);
 
-                                // 🔑 CRITICAL FIX: Restore signer_public_key from signers_by_identity
-                                // Extract own credential from the group to find the correct signer
+                                // Restore the signer from an exact credential + leaf-key
+                                // binding. Legacy databases can predate the signer manifest;
+                                // recover those only when OpenMLS storage still proves possession
+                                // of the precise private key authenticated by the own leaf.
                                 let signer_public_key = if let Some(own_leaf) =
                                     group.own_leaf_node()
                                 {
                                     let own_credential = own_leaf.credential().serialized_content();
+                                    let leaf_signature_key =
+                                        own_leaf.signature_key().as_slice().to_vec();
 
-                                    // Look up signer public key by identity
                                     if let Some(pk) = signers_by_identity.get(own_credential) {
+                                        if pk != &leaf_signature_key {
+                                            crate::error_log!(
+                                                "[MLS-CONTEXT] Signer manifest does not match own leaf for group {}",
+                                                hex_id
+                                            );
+                                            return Err(MLSError::StorageFailed);
+                                        }
                                         crate::debug_log!(
                                             "[MLS-CONTEXT] ✅ Restored signer for group {}",
                                             hex_id
                                         );
                                         pk.clone()
+                                    } else if SignatureKeyPair::read(
+                                        provider.storage(),
+                                        &leaf_signature_key,
+                                        SignatureScheme::ED25519,
+                                    )
+                                    .is_some()
+                                    {
+                                        crate::info_log!(
+                                            "[MLS-CONTEXT] Recovering legacy signer manifest entry for group {}",
+                                            hex_id
+                                        );
+                                        signers_by_identity.insert(
+                                            own_credential.to_vec(),
+                                            leaf_signature_key.clone(),
+                                        );
+                                        recovered_legacy_signers = true;
+                                        leaf_signature_key
                                     } else {
-                                        crate::error_log!("[MLS-CONTEXT] ⚠️ No signer found for group {} credential", hex_id);
-                                        Vec::new()
+                                        crate::error_log!(
+                                            "[MLS-CONTEXT] No durable leaf-bound signer found for group {} credential",
+                                            hex_id
+                                        );
+                                        return Err(MLSError::StorageFailed);
                                     }
                                 } else {
                                     crate::error_log!(
-                                        "[MLS-CONTEXT] ⚠️ Group {} has no own leaf node",
+                                        "[MLS-CONTEXT] Group {} has no own leaf node",
                                         hex_id
                                     );
-                                    Vec::new()
+                                    return Err(MLSError::StorageFailed);
                                 };
 
                                 // Skip verification round-trip in production to speed up initialization
                                 // The double-load was only useful for debugging storage consistency
+                                let pending_external_join =
+                                    pending_external_joins.get(hex_id).cloned();
+                                if pending_external_join.as_ref().is_some_and(|pending| {
+                                    pending.signer_public_key != signer_public_key
+                                }) {
+                                    crate::error_log!(
+                                        "[MLS-CONTEXT] Pending external-join signer mismatch for group {}",
+                                        hex_id
+                                    );
+                                    return Err(MLSError::StorageFailed);
+                                }
 
                                 groups.insert(
                                     group_id_bytes,
                                     GroupState {
                                         group,
                                         signer_public_key,
+                                        pending_external_join,
                                     },
                                 );
                                 loaded_count += 1;
@@ -1369,6 +1476,25 @@ impl MLSContext {
                     "[MLS-CONTEXT] 📋 No groups found, starting with empty group cache"
                 );
             }
+        }
+
+        if recovered_legacy_signers {
+            let signer_manifest: HashMap<String, String> = signers_by_identity
+                .iter()
+                .map(|(identity, public_key)| (hex::encode(identity), hex::encode(public_key)))
+                .collect();
+            manifest_storage.write_manifest("signers", &signer_manifest)?;
+            manifest_storage.flush_database()?;
+        }
+
+        let pending_count_before = pending_external_joins.len();
+        pending_external_joins.retain(|hex_group_id, _| {
+            hex::decode(hex_group_id)
+                .ok()
+                .is_some_and(|group_id| groups.contains_key(&group_id))
+        });
+        if pending_external_joins.len() != pending_count_before {
+            manifest_storage.write_manifest("pending_external_joins", &pending_external_joins)?;
         }
 
         let manifest_interrupt_handle = manifest_storage.get_interrupt_handle();
@@ -1548,6 +1674,81 @@ impl MLSContext {
         Ok(())
     }
 
+    fn remove_group_id_from_manifest(&self, group_id: &[u8]) -> Result<(), MLSError> {
+        let hex_id = hex::encode(group_id);
+        if let Some(mut group_ids) = self
+            .manifest_storage
+            .read_manifest::<Vec<String>>("group_ids")?
+        {
+            group_ids.retain(|id| id != &hex_id);
+            self.manifest_storage
+                .write_manifest("group_ids", &group_ids)?;
+        }
+        Ok(())
+    }
+
+    fn persist_pending_external_join(
+        &self,
+        group_id: &[u8],
+        pending_join: &PendingExternalJoin,
+    ) -> Result<(), MLSError> {
+        let mut pending: HashMap<String, PendingExternalJoin> = self
+            .manifest_storage
+            .read_manifest("pending_external_joins")?
+            .unwrap_or_default();
+        pending.insert(hex::encode(group_id), pending_join.clone());
+        self.manifest_storage
+            .write_manifest("pending_external_joins", &pending)
+    }
+
+    fn remove_pending_external_join(&self, group_id: &[u8]) -> Result<(), MLSError> {
+        if let Some(mut pending) = self
+            .manifest_storage
+            .read_manifest::<HashMap<String, PendingExternalJoin>>("pending_external_joins")?
+        {
+            pending.remove(&hex::encode(group_id));
+            self.manifest_storage
+                .write_manifest("pending_external_joins", &pending)?;
+        }
+        Ok(())
+    }
+
+    /// Compensate a group that OpenMLS persisted before it was published in
+    /// the live map. Every cleanup component is attempted and the rollback is
+    /// durability-checked before success is reported.
+    pub(crate) fn rollback_unpublished_group(
+        &self,
+        group: &mut MlsGroup,
+        group_id: &[u8],
+        context: &str,
+    ) -> Result<(), MLSError> {
+        let mut failures = Vec::new();
+        if let Err(error) = group.delete(self.provider.storage()) {
+            failures.push(format!("OpenMLS delete: {error:?}"));
+        }
+        if let Err(error) = self.remove_group_id_from_manifest(group_id) {
+            failures.push(format!("manifest delete: {error:?}"));
+        }
+        if let Err(error) = self.remove_pending_external_join(group_id) {
+            failures.push(format!("pending external-join delete: {error:?}"));
+        }
+        if let Err(error) = self.flush_database() {
+            failures.push(format!("rollback durability barrier: {error:?}"));
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            crate::error_log!(
+                "[MLS-CONTEXT] {} rollback incomplete for group {}: {}",
+                context,
+                hex::encode(group_id),
+                failures.join("; ")
+            );
+            Err(MLSError::Internal(failures.join("; ")))
+        }
+    }
+
     /// Persist signer identity mapping for reload on restart
     fn persist_signer_mapping(&self, identity: &[u8], public_key: &[u8]) -> Result<(), MLSError> {
         let storage = &self.manifest_storage;
@@ -1567,6 +1768,77 @@ impl MLSContext {
         );
 
         Ok(())
+    }
+
+    fn remove_signer_mapping_from_manifest(
+        &self,
+        identity: &[u8],
+        expected_public_key: &[u8],
+    ) -> Result<(), MLSError> {
+        if let Some(mut signers) = self
+            .manifest_storage
+            .read_manifest::<HashMap<String, String>>("signers")?
+        {
+            let identity_hex = hex::encode(identity);
+            let expected_key_hex = hex::encode(expected_public_key);
+            if signers.get(&identity_hex) == Some(&expected_key_hex) {
+                signers.remove(&identity_hex);
+                self.manifest_storage.write_manifest("signers", &signers)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_external_join_candidate(
+        &self,
+        group: &mut MlsGroup,
+        group_id: &[u8],
+        identity: &[u8],
+        signer_public_key: &[u8],
+        signer_was_persisted: bool,
+    ) -> Result<(), MLSError> {
+        let mut failures = Vec::new();
+        if let Err(error) = group.delete(self.provider.storage()) {
+            failures.push(format!("OpenMLS delete: {error:?}"));
+        }
+        if let Err(error) = self.remove_group_id_from_manifest(group_id) {
+            failures.push(format!("group manifest delete: {error:?}"));
+        }
+        if let Err(error) = self.remove_pending_external_join(group_id) {
+            failures.push(format!("pending external-join delete: {error:?}"));
+        }
+        if signer_was_persisted {
+            if let Err(error) =
+                self.remove_signer_mapping_from_manifest(identity, signer_public_key)
+            {
+                failures.push(format!("signer manifest delete: {error:?}"));
+            }
+        }
+        if let Err(error) = self.flush_database() {
+            failures.push(format!("rollback durability barrier: {error:?}"));
+        }
+        // Signature key deletion is last: after it succeeds there is no later
+        // fallible cleanup step that could require the key for retry.
+        if signer_was_persisted {
+            if let Err(error) = SignatureKeyPair::delete(
+                self.provider.storage(),
+                signer_public_key,
+                SignatureScheme::ED25519,
+            ) {
+                failures.push(format!("signing key delete: {error:?}"));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            crate::error_log!(
+                "[MLS-CONTEXT] External-join rollback incomplete for group {}: {}",
+                hex::encode(group_id),
+                failures.join("; ")
+            );
+            Err(MLSError::Internal(failures.join("; ")))
+        }
     }
 
     pub fn export_group_info(
@@ -1606,669 +1878,299 @@ impl MLSContext {
         group_info_bytes: &[u8],
         identity: &str,
     ) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>), MLSError> {
-        crate::debug_log!(
-            "[MLS-CONTEXT] create_external_commit: Starting for identity '{}'",
-            identity
-        );
-
-        // 🔍 DIAGNOSTIC: Log GroupInfo details to debug InvalidVectorLength errors
-        crate::info_log!("[MLS-CONTEXT] create_external_commit: GroupInfo diagnostics:");
-        crate::info_log!("   - Total bytes: {}", group_info_bytes.len());
-        if group_info_bytes.len() >= 16 {
-            crate::info_log!("   - First 16 bytes: {:02x?}", &group_info_bytes[..16]);
-        } else {
-            crate::info_log!("   - All bytes (truncated): {:02x?}", group_info_bytes);
-        }
+        validate_inbound_mls_message_len(group_info_bytes.len(), "group_info")?;
         if group_info_bytes.is_empty() {
-            crate::error_log!("[MLS-CONTEXT] ❌ ERROR: GroupInfo is empty!");
             return Err(MLSError::invalid_input("GroupInfo is empty"));
         }
-
-        // 🔍 DIAGNOSTIC: Check for suspiciously small GroupInfo
-        // A valid MLS GroupInfo should be at least ~100 bytes (group_id, epoch, tree, etc.)
-        if group_info_bytes.len() < 100 {
-            crate::error_log!(
-                "[MLS-CONTEXT] ⚠️ WARNING: GroupInfo suspiciously small: {} bytes",
-                group_info_bytes.len()
-            );
-            crate::error_log!("[MLS-CONTEXT]    Valid GroupInfo typically >= 100 bytes");
-            crate::error_log!("[MLS-CONTEXT]    Raw bytes: {:02x?}", group_info_bytes);
-            // Don't fail yet - let deserialization provide the specific error
+        if identity.is_empty() {
+            return Err(MLSError::invalid_input("External-join identity is empty"));
         }
 
-        // 🔍 DIAGNOSTIC: Check for base64 encoding issues
-        // MLS GroupInfo is binary TLS-serialized data, NOT base64 ASCII text
-        // If all bytes are printable ASCII, it was likely not decoded from base64
-        let is_ascii_only = group_info_bytes.iter().all(|&b| {
-            (0x20..=0x7E).contains(&b) || b == 0x0A || b == 0x0D // printable ASCII + newlines
-        });
-        if is_ascii_only && group_info_bytes.len() > 50 {
-            crate::error_log!(
-                "[MLS-CONTEXT] ❌ ERROR: GroupInfo appears to be base64-encoded text!"
-            );
-            crate::error_log!(
-                "[MLS-CONTEXT]    All {} bytes are printable ASCII characters",
-                group_info_bytes.len()
-            );
-            crate::error_log!(
-                "[MLS-CONTEXT]    This suggests base64 decoding was skipped somewhere"
-            );
-            if let Ok(text_preview) =
-                std::str::from_utf8(&group_info_bytes[..std::cmp::min(100, group_info_bytes.len())])
-            {
-                crate::error_log!("[MLS-CONTEXT]    First 100 chars: {}", text_preview);
-            }
+        let (mls_message, remaining) = MlsMessageIn::tls_deserialize_bytes(group_info_bytes)
+            .map_err(|error| {
+                crate::error_log!(
+                    "[MLS-CONTEXT] Invalid GroupInfo envelope ({} bytes): {:?}",
+                    group_info_bytes.len(),
+                    error
+                );
+                MLSError::invalid_input("Invalid GroupInfo")
+            })?;
+        if !remaining.is_empty() {
             return Err(MLSError::invalid_input(
-                "GroupInfo appears to be base64-encoded - decoding may have been skipped",
+                "GroupInfo contains trailing unparsed bytes",
             ));
         }
-
-        // 1. Deserialize MlsMessageIn first (GroupInfo is wrapped in MLS message envelope)
-        // The export_group_info() function returns MlsMessageOut which serializes with:
-        //   - 2 bytes: protocol version (0x0001)
-        //   - 2 bytes: message type discriminant (0x0004 for GroupInfo)
-        //   - N bytes: the actual GroupInfo/VerifiableGroupInfo data
-        let (mls_message, _) =
-            MlsMessageIn::tls_deserialize_bytes(group_info_bytes).map_err(|e| {
-                crate::error_log!("[MLS-CONTEXT] ❌ ERROR: MlsMessageIn deserialization failed!");
-                crate::error_log!("[MLS-CONTEXT]    Error type: {:?}", e);
-                crate::error_log!(
-                    "[MLS-CONTEXT]    GroupInfo length: {} bytes",
-                    group_info_bytes.len()
-                );
-                crate::error_log!("[MLS-CONTEXT]    This typically indicates:");
-                crate::error_log!("[MLS-CONTEXT]    1. GroupInfo was corrupted during transport");
-                crate::error_log!("[MLS-CONTEXT]    2. GroupInfo format version mismatch");
-                crate::error_log!(
-                    "[MLS-CONTEXT]    3. Server stored/returned stale or invalid GroupInfo"
-                );
-                MLSError::invalid_input(format!(
-                    "Invalid GroupInfo ({} bytes): {:?}",
-                    group_info_bytes.len(),
-                    e
-                ))
-            })?;
-
-        // Extract the VerifiableGroupInfo from the MLS message body
         let verifiable_group_info = match mls_message.extract() {
-            MlsMessageBodyIn::GroupInfo(vgi) => {
-                crate::debug_log!(
-                    "[MLS-CONTEXT] ✅ Successfully extracted VerifiableGroupInfo from MlsMessage"
-                );
-                vgi
-            }
-            _other => {
-                crate::error_log!("[MLS-CONTEXT] ❌ ERROR: MlsMessage is not a GroupInfo!");
-                crate::error_log!(
-                    "[MLS-CONTEXT]    Expected GroupInfo variant, got different message type"
-                );
-                return Err(MLSError::invalid_input(
-                    "Expected MlsMessage containing GroupInfo, got different message type"
-                        .to_string(),
-                ));
-            }
-        };
-
-        // 2. Create credential
-        let credential = Credential::new(CredentialType::Basic, identity.as_bytes().to_vec());
-
-        // 3. Get or create signature keys (reuse existing keys for this identity)
-        crate::debug_log!("[MLS-CONTEXT] Getting or creating signature keys for identity...");
-        let (signature_keys, is_new_key) = match self.get_signer_for_identity(identity) {
-            Some(existing_signer) => {
-                crate::info_log!(
-                    "[MLS-CONTEXT] ✅ Reusing existing signature keypair for identity: {}",
-                    identity
-                );
-                (existing_signer, false)
-            }
-            None => {
-                crate::debug_log!(
-                    "[MLS-CONTEXT] No existing signer found, generating new signature keys..."
-                );
-                let new_keys = SignatureKeyPair::new(SignatureScheme::ED25519).map_err(|e| {
-                    crate::error_log!(
-                        "[MLS-CONTEXT] ERROR: Failed to create signature keys: {:?}",
-                        e
-                    );
-                    MLSError::OpenMLS(format!(
-                        "create_external_commit: Failed to create signature keys: {:?}",
-                        e
-                    ))
-                })?;
-
-                new_keys.store(self.provider.storage()).map_err(|e| {
-                    crate::error_log!(
-                        "[MLS-CONTEXT] ERROR: Failed to store signature keys: {:?}",
-                        e
-                    );
-                    MLSError::OpenMLS(format!(
-                        "create_external_commit: Failed to store signature keys: {:?}",
-                        e
-                    ))
-                })?;
-                crate::debug_log!("[MLS-CONTEXT] Signature keys generated and stored");
-
-                (new_keys, true)
-            }
-        };
-
-        // 4. Create join config
-        let join_config = MlsGroupJoinConfig::builder()
-            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
-            .use_ratchet_tree_extension(true)
-            .build();
-
-        // 5. Create external commit using builder pattern (replaces deprecated join_by_external_commit)
-        let (group, commit_message_bundle) = MlsGroup::external_commit_builder()
-            .with_config(join_config)
-            .build_group(
-                &self.provider,
-                verifiable_group_info,
-                CredentialWithKey {
-                    credential,
-                    signature_key: signature_keys.public().into(),
-                },
-            )
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] ERROR: external_commit_builder build_group failed: {:?}",
-                    e
-                );
-                MLSError::OpenMLS(format!(
-                    "external_commit_builder build_group failed: {:?}",
-                    e
-                ))
-            })?
-            .leaf_node_parameters(
-                LeafNodeParameters::builder()
-                    .with_capabilities(metadata_leaf_capabilities())
-                    .build(),
-            )
-            .load_psks(self.provider.storage())
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] ERROR: external_commit_builder load_psks failed: {:?}",
-                    e
-                );
-                MLSError::OpenMLS(format!("external_commit_builder load_psks failed: {:?}", e))
-            })?
-            .build(
-                self.provider.rand(),
-                self.provider.crypto(),
-                &signature_keys,
-                |_| true, // accept all proposals
-            )
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] ERROR: external_commit_builder build failed: {:?}",
-                    e
-                );
-                MLSError::OpenMLS(format!("external_commit_builder build failed: {:?}", e))
-            })?
-            .finalize(&self.provider)
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] ERROR: external_commit_builder finalize failed: {:?}",
-                    e
-                );
-                MLSError::OpenMLS(format!("external_commit_builder finalize failed: {:?}", e))
-            })?;
-
-        let commit = commit_message_bundle.commit();
-
-        // 6. Store group state
-        let group_id = group.group_id().as_slice().to_vec();
-        self.groups.insert(
-            group_id.clone(),
-            GroupState {
-                group,
-                signer_public_key: signature_keys.public().to_vec(),
-            },
-        );
-
-        // Persist
-        self.persist_group_id(&group_id).map_err(|e| {
-            crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist group ID: {:?}", e);
-            MLSError::Internal(format!("Failed to persist group ID: {:?}", e))
-        })?;
-
-        // Only persist signer mapping if we created a new key
-        if is_new_key {
-            self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())
-                .map_err(|e| {
-                    crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist signer mapping: {:?}", e);
-                    MLSError::Internal(format!("Failed to persist signer mapping: {:?}", e))
-                })?;
-            crate::debug_log!("[MLS-CONTEXT] Persisted new signer mapping for identity");
-        } else {
-            crate::debug_log!(
-                "[MLS-CONTEXT] Signer already registered for identity, not persisting"
-            );
-        }
-
-        // Return commit bytes (to send to server) and group ID
-        let commit_bytes = TlsSerialize::tls_serialize_detached(&commit)
-            .map_err(|_| MLSError::SerializationError)?;
-
-        // Export GroupInfo from the newly created group so it can be sent to the server
-        let exported_group_info = {
-            let gs = self.groups.get(&group_id);
-            match gs {
-                Some(gs) => {
-                    match gs.group.export_group_info(
-                        self.provider.crypto(),
-                        &signature_keys,
-                        true, // with ratchet tree
-                    ) {
-                        Ok(gi_out) => match TlsSerialize::tls_serialize_detached(&gi_out) {
-                            Ok(bytes) => {
-                                crate::debug_log!(
-                                        "[MLS-CONTEXT] Exported GroupInfo after external commit: {} bytes",
-                                        bytes.len()
-                                    );
-                                Some(bytes)
-                            }
-                            Err(e) => {
-                                crate::warn_log!(
-                                    "[MLS-CONTEXT] Failed to serialize exported GroupInfo: {:?}",
-                                    e
-                                );
-                                None
-                            }
-                        },
-                        Err(e) => {
-                            crate::warn_log!(
-                                "[MLS-CONTEXT] Failed to export GroupInfo after external commit: {:?}", e
-                            );
-                            None
-                        }
-                    }
-                }
-                None => None,
-            }
-        };
-
-        crate::debug_log!("[MLS-CONTEXT] create_external_commit: Complete");
-        Ok((commit_bytes, group_id, exported_group_info))
-    }
-
-    pub fn create_external_commit_with_psk(
-        &mut self,
-        group_info_bytes: &[u8],
-        identity: &str,
-        psk_bytes: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), MLSError> {
-        crate::debug_log!(
-            "[MLS-CONTEXT] create_external_commit_with_psk: Starting for identity '{}'",
-            identity
-        );
-        crate::debug_log!("[MLS-CONTEXT] PSK length: {} bytes", psk_bytes.len());
-
-        // Note: OpenMLS 0.7.1's external commit mechanism with PSK requires using the new builder API
-        // or manually creating PSK proposals. The deprecated join_by_external_commit doesn't support
-        // PSK directly. For now, we'll create the PSK ID and store it for potential future use.
-        //
-        // A full implementation would require:
-        // 1. Using MlsGroup::external_commit_builder() (the non-deprecated API)
-        // 2. Adding a PSK proposal to the external commit
-        // 3. Ensuring both joiner and existing members have the PSK stored
-        //
-        // For this initial implementation, we'll create the external commit normally
-        // and document that PSK support requires the builder API (OpenMLS 0.7.1+).
-
-        // 🔍 DIAGNOSTIC: Log GroupInfo details to debug InvalidVectorLength errors
-        crate::info_log!("[MLS-CONTEXT] create_external_commit_with_psk: GroupInfo diagnostics:");
-        crate::info_log!("   - Total bytes: {}", group_info_bytes.len());
-        if group_info_bytes.len() >= 16 {
-            crate::info_log!("   - First 16 bytes: {:02x?}", &group_info_bytes[..16]);
-        } else {
-            crate::info_log!("   - All bytes (truncated): {:02x?}", group_info_bytes);
-        }
-        if group_info_bytes.is_empty() {
-            crate::error_log!("[MLS-CONTEXT] ❌ ERROR: GroupInfo is empty!");
-            return Err(MLSError::invalid_input("GroupInfo is empty"));
-        }
-
-        // 🔍 DIAGNOSTIC: Check for suspiciously small GroupInfo
-        if group_info_bytes.len() < 100 {
-            crate::error_log!(
-                "[MLS-CONTEXT] ⚠️ WARNING: GroupInfo suspiciously small: {} bytes",
-                group_info_bytes.len()
-            );
-            crate::error_log!("[MLS-CONTEXT]    Valid GroupInfo typically >= 100 bytes");
-            crate::error_log!("[MLS-CONTEXT]    Raw bytes: {:02x?}", group_info_bytes);
-        }
-
-        // 🔍 DIAGNOSTIC: Check for base64 encoding issues
-        let is_ascii_only = group_info_bytes
-            .iter()
-            .all(|&b| (0x20..=0x7E).contains(&b) || b == 0x0A || b == 0x0D);
-        if is_ascii_only && group_info_bytes.len() > 50 {
-            crate::error_log!(
-                "[MLS-CONTEXT] ❌ ERROR: GroupInfo appears to be base64-encoded text!"
-            );
-            crate::error_log!(
-                "[MLS-CONTEXT]    All {} bytes are printable ASCII characters",
-                group_info_bytes.len()
-            );
-            crate::error_log!(
-                "[MLS-CONTEXT]    This suggests base64 decoding was skipped somewhere"
-            );
-            if let Ok(text_preview) =
-                std::str::from_utf8(&group_info_bytes[..std::cmp::min(100, group_info_bytes.len())])
-            {
-                crate::error_log!("[MLS-CONTEXT]    First 100 chars: {}", text_preview);
-            }
-            return Err(MLSError::invalid_input(
-                "GroupInfo appears to be base64-encoded - decoding may have been skipped",
-            ));
-        }
-
-        // 1. Deserialize MlsMessageIn first (GroupInfo is wrapped in MLS message envelope)
-        let (mls_message, _) =
-            MlsMessageIn::tls_deserialize_bytes(group_info_bytes).map_err(|e| {
-                crate::error_log!("[MLS-CONTEXT] ❌ ERROR: MlsMessageIn deserialization failed!");
-                crate::error_log!("[MLS-CONTEXT]    Error type: {:?}", e);
-                crate::error_log!(
-                    "[MLS-CONTEXT]    GroupInfo length: {} bytes",
-                    group_info_bytes.len()
-                );
-                MLSError::invalid_input(format!(
-                    "Invalid GroupInfo ({} bytes): {:?}",
-                    group_info_bytes.len(),
-                    e
-                ))
-            })?;
-
-        // Extract the VerifiableGroupInfo from the MLS message body
-        let verifiable_group_info = match mls_message.extract() {
-            MlsMessageBodyIn::GroupInfo(vgi) => {
-                crate::debug_log!(
-                    "[MLS-CONTEXT] ✅ Successfully extracted VerifiableGroupInfo from MlsMessage"
-                );
-                vgi
-            }
+            MlsMessageBodyIn::GroupInfo(group_info) => group_info,
             _ => {
-                crate::error_log!("[MLS-CONTEXT] ❌ ERROR: MlsMessage is not a GroupInfo!");
                 return Err(MLSError::invalid_input(
                     "Expected MlsMessage containing GroupInfo",
                 ));
             }
         };
 
-        // 2. Create credential
+        let advertised_group_id = verifiable_group_info.group_id().as_slice().to_vec();
+        if self.groups.contains_key(&advertised_group_id) {
+            return Err(MLSError::InvalidState(format!(
+                "Cannot stage an external join over live group {}",
+                hex::encode(&advertised_group_id)
+            )));
+        }
+
         let credential = Credential::new(CredentialType::Basic, identity.as_bytes().to_vec());
-
-        // 3. Get or create signature keys (reuse existing keys for this identity)
-        crate::debug_log!("[MLS-CONTEXT] Getting or creating signature keys for identity...");
         let (signature_keys, is_new_key) = match self.get_signer_for_identity(identity) {
-            Some(existing_signer) => {
-                crate::info_log!(
-                    "[MLS-CONTEXT] ✅ Reusing existing signature keypair for identity: {}",
-                    identity
-                );
-                (existing_signer, false)
-            }
+            Some(existing_signer) => (existing_signer, false),
             None => {
-                crate::debug_log!(
-                    "[MLS-CONTEXT] No existing signer found, generating new signature keys..."
-                );
-                let new_keys = SignatureKeyPair::new(SignatureScheme::ED25519).map_err(|e| {
-                    crate::error_log!(
-                        "[MLS-CONTEXT] ERROR: Failed to create signature keys: {:?}",
-                        e
-                    );
-                    MLSError::OpenMLS(format!(
-                        "create_external_commit_with_psk: Failed to create signature keys: {:?}",
-                        e
-                    ))
-                })?;
-
-                new_keys.store(self.provider.storage()).map_err(|e| {
-                    crate::error_log!(
-                        "[MLS-CONTEXT] ERROR: Failed to store signature keys: {:?}",
-                        e
-                    );
-                    MLSError::OpenMLS(format!(
-                        "create_external_commit_with_psk: Failed to store signature keys: {:?}",
-                        e
-                    ))
-                })?;
-                crate::debug_log!("[MLS-CONTEXT] Signature keys generated and stored");
-
+                let new_keys =
+                    SignatureKeyPair::new(SignatureScheme::ED25519).map_err(|error| {
+                        MLSError::OpenMLS(format!(
+                            "create_external_commit: failed to create signing key: {error:?}"
+                        ))
+                    })?;
                 (new_keys, true)
             }
         };
 
-        // 4. Store PSK for later retrieval
-        // Create a deterministic PSK ID based on the PSK bytes
-        let psk_hash = {
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(psk_bytes);
-            hex::encode(hasher.finalize())
-        };
-
-        crate::debug_log!("[MLS-CONTEXT] PSK ID (hash): {}", psk_hash);
-
-        // Store the PSK in manifest storage for later use
-        // This allows the application to retrieve it when needed
-        let mut psk_map: HashMap<String, Vec<u8>> = self
-            .manifest_storage
-            .read_manifest("psks")?
-            .unwrap_or_else(HashMap::new);
-
-        psk_map.insert(psk_hash.clone(), psk_bytes.to_vec());
-        self.manifest_storage.write_manifest("psks", &psk_map)?;
-
-        crate::debug_log!("[MLS-CONTEXT] PSK stored in manifest");
-
-        // 5. Create join config
         let join_config = MlsGroupJoinConfig::builder()
             .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
             .build();
 
-        // 6. Create external commit with PSK using builder pattern
-        let (group, commit_message_bundle) = MlsGroup::external_commit_builder()
-            .with_config(join_config)
-            .build_group(
-                &self.provider,
-                verifiable_group_info,
-                CredentialWithKey {
-                    credential,
-                    signature_key: signature_keys.public().into(),
-                },
-            )
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] ERROR: external_commit_builder build_group failed: {:?}",
-                    e
-                );
+        let build_result = (|| {
+            let builder = MlsGroup::external_commit_builder()
+                .with_config(join_config)
+                .build_group(
+                    &self.provider,
+                    verifiable_group_info,
+                    CredentialWithKey {
+                        credential,
+                        signature_key: signature_keys.public().into(),
+                    },
+                )
+                .map_err(|error| {
+                    MLSError::OpenMLS(format!(
+                        "external_commit_builder build_group failed: {error:?}"
+                    ))
+                })?;
+            let builder = builder
+                .leaf_node_parameters(
+                    LeafNodeParameters::builder()
+                        .with_capabilities(metadata_leaf_capabilities())
+                        .build(),
+                )
+                .load_psks(self.provider.storage())
+                .map_err(|error| {
+                    MLSError::OpenMLS(format!(
+                        "external_commit_builder load_psks failed: {error:?}"
+                    ))
+                })?;
+            let builder = builder
+                .build(
+                    self.provider.rand(),
+                    self.provider.crypto(),
+                    &signature_keys,
+                    |_| true,
+                )
+                .map_err(|error| {
+                    MLSError::OpenMLS(format!("external_commit_builder build failed: {error:?}"))
+                })?;
+            builder.finalize(&self.provider).map_err(|error| {
                 MLSError::OpenMLS(format!(
-                    "external_commit_builder (with PSK) build_group failed: {:?}",
-                    e
+                    "external_commit_builder finalize failed: {error:?}"
                 ))
-            })?
-            .leaf_node_parameters(
-                LeafNodeParameters::builder()
-                    .with_capabilities(metadata_leaf_capabilities())
-                    .build(),
-            )
-            .load_psks(self.provider.storage())
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] ERROR: external_commit_builder load_psks failed: {:?}",
-                    e
-                );
-                MLSError::OpenMLS(format!(
-                    "external_commit_builder (with PSK) load_psks failed: {:?}",
-                    e
-                ))
-            })?
-            .build(
-                self.provider.rand(),
-                self.provider.crypto(),
-                &signature_keys,
-                |_| true, // accept all proposals
-            )
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] ERROR: external_commit_builder build failed: {:?}",
-                    e
-                );
-                MLSError::OpenMLS(format!(
-                    "external_commit_builder (with PSK) build failed: {:?}",
-                    e
-                ))
-            })?
-            .finalize(&self.provider)
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MLS-CONTEXT] ERROR: external_commit_builder finalize failed: {:?}",
-                    e
-                );
-                MLSError::OpenMLS(format!(
-                    "external_commit_builder (with PSK) finalize failed: {:?}",
-                    e
-                ))
-            })?;
+            })
+        })();
 
-        let commit = commit_message_bundle.commit();
+        let (mut group, commit_message_bundle) = build_result?;
 
-        // 7. Store group state
         let group_id = group.group_id().as_slice().to_vec();
+        if group_id != advertised_group_id {
+            let primary_error =
+                MLSError::InvalidState("External-commit group ID changed during validation".into());
+            let rollback_error = self
+                .rollback_external_join_candidate(
+                    &mut group,
+                    &group_id,
+                    identity.as_bytes(),
+                    signature_keys.public(),
+                    false,
+                )
+                .err();
+            return match rollback_error {
+                Some(error) => Err(MLSError::Internal(format!(
+                    "{primary_error}; rollback failed ({error})"
+                ))),
+                None => Err(primary_error),
+            };
+        }
+
+        // Produce every caller-visible artifact before publishing the group.
+        let commit_bytes = match commit_message_bundle.commit().tls_serialize_detached() {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                let primary_error = MLSError::SerializationError;
+                let rollback_error = self
+                    .rollback_external_join_candidate(
+                        &mut group,
+                        &group_id,
+                        identity.as_bytes(),
+                        signature_keys.public(),
+                        false,
+                    )
+                    .err();
+                return match rollback_error {
+                    Some(error) => Err(MLSError::Internal(format!(
+                        "{primary_error}; rollback failed ({error})"
+                    ))),
+                    None => Err(primary_error),
+                };
+            }
+        };
+        let exported_group_info = group
+            .export_group_info(self.provider.crypto(), &signature_keys, true)
+            .ok()
+            .and_then(|group_info| group_info.tls_serialize_detached().ok());
+
+        let pending_external_join = PendingExternalJoin {
+            signer_public_key: signature_keys.public().to_vec(),
+            minted_signer_identity: is_new_key.then(|| identity.as_bytes().to_vec()),
+        };
+        let durable_preparation = (|| -> Result<(), MLSError> {
+            if is_new_key {
+                signature_keys
+                    .store(self.provider.storage())
+                    .map_err(|error| {
+                        MLSError::OpenMLS(format!(
+                            "create_external_commit: failed to store signing key: {error:?}"
+                        ))
+                    })?;
+                self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())?;
+            }
+            self.persist_group_id(&group_id)?;
+            self.persist_pending_external_join(&group_id, &pending_external_join)?;
+            self.flush_database()
+        })();
+        if let Err(primary_error) = durable_preparation {
+            let rollback_error = self
+                .rollback_external_join_candidate(
+                    &mut group,
+                    &group_id,
+                    identity.as_bytes(),
+                    signature_keys.public(),
+                    is_new_key,
+                )
+                .err();
+            return match rollback_error {
+                Some(error) => Err(MLSError::Internal(format!(
+                    "external-commit preparation failed ({primary_error}); rollback failed ({error})"
+                ))),
+                None => Err(primary_error),
+            };
+        }
+
+        // Publication is the final, infallible step after serialization,
+        // manifest persistence, and the checked durability barrier.
+        if is_new_key {
+            self.signers_by_identity.insert(
+                identity.as_bytes().to_vec(),
+                signature_keys.public().to_vec(),
+            );
+        }
         self.groups.insert(
             group_id.clone(),
             GroupState {
                 group,
                 signer_public_key: signature_keys.public().to_vec(),
+                pending_external_join: Some(pending_external_join),
             },
         );
 
-        // Persist
-        self.persist_group_id(&group_id).map_err(|e| {
-            crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist group ID: {:?}", e);
-            MLSError::Internal(format!("Failed to persist group ID: {:?}", e))
-        })?;
-
-        // Only persist signer mapping if we created a new key
-        if is_new_key {
-            self.persist_signer_mapping(identity.as_bytes(), signature_keys.public())
-                .map_err(|e| {
-                    crate::error_log!("[MLS-CONTEXT] ⚠️ Failed to persist signer mapping: {:?}", e);
-                    MLSError::Internal(format!("Failed to persist signer mapping: {:?}", e))
-                })?;
-            crate::debug_log!("[MLS-CONTEXT] Persisted new signer mapping for identity");
-        } else {
-            crate::debug_log!(
-                "[MLS-CONTEXT] Signer already registered for identity, not persisting"
-            );
-        }
-
-        // Return commit bytes (to send to server) and group ID
-        let commit_bytes = TlsSerialize::tls_serialize_detached(&commit)
-            .map_err(|_| MLSError::SerializationError)?;
-
-        crate::debug_log!("[MLS-CONTEXT] create_external_commit_with_psk: Complete");
-        Ok((commit_bytes, group_id))
+        Ok((commit_bytes, group_id, exported_group_info))
     }
-
-    /// Discard a pending external join after server rejection.
+    pub fn create_external_commit_with_psk(
+        &mut self,
+        group_info_bytes: &[u8],
+        _identity: &str,
+        _psk_bytes: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), MLSError> {
+        validate_inbound_mls_message_len(group_info_bytes.len(), "group_info")?;
+        Err(MLSError::OperationNotSupported {
+            reason: "PSK external commits are disabled: this implementation does not yet cryptographically bind the supplied PSK into the MLS commit".to_string(),
+        })
+    }
+    /// Discard a locally staged external join after server rejection.
     ///
-    /// CRITICAL: Call this when the delivery service rejects an external commit.
-    /// This cleans up:
-    /// - The MlsGroup instance
-    /// - Signature keypairs generated for the join
-    /// - Manifest entries
-    /// - Epoch secret storage
-    ///
-    /// # Arguments
-    /// * `group_id` - Group identifier from the rejected external commit
-    ///
-    /// # Returns
-    /// Ok(()) if cleanup succeeded, Err if group not found or cleanup failed
+    /// Persistent group state and any signer minted solely for this candidate
+    /// are durably removed before the live maps publish absence. Failures keep
+    /// the maps and ownership marker so the caller can retry cleanup.
     pub fn discard_pending_external_join(&mut self, group_id: &[u8]) -> Result<(), MLSError> {
-        crate::info_log!(
-            "[MLS-CONTEXT] discard_pending_external_join: Cleaning up rejected join for group {}",
-            hex::encode(group_id)
-        );
-
-        let gid = GroupId::from_slice(group_id);
-
-        // 1. Get the group state to find associated signer
-        let signer_public_key = self
+        let state = self
             .groups
             .get(group_id)
-            .map(|state| state.signer_public_key.clone());
+            .ok_or_else(|| MLSError::group_not_found(hex::encode(group_id)))?;
+        let signer_public_key = state.signer_public_key.clone();
+        let pending_join = state.pending_external_join.as_ref().ok_or_else(|| {
+            MLSError::InvalidState("Group is not a pending external-join candidate".to_string())
+        })?;
+        if pending_join.signer_public_key != signer_public_key {
+            return Err(MLSError::StorageFailed);
+        }
+        let pending_identity = pending_join.minted_signer_identity.clone();
 
-        // 2. Remove from groups HashMap
-        if self.groups.remove(group_id).is_none() {
-            crate::warn_log!(
-                "[MLS-CONTEXT] Group not found for discard: {}",
-                hex::encode(group_id)
-            );
-            return Err(MLSError::group_not_found(hex::encode(group_id)));
+        let signer_is_used_by_other_group = self.groups.iter().any(|(other_id, state)| {
+            other_id.as_slice() != group_id && state.signer_public_key == signer_public_key
+        });
+        let signer_is_used_by_key_package = self.key_package_bundles.values().any(|bundle| {
+            bundle.key_package().leaf_node().signature_key().as_slice()
+                == signer_public_key.as_slice()
+        });
+        let delete_candidate_signer = pending_identity.is_some()
+            && !signer_is_used_by_other_group
+            && !signer_is_used_by_key_package;
+
+        // OpenMLS's complete deletion routine includes proposal queues,
+        // application export trees, and encryption epoch keypairs.
+        {
+            let (groups, provider) = (&mut self.groups, &self.provider);
+            let state = groups
+                .get_mut(group_id)
+                .ok_or_else(|| MLSError::group_not_found(hex::encode(group_id)))?;
+            state.group.delete(provider.storage())?;
         }
 
-        // 3. Delete from OpenMLS storage
-        // Manually delete group data since MlsGroup::delete is an instance method
-        let storage = self.provider.storage_mut();
+        if delete_candidate_signer {
+            let identity = pending_identity
+                .as_deref()
+                .expect("delete_candidate_signer requires an identity");
+            self.remove_signer_mapping_from_manifest(identity, &signer_public_key)?;
+        }
+        self.remove_group_id_from_manifest(group_id)?;
+        self.remove_pending_external_join(group_id)?;
 
-        // Best-effort deletion of all group components
-        let _ = storage.delete_group_state(&gid);
-        let _ = storage.delete_tree(&gid);
-        let _ = storage.delete_confirmation_tag(&gid);
-        let _ = storage.delete_interim_transcript_hash(&gid);
-        let _ = storage.delete_context(&gid);
-        let _ = storage.delete_message_secrets(&gid);
-        let _ = storage.delete_all_resumption_psk_secrets(&gid);
-        let _ = storage.delete_own_leaf_index(&gid);
-        let _ = storage.delete_group_epoch_secrets(&gid);
-        let _ = storage.delete_own_leaf_nodes(&gid);
-        let _ = storage.delete_group_config(&gid);
-
-        // 4. Remove from manifest
-        let storage = &self.manifest_storage;
-        if let Ok(Some(mut group_ids)) = storage.read_manifest::<Vec<String>>("group_ids") {
-            let hex_id = hex::encode(group_id);
-            group_ids.retain(|id| id != &hex_id);
-            let _ = storage.write_manifest("group_ids", &group_ids);
+        self.flush_database()?;
+        if delete_candidate_signer {
+            // Last fallible step. With synchronous=FULL the SQLite deletion
+            // commit is itself durable; no later checkpoint can strand a
+            // consumed retry token after key deletion succeeds.
+            SignatureKeyPair::delete(
+                self.provider.storage(),
+                &signer_public_key,
+                SignatureScheme::ED25519,
+            )?;
         }
 
-        // 5. Clean up signature keypair if it was newly created for this join
-        // Note: Only delete if no other groups use this signer
-        if let Some(pk) = signer_public_key {
-            let other_groups_use_signer = self
-                .groups
-                .values()
-                .any(|state| state.signer_public_key == pk);
-
-            if !other_groups_use_signer {
-                // Delete from storage
-                if let Some(identity) = self
-                    .signers_by_identity
-                    .iter()
-                    .find(|(_, v)| **v == pk)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.signers_by_identity.remove(&identity);
-                    // Remove from manifest
-                    if let Ok(Some(mut signers)) =
-                        storage.read_manifest::<HashMap<String, String>>("signers")
-                    {
-                        signers.remove(&hex::encode(&identity));
-                        let _ = storage.write_manifest("signers", &signers);
-                    }
-                }
+        self.groups.remove(group_id);
+        if delete_candidate_signer {
+            let identity = pending_identity.expect("candidate identity checked above");
+            if self.signers_by_identity.get(&identity) == Some(&signer_public_key) {
+                self.signers_by_identity.remove(&identity);
             }
         }
 
-        // 6. Flush to ensure cleanup is persisted
-        self.flush_database()?;
-
-        crate::info_log!("[MLS-CONTEXT] ✅ Successfully cleaned up rejected external join");
+        crate::info_log!(
+            "[MLS-CONTEXT] Rejected external join durably removed for group {}",
+            hex::encode(group_id)
+        );
         Ok(())
     }
 
@@ -2467,14 +2369,60 @@ impl MLSContext {
 
         // Fail-closed: if we can't export the epoch secret, we shouldn't create the group
         // because we won't be able to decrypt our own messages if the epoch advances.
-        crate::async_runtime::block_on(
+        if let Err(export_error) = crate::async_runtime::block_on(
             self.epoch_secret_manager
                 .export_current_epoch_secret(&mut group, &self.provider),
-        )
-        .map_err(|e| {
-            crate::error_log!("[MLS-CONTEXT] ❌ Failed to export epoch secret: {:?}", e);
-            MLSError::StorageFailed
-        })?;
+        ) {
+            crate::error_log!(
+                "[MLS-CONTEXT] Failed to durably export the initial epoch secret; rolling back group creation: {:?}",
+                export_error
+            );
+
+            // OpenMLS persists a newly-created group before returning it from
+            // `MlsGroup::new[_with_group_id]`. If the epoch-secret durability
+            // boundary fails, remove that state before returning; otherwise a
+            // deterministic-ID retry collides with an invisible, half-created
+            // group that was never published in `self.groups`.
+            let delete_result = group.delete(self.provider.storage());
+            let flush_result = self.flush_database();
+
+            match (delete_result, flush_result) {
+                (Err(delete_error), Err(flush_error)) => {
+                    crate::error_log!(
+                        "[MLS-CONTEXT] Group-creation rollback failed to delete OpenMLS state ({:?}) and flush the database ({:?})",
+                        delete_error,
+                        flush_error
+                    );
+                    return Err(MLSError::Internal(format!(
+                        "Failed to roll back group creation after epoch-secret persistence failure: OpenMLS delete failed: {:?}; database flush failed: {:?}",
+                        delete_error, flush_error
+                    )));
+                }
+                (Err(delete_error), Ok(())) => {
+                    crate::error_log!(
+                        "[MLS-CONTEXT] Failed to delete OpenMLS state while rolling back group creation: {:?}",
+                        delete_error
+                    );
+                    return Err(MLSError::Internal(format!(
+                        "Failed to roll back group creation after epoch-secret persistence failure: OpenMLS delete failed: {:?}",
+                        delete_error
+                    )));
+                }
+                (Ok(()), Err(flush_error)) => {
+                    crate::error_log!(
+                        "[MLS-CONTEXT] Failed to flush group-creation rollback: {:?}",
+                        flush_error
+                    );
+                    return Err(MLSError::Internal(format!(
+                        "Failed to roll back group creation after epoch-secret persistence failure: database flush failed: {:?}",
+                        flush_error
+                    )));
+                }
+                (Ok(()), Ok(())) => {}
+            }
+
+            return Err(export_error);
+        }
 
         crate::debug_log!(
             "[MLS-CONTEXT] ✅ Exported epoch {} secret successfully",
@@ -2486,6 +2434,7 @@ impl MLSContext {
             GroupState {
                 group,
                 signer_public_key: signature_keys.public().to_vec(),
+                pending_external_join: None,
             },
         );
         crate::debug_log!("[MLS-CONTEXT] Group state stored");
@@ -2607,7 +2556,7 @@ impl MLSContext {
         })
     }
 
-    pub fn add_group(&mut self, group: MlsGroup, identity: &str) -> Result<(), MLSError> {
+    pub fn add_group(&mut self, mut group: MlsGroup, identity: &str) -> Result<(), MLSError> {
         crate::debug_log!("[ADD-GROUP] Adding group for identity: {}", identity);
         crate::debug_log!(
             "[ADD-GROUP]   Available signers: {} entries",
@@ -2629,65 +2578,63 @@ impl MLSContext {
             }
         }
 
-        let signer_pk = self
-            .signers_by_identity
-            .get(identity.as_bytes())
-            .ok_or_else(|| {
-                crate::error_log!("[ADD-GROUP] No signer found for identity: {}", identity);
-                crate::error_log!(
-                    "[ADD-GROUP]   Identity bytes (hex): {}",
-                    hex::encode(identity.as_bytes())
-                );
-                MLSError::group_not_found(format!("No signer for identity: {}", identity))
-            })?
-            .clone();
+        let group_id = group.group_id().as_slice().to_vec();
+        let preparation = (|| -> Result<Vec<u8>, MLSError> {
+            let signer_pk = self
+                .signers_by_identity
+                .get(identity.as_bytes())
+                .ok_or_else(|| {
+                    crate::error_log!("[ADD-GROUP] No signer found for identity: {}", identity);
+                    MLSError::group_not_found(format!("No signer for identity: {}", identity))
+                })?
+                .clone();
 
-        crate::debug_log!(
-            "[ADD-GROUP] Found signer with public key: {}",
-            hex::encode(&signer_pk)
-        );
-
-        // Verify the signer can be loaded from storage
-        match SignatureKeyPair::read(
-            self.provider.storage(),
-            &signer_pk,
-            SignatureScheme::ED25519,
-        ) {
-            Some(_) => {
-                crate::debug_log!("[ADD-GROUP] Signer verified in storage");
-            }
-            None => {
+            if SignatureKeyPair::read(
+                self.provider.storage(),
+                &signer_pk,
+                SignatureScheme::ED25519,
+            )
+            .is_none()
+            {
                 crate::error_log!(
-                    "[ADD-GROUP] CRITICAL: Signer NOT found in storage! PK: {}",
+                    "[ADD-GROUP] Signer keypair missing from storage for public key {}",
                     hex::encode(&signer_pk)
                 );
+                return Err(MLSError::StorageFailed);
+            }
+
+            self.persist_group_id(&group_id)?;
+            self.flush_database()?;
+            Ok(signer_pk)
+        })();
+
+        match preparation {
+            Ok(signer_pk) => {
+                crate::debug_log!(
+                    "[ADD-GROUP] Publishing durable group {} with signer PK: {}",
+                    hex::encode(&group_id),
+                    hex::encode(&signer_pk)
+                );
+                self.groups.insert(
+                    group_id,
+                    GroupState {
+                        group,
+                        signer_public_key: signer_pk,
+                        pending_external_join: None,
+                    },
+                );
+                Ok(())
+            }
+            Err(primary_error) => {
+                let rollback = self.rollback_unpublished_group(&mut group, &group_id, "add_group");
+                if let Err(rollback_error) = rollback {
+                    return Err(MLSError::Internal(format!(
+                        "add_group failed ({primary_error}); rollback also failed ({rollback_error})"
+                    )));
+                }
+                Err(primary_error)
             }
         }
-
-        let group_id = group.group_id().as_slice().to_vec();
-        crate::debug_log!(
-            "[ADD-GROUP] Storing group {} with signer PK: {}",
-            hex::encode(&group_id),
-            hex::encode(&signer_pk)
-        );
-        self.groups.insert(
-            group_id.clone(),
-            GroupState {
-                group,
-                signer_public_key: signer_pk,
-            },
-        );
-
-        // Persist group ID to manifest
-        self.persist_group_id(&group_id).map_err(|e| {
-            crate::error_log!(
-                "[MLS-CONTEXT] ⚠️ Failed to persist group ID in add_group: {:?}",
-                e
-            );
-            MLSError::Internal(format!("Failed to persist group ID in add_group: {:?}", e))
-        })?;
-
-        Ok(())
     }
 
     /// Register a signer public key for an identity
@@ -2704,7 +2651,6 @@ impl MLSContext {
                     "[MLS-CONTEXT] Signer already registered for identity with same key: {}",
                     identity
                 );
-                return Ok(()); // No need to re-register the same key
             } else {
                 crate::error_log!(
                     "[MLS-CONTEXT] ⚠️ WARNING: Attempting to overwrite existing signer for identity '{}'. Existing: {}, New: {}",
@@ -2716,11 +2662,8 @@ impl MLSContext {
             }
         }
 
-        self.signers_by_identity
-            .insert(identity.as_bytes().to_vec(), signer_public_key.clone());
-        crate::debug_log!("[MLS-CONTEXT] Registered signer for identity: {}", identity);
-
-        // Persist signer mapping to manifest
+        // Persist and pass the durability barrier before publishing the mapping
+        // in memory. Re-registering the same key also repairs manifest drift.
         self.persist_signer_mapping(identity.as_bytes(), &signer_public_key)
             .map_err(|e| {
                 crate::error_log!(
@@ -2732,7 +2675,11 @@ impl MLSContext {
                     e
                 ))
             })?;
+        self.flush_database()?;
 
+        self.signers_by_identity
+            .insert(identity.as_bytes().to_vec(), signer_public_key);
+        crate::debug_log!("[MLS-CONTEXT] Registered durable signer mapping");
         Ok(())
     }
 
@@ -2883,6 +2830,29 @@ impl MLSContext {
         self.groups.contains_key(group_id)
     }
 
+    /// Clear rejection-cleanup ownership after the server-accepted external
+    /// transition has passed the crypto durability barrier.
+    pub(crate) fn mark_external_join_accepted(&mut self, group_id: &[u8]) -> Result<(), MLSError> {
+        let is_pending = self
+            .groups
+            .get(group_id)
+            .is_some_and(|state| state.pending_external_join.is_some());
+        if !is_pending {
+            return Ok(());
+        }
+
+        self.remove_pending_external_join(group_id)?;
+        self.flush_database()?;
+        if let Some(state) = self.groups.get_mut(group_id) {
+            state.pending_external_join = None;
+        }
+        crate::debug_log!(
+            "[MLS-CONTEXT] External join acceptance durably finalized for group {}",
+            hex::encode(group_id)
+        );
+        Ok(())
+    }
+
     pub(crate) fn local_group_ids(&self) -> Vec<Vec<u8>> {
         self.groups.keys().cloned().collect()
     }
@@ -2897,35 +2867,19 @@ impl MLSContext {
             return Ok(false);
         }
 
-        // Delete every OpenMLS row before publishing absence in memory. The
-        // operations are idempotent, so a retry after a partial failure can
-        // safely finish the remaining cleanup.
-        let gid = GroupId::from_slice(group_id);
+        // Use OpenMLS's complete deletion routine (including proposal queues,
+        // application export trees, and encryption epoch keypairs). Keep the
+        // map entry until every persistent component and the barrier succeed.
         {
-            let storage = self.provider.storage_mut();
-            storage.delete_group_state(&gid)?;
-            storage.delete_tree(&gid)?;
-            storage.delete_confirmation_tag(&gid)?;
-            storage.delete_interim_transcript_hash(&gid)?;
-            storage.delete_context(&gid)?;
-            storage.delete_message_secrets(&gid)?;
-            storage.delete_all_resumption_psk_secrets(&gid)?;
-            storage.delete_own_leaf_index(&gid)?;
-            storage.delete_group_epoch_secrets(&gid)?;
-            storage.delete_own_leaf_nodes(&gid)?;
-            storage.delete_group_config(&gid)?;
+            let (groups, provider) = (&mut self.groups, &self.provider);
+            let state = groups
+                .get_mut(group_id)
+                .ok_or_else(|| MLSError::group_not_found(hex::encode(group_id)))?;
+            state.group.delete(provider.storage())?;
         }
 
-        // Remove from manifest
-        let hex_id = hex::encode(group_id);
-        if let Some(mut group_ids) = self
-            .manifest_storage
-            .read_manifest::<Vec<String>>("group_ids")?
-        {
-            group_ids.retain(|id| id != &hex_id);
-            self.manifest_storage
-                .write_manifest("group_ids", &group_ids)?;
-        }
+        self.remove_group_id_from_manifest(group_id)?;
+        self.remove_pending_external_join(group_id)?;
 
         // Flush to ensure cleanup is persisted
         self.flush_database()?;
@@ -3673,17 +3627,18 @@ impl MLSContext {
     ) -> Result<Vec<crate::types::PendingProposalDetail>, MLSError> {
         let gid = GroupId::from_slice(group_id);
 
-        self.with_group_ref(&gid, |group, provider| {
+        self.with_group_ref(&gid, |group, _provider| {
             let details: Vec<crate::types::PendingProposalDetail> = group
                 .pending_proposals()
                 .filter_map(|queued_proposal| {
                     let proposal = queued_proposal.proposal();
 
-                    // Compute proposal reference
-                    let proposal_bytes = proposal.tls_serialize_detached().ok()?;
-                    let proposal_ref = provider
-                        .crypto()
-                        .hash(group.ciphersuite().hash_algorithm(), &proposal_bytes)
+                    // Use OpenMLS's authenticated-content reference exactly.
+                    // Hashing only the proposal body produces a different key
+                    // that cannot address the durable proposal store.
+                    let proposal_ref = queued_proposal
+                        .proposal_reference_ref()
+                        .tls_serialize_detached()
                         .ok()?;
 
                     let sender_identity = match queued_proposal.sender() {
@@ -3888,6 +3843,23 @@ impl MLSContext {
 mod manifest_bundle_storage_tests {
     use super::*;
 
+    struct NoopKeychain;
+
+    #[async_trait::async_trait]
+    impl KeychainAccess for NoopKeychain {
+        async fn read(&self, _key: String) -> Result<Option<Vec<u8>>, MLSError> {
+            Ok(None)
+        }
+
+        async fn write(&self, _key: String, _value: Vec<u8>) -> Result<(), MLSError> {
+            Ok(())
+        }
+
+        async fn delete(&self, _key: String) -> Result<(), MLSError> {
+            Ok(())
+        }
+    }
+
     fn make_storage() -> (ManifestStorage, std::path::PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3905,6 +3877,50 @@ mod manifest_bundle_storage_tests {
         let storage =
             ManifestStorage::new(dir.join("manifest.db"), "test-key-1234567890123456").unwrap();
         (storage, dir)
+    }
+
+    #[test]
+    fn durability_checkpoint_requires_complete_non_busy_wal_result() {
+        assert!(validate_durability_checkpoint(0, 7, 7).is_ok());
+        assert!(validate_durability_checkpoint(1, 7, 7).is_err());
+        assert!(validate_durability_checkpoint(0, 7, 6).is_err());
+        assert!(validate_durability_checkpoint(0, -1, -1).is_err());
+    }
+
+    #[test]
+    fn psk_external_commit_fails_closed_without_materializing_state() {
+        let (storage, dir) = make_storage();
+        drop(storage);
+        let db_path = dir.join("manifest.db").to_string_lossy().to_string();
+        let (mut context, _interrupt_handles) = MLSContext::new(
+            db_path,
+            "test-key-1234567890123456".to_string(),
+            Box::new(NoopKeychain),
+        )
+        .unwrap();
+
+        let error = context
+            .create_external_commit_with_psk(
+                &[0x01, 0x02, 0x03],
+                "did:plc:alice#device-1",
+                &[0x42; 32],
+            )
+            .unwrap_err();
+        assert!(matches!(error, MLSError::OperationNotSupported { .. }));
+        assert!(context.groups.is_empty());
+        assert!(context.signers_by_identity.is_empty());
+        assert!(context
+            .manifest_storage
+            .read_manifest::<Vec<String>>("group_ids")
+            .unwrap()
+            .unwrap_or_default()
+            .is_empty());
+        assert!(context
+            .manifest_storage
+            .read_manifest::<HashMap<String, PendingExternalJoin>>("pending_external_joins")
+            .unwrap()
+            .unwrap_or_default()
+            .is_empty());
     }
 
     #[test]
