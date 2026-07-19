@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
 #[path = "mock_api_client.rs"]
 pub mod mock_api_client;
 #[path = "mock_credentials.rs"]
@@ -14,7 +16,7 @@ pub mod mock_storage;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use catbird_mls::orchestrator::{MLSOrchestrator, OrchestratorConfig};
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
@@ -92,6 +94,10 @@ impl Drop for TestClient {
 pub struct TestWorld {
     pub api_service: MockDeliveryService,
     pub clients: HashMap<String, TestClient>,
+    /// Test-only DID authority populated exclusively during explicit fixture
+    /// device registration. Validation never learns from a later DS response,
+    /// so substitution/revocation tests cannot become self-authorizing.
+    authorized_device_keys: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>,
 }
 
 impl TestWorld {
@@ -102,6 +108,7 @@ impl TestWorld {
         Self {
             api_service,
             clients: HashMap::new(),
+            authorized_device_keys: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -133,9 +140,13 @@ impl TestWorld {
             keychain,
         )
         .expect("failed to create MLSContext");
+        epoch_secret_test_support::install(&mls_context);
 
         let storage = MockStorage::new();
         let credentials = MockCredentials::new();
+        for (root_did, keys) in self.authorized_device_keys.lock().unwrap().iter() {
+            credentials.set_authorized_device_keys(root_did, keys.clone());
+        }
 
         // All clients share the same backing delivery service, authenticated as their own DID
         let api_client = self.api_service.clone_as(&did);
@@ -175,7 +186,41 @@ impl TestWorld {
     ) -> catbird_mls::orchestrator::error::Result<String> {
         let client = self.client(name);
         client.orchestrator.initialize(&client.did).await?;
-        client.orchestrator.ensure_device_registered().await
+        let did = client.orchestrator.ensure_device_registered().await?;
+
+        // Establish test authority directly from the registering client's
+        // local persistent signer. This deliberately does not inspect any key
+        // package returned by the delivery service: a DS response under
+        // validation can never teach the resolver what is authoritative.
+        let signing_key = client
+            .orchestrator
+            .mls_context()
+            .create_key_package(did.as_bytes().to_vec())?
+            .signature_public_key;
+        self.authorized_device_keys
+            .lock()
+            .unwrap()
+            .insert(did.clone(), vec![signing_key.clone()]);
+        for fixture_client in self.clients.values() {
+            fixture_client
+                .credentials
+                .set_authorized_device_keys(&did, vec![signing_key.clone()]);
+        }
+
+        Ok(did)
+    }
+
+    /// Seed an independent test credential store from authority established by
+    /// explicit fixture registration, never from a package being validated.
+    pub fn install_authorized_device_keys(&self, credentials: &MockCredentials, root_did: &str) {
+        let keys = self
+            .authorized_device_keys
+            .lock()
+            .unwrap()
+            .get(root_did)
+            .cloned()
+            .unwrap_or_else(|| panic!("no registered test authority for {root_did}"));
+        credentials.set_authorized_device_keys(root_did, keys);
     }
 
     /// Access the shared delivery service for introspection.

@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
 #[path = "mock_api_client.rs"]
 mod mock_api_client;
 #[path = "mock_credentials.rs"]
@@ -23,6 +25,7 @@ use catbird_mls::{
     CreateConversationRequest, EngineLifecycle, KeychainAccess, MLSContext, MLSError, MlsEngine,
     StorageLifecycleState,
 };
+use openmls_basic_credential::{SignatureKeyPair, StorageId};
 
 use mock_api_client::MockDeliveryService;
 use mock_credentials::MockCredentials;
@@ -113,13 +116,19 @@ impl StorageCompatFixture {
         )
     }
 
-    fn context(&self) -> Arc<MLSContext> {
+    fn context_without_epoch_secret_storage(&self) -> Arc<MLSContext> {
         MLSContext::new(
             self.db_path.clone(),
             self.encryption_key.clone(),
             Box::new(self.keychain.clone()),
         )
         .expect("MLSContext")
+    }
+
+    fn context(&self) -> Arc<MLSContext> {
+        let context = self.context_without_epoch_secret_storage();
+        epoch_secret_test_support::install(&context);
+        context
     }
 
     fn engine(&self) -> MlsEngine<MockStorage, MockDeliveryService, MockCredentials, MLSContext> {
@@ -179,7 +188,7 @@ impl StorageCompatFixture {
 }
 
 #[test]
-fn existing_openmls_sqlite_state_loads_under_rust_engine_storage() {
+fn existing_openmls_sqlite_state_without_tier0_signer_fails_closed() {
     let (fixture, existing) = StorageCompatFixture::load_preexisting_openmls_fixture();
     fixture.load_fixture_projection_rows(&existing);
 
@@ -193,20 +202,19 @@ fn existing_openmls_sqlite_state_loads_under_rust_engine_storage() {
         "fixture builder should only seed Swift-owned projection rows"
     );
 
-    let reopened = fixture.engine();
-    reopened
-        .initialize_user(&fixture.did)
-        .expect("initialize reopened engine");
-
-    let ready = reopened
-        .ensure_conversation_ready(&existing.conversation_id)
-        .expect("preexisting group should be ready");
-    assert_eq!(ready.recovery_state, ConversationRecoveryState::Healthy);
-    assert_eq!(
-        ready.epoch,
-        Some(existing.epoch),
-        "engine should load epoch from preexisting OpenMLS SQLite state"
-    );
+    // This historical file fixture intentionally has no Keychain sidecar.
+    // Its signer manifest therefore names a Tier-0 key that is not available.
+    // Loading it as Healthy would retain readable group state while silently
+    // making every authenticated epoch-changing operation impossible.
+    let error = match MLSContext::new(
+        fixture.db_path.clone(),
+        fixture.encryption_key.clone(),
+        Box::new(fixture.keychain.clone()),
+    ) {
+        Ok(_) => panic!("missing Tier-0 signer must not initialize as healthy"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, MLSError::StorageFailed));
     assert_eq!(
         fixture.storage.storage_projection_counts(),
         StorageProjectionCounts {
@@ -214,12 +222,62 @@ fn existing_openmls_sqlite_state_loads_under_rust_engine_storage() {
             group_states: 1,
             messages: 0,
         },
-        "loading preexisting Rust-owned storage must not synthesize extra platform rows"
+        "rejecting incomplete Rust-owned storage must not mutate platform projections"
     );
     assert!(
         fixture.storage.has_group_state(&existing.group_id_hex),
-        "Swift-owned projection rows should remain the source of conversation/group mapping"
+        "Swift-owned projection rows must remain intact for explicit recovery"
     );
+}
+
+#[test]
+fn legacy_noncanonical_keychain_signer_is_migrated_and_verified() {
+    let fixture = StorageCompatFixture::new();
+    let (group_id, signer_data) = {
+        let context = fixture.context();
+        let created = context
+            .create_group(fixture.did.as_bytes().to_vec(), None)
+            .expect("create group with canonical signer");
+        let signer_data = context
+            .export_identity_key(fixture.did.clone())
+            .expect("export test signer");
+        context
+            .flush_and_prepare_close()
+            .expect("close before keychain migration fixture rewrite");
+        (created.group_id, signer_data)
+    };
+
+    let signer: SignatureKeyPair =
+        serde_json::from_slice(&signer_data).expect("decode test signer");
+    let canonical_key = format!(
+        "sig_key_{}",
+        hex::encode(serde_json::to_vec(&signer.id()).expect("encode canonical signer id"))
+    );
+    let legacy_key = format!(
+        "sig_key_{}",
+        hex::encode(
+            serde_json::to_vec(&StorageId::from(signer.public().to_vec()))
+                .expect("encode legacy signer id")
+        )
+    );
+    assert_ne!(canonical_key, legacy_key);
+
+    {
+        let mut keychain = fixture.keychain.store.lock().unwrap();
+        let key_data = keychain
+            .remove(&canonical_key)
+            .expect("canonical signer must exist before migration fixture rewrite");
+        keychain.insert(legacy_key.clone(), key_data);
+    }
+
+    let reopened = fixture.context();
+    assert_eq!(
+        reopened.get_epoch(group_id).expect("load migrated group"),
+        0
+    );
+    let keychain = fixture.keychain.store.lock().unwrap();
+    assert!(keychain.contains_key(&canonical_key));
+    assert!(!keychain.contains_key(&legacy_key));
 }
 
 #[test]
@@ -296,7 +354,7 @@ fn openmls_sqlite_state_round_trips_under_rust_engine_storage() {
 #[test]
 fn storage_lifecycle_status_reports_busy_interrupt_suspend_and_close() {
     let fixture = StorageCompatFixture::new();
-    let context = fixture.context();
+    let context = fixture.context_without_epoch_secret_storage();
     let engine = fixture.engine_with_context(Arc::clone(&context));
 
     engine.initialize_user(&fixture.did).expect("initialize");
@@ -307,6 +365,7 @@ fn storage_lifecycle_status_reports_busy_interrupt_suspend_and_close() {
     assert_eq!(initial.last_operation_label.as_deref(), Some("initialized"));
     assert_eq!(initial.interruptible_contexts, 2);
 
+    epoch_secret_test_support::install(&context);
     let created = engine
         .create_conversation(CreateConversationRequest {
             name: "operation-labels".into(),

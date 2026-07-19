@@ -1,5 +1,7 @@
 use crate::error::MLSError;
 use crate::keychain::KeychainAccess;
+use openmls::prelude::SignatureScheme;
+use openmls_basic_credential::{SignatureKeyPair, StorageId};
 use openmls_sqlite_storage::{Codec, SqliteStorageProvider};
 use openmls_traits::storage::*;
 use rusqlite::Connection;
@@ -18,6 +20,40 @@ impl<C: Codec> HybridStorageProvider<C> {
         keychain: Box<dyn KeychainAccess>,
     ) -> Self {
         Self { sqlite, keychain }
+    }
+
+    /// Migrate signer keys written by the legacy import path, which used the
+    /// raw public key as `StorageId` instead of OpenMLS's canonical derived ID.
+    /// The private key is copied between Keychain-backed slots, read back, and
+    /// only then removed from the obsolete slot.
+    pub(crate) fn migrate_legacy_signature_key_pair(
+        &self,
+        public_key: &[u8],
+        signature_scheme: SignatureScheme,
+    ) -> Result<bool, MLSError> {
+        let legacy_id = StorageId::from(public_key.to_vec());
+        let legacy_id_bytes =
+            serde_json::to_vec(&legacy_id).map_err(|_| MLSError::SerializationError)?;
+        let legacy_key = format!("sig_key_{}", hex::encode(legacy_id_bytes));
+        let legacy_data =
+            crate::async_runtime::block_on(async { self.keychain.read(legacy_key.clone()).await })?;
+        let Some(legacy_data) = legacy_data else {
+            return Ok(false);
+        };
+        let legacy_pair: SignatureKeyPair =
+            serde_json::from_slice(&legacy_data).map_err(|_| MLSError::StorageError)?;
+
+        if legacy_pair.public() != public_key || legacy_pair.signature_scheme() != signature_scheme
+        {
+            return Err(MLSError::StorageError);
+        }
+
+        legacy_pair.store(self)?;
+        if SignatureKeyPair::read(self, public_key, signature_scheme).is_none() {
+            return Err(MLSError::StorageError);
+        }
+        crate::async_runtime::block_on(async { self.keychain.delete(legacy_key).await })?;
+        Ok(true)
     }
 }
 

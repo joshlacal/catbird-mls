@@ -4,7 +4,10 @@ use catbird_mls::{
     FfiMlsErrorKind, KeychainAccess, MLSContext, MLSError,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TestKeychain {
     store: Mutex<HashMap<String, Vec<u8>>>,
@@ -36,9 +39,11 @@ impl KeychainAccess for TestKeychain {
 }
 
 fn make_db_path() -> (String, std::path::PathBuf) {
+    let sequence = DB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "catbird_mls_ffi_bridge_classifier_test_{}_{}",
+        "catbird_mls_ffi_bridge_classifier_test_{}_{}_{}",
         std::process::id(),
+        sequence,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -82,6 +87,28 @@ fn key_package_binding_classifier_accepts_matching_identity_and_signing_key() {
     assert_eq!(
         classification.claimed_identity.as_deref(),
         Some("did:plc:alice#device-1")
+    );
+}
+
+#[test]
+fn key_package_binding_classifier_rejects_case_distinct_did_root() {
+    let (key_package, signature_key) = alice_key_package();
+
+    let classification = mls_classify_key_package_binding(
+        "did:plc:Alice".to_string(),
+        key_package,
+        Some(vec![signature_key]),
+    );
+
+    assert_eq!(
+        classification.status,
+        FfiKeyPackageBindingStatus::IdentityMismatch
+    );
+    assert!(!classification.identity_matches);
+    assert_eq!(classification.signing_key_matches, Some(true));
+    assert_eq!(
+        classification.claimed_root_did.as_deref(),
+        Some("did:plc:alice")
     );
 }
 

@@ -167,6 +167,88 @@ fn single_create_delegates_to_batch() {
 }
 
 #[test]
+fn oversized_local_batch_is_rejected_before_allocation_or_generation() {
+    let (path, _dir) = make_db_path();
+    let ctx = open_context(&path);
+
+    let error = match ctx.create_key_packages(IDENTITY.to_vec(), 101) {
+        Ok(_) => panic!("local KeyPackage batches above the fixed ceiling must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, MLSError::InvalidInput { .. }));
+    assert_eq!(ctx.get_key_package_bundle_count().unwrap(), 0);
+}
+
+#[test]
+fn direct_add_rejects_key_package_size_limits_before_tls_parsing() {
+    let (path, _dir) = make_db_path();
+    let ctx = open_context(&path);
+
+    let oversized_package = catbird_mls::KeyPackageData {
+        data: vec![0_u8; 1024 * 1024 + 1],
+    };
+    let error = match ctx.add_members(vec![0xAA; 32], vec![oversized_package]) {
+        Ok(_) => {
+            panic!("a package above the fixed ceiling must fail before group lookup or parsing")
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(error, MLSError::InvalidInput { .. }));
+
+    let oversized_swap_package = catbird_mls::KeyPackageData {
+        data: vec![0_u8; 1024 * 1024 + 1],
+    };
+    let error = match ctx.swap_members(
+        vec![0xAA; 32],
+        vec![b"did:plc:old-member".to_vec()],
+        vec![oversized_swap_package],
+    ) {
+        Ok(_) => panic!("raw swap must apply the same pre-parse package ceiling as raw add"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, MLSError::InvalidInput { .. }));
+
+    let aggregate_batch = (0..11)
+        .map(|_| catbird_mls::KeyPackageData {
+            data: vec![0_u8; 1024 * 1024],
+        })
+        .collect();
+    let error = match ctx.add_members(vec![0xAA; 32], aggregate_batch) {
+        Ok(_) => panic!("an aggregate batch above ten MiB must fail before TLS parsing"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, MLSError::InvalidInput { .. }));
+}
+
+#[test]
+fn direct_stage_rejects_key_package_count_before_group_lookup_or_conversion() {
+    let (path, _dir) = make_db_path();
+    let ctx = open_context(&path);
+
+    let error = match ctx.stage_commit(
+        "not-a-group-id".to_string(),
+        catbird_mls::orchestrator_bridge::FFICommitKind::SwapMembers {
+            remove_dids: Vec::new(),
+            add_dids: (0..101).map(|i| format!("did:plc:member{i}")).collect(),
+            add_key_packages: vec![Vec::new(); 101],
+        },
+        IDENTITY.to_vec(),
+    ) {
+        Ok(_) => panic!("the 101-package batch must be rejected before invalid group lookup"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("101 packages"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("Invalid hex group ID"),
+        "batch limits must run before group decoding"
+    );
+}
+
+#[test]
 fn last_resort_create_marks_package_and_persists_bundle() {
     let (path, _dir) = make_db_path();
     let ctx = open_context(&path);

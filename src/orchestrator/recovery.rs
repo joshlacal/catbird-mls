@@ -3,13 +3,17 @@ use std::time::Duration;
 use web_time::Instant;
 
 use base64::Engine;
+use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+use sha2::{Digest, Sha256};
+use tls_codec::DeserializeBytes;
 
 use super::api_client::MLSAPIClient;
 use super::constants;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::mls_provider::MlsCryptoContext;
-use super::orchestrator::MLSOrchestrator;
+use super::orchestrator::{MLSOrchestrator, OwnCommitExpectation};
+use super::pagination::PaginationGuard;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 use super::welcome_recovery::{
@@ -21,6 +25,28 @@ pub(crate) enum DeferredRecoveryOutcome {
     ClearedStale,
     Skipped,
     Recovered(u64),
+}
+
+fn credential_root_matches_exact(identity: &str, expected_root: &str) -> bool {
+    super::credential_binding::credential_root_did(identity) == expected_root
+}
+
+fn advertised_group_id_from_group_info(group_info: &[u8]) -> Result<Vec<u8>> {
+    crate::message_limits::validate_inbound_mls_message_len(group_info.len(), "group_info")?;
+    let (message, remaining) = MlsMessageIn::tls_deserialize_bytes(group_info).map_err(|_| {
+        OrchestratorError::InvalidInput("recovery GroupInfo is malformed".to_string())
+    })?;
+    if !remaining.is_empty() {
+        return Err(OrchestratorError::InvalidInput(
+            "recovery GroupInfo has trailing bytes".to_string(),
+        ));
+    }
+    match message.extract() {
+        MlsMessageBodyIn::GroupInfo(group_info) => Ok(group_info.group_id().as_slice().to_vec()),
+        _ => Err(OrchestratorError::InvalidInput(
+            "recovery payload is not GroupInfo".to_string(),
+        )),
+    }
 }
 
 /// Snapshot of a conversation's `ResetPending` payload for use inside the
@@ -36,23 +62,63 @@ pub(crate) struct ResetPendingPayload {
     pub notified_at_ms: i64,
 }
 
-pub(crate) struct LocalDeleteSnapshot {
-    pub group_ids: Vec<Vec<u8>>,
-    pub group_state_keys: Vec<String>,
-    pub reset_pending: Option<ResetPendingPayload>,
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LocalDeleteGroupFence {
+    pub group_id_hex: String,
+    pub epoch: Option<u64>,
 }
 
-const LOCAL_DELETE_AUTHORITY_MAGIC: &[u8] = b"CBLD\x01";
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LocalDeleteConversationFence {
+    pub group_id: String,
+    pub epoch: u64,
+}
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LocalDeleteResetFence {
+    pub new_group_id: String,
+    pub reset_generation: i32,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LocalDeleteSnapshot {
+    pub groups: Vec<LocalDeleteGroupFence>,
+    pub group_state_keys: Vec<String>,
+    pub conversation: Option<LocalDeleteConversationFence>,
+    pub reset: Option<LocalDeleteResetFence>,
+}
+
+const LOCAL_DELETE_AUTHORITY_MAGIC_V1: &[u8] = b"CBLD\x01";
+const LOCAL_DELETE_AUTHORITY_MAGIC_V2: &[u8] = b"CBLD\x02";
+
+/// Original owner-bound authority format. It did not carry enough lifecycle
+/// state to distinguish an interrupted delete from a subsequently re-created
+/// conversation that reused the same stable id.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct PersistedLocalDeleteAuthority {
+struct PersistedLocalDeleteAuthorityV1 {
     owner_user_did: String,
     group_ids_hex: Vec<String>,
     group_state_keys: Vec<String>,
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PersistedLocalDeleteAuthorityV2 {
+    owner_user_did: String,
+    groups: Vec<LocalDeleteGroupFence>,
+    group_state_keys: Vec<String>,
+    conversation: Option<LocalDeleteConversationFence>,
+    reset: Option<LocalDeleteResetFence>,
+}
+
 pub(crate) enum LocalDeleteAuthority {
     Versioned {
+        owner_user_did: String,
+        snapshot: LocalDeleteSnapshot,
+    },
+    /// Compatibility decoder for owner-bound intents written before lifecycle
+    /// fences were added. Callers may perform only narrow orphan cleanup; this
+    /// format cannot authorize deleting a live conversation mapping.
+    VersionedV1 {
         owner_user_did: String,
         group_ids_hex: Vec<String>,
         group_state_keys: Vec<String>,
@@ -63,12 +129,14 @@ pub(crate) enum LocalDeleteAuthority {
 
 impl LocalDeleteSnapshot {
     pub(crate) fn encode_authority(&self, owner_user_did: &str) -> Result<String> {
-        let payload = PersistedLocalDeleteAuthority {
+        let payload = PersistedLocalDeleteAuthorityV2 {
             owner_user_did: owner_user_did.to_string(),
-            group_ids_hex: self.group_ids.iter().map(hex::encode).collect(),
+            groups: self.groups.clone(),
             group_state_keys: self.group_state_keys.clone(),
+            conversation: self.conversation.clone(),
+            reset: self.reset.clone(),
         };
-        let mut encoded = LOCAL_DELETE_AUTHORITY_MAGIC.to_vec();
+        let mut encoded = LOCAL_DELETE_AUTHORITY_MAGIC_V2.to_vec();
         encoded.extend(serde_json::to_vec(&payload).map_err(|error| {
             OrchestratorError::InvalidInput(format!(
                 "failed to serialize local-delete authority: {error}"
@@ -87,15 +155,65 @@ pub(crate) fn decode_local_delete_authority(encoded: Option<&str>) -> Result<Loc
             "pending local-delete authority is not valid hex: {error}"
         ))
     })?;
-    if !bytes.starts_with(LOCAL_DELETE_AUTHORITY_MAGIC) {
-        return Ok(LocalDeleteAuthority::LegacyGroupId(encoded.to_string()));
-    }
-    let payload: PersistedLocalDeleteAuthority =
-        serde_json::from_slice(&bytes[LOCAL_DELETE_AUTHORITY_MAGIC.len()..]).map_err(|error| {
+    if bytes.starts_with(LOCAL_DELETE_AUTHORITY_MAGIC_V2) {
+        let payload: PersistedLocalDeleteAuthorityV2 = serde_json::from_slice(
+            &bytes[LOCAL_DELETE_AUTHORITY_MAGIC_V2.len()..],
+        )
+        .map_err(|error| {
             OrchestratorError::InvalidInput(format!(
                 "pending local-delete authority is malformed: {error}"
             ))
         })?;
+        if payload.owner_user_did.is_empty() {
+            return Err(OrchestratorError::InvalidInput(
+                "pending local-delete authority has no owner".to_string(),
+            ));
+        }
+        for group in &payload.groups {
+            hex::decode(&group.group_id_hex).map_err(|error| {
+                OrchestratorError::InvalidInput(format!(
+                    "pending local-delete authority contains malformed group id {}: {error}",
+                    group.group_id_hex
+                ))
+            })?;
+        }
+        if let Some(conversation) = payload.conversation.as_ref() {
+            hex::decode(&conversation.group_id).map_err(|error| {
+                OrchestratorError::InvalidInput(format!(
+                    "pending local-delete authority contains malformed conversation group id {}: {error}",
+                    conversation.group_id
+                ))
+            })?;
+        }
+        if let Some(reset) = payload.reset.as_ref() {
+            hex::decode(&reset.new_group_id).map_err(|error| {
+                OrchestratorError::InvalidInput(format!(
+                    "pending local-delete authority contains malformed reset group id {}: {error}",
+                    reset.new_group_id
+                ))
+            })?;
+        }
+        return Ok(LocalDeleteAuthority::Versioned {
+            owner_user_did: payload.owner_user_did,
+            snapshot: LocalDeleteSnapshot {
+                groups: payload.groups,
+                group_state_keys: payload.group_state_keys,
+                conversation: payload.conversation,
+                reset: payload.reset,
+            },
+        });
+    }
+    if !bytes.starts_with(LOCAL_DELETE_AUTHORITY_MAGIC_V1) {
+        return Ok(LocalDeleteAuthority::LegacyGroupId(encoded.to_string()));
+    }
+    let payload: PersistedLocalDeleteAuthorityV1 = serde_json::from_slice(
+        &bytes[LOCAL_DELETE_AUTHORITY_MAGIC_V1.len()..],
+    )
+    .map_err(|error| {
+        OrchestratorError::InvalidInput(format!(
+            "pending local-delete authority is malformed: {error}"
+        ))
+    })?;
     if payload.owner_user_did.is_empty() {
         return Err(OrchestratorError::InvalidInput(
             "pending local-delete authority has no owner".to_string(),
@@ -108,7 +226,7 @@ pub(crate) fn decode_local_delete_authority(encoded: Option<&str>) -> Result<Loc
             ))
         })?;
     }
-    Ok(LocalDeleteAuthority::Versioned {
+    Ok(LocalDeleteAuthority::VersionedV1 {
         owner_user_did: payload.owner_user_did,
         group_ids_hex: payload.group_ids_hex,
         group_state_keys: payload.group_state_keys,
@@ -990,13 +1108,21 @@ where
             }
         };
         let gid = resolved.group_id_bytes()?;
-        let mems: Vec<String> = {
+        let group_state_projection = {
             let st = self.group_states().lock().await;
-            resolved
-                .group_state(&st)
-                .map(|g| g.members.clone())
-                .unwrap_or_default()
+            resolved.group_state(&st).cloned()
         };
+        let mut group_state_projection = match group_state_projection {
+            Some(state) => state,
+            None => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "missing group state for fork readd: {}",
+                    resolved.conversation_id
+                )));
+            }
+        };
+        let mems = group_state_projection.members.clone();
         if mems.is_empty() {
             self.escalate_fork_to_rejoin(convo_id).await;
             return Err(OrchestratorError::RecoveryFailed("no members".into()));
@@ -1015,13 +1141,18 @@ where
         // This is an automated Add path a malicious DS can steer clients into
         // via decrypt failures, so it must hit the same verify-on-fetch
         // chokepoint as create_group / add_members / swap_members.
-        self.verify_fetched_key_packages(
-            &mems,
-            &kp_refs,
-            "fork_readd",
-            Some(&resolved.conversation_id),
-        )
-        .await;
+        if let Err(error) = self
+            .verify_fetched_key_packages(
+                &mems,
+                &kp_refs,
+                "fork_readd",
+                Some(&resolved.conversation_id),
+            )
+            .await
+        {
+            self.escalate_fork_to_rejoin(convo_id).await;
+            return Err(error);
+        }
 
         let kps: Vec<Vec<u8>> = kp_refs.iter().map(|r| r.key_package_data.clone()).collect();
         let (commit, _) = match self
@@ -1055,7 +1186,54 @@ where
         }
         match self.mls_context().merge_pending_commit(gid.clone()) {
             Ok(ep) => {
-                // Cleanup old epoch secrets after fork readd
+                // The server has accepted the commit and the local MLS group
+                // has advanced, but fork recovery is not complete until the
+                // stable conversation -> group projection is durable. Publish
+                // none of the success side effects before that boundary.
+                group_state_projection.epoch = ep;
+                if let Err(error) = self
+                    .storage()
+                    .set_group_state(&group_state_projection)
+                    .await
+                {
+                    self.report_recovery_storage_failure(
+                        convo_id,
+                        "set_group_state:fork_readd",
+                        &error,
+                    )
+                    .await;
+                    self.escalate_fork_to_rejoin(convo_id).await;
+                    return Err(error);
+                }
+
+                {
+                    let mut st = self.group_states().lock().await;
+                    normalize_group_state(&mut st, group_state_projection);
+                }
+
+                match self
+                    .project_non_reset_cache_locked(convo_id, ConversationState::Active)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(OrchestratorError::RecoveryFailed(format!(
+                            "durable reset authority blocked fork readd completion for {convo_id}"
+                        )));
+                    }
+                    Err(error) => {
+                        self.report_recovery_storage_failure(
+                            convo_id,
+                            "fork_readd:active_projection_authority_read",
+                            &error,
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                }
+
+                // Cleanup old epoch secrets only after the durable projection
+                // and in-memory Active transition have both succeeded.
                 self.cleanup_epoch_secrets_if_needed(
                     &resolved.conversation_id,
                     &resolved.group_id,
@@ -1064,18 +1242,6 @@ where
                 .await;
 
                 {
-                    let mut st = self.group_states().lock().await;
-                    if let Some(mut gs) = resolved.group_state(&st).cloned() {
-                        gs.epoch = ep;
-                        let sc = gs.clone();
-                        normalize_group_state(&mut st, gs);
-                        drop(st);
-                        if let Err(e) = self.storage().set_group_state(&sc).await {
-                            tracing::warn!(error = %e, convo_id, "Failed to persist group state after fork readd");
-                        }
-                    }
-                }
-                {
                     let mut fds = self
                         .fork_detection_states()
                         .lock()
@@ -1083,9 +1249,6 @@ where
                     fds.remove(convo_id);
                 }
                 self.decrypt_fail_counts().lock().await.remove(convo_id);
-                let _ = self
-                    .project_non_reset_cache_locked(convo_id, ConversationState::Active)
-                    .await;
                 if let Ok(gi) = self
                     .mls_context()
                     .export_group_info(gid, user_did.as_bytes().to_vec())
@@ -1751,12 +1914,14 @@ where
     /// upload bumps the server's cosmetic `group_info_epoch` counter, producing
     /// the visible "epoch inflation" with no underlying crypto advance.
     ///
-    /// "Locally healthy" is gated on a CRYPTOGRAPHIC self-membership check
-    /// (I4 safety), not merely "an epoch exists": the group must be present in
-    /// the MLS context with a readable epoch AND have a populated ratchet tree
-    /// in which THIS device's identity is a current leaf. A locally
-    /// forked/emptied/self-evicted group fails this and still routes to
-    /// recovery, so we never unblock sends peers cannot decrypt.
+    /// "Locally healthy" is gated on both durable state and a CRYPTOGRAPHIC
+    /// self-membership check (I4 safety), not merely "an epoch exists": the
+    /// durable GroupState must bind the resolved mutable group to this stable
+    /// conversation at exactly the crypto epoch, and the group must have a
+    /// populated ratchet tree in which THIS device's identity is a current
+    /// leaf. A post-merge persistence failure, locally forked/emptied group, or
+    /// self-evicted group fails this and still routes to recovery, so we never
+    /// erase recovery intent or unblock sends peers cannot decrypt.
     ///
     /// Returns `true` (and clears the stale enum/boolean/counters, projecting
     /// `Active`) when the group is healthy; `false` when the caller should
@@ -1789,9 +1954,29 @@ where
             }
         }
 
-        let local_epoch = match self.local_group_epoch_result(convo_id).await {
-            Ok(Some(epoch)) => epoch,
-            Ok(None) => {
+        let resolved = match self.resolve_conversation_context(convo_id).await {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin group resolution FAILED ({}) -> keeping NeedsRejoin",
+                    convo_id, err
+                );
+                return false;
+            }
+        };
+        let group_id_bytes = match resolved.group_id_bytes() {
+            Err(err) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin group id invalid ({}) -> keeping NeedsRejoin",
+                    convo_id, err
+                );
+                return false;
+            }
+            Ok(group_id) => group_id,
+        };
+        let local_epoch = match self.mls_context().get_epoch(group_id_bytes.clone()) {
+            Ok(epoch) => epoch,
+            Err(crate::MLSError::GroupNotFound { .. }) => {
                 crate::warn_log!(
                     "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin local_group=ABSENT -> keeping NeedsRejoin",
                     convo_id
@@ -1807,13 +1992,35 @@ where
             }
         };
 
-        let Some(group_id_bytes) = self.group_id_bytes_for_conversation(convo_id).await else {
+        let durable_group_state = match self.storage().get_group_state(&resolved.group_id).await {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin durable group projection=ABSENT -> keeping NeedsRejoin",
+                    convo_id
+                );
+                return false;
+            }
+            Err(err) => {
+                crate::warn_log!(
+                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin durable group projection read FAILED ({}) -> keeping NeedsRejoin",
+                    convo_id, err
+                );
+                return false;
+            }
+        };
+        if durable_group_state.group_id != resolved.group_id
+            || durable_group_state.conversation_id != resolved.conversation_id
+            || durable_group_state.epoch != local_epoch
+        {
             crate::warn_log!(
-                "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin no local group id -> keeping NeedsRejoin",
-                convo_id
+                "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin durable projection does not match resolved crypto state (durable_epoch={} crypto_epoch={}) -> keeping NeedsRejoin",
+                convo_id,
+                durable_group_state.epoch,
+                local_epoch
             );
             return false;
-        };
+        }
 
         let members = match self.mls_context().group_member_identities(group_id_bytes) {
             Ok(members) => members,
@@ -2206,13 +2413,15 @@ where
         if let Some(pending) = reset_pending.as_ref() {
             group_ids.insert(pending.new_group_id.clone());
         }
-        if let Some(view) = self.conversations().lock().await.get(convo_id).cloned() {
-            group_ids.insert(view.group_id);
+        let cached_conversation = self.conversations().lock().await.get(convo_id).cloned();
+        if let Some(view) = cached_conversation.as_ref() {
+            group_ids.insert(view.group_id.clone());
         }
 
         let user_did = self.cleanup_user_did().await?;
-        if let Some(view) = self.storage().get_conversation(&user_did, convo_id).await? {
-            group_ids.insert(view.group_id);
+        let durable_conversation = self.storage().get_conversation(&user_did, convo_id).await?;
+        if let Some(view) = durable_conversation.as_ref() {
+            group_ids.insert(view.group_id.clone());
         }
 
         // On startup the in-memory group-state cache is intentionally empty.
@@ -2241,22 +2450,39 @@ where
             }
         }
 
-        let mut decoded_group_ids = Vec::with_capacity(group_ids.len());
+        let mut groups = Vec::with_capacity(group_ids.len());
         for group_id in group_ids {
             let decoded = hex::decode(&group_id).map_err(|error| {
                 OrchestratorError::InvalidInput(format!(
                     "local delete discovered malformed MLS group id {group_id}: {error}"
                 ))
             })?;
-            if !decoded_group_ids.contains(&decoded) {
-                decoded_group_ids.push(decoded);
-            }
+            let epoch = match self.mls_context().get_epoch(decoded) {
+                Ok(epoch) => Some(epoch),
+                Err(crate::MLSError::GroupNotFound { .. }) => None,
+                Err(error) => return Err(error.into()),
+            };
+            groups.push(LocalDeleteGroupFence {
+                group_id_hex: group_id,
+                epoch,
+            });
         }
 
         Ok(LocalDeleteSnapshot {
-            group_ids: decoded_group_ids,
+            groups,
             group_state_keys: group_state_keys.into_iter().collect(),
-            reset_pending,
+            // Durable application state is the restart fence. The cache is a
+            // fallback only during the narrow pre-persistence creation window.
+            conversation: durable_conversation.or(cached_conversation).map(|view| {
+                LocalDeleteConversationFence {
+                    group_id: view.group_id,
+                    epoch: view.epoch,
+                }
+            }),
+            reset: reset_pending.map(|pending| LocalDeleteResetFence {
+                new_group_id: pending.new_group_id,
+                reset_generation: pending.reset_generation,
+            }),
         })
     }
 
@@ -2328,17 +2554,15 @@ where
 
         // Compute remove_dids: every local leaf whose credential identity maps
         // to the recipient user (mirror Swift `removeIdentities` — split the
-        // device-qualified DID at `#`, compare case-insensitively).
+        // device-qualified DID at `#`, and compare the method-specific
+        // identifier exactly. DID roots are not globally case-insensitive.
         let group_id_bytes = hex::decode(&group_id)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
         let identities = self.mls_context().group_member_identities(group_id_bytes)?;
         let remove_dids: Vec<String> = identities
             .iter()
             .filter_map(|raw| String::from_utf8(raw.clone()).ok())
-            .filter(|id| {
-                super::credential_binding::credential_root_did(id)
-                    .eq_ignore_ascii_case(&recipient_user_did)
-            })
+            .filter(|id| credential_root_matches_exact(id, &recipient_user_did))
             .collect();
         if remove_dids.is_empty() {
             // No leaf for the recipient locally — this device is not a current
@@ -2362,7 +2586,7 @@ where
             "respond_to_welcome_reissue",
             Some(&resolved.conversation_id),
         )
-        .await;
+        .await?;
         let kp_data: Vec<crate::KeyPackageData> = key_packages
             .iter()
             .map(|kp| crate::KeyPackageData {
@@ -2396,33 +2620,40 @@ where
         match server_result {
             Ok(result) => {
                 if !result.success {
-                    let _ = self.discard_pending(plan.handle).await;
+                    self.discard_pending_after_failed_operation(
+                        plan.handle,
+                        "respond_to_welcome_reissue",
+                        "server returned success=false",
+                    )
+                    .await?;
                     return Err(OrchestratorError::MemberSyncFailed);
                 }
                 if let Some(ref receipt) = result.receipt {
                     self.record_and_check_sequencer_receipt(receipt, "respond_to_welcome_reissue")
                         .await;
                 }
-                // Epoch fence: only confirm (merge) if the server actually
-                // advanced past our local epoch. An idempotent replay of an
-                // already-answered request returns the prior epoch, so the
-                // fence discards the staged commit and leaves the epoch intact.
-                let current_epoch =
-                    self.mls_context()
-                        .get_epoch(hex::decode(&group_id).map_err(|_| {
-                            OrchestratorError::InvalidInput("Invalid hex group ID".into())
-                        })?)?;
-                if result.new_epoch > current_epoch {
-                    self.confirm_commit(plan.handle, super::staged_commit::SKIP_SERVER_EPOCH_FENCE)
-                        .await?;
+                // An idempotent replay returns the prior accepted epoch. Only
+                // the exact staged target may authorize this local merge.
+                if result.new_epoch == plan.target_epoch {
+                    self.confirm_commit(plan.handle, result.new_epoch).await?;
                 } else {
-                    let _ = self.discard_pending(plan.handle).await;
+                    self.discard_pending_after_failed_operation(
+                        plan.handle,
+                        "respond_to_welcome_reissue idempotent response",
+                        "server epoch did not equal staged target",
+                    )
+                    .await?;
                 }
                 tracing::info!(convo_id, request_id, "respond_to_welcome_reissue complete");
                 Ok(())
             }
             Err(e) => {
-                let _ = self.discard_pending(plan.handle).await;
+                self.discard_pending_after_failed_operation(
+                    plan.handle,
+                    "respond_to_welcome_reissue",
+                    &e.to_string(),
+                )
+                .await?;
                 Err(e)
             }
         }
@@ -2512,6 +2743,20 @@ where
             }
         };
 
+        // Parse and bind the DS-controlled GroupInfo before deleting any local
+        // MLS state. The stable conversation mapping is authoritative for the
+        // current mutable group ID; a valid GroupInfo from another conversation
+        // must not gain destructive authority merely because it was routed
+        // under this conversation ID.
+        let advertised_group_id = advertised_group_id_from_group_info(&group_info)?;
+        let resolved = self.resolve_conversation_context(convo_id).await?;
+        let authoritative_group_id = resolved.group_id_bytes()?;
+        if advertised_group_id != authoritative_group_id {
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "GroupInfo group binding mismatch for conversation {convo_id}"
+            )));
+        }
+
         // GroupInfo fetched successfully — now delete old local group state.
         // Prefer a locally materialized group bound to this stable conversation;
         // the authoritative mapping may already name an as-yet-unjoined reset
@@ -2578,15 +2823,19 @@ where
         // `messaging.rs:181, 371` for all other commit producers. The dedup
         // key is `sha2::Sha256::digest(ciphertext)`; the entry is evicted
         // after `OWN_COMMIT_TTL` (`constants.rs`, 300s) by `evict_stale_commits`.
-        {
-            use sha2::{Digest, Sha256};
-            self.evict_stale_commits().await;
-            let commit_hash = Sha256::digest(&ext_commit_result.commit_data).to_vec();
-            self.own_commits()
-                .lock()
-                .await
-                .insert(commit_hash, Instant::now());
-        }
+        let commit_hash = Sha256::digest(&ext_commit_result.commit_data).to_vec();
+        let target_epoch = self
+            .mls_context()
+            .get_epoch(ext_commit_result.group_id.clone())?;
+        self.track_epoch_changing_own_commit(
+            commit_hash.clone(),
+            OwnCommitExpectation {
+                conversation_id: convo_id.to_string(),
+                group_id: hex::encode(&ext_commit_result.group_id),
+                target_epoch,
+            },
+        )
+        .await;
 
         // Get confirmation tag from the new local group state
         let tag_b64 = self
@@ -2609,15 +2858,47 @@ where
         {
             Ok(result) => result,
             Err(e) => {
-                // Discard the pending external join on failure
-                let _ = self
+                // A rejected/ambiguous External Commit must not strand a
+                // materialized candidate group. Surface cleanup failure and
+                // retain durable recovery authority instead of returning only
+                // the network error.
+                if let Err(cleanup_error) = self
                     .mls_context()
-                    .discard_pending_external_join(ext_commit_result.group_id.clone());
+                    .discard_pending_external_join(ext_commit_result.group_id.clone())
+                {
+                    self.mark_needs_rejoin_critical(convo_id).await;
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "Failed to send external commit ({e}); candidate cleanup also failed: {cleanup_error}"
+                    )));
+                }
+                self.remove_own_commit_tracking(&commit_hash).await;
                 return Err(OrchestratorError::RecoveryFailed(format!(
                     "Failed to send external commit: {e}"
                 )));
             }
         };
+
+        // The callback is attacker-controlled DS evidence. Advancing merely
+        // "past" the local epoch could acknowledge a different commit or a
+        // different history; require the exact locally staged target before
+        // merging the candidate group.
+        if ext_commit_server_result.epoch != target_epoch {
+            let cleanup = self
+                .mls_context()
+                .discard_pending_external_join(ext_commit_result.group_id.clone());
+            self.remove_own_commit_tracking(&commit_hash).await;
+            self.mark_needs_rejoin_critical(convo_id).await;
+            if let Err(cleanup_error) = cleanup {
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "External Commit epoch mismatch (local target {target_epoch}, server {}); candidate cleanup failed: {cleanup_error}",
+                    ext_commit_server_result.epoch
+                )));
+            }
+            return Err(OrchestratorError::EpochMismatch {
+                local: target_epoch,
+                remote: ext_commit_server_result.epoch,
+            });
+        }
 
         // Best-effort receipt storage, preceded by sequencer-equivocation
         // detection against previously stored receipts for this conversation
@@ -2637,33 +2918,80 @@ where
                 OrchestratorError::RecoveryFailed(format!("Failed to merge external commit: {e}"))
             })?;
 
-        // Cleanup old epoch secrets after External Commit rejoin
-        let merged_group_id = hex::encode(&ext_commit_result.group_id);
-        self.cleanup_epoch_secrets_if_needed(convo_id, &merged_group_id, merged)
-            .await;
-
-        // Update group state (insert if missing, persist to storage)
+        // Persist the new group projection before publishing it in memory or
+        // clearing any recovery state. A merged External Commit without this
+        // durable conversation -> group binding is not a completed recovery:
+        // restart would lose the mapping while the server has already advanced.
         let new_group_id_hex = hex::encode(&ext_commit_result.group_id);
-        {
-            let mut states = self.group_states().lock().await;
-            states
-                .retain(|key, state| key == &new_group_id_hex || state.conversation_id != convo_id);
-            let state = states
-                .entry(new_group_id_hex.clone())
-                .or_insert_with(|| GroupState {
+        let state = {
+            let states = self.group_states().lock().await;
+            let mut state = states
+                .get(&new_group_id_hex)
+                .cloned()
+                .unwrap_or_else(|| GroupState {
                     group_id: new_group_id_hex.clone(),
                     conversation_id: convo_id.to_string(),
                     epoch: 0,
                     members: vec![],
                 });
-            state.group_id = new_group_id_hex;
+            state.group_id = new_group_id_hex.clone();
+            state.conversation_id = convo_id.to_string();
             state.epoch = merged;
-            let state_clone = state.clone();
-            drop(states);
-            if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                tracing::warn!(error = %e, convo_id, "Failed to persist group state after force rejoin");
+            state
+        };
+        if let Err(error) = self.storage().set_group_state(&state).await {
+            self.report_recovery_storage_failure(convo_id, "set_group_state:force_rejoin", &error)
+                .await;
+            // The cryptographic merge succeeded, but without the durable
+            // stable-conversation mapping a subsequent health probe could
+            // mistake this half-completed recovery for a healthy group and
+            // clear NeedsRejoin. Remove the uncommitted local projection so a
+            // retry must traverse recovery again instead of bypassing the
+            // failed durability boundary.
+            let cleanup_error = match self
+                .mls_context()
+                .delete_group(ext_commit_result.group_id.clone())
+            {
+                Ok(()) | Err(crate::MLSError::GroupNotFound { .. }) => None,
+                Err(cleanup_error) => Some(cleanup_error),
+            };
+            match self
+                .project_non_reset_state_locked(convo_id, ConversationState::NeedsRejoin)
+                .await
+            {
+                Ok(true) | Ok(false) => {}
+                Err(state_error) => {
+                    self.report_recovery_storage_failure(
+                        convo_id,
+                        "set_conversation_state:force_rejoin_persistence_failure",
+                        &state_error,
+                    )
+                    .await;
+                }
             }
+            self.mark_needs_rejoin_critical(convo_id).await;
+            if let Some(cleanup_error) = cleanup_error {
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "group-state persistence failed ({error}); failed to remove the undurable rejoin group ({cleanup_error})"
+                )));
+            }
+            return Err(error);
         }
+        {
+            let mut states = self.group_states().lock().await;
+            states.retain(|key, existing| {
+                key == &new_group_id_hex || existing.conversation_id != convo_id
+            });
+            states.insert(new_group_id_hex, state);
+        }
+
+        // Secret pruning is post-commit bookkeeping. Do not run it until the
+        // new stable-conversation projection is durable and installed in the
+        // in-memory cache; otherwise a failed persistence boundary could both
+        // remove the recovery group and prune the only remaining epoch data.
+        let merged_group_id = hex::encode(&ext_commit_result.group_id);
+        self.cleanup_epoch_secrets_if_needed(convo_id, &merged_group_id, merged)
+            .await;
 
         // Clear rejoin flag
         if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
@@ -2698,48 +3026,11 @@ where
             }
         }
 
-        // Seed lastSyncedSeq: fetch the latest message to get the current
-        // server sequence number so the next sync cycle doesn't re-process
-        // the entire backlog (spec: seed cursor after External Commit rejoin).
-        match self
-            .api_client()
-            .get_messages(convo_id, None, 1, None, None, None)
-            .await
-        {
-            Ok((_msgs, new_cursor)) => {
-                if let Some(cursor_val) = new_cursor {
-                    let user_did_for_cursor = user_did.to_string();
-                    let sync_cursor = SyncCursor {
-                        conversations_cursor: None,
-                        messages_cursor: Some(cursor_val.clone()),
-                    };
-                    if let Err(e) = self
-                        .storage()
-                        .set_sync_cursor(&user_did_for_cursor, &sync_cursor)
-                        .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            convo_id,
-                            "Failed to seed sync cursor after rejoin"
-                        );
-                    } else {
-                        tracing::info!(
-                            convo_id,
-                            cursor = %cursor_val,
-                            "Seeded sync cursor after External Commit rejoin"
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    convo_id,
-                    "Failed to fetch latest seq for sync cursor seeding"
-                );
-            }
-        }
+        // Do not manufacture a global message high-water mark from a one-row
+        // per-conversation fetch. Such a fetch both discarded an envelope and
+        // overwrote the independent conversations cursor. The normal sync path
+        // will process every envelope durably before advancing either field;
+        // recovery deliberately leaves the complete existing cursor unchanged.
 
         // Publish updated GroupInfo
         let group_info = self
@@ -2949,13 +3240,20 @@ where
         };
 
         let epoch = self.join_or_rejoin_locked(convo_id, user_did).await?;
-        if !self
+        match self
             .project_non_reset_state_locked(convo_id, ConversationState::Active)
-            .await?
+            .await
         {
-            return Err(OrchestratorError::RecoveryFailed(format!(
-                "ResetPending remains authoritative after recovery for {convo_id}"
-            )));
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "ResetPending remains authoritative after recovery for {convo_id}"
+                )));
+            }
+            Err(error) => {
+                self.mark_needs_rejoin_critical(convo_id).await;
+                return Err(error);
+            }
         }
         Ok(epoch)
     }
@@ -3112,47 +3410,99 @@ where
                                 .await?
                             }
                         } else {
-                            // Legacy non-reset Welcome joins retain their
-                            // historical epoch fallback. Reset completion above
-                            // is generation-bound and always fails closed.
+                            // A processed Welcome without a readable epoch is
+                            // not a usable recovery result. Epoch zero fallback
+                            // used to publish a half-joined group and clear its
+                            // recovery flag.
                             self.mls_context()
                                 .get_epoch(result.group_id.clone())
-                                .unwrap_or(0)
+                                .map_err(|error| {
+                                    OrchestratorError::RecoveryFailed(format!(
+                                        "processed Welcome epoch is unavailable for {convo_id}: {error}"
+                                    ))
+                                })?
                         };
 
-                        // Update group state
+                        // The durable stable-conversation projection is the
+                        // application-level commit point. Construct it without
+                        // mutating the cache, persist it first, and publish it
+                        // only after the write succeeds.
                         let welcome_group_id_hex = hex::encode(&result.group_id);
+                        let mut state = {
+                            let states = self.group_states().lock().await;
+                            states
+                                .get(&welcome_group_id_hex)
+                                .cloned()
+                                .or_else(|| {
+                                    states
+                                        .values()
+                                        .find(|state| state.conversation_id == convo_id)
+                                        .cloned()
+                                })
+                                .unwrap_or_else(|| GroupState {
+                                    group_id: welcome_group_id_hex.clone(),
+                                    conversation_id: convo_id.to_string(),
+                                    epoch: 0,
+                                    members: vec![],
+                                })
+                        };
+                        state.group_id = welcome_group_id_hex.clone();
+                        state.conversation_id = convo_id.to_string();
+                        state.epoch = epoch;
+                        // Materialize the stable conversation row before the
+                        // GroupState projection. Apart from binding the stable
+                        // conversation id to the mutable MLS group, this gives
+                        // recovery-flag storage a durable row to update if a
+                        // later commit-point write fails.
+                        if let Err(error) = self
+                            .storage()
+                            .ensure_conversation_exists(&user_did, convo_id, &welcome_group_id_hex)
+                            .await
                         {
-                            let mut states = self.group_states().lock().await;
-                            states.retain(|key, state| {
-                                key == &welcome_group_id_hex || state.conversation_id != convo_id
-                            });
-                            let state =
-                                states
-                                    .entry(welcome_group_id_hex.clone())
-                                    .or_insert_with(|| GroupState {
-                                        group_id: welcome_group_id_hex.clone(),
-                                        conversation_id: convo_id.to_string(),
-                                        epoch: 0,
-                                        members: vec![],
-                                    });
-                            state.group_id = welcome_group_id_hex;
-                            state.epoch = epoch;
-                            let state_clone = state.clone();
-                            drop(states);
-                            if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                                tracing::warn!(error = %e, convo_id, "Failed to persist group state after Welcome join");
-                            }
+                            self.report_recovery_storage_failure(
+                                convo_id,
+                                "ensure_conversation_exists:welcome_recovery",
+                                &error,
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                        if let Err(error) = self.storage().set_group_state(&state).await {
+                            self.mark_needs_rejoin_critical(convo_id).await;
+                            return Err(error);
+                        }
+                        if let Err(error) = self
+                            .storage()
+                            .update_join_info(convo_id, &user_did, JoinMethod::Welcome, epoch)
+                            .await
+                        {
+                            self.mark_needs_rejoin_critical(convo_id).await;
+                            return Err(error);
                         }
 
                         // Outside reset recovery there is no generation-bound
                         // completion transaction, so retain the legacy clear.
+                        if let Err(error) = self.clear_rejoin_failures(convo_id).await {
+                            self.mark_needs_rejoin_critical(convo_id).await;
+                            return Err(error);
+                        }
                         if current_reset_authority.is_none() {
-                            if let Err(e) = self.storage().clear_rejoin_flag(convo_id).await {
-                                tracing::warn!(error = %e, convo_id, "Failed to clear rejoin flag after Welcome join");
+                            if let Err(error) = self.storage().clear_rejoin_flag(convo_id).await {
+                                self.mark_needs_rejoin_critical(convo_id).await;
+                                return Err(error);
                             }
                         }
-                        self.clear_rejoin_failures(convo_id).await?;
+                        {
+                            let mut states = self.group_states().lock().await;
+                            normalize_group_state(&mut states, state);
+                        }
+
+                        self.cleanup_epoch_secrets_if_needed(
+                            convo_id,
+                            &welcome_group_id_hex,
+                            epoch,
+                        )
+                        .await;
 
                         // Insert history boundary marker for Welcome join.
                         // On iOS, Swift inserts first — message_exists prevents duplicates.
@@ -4631,11 +4981,13 @@ where
 
     async fn fetch_conversation_for_convo(&self, convo_id: &str) -> Result<ConversationView> {
         let mut cursor: Option<String> = None;
+        let mut pagination = PaginationGuard::for_conversations("reset conversation lookup");
         loop {
             let page = self
                 .api_client()
                 .get_conversations(50, cursor.as_deref())
                 .await?;
+            pagination.observe_page(page.conversations.len(), page.cursor.as_deref())?;
             for cv in &page.conversations {
                 if cv.conversation_id == convo_id {
                     return Ok(cv.clone());
@@ -4942,6 +5294,48 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn welcome_reissue_root_matching_preserves_method_specific_case() {
+        assert!(credential_root_matches_exact(
+            "did:web:Example.com#device-a",
+            "did:web:Example.com"
+        ));
+        assert!(!credential_root_matches_exact(
+            "did:web:example.com#device-b",
+            "did:web:Example.com"
+        ));
+    }
+
+    struct DurableEpochSecretStorage {
+        cleanup_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::types::EpochSecretStorage for DurableEpochSecretStorage {
+        async fn store_epoch_secret(
+            &self,
+            _conversation_id: String,
+            _epoch: u64,
+            _secret_data: Vec<u8>,
+        ) -> bool {
+            true
+        }
+
+        async fn get_epoch_secret(&self, _conversation_id: String, _epoch: u64) -> Option<Vec<u8>> {
+            None
+        }
+
+        async fn delete_epoch_secret(&self, _conversation_id: String, _epoch: u64) -> bool {
+            true
+        }
+
+        async fn delete_epochs_before(&self, _conversation_id: String, _cutoff_epoch: u64) -> u32 {
+            self.cleanup_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            0
+        }
+    }
+
     #[cfg(feature = "fork-resolution")]
     async fn fork_readd_fixture(
         label: &str,
@@ -5075,6 +5469,209 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "fork-resolution")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_readd_missing_group_projection_escalates_without_submitting() {
+        let (world, conversation_id, _group_id, source_epoch) =
+            fork_readd_fixture("fork missing projection").await;
+        let alice = world.client("Alice");
+        assert!(
+            alice
+                .orchestrator
+                .project_fork_detected_if_active(&conversation_id, source_epoch)
+                .await,
+            "fixture must enter ForkDetected before attempting repair"
+        );
+        alice
+            .orchestrator
+            .group_states()
+            .lock()
+            .await
+            .retain(|_, state| state.conversation_id != conversation_id);
+
+        let result = alice
+            .orchestrator
+            .attempt_fork_readd(&conversation_id)
+            .await;
+
+        assert!(
+            matches!(&result, Err(OrchestratorError::RecoveryFailed(message)) if message.contains("missing group state")),
+            "missing durable-projection source must fail closed, got {result:?}"
+        );
+        assert_eq!(
+            world
+                .delivery_service()
+                .commit_group_change_count(&conversation_id, "forkReadd"),
+            0,
+            "missing projection must be detected before server submission"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .conversation_states()
+                .lock()
+                .await
+                .get(&conversation_id),
+            Some(&ConversationState::NeedsRejoin)
+        );
+        assert!(alice.storage.has_rejoin_flag(&conversation_id));
+    }
+
+    #[cfg(feature = "fork-resolution")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fork_readd_group_state_write_failure_does_not_publish_success() {
+        let (world, conversation_id, group_id, source_epoch) =
+            fork_readd_fixture("fork durable projection failure").await;
+        let alice = world.client("Alice");
+        assert!(
+            alice
+                .orchestrator
+                .project_fork_detected_if_active(&conversation_id, source_epoch)
+                .await,
+            "fixture must enter ForkDetected before attempting repair"
+        );
+        alice
+            .orchestrator
+            .decrypt_fail_counts()
+            .lock()
+            .await
+            .insert(conversation_id.clone(), constants::FORK_DETECTION_THRESHOLD);
+
+        let group_info_before = alice
+            .orchestrator
+            .api_client()
+            .get_group_info(&conversation_id)
+            .await
+            .expect("fixture GroupInfo");
+        let cleanup_calls_before = alice.storage.epoch_cleanup_calls();
+        let durable_before = alice
+            .storage
+            .get_group_state(&group_id)
+            .await
+            .expect("read durable group state")
+            .expect("durable group state exists");
+        assert_eq!(durable_before.epoch, source_epoch);
+        alice.storage.fail_next_set_group_state();
+
+        let result = alice
+            .orchestrator
+            .attempt_fork_readd(&conversation_id)
+            .await;
+
+        assert!(
+            matches!(&result, Err(OrchestratorError::Storage(message)) if message.contains("set_group_state")),
+            "durable projection failure must abort fork readd, got {result:?}"
+        );
+        assert_eq!(
+            world
+                .delivery_service()
+                .commit_group_change_count(&conversation_id, "forkReadd"),
+            1,
+            "failure injection must occur after server acceptance and local merge"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(hex::decode(&group_id).expect("group id hex"))
+                .expect("merged crypto epoch remains readable"),
+            source_epoch + 1,
+            "regression must exercise failure after the local crypto merge"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .conversation_states()
+                .lock()
+                .await
+                .get(&conversation_id),
+            Some(&ConversationState::NeedsRejoin),
+            "failed durability must escalate instead of publishing Active"
+        );
+        assert!(
+            alice.storage.has_rejoin_flag(&conversation_id),
+            "failed durability must leave a durable recovery trigger"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .group_states()
+                .lock()
+                .await
+                .get(&group_id)
+                .expect("cached group state remains present")
+                .epoch,
+            source_epoch,
+            "undurable merged epoch must not be published to the group-state cache"
+        );
+        assert_eq!(
+            alice
+                .storage
+                .get_group_state(&group_id)
+                .await
+                .expect("read durable group state after failure")
+                .expect("prior durable group state remains present")
+                .epoch,
+            source_epoch,
+            "failed write must leave the prior durable projection intact"
+        );
+        assert_eq!(
+            alice.storage.epoch_cleanup_calls(),
+            cleanup_calls_before,
+            "platform epoch cleanup must not run before group-state durability"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .decrypt_fail_counts()
+                .lock()
+                .await
+                .get(&conversation_id),
+            Some(&constants::FORK_DETECTION_THRESHOLD),
+            "durability failure must not clear decrypt-failure evidence"
+        );
+        assert!(
+            !alice
+                .orchestrator
+                .fork_detection_states()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(&conversation_id),
+            "NeedsRejoin escalation must retire the fork-readd attempt state"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .api_client()
+                .get_group_info(&conversation_id)
+                .await
+                .expect("GroupInfo remains readable"),
+            group_info_before,
+            "durability failure must not publish advanced GroupInfo"
+        );
+        assert!(
+            !alice
+                .orchestrator
+                .clear_needs_rejoin_if_locally_healthy(&conversation_id)
+                .await,
+            "crypto membership must not clear recovery intent while durable GroupState is stale"
+        );
+        assert_eq!(
+            alice
+                .orchestrator
+                .conversation_states()
+                .lock()
+                .await
+                .get(&conversation_id),
+            Some(&ConversationState::NeedsRejoin),
+            "stale durable projection must remain NeedsRejoin"
+        );
+        assert!(
+            alice.storage.has_rejoin_flag(&conversation_id),
+            "stale durable projection must retain the durable recovery trigger"
+        );
+    }
+
     #[test]
     fn materialized_cleanup_propagates_first_delete_failure() {
         let groups = vec![vec![1], vec![2]];
@@ -5118,6 +5715,207 @@ mod tests {
             attempted,
             vec![vec![1], vec![2]],
             "cleanup must continue after an already-absent group"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_rejoin_group_state_write_failure_preserves_recovery_state() {
+        let mut world = crate::recovery_e2e_harness::TestWorld::new();
+        world.add_client("Alice").await;
+        world.register_device("Alice").await.unwrap();
+
+        let alice = world.client("Alice");
+        let epoch_cleanup_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        alice
+            .orchestrator
+            .mls_context()
+            .set_epoch_secret_storage(Box::new(DurableEpochSecretStorage {
+                cleanup_calls: std::sync::Arc::clone(&epoch_cleanup_calls),
+            }))
+            .expect("install durable epoch-secret storage");
+        let conversation = alice
+            .orchestrator
+            .create_group("durable rejoin projection", None, None)
+            .await
+            .expect("create group");
+        let conversation_id = conversation.conversation_id.clone();
+        let local_epoch = alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&conversation.group_id).expect("group id is hex"))
+            .expect("local epoch");
+        world
+            .delivery_service()
+            .set_conversation_epoch_for_test(&conversation_id, local_epoch);
+        alice
+            .storage
+            .mark_needs_rejoin(&conversation_id)
+            .await
+            .expect("seed durable rejoin flag");
+        alice.storage.fail_next_set_group_state();
+
+        let result = alice.orchestrator.force_rejoin(&conversation_id).await;
+        assert!(
+            matches!(&result, Err(OrchestratorError::Storage(message)) if message.contains("set_group_state")),
+            "durable group-state failure must abort force rejoin, got {result:?}"
+        );
+        assert!(
+            alice.storage.has_rejoin_flag(&conversation_id),
+            "failed durable projection must not clear the recovery flag"
+        );
+        assert!(matches!(
+            alice
+                .storage
+                .get_conversation_state(&conversation_id)
+                .await
+                .expect("read durable recovery state"),
+            Some(ConversationState::NeedsRejoin)
+        ));
+        assert!(matches!(
+            alice
+                .orchestrator
+                .conversation_states()
+                .lock()
+                .await
+                .get(&conversation_id),
+            Some(ConversationState::NeedsRejoin)
+        ));
+        assert!(
+            !alice.orchestrator.mls_context().group_exists(
+                hex::decode(&conversation.group_id).expect("conversation group id is hex")
+            ),
+            "an undurable merged group must not satisfy the next healthy-group probe"
+        );
+        assert!(
+            alice
+                .storage
+                .get_conversation_messages(&conversation_id)
+                .iter()
+                .all(|message| !message.id.starts_with("hb-")),
+            "history-boundary bookkeeping must not run after failed persistence"
+        );
+        assert!(
+            alice
+                .storage
+                .get_sync_cursor(&alice.did)
+                .await
+                .expect("read sync cursor")
+                .messages_cursor
+                .is_none(),
+            "cursor seeding must not run after failed persistence"
+        );
+        assert_eq!(
+            epoch_cleanup_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "epoch-secret cleanup must not run before the group-state durability boundary"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_rejoin_rejects_wrong_callback_epoch_without_merging_candidate() {
+        let mut world = crate::recovery_e2e_harness::TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+        let conversation = alice
+            .orchestrator
+            .create_group("external callback epoch fence", None, None)
+            .await
+            .expect("create group");
+        let old_group_id = hex::decode(&conversation.group_id).expect("group id is hex");
+        let local_epoch = alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(old_group_id.clone())
+            .expect("local epoch");
+        alice
+            .storage
+            .mark_needs_rejoin(&conversation.conversation_id)
+            .await
+            .expect("seed recovery state");
+        world
+            .delivery_service()
+            .set_conversation_epoch_for_test(&conversation.conversation_id, local_epoch + 7);
+
+        let error = alice
+            .orchestrator
+            .force_rejoin(&conversation.conversation_id)
+            .await
+            .expect_err("wrong DS callback epoch must not merge candidate");
+        assert!(matches!(error, OrchestratorError::EpochMismatch { .. }));
+        assert!(
+            !alice.orchestrator.mls_context().group_exists(old_group_id),
+            "the rejected external-join candidate must be discarded"
+        );
+        assert!(alice.storage.has_rejoin_flag(&conversation.conversation_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn force_rejoin_preserves_both_sync_cursor_fields_and_fetches_no_seed_envelope() {
+        let mut world = crate::recovery_e2e_harness::TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+        let conversation = alice
+            .orchestrator
+            .create_group("cursor preservation", None, None)
+            .await
+            .expect("create group");
+        let local_epoch = alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&conversation.group_id).expect("group id is hex"))
+            .expect("local epoch");
+        world
+            .delivery_service()
+            .set_conversation_epoch_for_test(&conversation.conversation_id, local_epoch);
+        alice
+            .storage
+            .mark_needs_rejoin(&conversation.conversation_id)
+            .await
+            .expect("seed recovery state");
+        let original_cursor = SyncCursor {
+            conversations_cursor: Some("conversation-high-water".to_string()),
+            messages_cursor: Some("message-high-water".to_string()),
+        };
+        alice
+            .storage
+            .set_sync_cursor(&alice.did, &original_cursor)
+            .await
+            .expect("seed cursor");
+        let unexpected_fetch = world.delivery_service().pause_next_get_messages();
+        let mut recovery = Box::pin(
+            alice
+                .orchestrator
+                .force_rejoin(&conversation.conversation_id),
+        );
+
+        tokio::select! {
+            result = &mut recovery => result.expect("force rejoin"),
+            _ = unexpected_fetch.wait_until_reached() => {
+                unexpected_fetch.release();
+                panic!("recovery must not fetch and discard an envelope solely to seed a cursor");
+            }
+        }
+
+        let persisted_cursor = alice
+            .storage
+            .get_sync_cursor(&alice.did)
+            .await
+            .expect("read cursor");
+        assert_eq!(
+            persisted_cursor.conversations_cursor, original_cursor.conversations_cursor,
+            "recovery must preserve the independent conversation cursor"
+        );
+        assert_eq!(
+            persisted_cursor.messages_cursor, original_cursor.messages_cursor,
+            "recovery must preserve the message cursor"
         );
     }
 

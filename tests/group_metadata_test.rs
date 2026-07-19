@@ -6,6 +6,9 @@
 //! `GroupMetadataV1` blobs (see `src/metadata.rs`) referenced from the
 //! AppDataDictionary at component `0x8001`.
 
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
+
 use async_trait::async_trait;
 use catbird_mls::{GroupConfig, KeychainAccess, MLSContext, MLSError};
 use std::collections::HashMap;
@@ -60,6 +63,7 @@ fn make_context() -> (Arc<MLSContext>, std::path::PathBuf) {
         Box::new(TestKeychain::new()),
     )
     .unwrap();
+    epoch_secret_test_support::install(&ctx);
     (ctx, dir)
 }
 

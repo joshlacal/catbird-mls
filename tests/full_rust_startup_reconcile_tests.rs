@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
 #[path = "mock_api_client.rs"]
 mod mock_api_client;
 #[path = "mock_credentials.rs"]
@@ -68,6 +70,7 @@ impl StartupReconcileFixture {
             Box::new(InMemoryKeychain::new()),
         )
         .expect("MLSContext");
+        epoch_secret_test_support::install(&context);
         let storage = Arc::new(MockStorage::new());
         let api = Arc::new(MockDeliveryService::new(did));
         let credentials = Arc::new(MockCredentials::new());
@@ -236,6 +239,67 @@ async fn recovery_state_read_failure_cannot_be_bypassed_by_reattach() {
         .initialize(fixture.did)
         .await
         .expect("an explicit serialized initialize retry may recover");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conversation_inventory_read_failure_keeps_persisted_quarantine_unavailable() {
+    let fixture = StartupReconcileFixture::new();
+    let conversation_id = "convo-quarantined-inventory-read";
+    fixture
+        .persist_missing_group(
+            conversation_id,
+            ConversationState::Quarantined {
+                reason: catbird_mls::orchestrator::QuarantineReason::PeerBadCommit,
+                since_ms: 1_717_000_000_000,
+            },
+            &random_group_id_hex(),
+        )
+        .await;
+    fixture.storage.fail_next_list_conversations();
+    let restarted = MLSOrchestrator::new(
+        Arc::clone(&fixture.context),
+        Arc::clone(&fixture.storage),
+        Arc::new(MockDeliveryService::new(fixture.did)),
+        Arc::new(MockCredentials::new()),
+        OrchestratorConfig::default(),
+    );
+
+    let error = restarted
+        .initialize(fixture.did)
+        .await
+        .expect_err("conversation inventory read failure must abort initialization");
+    assert!(
+        error
+            .to_string()
+            .contains("injected list_conversations failure"),
+        "initialization must expose the failed security inventory read: {error}"
+    );
+
+    let send = restarted
+        .send_message(conversation_id, "must remain blocked")
+        .await;
+    assert!(
+        matches!(
+            send,
+            Err(OrchestratorError::NotAuthenticated | OrchestratorError::ShuttingDown)
+        ),
+        "failed startup hydration must not expose send authority: {send:?}"
+    );
+
+    restarted
+        .initialize(fixture.did)
+        .await
+        .expect("an explicit retry may hydrate the persisted quarantine");
+    let send_after_retry = restarted
+        .send_message(conversation_id, "must remain quarantined")
+        .await;
+    assert!(
+        matches!(
+            send_after_retry,
+            Err(OrchestratorError::ConversationQuarantined { .. })
+        ),
+        "successful retry must hydrate and enforce persisted quarantine: {send_after_retry:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

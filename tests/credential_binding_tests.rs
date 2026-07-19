@@ -13,8 +13,8 @@
 //!   - `MockCredentials::set_authorized_device_keys` — resolve the optional
 //!     `get_authorized_device_keys` capability (ADR-009 full check).
 //!
-//! The historical observer checks remain warn-only. Outbound Add/Swap paths
-//! additionally enforce structural DID binding before MLS mutation.
+//! Observer callbacks remain as telemetry, while DID/device binding failures
+//! now reject before state-changing MLS operations.
 
 #![allow(dead_code)]
 
@@ -269,6 +269,123 @@ async fn mismatched_key_package_rejects_add_without_epoch_or_pending_commit() {
         .add_members(&convo.group_id, &[bob_did])
         .await
         .expect("valid retry proves the rejected add left no pending commit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_key_package_rejects_complete_batch_before_staging() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.add_client("Carol").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+    let carol_did = world.client("Carol").did.clone();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("missing-key-package", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id = hex::decode(&convo.group_id).unwrap();
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id.clone())
+        .unwrap();
+
+    let error = alice
+        .orchestrator
+        .add_members(&convo.group_id, &[bob_did.clone(), carol_did])
+        .await
+        .expect_err("partial DS batch must reject atomically");
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert!(error.to_string().contains("returned 1 key packages for 2"));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id.clone())
+            .unwrap(),
+        epoch_before
+    );
+
+    alice
+        .orchestrator
+        .add_members(&convo.group_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("valid retry proves partial batch did not create a pending commit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_no_advance_add_rejects_without_local_roster_mutation() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("no-advance-add", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id_bytes = hex::decode(&convo.group_id).unwrap();
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id_bytes.clone())
+        .unwrap();
+    let members_before = alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .get(&convo.group_id)
+        .expect("group state")
+        .members
+        .clone();
+
+    world.delivery_service().no_advance_next_add_members();
+    let error = alice
+        .orchestrator
+        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect_err("success without epoch advance must be rejected");
+    assert!(matches!(error, OrchestratorError::EpochMismatch { .. }));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())
+            .unwrap(),
+        epoch_before
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .group_states()
+            .lock()
+            .await
+            .get(&convo.group_id)
+            .expect("group state after rejection")
+            .members,
+        members_before,
+        "no-advance ACK must not append requested DIDs to local state"
+    );
+    assert!(alice
+        .storage
+        .get_group_state(&convo.group_id)
+        .await
+        .expect("persisted state after rejection")
+        .is_some_and(|state| state.members == members_before));
+
+    alice
+        .orchestrator
+        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("valid retry proves the no-advance rejection discarded pending state");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -978,8 +1095,17 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
     // A server group reset is ingested. The reset-ingestion path
     // (`persist_reset_pending_state`) must clear the conversation's stored
     // receipts alongside its other fresh-start mirrors.
-    let new_group_id =
-        hex::decode("aabbccddeeff00112233445566778899").expect("test fixture must be valid hex");
+    // This receipt-boundary test deliberately reuses the mock server's only
+    // cryptographically valid GroupInfo. Remove the local instance first so
+    // the same-ID reset is not classified as a live self-echo. Production
+    // resets normally rotate to a new group ID, but the mock cannot mint a
+    // detached authoritative GroupInfo for an arbitrary replacement ID.
+    let new_group_id = hex::decode(&convo.group_id).expect("created group id must be valid hex");
+    alice
+        .orchestrator
+        .mls_context()
+        .delete_group(new_group_id.clone())
+        .expect("remove local group before isolated reset-boundary fixture");
     alice
         .orchestrator
         .record_group_reset(&convo_id, new_group_id.clone(), 1)
@@ -1118,7 +1244,7 @@ async fn honest_inbound_sender_is_silent_and_message_processes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn spoofed_envelope_sender_warns_and_message_still_processes() {
+async fn spoofed_envelope_sender_is_rejected_before_message_delivery() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     world.add_client("Bob").await;
@@ -1165,23 +1291,16 @@ async fn spoofed_envelope_sender_warns_and_message_still_processes() {
         .relabel_envelope_sender_for_test(&bob_did, &mallory_did);
 
     let alice = world.client("Alice");
-    let (fetched, _cursor) = alice
+    let error = alice
         .orchestrator
         .fetch_messages(&group_id, None, 100, None, None, None)
         .await
-        .expect("alice fetch_messages failed");
+        .expect_err("spoofed envelope sender must fail application DID binding");
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert!(error.to_string().contains("credential binding"));
 
-    // Warn-and-allow: message processing behavior is unchanged.
-    assert!(
-        fetched
-            .iter()
-            .any(|m| m.text == "genuine bytes, lying envelope"),
-        "stage-1/2 warn-and-allow: the spoofed-envelope message must still \
-         be processed, got: {:?}",
-        fetched.iter().map(|m| m.text.clone()).collect::<Vec<_>>()
-    );
-
-    // ...and the D4 inbound check fired against the spoofed routing hint.
+    // The D4 enforcement check also remains observable through the legacy
+    // warning-named observer callback.
     let warnings = observer.credential_warnings();
     let w = warnings
         .iter()
@@ -1209,13 +1328,12 @@ async fn spoofed_envelope_sender_warns_and_message_still_processes() {
 
 // ---------------------------------------------------------------------------
 // (g) WS-3 stage 2 / N44c: authorized-device-key binding seam (ADR-009 full
-//     check, warn-only). The unsupported default staying silent is pinned by
-//     every other test in this file (MockCredentials resolves only DIDs that
-//     a test explicitly configures).
+//     check, enforced). TestWorld seeds authority only during explicit fixture
+//     registration; validation never trusts keys learned from the DS response.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn device_key_mismatch_warns_and_add_still_succeeds() {
+async fn device_key_mismatch_rejects_add_without_epoch_change() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     world.add_client("Bob").await;
@@ -1228,6 +1346,17 @@ async fn device_key_mismatch_warns_and_add_still_succeeds() {
         .orchestrator
         .set_event_observer(Some(observer.clone()))
         .await;
+
+    // Preserve Bob's genuine fixture-authorized key for the legitimate retry.
+    let refs = alice
+        .orchestrator
+        .api_client()
+        .get_key_packages(std::slice::from_ref(&bob_did))
+        .await
+        .expect("read Bob fixture package");
+    let bob_key = extract_key_package_binding(&refs[0].key_package_data)
+        .expect("decode Bob fixture package")
+        .signature_key;
 
     // Alice's platform resolves Bob's authorized device keys — but to a set
     // that does NOT contain the signing key in Bob's published key packages
@@ -1242,13 +1371,27 @@ async fn device_key_mismatch_warns_and_add_still_succeeds() {
         .await
         .expect("create_group failed");
 
-    // Warn-and-allow: the add must still succeed.
-    world
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&convo.group_id).unwrap())
+        .unwrap();
+    let error = world
         .client("Alice")
         .orchestrator
         .add_members(&convo.group_id, &[bob_did.clone()])
         .await
-        .expect("warn-only device-key binding: add_members must still succeed");
+        .expect_err("unauthorized device key must reject add_members");
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&convo.group_id).unwrap())
+            .unwrap(),
+        epoch_before,
+        "rejected device key must not stage or merge a commit"
+    );
 
     let warnings = observer.credential_warnings();
     let w = warnings
@@ -1265,10 +1408,62 @@ async fn device_key_mismatch_warns_and_add_still_succeeds() {
         "claimed identity should be Bob's credential identity, got: {}",
         w.claimed_identity
     );
+
+    alice
+        .credentials
+        .set_authorized_device_keys(&bob_did, vec![bob_key]);
+    alice.orchestrator.invalidate_device_key_cache().await;
+    alice
+        .orchestrator
+        .add_members(&convo.group_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("valid retry proves rejection left no pending commit");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn legacy_atomic_swap_keeps_device_resolution_warn_only() {
+async fn unsupported_device_key_resolution_rejects_before_staging() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("unsupported-device-resolution", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id = hex::decode(&convo.group_id).unwrap();
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_id.clone())
+        .unwrap();
+
+    alice.credentials.clear_authorized_device_keys(&bob_did);
+    alice.orchestrator.invalidate_device_key_cache().await;
+    let error = alice
+        .orchestrator
+        .add_members(&convo.group_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect_err("missing device resolver authority must fail closed");
+
+    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
+    assert!(error.to_string().contains("unsupported"));
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id)
+            .unwrap(),
+        epoch_before,
+        "unsupported resolution must not stage or merge an MLS commit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_atomic_swap_rejects_device_mismatch_and_resolver_failure() {
     let mut world = TestWorld::new();
     for name in ["Alice", "Bob", "Mallory"] {
         world.add_client(name).await;
@@ -1284,6 +1479,16 @@ async fn legacy_atomic_swap_keeps_device_resolution_warn_only() {
         .set_event_observer(Some(observer.clone()))
         .await;
 
+    let mallory_refs = alice
+        .orchestrator
+        .api_client()
+        .get_key_packages(std::slice::from_ref(&mallory_did))
+        .await
+        .expect("read Mallory fixture package");
+    let mallory_key = extract_key_package_binding(&mallory_refs[0].key_package_data)
+        .expect("decode Mallory fixture package")
+        .signature_key;
+
     alice
         .credentials
         .set_authorized_device_keys(&mallory_did, vec![vec![0xEE; 32]]);
@@ -1296,6 +1501,11 @@ async fn legacy_atomic_swap_keeps_device_resolution_warn_only() {
         )
         .await
         .expect("create mismatch group");
+    let mismatch_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&mismatch_group.group_id).unwrap())
+        .unwrap();
     alice
         .orchestrator
         .swap_members(
@@ -1304,7 +1514,15 @@ async fn legacy_atomic_swap_keeps_device_resolution_warn_only() {
             std::slice::from_ref(&mallory_did),
         )
         .await
-        .expect("Decision B keeps legacy Swap device-key mismatch warn-only");
+        .expect_err("legacy group-id route must reject device-key mismatch");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&mismatch_group.group_id).unwrap())
+            .unwrap(),
+        mismatch_epoch
+    );
 
     let resolver_group = alice
         .orchestrator
@@ -1319,6 +1537,11 @@ async fn legacy_atomic_swap_keeps_device_resolution_warn_only() {
         .credentials
         .set_authorized_device_key_resolution_failure(&mallory_did, true);
     alice.orchestrator.invalidate_device_key_cache().await;
+    let resolver_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(hex::decode(&resolver_group.group_id).unwrap())
+        .unwrap();
     alice
         .orchestrator
         .swap_members(
@@ -1327,7 +1550,15 @@ async fn legacy_atomic_swap_keeps_device_resolution_warn_only() {
             std::slice::from_ref(&mallory_did),
         )
         .await
-        .expect("Decision B keeps legacy Swap resolver failure warn-only");
+        .expect_err("legacy group-id route must reject resolver failure");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(&resolver_group.group_id).unwrap())
+            .unwrap(),
+        resolver_epoch
+    );
 
     let warnings = observer.credential_warnings();
     assert!(
@@ -1342,6 +1573,23 @@ async fn legacy_atomic_swap_keeps_device_resolution_warn_only() {
             .any(|warning| warning.reason.contains("resolution failed")),
         "resolver failure must remain observable: {warnings:?}"
     );
+
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&mallory_did, false);
+    alice
+        .credentials
+        .set_authorized_device_keys(&mallory_did, vec![mallory_key]);
+    alice.orchestrator.invalidate_device_key_cache().await;
+    alice
+        .orchestrator
+        .swap_members(
+            &resolver_group.group_id,
+            std::slice::from_ref(&bob_did),
+            std::slice::from_ref(&mallory_did),
+        )
+        .await
+        .expect("valid retry proves resolver rejection left no pending commit");
 }
 
 #[tokio::test(flavor = "multi_thread")]

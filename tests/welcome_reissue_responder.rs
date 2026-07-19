@@ -18,6 +18,7 @@
 
 mod e2e_harness;
 
+use catbird_mls::orchestrator::MLSStorageBackend;
 use e2e_harness::TestWorld;
 
 fn epoch_for_group(client: &e2e_harness::TestClient, group_id: &str) -> u64 {
@@ -135,6 +136,48 @@ async fn rotated_reissue_keeps_cleanup_bound_to_stable_conversation() {
     world
         .delivery_service()
         .rekey_conversation_for_test(&convo.conversation_id, &stable_conversation_id);
+
+    // Model the authorized local half of the stable-ID migration before sync
+    // observes only the replacement server row. Roster omission alone cannot
+    // authorize retirement of the superseded local projection.
+    let old_state = admin
+        .storage
+        .get_conversation_state(&convo.conversation_id)
+        .await
+        .expect("read superseded conversation state")
+        .expect("superseded conversation state exists");
+    let old_messages = admin
+        .storage
+        .get_conversation_messages(&convo.conversation_id);
+    admin
+        .storage
+        .ensure_conversation_exists(&admin.did, &stable_conversation_id, &group_id)
+        .await
+        .expect("persist replacement conversation projection");
+    admin
+        .storage
+        .set_conversation_state(&stable_conversation_id, old_state)
+        .await
+        .expect("preserve replacement conversation state");
+    for mut message in old_messages {
+        message.conversation_id = stable_conversation_id.clone();
+        admin
+            .storage
+            .store_message(&message)
+            .await
+            .expect("migrate conversation history to replacement ID");
+    }
+    admin
+        .storage
+        .delete_conversations(&admin.did, &[&convo.conversation_id])
+        .await
+        .expect("retire superseded conversation projection");
+    admin
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .remove(&convo.conversation_id);
     admin
         .orchestrator
         .sync_with_server(false)

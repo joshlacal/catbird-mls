@@ -64,6 +64,15 @@ enum OrchestratorLifecycleState {
     Shutdown,
 }
 
+/// Durable state that must be proven before an echoed epoch-changing commit
+/// may be treated as an already-processed self echo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnCommitExpectation {
+    pub conversation_id: ConversationId,
+    pub group_id: GroupId,
+    pub target_epoch: u64,
+}
+
 /// Platform-agnostic MLS orchestrator.
 ///
 /// Coordinates between the MLS crypto context, storage, API client, and credentials
@@ -103,8 +112,12 @@ where
     conversation_states: Mutex<HashMap<ConversationId, ConversationState>>,
     /// Pending message IDs for deduplication.
     pending_messages: Mutex<HashSet<String>>,
-    /// Own commit hashes for self-commit detection (with insertion timestamp for TTL eviction).
+    /// Own ciphertext hashes for self-echo detection (with insertion timestamp
+    /// for TTL eviction). Kept at its historical public test-helper type.
     own_commits: Mutex<HashMap<Vec<u8>, Instant>>,
+    /// Epoch-changing hashes additionally carry the durable proof required
+    /// before an echo can advance a server cursor.
+    own_commit_expectations: Mutex<HashMap<Vec<u8>, OwnCommitExpectation>>,
     /// Groups currently being created (protect from sync deletion).
     groups_being_created: Mutex<HashSet<GroupId>>,
     /// Monotonic version incremented when creation protection starts or ends.
@@ -112,6 +125,10 @@ where
     creation_generation: AtomicU64,
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
+    /// Per-stable-conversation inbound locks. These serialize duplicate HTTP,
+    /// push, and catch-up deliveries through their final crypto/application
+    /// durability barrier without reusing the rejoin transition lock.
+    inbound_processing_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
     /// Sync state lock.
     sync_in_progress: Mutex<bool>,
     /// Consecutive sync failures (for circuit breaker).
@@ -236,9 +253,11 @@ where
             conversation_states: Mutex::new(HashMap::new()),
             pending_messages: Mutex::new(HashSet::new()),
             own_commits: Mutex::new(HashMap::new()),
+            own_commit_expectations: Mutex::new(HashMap::new()),
             groups_being_created: Mutex::new(HashSet::new()),
             creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
+            inbound_processing_locks: Mutex::new(HashMap::new()),
             sync_in_progress: Mutex::new(false),
             consecutive_sync_failures: Mutex::new(0),
             circuit_breaker_tripped_at: Mutex::new(None),
@@ -413,11 +432,13 @@ where
                 }
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     error = ?e,
-                    "Failed to list conversations during init; \
-                     conversation_states starts empty"
+                    "Failed to list conversations during init; aborting initialization"
                 );
+                *self.lifecycle_state.lock().await =
+                    OrchestratorLifecycleState::FailedInitialization;
+                return Err(e);
             }
         }
 
@@ -509,7 +530,9 @@ where
         self.conversation_states.lock().await.clear();
         self.pending_messages.lock().await.clear();
         self.own_commits.lock().await.clear();
+        self.own_commit_expectations.lock().await.clear();
         self.rejoin_locks.lock().await.clear();
+        self.inbound_processing_locks.lock().await.clear();
         if let Ok(mut fds) = self.fork_detection_states.lock() {
             fds.clear();
         }
@@ -611,22 +634,62 @@ where
         &self.own_commits
     }
 
+    pub(crate) fn own_commit_expectations(&self) -> &Mutex<HashMap<Vec<u8>, OwnCommitExpectation>> {
+        &self.own_commit_expectations
+    }
+
+    /// Atomically publish an epoch-changing self-echo hash and the durable
+    /// expectation that authorizes skipping it. All paired-map mutations use
+    /// expectation -> hash lock order so concurrent insertion and eviction
+    /// cannot expose a visible hash without its fence.
+    pub(crate) async fn track_epoch_changing_own_commit(
+        &self,
+        hash: Vec<u8>,
+        expectation: OwnCommitExpectation,
+    ) {
+        self.evict_stale_commits().await;
+        let mut expectations = self.own_commit_expectations.lock().await;
+        let mut commits = self.own_commits.lock().await;
+        expectations.insert(hash.clone(), expectation);
+        commits.insert(hash, Instant::now());
+    }
+
+    /// Retain the hash as a replay token after both crypto and application
+    /// state are durable, but drop the transient epoch expectation.
+    pub(crate) async fn mark_own_commit_durably_confirmed(&self, hash: &[u8]) {
+        self.own_commit_expectations.lock().await.remove(hash);
+    }
+
+    pub(crate) async fn remove_own_commit_tracking(&self, hash: &[u8]) {
+        let mut expectations = self.own_commit_expectations.lock().await;
+        let mut commits = self.own_commits.lock().await;
+        expectations.remove(hash);
+        commits.remove(hash);
+    }
+
     /// Evict own-commit entries older than `OWN_COMMIT_TTL`.
     ///
     /// Called before insertions to bound memory growth. Commits that haven't
     /// been echoed back within 300 seconds are almost certainly orphaned.
     pub(crate) async fn evict_stale_commits(&self) {
         let now = Instant::now();
+        let mut expectations = self.own_commit_expectations.lock().await;
         let mut commits = self.own_commits.lock().await;
         let before = commits.len();
-        commits.retain(|_, ts| now.duration_since(*ts) < constants::OWN_COMMIT_TTL);
+        let expired: Vec<Vec<u8>> = commits
+            .iter()
+            .filter(|(_, inserted_at)| {
+                now.duration_since(**inserted_at) >= constants::OWN_COMMIT_TTL
+            })
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        for hash in &expired {
+            commits.remove(hash);
+            expectations.remove(hash);
+        }
         let evicted = before - commits.len();
         if evicted > 0 {
-            tracing::debug!(
-                evicted,
-                remaining = commits.len(),
-                "Evicted stale own_commits"
-            );
+            tracing::debug!(evicted, "Evicted stale own_commits");
         }
     }
 
@@ -642,6 +705,20 @@ where
     /// Acquire the per-conversation join/rejoin lock object.
     pub(crate) async fn rejoin_lock(&self, conversation_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.rejoin_locks.lock().await;
+        locks
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Acquire the independent per-conversation inbound-processing lock.
+    ///
+    /// Inbound entry points acquire this lock before decrypting and retain it
+    /// through the last crypto/storage barrier. No rejoin/reset path acquires
+    /// this lock, so the existing transition helpers can take `rejoin_lock`
+    /// from inside the serialized receive path without a reverse lock order.
+    pub(crate) async fn inbound_processing_lock(&self, conversation_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.inbound_processing_locks.lock().await;
         locks
             .entry(conversation_id.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))

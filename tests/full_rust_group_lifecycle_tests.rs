@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 mod e2e_harness;
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,7 +58,7 @@ impl GroupLifecycleFixture {
     async fn with_one_recipient_key_package() -> Self {
         let mut world = TestWorld::new();
         world.add_client("Bob").await;
-        world
+        let bob_did = world
             .register_device("Bob")
             .await
             .expect("register bob device");
@@ -69,9 +71,11 @@ impl GroupLifecycleFixture {
             Box::new(InMemoryKeychain::new()),
         )
         .expect("MLSContext");
+        epoch_secret_test_support::install(&context);
         let storage = Arc::new(MockStorage::new());
         let api = Arc::new(world.delivery_service().clone_as("did:plc:alice"));
         let credentials = Arc::new(MockCredentials::new());
+        world.install_authorized_device_keys(&credentials, &bob_did);
         let config = OrchestratorConfig::default();
 
         let engine = MlsEngine::new(

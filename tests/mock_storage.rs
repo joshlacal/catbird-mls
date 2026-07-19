@@ -67,6 +67,8 @@ struct Inner {
     /// Persisted global last-rejoin-attempt timestamp (epoch ms).
     last_global_rejoin_attempt_at_ms: Option<i64>,
     fail_next_get_recovery_state: bool,
+    /// One-shot failure injection for startup conversation inventory hydration.
+    fail_next_list_conversations: bool,
     /// One-shot partial-write injection for recovery persistence ordering.
     fail_next_set_last_global_rejoin_attempt_at: bool,
     /// conversation_id -> pending local-delete intent (WS-5.3).
@@ -88,6 +90,9 @@ struct Inner {
     /// tests (E7 follow-up R-2).
     fail_next_set_conversation_state: bool,
     fail_next_set_group_state: bool,
+    fail_next_store_message: bool,
+    fail_next_ensure_conversation_exists: bool,
+    fail_next_update_join_info: bool,
     fail_next_mark_reset_pending: bool,
     fail_next_mark_reset_pending_after_commit: bool,
     fail_next_mark_reset_pending_after_commit_with_notified_at_offset: Option<i64>,
@@ -246,6 +251,10 @@ impl MockStorage {
 
     pub fn fail_next_get_recovery_state(&self) {
         self.inner.lock().unwrap().fail_next_get_recovery_state = true;
+    }
+
+    pub fn fail_next_list_conversations(&self) {
+        self.inner.lock().unwrap().fail_next_list_conversations = true;
     }
 
     // ── Test helper methods ──────────────────────────────────────────────
@@ -512,6 +521,21 @@ impl MockStorage {
 
     pub fn fail_next_set_group_state(&self) {
         self.inner.lock().unwrap().fail_next_set_group_state = true;
+    }
+
+    pub fn fail_next_store_message(&self) {
+        self.inner.lock().unwrap().fail_next_store_message = true;
+    }
+
+    pub fn fail_next_ensure_conversation_exists(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_next_ensure_conversation_exists = true;
+    }
+
+    pub fn fail_next_update_join_info(&self) {
+        self.inner.lock().unwrap().fail_next_update_join_info = true;
     }
 
     #[allow(dead_code)]
@@ -807,6 +831,12 @@ impl MLSStorageBackend for MockStorage {
         group_id: &str,
     ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_ensure_conversation_exists {
+            inner.fail_next_ensure_conversation_exists = false;
+            return Err(OrchestratorError::Storage(
+                "injected ensure_conversation_exists failure".to_string(),
+            ));
+        }
         inner
             .conversations
             .entry(conversation_id.to_string())
@@ -840,6 +870,12 @@ impl MLSStorageBackend for MockStorage {
         join_epoch: u64,
     ) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_update_join_info {
+            inner.fail_next_update_join_info = false;
+            return Err(OrchestratorError::Storage(
+                "injected update_join_info failure".to_string(),
+            ));
+        }
         let record = inner
             .conversations
             .get_mut(conversation_id)
@@ -866,6 +902,12 @@ impl MLSStorageBackend for MockStorage {
     async fn list_conversations(&self, user_did: &str) -> Result<Vec<ConversationView>> {
         let mut inner = self.inner.lock().unwrap();
         inner.startup_probe_counts.list_conversations += 1;
+        if inner.fail_next_list_conversations {
+            inner.fail_next_list_conversations = false;
+            return Err(OrchestratorError::Storage(
+                "injected list_conversations failure".to_string(),
+            ));
+        }
         let views = inner
             .conversations
             .values()
@@ -1452,6 +1494,12 @@ impl MLSStorageBackend for MockStorage {
 
     async fn store_message(&self, message: &Message) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_store_message {
+            inner.fail_next_store_message = false;
+            return Err(OrchestratorError::Storage(
+                "injected store_message failure".to_string(),
+            ));
+        }
         inner
             .messages
             .entry(message.conversation_id.clone())

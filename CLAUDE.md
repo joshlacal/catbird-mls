@@ -137,18 +137,30 @@ UniFFI callbacks are synchronous. The orchestrator is async. Bridge: `async_runt
 
 ### Recovery State Machine
 
-This crate exposes a **5-state** `ConversationState` enum
-(`src/orchestrator/types.rs:154`) tracking **per-conversation, orchestrator-
-internal** lifecycle:
+This crate exposes a **7-variant** `ConversationState` enum
+(`src/orchestrator/types.rs`, search `pub enum ConversationState`) tracking
+**per-conversation, orchestrator-internal** lifecycle:
 
 ```
 Initializing → Active → ForkDetected → NeedsRejoin → Failed
+                  ↕
+        ResetPending / Quarantined
 ```
 
 - `Initializing` — group is being created but not yet committed
 - `Active` — healthy; sending and receiving messages
 - `ForkDetected` — fork detected during decryption; fork-readd in flight
 - `NeedsRejoin` — flagged for deferred External Commit rejoin
+- `ResetPending { new_group_id, reset_generation, notified_at_ms }` — server
+  issued a quorum-based group reset (spec §8.6); orchestrator must drop local
+  MLS state and join the new group id. Must survive restart (persisted via
+  the storage backend).
+- `Quarantined { reason, since_ms }` — Layer 3 quarantine: failures classified
+  as a *peer's* malformed commit, not local state loss. Suppresses ALL
+  auto-rejoin/External-Commit paths (sends blocked, reads work) so one buggy
+  peer can't drag healthy clients into an epoch storm. Persisted via
+  `MLSStorageBackend::mark_quarantined`. Exits via server reset event, a
+  healthy peer commit merging, or user-confirmed manual reset.
 - `Failed` — terminal local failure
 
 It's stored in `MLSOrchestrator.conversation_states`
@@ -173,9 +185,9 @@ catmos / catmos-cli layer. Each platform implements it independently:
   UniFFI object directly and runs its own sync + recovery loop in Swift
   (`MLSConversationManager+Sync.swift`).
 - **catmos / catmos-cli / WASM clients**: use `MLSOrchestrator` via
-  `CatbirdClient` / `WasmClient`. The orchestrator's 5-state
-  `ConversationState` is a smaller internal bookkeeping enum; the spec's
-  7 states are currently mapped loosely onto it. Concretely:
+  `CatbirdClient` / `WasmClient`. The orchestrator's `ConversationState`
+  is a separate internal bookkeeping enum; the spec's 7 states are
+  currently mapped loosely onto it. Concretely:
   - `Initializing` has no spec equivalent (pre-creation).
   - `Active` ≈ `HEALTHY`.
   - `ForkDetected` is a **Rust-specific** fork-readd path for
@@ -183,12 +195,13 @@ catmos / catmos-cli layer. Each platform implements it independently:
     `NEEDS_REJOIN`.
   - `NeedsRejoin` ≈ `NEEDS_REJOIN`.
   - `Failed` ≈ `UNRECOVERABLE_LOCAL`.
-  - `EPOCH_BEHIND`, `GROUP_MISSING`, `RECOVERING`, and `RESET_PENDING`
-    have **no direct Rust equivalent** — they're observed indirectly via
-    counters in `RecoveryTracker` (in-flight rejoin = `RECOVERING`;
-    group-not-found propagates from `MlsContext::get_epoch` failures;
-    server reset is observed via `GroupResetEvent` handled entirely at
-    the client layer).
+  - `ResetPending` ≈ `RESET_PENDING` (server-issued reset adoption).
+  - `Quarantined` is **Rust-specific** (Layer 3 peer-fault quarantine) —
+    no spec-7 equivalent.
+  - `EPOCH_BEHIND`, `GROUP_MISSING`, and `RECOVERING` have **no direct
+    Rust equivalent** — they're observed indirectly via counters in
+    `RecoveryTracker` (in-flight rejoin = `RECOVERING`; group-not-found
+    propagates from `MlsContext::get_epoch` failures).
 
 **Why two machines?** The Rust orchestrator's state tracks the attempt
 lifecycle inside its own sync loop: "am I currently allowed to try a
@@ -242,7 +255,7 @@ Outgoing ciphertext padded to buckets `[512, 1024, 2048, 4096, 8192]` bytes usin
 | Flag | Effect |
 |------|--------|
 | `echo-bot` | Enables the echo-bot binary (adds `reqwest`, `clap`, `tracing-subscriber`) |
-| `fork-resolution` | Reserved. Does NOT toggle OpenMLS `fork-resolution` (that's enabled unconditionally) |
+| `fork-resolution` | Gates `recover_fork_by_readding` (fork-readd recovery, `api.rs`). Does NOT toggle OpenMLS's own `fork-resolution` feature (that's enabled unconditionally) |
 | `android` | Reserved, unused |
 | `browser` | Reserved, unused |
 
@@ -255,8 +268,8 @@ Outgoing ciphertext padded to buckets `[512, 1024, 2048, 4096, 8192]` bytes usin
 
 | # | Gap | Priority | Status |
 |---|-----|----------|--------|
-| 1 | `fork-resolution` — OpenMLS feature enabled, but `recover_fork_by_readding` returns `OperationNotSupported` | HIGH | Implement in `mls_context.rs` |
-| 2 | `cleanup_epoch_secrets_if_needed` exists but is never called | HIGH | Add call after every successful commit merge |
+| 1 | ~~`recover_fork_by_readding` returns `OperationNotSupported`~~ | DONE | Implemented (gated behind the `fork-resolution` cargo feature; see `api.rs`) |
+| 2 | ~~`cleanup_epoch_secrets_if_needed` never called~~ | DONE | Called after merges in `groups.rs`, `staged_commit.rs`, `recovery.rs`, `messaging.rs` |
 | 3 | External Join Authorizer is a stub | LOW (HIGH for federation) | Server enforces membership today |
 | 4 | `swap_members()` not used for device rotation (two commits instead of one) | HIGH | Implement in `MLSContext` |
 | 5 | SelfRemove proposal not used for leave-group | MEDIUM | Server-mediated leave works |

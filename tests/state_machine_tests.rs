@@ -17,7 +17,7 @@ mod e2e_harness;
 
 // Re-use the TestWorld / TestClient infrastructure from e2e_harness.
 use catbird_mls::orchestrator::error::{OrchestratorError, Result as OrcResult};
-use catbird_mls::orchestrator::MLSAPIClient;
+use catbird_mls::orchestrator::{MLSAPIClient, MLSStorageBackend};
 use e2e_harness::TestWorld;
 
 // ---------------------------------------------------------------------------
@@ -811,6 +811,46 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
     world
         .delivery_service()
         .rekey_conversation_for_test(&group_id, &conversation_id);
+
+    // Model the authorized app-side half of the stable-ID migration before
+    // sync observes only the replacement server row. A server roster omission
+    // is not deletion authority for the superseded local projection.
+    let old_state = alice
+        .storage
+        .get_conversation_state(&group_id)
+        .await
+        .expect("read superseded conversation state")
+        .expect("superseded conversation state exists");
+    let old_messages = alice.storage.get_conversation_messages(&group_id);
+    alice
+        .storage
+        .ensure_conversation_exists(&alice.did, &conversation_id, &group_id)
+        .await
+        .expect("persist replacement conversation projection");
+    alice
+        .storage
+        .set_conversation_state(&conversation_id, old_state)
+        .await
+        .expect("preserve replacement conversation state");
+    for mut message in old_messages {
+        message.conversation_id = conversation_id.clone();
+        alice
+            .storage
+            .store_message(&message)
+            .await
+            .expect("migrate conversation history to replacement ID");
+    }
+    alice
+        .storage
+        .delete_conversations(&alice.did, &[&group_id])
+        .await
+        .expect("retire superseded conversation projection");
+    alice
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .remove(&group_id);
 
     let group_id_bytes = hex::decode(&group_id).expect("invalid group id hex");
     alice

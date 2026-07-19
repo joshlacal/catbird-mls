@@ -11,6 +11,9 @@
 // - Removed members CANNOT decrypt messages after removal
 // - This is the proper MLS cryptographic removal (not server-side soft removal)
 
+#[path = "epoch_secret_test_support.rs"]
+mod epoch_secret_test_support;
+
 use async_trait::async_trait;
 use catbird_mls::{GroupConfig, KeyPackageData, KeychainAccess, MLSContext, MLSError};
 use openmls::prelude::*;
@@ -142,6 +145,7 @@ fn new_context() -> (Arc<MLSContext>, tempfile::TempDir) {
         Box::new(TestKeychain::new()),
     )
     .unwrap();
+    epoch_secret_test_support::install(&context);
     (context, dir)
 }
 

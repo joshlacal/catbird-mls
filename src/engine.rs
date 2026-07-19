@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use crate::orchestrator::pagination::PaginationGuard;
 use crate::orchestrator::{
     normalize_group_state, ConversationReadyResult, ConversationRecoveryState, ConversationState,
     ConversationView, CredentialStore, DebugWipeLocalGroupResult, DeferredRecoveryReport,
@@ -561,12 +562,14 @@ where
     fn refresh_conversation_snapshot(&self, convo_id: &str) -> Result<ConversationView> {
         let snapshot = crate::async_runtime::block_on(async {
             let mut cursor: Option<String> = None;
+            let mut pagination = PaginationGuard::for_conversations("engine conversation refresh");
             loop {
                 let page = self
                     .orchestrator
                     .api_client()
                     .get_conversations(100, cursor.as_deref())
                     .await?;
+                pagination.observe_page(page.conversations.len(), page.cursor.as_deref())?;
                 if let Some(conversation) = page
                     .conversations
                     .into_iter()

@@ -10,8 +10,9 @@
 //!    NOT advance the local epoch.
 //! 2. `confirm_commit` — given the handle returned by `stage_commit` (and
 //!    optionally a `server_epoch` echoed back by the DS for fencing),
-//!    merges the pending commit, runs `cleanup_old_epochs`, updates the
-//!    in-memory group state, and removes the handle from the pending map.
+//!    merges the pending commit, durably projects the resulting `GroupState`,
+//!    then runs explicit epoch-secret cleanup and removes the handle from the
+//!    pending map.
 //! 3. `discard_pending` — clears the pending commit via
 //!    `MlsCryptoContext::clear_pending_commit`, removes the handle from the
 //!    pending map, and leaves the local epoch untouched.
@@ -22,7 +23,8 @@
 //! can migrate incrementally.
 
 use sha2::{Digest, Sha256};
-use web_time::Instant;
+
+use super::orchestrator::OwnCommitExpectation;
 
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
@@ -48,12 +50,9 @@ where
 {
     /// Validate staged Add/Swap packages before handing any bytes to OpenMLS.
     ///
-    /// `Ok(None)` from the optional authorized-device resolver deliberately
-    /// preserves the structural-only compatibility mode: the credential DID
-    /// root is still bound exactly, but complete device-key authorization is
-    /// unavailable until the platform wires that resolver. Once supported,
-    /// resolved keys are enforced and resolver infrastructure errors fail
-    /// closed so neither a pending MLS commit nor own-commit tracking changes.
+    /// Authorized-device resolution is mandatory. Unsupported resolution,
+    /// resolver infrastructure errors, and key mismatches all fail before a
+    /// pending MLS commit or own-commit tracking entry is created.
     async fn enforce_staged_resolved_device_keys(
         &self,
         key_packages: &[crate::KeyPackageData],
@@ -70,7 +69,11 @@ where
             })?;
             let root_did = credential_root_did(&binding.identity);
             match self.lookup_authorized_device_keys(root_did).await? {
-                DeviceKeyLookup::Unsupported => {}
+                DeviceKeyLookup::Unsupported => {
+                    return Err(OrchestratorError::InvalidInput(format!(
+                        "staged outbound key package {index} cannot be authorized because device-key resolution is unsupported for {root_did}"
+                    )));
+                }
                 DeviceKeyLookup::Keys(keys)
                     if keys
                         .iter()
@@ -100,25 +103,27 @@ where
         conversation_id: &str,
         kind: CommitKind,
     ) -> Result<CommitPlan> {
-        let resolved = self.resolve_conversation_context(conversation_id).await?;
-
-        // Bind the entire caller-supplied DID batch before resolving any DID.
-        // Besides avoiding unnecessary resolver work, this prevents an
-        // attacker-controlled credential root from entering the resolver
-        // cache when the delivery service substitutes a package.
+        // Apply byte ceilings before credential extraction invokes a TLS
+        // parser. Bind the entire caller-supplied DID batch before resolving
+        // any DID so an attacker-controlled credential root cannot enter the
+        // resolver cache when the delivery service substitutes a package.
         match &kind {
             CommitKind::AddMembers {
                 member_dids,
                 key_packages,
-            } => super::credential_binding::enforce_outbound_key_package_did_bindings(
-                member_dids,
-                key_packages,
-            )?,
+            } => {
+                crate::message_limits::validate_outbound_key_package_data_batch(key_packages)?;
+                super::credential_binding::enforce_outbound_key_package_did_bindings(
+                    member_dids,
+                    key_packages,
+                )?;
+            }
             CommitKind::SwapMembers {
                 add_dids,
                 add_key_packages,
                 ..
             } => {
+                crate::message_limits::validate_outbound_key_package_data_batch(add_key_packages)?;
                 super::credential_binding::enforce_outbound_key_package_did_bindings(
                     add_dids,
                     add_key_packages,
@@ -127,28 +132,22 @@ where
             CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
         }
 
-        // `groups::swap_members` historically passes the mutable group ID to
-        // this public method. Decision B keeps that legacy atomic route
-        // warn-only for device resolution, while callers using the stable
-        // conversation ID opt into fail-closed staged authorization. When old
-        // data uses the same value for both IDs, conservatively retain legacy
-        // compatibility until the public API/FFI migration lands.
-        let explicit_staged_authority = conversation_id == resolved.conversation_id
-            && resolved.conversation_id != resolved.group_id;
-        if explicit_staged_authority {
-            match &kind {
-                CommitKind::AddMembers { key_packages, .. } => {
-                    self.enforce_staged_resolved_device_keys(key_packages)
-                        .await?;
-                }
-                CommitKind::SwapMembers {
-                    add_key_packages, ..
-                } => {
-                    self.enforce_staged_resolved_device_keys(add_key_packages)
-                        .await?;
-                }
-                CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+
+        // Enforce the same device-key authority for every public route,
+        // including legacy callers that still pass a mutable group ID.
+        match &kind {
+            CommitKind::AddMembers { key_packages, .. } => {
+                self.enforce_staged_resolved_device_keys(key_packages)
+                    .await?;
             }
+            CommitKind::SwapMembers {
+                add_key_packages, ..
+            } => {
+                self.enforce_staged_resolved_device_keys(add_key_packages)
+                    .await?;
+            }
+            CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
         }
         self.stage_commit_for_group(&resolved.conversation_id, &resolved.group_id, kind)
             .await
@@ -180,6 +179,21 @@ where
         }
 
         let source_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+
+        // Internal wrapper paths call `stage_commit_for_group` directly, so
+        // repeat the pre-parse byte gate here rather than relying on the public
+        // resolver-aware entry point above.
+        match &kind {
+            CommitKind::AddMembers { key_packages, .. } => {
+                crate::message_limits::validate_outbound_key_package_data_batch(key_packages)?;
+            }
+            CommitKind::SwapMembers {
+                add_key_packages, ..
+            } => {
+                crate::message_limits::validate_outbound_key_package_data_batch(add_key_packages)?;
+            }
+            CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
+        }
 
         // Construct the pending commit via MlsCryptoContext. Each branch
         // mirrors the corresponding atomic method in `groups.rs` exactly —
@@ -270,26 +284,46 @@ where
             }
         };
 
-        // Track own commit hash for self-echo dedup on the receive path.
-        {
-            self.evict_stale_commits().await;
-            let hash = Sha256::digest(&commit_bytes);
-            self.own_commits()
-                .lock()
-                .await
-                .insert(hash.to_vec(), Instant::now());
-        }
-
         // Export GroupInfo from the *pre-merge* group state. OpenMLS will
         // happily re-export after merge; we still publish the post-merge
         // version in `confirm_commit`, but platforms that batch operations
         // may want to ship this pre-merge blob alongside the commit.
-        let group_info = self
+        let group_info = match self
             .mls_context()
-            .export_group_info(group_id_bytes.clone(), user_did.as_bytes().to_vec())?;
+            .export_group_info(group_id_bytes.clone(), user_did.as_bytes().to_vec())
+        {
+            Ok(group_info) => group_info,
+            Err(primary_error) => {
+                if let Err(cleanup_error) = self
+                    .mls_context()
+                    .clear_pending_commit(group_id_bytes.clone())
+                {
+                    self.mark_needs_rejoin_critical(conversation_id).await;
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "recovery-critical staged GroupInfo export failure ({primary_error}); pending commit cleanup also failed for group {group_id}: {cleanup_error}"
+                    )));
+                }
+                return Err(primary_error.into());
+            }
+        };
 
         let nonce = self.next_staged_commit_nonce().await;
         let target_epoch = source_epoch.saturating_add(1);
+
+        // Track epoch-changing self echoes with the durable proof they must
+        // satisfy. A hash match alone is insufficient: a dropped server
+        // response can leave the DS ahead while local confirmation never
+        // reached the stable GroupState commit point.
+        let hash = Sha256::digest(&commit_bytes).to_vec();
+        self.track_epoch_changing_own_commit(
+            hash,
+            OwnCommitExpectation {
+                conversation_id: conversation_id.to_string(),
+                group_id: group_id.to_string(),
+                target_epoch,
+            },
+        )
+        .await;
 
         self.pending_staged_commits().lock().await.insert(
             group_id.to_string(),
@@ -325,8 +359,9 @@ where
     }
 
     /// Confirm a previously staged commit: merge it locally, advance the
-    /// epoch, run epoch-secret cleanup, update the in-memory group state,
-    /// and remove the handle from the pending map.
+    /// epoch, durably project the resulting group state, update the in-memory
+    /// cache, run epoch-secret cleanup, and remove the handle from the pending
+    /// map.
     ///
     /// `server_epoch` is used to fence against confirm calls that reference
     /// a different epoch than the one the DS actually accepted. Pass
@@ -339,6 +374,14 @@ where
         server_epoch: u64,
     ) -> Result<ConfirmedCommit> {
         self.check_shutdown().await?;
+
+        // Complete every fallible prerequisite that does not depend on the
+        // pending metadata before consuming the nonce-bearing handle. A
+        // concurrent lifecycle transition or malformed group id must leave
+        // the caller able to confirm or discard the same staged commit.
+        let user_did = self.require_user_did().await?;
+        let group_id_bytes = hex::decode(&handle.group_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
         // Validate and pop the pending entry atomically to prevent a second
         // `confirm_commit` (or concurrent `discard_pending`) from operating
@@ -384,10 +427,6 @@ where
             });
         }
 
-        let user_did = self.require_user_did().await?;
-        let group_id_bytes = hex::decode(&handle.group_id)
-            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
-
         // Merge the pending commit. If this fails the local state is behind
         // the server — we clear the stale pending commit so future sends
         // don't hit OpenMLS's "pending commit exists" assertion, mark the
@@ -424,61 +463,108 @@ where
                 return Err(e.into());
             }
         };
+        if new_epoch != meta.target_epoch {
+            tracing::error!(
+                conversation_id = %meta.conversation_id,
+                group_id = %handle.group_id,
+                expected_epoch = meta.target_epoch,
+                observed_epoch = new_epoch,
+                "Confirmed commit did not land at its staged target epoch"
+            );
+            self.mark_needs_rejoin_critical(&meta.conversation_id).await;
+            return Err(OrchestratorError::EpochMismatch {
+                local: new_epoch,
+                remote: meta.target_epoch,
+            });
+        }
 
-        // Epoch-secret retention (spec §10).
-        self.cleanup_epoch_secrets_if_needed(&meta.conversation_id, &handle.group_id, new_epoch)
-            .await;
-
-        // Update in-memory group state based on which kind of commit this
-        // was. Best-effort: failure to persist is logged but doesn't poison
-        // the confirm (the merge already succeeded).
-        {
-            let mut states = self.group_states().lock().await;
+        // Build the post-merge projection without publishing it to the
+        // authoritative in-memory cache. The OpenMLS merge is already durable
+        // at this point, but returning success while this write fails would
+        // let callers observe/ack an epoch that restart recovery cannot map.
+        let cached_state = {
+            let states = self.group_states().lock().await;
             let resolved = ResolvedConversationContext {
                 conversation_id: meta.conversation_id.clone(),
                 group_id: handle.group_id.clone(),
             };
-            if let Some(mut gs) = resolved.group_state(&states).cloned() {
-                gs.epoch = new_epoch;
-                match &meta.kind {
-                    StagedCommitKindSummary::AddMembers { member_dids } => {
-                        for did in member_dids {
-                            if !gs.members.contains(did) {
-                                gs.members.push(did.clone());
-                            }
-                        }
+            resolved.group_state(&states).cloned()
+        };
+        let existing_state = match cached_state {
+            Some(state) => Some(state),
+            None => self.storage().get_group_state(&handle.group_id).await?,
+        };
+        let Some(mut state_clone) = existing_state else {
+            let error = OrchestratorError::Storage(format!(
+                "Missing GroupState projection after confirmed commit for conversation {} (group {})",
+                meta.conversation_id, handle.group_id
+            ));
+            self.mark_needs_rejoin_critical(&meta.conversation_id).await;
+            return Err(error);
+        };
+        if state_clone.group_id != handle.group_id {
+            let error = OrchestratorError::Storage(format!(
+                "Mismatched GroupState projection after confirmed commit for conversation {} (group {})",
+                meta.conversation_id, handle.group_id
+            ));
+            self.mark_needs_rejoin_critical(&meta.conversation_id).await;
+            return Err(error);
+        }
+        // A stable conversation id can legitimately diverge from the mutable
+        // group id after reset. `stage_commit` already resolved and recorded
+        // that stable id in `meta`; canonicalize an older group-keyed durable
+        // projection before writing the post-merge state.
+        state_clone.conversation_id = meta.conversation_id.clone();
+
+        state_clone.epoch = new_epoch;
+        match &meta.kind {
+            StagedCommitKindSummary::AddMembers { member_dids } => {
+                for did in member_dids {
+                    if !state_clone.members.contains(did) {
+                        state_clone.members.push(did.clone());
                     }
-                    StagedCommitKindSummary::RemoveMembers { member_dids } => {
-                        gs.members.retain(|m| !member_dids.contains(m));
-                    }
-                    StagedCommitKindSummary::SwapMembers {
-                        remove_dids,
-                        add_dids,
-                    } => {
-                        gs.members.retain(|m| !remove_dids.contains(m));
-                        for did in add_dids {
-                            if !gs.members.contains(did) {
-                                gs.members.push(did.clone());
-                            }
-                        }
-                    }
-                    StagedCommitKindSummary::UpdateMetadata => {
-                        // Membership unchanged.
-                    }
-                }
-                let state_clone = gs.clone();
-                normalize_group_state(&mut states, gs);
-                drop(states);
-                if let Err(e) = self.storage().set_group_state(&state_clone).await {
-                    tracing::warn!(
-                        error = %e,
-                        conversation_id = %meta.conversation_id,
-                        group_id = %handle.group_id,
-                        "Failed to persist group state after confirm_commit"
-                    );
                 }
             }
+            StagedCommitKindSummary::RemoveMembers { member_dids } => {
+                state_clone.members.retain(|m| !member_dids.contains(m));
+            }
+            StagedCommitKindSummary::SwapMembers {
+                remove_dids,
+                add_dids,
+            } => {
+                state_clone.members.retain(|m| !remove_dids.contains(m));
+                for did in add_dids {
+                    if !state_clone.members.contains(did) {
+                        state_clone.members.push(did.clone());
+                    }
+                }
+            }
+            StagedCommitKindSummary::UpdateMetadata => {
+                // Membership unchanged.
+            }
         }
+
+        if let Err(e) = self.storage().set_group_state(&state_clone).await {
+            tracing::error!(
+                error = %e,
+                conversation_id = %meta.conversation_id,
+                group_id = %handle.group_id,
+                new_epoch,
+                "Failed to persist group state after confirm_commit; withholding success"
+            );
+            self.mark_needs_rejoin_critical(&meta.conversation_id).await;
+            return Err(e);
+        }
+
+        {
+            let mut states = self.group_states().lock().await;
+            normalize_group_state(&mut states, state_clone);
+        }
+
+        // Epoch-secret retention (spec §10) runs only after both the crypto
+        // state and its stable-conversation projection are durable.
+        self.cleanup_epoch_secrets_if_needed(&meta.conversation_id, &handle.group_id, new_epoch)
+            .await;
 
         // Publish updated GroupInfo (best-effort).
         match self
@@ -538,10 +624,24 @@ where
         // shutdown to keep MLS state clean. Discarding after shutdown is
         // safe since we're only clearing in-memory + MLS-layer state.
 
+        let group_id_bytes = hex::decode(&handle.group_id).map_err(|error| {
+            OrchestratorError::InvalidInput(format!(
+                "Invalid staged-commit group id {}: {error}",
+                handle.group_id
+            ))
+        })?;
+
         let removed = {
             let mut pending = self.pending_staged_commits().lock().await;
             match pending.get(&handle.group_id) {
                 Some(existing) if existing.nonce == handle.nonce => {
+                    // Keep the handle authoritative until the crypto pending
+                    // state is actually cleared. Returning success after a
+                    // clear failure strands OpenMLS in a pending-commit state
+                    // while making retry impossible.
+                    self.mls_context()
+                        .clear_pending_commit(group_id_bytes)
+                        .map_err(OrchestratorError::from)?;
                     pending.remove(&handle.group_id)
                 }
                 Some(_) => {
@@ -559,20 +659,6 @@ where
             }
         };
 
-        // Tell MLS to forget the pending commit so future operations can
-        // construct new ones. If hex-decode or the crypto layer fails we
-        // still consider the discard "succeeded" from the caller's
-        // perspective — the handle is gone from the pending map.
-        if let Ok(group_id_bytes) = hex::decode(&handle.group_id) {
-            if let Err(e) = self.mls_context().clear_pending_commit(group_id_bytes) {
-                tracing::warn!(
-                    error = %e,
-                    conversation_id = %handle.group_id,
-                    "clear_pending_commit failed during discard_pending"
-                );
-            }
-        }
-
         tracing::debug!(
             conversation_id = %handle.group_id,
             nonce = handle.nonce,
@@ -580,6 +666,38 @@ where
             "Discarded staged commit"
         );
 
+        Ok(())
+    }
+
+    /// Discard a wrapper-owned staged commit after the surrounding server
+    /// operation failed or was an idempotent no-op. Legacy wrappers do not
+    /// return the nonce-bearing handle to their caller, so swallowing a
+    /// cleanup failure would make the retained pending commit inaccessible.
+    /// Escalate such failures into durable recovery and return a composite
+    /// error; callers may return their original error only after this succeeds.
+    pub(crate) async fn discard_pending_after_failed_operation(
+        &self,
+        handle: StagedCommitHandle,
+        operation: &str,
+        primary_failure: &str,
+    ) -> Result<()> {
+        let conversation_id = {
+            let pending = self.pending_staged_commits().lock().await;
+            pending
+                .get(&handle.group_id)
+                .filter(|meta| meta.nonce == handle.nonce)
+                .map(|meta| meta.conversation_id.clone())
+        };
+
+        if let Err(cleanup_error) = self.discard_pending(handle.clone()).await {
+            if let Some(conversation_id) = conversation_id.as_deref() {
+                self.mark_needs_rejoin_critical(conversation_id).await;
+            }
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "{operation} failed ({primary_failure}); pending commit cleanup also failed for group {}: {cleanup_error}",
+                handle.group_id
+            )));
+        }
         Ok(())
     }
 }

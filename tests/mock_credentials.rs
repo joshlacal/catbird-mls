@@ -52,6 +52,12 @@ impl MockCredentials {
             .insert(root_did.to_string(), keys);
     }
 
+    /// Remove the resolver capability for one DID. Used to prove that the
+    /// orchestrator fails closed when ADR-009 device-key authority is absent.
+    pub fn clear_authorized_device_keys(&self, root_did: &str) {
+        self.authorized_device_keys.lock().unwrap().remove(root_did);
+    }
+
     /// Number of `get_authorized_device_keys` calls observed for a DID.
     pub fn device_key_lookup_count(&self, root_did: &str) -> u32 {
         self.device_key_lookup_counts

@@ -45,6 +45,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use tls_codec::{Deserialize as TlsDeserialize};
 
 use crate::error::{MLSError, Result};
+use crate::message_limits::validate_inbound_mls_message_len;
 use crate::mls_context::MLSContext;
 
 // P0: Rate limiting constants for anti-DoS protection
@@ -460,7 +461,7 @@ pub extern "C" fn mls_decrypt_message(
     ffi_catch_unwind!({
         let result: Result<Vec<u8>> = (|| {
             validate_input_len(group_id_len, MAX_GROUP_ID_LEN, "group_id")?;
-            validate_input_len(ciphertext_len, MAX_MESSAGE_LEN, "ciphertext")?;
+            validate_inbound_mls_message_len(ciphertext_len, "ciphertext")?;
             
             let context = get_context(context_id)?;
             let gid = safe_slice(group_id, group_id_len, "group_id")?;
@@ -595,7 +596,7 @@ pub extern "C" fn mls_process_welcome(
     // P0: Catch panics at FFI boundary
     ffi_catch_unwind!({
         let result: Result<Vec<u8>> = (|| {
-            validate_input_len(welcome_len, MAX_MESSAGE_LEN, "welcome")?;
+            validate_inbound_mls_message_len(welcome_len, "welcome")?;
             validate_input_len(_identity_len, MAX_IDENTITY_LEN, "identity")?;
             
             let context = get_context(context_id)?;
@@ -761,7 +762,7 @@ pub extern "C" fn mls_process_commit(
     ffi_catch_unwind!({
         let result: Result<Vec<u8>> = (|| {
             validate_input_len(group_id_len, MAX_GROUP_ID_LEN, "group_id")?;
-            validate_input_len(commit_len, MAX_MESSAGE_LEN, "commit")?;
+            validate_inbound_mls_message_len(commit_len, "commit")?;
             
             let context = get_context(context_id)?;
             let gid = safe_slice(group_id, group_id_len, "group_id")?;

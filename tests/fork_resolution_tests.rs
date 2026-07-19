@@ -611,6 +611,18 @@ async fn fork_readd_resolves_rotated_stable_conversation_to_active_group() {
         .await
         .expect("persist migrated stable conversation as Active");
     alice
+        .storage
+        .delete_conversations(&alice.did, &[&group_id])
+        .await
+        .expect("retire superseded stable-conversation projection");
+    {
+        let mut conversations = alice.orchestrator.conversations().lock().await;
+        if let Some(mut migrated) = conversations.remove(&group_id) {
+            migrated.conversation_id = stable_conversation_id.clone();
+            conversations.insert(stable_conversation_id.clone(), migrated);
+        }
+    }
+    alice
         .orchestrator
         .sync_with_server(false)
         .await
@@ -672,6 +684,28 @@ async fn recovery_vote_authenticator_ignores_stale_legacy_group_state() {
     world
         .delivery_service()
         .rekey_conversation_for_test(&group_id, &stable_conversation_id);
+    alice
+        .storage
+        .ensure_conversation_exists(&alice.did, &stable_conversation_id, &group_id)
+        .await
+        .expect("persist authorized stable-conversation migration");
+    alice
+        .storage
+        .set_conversation_state(&stable_conversation_id, ConversationState::Active)
+        .await
+        .expect("persist migrated stable conversation as Active");
+    alice
+        .storage
+        .delete_conversations(&alice.did, &[&group_id])
+        .await
+        .expect("retire superseded stable-conversation projection");
+    {
+        let mut conversations = alice.orchestrator.conversations().lock().await;
+        if let Some(mut migrated) = conversations.remove(&group_id) {
+            migrated.conversation_id = stable_conversation_id.clone();
+            conversations.insert(stable_conversation_id.clone(), migrated);
+        }
+    }
     alice
         .orchestrator
         .sync_with_server(false)

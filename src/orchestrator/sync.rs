@@ -7,8 +7,23 @@ use super::credentials::CredentialStore;
 use super::error::Result;
 use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
+use super::pagination::PaginationGuard;
 use super::storage::MLSStorageBackend;
 use super::types::*;
+
+fn member_matches_user_root_exact(member_did: &str, expected_root_did: &str) -> bool {
+    super::credential_binding::credential_root_did(member_did) == expected_root_did
+}
+
+fn conversation_contains_user_root_exact(
+    conversation: &ConversationView,
+    expected_root_did: &str,
+) -> bool {
+    conversation
+        .members
+        .iter()
+        .any(|member| member_matches_user_root_exact(&member.did, expected_root_did))
+}
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
@@ -142,7 +157,7 @@ where
     /// 1. Acquires sync lock (skip if already syncing)
     /// 2. Validates authentication
     /// 3. Fetches all conversations with pagination
-    /// 4. Filters stale conversations where user is no longer a member
+    /// 4. Rejects uncorroborated server roster/listing omissions
     /// 5. Reconciles local state
     pub async fn sync_with_server(&self, full_sync: bool) -> Result<()> {
         self.check_shutdown().await?;
@@ -260,6 +275,7 @@ where
         // Fetch all conversations with pagination
         let mut all_convos = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut pagination = PaginationGuard::for_conversations("server sync");
 
         loop {
             self.check_shutdown().await?;
@@ -268,6 +284,7 @@ where
                 .api_client()
                 .get_conversations(100, cursor.as_deref())
                 .await?;
+            pagination.observe_page(page.conversations.len(), page.cursor.as_deref())?;
             all_convos.extend(page.conversations);
             cursor = page.cursor;
 
@@ -277,46 +294,38 @@ where
         }
 
         crate::info_log!(
-            "[sync] fetched {} convos from server (before member filter)",
+            "[sync] fetched {} convos from server (before roster validation)",
             all_convos.len()
         );
-        // Filter stale conversations (user no longer a member)
-        let normalized_did = user_did.to_lowercase();
-        let mut stale_ids = Vec::new();
+        // A delivery-service roster is authenticated transport data, but it is
+        // not cryptographic proof that this MLS client was removed. Treating a
+        // missing self DID as deletion authority lets an inconsistent or
+        // malicious DS erase the local ratchet tree and durable conversation
+        // state. A real removal must arrive through an authenticated MLS commit
+        // (or an explicit local leave), whose dedicated path owns cleanup.
+        let expected_root_did =
+            super::credential_binding::credential_root_did(user_did).to_string();
+        // A single omitted roster must not abort the whole sync: that would let
+        // one anomalous/compromised conversation deny message delivery for every
+        // healthy conversation. Skip the omitted conversation instead, preserving
+        // its local state, and keep syncing the rest. Deletion still only happens
+        // via an authenticated MLS commit / explicit local leave.
         all_convos.retain(|convo| {
-            let is_member = convo
-                .members
-                .iter()
-                .any(|m| m.did.to_lowercase() == normalized_did);
-            if !is_member {
-                let member_list: Vec<String> =
-                    convo.members.iter().map(|m| m.did.clone()).collect();
-                crate::info_log!(
-                    "[sync] convo={} group={} filtered OUT: user_did={} not in members={:?}",
-                    convo.conversation_id,
-                    convo.group_id,
-                    normalized_did,
-                    member_list
+            if conversation_contains_user_root_exact(convo, &expected_root_did) {
+                true
+            } else {
+                tracing::warn!(
+                    conversation_id = %convo.conversation_id,
+                    group_id = %convo.group_id,
+                    member_count = convo.members.len(),
+                    "Server roster omitted the current user; preserving local state and skipping sync for this conversation until authenticated MLS removal evidence arrives"
                 );
-                stale_ids.push(convo.conversation_id.clone());
+                false
             }
-            is_member
         });
-        crate::info_log!(
-            "[sync] {} convos remain after member filter ({} filtered out)",
-            all_convos.len(),
-            stale_ids.len()
-        );
 
-        // Clean up stale conversations
-        if !stale_ids.is_empty() {
-            tracing::info!(count = stale_ids.len(), "Cleaning up stale conversations");
-            for id in &stale_ids {
-                self.force_delete_local(id).await;
-            }
-        }
-
-        // Reconcile: find local conversations not on server
+        // Preflight the inverse omission too: a DS can omit the whole row,
+        // not only the current DID inside a returned row.
         let server_ids: HashSet<&str> = all_convos
             .iter()
             .map(|c| c.conversation_id.as_str())
@@ -335,23 +344,25 @@ where
         let creation_changed_during_snapshot =
             creation_generation_before != creation_generation_after;
 
+        // Log local conversations the server listing omitted, but do not abort
+        // the sync: preserving local state (by simply not deleting) is the whole
+        // point, and one omitted row must not block sync for the others.
         for (local_id, local_group_id) in &local_conversations {
-            // Creation protection is keyed by the locally-created MLS group
-            // id. A server may return a distinct stable conversation id before
-            // that row becomes visible to getConversations, so compare both
-            // identities. The single group-id guard remains balanced by the
-            // create path on every success and error exit.
+            // Creation protection is keyed by the locally-created MLS group id.
+            // A server may return a distinct stable conversation id before that
+            // row becomes visible to getConversations, so compare both identities.
+            // The single group-id guard remains balanced by the create path on
+            // every success and error exit.
             let creation_in_progress =
                 creating.contains(local_id) || creating.contains(local_group_id);
             if !server_ids.contains(local_id.as_str())
                 && !creation_in_progress
                 && !creation_changed_during_snapshot
             {
-                tracing::info!(
+                tracing::warn!(
                     conversation_id = %local_id,
-                    "Local conversation not on server, deleting"
+                    "Server listing omitted a local conversation; preserving local state until authenticated MLS removal evidence arrives"
                 );
-                self.force_delete_local(local_id).await;
             }
         }
 
@@ -605,20 +616,28 @@ where
                         .map(|member| member.did.clone())
                         .collect(),
                 };
+                self.storage().set_group_state(&state).await?;
                 {
                     let mut states = self.group_states().lock().await;
-                    normalize_group_state(&mut states, state.clone());
+                    normalize_group_state(&mut states, state);
                 }
-                self.storage().set_group_state(&state).await?;
             } else {
-                // Update member list from server
-                let mut states = self.group_states().lock().await;
+                // Update the authoritative member list durably before making
+                // it visible in memory. Publishing first could make a failed
+                // write permanent: the next sync would take this existing-state
+                // branch again and never retry the missing projection.
                 let resolved = ResolvedConversationContext {
                     conversation_id: conversation_id.to_string(),
                     group_id: group_id.to_string(),
                 };
-                if let Some(mut state) = resolved.group_state(&states).cloned() {
+                let existing = {
+                    let states = self.group_states().lock().await;
+                    resolved.group_state(&states).cloned()
+                };
+                if let Some(mut state) = existing {
                     state.members = convo.members.iter().map(|m| m.did.clone()).collect();
+                    self.storage().set_group_state(&state).await?;
+                    let mut states = self.group_states().lock().await;
                     normalize_group_state(&mut states, state);
                 }
             }
@@ -792,44 +811,17 @@ where
                 }
             }
 
-            // Commit any pending proposals (e.g. self-remove from departing members).
-            if let Ok(gid_bytes) = hex::decode(group_id) {
-                match self.mls_context().commit_pending_proposals(gid_bytes) {
-                    Ok(commit_bytes) => {
-                        tracing::info!(
-                            conversation_id = %conversation_id,
-                            group_id = %group_id,
-                            commit_len = commit_bytes.len(),
-                            "Committed pending proposals during sync"
-                        );
-                        if let Err(e) = self
-                            .api_client()
-                            .commit_group_change(
-                                conversation_id,
-                                &commit_bytes,
-                                "commitPendingProposals",
-                                None,
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                error = %e,
-                                conversation_id = %conversation_id,
-                                group_id = %group_id,
-                                "Failed to send pending proposals commit to server"
-                            );
-                        }
-                    }
-                    Err(crate::MLSError::InvalidInput { .. }) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            conversation_id = %conversation_id,
-                            group_id = %group_id,
-                            "Failed to commit pending proposals during sync"
-                        );
-                    }
-                }
+            // Use the same server-acceptance -> local-merge -> durable
+            // projection transaction as the explicit API. The former inline
+            // path merged before sending and could advance locally after a DS
+            // rejection or lose an accepted commit after a projection failure.
+            if let Err(e) = self.commit_self_remove_proposals(conversation_id).await {
+                tracing::warn!(
+                    error = %e,
+                    conversation_id = %conversation_id,
+                    group_id = %group_id,
+                    "Failed to commit pending proposals during sync"
+                );
             }
 
             // Auto-consume needs_rejoin flag: if a previous sync or decrypt failure
@@ -898,6 +890,67 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        conversation_contains_user_root_exact, member_matches_user_root_exact, ConversationView,
+        MemberRole, MemberView,
+    };
+
+    #[test]
+    fn membership_filter_preserves_method_specific_did_case() {
+        assert!(member_matches_user_root_exact(
+            "did:web:Example.com#device-a",
+            "did:web:Example.com"
+        ));
+        assert!(!member_matches_user_root_exact(
+            "did:web:example.com#device-b",
+            "did:web:Example.com"
+        ));
+    }
+
+    #[test]
+    fn conversation_roster_requires_the_current_user_root() {
+        let conversation = ConversationView {
+            group_id: "abcd".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            epoch: 7,
+            members: vec![MemberView {
+                did: "did:plc:mallory#device-1".to_string(),
+                role: MemberRole::Member,
+            }],
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+        };
+
+        assert!(
+            !conversation_contains_user_root_exact(&conversation, "did:plc:alice"),
+            "a DS roster containing only another member must be classified as an omission"
+        );
+    }
+
+    #[test]
+    fn conversation_roster_accepts_an_exact_device_bound_user_root() {
+        let conversation = ConversationView {
+            group_id: "abcd".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            epoch: 7,
+            members: vec![MemberView {
+                did: "did:plc:alice#device-1".to_string(),
+                role: MemberRole::Member,
+            }],
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+        };
+
+        assert!(conversation_contains_user_root_exact(
+            &conversation,
+            "did:plc:alice"
+        ));
+    }
+
     /// Verify that `saturating_sub` prevents underflow when local epoch exceeds server epoch.
     ///
     /// This is a regression test for the epoch difference calculations in `do_sync`.
