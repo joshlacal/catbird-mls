@@ -380,6 +380,26 @@ impl MockDeliveryService {
 
     /// Test helper: change the stable conversation ID while preserving the
     /// MLS group ID inside the conversation view.
+    /// Append a copy of `(convo_id, from_did)`'s queued Welcome blobs onto
+    /// `(convo_id, to_did)`'s queue. Simulates the orphaned-key-package wedge:
+    /// the recipient can FETCH a Welcome for the conversation, but it is
+    /// sealed to key material their local storage does not hold, so
+    /// `process_welcome` fails with `NoMatchingKeyPackage` (a device whose
+    /// server-side key packages outlived a local storage wipe).
+    pub fn copy_welcome_for_test(&self, convo_id: &str, from_did: &str, to_did: &str) {
+        let mut guard = self.state.lock().unwrap();
+        let source = guard
+            .welcomes
+            .get(&(convo_id.to_string(), from_did.to_string()))
+            .cloned()
+            .unwrap_or_else(|| panic!("no welcome stored for {convo_id}/{from_did}"));
+        guard
+            .welcomes
+            .entry((convo_id.to_string(), to_did.to_string()))
+            .or_default()
+            .extend(source);
+    }
+
     pub fn rekey_conversation_for_test(&self, old_convo_id: &str, new_convo_id: &str) {
         if old_convo_id == new_convo_id {
             return;

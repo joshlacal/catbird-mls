@@ -2145,6 +2145,11 @@ where
                 retry_after,
             } => {
                 if !retry_after.is_zero() {
+                    crate::warn_log!(
+                        "[WELCOME-RECOVERY] convo={} reissue suppressed, retry after {}s",
+                        convo_id,
+                        retry_after.as_secs()
+                    );
                     return Err(OrchestratorError::RecoveryFailed(format!(
                         "Welcome reissue suppressed for {convo_id}: retry after {}s",
                         retry_after.as_secs()
@@ -2156,22 +2161,55 @@ where
                     .get_mls_did(user_did)
                     .await?
                     .unwrap_or_else(|| user_did.to_string());
-                self.api_client()
+                let reissue_result = self
+                    .api_client()
                     .request_welcome_reissue(convo_id, &recipient_device_did, &reason)
-                    .await?;
+                    .await;
+                // Record the attempt REGARDLESS of the request outcome. A
+                // failing or unwired reissue backend (the ApiClient default
+                // returns "not implemented"; the iOS FFI callback historically
+                // lacked this method) previously bailed out via `?` before the
+                // attempt was recorded, so every sync tick re-entered this arm
+                // with attempt_count == 0 — an unbounded ~5s retry loop that
+                // never backed off and never escalated to External Commit.
+                // Consuming an attempt slot on failure keeps the reissue
+                // backoff ladder moving and lets `decide_welcome_recovery`
+                // reach ExternalCommitWithHistoryGap once attempts exhaust.
                 self.storage()
                     .record_welcome_reissue_attempt(convo_id, now_ms)
                     .await?;
                 self.storage().mark_needs_rejoin(convo_id).await?;
-                Err(OrchestratorError::RecoveryFailed(format!(
-                    "Welcome reissue requested for {convo_id}"
-                )))
+                match reissue_result {
+                    Ok(_) => {
+                        crate::warn_log!(
+                            "[WELCOME-RECOVERY] convo={} reissue REQUESTED (attempt recorded)",
+                            convo_id
+                        );
+                        Err(OrchestratorError::RecoveryFailed(format!(
+                            "Welcome reissue requested for {convo_id}"
+                        )))
+                    }
+                    Err(e) => {
+                        crate::warn_log!(
+                            "[WELCOME-RECOVERY] convo={} reissue request FAILED (attempt recorded, will back off then escalate): {}",
+                            convo_id,
+                            e
+                        );
+                        Err(OrchestratorError::RecoveryFailed(format!(
+                            "Welcome reissue request failed for {convo_id}: {e}"
+                        )))
+                    }
+                }
             }
             WelcomeRecoveryDecision::ExternalCommitWithHistoryGap { last_seen_epoch } => {
                 tracing::warn!(
                     convo_id,
                     last_seen_epoch,
                     "Welcome recovery exhausted reissue path; authorizing External Commit with history gap"
+                );
+                crate::warn_log!(
+                    "[WELCOME-RECOVERY] convo={} reissue path exhausted — authorizing External Commit with history gap",
+                    convo_id
                 );
                 Ok(true)
             }

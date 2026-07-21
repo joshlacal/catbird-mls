@@ -386,6 +386,25 @@ pub trait OrchestratorAPICallback: Send + Sync {
     /// fall back to External Commit" from "transport error".
     fn get_welcome(&self, convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError>;
 
+    /// Ask the server to reissue a Welcome for this device.
+    ///
+    /// Platform impls should POST to `blue.catbird.mlsChat.reissueWelcome`
+    /// with the conversation id, the recipient device DID, and the reason
+    /// string (e.g. `"no_matching_key_package"`). The active inviter/admin
+    /// fulfills the request by resealing a Welcome to one of this device's
+    /// CURRENT key packages — the recovery path for a Welcome sealed to a
+    /// key package whose private key this device no longer holds
+    /// (`NoMatchingKeyPackage`).
+    ///
+    /// Errors should be returned (not swallowed); the orchestrator records
+    /// the attempt either way so the reissue backoff ladder keeps moving.
+    fn request_welcome_reissue(
+        &self,
+        convo_id: String,
+        recipient_device_did: String,
+        reason: String,
+    ) -> Result<(), OrchestratorBridgeError>;
+
     /// Submit an External Commit to join/rejoin a conversation.
     ///
     /// Platform impls should POST to `blue.catbird.mlsChat.commitGroupChange`
@@ -2412,6 +2431,31 @@ impl MLSAPIClient for APIAdapter {
 
     async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
         self.0.get_welcome(convo_id.to_string()).map_err(bridge_err)
+    }
+
+    async fn request_welcome_reissue(
+        &self,
+        convo_id: &str,
+        recipient_device_did: &str,
+        reason: &str,
+    ) -> crate::orchestrator::Result<crate::orchestrator::welcome_recovery::WelcomeReissueRequestResult>
+    {
+        self.0
+            .request_welcome_reissue(
+                convo_id.to_string(),
+                recipient_device_did.to_string(),
+                reason.to_string(),
+            )
+            .map_err(bridge_err)?;
+        // The FFI surface is deliberately minimal (unit result); the caller
+        // only branches on success/failure, so synthesize the internal shape.
+        Ok(
+            crate::orchestrator::welcome_recovery::WelcomeReissueRequestResult {
+                welcome_requested: true,
+                requested_at: String::new(),
+                inviter_device: None,
+            },
+        )
     }
 
     async fn process_external_commit(
@@ -4609,6 +4653,18 @@ mod tests {
                 } else {
                     "bridge server error".to_string()
                 },
+            })
+        }
+
+        fn request_welcome_reissue(
+            &self,
+            _convo_id: String,
+            _recipient_device_did: String,
+            _reason: String,
+        ) -> Result<(), OrchestratorBridgeError> {
+            Err(OrchestratorBridgeError::ServerError {
+                status: 501,
+                body: "reissue not supported by test callback".to_string(),
             })
         }
 
