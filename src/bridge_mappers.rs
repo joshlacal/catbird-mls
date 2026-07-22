@@ -85,9 +85,19 @@ pub(crate) fn ffi_conversation_state_to_internal(
             reset_generation: ffi.reset_generation.ok_or_else(|| {
                 OrchestratorError::Storage("reset_pending missing reset_generation".into())
             })?,
-            notified_at_ms: ffi.notified_at_ms.ok_or_else(|| {
-                OrchestratorError::Storage("reset_pending missing notified_at_ms".into())
-            })?,
+            // Legacy compatibility: rows written before `notified_at_ms`
+            // existed have no value. Unlike `new_group_id`/`reset_generation`
+            // (load-bearing for first-responder bootstrap), this is a
+            // bookkeeping timestamp used for idempotency comparison — failing
+            // closed here bricked the entire runtime init on upgraded devices
+            // ("Failed to initialize Rust orchestrator runtime: reset_pending
+            // missing notified_at_ms"). Default deterministically to 0.
+            notified_at_ms: ffi.notified_at_ms.unwrap_or_else(|| {
+                tracing::warn!(
+                    "reset_pending row missing notified_at_ms (legacy write); defaulting to 0"
+                );
+                0
+            }),
         }),
         "quarantined" => {
             let reason = match ffi.quarantine_reason.as_deref() {

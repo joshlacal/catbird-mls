@@ -120,6 +120,13 @@ where
     own_commit_expectations: Mutex<HashMap<Vec<u8>, OwnCommitExpectation>>,
     /// Groups currently being created (protect from sync deletion).
     groups_being_created: Mutex<HashSet<GroupId>>,
+    /// In-memory Welcome-reissue attempt log, merged over the storage-backed
+    /// log in `route_welcome_recovery_decision`. Storage backends may
+    /// implement the persistence hooks as no-ops (the trait defaults; the
+    /// FFI-backed platforms historically did) — without this session-scoped
+    /// record the reissue arm re-ran with attempt_count == 0 every sync tick,
+    /// so the backoff ladder never engaged and recovery never escalated.
+    reissue_attempts_mem: Mutex<HashMap<ConversationId, super::welcome_recovery::ReissueAttemptLog>>,
     /// Monotonic version incremented when creation protection starts or ends.
     /// Sync uses this to reject stale server/local reconciliation snapshots.
     creation_generation: AtomicU64,
@@ -255,6 +262,7 @@ where
             own_commits: Mutex::new(HashMap::new()),
             own_commit_expectations: Mutex::new(HashMap::new()),
             groups_being_created: Mutex::new(HashSet::new()),
+            reissue_attempts_mem: Mutex::new(HashMap::new()),
             creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
             inbound_processing_locks: Mutex::new(HashMap::new()),
@@ -627,6 +635,13 @@ where
     /// Access the pending messages set.
     pub fn pending_messages(&self) -> &Mutex<HashSet<String>> {
         &self.pending_messages
+    }
+
+    /// Access the in-memory Welcome-reissue attempt log.
+    pub(crate) fn reissue_attempts_mem(
+        &self,
+    ) -> &Mutex<HashMap<ConversationId, super::welcome_recovery::ReissueAttemptLog>> {
+        &self.reissue_attempts_mem
     }
 
     /// Access the own commits map.

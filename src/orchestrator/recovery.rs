@@ -1856,6 +1856,9 @@ where
     }
 
     pub(crate) async fn clear_rejoin_failures(&self, convo_id: &str) -> Result<()> {
+        // Successful recovery also resets the session-scoped reissue attempt
+        // log so a future (unrelated) welcome failure starts a fresh ladder.
+        self.reissue_attempts_mem().lock().await.remove(convo_id);
         // WS-5.4 write-through: successful rejoin clears the persisted entry;
         // `clear` arms the global gate, so persist that too. Do not publish the
         // in-memory success until both durable mutations complete.
@@ -2124,10 +2127,30 @@ where
         user_did: &str,
         last_error: LastRecoveryError,
     ) -> Result<bool> {
-        let attempts = self
-            .storage()
-            .get_welcome_reissue_attempt_log(convo_id)
-            .await?;
+        // Merge the storage-backed log with the session-scoped in-memory log
+        // and take whichever has MORE attempts. Storage backends may leave the
+        // persistence hooks as the no-op trait defaults (the FFI-backed
+        // platforms historically did); with only the storage log, this arm
+        // re-ran with attempt_count == 0 every sync tick and the backoff
+        // ladder never engaged.
+        let attempts = {
+            let stored = self
+                .storage()
+                .get_welcome_reissue_attempt_log(convo_id)
+                .await?;
+            let mem = self
+                .reissue_attempts_mem()
+                .lock()
+                .await
+                .get(convo_id)
+                .cloned()
+                .unwrap_or_default();
+            if mem.attempt_count() > stored.attempt_count() {
+                mem
+            } else {
+                stored
+            }
+        };
 
         let has_groupinfo = self.api_client().get_group_info(convo_id).await.is_ok();
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -2178,6 +2201,15 @@ where
                 self.storage()
                     .record_welcome_reissue_attempt(convo_id, now_ms)
                     .await?;
+                self.reissue_attempts_mem()
+                    .lock()
+                    .await
+                    .entry(convo_id.to_string())
+                    .or_default()
+                    .attempts
+                    .push(crate::orchestrator::welcome_recovery::ReissueAttempt {
+                        attempted_at_ms: now_ms,
+                    });
                 self.storage().mark_needs_rejoin(convo_id).await?;
                 match reissue_result {
                     Ok(_) => {
