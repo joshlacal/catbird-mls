@@ -30,6 +30,7 @@
 //!   validation precede decryption, attribution, display, and effects, for both
 //!   application entries and all thirteen control kinds.
 
+pub mod endpoint_error;
 pub mod ids;
 
 /// Enforces the v1/v2 isolation rule stated in this module's documentation.
