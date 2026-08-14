@@ -534,10 +534,19 @@ mod tests {
         assert_eq!(at_min.len(), BARE_DID_MIN_LEN);
         assert!(BareDid::parse(at_min).is_ok());
 
-        // "did:web:a.b" is 11 bytes. It satisfies the hostname grammar but
-        // fails the jointly-normative length bound, so the length predicate is
-        // what rejects the shortest grammatically-legal did:web. Flagged to
-        // Josh as an open reading of CHAT_PROTOCOL.md §2.
+        // "did:web:a.b" is 11 bytes. It satisfies the did:web hostname
+        // production yet fails the global length bound, and the bound is what
+        // rejects it.
+        //
+        // Ratified by Josh, verbatim: "All bare-DID constraints are
+        // cumulative. A DID MUST satisfy the global 12-261 ASCII-byte length
+        // bound in addition to its method-specific grammar; consequently,
+        // did:web:a.b is invalid despite satisfying the did:web hostname-
+        // production rules."
+        //
+        // This vector exists so the cumulative rule stays executable. A future
+        // reader who only sees the grammar will conclude this DID is valid;
+        // the ruling is not re-litigable from the grammar alone.
         let under_min = "did:web:a.b";
         assert_eq!(under_min.len(), BARE_DID_MIN_LEN - 1);
         assert!(

@@ -19,6 +19,45 @@
 //! The server's `nextAfterSeq` is verified against the returned entries rather
 //! than trusted. An unchecked advance value lets a server move a client past
 //! entries it is entitled to, which would silently lose messages.
+//!
+//! # The advance rule is strict equality, and why
+//!
+//! `blue.catbird.chat.getEntries` states it verbatim:
+//!
+//! > The server skips inaccessible gaps and never returns their entries.
+//! > `nextAfterSeq` is `afterSeq` when entries is empty, otherwise the greatest
+//! > returned seq; `hasMore` is true exactly when another caller-visible
+//! > application or separately entitled control entry has seq greater than
+//! > `nextAfterSeq`.
+//!
+//! Per-device visibility gaps do **not** loosen this into `nextAfterSeq >=
+//! max(returned)`. A gap is skipped by the *entries* — a page may legitimately
+//! return seq 5 then seq 900 — and the cursor lands on the greatest entry that
+//! was actually delivered. Nothing needs to advance past an invisible row,
+//! because an invisible row is never a thing the cursor must step over; it is
+//! simply never returned.
+//!
+//! Relaxing to `>=` would give up the only property this check buys. A server
+//! could return seq 5 and set `nextAfterSeq` to 100000, and the client would
+//! resume above every entitled entry in between and never learn it had lost
+//! them. Equality is what makes that unrepresentable.
+//!
+//! # Recorded for the mls-ds lane
+//!
+//! `getEntries` is **not implemented** server-side. On `mls-ds` main the chat
+//! router registers all 32 routes but only device lifecycle, Reset, G6,
+//! Welcome, and Recovery have real handlers; the rest, including this one, sit
+//! on the shared cutover-gated stub. So the reading above is recorded here to
+//! be implemented against rather than diverged from.
+//!
+//! One genuine gap in the frozen contract, surfaced rather than papered over:
+//! it gives a server no way to say "I scanned a large inaccessible region,
+//! found nothing visible, and have not reached the end". Empty forces
+//! `nextAfterSeq == afterSeq`, and `hasMore` is defined by whether a visible
+//! entry exists above rather than by how far the server looked — so a device
+//! resuming beneath a very large gap implies an unbounded scan. That needs a
+//! contract answer before `getEntries` is built, not a client-side workaround:
+//! accepting a bare `>=` here would trade a real security property for it.
 
 use super::cursor::AfterSeq;
 use super::endpoint_error::EndpointError;
@@ -525,6 +564,26 @@ mod tests {
         )
         .expect("a gapped page is legitimate");
         assert_eq!(validated.next_after_seq().get(), 900);
+    }
+
+    #[test]
+    fn a_visibility_gap_does_not_loosen_the_advance_rule() {
+        // Gaps are handled by the entries, not by the cursor: the page above
+        // steps 1 -> 900 and the cursor lands on 900, the greatest entry
+        // actually delivered. An invisible row is never something the cursor
+        // must step over, so relaxing to `nextAfterSeq >= max(returned)` buys
+        // nothing and costs the anti-skip property. Concretely, this page
+        // returns only seq 1 while claiming 900; under a `>=` rule it would be
+        // accepted and 899 entitled entries would be lost silently, and it
+        // would be indistinguishable from the legitimate gapped page above.
+        let err = validate(0, page(vec![TestEntry::at(1)], 900, true)).unwrap_err();
+        assert_eq!(
+            err,
+            AppendLogError::NextAfterSeqMismatch {
+                expected: 1,
+                server_sent: 900
+            }
+        );
     }
 
     #[test]

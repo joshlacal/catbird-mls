@@ -114,8 +114,15 @@ impl ChatErrorCode {
             | Self::StandaloneProposalForbidden
             | Self::InvitationNotPending => C::Authorization,
 
-            // Relationship policy. Retrying cannot change a block or a
-            // declaration, so these are never put on a timer.
+            // Relationship policy. Two independent reasons these are never put
+            // on a timer. First, retrying cannot change a block or a
+            // declaration, so the retry can only ever fail. Second — and this
+            // is the one that makes it a safety rule rather than an efficiency
+            // one — a client that re-attempts delivery on a schedule keeps
+            // generating requests against a party who has blocked the actor,
+            // leaking continued activity and presence to exactly the person who
+            // asked not to receive it. Backing off is not enough; the correct
+            // behaviour is to stop and surface it.
             Self::BlockedRelationship
             | Self::MessagesDisabled
             | Self::GroupInvitesDisabled
