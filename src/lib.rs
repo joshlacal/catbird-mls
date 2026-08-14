@@ -1,6 +1,9 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod api;
 pub mod blob_crypto;
+/// Clean chat protocol (`blue.catbird.chat.*`). Isolated from `orchestrator`;
+/// the two protocols never interoperate.
+pub mod chat_v2;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;
 #[cfg(not(target_arch = "wasm32"))]
