@@ -38,6 +38,8 @@ pub mod endpoint_error;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ffi;
 pub mod ids;
+pub mod journal;
+pub mod provenance;
 pub mod wire;
 
 /// Enforces the v1/v2 isolation rule stated in this module's documentation.
