@@ -31,6 +31,7 @@
 //!   application entries and all thirteen control kinds.
 
 pub mod append_log;
+pub mod coordinate;
 pub mod cursor;
 pub mod endpoint_error;
 /// Platform binding surface. Compiled out on wasm32, matching the crate layout
@@ -38,6 +39,7 @@ pub mod endpoint_error;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ffi;
 pub mod ids;
+pub mod interval;
 pub mod journal;
 pub mod provenance;
 pub mod wire;
