@@ -16,10 +16,11 @@
 //!   interval's inclusive range;
 //! - once a schedule is terminalized, nothing later is accepted.
 //!
-//! Reanchor after a gap, the reset-activator cases, and the two Terminal paths
-//! are separate concerns and land in their own sub-slices. What is here refuses
-//! them rather than half-implementing them, so an unbuilt path cannot be
-//! mistaken for a permissive one.
+//! Interval closure, reanchor after a gap, and legal touching boundaries live
+//! in [`reanchor`]. The reset-activator classification and the two Terminal
+//! paths are still separate concerns and land in their own sub-slices. What is
+//! built refuses them by name rather than half-implementing them, so an unbuilt
+//! path cannot be mistaken for a permissive one.
 //!
 //! # Why sequences alone are never enough
 //!
@@ -27,6 +28,10 @@
 //! that arrives with the right sequence but the wrong transition ID,
 //! fingerprint, or context is refused, because the sequence is the one part of
 //! a row an adversary can most easily arrange to look correct.
+
+pub mod reanchor;
+
+pub use reanchor::{ReanchorAuthority, SequentialClose, TouchingBoundary};
 
 use super::coordinate::Coordinate;
 use super::ids::Seq;
@@ -81,6 +86,26 @@ pub enum ReducerError {
     PostTerminal { terminal_seq: Seq, row_seq: Seq },
     /// A row's seq did not advance past the interval's opening.
     NotAdvancing { expected_after: Seq, found: Seq },
+    /// A reanchor arrived while an interval was still open.
+    ///
+    /// Reanchor reopens access after a gap. Applying one over a live interval
+    /// would abandon its expected context without a close proof.
+    NotAwaitingReanchor { open_since: Seq, seq: Seq },
+    /// A close or touching boundary arrived with no interval open.
+    NothingToClose { seq: Seq },
+    /// A non-touching reanchor did not leave a strict gap after the close.
+    ///
+    /// Sharing a seq is a *touching* boundary and has its own entry point,
+    /// because it must be processed exactly once rather than as a close
+    /// followed by an independent open.
+    ReanchorMustNotTouch { close_seq: Seq, opening_seq: Seq },
+    /// A `Terminal` close reached the ordinary close path.
+    ///
+    /// Terminal must atomically install the exact schedule terminal proof. Its
+    /// dedicated path is not built yet, and closing the interval here without
+    /// that proof would leave the schedule un-terminalized while looking
+    /// finished — so it is refused by name rather than silently mishandled.
+    TerminalRequiresScheduleProof { seq: Seq },
     /// An interval-level rule was violated.
     Interval(IntervalError),
 }
@@ -121,6 +146,25 @@ impl fmt::Display for ReducerError {
                 expected_after,
                 found,
             } => write!(f, "row at {found} must be after {expected_after}"),
+            Self::NotAwaitingReanchor { open_since, seq } => write!(
+                f,
+                "reanchor at {seq} refused: an interval opened at {open_since} is still live"
+            ),
+            Self::NothingToClose { seq } => {
+                write!(f, "row at {seq} has no open interval to close")
+            }
+            Self::ReanchorMustNotTouch {
+                close_seq,
+                opening_seq,
+            } => write!(
+                f,
+                "reanchor at {opening_seq} shares the close seq {close_seq}; \
+                 a touching boundary is one shared row and has its own path"
+            ),
+            Self::TerminalRequiresScheduleProof { seq } => write!(
+                f,
+                "terminal close at {seq} must atomically install the schedule proof"
+            ),
             Self::Interval(err) => write!(f, "{err}"),
         }
     }
@@ -270,6 +314,50 @@ impl ApplicationReducer {
                 None => true,
             }
         })
+    }
+
+    /// The currently open interval, if any.
+    fn open_interval(&self) -> Option<&AccessInterval<Coordinate>> {
+        self.intervals.last().filter(|i| i.is_open())
+    }
+
+    /// Mutable access to the interval list, for the reanchor module.
+    fn intervals_mut(&mut self) -> &mut Vec<AccessInterval<Coordinate>> {
+        &mut self.intervals
+    }
+
+    /// Installs a new expected context.
+    fn set_expected(&mut self, context: Coordinate) {
+        self.expected = Some(context);
+    }
+
+    /// Drops the expected context, as a close does.
+    ///
+    /// Nothing may be sequenced afterwards until a verified reanchor: there is
+    /// no context to compare a `previous` against, and inventing one is exactly
+    /// what an arbitrary-current-head reanchor would be.
+    fn clear_expected(&mut self) {
+        self.expected = None;
+    }
+
+    /// Requires a row to build on the expected context.
+    fn require_expected_predecessor(
+        &self,
+        seq: Seq,
+        previous: &Coordinate,
+    ) -> Result<(), ReducerError> {
+        let expected = self
+            .expected
+            .as_ref()
+            .ok_or(ReducerError::NoOpenInterval { seq })?;
+        if previous != expected {
+            return Err(ReducerError::ContextMismatch {
+                seq,
+                expected: Box::new(expected.clone()),
+                found: Box::new(previous.clone()),
+            });
+        }
+        Ok(())
     }
 
     fn require_recipient(&self, found: &RecipientBinding) -> Result<(), ReducerError> {
