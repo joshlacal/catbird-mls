@@ -36,6 +36,7 @@
 
 use super::super::cursor::AfterSeq;
 use super::super::interval::RecipientBinding;
+use super::super::journal::{JournalEntry, OperationIdentity};
 use super::page::{PageCommit, PersistedEntry, RatchetCheckpoint};
 use super::{StorageError, StoreScope};
 use async_trait::async_trait;
@@ -116,6 +117,28 @@ pub trait ChatV2Store: ChatV2StoreBounds {
         &self,
         binding: &RecipientBinding,
     ) -> Result<Option<RatchetCheckpoint>, StorageError>;
+
+    /// Durably records a journalled mutation, or updates its progress.
+    ///
+    /// The bytes are stored verbatim. §5 deduplicates on
+    /// `(endpoint NSID, principal DID, operation ID)` and compares the stored
+    /// transcript digest and signature byte-for-byte, so an implementation that
+    /// re-encoded a body — reserializing it, or normalizing it on the way to a
+    /// column — would produce a retry the server reads as a different request.
+    async fn put_journal_entry(&self, entry: &JournalEntry) -> Result<(), StorageError>;
+
+    /// Reads one journalled mutation by its idempotency identity.
+    async fn journal_entry(
+        &self,
+        identity: &OperationIdentity,
+    ) -> Result<Option<JournalEntry>, StorageError>;
+
+    /// Every journalled mutation whose outcome is still unknown.
+    ///
+    /// The restart path. These are the operations that may or may not have
+    /// committed, and the only way to find out is to resubmit the identical
+    /// stored bytes and read the result the server kept.
+    async fn outstanding_journal_entries(&self) -> Result<Vec<JournalEntry>, StorageError>;
 }
 
 /// Enforces that [`ChatV2Store`] never grows a default method body.

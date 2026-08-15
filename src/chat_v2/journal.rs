@@ -202,6 +202,37 @@ impl JournalEntry {
         }
     }
 
+    /// Reconstructs an entry from durable storage, including its progress.
+    ///
+    /// The counterpart to [`JournalEntry::prepare`], which always produces
+    /// [`JournalState::Prepared`] because a freshly prepared mutation has made
+    /// no progress. A restart must instead restore whatever progress was
+    /// durable, so this constructor necessarily accepts any state — that is what
+    /// reading durable state means.
+    ///
+    /// It is deliberately *not* a way to rebuild a request. Every byte here
+    /// comes from storage and is passed through unchanged; there is still
+    /// nothing in this module that regenerates a body, a digest, or a signature,
+    /// because doing so would produce a fresh `signedAt` and convert a
+    /// recoverable ambiguous outcome into a permanent conflict.
+    pub fn rehydrate(
+        identity: OperationIdentity,
+        canonical_body: Vec<u8>,
+        request_digest: [u8; 32],
+        signature: [u8; 64],
+        signed_at: CanonicalTimestamp,
+        state: JournalState,
+    ) -> Self {
+        Self {
+            identity,
+            request_digest,
+            signature,
+            signed_at,
+            canonical_body,
+            state,
+        }
+    }
+
     /// The idempotency triple.
     pub fn identity(&self) -> &OperationIdentity {
         &self.identity

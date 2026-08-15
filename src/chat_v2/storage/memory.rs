@@ -28,6 +28,7 @@
 use super::super::cursor::AfterSeq;
 use super::super::ids::Seq;
 use super::super::interval::RecipientBinding;
+use super::super::journal::{JournalEntry, OperationIdentity};
 use super::page::{PageCommit, PersistedEntry, RatchetCheckpoint};
 use super::store::ChatV2Store;
 use super::{RecordKind, StorageError, StoreScope};
@@ -41,6 +42,7 @@ struct State {
     cursors: HashMap<RecipientBinding, AfterSeq>,
     entries: HashMap<RecipientBinding, BTreeMap<Seq, PersistedEntry>>,
     checkpoints: HashMap<RecipientBinding, RatchetCheckpoint>,
+    journal: HashMap<OperationIdentity, JournalEntry>,
 }
 
 /// A non-durable [`ChatV2Store`] for tests and for proving the trait's shape.
@@ -159,13 +161,50 @@ impl ChatV2Store for MemoryStore {
         let state = self.guard("ratchet_checkpoint")?;
         Ok(state.checkpoints.get(binding).cloned())
     }
+
+    async fn put_journal_entry(&self, entry: &JournalEntry) -> Result<(), StorageError> {
+        self.scope.require_owner(&entry.identity().actor_did)?;
+        let mut state = self.guard("put_journal_entry")?;
+        // Stored verbatim: the same JournalEntry, not a re-encoding of it. Any
+        // transformation on the way in is a transformation the server would
+        // read as a different request.
+        state
+            .journal
+            .insert(entry.identity().clone(), entry.clone());
+        Ok(())
+    }
+
+    async fn journal_entry(
+        &self,
+        identity: &OperationIdentity,
+    ) -> Result<Option<JournalEntry>, StorageError> {
+        self.scope.require_owner(&identity.actor_did)?;
+        let state = self.guard("journal_entry")?;
+        Ok(state.journal.get(identity).cloned())
+    }
+
+    async fn outstanding_journal_entries(&self) -> Result<Vec<JournalEntry>, StorageError> {
+        let state = self.guard("outstanding_journal_entries")?;
+        Ok(state
+            .journal
+            .values()
+            // `should_submit` is the journal's own predicate for "outcome still
+            // unknown". Restating it as a state match here would be a second
+            // source of truth for which states are terminal.
+            .filter(|entry| entry.should_submit())
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::page::EntryOutcome;
     use super::*;
-    use crate::chat_v2::ids::{BareDid, ConversationId, DeviceId, EntryId};
+    use crate::chat_v2::ids::{
+        BareDid, CanonicalTimestamp, ConversationId, DeviceId, EntryId, IdempotencyKey, MessageId,
+    };
+    use crate::chat_v2::journal::{JournalState, OperationId};
     use crate::chat_v2::provenance::OuterEntryFingerprint;
 
     const OWNER: &str = "did:plc:z72i7hdynmk6r22z27h6tvur";
@@ -497,5 +536,216 @@ mod tests {
             .unwrap();
         assert_eq!(capped.len(), 2);
         assert_eq!(capped[0].seq.get(), 1, "reads are oldest first");
+    }
+
+    // ---- the journal ------------------------------------------------------
+
+    const KEY: &str = "70707070-7070-4070-b070-707070707070";
+    const SIGNED_AT: &str = "2026-08-14T12:34:56.789Z";
+
+    fn identity(owner: &str, endpoint: &str, operation_id: OperationId) -> OperationIdentity {
+        OperationIdentity {
+            endpoint: endpoint.to_owned(),
+            actor_did: did(owner),
+            operation_id,
+        }
+    }
+
+    fn transition_identity(owner: &str) -> OperationIdentity {
+        identity(
+            owner,
+            "blue.catbird.chat.submitTransition",
+            OperationId::IdempotencyKey(IdempotencyKey::parse(KEY).unwrap()),
+        )
+    }
+
+    fn message_identity(owner: &str) -> OperationIdentity {
+        identity(
+            owner,
+            "blue.catbird.chat.sendMessage",
+            OperationId::MessageId(MessageId::parse(KEY).unwrap()),
+        )
+    }
+
+    fn journalled(identity: OperationIdentity) -> JournalEntry {
+        JournalEntry::prepare(
+            identity,
+            b"exact-canonical-body".to_vec(),
+            [0xab; 32],
+            [0xcd; 64],
+            CanonicalTimestamp::parse(SIGNED_AT).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_journalled_mutation_round_trips_byte_for_byte() {
+        // The whole reason the journal exists. §5 compares the stored transcript
+        // digest and signature byte-for-byte, so a store that re-encoded a body
+        // on the way in or out would produce a retry the server reads as a
+        // different request — a permanent conflict on an operation that may
+        // already have committed.
+        let store = store();
+        let original = journalled(transition_identity(OWNER));
+        store.put_journal_entry(&original).await.unwrap();
+
+        let restored = store
+            .journal_entry(&transition_identity(OWNER))
+            .await
+            .unwrap()
+            .expect("the entry must be readable");
+
+        assert_eq!(restored.canonical_body(), original.canonical_body());
+        assert_eq!(restored.request_digest(), original.request_digest());
+        assert_eq!(restored.signature(), original.signature());
+        assert_eq!(restored.signed_at(), original.signed_at());
+        assert!(
+            restored.matches_stored_bytes(original.request_digest(), original.signature()),
+            "a restored entry must satisfy the server's own equality check"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_entry_keeps_its_progress_and_never_re_signs() {
+        // Restoring must not reset an in-flight operation to Prepared, and must
+        // not refresh signedAt. A fresh signedAt changes the transcript, the
+        // digest, and the signature, which is precisely the failure the journal
+        // was written to prevent.
+        let store = store();
+        let mut original = journalled(transition_identity(OWNER));
+        original.record_transmission().unwrap();
+        original.record_transmission().unwrap();
+        store.put_journal_entry(&original).await.unwrap();
+
+        let restored = store
+            .journal_entry(&transition_identity(OWNER))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.state(), &JournalState::InFlight { attempts: 2 });
+        assert!(
+            restored.should_submit(),
+            "an ambiguous outcome is resolved by resubmitting the same bytes"
+        );
+        assert_eq!(
+            restored.signed_at(),
+            &CanonicalTimestamp::parse(SIGNED_AT).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn rehydration_reconstructs_any_durable_state() {
+        // The constructor storage needs, exercised through storage. `prepare`
+        // always yields Prepared, which is right for a new mutation and wrong
+        // for a restart — durable progress has to come back as it was.
+        let store = store();
+        let stored = JournalEntry::rehydrate(
+            transition_identity(OWNER),
+            b"exact-canonical-body".to_vec(),
+            [0xab; 32],
+            [0xcd; 64],
+            CanonicalTimestamp::parse(SIGNED_AT).unwrap(),
+            JournalState::InFlight { attempts: 7 },
+        );
+        store.put_journal_entry(&stored).await.unwrap();
+
+        let restored = store
+            .journal_entry(&transition_identity(OWNER))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored, stored);
+        assert_eq!(restored.state(), &JournalState::InFlight { attempts: 7 });
+    }
+
+    #[tokio::test]
+    async fn outstanding_is_exactly_what_a_restart_must_resubmit() {
+        let store = store();
+        store
+            .put_journal_entry(&journalled(transition_identity(OWNER)))
+            .await
+            .unwrap();
+        store
+            .put_journal_entry(&journalled(message_identity(OWNER)))
+            .await
+            .unwrap();
+        assert_eq!(store.outstanding_journal_entries().await.unwrap().len(), 2);
+
+        // A completed operation drops out; an in-flight one stays, because its
+        // outcome is still unknown.
+        let mut completed = journalled(transition_identity(OWNER));
+        completed.record_completed().unwrap();
+        store.put_journal_entry(&completed).await.unwrap();
+
+        let mut in_flight = journalled(message_identity(OWNER));
+        in_flight.record_transmission().unwrap();
+        store.put_journal_entry(&in_flight).await.unwrap();
+
+        let outstanding = store.outstanding_journal_entries().await.unwrap();
+        assert_eq!(outstanding.len(), 1);
+        assert_eq!(outstanding[0].identity(), &message_identity(OWNER));
+    }
+
+    #[tokio::test]
+    async fn the_two_operation_id_kinds_do_not_collide_in_storage() {
+        // Same UUID and same DID, different endpoint and different ID kind.
+        // These are distinct server-side identities; collapsing them in a
+        // storage key would have one operation's bytes answer for the other's.
+        let store = store();
+        store
+            .put_journal_entry(&journalled(transition_identity(OWNER)))
+            .await
+            .unwrap();
+        store
+            .put_journal_entry(&journalled(message_identity(OWNER)))
+            .await
+            .unwrap();
+
+        assert_eq!(store.outstanding_journal_entries().await.unwrap().len(), 2);
+        assert!(store
+            .journal_entry(&transition_identity(OWNER))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store
+            .journal_entry(&message_identity(OWNER))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn another_principals_journal_is_refused_on_read_and_write() {
+        // The journal is keyed by the authenticated principal, so a foreign
+        // identity reaching this store is the same containment breach as a
+        // foreign binding.
+        let store = store();
+        let foreign = journalled(transition_identity(STRANGER));
+        assert!(store
+            .put_journal_entry(&foreign)
+            .await
+            .unwrap_err()
+            .is_isolation_breach());
+        assert!(store
+            .journal_entry(&transition_identity(STRANGER))
+            .await
+            .unwrap_err()
+            .is_isolation_breach());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_operation_reads_as_absent_not_as_a_fault() {
+        let store = store();
+        assert_eq!(
+            store
+                .journal_entry(&transition_identity(OWNER))
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(store
+            .outstanding_journal_entries()
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
