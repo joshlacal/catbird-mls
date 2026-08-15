@@ -143,6 +143,14 @@ pub enum TrafficRefusal {
     /// A direct is between the sender and exactly one other. A pair that does
     /// not include the sender is a roster assembled for a different
     /// conversation, and readiness would answer about the wrong two people.
+    ///
+    /// Unlike its two roster siblings, this one **does** carry an endpoint
+    /// code. It is not a local bookkeeping mistake the server cannot see: a
+    /// send from a principal who is not a participant is refused server-side as
+    /// [`ChatErrorCode::NotParticipant`], which the delivery service classifies
+    /// as authorization — authenticated, but not permitted here. So the local
+    /// pre-check and the server's answer stay one vocabulary, which is this
+    /// module's standing rule.
     SenderNotAParticipant { sender: BareDid },
 }
 
@@ -155,14 +163,17 @@ impl TrafficRefusal {
         match self {
             Self::ConversationNotAccepted { .. } => Some(ChatErrorCode::ConversationNotAccepted),
             Self::RecipientNotReady { .. } => Some(ChatErrorCode::RecipientNotReady),
-            // Local-only preconditions: the server has no code for any of them
-            // because a client should never have reached the point of asking.
-            // A malformed roster is this client's mistake, not an answer a
-            // server would ever give.
+            // A send from a non-participant is refused server-side too, so it
+            // reports what the server would rather than inventing a local-only
+            // vocabulary for a condition the protocol already names.
+            Self::SenderNotAParticipant { .. } => Some(ChatErrorCode::NotParticipant),
+            // Genuinely local preconditions: the server never sees the roster,
+            // so a roster this client assembled wrongly is not an answer a
+            // server would ever give, and claiming one would put words in its
+            // mouth.
             Self::NoCurrentLeaves
             | Self::DirectNotTwoParticipants { .. }
-            | Self::DirectParticipantsNotDistinct { .. }
-            | Self::SenderNotAParticipant { .. } => None,
+            | Self::DirectParticipantsNotDistinct { .. } => None,
         }
     }
 }
@@ -422,10 +433,22 @@ mod tests {
         for refusal in [
             TrafficRefusal::DirectNotTwoParticipants { found: 5 },
             TrafficRefusal::DirectParticipantsNotDistinct { did: did(ALICE) },
-            TrafficRefusal::SenderNotAParticipant { sender: did(ALICE) },
         ] {
             assert_eq!(refusal.endpoint_code(), None, "{refusal}");
         }
+    }
+
+    #[test]
+    fn a_non_participant_sender_reports_what_the_server_would() {
+        // The one roster refusal that is not local-only. A send from a
+        // principal who is not a participant is refused server-side as
+        // NotParticipant, so the pre-check speaks the same vocabulary rather
+        // than inventing a second description of one condition — this module's
+        // standing rule, applied to the case where it actually applies.
+        assert_eq!(
+            TrafficRefusal::SenderNotAParticipant { sender: did(ALICE) }.endpoint_code(),
+            Some(ChatErrorCode::NotParticipant)
+        );
     }
 
     #[test]
