@@ -24,7 +24,7 @@ use crate::chat_v2::ids::{
 use crate::chat_v2::interval::{IntervalOpening, RecipientBinding};
 use crate::chat_v2::journal::{JournalEntry, JournalState, OperationId, OperationIdentity};
 use crate::chat_v2::provenance::{OpeningKind, OuterEntryFingerprint};
-use crate::chat_v2::reducer::{ApplicationReducer, ReducerError, SequentialControl};
+use crate::chat_v2::reducer::{ApplicationReducer, SequentialControl};
 
 const OWNER: &str = "did:plc:z72i7hdynmk6r22z27h6tvur";
 const STRANGER: &str = "did:plc:44ybard66vv44zksje25o7dz";
@@ -660,67 +660,6 @@ async fn sibling_devices_keep_separate_schedules() {
         !own.binding().matches(sibling.binding()),
         "two devices of one principal are different audiences"
     );
-}
-
-#[tokio::test]
-async fn restoring_refuses_a_schedule_holding_another_devices_intervals() {
-    // The check that makes the round trip safe rather than merely
-    // convenient. Storage hands back what it was given, so restoration is
-    // where a schedule stitched together from two devices must be caught.
-    let sibling_interval = open_schedule(SIBLING_DEVICE).intervals().to_vec();
-    let err = ApplicationReducer::rehydrate(
-        binding(OWNER, DEVICE),
-        sibling_interval,
-        Some(coordinate(0)),
-        None,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, ReducerError::RecipientMismatch { .. }),
-        "expected a recipient refusal, got {err}"
-    );
-}
-
-#[tokio::test]
-async fn restoring_refuses_a_context_that_disagrees_with_the_intervals() {
-    // Both directions. An open interval without a context panics the
-    // sequencing path; a context without an open interval would sequence
-    // rows through a gap that grants no access.
-    let open = open_schedule(DEVICE).intervals().to_vec();
-    let err = ApplicationReducer::rehydrate(binding(OWNER, DEVICE), open, None, None).unwrap_err();
-    assert_eq!(
-        err,
-        ReducerError::RestoredScheduleIncoherent {
-            has_open_interval: true,
-            has_expected_context: false,
-        }
-    );
-
-    let err = ApplicationReducer::rehydrate(
-        binding(OWNER, DEVICE),
-        Vec::new(),
-        Some(coordinate(0)),
-        None,
-    )
-    .unwrap_err();
-    assert_eq!(
-        err,
-        ReducerError::RestoredScheduleIncoherent {
-            has_open_interval: false,
-            has_expected_context: true,
-        }
-    );
-}
-
-#[tokio::test]
-async fn a_fresh_schedule_restores_as_empty_rather_than_incoherent() {
-    // No intervals and no context is the legitimate starting state, not a
-    // violation of the invariant.
-    let restored = ApplicationReducer::rehydrate(binding(OWNER, DEVICE), Vec::new(), None, None)
-        .expect("an empty schedule must restore");
-    assert!(!restored.has_open_interval());
-    assert!(restored.intervals().is_empty());
-    assert_eq!(restored.expected_context(), None);
 }
 
 #[tokio::test]

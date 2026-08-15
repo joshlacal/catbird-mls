@@ -38,6 +38,9 @@ pub mod reanchor;
 pub mod reset;
 pub mod terminal;
 
+#[cfg(test)]
+mod restore_tests;
+
 pub use reanchor::{ReanchorAuthority, SequentialClose, TouchingBoundary};
 pub use reset::{ResetActivation, ResetParticipation, ResetRole};
 pub use terminal::{TerminalClose, TerminalMode};
@@ -155,6 +158,42 @@ pub enum ReducerError {
         /// Whether a restored expected context was supplied.
         has_expected_context: bool,
     },
+    /// Restored intervals were not in ascending order of opening sequence.
+    ///
+    /// The interval list is ordered oldest first, and three separate paths
+    /// reason about "the current interval" as `intervals.last()`:
+    /// [`ApplicationReducer::has_open_interval`], the strict-gap check in
+    /// `reanchor`, and the `last_mut()` that `close_interval` applies a close
+    /// proof to. In an unordered list the last element is not the latest
+    /// interval, so each of those silently operates on the wrong one.
+    RestoredIntervalsOutOfOrder {
+        /// The opening sequence of the earlier list element.
+        earlier_opening: Seq,
+        /// The opening sequence of the element after it, which precedes it.
+        later_opening: Seq,
+    },
+    /// A restored interval opened before its predecessor closed.
+    ///
+    /// Equality is permitted: a legal touching boundary shares one sequence
+    /// between a close and the opening it also performs. Anything below the
+    /// predecessor's close is an overlap, which would make one application
+    /// sequence visible through two interval interiors.
+    RestoredIntervalsOverlap {
+        /// Where the predecessor closes.
+        close_seq: Seq,
+        /// Where the successor claims to open.
+        opening_seq: Seq,
+    },
+    /// A restored interval other than the last was still open.
+    ///
+    /// Only the most recent interval may be open. An earlier open interval
+    /// leaves [`ApplicationReducer::has_open_interval`] reporting `false` while
+    /// an interval genuinely is open, which reads as a closed schedule and
+    /// admits rows that should have been refused.
+    RestoredNonFinalIntervalOpen {
+        /// The opening sequence of the interval that was left open.
+        opening_seq: Seq,
+    },
     /// An interval-level rule was violated.
     Interval(IntervalError),
 }
@@ -236,6 +275,28 @@ impl fmt::Display for ReducerError {
                  expected_context={has_expected_context}; an interval is open \
                  exactly when a context is expected"
             ),
+            Self::RestoredIntervalsOutOfOrder {
+                earlier_opening,
+                later_opening,
+            } => write!(
+                f,
+                "restored interval opening {later_opening} follows {earlier_opening} \
+                 in the list; intervals are ordered oldest first and the last one \
+                 must be the latest"
+            ),
+            Self::RestoredIntervalsOverlap {
+                close_seq,
+                opening_seq,
+            } => write!(
+                f,
+                "restored interval opens at {opening_seq}, before its predecessor \
+                 closes at {close_seq}"
+            ),
+            Self::RestoredNonFinalIntervalOpen { opening_seq } => write!(
+                f,
+                "restored interval opened at {opening_seq} is still open but is not \
+                 the last; only the most recent interval may be open"
+            ),
             Self::Interval(err) => write!(f, "{err}"),
         }
     }
@@ -282,6 +343,19 @@ impl ApplicationReducer {
     /// - an interval is open exactly when an expected context is present.
     ///   Violating this does not produce a wrong answer, it panics
     ///   [`ApplicationReducer::apply_sequential_control`].
+    /// - the interval list is ordered oldest first, non-overlapping, and open
+    ///   only in its final position. Three separate paths treat
+    ///   `intervals.last()` as "the current interval" —
+    ///   [`ApplicationReducer::has_open_interval`], the strict-gap check in
+    ///   `reanchor`, and the `last_mut()` that `close_interval` writes a close
+    ///   proof into. If the last element is not the latest interval, each of
+    ///   those operates on the wrong one and reports success.
+    ///
+    /// That last group exists because restore is a **second feed** into this
+    /// type. The specified append-log feed cannot produce an unordered or
+    /// overlapping schedule, so the reducer's own paths never had to defend
+    /// against one; durable storage can hand over anything that was written, so
+    /// the structural checks live here rather than being assumed upstream.
     pub fn rehydrate(
         binding: RecipientBinding,
         intervals: Vec<AccessInterval<Coordinate>>,
@@ -301,6 +375,35 @@ impl ApplicationReducer {
                 return Err(ReducerError::RecipientMismatch {
                     expected: binding.clone(),
                     found: proof.binding().clone(),
+                });
+            }
+        }
+
+        // Structural checks run before the coherence check below, because that
+        // one asks whether `last()` is open — a question with no meaningful
+        // answer until the list is known to be ordered.
+        for pair in intervals.windows(2) {
+            let (earlier, later) = (&pair[0], &pair[1]);
+            let earlier_opening = earlier.opening().seq;
+            let later_opening = later.opening().seq;
+
+            if later_opening < earlier_opening {
+                return Err(ReducerError::RestoredIntervalsOutOfOrder {
+                    earlier_opening,
+                    later_opening,
+                });
+            }
+            let Some(close) = earlier.close() else {
+                return Err(ReducerError::RestoredNonFinalIntervalOpen {
+                    opening_seq: earlier_opening,
+                });
+            };
+            // Equality is legal: a touching boundary is one row that closes the
+            // predecessor and opens the successor at the same sequence.
+            if later_opening < close.seq {
+                return Err(ReducerError::RestoredIntervalsOverlap {
+                    close_seq: close.seq,
+                    opening_seq: later_opening,
                 });
             }
         }
