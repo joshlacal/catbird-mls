@@ -1,12 +1,12 @@
 # chat_v2 — Task 3 handoff
 
 State of the clean chat protocol (`blue.catbird.chat.*`) client implementation
-as of the ninth sealed slice. Written for the session that continues it.
+as of the eleventh sealed slice. Written for the session that continues it.
 
 Workspace: `catbird-mls-task3-ws` (isolated jj workspace; Josh's default
 workspace is untouched and must stay that way).
 
-Verification at handoff: **364 lib tests pass, 0 failures.** `cargo fmt
+Verification at handoff: **399 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib --all-targets` reports zero warnings under
 `chat_v2`, `wasm32-unknown-unknown` builds.
 
@@ -14,7 +14,7 @@ Verification at handoff: **364 lib tests pass, 0 failures.** `cargo fmt
 
 ## 1. Sealed commits
 
-Nine, oldest first. All additive; the only pre-existing file touched is
+Eleven, oldest first. All additive; the only pre-existing file touched is
 `src/lib.rs` (three lines declaring the module).
 
 | Change | Commit | What |
@@ -28,6 +28,8 @@ Nine, oldest first. All additive; the only pre-existing file touched is
 | `mxquskum` | `756538cf` | Coordinate transition relations; interval provenance types |
 | `ssqpvqst` | `8e088173` | Reducer sequencing core (6a) |
 | `zxryzskq` | `7c8f7a20` | Interval closure, verified reanchor, touching boundaries (6b) |
+| `oukpxxkq` | `3d54a64c` | Reset-activator classification (6c) |
+| `nzvoxxxn` | `0b02a553` | The two Terminal modes (6d) |
 
 ### Known pre-existing breakage, not ours
 
@@ -108,6 +110,8 @@ chat_v2/
   reducer/
     mod.rs      sequencing core (6a)
     reanchor.rs closure, reanchor, touching boundaries (6b)
+    reset.rs    the three reset-activator roles (6c)
+    terminal.rs the two Terminal modes (6d)
   ffi.rs        skeletal UniFFI surface (cfg'd out on wasm32)
 ```
 
@@ -127,7 +131,11 @@ table keyed only by group id.
 
 ---
 
-## 4. Reducer: what exists, what 6c/6d must do
+## 4. Reducer: complete (6a–6d)
+
+Every path §6 describes is now built. No unbuilt path remains in the reducer,
+so a refusal you meet here is a real rule rather than a placeholder — check the
+status table at the end of this section before relaxing one.
 
 ### Built (6a, `reducer/mod.rs`)
 
@@ -154,50 +162,75 @@ Two design points that must survive refactoring:
   close call plus an open call would let one authenticated event advance the
   context twice.
 
-### Named refusals 6c/6d must convert
+### Built (6c, `reducer/reset.rs`)
 
-The standing rule is that unbuilt paths refuse by name rather than permit. Each
-of these is an error variant plus a test; converting them is the work, and the
-tests should become positives rather than being deleted.
+`apply_reset_activation` covers all three §6 roles and **derives** which one
+applies. `ResetActivation` carries only what the verified row states, including
+a two-variant `ResetParticipation` (`Activator { opening_context }` /
+`Retired`); the reducer decides old-leaf vs non-leaf from `has_open_interval()`
+and returns a `ResetRole`.
 
-| Refusal | Where | Converted by |
+| Participation | Held access | Role | Mechanism |
+|---|---|---|---|
+| `Activator` | yes | `OldLeafActivator` | touching `Reset -> Reset` |
+| `Activator` | no | `NonLeafActivator` | first `Reset` interval at the reset row |
+| `Retired` | yes | `RetiredOldLeaf` | close only |
+| `Retired` | no | — | `ResetAffectsNoInterval` |
+
+Design points that must survive refactoring:
+
+- **The role is derived, never accepted.** The hazard is an old leaf taking the
+  non-leaf path, which deliberately does not compare `previous` against an
+  expected context. Deriving the role means no argument exists that could
+  request that, so it is unrepresentable rather than refused.
+- **Case 2 does not go through `reanchor`.** An earlier draft of this document
+  said it did. It cannot: `ReanchorAuthority` is a closed two-variant enum and
+  reset activation is neither variant. Case 2 has its own private path
+  (`open_activator_genesis`), and `ReanchorAuthority` was left alone. No new
+  authority marker type was added either — the row's `OuterEntryFingerprint` is
+  already constructible only by the envelope-verification layer, so it is the
+  same structural gate.
+- **"Not an old leaf" means not a leaf *at the reset*, not never a leaf.** A
+  device removed at seq 3 can activate a reset at seq 20, so the new opening
+  must clear any earlier close strictly.
+
+### Built (6d, `reducer/terminal.rs`)
+
+`apply_terminal` covers both §6 modes and derives which applies, returning a
+`TerminalMode`.
+
+1. **Open interval** → `ClosedOpenInterval`. Requires `previous == expected`,
+   closes inclusively, and installs `ApplicationScheduleTerminalProof`.
+   **Atomicity is the requirement**: every fallible check runs before any state
+   is touched, so the close and the proof land together or not at all. A test
+   pins that a refusal deposits neither half.
+2. **Last interval already closed by Remove or Reset** → `ScheduleProofOnly`.
+   Installs only the schedule proof. Does not consult `previous`, does not
+   rewrite or double-close the old interval, grants no gap history — three
+   separate tests.
+
+Both modes are irreversible, and that is checked against **all seven** entry
+points rather than a sample, with a positive control proving the sweep rejects a
+reducer that was never terminalized.
+
+### Named refusals: current status
+
+The standing rule is that unbuilt paths refuse by name rather than permit.
+
+| Refusal | Where | Status |
 |---|---|---|
-| `TerminalRequiresScheduleProof` | `close_interval`, `apply_touching_boundary` | 6d |
-| `NoOpenInterval` on a post-gap control | `apply_sequential_control` | already 6b (reanchor) |
+| `TerminalRequiresScheduleProof` | `close_interval`, `apply_touching_boundary` | **permanent, not a placeholder** |
+| `NoOpenInterval` on a post-gap control | `apply_sequential_control` | converted by 6b (reanchor) |
 | `install_initial_opening` over a closed interval | `reducer/mod.rs` | stays refused; reanchor is the path |
+| `ResetAffectsNoInterval` | `apply_reset_activation` | permanent; §6 has no fourth reset role |
+| `TerminalAfterUnsupportedClose`, `TerminalWithoutSchedule` | `apply_terminal` | permanent |
 
-### 6c — the three reset-activator cases
-
-All three *mechanisms* exist; 6c is classification plus one new prohibition.
-
-1. **Old-leaf activator** → `apply_touching_boundary` with
-   `Reset -> Reset`. Already works; 6c decides when this role applies.
-2. **Registered active-admin activator that was NOT an old leaf** → opens its
-   first `Reset` interval at the reset row via `reanchor`. The new work is
-   **no pre-reset access**: this device must not become able to see entries
-   below its opening. The existing "entries before the opening are never
-   visible" behaviour already covers the mechanics — 6c needs the explicit
-   named test, and must verify the signed outer reset predecessor without that
-   verification granting history.
-3. **Every other old leaf** → close only, via `close_interval` with
-   `CloseKind::Reset`, and no successor unless separately re-added.
-
-### 6d — the two Terminal paths
-
-1. **Open interval**: the Terminal row is sequential, requires
-   `previous == expected`, and *atomically* closes the interval **and** installs
-   `ApplicationScheduleTerminalProof`. Atomicity matters — a close without the
-   proof is the exact failure the current named refusal exists to prevent.
-2. **Last interval already closed by Remove or Reset**: an entitled signed
-   Terminal arriving across the inaccessible gap installs **only** the schedule
-   proof. It must NOT compare its `previous` against the reducer's stale
-   expected context, must NOT rewrite or double-close the old interval, and must
-   NOT grant gap history. Upstream outer Terminal authority already verified the
-   real predecessor. `interval.rs` has a test sketching this shape
-   (`a_schedule_proof_is_independent_of_interval_closure`).
-
-Both paths are irreversible. Neither a hint nor a current head may substitute
-for the signed row and proof.
+`TerminalRequiresScheduleProof` deserves the emphasis. 6d did **not** widen the
+ordinary close paths to accept `CloseKind::Terminal`. Those paths have no proof
+to install, so accepting a Terminal there is exactly the failure the refusal
+exists to prevent. What 6d converted is that the refusal now has a destination:
+one test pins the wrong entry point refusing *and* the identical row succeeding
+through `apply_terminal`. Do not "finish the conversion" by relaxing it.
 
 ---
 
