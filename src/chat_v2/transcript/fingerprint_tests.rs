@@ -279,13 +279,14 @@ fn every_control_case_pins_a_signing_domain_this_crate_spells_identically() {
 }
 
 #[test]
-fn fourteen_of_the_twenty_five_domains_are_server_pinned_and_eleven_are_not() {
-    // The honest accounting, recorded rather than left to be assumed. The
-    // vendored fixture covers the thirteen control entries plus BLOB-DELETE
-    // from the signed-mutator vector. The remaining eleven have no server
-    // vector in this fixture at all, so they are pinned only by the transcribed
-    // constant table — real coverage, but a weaker kind, and a reader deciding
-    // whether to trust a domain should know which kind they have.
+fn this_fixture_pins_fourteen_of_the_twenty_five_domains_and_names_the_rest() {
+    // What *this* fixture covers, kept exact so its scope is never overstated:
+    // the thirteen control entries plus BLOB-DELETE from the signed-mutator
+    // vector. The other eleven were once pinned only by the transcribed
+    // constant table; they now have their own server vectors in
+    // `mls_ds_signing_domain_vectors.json`, and
+    // [`super::domain_vector_tests::every_signing_domain_is_now_pinned_by_a_server_vector`]
+    // is what proves the two fixtures together leave nothing unpinned.
     let vectors = vectors();
     let mut pinned: Vec<String> = vectors["controlEntryFingerprints"]["cases"]
         .as_array()
@@ -298,7 +299,7 @@ fn fourteen_of_the_twenty_five_domains_are_server_pinned_and_eleven_are_not() {
             .expect("a domain is ASCII plus its NUL"),
     );
 
-    let unpinned: Vec<&str> = SignedMutationKind::ALL
+    let elsewhere: Vec<&str> = SignedMutationKind::ALL
         .iter()
         .filter(|kind| {
             !pinned
@@ -308,9 +309,9 @@ fn fourteen_of_the_twenty_five_domains_are_server_pinned_and_eleven_are_not() {
         .map(|kind| kind.body_name())
         .collect();
 
-    assert_eq!(pinned.len(), 14, "server-pinned domains");
+    assert_eq!(pinned.len(), 14, "domains this fixture pins");
     assert_eq!(
-        unpinned,
+        elsewhere,
         vec![
             "deviceEnrollmentBody",
             "keyPackageReplenishmentBody",
@@ -324,10 +325,12 @@ fn fourteen_of_the_twenty_five_domains_are_server_pinned_and_eleven_are_not() {
             "welcomeAcknowledgementBody",
             "welcomeRejectionBody",
         ],
-        "these eleven rest on the transcribed table; lifting a server vector for \
-         one of them means moving it out of this list"
+        "these eleven are pinned by the signing-domain vectors, not this fixture"
     );
-    assert_eq!(pinned.len() + unpinned.len(), SignedMutationKind::ALL.len());
+    assert_eq!(
+        pinned.len() + elsewhere.len(),
+        SignedMutationKind::ALL.len()
+    );
 }
 
 #[test]

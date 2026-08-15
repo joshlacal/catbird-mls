@@ -344,6 +344,8 @@ impl SigningTranscript {
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
+mod domain_vector_tests;
+#[cfg(test)]
 mod entry_tests;
 #[cfg(test)]
 mod fingerprint_tests;
