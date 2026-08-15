@@ -216,55 +216,125 @@ pub struct CrateRootName {
 ///
 /// # What it reads, and what it does not
 ///
-/// Both re-export forms in `lib.rs`: `pub use <mod>::*;`, whose source module is
-/// then scanned for `pub` items, and `pub use <mod>::<Name>;`, which names its
-/// own. Renames (`pub use x as y;`) and crate-level aliases are skipped — they
-/// hoist a name this scan would misreport, and a rename of a v1 module into
-/// `chat_v2`'s reach would be a deliberate act rather than an editor accident.
+/// Both re-export forms in `lib.rs`: `pub use <mod>::*;` (nested modules
+/// included), whose source module is then scanned for `pub` items, and
+/// `pub use <path>::<Name>;`, which hoists its FINAL segment — the review
+/// showed `pub use orchestrator::types::ConversationState;` evading the gate
+/// when the tail was required to be a single plain identifier. Renames
+/// (`pub use x as y;`) are skipped — they hoist a name this scan would
+/// misreport, and a rename of a v1 module into `chat_v2`'s reach would be a
+/// deliberate act rather than an editor accident.
 ///
 /// It is **depth one**. A module that itself globs a third module hoists that
-/// module's names too, and those are not derived here. Nothing in `lib.rs` does
-/// that today, and the assertion on the derived count is what would make its
-/// arrival visible.
+/// module's names too, and those are not derived here. Nothing in `lib.rs`'s
+/// glob sources does that today, and two tests in `chat_v2/mod.rs` are what
+/// make its arrival a failure rather than a silent hole:
+/// `the_re_export_surface_is_the_reviewed_one` pins the glob-module set, so a
+/// NEW glob is a deliberate re-pin, and `no_glob_source_module_globs_a_third`
+/// refuses the depth-two shape inside the modules already globbed.
 pub fn crate_root_glob_exports() -> Vec<CrateRootName> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
 
     let mut found = Vec::new();
     for line in lib.lines() {
-        let code = code_only(line);
-        let trimmed = code.trim();
-        let Some(rest) = trimmed
-            .strip_prefix("pub use ")
-            .and_then(|rest| rest.strip_suffix(';'))
-        else {
-            continue;
-        };
-        if rest.contains(" as ") {
-            continue;
-        }
-        let Some((module, tail)) = rest.split_once("::") else {
-            continue;
-        };
-        if !is_plain_ident(module) {
-            continue;
-        }
-
-        if tail == "*" {
-            for name in module_pub_items(&src, module) {
-                found.push(CrateRootName {
-                    name,
-                    module: module.to_owned(),
-                });
+        match parse_pub_use(line) {
+            Some(PubUse {
+                module,
+                target: PubUseTarget::Glob,
+            }) => {
+                for name in module_pub_items(&src, &module) {
+                    found.push(CrateRootName {
+                        name,
+                        module: module.clone(),
+                    });
+                }
             }
-        } else if is_plain_ident(tail) {
-            found.push(CrateRootName {
-                name: tail.to_owned(),
-                module: module.to_owned(),
-            });
+            Some(PubUse {
+                module,
+                target: PubUseTarget::Named(name),
+            }) => {
+                found.push(CrateRootName { name, module });
+            }
+            None => {}
         }
     }
     found
+}
+
+/// The modules `lib.rs` glob-re-exports, for the depth-two guard.
+pub fn crate_root_glob_modules() -> Vec<String> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
+    lib.lines()
+        .filter_map(parse_pub_use)
+        .filter(|re_export| re_export.target == PubUseTarget::Glob)
+        .map(|re_export| re_export.module)
+        .collect()
+}
+
+/// One `pub use …;` line, reduced to what it hoists onto the crate root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PubUse {
+    /// The module path the hoisted surface comes from.
+    pub module: String,
+    pub target: PubUseTarget,
+}
+
+/// What a `pub use` line hoists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PubUseTarget {
+    /// `pub use m::*;` — every `pub` item of `m`.
+    Glob,
+    /// `pub use m::Name;` or `pub use m::nested::Name;` — `Name` alone.
+    Named(String),
+}
+
+/// Parses one line as a re-export, or `None` if it is not one.
+///
+/// Renames (` as `) are skipped by design — see `crate_root_glob_exports`.
+pub fn parse_pub_use(line: &str) -> Option<PubUse> {
+    let code = code_only(line);
+    let trimmed = code.trim();
+    let rest = trimmed.strip_prefix("pub use ")?.strip_suffix(';')?;
+    if rest.contains(" as ") {
+        return None;
+    }
+    let (module, tail) = rest.split_once("::")?;
+    if !is_plain_ident(module) {
+        return None;
+    }
+    if tail == "*" {
+        return Some(PubUse {
+            module: module.to_owned(),
+            target: PubUseTarget::Glob,
+        });
+    }
+    if let Some(inner) = tail.strip_suffix("::*") {
+        if !inner.split("::").all(is_plain_ident) {
+            return None;
+        }
+        return Some(PubUse {
+            module: format!("{module}::{inner}"),
+            target: PubUseTarget::Glob,
+        });
+    }
+    let mut segments: Vec<&str> = tail.split("::").collect();
+    if !segments.iter().all(|segment| is_plain_ident(segment)) {
+        return None;
+    }
+    let name = segments
+        .pop()
+        .expect("split_once guarantees at least one segment");
+    let module = if segments.is_empty() {
+        module.to_owned()
+    } else {
+        format!("{module}::{}", segments.join("::"))
+    };
+    Some(PubUse {
+        module,
+        target: PubUseTarget::Named(name.to_owned()),
+    })
 }
 
 fn is_plain_ident(value: &str) -> bool {
@@ -276,9 +346,10 @@ fn is_plain_ident(value: &str) -> bool {
 
 /// The `pub` items a module declares, as the crate root would hoist them.
 fn module_pub_items(src: &Path, module: &str) -> Vec<String> {
+    let relative = module.replace("::", "/");
     let path = [
-        src.join(format!("{module}.rs")),
-        src.join(module).join("mod.rs"),
+        src.join(format!("{relative}.rs")),
+        src.join(&relative).join("mod.rs"),
     ]
     .into_iter()
     .find(|candidate| candidate.exists())

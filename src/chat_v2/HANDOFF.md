@@ -56,6 +56,26 @@ section no longer carries open work.
 | F1 addendum | `bd6be439` | `SenderNotAParticipant` carries the server's `NotParticipant` |
 | expects and their predicates | `b8196784` | the duplicated close predicate collapsed; `is_open()` pinned |
 | high-water durability | `adcabf3e` | the mark's store round-trip proved on the case that cannot be derived |
+| review micro-round | (final seal) | depth-two guard made enforced, nested-tail re-exports derived, vector verdict below |
+
+**Micro-round (post-re-verification), three closures.** (1) The derivation's
+depth-one limit was *documented* as guarded by a count assertion that did not
+exist — the docs-overstate-the-code shape recurring inside the F9 fix itself.
+It is now genuinely guarded twice: `the_re_export_surface_is_the_reviewed_one`
+pins the glob-module set (a new `lib.rs` glob is a deliberate re-pin), and
+`no_glob_source_module_globs_a_third` refuses the depth-two shape inside the
+globbed modules, with a positive control on the matcher. (2) The nested-tail
+evasion (`pub use orchestrator::types::ConversationState;` hoists
+`ConversationState`, which the old whole-tail plain-ident check skipped) is
+closed: `parse_pub_use` hoists the final segment of nested named re-exports
+and handles nested globs; the rename skip stays, by its recorded rationale.
+(3) **The 11 unpinned signing domains cannot be lifted from the existing
+fixture**: `mls_chat_contract_vectors.json` @ `425e149f` carries exactly ONE
+`signedMutator` case (blobDelete) — verified by opening it, not assumed. The
+13 control domains are pinned via `controlEntryFingerprints`; the mutation
+domains (`CATBIRD-CHAT-MESSAGE` above all — the application-send domain)
+require **server-side vector generation in mls-ds**. That is a chartered
+cross-repo item for the landing pass, not a defect this lane can close.
 
 **F9 is the one worth reading before touching a gate.** `use crate::MLSContext;`
 inside `chat_v2` compiled, reached v1's SQLCipher group and crypto surface, and

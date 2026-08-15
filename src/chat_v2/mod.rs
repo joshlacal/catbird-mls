@@ -156,6 +156,108 @@ mod isolation {
         );
     }
 
+    /// A new glob widens what the derivation must cover — including the
+    /// depth-two case its doc declares out of scope — so its arrival must be
+    /// a deliberate re-pin here, not a silent extension. This is the assertion
+    /// `gate_support.rs`'s depth-one paragraph refers to.
+    #[test]
+    fn the_re_export_surface_is_the_reviewed_one() {
+        let mut modules = super::gate_support::crate_root_glob_modules();
+        modules.sort();
+        assert_eq!(
+            modules,
+            [
+                "api",
+                "engine",
+                "error",
+                "keychain",
+                "platform_lifecycle",
+                "types"
+            ],
+            "lib.rs's glob re-export surface changed; re-review the derivation's \
+             depth-one limit against the changed module set before re-pinning \
+             this list"
+        );
+    }
+
+    /// The derivation scans a glob source for `pub` ITEMS, not for `pub use`
+    /// lines, so a glob source that itself globs a third module would hoist
+    /// that module's names invisibly. Refuse the shape at its source.
+    #[test]
+    fn no_glob_source_module_globs_a_third() {
+        use super::gate_support::{parse_pub_use, PubUseTarget};
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+
+        // Positive control: the matcher must find real glob lines in lib.rs,
+        // or its silence over the modules below means nothing.
+        let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
+        assert!(
+            lib.lines()
+                .filter_map(parse_pub_use)
+                .any(|re_export| re_export.target == PubUseTarget::Glob),
+            "the matcher found no glob in lib.rs itself, so it is not reading re-exports"
+        );
+
+        let mut violations = Vec::new();
+        for module in super::gate_support::crate_root_glob_modules() {
+            let relative = module.replace("::", "/");
+            let path = [
+                src.join(format!("{relative}.rs")),
+                src.join(&relative).join("mod.rs"),
+            ]
+            .into_iter()
+            .find(|candidate| candidate.exists())
+            .unwrap_or_else(|| panic!("glob source `{module}` must have a source file"));
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
+            for (index, line) in source.lines().enumerate() {
+                if let Some(re_export) = parse_pub_use(line) {
+                    if re_export.target == PubUseTarget::Glob {
+                        violations.push(format!(
+                            "{}:{} — `{module}` globs `{}`; the crate root hoists that \
+                             module's names at depth two, which the derivation does not \
+                             cover. Extend the derivation before allowing this.",
+                            path.display(),
+                            index + 1,
+                            re_export.module
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "a glob-re-exported module must not glob a third module:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    /// The nested-tail evasion the review found: a named re-export with a
+    /// nested path hoists its FINAL segment, and requiring the whole tail to
+    /// be one plain identifier skipped it entirely.
+    #[test]
+    fn the_parser_hoists_the_final_segment_of_a_nested_re_export() {
+        use super::gate_support::{parse_pub_use, PubUse, PubUseTarget};
+        // Assembled at runtime so this file does not read as a violation.
+        let v1 = ["orch", "estrator"].concat();
+        assert_eq!(
+            parse_pub_use(&format!("pub use {v1}::types::ConversationState;")),
+            Some(PubUse {
+                module: format!("{v1}::types"),
+                target: PubUseTarget::Named("ConversationState".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse_pub_use(&format!("pub use {v1}::types::*;")),
+            Some(PubUse {
+                module: format!("{v1}::types"),
+                target: PubUseTarget::Glob,
+            })
+        );
+        // Renames stay skipped by design.
+        assert_eq!(parse_pub_use("pub use api::MLSContext as V1Ctx;"), None);
+    }
+
     #[test]
     fn the_derivation_covers_the_spellings_that_defeated_every_gate() {
         // The two the review found, named explicitly — not as the rule, but as
