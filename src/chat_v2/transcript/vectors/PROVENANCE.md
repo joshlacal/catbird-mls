@@ -43,6 +43,32 @@ fingerprints):
 
 ## What was lifted
 
+Both vendored files come from the **same source file at the same revision**, so
+the hash above covers both.
+
+### `mls_ds_fingerprint_vectors.json` (S7c)
+
+- `applicationEntryFingerprint` — the six-field projection, its canonical
+  DAG-CBOR hex, and the resulting fingerprint
+- `controlEntryFingerprints` — the domain, the eight `projectionFields`, the
+  `ordinaryServerFields` / `nonemptyServerFields` rules, and **all thirteen
+  cases**, each with its `serverFields`, `uuidBytePaths`, `base64BytePaths`,
+  canonical DAG-CBOR hex, and fingerprint
+
+Per case, twelve keys were kept and the rest dropped as belonging to later
+slices: `unsignedSigningProjectionCanonicalDagCborHex`, `signingTranscriptHex`,
+`signedRequestRef`, `signingDomain`, and `historicalPublicKeyRef` are the
+signing-side vectors, and `historicalPublicKeys` /
+`authoritativeReferenceBindings` go with them. **Dropping is not editing** — no
+kept value is altered, and the omitted keys are still in the source file at the
+recorded revision for whichever slice needs them.
+
+The `uuidBytePaths` / `base64BytePaths` lists are what make these usable without
+reimplementing the lexicon contract: they declare, by dotted path and at every
+depth, which fields are raw 16-byte UUIDs and which are base64 byte strings.
+
+### `mls_ds_transcript_vectors.json` (S7a/S7b)
+
 Four sections, copied without modification:
 
 - `canonicalOrdering` — string and byte array ordering

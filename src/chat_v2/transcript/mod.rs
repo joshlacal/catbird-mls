@@ -35,10 +35,16 @@
 //!    is `serde_ipld_dagcbor`'s doing, which is exactly why the crate is shared
 //!    with the server rather than reimplemented.
 
+pub mod fingerprint;
 pub mod signed;
 pub mod strict_json;
 pub mod value;
 
+pub use fingerprint::{
+    application_entry_fingerprint, control_entry_fingerprint, ControlEntryKind,
+    ControlServerFields, EntryRow, FingerprintError, FingerprintProducts,
+    APPLICATION_FINGERPRINT_DOMAIN, CONTROL_FINGERPRINT_DOMAIN,
+};
 pub use signed::{
     verify_ed25519_strict, SignedMutationError, SignedWrapper, VerifiedMutation,
     ED25519_SIGNATURE_LEN,
@@ -326,6 +332,8 @@ impl SigningTranscript {
     }
 }
 
+#[cfg(test)]
+mod fingerprint_tests;
 #[cfg(test)]
 mod signed_tests;
 #[cfg(test)]

@@ -1,0 +1,399 @@
+{
+  "applicationEntryFingerprint": {
+    "base64BytePaths": [
+      "requestDigest",
+      "signature"
+    ],
+    "canonicalDagCborHex": "a663736571182a67656e747279496450018f3f6a7b2c4d918a5e0f123456789a697369676e61747572655840666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6d72657175657374446967657374582055555555555555555555555555555555555555555555555555555555555555556e636f6e766572736174696f6e4964503b241101e2bb42558caf4136c566a962",
+    "conversationId": "3b241101-e2bb-4255-8caf-4136c566a962",
+    "domain": "CATBIRD-CHAT-APPLICATION-ENTRY-FINGERPRINT\u0000",
+    "entryId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+    "fingerprintSha256Hex": "5b91d403a6dbc8b9bbc1904399283dc1bfc2de706e71f927d1e7527305598b18",
+    "receivedAt": "2026-07-22T14:05:09.123Z",
+    "requestDigest": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=",
+    "seq": 42,
+    "signature": "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZg==",
+    "uuidBytePaths": [
+      "entryId",
+      "conversationId"
+    ]
+  },
+  "controlEntryFingerprints": {
+    "cases": [
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571182a67656e7472794964508080808080804080808080808080808069656e7472794b696e647822626c75652e636174626972642e636861742e6465667323636f6d6d6974456e747279697369676e61747572655840ec54a8d4288c19b7bddf7c51efb48c6a7f4e779c942c9da7bfd5040ed63dddc793cdd61f51d0048992cf2d1a3bb2e23cdc044e741a8825c94bf6e65071fdd5076a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d726571756573744469676573745820fb4767b454cd10e2e9d4240688a81e2b4b0247468f20a93f3da2b0900265dcca6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "80808080-8080-4080-8080-808080808080",
+        "entryKind": "blue.catbird.chat.defs#commitEntry",
+        "fingerprintSha256Hex": "72cd810563f1efda023868125a7695891ec1850b5d228658d939097aa0ec645c",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "+0dntFTNEOLp1CQGiKgeK0sCR0aPIKk/PaKwkAJl3Mo=",
+        "seq": 42,
+        "serverFields": {},
+        "signature": "7FSo1CiMGbe933xR77SMan9Od5yULJ2nv9UEDtY93ceTzdYfUdAEiZLPLRo7suI83AROdBqIJclL9uZQcf3VBw==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571182b67656e7472794964508181818181814181818181818181818169656e7472794b696e647822626c75652e636174626972642e636861742e6465667323706f6c696379456e747279697369676e6174757265584089a94b186e47bea51ac8e0a52740d90c24899f81c853fba39d99252b7b709dfaabc2f10fb597158da28c070469c24668f56b2498a6991ba37ce089d8a08f550b6a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d7265717565737444696765737458205dd00fa4a7d15a197084ccdc19eeeb4854b8699b027575614add565efbaf5ed06e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "81818181-8181-4181-8181-818181818181",
+        "entryKind": "blue.catbird.chat.defs#policyEntry",
+        "fingerprintSha256Hex": "11b684c51b63a527b313a4c620a5113f510a8e00d13f4e21c5b9c551f04dfcfa",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "XdAPpKfRWhlwhMzcGe7rSFS4aZsCdXVhSt1WXvuvXtA=",
+        "seq": 43,
+        "serverFields": {},
+        "signature": "ialLGG5HvqUayOClJ0DZDCSJn4HIU/ujnZklK3twnfqrwvEPtZcVjaKMBwRpwkZo9WskmKaZG6N84InYoI9VCw==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571182c67656e7472794964508282828282824282828282828282828269656e7472794b696e647824626c75652e636174626972642e636861742e64656673236d65746164617461456e747279697369676e61747572655840e9ea99e0ad7f61a1192f5a459fb540183f1bd89b07c926cfa4909a57b5355696b2e920f661475a519ffc2a5bd83f42e3bfd9b7189ec279c93a43f2659a6e73096a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d726571756573744469676573745820cedad3e422b7b3b88b5cc6114b337f2eb7375e2ce9c84f05d2dd0faef73b86266e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "82828282-8282-4282-8282-828282828282",
+        "entryKind": "blue.catbird.chat.defs#metadataEntry",
+        "fingerprintSha256Hex": "56c0fe3288b1a7fc5262de8f990caa43b8d6825c7877dc293054de20fbb2dd14",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "ztrT5CK3s7iLXMYRSzN/Lrc3XizpyE8F0t0Prvc7hiY=",
+        "seq": 44,
+        "serverFields": {},
+        "signature": "6eqZ4K1/YaEZL1pFn7VAGD8b2JsHySbPpJCaV7U1Vpay6SD2YUdaUZ/8KlvYP0Ljv9m3GJ7Ceck6Q/Jlmm5zCQ==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571182d67656e7472794964508383838383834383838383838383838369656e7472794b696e647824626c75652e636174626972642e636861742e64656673236372656174696f6e456e747279697369676e61747572655840f44b40a3e6cacdcc3c2f186e8a54d1b5ab149cb1284ea126ab082b6c17e3e090175dd790080af4e9bd897e0f1d98777407829bcd24ad719e37a8840dd9b285056a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582078c684e079418dee63ef264cd2b061d97e17b46b97835eaa357bd72f8039ed3f6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "83838383-8383-4383-8383-838383838383",
+        "entryKind": "blue.catbird.chat.defs#creationEntry",
+        "fingerprintSha256Hex": "8d8bc1b96d78474e13d3d00e44750cb6338bd0cf2440637c431968d375bb62e9",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "eMaE4HlBje5j7yZM0rBh2X4XtGuXg16qNXvXL4A57T8=",
+        "seq": 45,
+        "serverFields": {},
+        "signature": "9EtAo+bKzcw8LxhuilTRtasUnLEoTqEmqwgrbBfj4JAXXdeQCAr06b2Jfg8dmHd0B4KbzSStcZ43qIQN2bKFBQ==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature",
+          "serverFields.recovery.boundCoordinate.groupId",
+          "serverFields.recovery.boundCoordinate.groupContextHash",
+          "serverFields.recovery.boundCoordinate.confirmationTag",
+          "serverFields.recovery.reservation.boundCoordinate.groupId",
+          "serverFields.recovery.reservation.boundCoordinate.groupContextHash",
+          "serverFields.recovery.reservation.boundCoordinate.confirmationTag",
+          "serverFields.recovery.reservation.keyPackageRef",
+          "serverFields.recovery.reservation.keyPackage.bytes",
+          "serverFields.recovery.reservation.keyPackage.sha256",
+          "serverFields.recovery.reservation.keyPackage.keyPackageRef"
+        ],
+        "canonicalDagCborHex": "a863736571182e67656e7472794964508484848484844484848484848484848469656e7472794b696e647831626c75652e636174626972642e636861742e64656673237061727469636970616e74416363657074616e6365456e747279697369676e61747572655840b26bf645afd32180bdc49f5a7de228798f61dc25fccfc05126418459f5d3d1abf99fbc273d5fec74cb52405b986e44ce7ac6196148597a266e2d4d509216b5036a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a1687265636f76657279aa66737461747573646f70656e696578706972657341747818323032362d30372d32325431343a31303a30392e3132335a6b72657175657374656441747818323032362d30372d32325431343a30353a30392e3132335a6b7265736572766174696f6ead667374617475736661637469766567707572706f73656c6c6561665265636f76657279696578706972657341747818323032362d30372d32325431343a31303a30392e3132335a6a6b65795061636b616765a56562797465734800000005000000016673686132353658204a181c72fece92f9908a6b8ad31911578f3827302b963e8008955b097a51e884676672616d696e676a6d6c734d6573736167656b636f6e74656e74547970656a6b65795061636b6167656d6b65795061636b61676552656658204b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b6b6369706865725375697465782d4d4c535f3235365f5857494e475f4348414348413230504f4c59313330355f5348413235365f456432353531396c72657175657374657244696478206469643a706c633a616c696365666978747572656161616161616161616161616d6b65795061636b61676552656658204b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b6e636f6e766572736174696f6e496450111111111111411191111111111111116e7265717565737465724b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a72385774573669386f626f756e64436f6f7264696e617465a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c65666163746976656a67656e65726174696f6e184e6c737461746556657273696f6e184f6e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e33333333333333333333333333333333333333333333333333333333333333717265636f7665727952657175657374496450a1a1a1a1a1a141a1a1a1a1a1a1a1a1a1717265717565737465724465766963654964507272727272724272b272727272727272777265717565737465724175746847656e65726174696f6e016c7265636f766572794b696e64636164646c72657175657374657244696478206469643a706c633a616c696365666978747572656161616161616161616161616e636f6e766572736174696f6e496450111111111111411191111111111111116f626f756e64436f6f7264696e617465a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c65666163746976656a67656e65726174696f6e184e6c737461746556657273696f6e184f6e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e33333333333333333333333333333333333333333333333333333333333333717265636f7665727952657175657374496450a1a1a1a1a1a141a1a1a1a1a1a1a1a1a1717265717565737465724465766963654964507272727272724272b2727272727272726d7265717565737444696765737458206198d5b6e7310bec49231e25fde4bcfb2a2bb971a3fbed1fac440aadcd1c09c96e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "84848484-8484-4484-8484-848484848484",
+        "entryKind": "blue.catbird.chat.defs#participantAcceptanceEntry",
+        "fingerprintSha256Hex": "182d56033f43c4ac1de45f345d6922beea357d91f7fe8164a04bf8ffb597ab21",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "YZjVtucxC+xJIx4l/eS8+yoruXGj++0frEQKrc0cCck=",
+        "seq": 46,
+        "serverFields": {
+          "recovery": {
+            "boundCoordinate": {
+              "confirmationTag": "CUREREREREREREREREREREREREREREREREREREREREQ=",
+              "conversationId": "11111111-1111-4111-9111-111111111111",
+              "epoch": 3,
+              "generation": 78,
+              "groupContextHash": "fjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+              "groupId": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+              "lifecycle": "active",
+              "stateVersion": 79
+            },
+            "conversationId": "11111111-1111-4111-9111-111111111111",
+            "expiresAt": "2026-07-22T14:10:09.123Z",
+            "recoveryKind": "add",
+            "recoveryRequestId": "a1a1a1a1-a1a1-41a1-a1a1-a1a1a1a1a1a1",
+            "requestedAt": "2026-07-22T14:05:09.123Z",
+            "requesterDeviceId": "72727272-7272-4272-b272-727272727272",
+            "requesterDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+            "reservation": {
+              "boundCoordinate": {
+                "confirmationTag": "CUREREREREREREREREREREREREREREREREREREREREQ=",
+                "conversationId": "11111111-1111-4111-9111-111111111111",
+                "epoch": 3,
+                "generation": 78,
+                "groupContextHash": "fjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+                "groupId": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+                "lifecycle": "active",
+                "stateVersion": 79
+              },
+              "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+              "conversationId": "11111111-1111-4111-9111-111111111111",
+              "expiresAt": "2026-07-22T14:10:09.123Z",
+              "keyPackage": {
+                "bytes": "AAAABQAAAAE=",
+                "contentType": "keyPackage",
+                "framing": "mlsMessage",
+                "keyPackageRef": "S0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0s=",
+                "sha256": "Shgccv7OkvmQimuK0xkRV484JzArlj6ACJVbCXpR6IQ="
+              },
+              "keyPackageRef": "S0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0s=",
+              "purpose": "leafRecovery",
+              "recoveryRequestId": "a1a1a1a1-a1a1-41a1-a1a1-a1a1a1a1a1a1",
+              "requesterAuthGeneration": 1,
+              "requesterDeviceId": "72727272-7272-4272-b272-727272727272",
+              "requesterDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+              "requesterKeyId": "OQpJSMbjoMkp9Mz8qJRGo6zAieMT1g9qNZJr8WtW6i8",
+              "status": "active"
+            },
+            "status": "open"
+          }
+        },
+        "signature": "smv2Ra/TIYC9xJ9afeIoeY9h3CX8z8BRJkGEWfXT0av5n7wnPV/sdMtSQFuYbkTOesYZYUhZeiZuLU1Qkha1Aw==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId",
+          "serverFields.recovery.recoveryRequestId",
+          "serverFields.recovery.conversationId",
+          "serverFields.recovery.requesterDeviceId",
+          "serverFields.recovery.boundCoordinate.conversationId",
+          "serverFields.recovery.reservation.recoveryRequestId",
+          "serverFields.recovery.reservation.conversationId",
+          "serverFields.recovery.reservation.boundCoordinate.conversationId",
+          "serverFields.recovery.reservation.requesterDeviceId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature",
+          "serverFields.tombstone.retired.groupId",
+          "serverFields.tombstone.retired.groupContextHash",
+          "serverFields.tombstone.retired.confirmationTag"
+        ],
+        "canonicalDagCborHex": "a8637365710a67656e7472794964506666666666664666a66666666666666669656e7472794b696e64782d626c75652e636174626972642e636861742e6465667323636f6e766572736174696f6e436c6f7365456e747279697369676e6174757265584076461fa126ffc5e3ac4ab88f736df7dc021ab205ac5bf4ce96af2f4f4f4104802978e69b9833dd216b2bece918c0303cbbfda64cfcaa6dc860d7dde992b6ad0d6a726563656976656441747818323032362d30372d32325431323a33343a35362e3030305a6c7365727665724669656c6473a169746f6d6273746f6e65a76772657469726564a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c656a737570657273656465646a67656e65726174696f6e184e6c737461746556657273696f6e18506e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e3333333333333333333333333333333333333333333333333333333333333368636c6f73656441747818323032362d30372d32325431323a33343a35362e3030305a6b636c6f736564427944696478206469643a706c633a616c696365666978747572656161616161616161616161616b7465726d696e616c5365710a6e636f6e766572736174696f6e4964501111111111114111911111111111111170636c6f73656442794465766963654964507272727272724272b27272727272727270636f6e766572736174696f6e4b696e646567726f75706d726571756573744469676573745820077ed633d1e780b4a1524bd3b7de2bc42c1358937bcfffa4fe8b08019f8fc25d6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "66666666-6666-4666-a666-666666666666",
+        "entryKind": "blue.catbird.chat.defs#conversationCloseEntry",
+        "fingerprintSha256Hex": "39009aff7d5685b763a84bb3956604eeff30b0d4720e041a612b3b62760eea5a",
+        "receivedAt": "2026-07-22T12:34:56.000Z",
+        "requestDigest": "B37WM9HngLShUkvTt94rxCwTWJN7z/+k/osIAZ+Pwl0=",
+        "seq": 10,
+        "serverFields": {
+          "tombstone": {
+            "closedAt": "2026-07-22T12:34:56.000Z",
+            "closedByDeviceId": "72727272-7272-4272-b272-727272727272",
+            "closedByDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+            "conversationId": "11111111-1111-4111-9111-111111111111",
+            "conversationKind": "group",
+            "retired": {
+              "confirmationTag": "CUREREREREREREREREREREREREREREREREREREREREQ=",
+              "conversationId": "11111111-1111-4111-9111-111111111111",
+              "epoch": 3,
+              "generation": 78,
+              "groupContextHash": "fjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+              "groupId": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+              "lifecycle": "superseded",
+              "stateVersion": 80
+            },
+            "terminalSeq": 10
+          }
+        },
+        "signature": "dkYfoSb/xeOsSriPc2333AIasgWsW/TOlq8vT09BBIApeOabmDPdIWsr7OkYwDA8u/2mTPyqbchg193pkratDQ==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId",
+          "serverFields.tombstone.conversationId",
+          "serverFields.tombstone.retired.conversationId",
+          "serverFields.tombstone.closedByDeviceId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183067656e7472794964508686868686864686868686868686868669656e7472794b696e647828626c75652e636174626972642e636861742e6465667323726573657452657175657374456e747279697369676e617475726558406931aeb1da3549841c003f77d76d31fe4b31d705fd818aebec31ada0b2970d032888f51e120fa05a98bc42e4abcb404af682fc98e2db38a895be09d09dc4b7006a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d726571756573744469676573745820a7e96a4462436671e62519d7184f93fe7ac41a53b5160006716de40bdf73e8096e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "86868686-8686-4686-8686-868686868686",
+        "entryKind": "blue.catbird.chat.defs#resetRequestEntry",
+        "fingerprintSha256Hex": "8dccd0477b767c5f9169fc549514aa2f084a108f3cf1065f0353492346425e43",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "p+lqRGJDZnHmJRnXGE+T/nrEGlO1FgAGcW3kC99z6Ak=",
+        "seq": 48,
+        "serverFields": {},
+        "signature": "aTGusdo1SYQcAD93120x/ksx1wX9gYrr7DGtoLKXDQMoiPUeEg+gWpi8QuSry0BK9oL8mOLbOKiVvgnQncS3AA==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183167656e7472794964508787878787874787878787878787878769656e7472794b696e64782b626c75652e636174626972642e636861742e6465667323726573657441637469766174696f6e456e747279697369676e617475726558407cd63c26dc680bb23d0f601756a329a43cc338fbcd6251cb1d0708fa819fa1a1526e1181a4d7822cc23f96bf6e4bd91bd3f0d93cf2c847024d54c4e8d988bd086a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582089b96b1b1dcc1f69e995ca520e51ed4ff5359fd5f451b8668e1aad700cc34cf26e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "87878787-8787-4787-8787-878787878787",
+        "entryKind": "blue.catbird.chat.defs#resetActivationEntry",
+        "fingerprintSha256Hex": "6959ff3c587585dd78d42475fd95b9df75d3fb19b8137efcb4588e3eb5a08b3a",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "iblrGx3MH2nplcpSDlHtT/U1n9X0UbhmjhqtcAzDTPI=",
+        "seq": 49,
+        "serverFields": {},
+        "signature": "fNY8JtxoC7I9D2AXVqMppDzDOPvNYlHLHQcI+oGfoaFSbhGBpNeCLMI/lr9uS9kb0/DZPPLIRwJNVMTo2Yi9CA==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183267656e7472794964508888888888884888888888888888888869656e7472794b696e647833626c75652e636174626972642e636861742e64656673236c6561665265636f7665727946756c66696c6c6d656e74456e747279697369676e61747572655840e4d1b224bcb7ca6d4521c76307d7de947e4a5abda18d32a7c84949f8be39092df972b45e7d06ea6e9624711731cf9cd9ef99e6b478683bdc2723817d03fbc10d6a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582015c94b2c865739c3266468f0ac42bacb73dbffc5d2b03665d8d4814e95753fc36e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "88888888-8888-4888-8888-888888888888",
+        "entryKind": "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
+        "fingerprintSha256Hex": "ea2aeb10bb5d03cd1b528e62afafedbc49326606c4bb506c0b7198f6ba62707f",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "FclLLIZXOcMmZGjwrEK6y3Pb/8XSsDZl2NSBTpV1P8M=",
+        "seq": 50,
+        "serverFields": {},
+        "signature": "5NGyJLy3ym1FIcdjB9felH5KWr2hjTKnyElJ+L45CS35crRefQbqbpYkcRcxz5zZ75nmtHhoO9wnI4F9A/vBDQ==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183367656e7472794964508989898989894989898989898989898969656e7472794b696e647828626c75652e636174626972642e636861742e64656673236c6561766552657175657374456e747279697369676e61747572655840fab21ee65d0cdad75f4dba1ea9f470f4db01ba7c2208d29a629294ea5a45231eb92cbb62414adf52e8e19ceb24c9ef74a327e2b618d6aa38bc91c3c95c0d970d6a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d7265717565737444696765737458202f753ecc436765f3b3dae38ed9041d09012022a13a1510ba592793d0cac087b66e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "89898989-8989-4989-8989-898989898989",
+        "entryKind": "blue.catbird.chat.defs#leaveRequestEntry",
+        "fingerprintSha256Hex": "db1854c6486199f175b7074d19256587c74c1c7811512ea667c92591f7a023cf",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "L3U+zENnZfOz2uOO2QQdCQEgIqE6FRC6WSeT0MrAh7Y=",
+        "seq": 51,
+        "serverFields": {},
+        "signature": "+rIe5l0M2tdfTboeqfRw9NsBunwiCNKaYpKU6lpFIx65LLtiQUrfUujhnOskye90oyfithjWqji8kcPJXA2XDQ==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183467656e7472794964508a8a8a8a8a8a4a8a8a8a8a8a8a8a8a8a69656e7472794b696e647829626c75652e636174626972642e636861742e64656673237a65726f4c6561664c65617665456e747279697369676e61747572655840af32d129eefc7f91015c18f0dbb3194c896642ed63550df575e45b9d74512b67afafe34fb5c3283bd26bba5ddd156d25dc2c19e1f3f51e52aedd295a7c6493066a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582058b3609ae357b1f82c8d53aa8db87f037da9342e886d902423bc2981d5c7377b6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "8a8a8a8a-8a8a-4a8a-8a8a-8a8a8a8a8a8a",
+        "entryKind": "blue.catbird.chat.defs#zeroLeafLeaveEntry",
+        "fingerprintSha256Hex": "f10dab25e6a366c761b5999bcdd13294c6d55c9774b01787138070d0d4261fec",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "WLNgmuNXsfgsjVOqjbh/A32pNC6IbZAkI7wpgdXHN3s=",
+        "seq": 52,
+        "serverFields": {},
+        "signature": "rzLRKe78f5EBXBjw27MZTIlmQu1jVQ31deRbnXRRK2evr+NPtcMoO9Jrul3dFW0l3CwZ4fP1HlKu3SlafGSTBg==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183567656e7472794964508b8b8b8b8b8b4b8b8b8b8b8b8b8b8b8b69656e7472794b696e64782d626c75652e636174626972642e636861742e64656673236c6561766543616e63656c6c6174696f6e456e747279697369676e61747572655840af810a1c38f252c810763828a5945d6cdd8c002a1a253901b89a60429f49bbbdf51bea801b2dd7ab7ec2cd54bcaa76d3bcf7f8aa9cdd8c35c7ccf24e1c6f0d056a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d726571756573744469676573745820f46c1f6d71b67339af880914a8c4036f368e020ee457fa244e63d75da8b78abc6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "8b8b8b8b-8b8b-4b8b-8b8b-8b8b8b8b8b8b",
+        "entryKind": "blue.catbird.chat.defs#leaveCancellationEntry",
+        "fingerprintSha256Hex": "f14ad9e884d6e1ddeeaee0233b3551999d883e6a0c9f66bd7adf2d621e4b13a1",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "9GwfbXG2czmviAkUqMQDbzaOAg7kV/okTmPXXai3irw=",
+        "seq": 53,
+        "serverFields": {},
+        "signature": "r4EKHDjyUsgQdjgopZRdbN2MACoaJTkBuJpgQp9Ju731G+qAGy3Xq37CzVS8qnbTvPf4qpzdjDXHzPJOHG8NBQ==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183667656e7472794964508c8c8c8c8c8c4c8c8c8c8c8c8c8c8c8c69656e7472794b696e647832626c75652e636174626972642e636861742e64656673236c65617665436f6d6d697446756c66696c6c6d656e74456e747279697369676e61747572655840a14e5262955ef53bf4c870da747e8b877641ea9782bcd96b576484f839d862e292cfefa2a22716c8035b0a2dc70013cf97180c8a424437a2ed40bc576e9101086a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582057073f3727e88f67a88e56592079639379e987b31f9b774526c944afbf723cbf6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "8c8c8c8c-8c8c-4c8c-8c8c-8c8c8c8c8c8c",
+        "entryKind": "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+        "fingerprintSha256Hex": "fce6ae5dac9636c99b00f9d39fe337d86850306d6d8456cceba9e96f5bd08d9f",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "Vwc/Nyfoj2eojlZZIHljk3nph7Mfm3dFJslEr79yPL8=",
+        "seq": 54,
+        "serverFields": {},
+        "signature": "oU5SYpVe9Tv0yHDadH6Lh3ZB6peCvNlrV2SE+DnYYuKSz++ioicWyANbCi3HABPPlxgMikJEN6LtQLxXbpEBCA==",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      }
+    ],
+    "domain": "CATBIRD-CHAT-CONTROL-ENTRY-FINGERPRINT\u0000",
+    "nonemptyServerFields": {
+      "blue.catbird.chat.defs#conversationCloseEntry": [
+        "tombstone"
+      ],
+      "blue.catbird.chat.defs#participantAcceptanceEntry": [
+        "recovery"
+      ]
+    },
+    "ordinaryServerFields": {},
+    "projectionFields": [
+      "entryKind",
+      "entryId",
+      "conversationId",
+      "seq",
+      "requestDigest",
+      "signature",
+      "serverFields",
+      "receivedAt"
+    ]
+  }
+}
