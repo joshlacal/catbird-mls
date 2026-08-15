@@ -112,6 +112,173 @@ impl StoreScope {
     }
 }
 
+/// Enforces that no module under `chat_v2` reaches into a v1 storage mechanism.
+///
+/// The existing isolation gate forbids importing `crate::orchestrator`, which
+/// catches the v1 storage *trait* because it lives there. It does not catch the
+/// stores underneath: `HybridStorageProvider`, the OpenMLS SQLite provider, and
+/// v1's SQLCipher context are reachable by other paths, and any one of them
+/// would put v2 state into a store that has nowhere to record which protocol
+/// version wrote it.
+///
+/// This gate is the storage counterpart to the recovery tree's
+/// forbidden-mechanism gate, and it is built the same way: needles assembled at
+/// runtime, comments stripped, a positive control, and every entry carrying its
+/// reason so that whoever eventually wants to delete one has to read why it is
+/// there first.
+#[cfg(test)]
+mod physical_separation {
+    use std::path::Path;
+
+    /// The v1 storage mechanisms v2 must never reach, each with its reason.
+    ///
+    /// Assembled from fragments so this gate's own source does not read as a
+    /// violation of itself.
+    fn forbidden_stores() -> Vec<(String, &'static str)> {
+        vec![
+            (
+                ["openmls", "sqlite", "storage"].join("_"),
+                "the OpenMLS store has no prefix or namespace mechanism, so a shared \
+                 context puts v1 and v2 groups in one table keyed only by group id",
+            ),
+            (
+                ["Hybrid", "Storage", "Provider"].concat(),
+                "v1's OpenMLS-plus-keychain store; v2 opens a separate store with its \
+                 own database file rather than nesting inside this one",
+            ),
+            (
+                ["MLS", "Storage", "Backend"].concat(),
+                "v1's flat storage seam, twenty of whose thirty-four methods default to \
+                 no-ops that discard state and report success",
+            ),
+            (
+                ["hybrid", "storage"].join("_"),
+                "the module path to the same v1 store, reachable without naming the type",
+            ),
+            (
+                ["mls", "context"].join("_"),
+                "v1's SQLCipher connection and MlsGroup map; §1 forbids reading or \
+                 translating superseded storage and cryptographic state",
+            ),
+        ]
+    }
+
+    fn source_files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).expect("chat_v2 source tree must be readable");
+        for entry in entries {
+            let path = entry.expect("directory entry must be readable").path();
+            if path.is_dir() {
+                source_files(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+
+    /// Strips `//` comments, so documentation naming a forbidden store in order
+    /// to forbid it — as this module's own docs do at length — is not a
+    /// violation.
+    fn code_only(line: &str) -> &str {
+        match line.find("//") {
+            Some(index) => &line[..index],
+            None => line,
+        }
+    }
+
+    #[test]
+    fn chat_v2_never_reaches_a_v1_store() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/chat_v2");
+        let mut files = Vec::new();
+        source_files(&root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "the walk found no sources, so this test would pass vacuously"
+        );
+
+        let forbidden = forbidden_stores();
+        let mut violations = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("source file must be readable");
+            for (number, line) in text.lines().enumerate() {
+                let code = code_only(line);
+                for (needle, why) in &forbidden {
+                    if code.contains(needle.as_str()) {
+                        violations.push(format!(
+                            "{}:{}: {} — {why}",
+                            file.display(),
+                            number + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "v2 storage must be physically separate from v1's; found:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_separation_gate_can_actually_fail() {
+        // A control that cannot fail is not a control. These are the exact
+        // spellings the real v1 modules use, so the matcher is proven against
+        // the thing it exists to catch rather than against an invented string.
+        let forbidden = forbidden_stores();
+        for offending in [
+            format!(
+                "use {}::SqliteStorageProvider;",
+                ["openmls", "sqlite", "storage"].join("_")
+            ),
+            format!(
+                "    let provider = {}::new();",
+                ["Hybrid", "Storage", "Provider"].concat()
+            ),
+            format!(
+                "impl {} for ChatV2Store {{",
+                ["MLS", "Storage", "Backend"].concat()
+            ),
+        ] {
+            assert!(
+                forbidden
+                    .iter()
+                    .any(|(needle, _)| code_only(&offending).contains(needle.as_str())),
+                "the matcher must flag: {offending}"
+            );
+        }
+
+        // And that comment stripping is what spares this module's own docs,
+        // which necessarily name every store they forbid.
+        let documented = format!(
+            "//! - v1's {} is flat and has no namespace to parallel.",
+            ["MLS", "Storage", "Backend"].concat()
+        );
+        assert!(
+            forbidden
+                .iter()
+                .all(|(needle, _)| !code_only(&documented).contains(needle.as_str())),
+            "a mention inside a comment must not count as a violation"
+        );
+    }
+
+    #[test]
+    fn every_forbidden_store_carries_its_reason() {
+        // The list is only useful if a future reader learns why each entry is
+        // there rather than deleting whichever one is inconveniencing them.
+        let forbidden = forbidden_stores();
+        assert_eq!(forbidden.len(), 5);
+        for (needle, why) in &forbidden {
+            assert!(!needle.is_empty());
+            assert!(
+                why.len() > 20,
+                "{needle} needs a real explanation, not a label"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -296,6 +296,44 @@ mod required_methods {
     }
 
     #[test]
+    fn the_method_count_is_pinned_so_the_scope_sweep_stays_complete() {
+        // Every method taking a principal-bearing argument must refuse a
+        // foreign one, and that is checked by calling them — in
+        // `memory::tests`, across the three `another_principal...` and
+        // `every_read_and_write...` sweeps. A call-based sweep cannot notice a
+        // method nobody added to it, so the count is pinned here: adding a
+        // method fails this assertion, and the fix is to extend the sweep
+        // rather than to bump the number.
+        //
+        // Of the ten, `scope` and `outstanding_journal_entries` take no
+        // principal-bearing argument and are inherently scoped; the other eight
+        // are swept.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/chat_v2/storage/store.rs");
+        let source = std::fs::read_to_string(path).expect("the trait's source must be readable");
+        let methods = guarded_methods(&source);
+        let names: Vec<&str> = methods.iter().map(|(name, _)| name.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "scope",
+                "cursor",
+                "commit_page",
+                "entries_after",
+                "ratchet_checkpoint",
+                "put_journal_entry",
+                "journal_entry",
+                "outstanding_journal_entries",
+                "put_schedule",
+                "schedule",
+            ],
+            "the store's method set changed; extend the foreign-principal sweep \
+             in memory::tests to cover any new principal-bearing method, then \
+             update this list"
+        );
+    }
+
+    #[test]
     fn the_gate_can_actually_fail() {
         // A control that cannot fail is not a control. This proves the scanner
         // recognizes a default body rather than reporting every input clean,
