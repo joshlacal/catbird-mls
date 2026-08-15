@@ -11,8 +11,13 @@
 //! positive control proving the matcher can actually fail.
 
 pub mod ladder;
+pub mod poison;
 
 pub use ladder::{LadderError, RecoveryLadder, RecoveryRung};
+pub use poison::{
+    poisoned_device_next_rung, select_fulfiller, Containment, FulfillerCandidate, PoisonEscalation,
+    PoisonObservation, PoisonSource, ProcessingFailure, RecoveryKind,
+};
 
 /// Enforces the deliberate absences the recovery design depends on.
 ///
