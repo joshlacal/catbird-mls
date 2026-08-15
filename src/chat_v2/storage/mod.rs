@@ -46,8 +46,14 @@
 //! decided them by the time anything reaches storage.
 
 pub mod error;
+pub mod memory;
+pub mod page;
+pub mod store;
 
 pub use error::{RecordKind, StorageError};
+pub use memory::MemoryStore;
+pub use page::{EntryOutcome, PageCommit, PersistedEntry, RatchetCheckpoint};
+pub use store::ChatV2Store;
 
 use super::ids::BareDid;
 use super::interval::RecipientBinding;

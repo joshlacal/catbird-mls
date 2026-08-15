@@ -19,7 +19,9 @@
 //!   which for the journal means re-signing an operation and burning its
 //!   identity permanently.
 
+use crate::chat_v2::cursor::AfterSeq;
 use crate::chat_v2::ids::BareDid;
+use crate::chat_v2::interval::RecipientBinding;
 use core::fmt;
 
 /// Which family of record a storage failure concerns.
@@ -98,6 +100,24 @@ pub enum StorageError {
         /// What the decoder objected to.
         detail: String,
     },
+    /// A page commit did not build on the stored scan position.
+    ///
+    /// The compare-and-set refusal. Two commits racing on one device would
+    /// otherwise silently lose one another's effects: the loser's entries land,
+    /// the winner's cursor stands, and the difference is skipped forever because
+    /// `afterSeq` is exclusive and those entries are never returned again.
+    ///
+    /// Distinct from a [`StorageError::NotFound`] cursor, which means the page
+    /// continued from a position this store never held — a misrouted store
+    /// rather than a lost race, and a different thing to go and fix.
+    CursorMismatch {
+        /// The exact device whose position was contested.
+        binding: RecipientBinding,
+        /// The position the page was fetched against.
+        page_built_on: AfterSeq,
+        /// The position the store actually holds.
+        stored: AfterSeq,
+    },
     /// The underlying platform store failed.
     ///
     /// The one variant carrying an opaque platform message, because the platform
@@ -125,6 +145,7 @@ impl StorageError {
     pub fn record(&self) -> Option<RecordKind> {
         match self {
             Self::NotFound { record, .. } | Self::Corrupt { record, .. } => Some(*record),
+            Self::CursorMismatch { .. } => Some(RecordKind::Cursor),
             Self::CrossDidAccess { .. } | Self::Backend { .. } => None,
         }
     }
@@ -144,6 +165,15 @@ impl fmt::Display for StorageError {
                 key,
                 detail,
             } => write!(f, "stored {record} for {key} did not decode: {detail}"),
+            Self::CursorMismatch {
+                binding,
+                page_built_on,
+                stored,
+            } => write!(
+                f,
+                "page for {binding} was fetched at {page_built_on} but the store holds {stored}; \
+                 committing it would discard the effects that advanced it"
+            ),
             Self::Backend { operation, detail } => {
                 write!(f, "{operation} failed in the platform store: {detail}")
             }
