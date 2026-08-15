@@ -10,6 +10,21 @@
 //! > misleading direct ciphertext during those gaps. **Group traffic may
 //! > continue for remaining current leaves.**
 //!
+//! # "Both exact participants" is a cardinality rule first
+//!
+//! The sentence names *both* participants, so a direct is only evaluable
+//! against a roster that has exactly two of them, distinct, one of which is the
+//! sender. That part is easy to lose: a readiness check written as "no
+//! participant is unready" answers `Ok` for an **empty** roster, for a roster
+//! holding only the sender, and for a five-member roster that is not a direct at
+//! all. Each of those is a caller assembling the wrong roster, and each would
+//! have sent direct traffic the protocol forbids — the empty case most plainly,
+//! since it permits sending to nobody.
+//!
+//! So the cardinality is checked before readiness, and refused by its own names.
+//! The group arm has no equivalent rule on purpose: a group is one creator plus
+//! zero or more invitees, so no member count is wrong there.
+//!
 //! # Two conditions, two different refusals
 //!
 //! "Active" and "has a leaf" are separate facts, and conflating them loses the
@@ -111,6 +126,24 @@ pub enum TrafficRefusal {
     /// least one; sending into a group nobody can decrypt stores ciphertext no
     /// one will ever read.
     NoCurrentLeaves,
+    /// A direct's roster was not exactly two participants.
+    ///
+    /// §9 requires *both* exact participants, so a roster of nought, one, or
+    /// five is not a direct whose precondition can be evaluated. Refusing is
+    /// the only safe answer: the alternative permits sending to nobody.
+    DirectNotTwoParticipants { found: usize },
+    /// A direct's roster named one participant twice.
+    ///
+    /// Two entries for one DID are one participant, not both of them. Left
+    /// unchecked, a roster holding a device's own two rows would satisfy a
+    /// count of two while the peer was never present.
+    DirectParticipantsNotDistinct { did: BareDid },
+    /// The sender was neither of the direct's two participants.
+    ///
+    /// A direct is between the sender and exactly one other. A pair that does
+    /// not include the sender is a roster assembled for a different
+    /// conversation, and readiness would answer about the wrong two people.
+    SenderNotAParticipant { sender: BareDid },
 }
 
 impl TrafficRefusal {
@@ -122,9 +155,14 @@ impl TrafficRefusal {
         match self {
             Self::ConversationNotAccepted { .. } => Some(ChatErrorCode::ConversationNotAccepted),
             Self::RecipientNotReady { .. } => Some(ChatErrorCode::RecipientNotReady),
-            // A local-only precondition: the server has no code for it because
-            // a client should never have reached the point of asking.
-            Self::NoCurrentLeaves => None,
+            // Local-only preconditions: the server has no code for any of them
+            // because a client should never have reached the point of asking.
+            // A malformed roster is this client's mistake, not an answer a
+            // server would ever give.
+            Self::NoCurrentLeaves
+            | Self::DirectNotTwoParticipants { .. }
+            | Self::DirectParticipantsNotDistinct { .. }
+            | Self::SenderNotAParticipant { .. } => None,
         }
     }
 }
@@ -140,6 +178,17 @@ impl fmt::Display for TrafficRefusal {
                 "{did} is active but currently has no MLS leaf; the gap is temporary"
             ),
             Self::NoCurrentLeaves => f.write_str("no current leaf could receive this"),
+            Self::DirectNotTwoParticipants { found } => write!(
+                f,
+                "a direct has exactly two participants, this roster has {found}"
+            ),
+            Self::DirectParticipantsNotDistinct { did } => write!(
+                f,
+                "{did} appears twice; two entries for one DID are one participant"
+            ),
+            Self::SenderNotAParticipant { sender } => {
+                write!(f, "{sender} is not one of this direct's two participants")
+            }
         }
     }
 }
@@ -148,15 +197,25 @@ impl core::error::Error for TrafficRefusal {}
 
 /// Whether application traffic may be sent.
 ///
-/// Direct requires **both** participants active and leafed. Group requires only
-/// that some current leaf remains — silencing a whole group because one member
-/// is mid-recovery is the availability failure the asymmetry avoids.
+/// Direct requires the roster to be exactly the sender and one distinct other,
+/// **both** active and leafed. Group requires only that some current leaf
+/// remains — silencing a whole group because one member is mid-recovery is the
+/// availability failure the asymmetry avoids.
+///
+/// `sender` is this device's own principal. It is read only on the direct path,
+/// where "both exact participants" cannot be checked without knowing who one of
+/// them is meant to be.
 pub fn require_traffic_allowed(
     kind: ConversationKind,
+    sender: &BareDid,
     participants: &[ParticipantPresence],
 ) -> Result<(), TrafficRefusal> {
     match kind {
         ConversationKind::Direct => {
+            // Cardinality before readiness. "No participant is unready" is
+            // vacuously true of an empty roster, so a readiness-first check
+            // permits sending a direct to nobody.
+            require_direct_roster(sender, participants)?;
             // Pending is reported ahead of zero-leaf when both apply: "they
             // have not accepted" is the more accurate and more actionable
             // answer, and a pending participant has no leaf by construction.
@@ -186,6 +245,37 @@ pub fn require_traffic_allowed(
             }
         }
     }
+}
+
+/// Confirms a direct's roster really is this sender and one distinct other.
+///
+/// Separate from the readiness checks because it answers a different question:
+/// readiness asks whether the two participants can receive, and this asks
+/// whether there are two participants at all and whether they are the right
+/// two. A roster failing here is a caller mistake, not a peer's state.
+fn require_direct_roster(
+    sender: &BareDid,
+    participants: &[ParticipantPresence],
+) -> Result<(), TrafficRefusal> {
+    if participants.len() != 2 {
+        return Err(TrafficRefusal::DirectNotTwoParticipants {
+            found: participants.len(),
+        });
+    }
+    if participants[0].did == participants[1].did {
+        return Err(TrafficRefusal::DirectParticipantsNotDistinct {
+            did: participants[0].did.clone(),
+        });
+    }
+    if !participants
+        .iter()
+        .any(|participant| &participant.did == sender)
+    {
+        return Err(TrafficRefusal::SenderNotAParticipant {
+            sender: sender.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Why an Add was refused.
@@ -233,6 +323,7 @@ mod tests {
 
     const ALICE: &str = "did:plc:z72i7hdynmk6r22z27h6tvur";
     const BOB: &str = "did:plc:ewvi7nxzyoun6zhxrhs64oiz";
+    const CAROL: &str = "did:plc:44ybard66vv44zksje25o7dz";
 
     fn did(value: &str) -> BareDid {
         BareDid::parse(value).unwrap()
@@ -250,23 +341,91 @@ mod tests {
         presence(value, ParticipantStatus::Active, 1)
     }
 
+    /// Every direct below sends as Alice, so the sender is spelled once.
+    fn direct(participants: &[ParticipantPresence]) -> Result<(), TrafficRefusal> {
+        require_traffic_allowed(ConversationKind::Direct, &did(ALICE), participants)
+    }
+
+    fn group(participants: &[ParticipantPresence]) -> Result<(), TrafficRefusal> {
+        require_traffic_allowed(ConversationKind::Group, &did(ALICE), participants)
+    }
+
     // ---- direct ------------------------------------------------------------
 
     #[test]
     fn a_direct_with_both_participants_ready_permits_traffic() {
-        assert_eq!(
-            require_traffic_allowed(ConversationKind::Direct, &[ready(ALICE), ready(BOB)]),
-            Ok(())
-        );
+        assert_eq!(direct(&[ready(ALICE), ready(BOB)]), Ok(()));
     }
 
     #[test]
     fn a_pending_invitee_blocks_direct_traffic_as_not_accepted() {
         let participants = [ready(ALICE), presence(BOB, ParticipantStatus::Pending, 0)];
         assert_eq!(
-            require_traffic_allowed(ConversationKind::Direct, &participants),
+            direct(&participants),
             Err(TrafficRefusal::ConversationNotAccepted { did: did(BOB) })
         );
+    }
+
+    // ---- direct cardinality ---------------------------------------------------
+
+    #[test]
+    fn a_direct_roster_that_is_not_two_participants_is_refused_by_name() {
+        // The four rosters a readiness-only check answers `Ok` for. The empty
+        // one is the plainest: "no participant is unready" is vacuously true,
+        // so the gate would permit sending a direct to nobody.
+        for participants in [
+            vec![],
+            vec![ready(ALICE)],
+            vec![ready(ALICE), ready(BOB), ready(CAROL)],
+            vec![
+                ready(ALICE),
+                ready(BOB),
+                ready(CAROL),
+                presence(BOB, ParticipantStatus::Active, 2),
+                presence(CAROL, ParticipantStatus::Active, 3),
+            ],
+        ] {
+            let found = participants.len();
+            assert_eq!(
+                direct(&participants),
+                Err(TrafficRefusal::DirectNotTwoParticipants { found }),
+                "a roster of {found} is not a direct"
+            );
+        }
+    }
+
+    #[test]
+    fn one_participant_named_twice_is_not_two_participants() {
+        // A count of two is not the rule; §9 names *both exact participants*.
+        // Two rows for one DID satisfy the count while the peer is absent.
+        assert_eq!(
+            direct(&[ready(ALICE), presence(ALICE, ParticipantStatus::Active, 2)]),
+            Err(TrafficRefusal::DirectParticipantsNotDistinct { did: did(ALICE) })
+        );
+    }
+
+    #[test]
+    fn a_direct_the_sender_is_not_part_of_is_refused() {
+        // Two ready, distinct participants — and neither of them is us. The
+        // roster belongs to a different conversation, so readiness would be
+        // answering about the wrong two people.
+        assert_eq!(
+            direct(&[ready(BOB), ready(CAROL)]),
+            Err(TrafficRefusal::SenderNotAParticipant { sender: did(ALICE) })
+        );
+    }
+
+    #[test]
+    fn the_roster_refusals_are_local_and_carry_no_endpoint_code() {
+        // A server never answers "your roster is malformed" — it never sees the
+        // roster. Handing these an endpoint code would put words in its mouth.
+        for refusal in [
+            TrafficRefusal::DirectNotTwoParticipants { found: 5 },
+            TrafficRefusal::DirectParticipantsNotDistinct { did: did(ALICE) },
+            TrafficRefusal::SenderNotAParticipant { sender: did(ALICE) },
+        ] {
+            assert_eq!(refusal.endpoint_code(), None, "{refusal}");
+        }
     }
 
     #[test]
@@ -276,7 +435,7 @@ mod tests {
         // unkind.
         let participants = [ready(ALICE), presence(BOB, ParticipantStatus::Active, 0)];
         assert_eq!(
-            require_traffic_allowed(ConversationKind::Direct, &participants),
+            direct(&participants),
             Err(TrafficRefusal::RecipientNotReady { did: did(BOB) })
         );
     }
@@ -304,7 +463,7 @@ mod tests {
             presence(BOB, ParticipantStatus::Pending, 0),
         ];
         assert_eq!(
-            require_traffic_allowed(ConversationKind::Direct, &participants),
+            direct(&participants),
             Err(TrafficRefusal::ConversationNotAccepted { did: did(BOB) })
         );
     }
@@ -316,10 +475,7 @@ mod tests {
             presence(BOB, ParticipantStatus::Pending, 0),
             presence(BOB, ParticipantStatus::Active, 0),
         ] {
-            assert!(
-                require_traffic_allowed(ConversationKind::Direct, &[ready(ALICE), unready])
-                    .is_err()
-            );
+            assert!(direct(&[ready(ALICE), unready]).is_err());
         }
     }
 
@@ -329,20 +485,30 @@ mod tests {
     fn group_traffic_continues_for_remaining_leaves() {
         // The asymmetry, and the reason for it: applying the direct rule here
         // would silence a whole conversation because one member is mid-recovery.
-        let participants = [
-            ready(ALICE),
-            presence(BOB, ParticipantStatus::Active, 0),
-            presence(BOB, ParticipantStatus::Pending, 0),
-        ];
+        // The roster is a legal direct roster — two distinct participants, one
+        // of them the sender — so the two answers differ on *readiness* and not
+        // on cardinality, which is what makes this a genuine asymmetry.
+        let participants = [ready(ALICE), presence(BOB, ParticipantStatus::Active, 0)];
         assert_eq!(
-            require_traffic_allowed(ConversationKind::Group, &participants),
+            group(&participants),
             Ok(()),
             "a group tolerates unready members that a direct does not"
         );
+        assert_eq!(
+            direct(&participants),
+            Err(TrafficRefusal::RecipientNotReady { did: did(BOB) }),
+            "the identical roster, refused as a direct, and for the readiness reason"
+        );
 
-        // The identical roster is refused as a direct, which is what makes this
-        // a genuine asymmetry rather than two unrelated rules.
-        assert!(require_traffic_allowed(ConversationKind::Direct, &participants).is_err());
+        // A group is also unbothered by a member count no direct could have.
+        assert_eq!(
+            group(&[
+                ready(ALICE),
+                presence(BOB, ParticipantStatus::Active, 0),
+                presence(CAROL, ParticipantStatus::Pending, 0),
+            ]),
+            Ok(())
+        );
     }
 
     #[test]
@@ -353,23 +519,14 @@ mod tests {
             presence(ALICE, ParticipantStatus::Active, 0),
             presence(BOB, ParticipantStatus::Pending, 0),
         ];
-        assert_eq!(
-            require_traffic_allowed(ConversationKind::Group, &participants),
-            Err(TrafficRefusal::NoCurrentLeaves)
-        );
-        assert_eq!(
-            require_traffic_allowed(ConversationKind::Group, &[]),
-            Err(TrafficRefusal::NoCurrentLeaves)
-        );
+        assert_eq!(group(&participants), Err(TrafficRefusal::NoCurrentLeaves));
+        assert_eq!(group(&[]), Err(TrafficRefusal::NoCurrentLeaves));
     }
 
     #[test]
     fn a_pending_member_alone_does_not_make_a_group_sendable() {
         assert_eq!(
-            require_traffic_allowed(
-                ConversationKind::Group,
-                &[presence(ALICE, ParticipantStatus::Pending, 1)]
-            ),
+            group(&[presence(ALICE, ParticipantStatus::Pending, 1)]),
             Err(TrafficRefusal::NoCurrentLeaves),
             "a leaf without acceptance is not a ready participant"
         );
@@ -418,7 +575,7 @@ mod tests {
             "accepted, so addable"
         );
         assert_eq!(
-            require_traffic_allowed(ConversationKind::Direct, &[ready(ALICE), freshly_accepted]),
+            direct(&[ready(ALICE), freshly_accepted]),
             Err(TrafficRefusal::RecipientNotReady { did: did(BOB) }),
             "but not yet sendable, and for the leaf reason"
         );
