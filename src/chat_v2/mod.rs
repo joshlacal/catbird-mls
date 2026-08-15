@@ -29,6 +29,18 @@
 //! - **Verify before decrypt.** Signature, transcript, and fingerprint
 //!   validation precede decryption, attribution, display, and effects, for both
 //!   application entries and all thirteen control kinds.
+//!
+//! # Continuing this work
+//!
+//! `HANDOFF.md`, alongside this file, is the current state of play: the sealed
+//! commit map, the ratified policy decisions and why each was decided that way,
+//! what the reducer has and has not built, which named refusals the next slices
+//! must convert into implementations, and the plan for envelope verification.
+//!
+//! Read it before changing anything here. Several decisions in this tree look
+//! arbitrary from the code alone and are not — the strict `nextAfterSeq`
+//! equality, the cumulative bare-DID length rule, and the two-code auto-retry
+//! set were each settled against evidence and are pinned by tests.
 
 pub mod append_log;
 pub mod coordinate;
