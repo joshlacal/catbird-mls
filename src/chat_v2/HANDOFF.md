@@ -26,9 +26,22 @@ workspace is untouched and must stay that way).
 > landing pass, not to this workspace — nothing ships from here — but the
 > obligation travels with the revision.
 
-Verification at handoff: **632 lib tests pass, 0 failures.** `cargo fmt
+Verification at handoff: **638 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib` reports zero warnings under `chat_v2`,
 `wasm32-unknown-unknown` builds.
+
+### Known open, handed to the fix round
+
+Two items from the adversarial review are **deliberately not fixed here**, and
+`rehydrate` was hardened to refuse what they would make unrepresentable rather
+than to paper over them:
+
+- **No seq high-water mark** (review F2). Controls compare against the interval
+  *opening* only, so a close or terminal can land below an already-consumed row.
+  The specified feed cannot produce that ordering.
+- **`AccessInterval::apply_close` silently overwrites an existing close.** It
+  checks only `close.seq > opening.seq`. Unreachable through the reducer today,
+  but it is a public method and storage is now a caller.
 
 A note on the lint command: `cargo clippy --all-targets` exits **101**, and that
 is the pre-existing `tests/sequencer_did_sync_tests.rs` breakage documented in
@@ -86,6 +99,8 @@ promotions and one new dependency).
 | `qylztuwk` | `9943c4af` | Split the reference store's tests into a sibling file |
 | `ovkuwqzx` | `4a313a50` | Gate the reference store out of production builds (S10e addendum) |
 | `olrmypzv` | `b947ec01` | Correct the readiness probe to protocol completeness (S10f) |
+| `lwouupwq` | `8fa1427d` | Handoff refresh for S10f and the reference-store gating |
+| `ptkyzxrn` | `0075e5c5` | Refuse structurally corrupt restored schedules (review follow-up) |
 
 ### The detached-HEAD trap — read before concluding a server file is missing
 
@@ -222,7 +237,8 @@ chat_v2/
     ladder.rs   four rungs, skip/descent/exhaustion refused by name
     poison.rs   deterministic-only poison, containment, different-DID fulfiller
   reducer/
-    mod.rs      sequencing core (6a)
+    mod.rs      sequencing core (6a) + rehydrate, the restore feed
+    restore_tests.rs  what rehydrate accepts back; why restore checks shape
     reanchor.rs closure, reanchor, touching boundaries (6b)
     reset.rs    the three reset-activator roles (6c)
     terminal.rs the two Terminal modes (6d)
@@ -540,6 +556,17 @@ Physically separate, per DID, with every method required.
   `.expect()`, treating absence as unreachable. Restore is the only way into the
   type that bypasses the paths maintaining it, so it refuses an incoherent pair
   by name. Do not relax that check to accept a row that "looks fine".
+- **Restore is a second feed, and that is the whole reason it checks shape.**
+  `rehydrate` also refuses an unordered, overlapping, or non-finally-open
+  interval list, because three paths read `intervals.last()` as "the current
+  interval": `has_open_interval`, `reanchor`'s strict gap, and the `last_mut()`
+  that `close_interval` writes into. The specified append-log feed cannot
+  produce such a list, so those paths were written to trust the shape; durable
+  storage hands back whatever was written. Demonstrated rather than argued: with
+  the checks removed, an unordered restore let `reanchor` accept an opening at
+  seq 15 *inside* the real latest interval `10..=20` and return `Ok`. Equality at
+  a touching boundary is permitted and pinned — tightening it to a strict
+  comparison would reject legal schedules.
 - **Restore reinstates; it does not re-adjudicate.** Replaying admission
   decisions against rows the client no longer holds would refuse a schedule that
   was legitimately built. What restore *does* enforce is exact-recipient
