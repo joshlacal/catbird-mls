@@ -1,7 +1,7 @@
 # chat_v2 — Task 3 handoff
 
 State of the clean chat protocol (`blue.catbird.chat.*`) client implementation
-as of the twenty-fifth sealed slice. Written for the session that continues it.
+as of the sealed commits listed below. Written for the session that continues it.
 
 Workspace: `catbird-mls-task3-ws` (isolated jj workspace; Josh's default
 workspace is untouched and must stay that way).
@@ -32,8 +32,11 @@ Verification at handoff: **580 lib tests pass, 0 failures.** `cargo fmt
 
 ## 1. Sealed commits
 
-Twenty-five, oldest first. All additive; the only pre-existing file touched is
-`src/lib.rs` (three lines declaring the module).
+Oldest first, and the table is the count — a number written beside it is a
+second source of truth that drifts, which it did. All additive; the only
+pre-existing files touched are
+`src/lib.rs` (three lines declaring the module) and `Cargo.toml` (two
+promotions and one new dependency).
 
 | Change | Commit | What |
 |---|---|---|
@@ -46,6 +49,7 @@ Twenty-five, oldest first. All additive; the only pre-existing file touched is
 | `mxquskum` | `756538cf` | Coordinate transition relations; interval provenance types |
 | `ssqpvqst` | `8e088173` | Reducer sequencing core (6a) |
 | `zxryzskq` | `7c8f7a20` | Interval closure, verified reanchor, touching boundaries (6b) |
+| `ptlzkqyx` | `4e9651a7` | The first Task 3 handoff document |
 | `oukpxxkq` | `3d54a64c` | Reset-activator classification (6c) |
 | `nzvoxxxn` | `0b02a553` | The two Terminal modes (6d) |
 | `twsmwtww` | `a16e4fe5` | Handoff refresh for the built reducer |
@@ -64,6 +68,7 @@ Twenty-five, oldest first. All additive; the only pre-existing file touched is
 | `szlxmzrz` | `967deea2` | The single recovery projection on the FFI surface (S9b) |
 | `zlmxmxww` | `b0a8c2f5` | Poisoned-state containment (S9c) |
 | `xwnzpuqk` | `eaf655ff` | Participation status and the direct-traffic gate (S9d) |
+| `pxukowsz` | `f3f227a9` | Handoff refresh for completed content, recovery, participation |
 
 ### The detached-HEAD trap — read before concluding a server file is missing
 
