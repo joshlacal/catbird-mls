@@ -18,9 +18,12 @@
 //!    are frozen and byte-exact. Five clients hand-rolling them is five chances
 //!    to diverge, so they are validated here once.
 //! 3. **A readiness probe.** [`chat_v2_status`] reports `is_operational =
-//!    false` until the envelope and reducer layers land. The types are
-//!    bindable now; the protocol is not usable yet, and this makes that
-//!    impossible to mistake.
+//!    false`, and reports *why* as a list of named capabilities each carrying
+//!    its own sentence. The types are bindable now; the protocol is not usable
+//!    yet, and this makes that impossible to mistake. The probe claims protocol
+//!    completeness rather than any one lane's completeness — a distinction that
+//!    has already had to be corrected once, and the reasoning is recorded on
+//!    [`chat_v2_status`] itself.
 //!
 //! 4. **The recovery projection.** [`chat_v2_recovery_projection`] is the
 //!    **single** projection platforms consume. There are deliberately no
@@ -37,12 +40,22 @@
 //! `CatbirdMLSCore/Scripts/rebuild-ffi.sh` for iOS and `./build-android.sh` for
 //! Android. See the `ffi-propagate` skill.
 //!
+//! The most recent change is the readiness probe's capability lists, which are
+//! now `Vec<ChatV2Capability>` — a name plus a description — rather than
+//! `Vec<String>`. Both lists changed together on purpose: a platform reading one
+//! and rendering the other would otherwise face two shapes for one concept.
+//!
 //! # Not exposed yet, on purpose
 //!
-//! The append-log sink and the storage seam are absent because their shapes are
-//! not settled. Reducer state and interval provenance *were* absent for the same
-//! reason and no longer are: 6a-6d and S7 settled them, which is why the
-//! recovery projection can exist at all.
+//! The append-log sink is absent because its shape is not settled.
+//!
+//! **Storage is a different case and worth stating plainly**: its shape *is*
+//! settled, and exporting it would be defensible. It is absent because binding
+//! it has never been attempted and doing so changes the checksum again — that
+//! belongs to the coordinated landing pass, not to a lane that would be
+//! guessing at what the platforms need. Reducer state and interval provenance
+//! were absent for the "not settled" reason and no longer are: 6a-6d and S7
+//! settled them, which is why the recovery projection can exist at all.
 //!
 //! # Policy is precomputed, never re-derived
 //!
@@ -219,6 +232,31 @@ impl ChatV2ValidationError {
     }
 }
 
+/// One named capability, with the sentence that explains it.
+///
+/// The description is not decoration. These lists coordinate lanes and outlive
+/// the context of whoever wrote them: an entry reading only `mls-crypto-seam`
+/// tells a reader in six months that something is missing but not what, and a
+/// bare name in the outstanding list is the kind of thing that gets deleted
+/// because nobody remembers why it is there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct ChatV2Capability {
+    /// The stable identifier lanes coordinate on.
+    pub name: String,
+    /// One line: what it is, and for an outstanding entry, why it is not done.
+    pub description: String,
+}
+
+impl ChatV2Capability {
+    fn new(name: &str, description: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            description: description.to_owned(),
+        }
+    }
+}
+
 /// Readiness of the clean chat protocol implementation in this build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
@@ -227,14 +265,15 @@ pub struct ChatV2Status {
     pub protocol_version: String,
     /// Whether the protocol can actually be used end to end.
     ///
-    /// False until envelope verification and the context reducer land. The
-    /// types are bindable well before the protocol is usable, and conflating
-    /// the two is how a half-built protocol reaches a release.
+    /// The types are bindable well before the protocol is usable, and
+    /// conflating the two is how a half-built protocol reaches a release. This
+    /// claims **protocol completeness**, not the completeness of whichever lane
+    /// happens to be working — see [`chat_v2_status`].
     pub is_operational: bool,
     /// Capabilities this build implements, for lane coordination.
-    pub implemented_capabilities: Vec<String>,
+    pub implemented_capabilities: Vec<ChatV2Capability>,
     /// Capabilities still outstanding before `is_operational` can be true.
-    pub outstanding_capabilities: Vec<String>,
+    pub outstanding_capabilities: Vec<ChatV2Capability>,
 }
 
 /// Classifies a `blue.catbird.chat.*` error code received off the wire.
@@ -424,30 +463,96 @@ pub fn chat_v2_recovery_projection(
 }
 
 /// Reports what this build of the clean chat protocol can do.
+///
+/// # The outstanding list tracks the protocol, not a lane
+///
+/// It previously read `["storage"]`, which was the work one lane had left
+/// rather than the work the protocol had left. Storage landing therefore
+/// appeared to empty the list — and because `is_operational` is pinned to
+/// `outstanding.is_empty()`, that would have flipped this build to advertising a
+/// usable protocol.
+///
+/// It would not have been usable. Two seams do not exist in this tree at all,
+/// and both are named below. Their absence was established with needles that
+/// *fire* on the v1 tree before their silence on `chat_v2` was trusted:
+/// `reqwest`/`xrpc`/`HttpClient` hit `src/orchestrator/api_client.rs`, and
+/// `openmls`/`MlsGroup` hit `src/mls_context.rs`, while neither matches anything
+/// under `src/chat_v2`.
+///
+/// So the list is corrected to describe protocol completeness, which is what
+/// `is_operational` actually claims. Entries beyond the current lane's scope
+/// belong here for exactly that reason.
 #[cfg(not(target_arch = "wasm32"))]
 #[uniffi::export]
 pub fn chat_v2_status() -> ChatV2Status {
     ChatV2Status {
         protocol_version: "1".to_owned(),
-        // Still deliberately false. The reducer, envelope, content, and
-        // recovery-ladder layers are built, but storage isolation is not, and a
-        // protocol that cannot persist anything is not usable end to end.
-        // Flip this only when the outstanding list is genuinely empty.
+        // Still deliberately false, and for a reason that outlived the original
+        // one. Every domain layer this tree owns is now built, storage
+        // included — but a protocol with no transport and no MLS engine cannot
+        // be used end to end. Flip this only when the outstanding list is
+        // genuinely empty.
         is_operational: false,
         implemented_capabilities: vec![
-            "identifiers".to_owned(),
-            "typed-endpoint-errors".to_owned(),
-            "cursors".to_owned(),
-            "append-log-pull".to_owned(),
-            "pending-transition-journal".to_owned(),
-            "context-reducer".to_owned(),
-            "envelope-verification".to_owned(),
-            "application-content-predicates".to_owned(),
-            "recovery-ladder".to_owned(),
-            "poison-containment".to_owned(),
-            "participation-gating".to_owned(),
+            ChatV2Capability::new(
+                "identifiers",
+                "Frozen DID, UUID, keyId, and timestamp grammars; reject, never normalize.",
+            ),
+            ChatV2Capability::new(
+                "typed-endpoint-errors",
+                "All 91 codes classified, with retry and resync policy precomputed in Rust.",
+            ),
+            ChatV2Capability::new(
+                "cursors",
+                "AfterSeq, SnapshotSeq, and EventCursor as separate non-interchangeable types.",
+            ),
+            ChatV2Capability::new(
+                "append-log-pull",
+                "Ordered page pull with strict nextAfterSeq validation.",
+            ),
+            ChatV2Capability::new(
+                "pending-transition-journal",
+                "Retains exact signed bytes so a retry resubmits them rather than re-signing.",
+            ),
+            ChatV2Capability::new(
+                "context-reducer",
+                "Exact-device access intervals, reanchor, reset roles, and both Terminal modes.",
+            ),
+            ChatV2Capability::new(
+                "envelope-verification",
+                "Canonical transcript, signature, and both fingerprint domains, byte-identical to the server.",
+            ),
+            ChatV2Capability::new(
+                "application-content-predicates",
+                "Media, reaction, AT URI, and external link rules enforced independently per client.",
+            ),
+            ChatV2Capability::new(
+                "recovery-ladder",
+                "The bounded four-rung ladder; no external commit and no autonomous reset.",
+            ),
+            ChatV2Capability::new(
+                "poison-containment",
+                "Deterministic-only poison, freezing sending and ratchet advancement together.",
+            ),
+            ChatV2Capability::new(
+                "participation-gating",
+                "Direct and group readiness gated separately, with distinct refusals.",
+            ),
+            ChatV2Capability::new(
+                "storage",
+                "Physically separate per-DID store: atomic page commit, journal, and exact-device schedules.",
+            ),
         ],
-        outstanding_capabilities: vec!["storage".to_owned()],
+        outstanding_capabilities: vec![
+            ChatV2Capability::new(
+                "transport-binding",
+                "No XRPC client exists in this tree, so nothing here can reach a delivery service.",
+            ),
+            ChatV2Capability::new(
+                "mls-crypto-seam",
+                "No MLS engine binding; a committed ratchet checkpoint is opaque bytes because the layer producing them does not exist yet.",
+            ),
+        ],
     }
 }
 
@@ -630,21 +735,24 @@ mod tests {
         .is_err());
     }
 
+    fn names(capabilities: &[ChatV2Capability]) -> Vec<&str> {
+        capabilities.iter().map(|c| c.name.as_str()).collect()
+    }
+
     #[test]
     fn the_build_reports_itself_as_not_operational() {
         let status = chat_v2_status();
         assert_eq!(status.protocol_version, "1");
         assert!(
             !status.is_operational,
-            "storage isolation is not built; a protocol that cannot persist \
-             anything must not read as usable"
+            "there is no transport and no MLS crypto seam in this tree; a \
+             protocol that cannot reach a server must not read as usable"
         );
         assert!(!status.outstanding_capabilities.is_empty());
-        assert!(
-            status
-                .outstanding_capabilities
-                .contains(&"storage".to_owned()),
-            "the largest outstanding piece must be named"
+        assert_eq!(
+            names(&status.outstanding_capabilities),
+            vec!["transport-binding", "mls-crypto-seam"],
+            "the outstanding list must name what the PROTOCOL still lacks"
         );
     }
 
@@ -661,12 +769,72 @@ mod tests {
             "recovery-ladder",
             "poison-containment",
             "participation-gating",
+            "storage",
         ] {
             assert!(
-                status
-                    .implemented_capabilities
-                    .contains(&capability.to_owned()),
+                names(&status.implemented_capabilities).contains(&capability),
                 "{capability} is built and must be reported as such"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_moved_from_outstanding_to_implemented_in_both_directions() {
+        // The specific correction this revision makes, pinned on both sides so
+        // neither half can be reverted alone. Storage appearing in one list
+        // while still sitting in the other is exactly the inconsistency the
+        // overlap check below exists to catch.
+        let status = chat_v2_status();
+        assert!(
+            names(&status.implemented_capabilities).contains(&"storage"),
+            "storage is built"
+        );
+        assert!(
+            !names(&status.outstanding_capabilities).contains(&"storage"),
+            "storage must no longer be listed as outstanding"
+        );
+    }
+
+    #[test]
+    fn an_empty_outstanding_list_is_the_only_thing_that_could_flip_the_probe() {
+        // Guards the reasoning that made this revision necessary. The outstanding
+        // list once tracked one lane's remaining work, so finishing that lane
+        // appeared to empty it — and because the probe is pinned to
+        // `outstanding.is_empty()`, that would have advertised a usable protocol.
+        // The list now tracks protocol completeness, and this asserts the pin is
+        // what still governs the flip.
+        let status = chat_v2_status();
+        assert_eq!(
+            status.is_operational,
+            status.outstanding_capabilities.is_empty()
+        );
+        assert!(
+            !status.outstanding_capabilities.is_empty(),
+            "two seams do not exist in this tree; the list must say so"
+        );
+    }
+
+    #[test]
+    fn every_capability_explains_itself() {
+        // These lists outlive the context of whoever wrote them. A bare name in
+        // the outstanding list is what gets deleted by someone who cannot tell
+        // why it is there.
+        let status = chat_v2_status();
+        for capability in status
+            .implemented_capabilities
+            .iter()
+            .chain(status.outstanding_capabilities.iter())
+        {
+            assert!(!capability.name.is_empty());
+            assert!(
+                capability.description.len() > 20,
+                "{} needs a real explanation, not a label",
+                capability.name
+            );
+            assert!(
+                capability.description.ends_with('.'),
+                "{} should read as a sentence",
+                capability.name
             );
         }
     }
@@ -793,10 +961,13 @@ mod tests {
     fn operational_and_outstanding_stay_consistent() {
         // Guards the one way this probe could lie: reporting operational while
         // work remains, or listing a capability as both done and outstanding.
+        // Compared by name, so an entry whose description was edited on one
+        // side still counts as the same capability.
         let status = chat_v2_status();
-        for capability in &status.implemented_capabilities {
+        let outstanding = names(&status.outstanding_capabilities);
+        for capability in names(&status.implemented_capabilities) {
             assert!(
-                !status.outstanding_capabilities.contains(capability),
+                !outstanding.contains(&capability),
                 "{capability} is listed as both implemented and outstanding"
             );
         }

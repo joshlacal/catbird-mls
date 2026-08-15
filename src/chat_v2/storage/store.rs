@@ -18,13 +18,27 @@
 //! body" is exactly the kind of rule that erodes the first time a method is
 //! added to unblock somebody.
 //!
-//! # No cursor setter
+//! # No cursor setter — a ratified absence, not an omission
 //!
-//! There is deliberately no method that writes a scan position. §9 requires that
-//! effects persist atomically *before* advancing, and the only way to advance
-//! here is [`ChatV2Store::commit_page`], which carries the effects that justify
-//! the advance. See [`super::page`] for why that is one value rather than
-//! several calls.
+//! There is deliberately no method that writes a scan position, and this is on
+//! the record as a decision rather than as something nobody got round to.
+//!
+//! Two sentences require it. §9: "Clients atomically persist all returned
+//! state/content/rejection and ratchet effects **before advancing to
+//! `nextAfterSeq`**." §4: "Ratchet state, frame/rejection, and `afterSeq`
+//! persist atomically." The only way to advance a position here is
+//! [`ChatV2Store::commit_page`], which carries the effects that justify the
+//! advance; see [`super::page`] for why that is one value rather than several
+//! calls.
+//!
+//! The method a future change will want to add is a bare `set_cursor`, for a
+//! resync or repair path that "just needs to move the position". Adding one
+//! reintroduces exactly the failure this shape exists to prevent: a cursor ahead
+//! of the entries that were actually stored skips them permanently, because
+//! `afterSeq` is exclusive and the server never returns them again — and it does
+//! so silently, with no error anywhere. A repair path that genuinely needs to
+//! move backwards or re-scan should commit a page describing what it repaired,
+//! not set a number.
 //!
 //! # Reads return absence; they do not interpret it
 //!
