@@ -419,8 +419,15 @@ pub struct ChatV2RecoveryProjection {
     pub is_exhausted: bool,
     /// Precomputed: whether the next step mutates conversation state.
     ///
-    /// False only for catch-up. A platform may retry a non-mutating step freely
-    /// and must not retry a mutating one without going through Rust.
+    /// False for catch-up **and when the ladder is exhausted**, since there is
+    /// no next step at all to mutate anything. The second case is easy to read
+    /// past: `false` here does not mean "safe to retry", it means "nothing this
+    /// field describes". A platform must consult `next_rung` — `None` is
+    /// exhaustion, and the answer there is escalation to a human, never a
+    /// retry.
+    ///
+    /// A platform may retry a non-mutating *step* freely and must not retry a
+    /// mutating one without going through Rust.
     pub next_step_mutates: bool,
     /// A display label for the next step. **Never a policy input.**
     pub next_step_label: Option<String>,
@@ -918,6 +925,29 @@ mod tests {
         assert_eq!(projection.next_rung, None);
         assert_eq!(projection.next_step_label, None);
         assert!(!projection.next_step_mutates);
+    }
+
+    #[test]
+    fn a_false_mutation_flag_means_two_different_things() {
+        // The doc used to say `next_step_mutates` is false "only for catch-up",
+        // which is wrong in a way a platform could act on: it is also false at
+        // exhaustion, where it means "there is no next step" rather than "this
+        // step is safe to repeat". The two cases are distinguished by
+        // `next_rung`, and nothing else distinguishes them.
+        let catch_up = chat_v2_recovery_projection(None);
+        assert!(!catch_up.next_step_mutates);
+        assert_eq!(catch_up.next_rung, Some(ChatV2RecoveryRung::CatchUp));
+        assert!(catch_up.may_escalate);
+
+        let exhausted = chat_v2_recovery_projection(Some(ChatV2RecoveryRung::ResetRequest));
+        assert!(!exhausted.next_step_mutates);
+        assert_eq!(exhausted.next_rung, None, "the flag is describing nothing");
+        assert!(exhausted.is_exhausted);
+
+        assert_eq!(
+            catch_up.next_step_mutates, exhausted.next_step_mutates,
+            "the flag alone cannot tell these apart, which is why the doc must"
+        );
     }
 
     #[test]

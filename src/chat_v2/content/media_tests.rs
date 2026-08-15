@@ -59,7 +59,55 @@ fn the_audio_mime_set_is_exactly_the_contracts() {
 }
 
 #[test]
+fn the_avatar_mime_set_is_exactly_the_contracts_and_excludes_gif() {
+    // A separate declaration in the contract, and a narrower one. Reusing the
+    // image set here would accept an animated avatar the server rejects, on the
+    // encrypted path where nothing upstream sees the value.
+    let declared: Vec<String> = property("metadataAvatarEmbed", "mimeType")["enum"]
+        .as_array()
+        .expect("the contract declares an avatar enum")
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    let ours: Vec<String> = AvatarMime::ALL
+        .iter()
+        .map(|mime| mime.as_str().to_owned())
+        .collect();
+
+    assert_eq!(
+        ours, declared,
+        "the avatar MIME set must match the contract"
+    );
+    assert_eq!(declared.len(), 4);
+    assert!(
+        !declared.iter().any(|value| value == "image/gif"),
+        "the contract's avatar set omits GIF"
+    );
+}
+
+#[test]
+fn the_two_image_sets_differ_by_exactly_gif() {
+    // Both sets are pinned to the contract above; this pins the *relationship*,
+    // so a future edit that quietly unified them fails here with the reason
+    // rather than passing because both lists were changed together.
+    let image: Vec<&str> = ImageMime::ALL.iter().map(|mime| mime.as_str()).collect();
+    let avatar: Vec<&str> = AvatarMime::ALL.iter().map(|mime| mime.as_str()).collect();
+    let only_in_image: Vec<&&str> = image.iter().filter(|m| !avatar.contains(m)).collect();
+
+    assert_eq!(only_in_image, vec![&"image/gif"]);
+    assert!(
+        avatar.iter().all(|m| image.contains(m)),
+        "the avatar set is a subset of the image set"
+    );
+    assert_eq!(AvatarMime::parse("image/gif"), None);
+    assert_eq!(ImageMime::parse("image/gif"), Some(ImageMime::Gif));
+}
+
+#[test]
 fn mime_tokens_round_trip_and_fail_closed() {
+    for mime in AvatarMime::ALL {
+        assert_eq!(AvatarMime::parse(mime.as_str()), Some(mime));
+    }
     for mime in ImageMime::ALL {
         assert_eq!(ImageMime::parse(mime.as_str()), Some(mime));
     }

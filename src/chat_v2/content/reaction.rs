@@ -180,6 +180,73 @@ fn is_control(ch: char) -> bool {
 mod tests {
     use super::*;
 
+    const CONTRACT: &str = include_str!("../transcript/vectors/blue.catbird.chat.defs.json");
+
+    /// The contract's own declaration for the reaction value.
+    fn declared_emoji() -> serde_json::Value {
+        let contract: serde_json::Value =
+            serde_json::from_str(CONTRACT).expect("the embedded contract must parse");
+        contract["defs"]["reactionFrameBody"]["properties"]["emoji"].clone()
+    }
+
+    #[test]
+    fn the_byte_bounds_are_the_contracts_own() {
+        // The cap was a bare constant, agreeing with the contract by
+        // coincidence rather than by construction: a mutation from 64 to 66
+        // survived the whole suite. The media predicates already read their
+        // bounds from the contract; this one now does too, so the constant and
+        // the declaration cannot drift apart silently.
+        let emoji = declared_emoji();
+        assert_eq!(
+            emoji["maxLength"].as_u64(),
+            Some(REACTION_MAX_BYTES as u64),
+            "the reaction cap must be the contract's maxLength"
+        );
+        assert_eq!(
+            emoji["minLength"].as_u64(),
+            Some(1),
+            "the contract's minimum is what makes empty a refusal"
+        );
+
+        // And the contract is genuinely being read, rather than a missing
+        // lookup yielding JSON null and comparing equal to nothing.
+        assert!(emoji.is_object(), "the emoji declaration must be present");
+    }
+
+    #[test]
+    fn the_grapheme_bounds_are_the_contracts_own_too() {
+        // `minGraphemes`/`maxGraphemes` are annotations the projection ignores,
+        // which is exactly why this module exists. Reading them here keeps the
+        // "exactly one cluster" rule anchored to the declaration rather than to
+        // a sentence in a doc comment.
+        let emoji = declared_emoji();
+        assert_eq!(emoji["minGraphemes"].as_u64(), Some(1));
+        assert_eq!(emoji["maxGraphemes"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn the_cap_is_enforced_at_the_exact_boundary() {
+        // Bytes, not characters: the boundary is where a character-counting
+        // implementation would diverge.
+        let at_cap = "a".repeat(REACTION_MAX_BYTES);
+        assert_eq!(
+            require_reaction_shape(&at_cap),
+            Err(ReactionError::NotOneGraphemeCluster {
+                clusters: REACTION_MAX_BYTES
+            }),
+            "the cap is a byte bound; this is refused for its cluster count, not its length"
+        );
+
+        let over_cap = "a".repeat(REACTION_MAX_BYTES + 1);
+        assert_eq!(
+            require_reaction_shape(&over_cap),
+            Err(ReactionError::TooManyBytes {
+                bytes: REACTION_MAX_BYTES + 1
+            }),
+            "one byte over the cap is refused for its length, before any clustering"
+        );
+    }
+
     #[test]
     fn the_segmenter_carries_the_pinned_unicode_version() {
         // The interoperability surface. Two clients on different Unicode data

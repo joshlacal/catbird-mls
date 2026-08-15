@@ -145,6 +145,17 @@ pub enum IntervalError {
     },
     /// A finite end was not strictly after its own opening.
     CloseNotAfterOpening { opening_seq: Seq, close_seq: Seq },
+    /// A second close was applied to an already-closed interval.
+    ///
+    /// A close is the authenticated row a closure rests on and the inclusive
+    /// end that decides which entries were ever visible. Overwriting one
+    /// silently would change both.
+    AlreadyClosed {
+        /// The close the interval already carries.
+        existing_close_seq: Seq,
+        /// The close that was refused.
+        close_seq: Seq,
+    },
     /// Two adjacent intervals shared a seq under a close kind that forbids it.
     IllegalTouching {
         close_kind: CloseKind,
@@ -173,6 +184,14 @@ impl fmt::Display for IntervalError {
             } => write!(
                 f,
                 "close seq {close_seq} must be strictly after its own opening {opening_seq}"
+            ),
+            Self::AlreadyClosed {
+                existing_close_seq,
+                close_seq,
+            } => write!(
+                f,
+                "interval already closed at {existing_close_seq}; refusing a second close at \
+                 {close_seq}"
             ),
             Self::IllegalTouching {
                 close_kind,
@@ -253,7 +272,21 @@ impl<C: PartialEq> AccessInterval<C> {
     /// Requires `close.seq > opening.seq` strictly. Equality is legal only
     /// across adjacent intervals, never within one — which is precisely why an
     /// opening and a terminal close at the same seq is invalid.
+    ///
+    /// Refuses an interval that already has one. The reducer's own paths check
+    /// `has_open_interval` first and never reach that case, but this became a
+    /// **called path** when storage arrived: restore rebuilds intervals through
+    /// here, and a second close would silently replace a proof — swapping the
+    /// authenticated row a closure rests on, and moving the inclusive end that
+    /// decides which entries were ever visible. Refusing by name is the
+    /// difference between a caller learning that and not.
     pub fn apply_close(&mut self, close: CloseProof) -> Result<(), IntervalError> {
+        if let Some(existing) = &self.close {
+            return Err(IntervalError::AlreadyClosed {
+                existing_close_seq: existing.seq,
+                close_seq: close.seq,
+            });
+        }
         if !close.seq.is_strictly_after(self.opening.seq) {
             return Err(IntervalError::CloseNotAfterOpening {
                 opening_seq: self.opening.seq,
@@ -543,6 +576,37 @@ mod tests {
         assert!(
             open.is_open(),
             "a refused close must leave the interval open"
+        );
+    }
+
+    #[test]
+    fn a_second_close_is_refused_rather_than_overwriting_the_first() {
+        // Storage made this a called path: restore rebuilds intervals through
+        // `apply_close`. A silent overwrite would swap the authenticated row a
+        // closure rests on and move the inclusive end that decides which
+        // entries were ever visible.
+        let mut interval = interval(
+            DEVICE,
+            opening(1, OpeningKind::Creation, TRANSITION, 0x11, 7),
+            Some(close(5, CloseKind::Remove, TRANSITION, 0x22)),
+        );
+        assert_eq!(
+            interval
+                .apply_close(close(9, CloseKind::Reset, OTHER_TRANSITION, 0x33))
+                .unwrap_err(),
+            IntervalError::AlreadyClosed {
+                existing_close_seq: seq(5),
+                close_seq: seq(9)
+            }
+        );
+
+        let kept = interval.close().expect("the original close must survive");
+        assert_eq!(kept.seq, seq(5));
+        assert_eq!(kept.kind, CloseKind::Remove);
+        assert_eq!(
+            kept.outer_entry_fingerprint,
+            OuterEntryFingerprint::for_tests([0x22; 32]),
+            "the refused row must not have replaced the authenticated proof"
         );
     }
 

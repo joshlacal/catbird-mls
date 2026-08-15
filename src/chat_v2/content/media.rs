@@ -95,6 +95,52 @@ impl ImageMime {
     }
 }
 
+/// The closed MIME set for an encrypted **metadata avatar**.
+///
+/// A separate predicate from [`ImageMime`] because the contract declares a
+/// separate, narrower set: `metadataAvatarEmbed.mimeType` omits `image/gif`,
+/// which `encryptedImageEmbed.mimeType` includes. Two sets, both pinned against
+/// the contract by their own test.
+///
+/// Reusing the image predicate here would accept an animated avatar the server
+/// rejects — and it would do so on the *encrypted* path, where nothing upstream
+/// sees the value to disagree with. That is the whole reason this is a type
+/// rather than a comment on the image one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AvatarMime {
+    /// `image/heic`
+    Heic,
+    /// `image/jpeg`
+    Jpeg,
+    /// `image/png`
+    Png,
+    /// `image/webp`
+    Webp,
+}
+
+impl AvatarMime {
+    /// Every member, for exhaustive sweeps.
+    pub const ALL: [Self; 4] = [Self::Heic, Self::Jpeg, Self::Png, Self::Webp];
+
+    /// The exact wire token.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Heic => "image/heic",
+            Self::Jpeg => "image/jpeg",
+            Self::Png => "image/png",
+            Self::Webp => "image/webp",
+        }
+    }
+
+    /// Resolves a wire token, failing closed on anything else.
+    ///
+    /// `image/gif` fails here and succeeds in [`ImageMime::parse`]. That is the
+    /// point of the type, not an inconsistency.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mime| mime.as_str() == value)
+    }
+}
+
 /// The closed encrypted-audio MIME set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AudioMime {
