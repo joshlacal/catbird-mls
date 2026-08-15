@@ -617,15 +617,32 @@ where
                 let mut states = self.orchestrator.group_states().lock().await;
                 normalize_group_state(&mut states, state.clone());
             }
-            self.orchestrator.conversation_states().lock().await.insert(
-                conversation.conversation_id.clone(),
-                ConversationState::Active,
-            );
             self.orchestrator.storage().set_group_state(&state).await?;
-            self.orchestrator
-                .storage()
-                .set_conversation_state(&conversation.conversation_id, ConversationState::Active)
-                .await
+            // A server snapshot is a NON-reset projection: it must never
+            // overwrite a committed RESET_PENDING authority (durable payload
+            // or cached state), or a backend that clears the reset tuple on
+            // an "active" write silently loses the reset. Take the transition
+            // lock and route through the same reset-aware projection every
+            // other non-reset transition uses; ResetPending always wins.
+            let transition_lock = self
+                .orchestrator
+                .rejoin_lock(&conversation.conversation_id)
+                .await;
+            let _transition_guard = transition_lock.lock().await;
+            let projected = self
+                .orchestrator
+                .project_non_reset_state_locked(
+                    &conversation.conversation_id,
+                    ConversationState::Active,
+                )
+                .await?;
+            if !projected {
+                tracing::info!(
+                    convo_id = %conversation.conversation_id,
+                    "conversation snapshot stored; Active projection skipped — reset authority is pending"
+                );
+            }
+            Ok(())
         })
     }
 }
@@ -644,4 +661,96 @@ fn events_for_reset_outcome(convo_id: &str, outcome: ResetRecordOutcome) -> Vec<
             convo_id: convo_id.to_string(),
         },
     ]
+}
+
+#[cfg(test)]
+mod reset_aware_snapshot_tests {
+    //! `store_conversation_snapshot` is a NON-reset projection. It used to
+    //! write `ConversationState::Active` straight to storage and the state
+    //! cache with no reset guard, bypassing `project_non_reset_state_locked`
+    //! — so an ordinary server refresh (create/add/remove members) could
+    //! erase a committed RESET_PENDING authority on any backend that clears
+    //! the reset tuple on an "active" write. Found by the 2026-08-15 Android
+    //! reset-lineage analysis; fixed by routing the projection through the
+    //! reset-aware path under the transition lock.
+
+    use std::sync::Arc;
+
+    use crate::orchestrator::{ConversationState, OrchestratorConfig};
+    use crate::recovery_e2e_harness::TestWorld;
+    use crate::MlsEngine;
+
+    #[test]
+    fn server_snapshot_never_overwrites_committed_reset_authority() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            world.add_client("Alice").await;
+            world.register_device("Alice").await.expect("register");
+            let alice = world.client("Alice");
+            let convo = alice
+                .orchestrator
+                .create_group("snapshot vs reset", None, None)
+                .await
+                .expect("create group");
+            let convo_id = convo.conversation_id.clone();
+
+            // Server-pushed reset: durable authority is committed.
+            let new_group_id = hex::decode("aabbccddeeff00112233445566778899").unwrap();
+            alice
+                .orchestrator
+                .record_group_reset(&convo_id, new_group_id, 7)
+                .await
+                .expect("record reset");
+            let pending_before = alice
+                .storage
+                .get_persisted_reset_pending(&convo_id)
+                .expect("reset authority persisted");
+            assert_eq!(pending_before.reset_generation, 7);
+
+            // An engine over the SAME storage handle refreshes the snapshot —
+            // the exact path create_conversation / add_members / remove_members
+            // take after every server round-trip.
+            let engine = MlsEngine::new(
+                alice.orchestrator.mls_context().clone(),
+                Arc::new(alice.storage.clone()),
+                Arc::new(world.delivery_service().clone_as(&alice.did)),
+                Arc::new(alice.credentials.clone()),
+                Arc::new(crate::EngineLifecycle::default()),
+                OrchestratorConfig::default(),
+            );
+            engine
+                .orchestrator()
+                .initialize(&alice.did)
+                .await
+                .expect("engine init");
+            engine
+                .store_conversation_snapshot(&convo)
+                .expect("snapshot store must succeed even when projection is skipped");
+
+            // Durable authority is intact — the Active projection was skipped,
+            // not applied over the reset.
+            let pending_after = alice
+                .storage
+                .get_persisted_reset_pending(&convo_id)
+                .expect("REGRESSION: a server snapshot erased committed reset authority");
+            assert_eq!(pending_after.reset_generation, 7);
+            assert!(
+                !matches!(
+                    alice.storage.get_current_state(&convo_id),
+                    Some(ConversationState::Active)
+                ),
+                "REGRESSION: a server snapshot projected Active over a pending reset"
+            );
+            // And the engine's own orchestrator cache did not learn a lie.
+            assert!(matches!(
+                engine
+                    .orchestrator()
+                    .conversation_states()
+                    .lock()
+                    .await
+                    .get(&convo_id),
+                None | Some(ConversationState::ResetPending { .. })
+            ));
+        });
+    }
 }
