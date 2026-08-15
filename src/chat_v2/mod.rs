@@ -43,6 +43,7 @@
 //! set were each settled against evidence and are pinned by tests.
 
 pub mod append_log;
+pub mod content;
 pub mod coordinate;
 pub mod cursor;
 pub mod endpoint_error;
