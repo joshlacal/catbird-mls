@@ -95,8 +95,9 @@ mod isolation {
     /// patched with two more literals — it is structural. `src/lib.rs` globs six
     /// modules, so `use crate::MLSContext;` reaches v1's SQLCipher group and
     /// crypto surface while naming no forbidden path at all. The set is derived
-    /// from the re-export surface, so a new glob, or a new `pub` item in a
-    /// module already globbed, is covered without anyone extending a list.
+    /// from the re-export surface, so a new glob, a new `pub` item in a module
+    /// already globbed, or a name a globbed module re-exports (the depth-two
+    /// form) is covered without anyone extending a list.
     fn forbidden_crate_root_names() -> Vec<(String, String)> {
         crate_root_glob_exports()
             .into_iter()
@@ -156,10 +157,9 @@ mod isolation {
         );
     }
 
-    /// A new glob widens what the derivation must cover — including the
-    /// depth-two case its doc declares out of scope — so its arrival must be
-    /// a deliberate re-pin here, not a silent extension. This is the assertion
-    /// `gate_support.rs`'s depth-one paragraph refers to.
+    /// A new glob widens what the derivation must cover, so its arrival must
+    /// be a deliberate re-pin here, not a silent extension. This is one of the
+    /// assertions `gate_support.rs`'s depth paragraph refers to.
     #[test]
     fn the_re_export_surface_is_the_reviewed_one() {
         let mut modules = super::gate_support::crate_root_glob_modules();
@@ -180,21 +180,24 @@ mod isolation {
         );
     }
 
-    /// The derivation scans a glob source for `pub` ITEMS, not for `pub use`
-    /// lines, so a glob source that itself globs a third module would hoist
-    /// that module's names invisibly. Refuse the shape at its source.
+    /// A glob source that itself GLOBS a third module would hoist that
+    /// module's names, and deriving them would take recursive scanning.
+    /// Refuse the shape at its source instead. (The NAMED depth-two form —
+    /// a `pub use path::Name;` inside a glob source — is derived, and the
+    /// spot-check test below pins the live instance.)
     #[test]
     fn no_glob_source_module_globs_a_third() {
-        use super::gate_support::{parse_pub_use, PubUseTarget};
+        use super::gate_support::{parse_use_decl, PubUseTarget, UseParse};
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
         // Positive control: the matcher must find real glob lines in lib.rs,
         // or its silence over the modules below means nothing.
         let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
         assert!(
-            lib.lines()
-                .filter_map(parse_pub_use)
-                .any(|re_export| re_export.target == PubUseTarget::Glob),
+            lib.lines().any(|line| matches!(
+                parse_use_decl(line),
+                UseParse::Decl(decl) if decl.targets.contains(&PubUseTarget::Glob)
+            )),
             "the matcher found no glob in lib.rs itself, so it is not reading re-exports"
         );
 
@@ -211,15 +214,15 @@ mod isolation {
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
             for (index, line) in source.lines().enumerate() {
-                if let Some(re_export) = parse_pub_use(line) {
-                    if re_export.target == PubUseTarget::Glob {
+                if let UseParse::Decl(decl) = parse_use_decl(line) {
+                    if decl.is_pub && decl.targets.contains(&PubUseTarget::Glob) {
                         violations.push(format!(
                             "{}:{} — `{module}` globs `{}`; the crate root hoists that \
                              module's names at depth two, which the derivation does not \
                              cover. Extend the derivation before allowing this.",
                             path.display(),
                             index + 1,
-                            re_export.module
+                            decl.module
                         ));
                     }
                 }
@@ -237,25 +240,112 @@ mod isolation {
     /// be one plain identifier skipped it entirely.
     #[test]
     fn the_parser_hoists_the_final_segment_of_a_nested_re_export() {
-        use super::gate_support::{parse_pub_use, PubUse, PubUseTarget};
+        use super::gate_support::{parse_use_decl, PubUseTarget, UseParse};
         // Assembled at runtime so this file does not read as a violation.
         let v1 = ["orch", "estrator"].concat();
+        match parse_use_decl(&format!("pub use {v1}::types::ConversationState;")) {
+            UseParse::Decl(decl) => {
+                assert_eq!(decl.module, format!("{v1}::types"));
+                assert_eq!(
+                    decl.targets,
+                    [PubUseTarget::Named("ConversationState".to_owned())]
+                );
+                assert!(decl.is_pub && !decl.indented);
+            }
+            other => panic!("a nested named re-export must parse, got {other:?}"),
+        }
+        match parse_use_decl(&format!("pub use {v1}::types::*;")) {
+            UseParse::Decl(decl) => {
+                assert_eq!(decl.module, format!("{v1}::types"));
+                assert_eq!(decl.targets, [PubUseTarget::Glob]);
+            }
+            other => panic!("a nested glob must parse, got {other:?}"),
+        }
+        // Renames stay skipped by design: a declaration, hoisting nothing.
+        match parse_use_decl("pub use api::MLSContext as V1Ctx;") {
+            UseParse::Decl(decl) => assert!(decl.targets.is_empty()),
+            other => panic!("a rename must parse as an empty declaration, got {other:?}"),
+        }
+    }
+
+    /// The four escapes the spot-check of the depth-two seal found, each held
+    /// as a permanent control. Every one was a `use` line the old parser
+    /// silently returned `None` for while the compiler resolved the name from
+    /// `chat_v2` — proven by compilation at the time, pinned here since.
+    #[test]
+    fn the_shapes_the_spot_check_found_are_now_read() {
+        use super::gate_support::{parse_use_decl, PubUseTarget, UseParse};
+        let v1 = ["orch", "estrator"].concat();
+
+        // F-1: the brace list. An import organizer's output, not an exotic.
+        match parse_use_decl(&format!(
+            "pub use {v1}::types::{}ConversationState, GroupState{};",
+            "{", "}"
+        )) {
+            UseParse::Decl(decl) => assert_eq!(
+                decl.targets,
+                [
+                    PubUseTarget::Named("ConversationState".to_owned()),
+                    PubUseTarget::Named("GroupState".to_owned()),
+                ]
+            ),
+            other => panic!("the brace list must parse, got {other:?}"),
+        }
+
+        // F-2: restricted visibility is still crate-wide reachability.
+        match parse_use_decl(&format!("pub(crate) use {v1}::types::ConversationState;")) {
+            UseParse::Decl(decl) => {
+                assert!(decl.is_pub, "pub(crate) carries a pub marker");
+                assert_eq!(
+                    decl.targets,
+                    [PubUseTarget::Named("ConversationState".to_owned())]
+                );
+            }
+            other => panic!("pub(crate) use must parse, got {other:?}"),
+        }
+
+        // F-3: a PRIVATE use at the crate root is visible to descendants.
+        match parse_use_decl(&format!("use {v1}::types::ConversationState;")) {
+            UseParse::Decl(decl) => {
+                assert!(!decl.is_pub);
+                assert_eq!(
+                    decl.targets,
+                    [PubUseTarget::Named("ConversationState".to_owned())]
+                );
+            }
+            other => panic!("a private use must parse, got {other:?}"),
+        }
+
+        // The fail-closed hinge: a shape the parser cannot read must be
+        // distinguished from a non-use, because the derivation panics on one
+        // and skips the other. A wrapped use tree is the everyday instance.
         assert_eq!(
-            parse_pub_use(&format!("pub use {v1}::types::ConversationState;")),
-            Some(PubUse {
-                module: format!("{v1}::types"),
-                target: PubUseTarget::Named("ConversationState".to_owned()),
-            })
+            parse_use_decl(&format!("pub use {v1}::types::{}", "{")),
+            UseParse::Unparseable { is_pub: true },
+            "an unreadable use must be loud, not skipped"
         );
         assert_eq!(
-            parse_pub_use(&format!("pub use {v1}::types::*;")),
-            Some(PubUse {
-                module: format!("{v1}::types"),
-                target: PubUseTarget::Glob,
-            })
+            parse_use_decl("pub fn not_a_use() {}"),
+            UseParse::NotAUse,
+            "a non-use must not trip the fail-closed arm"
         );
-        // Renames stay skipped by design.
-        assert_eq!(parse_pub_use("pub use api::MLSContext as V1Ctx;"), None);
+    }
+
+    /// F-4, the escape that was LIVE in the tree: `engine` re-exports a v1
+    /// orchestrator type by name, and lib.rs globs `engine`, so the name is
+    /// reachable as `crate::<Name>` at depth two. The derivation now reads a
+    /// glob source's `pub use` lines, so the name must be in the forbidden
+    /// set. If this fails, the derivation has stopped reading them.
+    #[test]
+    fn the_named_depth_two_re_export_is_derived() {
+        let name = ["Message", "Processing", "Result"].concat();
+        let needle = format!("crate::{name}");
+        let derived = forbidden_crate_root_names();
+        let found = derived
+            .iter()
+            .find(|(candidate, _)| *candidate == needle)
+            .unwrap_or_else(|| panic!("{needle} must be derived through the `engine` glob"));
+        assert_eq!(found.1, "engine", "{needle} is hoisted through `engine`");
     }
 
     #[test]
@@ -297,6 +387,11 @@ mod isolation {
             format!("use crate::{};", ["MLS", "Context"].concat()),
             format!("use crate::{};", ["Mls", "Engine"].concat()),
             format!("use crate::{}{}{};", "{", ["MLS", "Context"].concat(), "}"),
+            // The depth-two name the spot-check reached past every gate.
+            format!(
+                "use crate::{};",
+                ["Message", "Processing", "Result"].concat()
+            ),
         ] {
             assert!(
                 needles

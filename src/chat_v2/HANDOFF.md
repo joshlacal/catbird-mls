@@ -56,7 +56,9 @@ section no longer carries open work.
 | F1 addendum | `bd6be439` | `SenderNotAParticipant` carries the server's `NotParticipant` |
 | expects and their predicates | `b8196784` | the duplicated close predicate collapsed; `is_open()` pinned |
 | high-water durability | `adcabf3e` | the mark's store round-trip proved on the case that cannot be derived |
-| review micro-round | (final seal) | depth-two guard made enforced, nested-tail re-exports derived, vector verdict below |
+| review micro-round | `4e2fa917` | depth-two guard made enforced, nested-tail re-exports derived, vector verdict below |
+| ratifications | `32166d6d` | §5 active-admin interpretation + unicode-normalization dep, both ratified by Josh |
+| spot-check closures | (this seal) | the four `use`-shape escapes the micro-round spot-check found, all closed |
 
 **Micro-round (post-re-verification), three closures.** (1) The derivation's
 depth-one limit was *documented* as guarded by a count assertion that did not
@@ -76,6 +78,25 @@ fixture**: `mls_chat_contract_vectors.json` @ `425e149f` carries exactly ONE
 domains (`CATBIRD-CHAT-MESSAGE` above all — the application-send domain)
 require **server-side vector generation in mls-ds**. That is a chartered
 cross-repo item for the landing pass, not a defect this lane can close.
+
+**Spot-check round (post-micro-round), four escapes closed.** An independent
+spot-check of `4e2fa917` confirmed both depth-two tests bite on injection, then
+proved by compilation that four `use` shapes still escaped the derivation —
+one LIVE in the tree: `engine.rs:14`'s named re-export of a v1 orchestrator
+result type, hoisted to the crate root by the `engine` glob and caught by no
+gate (the NAMED form of depth two). The other three were parser skips: the
+single-level brace list (`pub use m::{A, B};`), restricted visibility
+(`pub(crate) use`), and a PRIVATE `use` at the crate root (still visible to
+descendant modules — chat_v2 is one). All four are closed by one change of
+shape: `parse_use_decl` reads every visibility and every single-line form,
+distinguishes "not a use" from "a use it cannot read", and **both derivation
+entry points panic on the unreadable** — the old parser's silent `None` on the
+unknown was the common root of all four. The glob sources' own top-level
+`pub use` lines are now derived (so `crate::MessageProcessingResult` is
+forbidden, pinned by `the_named_depth_two_re_export_is_derived`), the four
+shapes are permanent controls in `the_shapes_the_spot_check_found_are_now_read`,
+and the depth-two GLOB form stays refused rather than recursed into. Renames
+stay skipped, by their recorded rationale.
 
 **F9 is the one worth reading before touching a gate.** `use crate::MLSContext;`
 inside `chat_v2` compiled, reached v1's SQLCipher group and crypto surface, and

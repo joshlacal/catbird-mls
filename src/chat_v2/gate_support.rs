@@ -216,125 +216,259 @@ pub struct CrateRootName {
 ///
 /// # What it reads, and what it does not
 ///
-/// Both re-export forms in `lib.rs`: `pub use <mod>::*;` (nested modules
-/// included), whose source module is then scanned for `pub` items, and
-/// `pub use <path>::<Name>;`, which hoists its FINAL segment — the review
-/// showed `pub use orchestrator::types::ConversationState;` evading the gate
-/// when the tail was required to be a single plain identifier. Renames
-/// (`pub use x as y;`) are skipped — they hoist a name this scan would
-/// misreport, and a rename of a v1 module into `chat_v2`'s reach would be a
-/// deliberate act rather than an editor accident.
+/// **Every `use` declaration in `lib.rs`, whatever its visibility.** A
+/// `pub use` re-exports; a `pub(crate) use` is still reachable as
+/// `crate::<Name>` from anywhere in the crate; and a PRIVATE `use` at the
+/// crate root is visible to the root's descendant modules — which is every
+/// module, `chat_v2` included. The spot-check proved all three reachable by
+/// compilation, so all three are read. The shapes read are the glob
+/// (`use m::*;`), the named path (`use m::nested::Name;`, hoisting the FINAL
+/// segment), and the single-level brace list (`use m::{A, B, sub::C};`,
+/// hoisting each item's final segment; `self` in the list hoists the module's
+/// own name). Renames (` as `) are skipped by design — they hoist a name this
+/// scan would misreport, and a rename of a v1 module into `chat_v2`'s reach
+/// would be a deliberate act rather than an editor accident.
 ///
-/// It is **depth one**. A module that itself globs a third module hoists that
-/// module's names too, and those are not derived here. Nothing in `lib.rs`'s
-/// glob sources does that today, and two tests in `chat_v2/mod.rs` are what
-/// make its arrival a failure rather than a silent hole:
-/// `the_re_export_surface_is_the_reviewed_one` pins the glob-module set, so a
-/// NEW glob is a deliberate re-pin, and `no_glob_source_module_globs_a_third`
-/// refuses the depth-two shape inside the modules already globbed.
+/// **A `use` shape this parser cannot read is a loud failure, not a skip.**
+/// The spot-check found four escapes, and every one was a parseable line the
+/// old parser silently returned `None` for. Returning `None` on the unknown is
+/// exactly how a gate rots, so `parse_use_decl` distinguishes "not a use" from
+/// "a use I cannot read", and both derivation entry points panic on the
+/// latter, naming the line to extend the parser for.
+///
+/// **Depth two is covered for the NAMED form and refused for the GLOB form.**
+/// A globbed module's own `pub use` lines hoist foreign names that the root
+/// glob then hoists again — `engine`'s re-export of a v1 orchestrator result
+/// type was live in the tree when the spot-check ran, reachable as
+/// `crate::<Name>` past every gate. Those names are now derived. A globbed
+/// module that GLOBS a third module would need recursive scanning instead,
+/// and `no_glob_source_module_globs_a_third` in `chat_v2/mod.rs` refuses that
+/// shape outright, while `the_re_export_surface_is_the_reviewed_one` pins the
+/// glob-module set so a NEW root glob is a deliberate re-pin.
 pub fn crate_root_glob_exports() -> Vec<CrateRootName> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
 
     let mut found = Vec::new();
-    for line in lib.lines() {
-        match parse_pub_use(line) {
-            Some(PubUse {
-                module,
-                target: PubUseTarget::Glob,
-            }) => {
-                for name in module_pub_items(&src, &module) {
-                    found.push(CrateRootName {
-                        name,
-                        module: module.clone(),
-                    });
+    for (index, line) in lib.lines().enumerate() {
+        match parse_use_decl(line) {
+            UseParse::NotAUse => {}
+            UseParse::Unparseable { .. } => panic!(
+                "lib.rs:{} is a use declaration in a shape the derivation cannot \
+                 read; extend parse_use_decl before trusting the gate: {}",
+                index + 1,
+                line.trim()
+            ),
+            UseParse::Decl(decl) => {
+                for target in &decl.targets {
+                    match target {
+                        PubUseTarget::Named(name) => found.push(CrateRootName {
+                            name: name.clone(),
+                            module: decl.module.clone(),
+                        }),
+                        // A glob inside a nested module of lib.rs does not
+                        // reach the crate root; a top-level one hoists its
+                        // source module's whole surface.
+                        PubUseTarget::Glob if !decl.indented => {
+                            for name in module_pub_items(&src, &decl.module) {
+                                found.push(CrateRootName {
+                                    name,
+                                    module: decl.module.clone(),
+                                });
+                            }
+                        }
+                        PubUseTarget::Glob => {}
+                    }
                 }
             }
-            Some(PubUse {
-                module,
-                target: PubUseTarget::Named(name),
-            }) => {
-                found.push(CrateRootName { name, module });
-            }
-            None => {}
         }
     }
     found
 }
 
-/// The modules `lib.rs` glob-re-exports, for the depth-two guard.
+/// The modules `lib.rs` glob-re-exports at its top level, for the depth-two
+/// guard. Fails loudly on a use shape it cannot read, for the same reason the
+/// derivation does.
 pub fn crate_root_glob_modules() -> Vec<String> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
-    lib.lines()
-        .filter_map(parse_pub_use)
-        .filter(|re_export| re_export.target == PubUseTarget::Glob)
-        .map(|re_export| re_export.module)
-        .collect()
+    let mut modules = Vec::new();
+    for (index, line) in lib.lines().enumerate() {
+        match parse_use_decl(line) {
+            UseParse::NotAUse => {}
+            UseParse::Unparseable { .. } => panic!(
+                "lib.rs:{} is a use declaration in a shape the guard cannot \
+                 read; extend parse_use_decl before trusting it: {}",
+                index + 1,
+                line.trim()
+            ),
+            UseParse::Decl(decl) => {
+                if !decl.indented && decl.targets.contains(&PubUseTarget::Glob) {
+                    modules.push(decl.module);
+                }
+            }
+        }
+    }
+    modules
 }
 
-/// One `pub use …;` line, reduced to what it hoists onto the crate root.
+/// What one line contributes to a module's re-export surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PubUse {
-    /// The module path the hoisted surface comes from.
-    pub module: String,
-    pub target: PubUseTarget,
+pub enum UseParse {
+    /// Not a `use` declaration at all.
+    NotAUse,
+    /// Starts as a `use` declaration but in a shape this parser does not
+    /// understand — a wrapped use tree, a nested brace list. Callers fail
+    /// loudly on this: a silently unparsed shape is exactly how the named
+    /// depth-two hole survived every gate.
+    Unparseable {
+        /// Whether the declaration carried a `pub` marker, so module scans can
+        /// ignore unreadable PRIVATE uses (which hoist nothing through a glob).
+        is_pub: bool,
+    },
+    Decl(UseDecl),
 }
 
-/// What a `pub use` line hoists.
+/// One `use` declaration, reduced to what it can hoist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseDecl {
+    /// Whether the declaration carries any `pub` marker, restricted forms
+    /// (`pub(crate)`, `pub(super)`, `pub(in …)`) included.
+    pub is_pub: bool,
+    /// Whether the line is indented — i.e. inside a nested module rather than
+    /// at the file's top level. Glob resolution skips indented lines, because
+    /// a nested module's glob does not reach the crate root.
+    pub indented: bool,
+    /// The path the names come from — for messages, and for resolving a glob
+    /// to its source file.
+    pub module: String,
+    /// Empty for a rename (` as `), which is skipped by recorded design.
+    pub targets: Vec<PubUseTarget>,
+}
+
+/// What a `use` declaration hoists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PubUseTarget {
-    /// `pub use m::*;` — every `pub` item of `m`.
+    /// `use m::*;` — every `pub` item of `m`.
     Glob,
-    /// `pub use m::Name;` or `pub use m::nested::Name;` — `Name` alone.
+    /// `use m::Name;`, `use m::nested::Name;`, or one brace-list item —
+    /// the final segment alone.
     Named(String),
 }
 
-/// Parses one line as a re-export, or `None` if it is not one.
-///
-/// Renames (` as `) are skipped by design — see `crate_root_glob_exports`.
-pub fn parse_pub_use(line: &str) -> Option<PubUse> {
+/// Parses one line as a `use` declaration in any of the shapes named on
+/// `crate_root_glob_exports`. Renames yield a `Decl` with no targets.
+pub fn parse_use_decl(line: &str) -> UseParse {
     let code = code_only(line);
+    let indented = code.starts_with([' ', '\t']);
     let trimmed = code.trim();
-    let rest = trimmed.strip_prefix("pub use ")?.strip_suffix(';')?;
-    if rest.contains(" as ") {
-        return None;
-    }
-    let (module, tail) = rest.split_once("::")?;
-    if !is_plain_ident(module) {
-        return None;
-    }
-    if tail == "*" {
-        return Some(PubUse {
-            module: module.to_owned(),
-            target: PubUseTarget::Glob,
-        });
-    }
-    if let Some(inner) = tail.strip_suffix("::*") {
-        if !inner.split("::").all(is_plain_ident) {
-            return None;
+
+    let (is_pub, rest) = if let Some(after) = trimmed.strip_prefix("pub") {
+        let after = after.trim_start();
+        if let Some(after_paren) = after.strip_prefix('(') {
+            match after_paren.split_once(')') {
+                Some((_, tail)) => (true, tail.trim_start()),
+                None => return UseParse::NotAUse,
+            }
+        } else {
+            (true, after)
         }
-        return Some(PubUse {
-            module: format!("{module}::{inner}"),
-            target: PubUseTarget::Glob,
+    } else {
+        (false, trimmed)
+    };
+    let Some(body) = rest.strip_prefix("use ") else {
+        return UseParse::NotAUse;
+    };
+    let Some(body) = body.trim().strip_suffix(';') else {
+        // A `use` without its `;` is a use tree wrapped across lines, which
+        // this line-based parser cannot follow.
+        return UseParse::Unparseable { is_pub };
+    };
+    let body = body.trim();
+    let body = body.strip_prefix("::").unwrap_or(body);
+
+    // The brace form, one level only: `use m::{A, B, sub::C, self};`.
+    if let Some(open) = body.find('{') {
+        let (Some(list), Some(module)) = (
+            body[open..]
+                .strip_prefix('{')
+                .and_then(|t| t.strip_suffix('}')),
+            body[..open].strip_suffix("::"),
+        ) else {
+            return UseParse::Unparseable { is_pub };
+        };
+        if !path_of_plain_idents(module) || list.contains('{') {
+            return UseParse::Unparseable { is_pub };
+        }
+        let mut targets = Vec::new();
+        for item in list.split(',') {
+            let item = item.trim();
+            if item.is_empty() || item.contains(" as ") {
+                // A trailing comma, or a rename — skipped by design.
+                continue;
+            }
+            if item == "*" {
+                targets.push(PubUseTarget::Glob);
+            } else if item == "self" {
+                targets.push(PubUseTarget::Named(final_segment(module)));
+            } else if path_of_plain_idents(item) {
+                targets.push(PubUseTarget::Named(final_segment(item)));
+            } else {
+                return UseParse::Unparseable { is_pub };
+            }
+        }
+        return UseParse::Decl(UseDecl {
+            is_pub,
+            indented,
+            module: module.to_owned(),
+            targets,
         });
     }
-    let mut segments: Vec<&str> = tail.split("::").collect();
-    if !segments.iter().all(|segment| is_plain_ident(segment)) {
-        return None;
+
+    if body.contains(" as ") {
+        // Renames skipped by design — see `crate_root_glob_exports`.
+        return UseParse::Decl(UseDecl {
+            is_pub,
+            indented,
+            module: body.to_owned(),
+            targets: Vec::new(),
+        });
     }
-    let name = segments
-        .pop()
-        .expect("split_once guarantees at least one segment");
-    let module = if segments.is_empty() {
-        module.to_owned()
-    } else {
-        format!("{module}::{}", segments.join("::"))
+    if let Some(module) = body.strip_suffix("::*") {
+        if !path_of_plain_idents(module) {
+            return UseParse::Unparseable { is_pub };
+        }
+        return UseParse::Decl(UseDecl {
+            is_pub,
+            indented,
+            module: module.to_owned(),
+            targets: vec![PubUseTarget::Glob],
+        });
+    }
+    if !path_of_plain_idents(body) {
+        return UseParse::Unparseable { is_pub };
+    }
+    let module = match body.rfind("::") {
+        Some(at) => body[..at].to_owned(),
+        None => body.to_owned(),
     };
-    Some(PubUse {
+    UseParse::Decl(UseDecl {
+        is_pub,
+        indented,
         module,
-        target: PubUseTarget::Named(name.to_owned()),
+        targets: vec![PubUseTarget::Named(final_segment(body))],
     })
+}
+
+fn final_segment(path: &str) -> String {
+    path.rsplit("::")
+        .next()
+        .expect("rsplit yields at least one segment")
+        .to_owned()
+}
+
+fn path_of_plain_idents(path: &str) -> bool {
+    !path.is_empty() && path.split("::").all(is_plain_ident)
 }
 
 fn is_plain_ident(value: &str) -> bool {
@@ -344,9 +478,17 @@ fn is_plain_ident(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-/// The `pub` items a module declares, as the crate root would hoist them.
+/// The names a module contributes to the crate root when globbed: its `pub`
+/// item declarations, plus the names its own top-level `pub use` lines hoist
+/// into it — the named depth-two form the spot-check found live in the tree.
+/// A `pub use …::*` here is refused by `no_glob_source_module_globs_a_third`
+/// rather than recursed into; an unreadable `pub use` is a loud failure.
 fn module_pub_items(src: &Path, module: &str) -> Vec<String> {
-    let relative = module.replace("::", "/");
+    let relative = module
+        .strip_prefix("crate::")
+        .or_else(|| module.strip_prefix("self::"))
+        .unwrap_or(module)
+        .replace("::", "/");
     let path = [
         src.join(format!("{relative}.rs")),
         src.join(&relative).join("mod.rs"),
@@ -361,7 +503,25 @@ fn module_pub_items(src: &Path, module: &str) -> Vec<String> {
         "struct ", "enum ", "trait ", "type ", "fn ", "const ", "static ", "union ", "mod ",
     ];
     let mut names = Vec::new();
-    for line in source.lines() {
+    for (index, line) in source.lines().enumerate() {
+        match parse_use_decl(line) {
+            UseParse::Decl(decl) if decl.is_pub && !decl.indented => {
+                for target in &decl.targets {
+                    if let PubUseTarget::Named(name) = target {
+                        names.push(name.clone());
+                    }
+                }
+                continue;
+            }
+            UseParse::Unparseable { is_pub: true } => panic!(
+                "{}:{} is a pub use in a shape the derivation cannot read; \
+                 extend parse_use_decl before trusting the gate: {}",
+                path.display(),
+                index + 1,
+                line.trim()
+            ),
+            _ => {}
+        }
         let code = code_only(line);
         let trimmed = code.trim();
         let Some(rest) = trimmed.strip_prefix("pub ") else {
