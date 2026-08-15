@@ -1,12 +1,12 @@
 //! Platform binding surface for the clean chat protocol.
 //!
 //! This is deliberately the *small* surface: only things whose shape is already
-//! settled by sealed slices. It exists so the iOS and Android lanes can start
-//! their binding plumbing — regeneration, error plumbing, module wiring —
-//! without waiting on the reducer, which is the largest remaining piece and the
-//! one whose types would churn if published early.
+//! settled by sealed slices. It began as three items published while the reducer
+//! was still moving, so the iOS and Android lanes could start their binding
+//! plumbing without waiting; the fourth was added once 6a-6d and S7 settled the
+//! shapes it depends on.
 //!
-//! Three things are exposed, all backed by implemented code:
+//! Four things are exposed, all backed by implemented code:
 //!
 //! 1. **Typed endpoint errors.** Platforms receive an XRPC error code off the
 //!    wire and need it classified. [`chat_v2_classify_endpoint_error`] returns
@@ -22,12 +22,36 @@
 //!    bindable now; the protocol is not usable yet, and this makes that
 //!    impossible to mistake.
 //!
+//! 4. **The recovery projection.** [`chat_v2_recovery_projection`] is the
+//!    **single** projection platforms consume. There are deliberately no
+//!    platform-specific variants: a per-platform projection is how iOS and
+//!    Android come to disagree about whether a device may escalate, and the
+//!    ladder's bound only holds if every client reads the same answer.
+//!
+//! # REGENERATING BINDINGS IS MANDATORY FOR THIS REVISION
+//!
+//! This revision **changes the UniFFI surface**. A client built against a
+//! rebuilt library without regenerated Swift/Kotlin **panics at runtime with a
+//! checksum mismatch** — not a compile error, so nothing catches it before the
+//! app is running. Consuming this revision requires
+//! `CatbirdMLSCore/Scripts/rebuild-ffi.sh` for iOS and `./build-android.sh` for
+//! Android. See the `ffi-propagate` skill.
+//!
 //! # Not exposed yet, on purpose
 //!
-//! Reducer state, interval provenance, schedule terminal proofs, and the
-//! append-log sink are absent because their shapes are not settled. Publishing
-//! them now would hand the platform lanes a surface that is guaranteed to
-//! break.
+//! The append-log sink and the storage seam are absent because their shapes are
+//! not settled. Reducer state and interval provenance *were* absent for the same
+//! reason and no longer are: 6a-6d and S7 settled them, which is why the
+//! recovery projection can exist at all.
+//!
+//! # Policy is precomputed, never re-derived
+//!
+//! Every policy answer this module returns is a field, not something a platform
+//! computes from the other fields. That is the ratified rule and it is the
+//! reason this surface is worth having: Rust owns the only recovery policy, and
+//! precomputing is what makes that structural rather than a convention someone
+//! remembers. A test sweeps the ladder and asserts every exported boolean agrees
+//! with the Rust decision.
 //!
 //! # WASM
 //!
@@ -40,6 +64,7 @@
 use super::endpoint_error::{ChatErrorClass, ChatErrorCode, EndpointError};
 use super::ids::uuid::{ConversationId, EntryId, MessageId, TransitionId};
 use super::ids::{BareDid, BasicCredential, CanonicalTimestamp, DeviceId, KeyId};
+use super::recovery::{RecoveryLadder, RecoveryRung};
 
 /// What a chat error means for synchronization and recovery policy.
 ///
@@ -297,27 +322,132 @@ pub fn chat_v2_basic_credential(
     Ok(BasicCredential::new(did, device).to_string())
 }
 
+/// One rung of the bounded recovery ladder, across the FFI boundary.
+///
+/// Mirrors [`RecoveryRung`]. Exactly four, in one order, and no variant for
+/// anything above a reset request — the ladder's bound is part of the exported
+/// type, not a rule the platform is asked to honour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
+pub enum ChatV2RecoveryRung {
+    /// Fetch and apply already-entitled entries. Non-mutating.
+    CatchUp,
+    /// Process a Welcome already waiting for this device.
+    PendingWelcome,
+    /// Sign `requestLeafRecovery` and wait for a healthy different-DID leaf.
+    TargetDeviceRecoveryRequest,
+    /// Sign a durable reset intent. Activation is a separate authorized act.
+    ResetRequest,
+}
+
+impl From<RecoveryRung> for ChatV2RecoveryRung {
+    fn from(rung: RecoveryRung) -> Self {
+        match rung {
+            RecoveryRung::CatchUp => Self::CatchUp,
+            RecoveryRung::PendingWelcome => Self::PendingWelcome,
+            RecoveryRung::TargetDeviceRecoveryRequest => Self::TargetDeviceRecoveryRequest,
+            RecoveryRung::ResetRequest => Self::ResetRequest,
+        }
+    }
+}
+
+/// The single recovery projection every platform consumes.
+///
+/// There are deliberately no platform-specific variants. A per-platform
+/// projection is how two clients come to disagree about whether a device may
+/// escalate, and the ladder's bound only means something if every client reads
+/// the same answer.
+///
+/// Every policy field is **precomputed here**. A platform must never derive
+/// `may_escalate` from `is_exhausted`, or decide for itself what "exhausted"
+/// implies — that is five clients with five policies again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct ChatV2RecoveryProjection {
+    /// The highest rung already attempted in this episode, if any.
+    pub reached_rung: Option<ChatV2RecoveryRung>,
+    /// The rung this device must attempt next, if any.
+    ///
+    /// `None` means exhausted. It never means "choose one".
+    pub next_rung: Option<ChatV2RecoveryRung>,
+    /// Precomputed: whether any rung remains.
+    pub may_escalate: bool,
+    /// Precomputed: whether every rung has been tried.
+    ///
+    /// Exhaustion is **not** a licence to act outside the ladder. There is no
+    /// step above a reset request, and a platform reaching this state escalates
+    /// to a human, never to an external commit or a local reset.
+    pub is_exhausted: bool,
+    /// Precomputed: whether the next step mutates conversation state.
+    ///
+    /// False only for catch-up. A platform may retry a non-mutating step freely
+    /// and must not retry a mutating one without going through Rust.
+    pub next_step_mutates: bool,
+    /// A display label for the next step. **Never a policy input.**
+    pub next_step_label: Option<String>,
+}
+
+/// Projects a recovery episode for platform consumption.
+///
+/// Takes the rung already reached, mirroring how a platform stores it, and
+/// returns every answer precomputed.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub fn chat_v2_recovery_projection(
+    reached_rung: Option<ChatV2RecoveryRung>,
+) -> ChatV2RecoveryProjection {
+    let mut ladder = RecoveryLadder::new();
+    // Replay the episode rung by rung rather than constructing a position
+    // directly: the ladder has no restart-at constructor, and going through
+    // `advance_to` means the projection cannot describe a position the ladder
+    // itself would refuse to occupy.
+    if let Some(reached) = reached_rung {
+        for rung in RecoveryRung::ALL {
+            ladder
+                .advance_to(rung)
+                .expect("replaying the ladder in order always succeeds");
+            if ChatV2RecoveryRung::from(rung) == reached {
+                break;
+            }
+        }
+    }
+
+    let next = ladder.next_rung();
+    ChatV2RecoveryProjection {
+        reached_rung: ladder.reached().map(ChatV2RecoveryRung::from),
+        next_rung: next.map(ChatV2RecoveryRung::from),
+        may_escalate: next.is_some(),
+        is_exhausted: ladder.is_exhausted(),
+        next_step_mutates: next.is_some_and(RecoveryRung::is_mutating),
+        next_step_label: next.map(|rung| rung.to_string()),
+    }
+}
+
 /// Reports what this build of the clean chat protocol can do.
 #[cfg(not(target_arch = "wasm32"))]
 #[uniffi::export]
 pub fn chat_v2_status() -> ChatV2Status {
     ChatV2Status {
         protocol_version: "1".to_owned(),
-        // Deliberately false: the types below are bindable, the protocol is
-        // not yet usable. Flip this only when the outstanding list is empty.
+        // Still deliberately false. The reducer, envelope, content, and
+        // recovery-ladder layers are built, but storage isolation is not, and a
+        // protocol that cannot persist anything is not usable end to end.
+        // Flip this only when the outstanding list is genuinely empty.
         is_operational: false,
         implemented_capabilities: vec![
             "identifiers".to_owned(),
             "typed-endpoint-errors".to_owned(),
             "cursors".to_owned(),
             "append-log-pull".to_owned(),
-        ],
-        outstanding_capabilities: vec![
             "pending-transition-journal".to_owned(),
             "context-reducer".to_owned(),
             "envelope-verification".to_owned(),
             "application-content-predicates".to_owned(),
             "recovery-ladder".to_owned(),
+        ],
+        outstanding_capabilities: vec![
+            "poison-handling".to_owned(),
+            "pending-invite-gating".to_owned(),
             "storage".to_owned(),
         ],
     }
@@ -508,15 +638,154 @@ mod tests {
         assert_eq!(status.protocol_version, "1");
         assert!(
             !status.is_operational,
-            "the reducer and envelope layers are not built; \
-             this must not read as usable"
+            "storage isolation is not built; a protocol that cannot persist \
+             anything must not read as usable"
         );
         assert!(!status.outstanding_capabilities.is_empty());
         assert!(
             status
                 .outstanding_capabilities
-                .contains(&"context-reducer".to_owned()),
+                .contains(&"storage".to_owned()),
             "the largest outstanding piece must be named"
+        );
+    }
+
+    #[test]
+    fn the_layers_this_lane_built_are_reported_as_implemented() {
+        // The counterpart to the probe above. Under-reporting is as much a lie
+        // as over-reporting: a lane waiting on the reducer should be able to
+        // see that it has landed.
+        let status = chat_v2_status();
+        for capability in [
+            "context-reducer",
+            "envelope-verification",
+            "application-content-predicates",
+            "recovery-ladder",
+        ] {
+            assert!(
+                status
+                    .implemented_capabilities
+                    .contains(&capability.to_owned()),
+                "{capability} is built and must be reported as such"
+            );
+        }
+    }
+
+    // ---- the recovery projection ------------------------------------------
+
+    #[test]
+    fn a_fresh_episode_projects_the_cheapest_rung_first() {
+        let projection = chat_v2_recovery_projection(None);
+        assert_eq!(projection.reached_rung, None);
+        assert_eq!(projection.next_rung, Some(ChatV2RecoveryRung::CatchUp));
+        assert!(projection.may_escalate);
+        assert!(!projection.is_exhausted);
+        assert!(
+            !projection.next_step_mutates,
+            "catch-up is the non-mutating rung and must be projected as such"
+        );
+        assert_eq!(projection.next_step_label.as_deref(), Some("catch-up"));
+    }
+
+    #[test]
+    fn every_exported_policy_field_agrees_with_the_rust_decision() {
+        // The ratified rule made executable: the FFI exports precomputed
+        // decisions, and a platform deriving them itself must get the same
+        // answers. This sweeps every position the ladder can occupy.
+        let positions: Vec<Option<RecoveryRung>> = std::iter::once(None)
+            .chain(RecoveryRung::ALL.into_iter().map(Some))
+            .collect();
+
+        for reached in positions {
+            let projection = chat_v2_recovery_projection(reached.map(ChatV2RecoveryRung::from));
+
+            // Rebuild the same position through the ladder itself.
+            let mut ladder = RecoveryLadder::new();
+            if let Some(target) = reached {
+                for rung in RecoveryRung::ALL {
+                    ladder.advance_to(rung).unwrap();
+                    if rung == target {
+                        break;
+                    }
+                }
+            }
+            let expected_next = ladder.next_rung();
+
+            assert_eq!(
+                projection.reached_rung,
+                ladder.reached().map(ChatV2RecoveryRung::from),
+                "{reached:?} reached"
+            );
+            assert_eq!(
+                projection.next_rung,
+                expected_next.map(ChatV2RecoveryRung::from),
+                "{reached:?} next"
+            );
+            assert_eq!(
+                projection.may_escalate,
+                expected_next.is_some(),
+                "{reached:?} may_escalate"
+            );
+            assert_eq!(
+                projection.is_exhausted,
+                ladder.is_exhausted(),
+                "{reached:?} is_exhausted"
+            );
+            assert_eq!(
+                projection.next_step_mutates,
+                expected_next.is_some_and(RecoveryRung::is_mutating),
+                "{reached:?} next_step_mutates"
+            );
+        }
+    }
+
+    #[test]
+    fn the_top_of_the_ladder_projects_as_exhausted_with_no_next_step() {
+        // Exhaustion must read as "nothing further is available", never as
+        // "choose your own step". There is no variant above a reset request for
+        // a platform to reach for.
+        let projection = chat_v2_recovery_projection(Some(ChatV2RecoveryRung::ResetRequest));
+        assert!(projection.is_exhausted);
+        assert!(!projection.may_escalate);
+        assert_eq!(projection.next_rung, None);
+        assert_eq!(projection.next_step_label, None);
+        assert!(!projection.next_step_mutates);
+    }
+
+    #[test]
+    fn the_projected_rung_set_is_exactly_the_ladders() {
+        // Two enums naming the same four things drift. This pins that the FFI
+        // mirror has no extra variant — in particular nothing above a reset
+        // request — and that every ladder rung has a mirror.
+        let mirrored: Vec<ChatV2RecoveryRung> = RecoveryRung::ALL
+            .into_iter()
+            .map(ChatV2RecoveryRung::from)
+            .collect();
+        assert_eq!(
+            mirrored,
+            vec![
+                ChatV2RecoveryRung::CatchUp,
+                ChatV2RecoveryRung::PendingWelcome,
+                ChatV2RecoveryRung::TargetDeviceRecoveryRequest,
+                ChatV2RecoveryRung::ResetRequest,
+            ]
+        );
+        assert_eq!(mirrored.len(), RecoveryRung::ALL.len());
+    }
+
+    #[test]
+    fn the_label_is_display_only_and_never_the_policy() {
+        // A platform switching on the label string instead of the booleans
+        // would be deriving policy from prose. The label exists for humans; the
+        // booleans exist for decisions, and they are what the sweep checks.
+        let projection = chat_v2_recovery_projection(Some(ChatV2RecoveryRung::CatchUp));
+        assert_eq!(
+            projection.next_step_label.as_deref(),
+            Some("pending Welcome")
+        );
+        assert!(
+            projection.next_step_mutates,
+            "and the boolean is the answer"
         );
     }
 

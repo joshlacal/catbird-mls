@@ -6,6 +6,24 @@ as of the twenty-second sealed slice. Written for the session that continues it.
 Workspace: `catbird-mls-task3-ws` (isolated jj workspace; Josh's default
 workspace is untouched and must stay that way).
 
+> ## ⚠ CONSUMING THIS REVISION REQUIRES REGENERATING BINDINGS
+>
+> The UniFFI surface **changed** in `b8fdd164`'s successor (the FFI slice): the
+> recovery projection and its rung enum were added, and the status probe's
+> capability lists moved.
+>
+> A client built against a rebuilt library **without regenerated Swift/Kotlin
+> panics at runtime with a checksum mismatch.** It is not a compile error, so
+> nothing catches it before the app is running.
+>
+> - iOS: `CatbirdMLSCore/Scripts/rebuild-ffi.sh`
+> - Android: `./build-android.sh`
+> - See the `ffi-propagate` skill.
+>
+> Bindings are committed artifacts. Regeneration belongs to the coordinated
+> landing pass, not to this workspace — nothing ships from here — but the
+> obligation travels with the revision.
+
 Verification at handoff: **546 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib --all-targets` reports zero warnings under
 `chat_v2`, `wasm32-unknown-unknown` builds.
