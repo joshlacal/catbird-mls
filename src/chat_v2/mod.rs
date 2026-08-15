@@ -55,6 +55,7 @@ pub mod interval;
 pub mod journal;
 pub mod provenance;
 pub mod reducer;
+pub mod transcript;
 pub mod wire;
 
 /// Enforces the v1/v2 isolation rule stated in this module's documentation.
