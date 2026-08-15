@@ -140,6 +140,28 @@ grammar; consequently, `did:web:a.b` is invalid despite satisfying the
 ruling in `ids/did.rs`, because a reader seeing only the grammar would conclude
 it is valid.
 
+**OPEN — under a veto window, not yet ratified: may a previously removed device
+activate a reset?** The reading built into `reducer/reset.rs` is **yes**. §5
+says `activateReset` is "uniformly active-admin-only: an active registered
+device of an active admin DID may activate **without being an old-generation
+leaf**", so interval history is not an admission criterion — "not an old leaf"
+means not a leaf *at the reset*, not *never* a leaf. A device removed at seq 3
+may therefore activate at seq 20, constrained only by the schedule rule that its
+new opening clear the old close strictly.
+
+The layering behind that reading, confirmed with the lead: **admission** (is this
+device currently active, registered, admin?) is the authority layer's question
+and is answered server-side; the reducer owns only the **schedule** constraint.
+That is why the refusals there are the neutral interval errors rather than a
+reset-specific one — a bespoke error would encode admission policy into the
+schedule layer, where it does not belong.
+
+Josh has a veto window on this. If it is overruled it is a **one-line change**,
+and the anchors are exact: the §5 sentence is quoted verbatim in
+`reducer/reset.rs`'s module docs and again in the comment on
+`a_previously_removed_activator_opens_after_a_strict_gap`. Do not re-derive the
+reasoning — read those two places.
+
 **Chartered open question — scan budget.** The frozen contract gives a server
 no way to say "I scanned a large inaccessible region, found nothing visible, and
 have not reached the end". Empty forces `nextAfterSeq == afterSeq`, and
