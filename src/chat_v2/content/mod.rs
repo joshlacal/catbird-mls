@@ -31,9 +31,13 @@
 //! `minGraphemes` and `maxGraphemes` on a reaction but the projection enforces
 //! only byte length. Those gaps are this module's subject matter.
 
+pub mod at_uri;
+pub mod link;
 pub mod media;
 pub mod reaction;
 
+pub use at_uri::{AtUriError, RestrictedAtUri, AT_URI_MAX_LEN, NSID_MAX_LEN, RKEY_MAX_LEN, SCHEME};
+pub use link::{require_external_link, LinkError, EXTERNAL_LINK_MAX_BYTES, HTTPS_SCHEME};
 pub use media::{
     require_alt_text, require_blurhash, require_ciphertext_size, require_dimensions,
     require_duration, require_waveform, AudioMime, ImageMime, MediaError, AEAD_TAG_LEN,
@@ -47,3 +51,5 @@ pub use reaction::{
 
 #[cfg(test)]
 mod media_tests;
+#[cfg(test)]
+mod uri_tests;
