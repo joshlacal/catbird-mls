@@ -117,6 +117,18 @@ impl ApplicationReducer {
         self.require_advances_high_water(terminal.seq)?;
         self.require_expected_predecessor(terminal.seq, &terminal.previous)?;
 
+        // Propagated rather than `expect`ed. The two predicates
+        // `AccessInterval::apply_close` enforces — the close is after its own
+        // opening, and the interval is not already closed — are both
+        // unreachable here: the high-water check above is never below the
+        // opening, and `apply_terminal` only routes to this function when the
+        // last interval is open. But this call is the **first** mutation in the
+        // sequence, so an error returns before anything has changed, and a
+        // refusal is strictly better than a panic at an FFI boundary.
+        //
+        // It also collapses the duplicated predicate: the close-after-opening
+        // rule is now stated once, in `interval.rs`, and this path defers to it
+        // rather than restating it and asserting the restatement.
         self.intervals_mut()
             .last_mut()
             .expect("an open interval was just observed")
@@ -125,8 +137,7 @@ impl ApplicationReducer {
                 kind: CloseKind::Terminal,
                 transition_id: terminal.transition_id,
                 outer_entry_fingerprint: terminal.outer_entry_fingerprint,
-            })
-            .expect("the close seq was just checked against this interval's opening");
+            })?;
         self.clear_expected();
         self.install_schedule_terminal_proof(terminal);
         Ok(TerminalMode::ClosedOpenInterval)

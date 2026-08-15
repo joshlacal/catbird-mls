@@ -324,6 +324,55 @@ fn the_sweep_would_notice_a_path_that_stopped_checking() {
         .expect("a terminal above the mark must apply");
 }
 
+// ---- the overwrite guard is not armed by the terminal path ------------------
+
+#[test]
+fn a_terminal_closes_an_interval_that_has_consumed_rows_above_its_opening() {
+    // `AccessInterval::apply_close` gained a second predicate — it refuses an
+    // already-closed interval — and the terminal path applies a close through
+    // it. Neither predicate can fire here, and this is the case that proves the
+    // first one cannot: the close lands at 200, far above the opening at 1,
+    // with a consumed row at 100 in between. If the high-water rule and the
+    // close-after-opening rule ever disagreed, this is where it would show.
+    let mut reducer = consumed_up_to(100);
+    assert_eq!(reducer.intervals()[0].opening().seq, seq(1));
+    assert_eq!(reducer.high_water(), Some(seq(100)));
+
+    assert_eq!(
+        reducer
+            .apply_terminal(&terminal(200, coordinate(1)))
+            .unwrap(),
+        crate::chat_v2::reducer::TerminalMode::ClosedOpenInterval
+    );
+    let close = reducer.intervals()[0].close().expect("the interval closed");
+    assert_eq!(close.seq, seq(200));
+    assert_eq!(close.kind, CloseKind::Terminal);
+    assert!(reducer.is_terminal());
+}
+
+#[test]
+fn the_terminal_path_never_reaches_an_already_closed_interval() {
+    // The second predicate's turn. A closed last interval routes to the
+    // proof-only mode, which does not call `apply_close` at all — so the
+    // overwrite guard is unreachable from here rather than merely unlikely.
+    // Checked through the public surface: the old close survives untouched.
+    let mut reducer = consumed_up_to(10);
+    reducer
+        .close_interval(&closing(11, CloseKind::Remove, coordinate(1)))
+        .unwrap();
+
+    assert_eq!(
+        reducer
+            .apply_terminal(&terminal(20, coordinate(1)))
+            .unwrap(),
+        crate::chat_v2::reducer::TerminalMode::ScheduleProofOnly
+    );
+    let close = reducer.intervals()[0].close().expect("still closed");
+    assert_eq!(close.seq, seq(11), "the original close must be untouched");
+    assert_eq!(close.kind, CloseKind::Remove);
+    assert_eq!(reducer.intervals().len(), 1, "no interval was added");
+}
+
 // ---- the ratified touching semantics survive --------------------------------
 
 #[test]

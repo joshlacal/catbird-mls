@@ -263,6 +263,16 @@ impl<C: PartialEq> AccessInterval<C> {
     ///
     /// An open interval has no end *and* no close proof; the two are the same
     /// condition, because a partial close proof is never representable.
+    ///
+    /// **Three `expect`s in the reducer rest on this being *defined* as
+    /// `close.is_none()` rather than merely agreeing with it** — the
+    /// "a non-open interval always carries a close proof" calls in
+    /// `reducer/reanchor.rs`, `reducer/reset.rs`, and `reducer/terminal.rs`.
+    /// They are safe because the two are one condition on one field, so no
+    /// constructor and no restore can separate them. Give this method a second
+    /// source of truth — a `closed: bool` alongside the proof, say, or an
+    /// `is_open` that consults anything else — and all three become reachable
+    /// panics in sealed paths.
     pub fn is_open(&self) -> bool {
         self.close.is_none()
     }
