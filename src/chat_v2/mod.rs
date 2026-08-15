@@ -58,6 +58,7 @@ pub mod participation;
 pub mod provenance;
 pub mod recovery;
 pub mod reducer;
+pub mod storage;
 pub mod transcript;
 pub mod wire;
 
