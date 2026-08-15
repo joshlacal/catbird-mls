@@ -126,7 +126,8 @@ where
     /// FFI-backed platforms historically did) — without this session-scoped
     /// record the reissue arm re-ran with attempt_count == 0 every sync tick,
     /// so the backoff ladder never engaged and recovery never escalated.
-    reissue_attempts_mem: Mutex<HashMap<ConversationId, super::welcome_recovery::ReissueAttemptLog>>,
+    reissue_attempts_mem:
+        Mutex<HashMap<ConversationId, super::welcome_recovery::ReissueAttemptLog>>,
     /// Monotonic version incremented when creation protection starts or ends.
     /// Sync uses this to reject stale server/local reconciliation snapshots.
     creation_generation: AtomicU64,

@@ -2438,8 +2438,9 @@ impl MLSAPIClient for APIAdapter {
         convo_id: &str,
         recipient_device_did: &str,
         reason: &str,
-    ) -> crate::orchestrator::Result<crate::orchestrator::welcome_recovery::WelcomeReissueRequestResult>
-    {
+    ) -> crate::orchestrator::Result<
+        crate::orchestrator::welcome_recovery::WelcomeReissueRequestResult,
+    > {
         self.0
             .request_welcome_reissue(
                 convo_id.to_string(),
