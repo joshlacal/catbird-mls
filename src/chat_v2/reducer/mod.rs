@@ -19,10 +19,13 @@
 //! Interval closure, reanchor after a gap, and legal touching boundaries live
 //! in [`reanchor`]. The three reset-activator roles live in [`reset`], which
 //! classifies rather than trusts a caller's claim about which role a device
-//! held. The two Terminal paths are still a separate concern and land in their
-//! own sub-slice; what is built refuses them by name rather than
-//! half-implementing them, so an unbuilt path cannot be mistaken for a
-//! permissive one.
+//! held. The two Terminal modes live in [`terminal`].
+//!
+//! The ordinary close paths still refuse [`CloseKind::Terminal`] by name. That
+//! refusal is not a placeholder for something unbuilt — it is permanent. A
+//! Terminal must install the schedule proof in the same step that it closes,
+//! those paths have no proof to install, and a caller arriving there with a
+//! Terminal row is simply at the wrong entry point.
 //!
 //! # Why sequences alone are never enough
 //!
@@ -33,9 +36,11 @@
 
 pub mod reanchor;
 pub mod reset;
+pub mod terminal;
 
 pub use reanchor::{ReanchorAuthority, SequentialClose, TouchingBoundary};
 pub use reset::{ResetActivation, ResetParticipation, ResetRole};
+pub use terminal::{TerminalClose, TerminalMode};
 
 use super::coordinate::Coordinate;
 use super::ids::Seq;
@@ -43,6 +48,7 @@ use super::interval::{
     AccessInterval, ApplicationScheduleTerminalProof, IntervalError, IntervalOpening,
     RecipientBinding,
 };
+use super::provenance::CloseKind;
 use core::fmt;
 
 /// An authenticated context-changing control row addressed to this recipient.
@@ -103,13 +109,27 @@ pub enum ReducerError {
     /// because it must be processed exactly once rather than as a close
     /// followed by an independent open.
     ReanchorMustNotTouch { close_seq: Seq, opening_seq: Seq },
-    /// A `Terminal` close reached the ordinary close path.
+    /// A `Terminal` close reached an ordinary close path.
     ///
-    /// Terminal must atomically install the exact schedule terminal proof. Its
-    /// dedicated path is not built yet, and closing the interval here without
-    /// that proof would leave the schedule un-terminalized while looking
-    /// finished — so it is refused by name rather than silently mishandled.
+    /// Terminal must atomically install the exact schedule terminal proof, and
+    /// the ordinary paths have no proof to install. Closing here would leave the
+    /// schedule un-terminalized while looking finished, so the row is refused
+    /// and its caller directed to [`ApplicationReducer::apply_terminal`].
     TerminalRequiresScheduleProof { seq: Seq },
+    /// A Terminal arrived across a gap after a close kind that admits no
+    /// proof-only finalization.
+    ///
+    /// §6 names `Remove` and `Reset`. A `Replace` close always touches an `Add`
+    /// successor on one shared row, so a `Replace`-closed last interval means
+    /// that successor was never installed.
+    TerminalAfterUnsupportedClose { close_seq: Seq, kind: CloseKind },
+    /// A Terminal was applied to a schedule that never held an interval.
+    ///
+    /// §9 entitles a *historical* exact-device recipient schedule to fetch the
+    /// Terminal control for schedule-level finalization. A device with no
+    /// history is not one, and terminalizing it would record a schedule that
+    /// never existed.
+    TerminalWithoutSchedule { seq: Seq },
     /// A reset activation retired nothing and opened nothing on this schedule.
     ///
     /// A registered sibling or roster-only device may legitimately *see* the
@@ -179,6 +199,15 @@ impl fmt::Display for ReducerError {
             Self::ResetAffectsNoInterval { seq } => write!(
                 f,
                 "reset at {seq} retires no interval and opens none on this schedule"
+            ),
+            Self::TerminalAfterUnsupportedClose { close_seq, kind } => write!(
+                f,
+                "terminal follows a {kind:?} close at {close_seq}; \
+                 only Remove and Reset admit a proof-only terminal"
+            ),
+            Self::TerminalWithoutSchedule { seq } => write!(
+                f,
+                "terminal at {seq} has no historical schedule to finalize"
             ),
             Self::Interval(err) => write!(f, "{err}"),
         }
