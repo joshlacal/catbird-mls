@@ -725,19 +725,23 @@ async fn legacy_orphan_without_mapping_clears_stale_recovery_rows() {
         });
     alice
         .storage
-        .mark_quarantined(&conversation_id, "legacy-orphan", now_ms())
-        .await
-        .expect("seed quarantine");
-    alice
-        .storage
         .mark_needs_rejoin(&conversation_id)
         .await
         .expect("seed rejoin");
+    // Seed reset authority before quarantine: under ruling 2a the authority
+    // commit is itself a quarantine exit, so seeding in the other order would
+    // clear the row this test needs. The resulting both-set row is the legacy
+    // artifact whose survival across restart is what is under test here.
     alice
         .storage
         .mark_reset_pending(&conversation_id, &hex::encode(vec![0x7a; 32]), 11, now_ms())
         .await
         .expect("seed reset");
+    alice
+        .storage
+        .mark_quarantined(&conversation_id, "legacy-orphan", now_ms())
+        .await
+        .expect("seed quarantine");
     let rejoin_flag_before_restart = alice.storage.has_rejoin_flag(&conversation_id);
 
     let (restarted, temp_dir) = restart_orchestrator(&world, "Alice").await;
@@ -1548,6 +1552,113 @@ async fn failing_quarantine_persists_escalate() {
             .iter()
             .any(|(cid, op, _)| cid == &convo_id && op == "clear_quarantine"),
         "R-2 REGRESSION: failing clear_quarantine must escalate, got {escalations:?}"
+    );
+}
+
+/// Ruling 2a (2026-08-15): a server reset is a quarantine exit, and the exit
+/// belongs to the `mark_reset_pending` authority commit rather than to the
+/// separate `clear_quarantine` call issued after it. The Android lane found
+/// that the old warn-only backstop minted the both-set row on its own — no
+/// crash required, just a failed clear — and such a row rehydrates quarantined
+/// forever because the replayed reset event dedupes on generation before
+/// reaching the clear again. Fail that separate call and the conversation must
+/// still land ResetPending with no persisted quarantine residue.
+#[tokio::test(flavor = "multi_thread")]
+async fn server_reset_exits_quarantine_even_when_the_backstop_clear_fails() {
+    let did = "did:plc:alice";
+    let convo_id = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+    let storage = e2e_harness::mock_storage::MockStorage::new();
+    let credentials = e2e_harness::mock_credentials::MockCredentials::new();
+    let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
+
+    let orchestrator = MLSOrchestrator::new(
+        Arc::new(FailingCrypto::peer_bad()),
+        Arc::new(storage.clone()),
+        Arc::new(ds.clone_as(did)),
+        Arc::new(credentials.clone()),
+        OrchestratorConfig::default(),
+    );
+    orchestrator.initialize(did).await.expect("initialize");
+    storage
+        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .await
+        .expect("seed explicit conversation-to-group mapping");
+
+    let observer = Arc::new(RecordingObserver::default());
+    orchestrator
+        .set_event_observer(Some(observer.clone()))
+        .await;
+
+    // Three peer-bad frames trip Layer-3 quarantine, arming both the in-memory
+    // tracker and the persisted row.
+    for i in 0..3 {
+        let envelope = IncomingEnvelope {
+            conversation_id: convo_id.clone(),
+            sender_did: "did:plc:mallory".to_string(),
+            ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some(format!("bad-frame-{i}")),
+            server_epoch: None,
+        };
+        let _ = orchestrator.process_incoming(&envelope).await;
+    }
+    assert!(
+        orchestrator
+            .get_conversation_quarantine_state(&convo_id)
+            .await
+            .is_some(),
+        "three peer-bad frames must enter Layer-3 quarantine (test precondition)"
+    );
+    assert!(
+        storage.get_persisted_quarantine(&convo_id).is_some(),
+        "quarantine entry must have persisted a row (test precondition)"
+    );
+
+    // The exact minting path: the authority commit lands, the separate
+    // backstop clear fails.
+    storage.fail_next_clear_quarantine();
+    let new_group_id = vec![0x5a; 32];
+    orchestrator
+        .record_group_reset(&convo_id, new_group_id.clone(), 9)
+        .await
+        .expect("record_group_reset failed");
+
+    assert!(
+        storage.get_persisted_quarantine(&convo_id).is_none(),
+        "RULING 2a REGRESSION: a failed backstop clear minted a row that is \
+         both reset-pending and quarantined"
+    );
+    assert!(
+        orchestrator
+            .get_conversation_quarantine_state(&convo_id)
+            .await
+            .is_none(),
+        "server reset must exit quarantine in memory too"
+    );
+    match storage
+        .get_conversation_state(&convo_id)
+        .await
+        .expect("read durable state")
+    {
+        Some(ConversationState::ResetPending {
+            new_group_id: target,
+            reset_generation,
+            ..
+        }) => {
+            assert_eq!(target, hex::encode(&new_group_id));
+            assert_eq!(reset_generation, 9);
+        }
+        other => panic!("expected durable ResetPending, got {other:?}"),
+    }
+
+    // The backstop still escalates rather than warning, so a pre-amendment
+    // backend that leaves residue is visible instead of silent.
+    let escalations = observer.storage_failures.lock().unwrap().clone();
+    assert!(
+        escalations
+            .iter()
+            .any(|(cid, op, _)| cid == &convo_id && op == "clear_quarantine"),
+        "failing backstop clear_quarantine must escalate, got {escalations:?}"
     );
 }
 

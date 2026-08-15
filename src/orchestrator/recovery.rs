@@ -4428,10 +4428,19 @@ where
                 .await;
         }
         if was_quarantined {
-            // Server reset trumps client-side quarantine; persist the cleared
-            // quarantine row alongside the new ResetPending payload.
+            // Server reset trumps client-side quarantine (ruling 2a). The
+            // authority commit in `mark_reset_pending` is now contractually
+            // required to clear the persisted quarantine itself; this call
+            // remains as a backstop for backends written before that
+            // amendment. Warn-only here used to mint the both-set row on its
+            // own — a plain failed clear, no crash needed — and such a row
+            // rehydrates quarantined forever because the replayed reset takes
+            // the same-generation dedupe path above and never returns here.
+            // Escalate like the other recovery-critical writes in this
+            // function.
             if let Err(e) = self.storage().clear_quarantine(convo_id).await {
-                tracing::warn!(convo_id, error = %e, "Failed to clear persisted quarantine on server reset");
+                self.report_recovery_storage_failure(convo_id, "clear_quarantine", &e)
+                    .await;
             }
             tracing::info!(convo_id, "[QUARANTINE-CLEAR] via server reset");
         }

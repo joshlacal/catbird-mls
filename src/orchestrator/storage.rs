@@ -211,6 +211,17 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     /// never expose an incomplete reset tag. A returned
     /// error is ambiguous, so callers re-read durable state instead of rolling
     /// back a write that may already have committed.
+    ///
+    /// The same commit MUST also clear any persisted quarantine for the
+    /// conversation. A server reset is a documented quarantine exit (ruling 2a,
+    /// 2026-08-15), so the tag, complete payload, rejoin route, and quarantine
+    /// clear are one commit — not a commit followed by a separate clear. The
+    /// orchestrator still issues `clear_quarantine` afterwards as a backstop
+    /// for pre-amendment backends, but a backend that defers the clear to that
+    /// call can mint a row that is simultaneously reset-pending and
+    /// quarantined whenever the process dies or that call fails, and such a
+    /// row rehydrates quarantined forever: the replayed reset event takes the
+    /// same-generation dedupe path and never reaches the clear again.
     async fn mark_reset_pending(
         &self,
         _conversation_id: &str,

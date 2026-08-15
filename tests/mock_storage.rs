@@ -1115,6 +1115,12 @@ impl MLSStorageBackend for MockStorage {
                     notified_at_ms,
                 },
             );
+            // Ruling 2a: the authority commit is also the quarantine exit, so
+            // the persisted quarantine row goes away in this same critical
+            // section. A backend that waits for the orchestrator's separate
+            // `clear_quarantine` backstop can mint a row that is both
+            // reset-pending and quarantined whenever that call fails.
+            inner.quarantines.remove(conversation_id);
             *inner
                 .mark_reset_pending_calls
                 .entry(conversation_id.to_string())

@@ -96,6 +96,14 @@ pub trait OrchestratorStorageCallback: Send + Sync {
     /// `needs_rejoin = true`, rejecting stale generations while preserving the
     /// old durable group mapping for restart-safe predecessor cleanup. Missing
     /// support fails closed.
+    ///
+    /// That same commit must also clear any persisted quarantine for the
+    /// conversation: a server reset is a documented quarantine exit (ruling 2a,
+    /// 2026-08-15), so tag, payload, rejoin route, and quarantine clear land
+    /// together. Deferring the clear to the separate `clear_quarantine`
+    /// callback leaves a window in which the platform can persist a row that
+    /// is both reset-pending and quarantined, which rehydrates quarantined
+    /// forever because the replayed reset dedupes before reaching the clear.
     fn mark_reset_pending(
         &self,
         conversation_id: String,
@@ -4124,6 +4132,16 @@ mod tests {
                     message: "injected storage failure".into(),
                 });
             }
+            // Ruling 2a: the authority commit is also the quarantine exit, so
+            // drop this conversation's persisted quarantine row here — exactly
+            // what `clear_quarantine` below does — rather than relying on that
+            // separate call. `quarantine_payload` is an argument recorder, not
+            // durable state, so it is left alone here just as `clear_quarantine`
+            // leaves it alone.
+            self.conversation_states
+                .lock()
+                .unwrap()
+                .remove(&conversation_id);
             *self.reset_payload.lock().unwrap() = Some((
                 conversation_id,
                 new_group_id_hex,
@@ -5155,6 +5173,67 @@ mod tests {
                     ));
                 }
             }
+        });
+    }
+
+    /// Ruling 2a (2026-08-15): a server reset is a documented quarantine exit,
+    /// and the exit belongs to the `mark_reset_pending` authority commit — not
+    /// to the separate `clear_quarantine` callback issued after it. A backend
+    /// that defers the clear to that callback can leave a row that is
+    /// simultaneously reset-pending and quarantined, and such a row rehydrates
+    /// quarantined forever because the replayed reset dedupes on generation
+    /// before reaching the clear again. Both adapters must therefore see the
+    /// quarantine gone the moment `mark_reset_pending` returns, with no
+    /// `clear_quarantine` call in between.
+    #[test]
+    fn both_storage_adapters_exit_quarantine_inside_the_reset_authority_commit() {
+        crate::async_runtime::block_on(async {
+            let callback = Arc::new(RecordingStorageCallback::default());
+            let adapters: Vec<(&str, Box<dyn MLSStorageBackend>)> = vec![
+                (
+                    "storage-adapter",
+                    Box::new(StorageAdapter(callback.clone())),
+                ),
+                (
+                    "client-storage-adapter",
+                    Box::new(crate::client_bridge::ClientStorageAdapter(callback.clone())),
+                ),
+            ];
+
+            for (convo_id, adapter) in &adapters {
+                adapter
+                    .mark_quarantined(convo_id, "multi_peer_bad_commits", 5678)
+                    .await
+                    .expect("seed persisted quarantine");
+                assert!(
+                    matches!(
+                        adapter.get_conversation_state(convo_id).await.unwrap(),
+                        Some(ConversationState::Quarantined { .. })
+                    ),
+                    "{convo_id}: quarantine must persist before the reset (test precondition)"
+                );
+
+                // No `clear_quarantine` call here — the authority commit alone
+                // has to be the exit.
+                adapter
+                    .mark_reset_pending(convo_id, "aabb", 9, 1234)
+                    .await
+                    .expect("reset authority commit");
+
+                assert_eq!(
+                    adapter.get_conversation_state(convo_id).await.unwrap(),
+                    None,
+                    "RULING 2a REGRESSION ({convo_id}): the reset authority commit left \
+                     persisted quarantine behind, minting a both-set row"
+                );
+            }
+
+            // The reset payload still lands — the quarantine exit rides along
+            // with the tag rather than replacing it.
+            assert_eq!(
+                callback.reset_payload.lock().unwrap().clone(),
+                Some(("client-storage-adapter".into(), "aabb".into(), 9, 1234))
+            );
         });
     }
 
