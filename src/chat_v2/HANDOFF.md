@@ -24,9 +24,12 @@ workspace is untouched and must stay that way).
 > landing pass, not to this workspace — nothing ships from here — but the
 > obligation travels with the revision.
 
-Verification at handoff: **580 lib tests pass, 0 failures.** `cargo fmt
+Verification at handoff: **628 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib --all-targets` reports zero warnings under
 `chat_v2`, `wasm32-unknown-unknown` builds.
+
+The storage slices added **no FFI surface**. `ffi.rs` is untouched since
+`eaf655ff`, so the banner above is the same obligation it was, not a new one.
 
 ---
 
@@ -69,6 +72,12 @@ promotions and one new dependency).
 | `zlmxmxww` | `b0a8c2f5` | Poisoned-state containment (S9c) |
 | `xwnzpuqk` | `eaf655ff` | Participation status and the direct-traffic gate (S9d) |
 | `pxukowsz` | `f3f227a9` | Handoff refresh for completed content, recovery, participation |
+| `oyuopxzp` | `83ff47d8` | The open §5 veto recorded (stand-down doc seal) |
+| `lwnmxyqk` | `b43f460d` | Per-DID store scope and the storage error taxonomy (S10a) |
+| `vyrukxnt` | `6c0f8973` | The store trait, the atomic page commit, the no-default gate (S10b) |
+| `pllzwzuo` | `b55034d3` | Journal persistence with byte-identical rehydration (S10c) |
+| `oxowttxz` | `cc11d4ec` | Exact-device schedule persistence and coherent restore (S10d) |
+| `qkskwkzl` | `a5ed57f1` | The physical-separation gate and a pinned scope sweep (S10e) |
 
 ### The detached-HEAD trap — read before concluding a server file is missing
 
@@ -209,6 +218,12 @@ chat_v2/
     reanchor.rs closure, reanchor, touching boundaries (6b)
     reset.rs    the three reset-activator roles (6c)
     terminal.rs the two Terminal modes (6d)
+  storage/      physically separate durable storage (S10); NOT gated off wasm
+    mod.rs      StoreScope (one store per DID) + the physical-separation gate
+    error.rs    the named taxonomy; every failure says which record and why
+    page.rs     PageCommit — the atomic unit; entries + ratchet + cursor as one
+    store.rs    the ChatV2Store trait, every method required + the no-default gate
+    memory.rs   a NON-DURABLE reference implementation; never a production store
   ffi.rs        skeletal UniFFI surface (cfg'd out on wasm32)
 ```
 
@@ -219,12 +234,20 @@ orchestrator import, with a positive control proving the matcher can fail. The
 needles are assembled at runtime so the gate's own source is not a violation of
 itself. **Keep it passing.** v1 and v2 never interoperate.
 
-Storage isolation is still to be built and must be *physical*: v2 gets its own
-storage trait with every method required (v1's 20-of-34 default-no-op methods
-are a silent data-loss footgun), and platforms open a separate store. v1's
-storage is flat with no namespace concept to parallel, and the OpenMLS store has
-no prefix mechanism, so a shared context would put v1 and v2 groups in the same
-table keyed only by group id.
+Storage isolation is **built** (S10a-S10e) and is physical. See section 6.5.
+
+There are now **four** gates, not two, and they catch different things. That is
+not redundancy — it was verified. Injecting a real
+`use crate::hybrid_storage::HybridStorageProvider;` into a `chat_v2` file leaves
+*both* original gates passing, because the isolation gate forbids
+`crate::orchestrator` and that store does not live there. Keep all four green:
+
+| Gate | Where | Catches |
+|---|---|---|
+| v1 import isolation | `chat_v2/mod.rs` | `crate::orchestrator` imports |
+| forbidden recovery mechanism | `recovery/mod.rs` | external commits, `force_rejoin` |
+| no default trait method | `storage/store.rs` | a store method that could silently discard state |
+| physical separation | `storage/mod.rs` | reaching a v1 or OpenMLS store by any path |
 
 ---
 
@@ -407,9 +430,15 @@ structural rather than promised.
 
 ## 6. Content predicates, recovery, and participation — complete
 
-Everything §8 and §9 describe is built. **Storage isolation is the only thing
-left before this protocol is usable end to end**, which is why
-`chat_v2_status()` still reports `is_operational = false`.
+Everything §8 and §9 describe is built. Storage followed in S10a-S10e (section
+6.5), so every **domain** layer this tree owns is now complete.
+
+`chat_v2_status()` still reports `is_operational = false`, and correctly: what
+remains is not a domain layer but two seams that do not exist here at all — no
+transport and no MLS crypto. An earlier revision of this document said storage
+was "the only thing left before this protocol is usable end to end". That was
+wrong, and believing it would have flipped the readiness probe on a build with
+no way to reach a server.
 
 ### Built (S8a/S8b/S8b-pre, `content/`)
 
@@ -464,14 +493,93 @@ The bounded four-rung ladder, refusing skip, descent, and past-top by name;
 - **Acceptance changes only status.** A freshly accepted participant is
   *addable but not yet sendable*, and the refusal is the leaf one.
 
+## 6.5 Storage — complete (S10a–S10e)
+
+Physically separate, per DID, with every method required.
+
+### The three shapes that carry the invariants
+
+- **`StoreScope` is opened *for* a DID**, not a shared store filtered by a DID
+  column. It offers no way to widen itself — no two-DID constructor, no setter,
+  no "any principal" variant — so a second principal requires a second store.
+  A foreign access is `CrossDidAccess`, deliberately **not** `NotFound`: a miss
+  is something callers retry, repair, or create through, and a containment
+  breach must not read as one.
+- **`PageCommit` carries entries, ratchet checkpoint, and the new cursor as one
+  value, and the trait has no cursor setter.** §9 states the atomicity rule
+  twice. A seam with separate `store_entry` / `store_ratchet` / `set_cursor`
+  satisfies it only if every caller wraps them and every platform's wrapping is
+  genuinely transactional, neither of which is checkable — and the failure is
+  silent *and permanent*, because a cursor past unwritten entries skips them
+  forever (`afterSeq` is exclusive; the server never returns them again). Same
+  shape as `CloseProof`, `TouchingBoundary`, and `Containment`.
+- **Every trait method is required**, enforced mechanically. v1's backend
+  defaults 20 of 34 methods to no-ops and mitigates it with a self-reported
+  capabilities *warning*; a platform that skips one there loses the state and is
+  told nothing.
+
+### Things that will be got wrong if not read
+
+- **Commits are compare-and-set, with two distinct refusals.**
+  `CursorMismatch` means another commit advanced this cursor; a `NotFound`
+  cursor means the page continued from a position this store never held. The
+  first is a lost race, the second is a misrouted store. Different mistakes,
+  different fixes, so different errors.
+- **`ApplicationReducer::rehydrate` prevents a panic, not a wrong answer.** The
+  reducer maintains "an interval is open exactly when an expected context is
+  installed", and `apply_sequential_control` reaches for that context with
+  `.expect()`, treating absence as unreachable. Restore is the only way into the
+  type that bypasses the paths maintaining it, so it refuses an incoherent pair
+  by name. Do not relax that check to accept a row that "looks fine".
+- **Restore reinstates; it does not re-adjudicate.** Replaying admission
+  decisions against rows the client no longer holds would refuse a schedule that
+  was legitimately built. What restore *does* enforce is exact-recipient
+  ownership and the coherence pair above.
+- **Reads return absence, never a substituted default.** `cursor` yields
+  `Option`, not `AfterSeq::START`. "Never scanned" and "scanned to the
+  beginning" want different handling.
+- **The schedule key includes the device.** Visibility is per exact
+  `(DID, deviceId)`; a conversation-only key hands a sibling device history it
+  never had.
+- **`MemoryStore` is not a production store.** It holds nothing across process
+  exit. It exists to prove the trait is implementable with every method
+  required, that the atomic commit is achievable atomically, and that the scope
+  refuses a foreign principal at real call sites.
+- **The store method list is pinned by a test.** Foreign-principal refusal is
+  checked by *calling* each method, and a call-based sweep cannot notice a
+  method nobody added to it. Adding a method fails that test with an instruction
+  to extend the sweep — extend it, do not bump the list.
+
+Conventions kept from the rest of the tree: page well-formedness stays with
+`append_log` (nothing here re-derives `nextAfterSeq` or the entry bound), and
+where a predicate already exists it is reused rather than restated —
+`AfterSeq::admits` for the exclusive bound, `JournalEntry::should_submit` for
+which states are terminal.
+
 ### Still outstanding
 
-**Storage isolation, and it must be physical.** v2 needs its own storage trait
-with every method required — v1's 20-of-34 default-no-op methods are a silent
-data-loss footgun — and platforms must open a separate store. v1's storage is
-flat with no namespace concept, and the OpenMLS store has no prefix mechanism,
-so a shared context would put v1 and v2 groups in one table keyed only by group
-id.
+**Storage was the last domain layer, but it is not the last thing.** Two seams
+do not exist in this tree at all, and both are required before the protocol is
+usable end to end:
+
+- **No transport.** A grep for `reqwest`, `xrpc`, or `HttpClient` over
+  `src/chat_v2` returns nothing, while the identical needles fire on v1
+  (`src/orchestrator/api_client.rs`). Nothing here can talk to a server.
+- **No MLS crypto seam.** Same result for `openmls` and `MlsGroup`, with the
+  positive control firing on `src/mls_context.rs`. The ratchet checkpoint that
+  travels in a `PageCommit` is opaque bytes precisely because the layer that
+  produces them does not exist yet.
+
+Both absences were checked with a firing positive control rather than asserted.
+
+**`chat_v2_status()` still reports `is_operational = false`, and the FFI probe's
+`outstanding_capabilities` still says only `"storage"` — which is now stale.**
+Correcting it is a deliberate reviewed change, not a refactor: the probe pins
+`is_operational == outstanding.is_empty()`, so simply deleting `"storage"` from
+the list flips the build to advertising a usable protocol with no way to reach a
+server. The recommendation on the table is that the outstanding list instead
+names the two seams above. That decision was referred to the lead and is
+**unresolved at this seal** — see section 7.
 
 
 ## 7. FFI notes for whoever extends `ffi.rs`
@@ -482,6 +590,19 @@ id.
 - `chat_v2_status()` reports `is_operational = false`. A test pins
   `is_operational == outstanding.is_empty()` and that no capability appears in
   both lists. Flip it only when the outstanding list is genuinely empty.
+
+  **Open, referred to the lead, unresolved at this seal.** The outstanding list
+  reads `["storage"]`, and storage is now built — so the list is stale, and the
+  obvious edit (deleting the entry) would flip `is_operational` to true. That
+  would be false: there is no transport and no MLS crypto seam in this tree, both
+  verified absent with a firing positive control. The proposal is that the list
+  loses `"storage"` and gains those two, keeping `is_operational` false and the
+  probe honest. Do not make this change as a tidy-up; it is the one field in this
+  tree that tells other lanes whether the protocol can be used.
+- **The storage layer is deliberately absent from the FFI surface.** Its shape is
+  settled now, so exporting it is defensible — but it has never been bound, and
+  adding it changes the UniFFI checksum. That is the coordinated landing pass's
+  call, not a drive-by.
 - Policy booleans are **precomputed fields**, not derived platform-side. A sweep
   asserts they agree with the Rust classification for all 91 codes. Keep that
   sweep.
