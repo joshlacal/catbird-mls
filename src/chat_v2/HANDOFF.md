@@ -8,9 +8,11 @@ workspace is untouched and must stay that way).
 
 > ## ⚠ CONSUMING THIS REVISION REQUIRES REGENERATING BINDINGS
 >
-> The UniFFI surface **changed** in `967deea2` (S9b) and again in `eaf655ff`
-> (S9d): the recovery projection and its rung enum were added, and the status
-> probe's capability lists moved twice.
+> The UniFFI surface **changed** in `967deea2` (S9b), `eaf655ff` (S9d), and
+> again in `b947ec01` (S10f): the recovery projection and its rung enum were
+> added, the status probe's capability lists moved twice, and those lists then
+> became `Vec<ChatV2Capability>` (name plus description) rather than
+> `Vec<String>`.
 >
 > A client built against a rebuilt library **without regenerated Swift/Kotlin
 > panics at runtime with a checksum mismatch.** It is not a compile error, so
@@ -24,12 +26,14 @@ workspace is untouched and must stay that way).
 > landing pass, not to this workspace — nothing ships from here — but the
 > obligation travels with the revision.
 
-Verification at handoff: **628 lib tests pass, 0 failures.** `cargo fmt
---check` clean, `cargo clippy --lib --all-targets` reports zero warnings under
-`chat_v2`, `wasm32-unknown-unknown` builds.
+Verification at handoff: **632 lib tests pass, 0 failures.** `cargo fmt
+--check` clean, `cargo clippy --lib` reports zero warnings under `chat_v2`,
+`wasm32-unknown-unknown` builds.
 
-The storage slices added **no FFI surface**. `ffi.rs` is untouched since
-`eaf655ff`, so the banner above is the same obligation it was, not a new one.
+A note on the lint command: `cargo clippy --all-targets` exits **101**, and that
+is the pre-existing `tests/sequencer_did_sync_tests.rs` breakage documented in
+section 1 — not a regression. `cargo clippy --lib` is the signal that means
+anything here.
 
 ---
 
@@ -78,6 +82,10 @@ promotions and one new dependency).
 | `pllzwzuo` | `b55034d3` | Journal persistence with byte-identical rehydration (S10c) |
 | `oxowttxz` | `cc11d4ec` | Exact-device schedule persistence and coherent restore (S10d) |
 | `qkskwkzl` | `a5ed57f1` | The physical-separation gate and a pinned scope sweep (S10e) |
+| `yuwqpuuz` | `5124fa48` | Handoff refresh for the storage subsystem |
+| `qylztuwk` | `9943c4af` | Split the reference store's tests into a sibling file |
+| `ovkuwqzx` | `4a313a50` | Gate the reference store out of production builds (S10e addendum) |
+| `olrmypzv` | `b947ec01` | Correct the readiness probe to protocol completeness (S10f) |
 
 ### The detached-HEAD trap — read before concluding a server file is missing
 
@@ -223,7 +231,7 @@ chat_v2/
     error.rs    the named taxonomy; every failure says which record and why
     page.rs     PageCommit — the atomic unit; entries + ratchet + cursor as one
     store.rs    the ChatV2Store trait, every method required + the no-default gate
-    memory.rs   a NON-DURABLE reference implementation; never a production store
+    memory.rs   a NON-DURABLE reference impl, cfg(test) ONLY — absent from release
     memory_tests.rs  its behaviour tests; what any platform store must also meet
   ffi.rs        skeletal UniFFI surface (cfg'd out on wasm32)
 ```
@@ -542,10 +550,13 @@ Physically separate, per DID, with every method required.
 - **The schedule key includes the device.** Visibility is per exact
   `(DID, deviceId)`; a conversation-only key hands a sibling device history it
   never had.
-- **`MemoryStore` is not a production store.** It holds nothing across process
-  exit. It exists to prove the trait is implementable with every method
-  required, that the atomic commit is achievable atomically, and that the scope
-  refuses a foreign principal at real call sites.
+- **`MemoryStore` is `cfg(test)` only, and that is structural, not a label.** A
+  store that forgets everything on process exit is the failure this layer exists
+  to prevent, and a type merely *documented* as unsuitable is one import away
+  from being used. In a release build the symbol does not exist — verified by
+  importing it from `ffi.rs` and getting `error[E0432]`. A gate keeps the
+  attribute in place. A platform wanting one for its own tests writes it against
+  `ChatV2Store`, where every method is required.
 - **The store method list is pinned by a test.** Foreign-principal refusal is
   checked by *calling* each method, and a call-based sweep cannot notice a
   method nobody added to it. Adding a method fails that test with an instruction
@@ -573,14 +584,17 @@ usable end to end:
 
 Both absences were checked with a firing positive control rather than asserted.
 
-**`chat_v2_status()` still reports `is_operational = false`, and the FFI probe's
-`outstanding_capabilities` still says only `"storage"` — which is now stale.**
-Correcting it is a deliberate reviewed change, not a refactor: the probe pins
-`is_operational == outstanding.is_empty()`, so simply deleting `"storage"` from
-the list flips the build to advertising a usable protocol with no way to reach a
-server. The recommendation on the table is that the outstanding list instead
-names the two seams above. That decision was referred to the lead and is
-**unresolved at this seal** — see section 7.
+**The probe now names them, and this was ruled on rather than assumed.**
+`outstanding_capabilities` lists `transport-binding` and `mls-crypto-seam`, each
+with a sentence; `storage` moved to implemented; `is_operational` stays `false`.
+
+The correction worth understanding is *why* the old list was wrong. It read
+`["storage"]`, which was one lane's remaining work rather than the protocol's —
+and since the probe pins `is_operational == outstanding.is_empty()`, finishing
+that lane appeared to empty the list and would have flipped the build to
+advertising a usable protocol. The list tracks **protocol completeness**, which
+is what `is_operational` claims. Entries beyond the current lane's scope belong
+in it for exactly that reason.
 
 
 ## 7. FFI notes for whoever extends `ffi.rs`
@@ -592,14 +606,12 @@ names the two seams above. That decision was referred to the lead and is
   `is_operational == outstanding.is_empty()` and that no capability appears in
   both lists. Flip it only when the outstanding list is genuinely empty.
 
-  **Open, referred to the lead, unresolved at this seal.** The outstanding list
-  reads `["storage"]`, and storage is now built — so the list is stale, and the
-  obvious edit (deleting the entry) would flip `is_operational` to true. That
-  would be false: there is no transport and no MLS crypto seam in this tree, both
-  verified absent with a firing positive control. The proposal is that the list
-  loses `"storage"` and gains those two, keeping `is_operational` false and the
-  probe honest. Do not make this change as a tidy-up; it is the one field in this
-  tree that tells other lanes whether the protocol can be used.
+  **Resolved in S10f.** The list previously tracked one lane's scope, which is
+  not what `is_operational` claims; it now tracks protocol completeness and names
+  `transport-binding` and `mls-crypto-seam`. Capabilities carry a description
+  because an unexplained outstanding entry is what gets deleted by someone who
+  cannot tell why it is there. Do not treat a stale-looking entry as a tidy-up:
+  this is the one field telling other lanes whether the protocol can be used.
 - **The storage layer is deliberately absent from the FFI surface.** Its shape is
   settled now, so exporting it is defensible — but it has never been bound, and
   adding it changes the UniFFI checksum. That is the coordinated landing pass's
