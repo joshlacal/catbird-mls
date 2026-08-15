@@ -46,15 +46,28 @@
 //! decided them by the time anything reaches storage.
 
 pub mod error;
-pub mod memory;
 pub mod page;
 pub mod store;
+
+/// The non-durable reference store, **compiled only into test builds**.
+///
+/// Labelling it "not a production store" is not enough. A store that silently
+/// forgets everything on process exit is the exact failure this whole layer
+/// exists to prevent, and a type that is merely documented as unsuitable is one
+/// import away from being used. Gating it on `cfg(test)` means a production or
+/// FFI path cannot reach it even by mistake: there is no such symbol in a
+/// release build.
+///
+/// A platform wanting an in-memory store for its own tests writes one against
+/// [`store::ChatV2Store`], which is the point — every method is required, so
+/// theirs cannot quietly skip one either.
+#[cfg(test)]
+mod memory;
 
 #[cfg(test)]
 mod memory_tests;
 
 pub use error::{RecordKind, StorageError};
-pub use memory::MemoryStore;
 pub use page::{EntryOutcome, PageCommit, PersistedEntry, RatchetCheckpoint};
 pub use store::ChatV2Store;
 
@@ -263,6 +276,40 @@ mod physical_separation {
                 .iter()
                 .all(|(needle, _)| !code_only(&documented).contains(needle.as_str())),
             "a mention inside a comment must not count as a violation"
+        );
+    }
+
+    #[test]
+    fn the_reference_store_is_unreachable_from_a_production_build() {
+        // A non-durable store is the failure this layer exists to prevent, so
+        // it must be structurally absent from release builds rather than
+        // documented as unsuitable. Documentation does not survive an editor's
+        // import completion; a missing symbol does.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/chat_v2/storage/mod.rs");
+        let source = std::fs::read_to_string(path).expect("this module's source must be readable");
+
+        // Assembled so this assertion's own source is not what it matches.
+        let declaration = ["mod", "memory;"].join(" ");
+        let lines: Vec<&str> = source.lines().collect();
+        let index = lines
+            .iter()
+            .position(|line| line.trim() == declaration)
+            .expect("the reference store's module declaration must be present");
+
+        // Walk back over any documentation to the attribute above it.
+        let gate = lines[..index]
+            .iter()
+            .rev()
+            .find(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with("///")
+            })
+            .expect("the declaration must carry an attribute above it");
+
+        assert_eq!(
+            gate.trim(),
+            format!("#[{}(test)]", "cfg"),
+            "the reference store must be gated out of production builds"
         );
     }
 
