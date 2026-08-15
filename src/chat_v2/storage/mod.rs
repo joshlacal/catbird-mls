@@ -226,6 +226,18 @@ mod physical_separation {
                 "{", sqlite, "}"
             ),
             format!("let doc = \"https://x\"; let p = {provider}::new();"),
+            // The module-path spelling of v1's MLS context, which this gate has
+            // always caught — and that is exactly the asymmetry the crate-root
+            // finding turns on. `use crate::MLSContext;` reaches the identical
+            // type, names no module path at all, and is caught by the
+            // *isolation* gate's derived crate-root set instead. Keeping this
+            // control here stops a pass on the short spelling from reading as a
+            // clean tree.
+            format!(
+                "use crate::{}::{};",
+                ["mls", "context"].join("_"),
+                ["MLS", "Context"].concat()
+            ),
         ] {
             assert!(
                 forbidden

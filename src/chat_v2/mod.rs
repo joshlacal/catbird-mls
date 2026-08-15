@@ -73,7 +73,7 @@ pub mod wire;
 /// catch that, so the rule is checked here instead of merely written down.
 #[cfg(test)]
 mod isolation {
-    use super::gate_support::SourceScan;
+    use super::gate_support::{crate_root_glob_exports, SourceScan};
 
     /// The superseded module's name, spelled once.
     ///
@@ -86,6 +86,21 @@ mod isolation {
         ["crate", "super::super", "catbird_mls"]
             .iter()
             .map(|root| format!("{root}::{V1_MODULE}"))
+            .collect()
+    }
+
+    /// Every `crate::<Name>` the crate root's re-export globs make reachable.
+    ///
+    /// Module-path needles cannot cover these, and that is not a gap to be
+    /// patched with two more literals — it is structural. `src/lib.rs` globs six
+    /// modules, so `use crate::MLSContext;` reaches v1's SQLCipher group and
+    /// crypto surface while naming no forbidden path at all. The set is derived
+    /// from the re-export surface, so a new glob, or a new `pub` item in a
+    /// module already globbed, is covered without anyone extending a list.
+    fn forbidden_crate_root_names() -> Vec<(String, String)> {
+        crate_root_glob_exports()
+            .into_iter()
+            .map(|export| (format!("crate::{}", export.name), export.module))
             .collect()
     }
 
@@ -115,12 +130,61 @@ mod isolation {
     }
 
     #[test]
+    fn chat_v2_never_reaches_v1_through_a_crate_root_re_export() {
+        let scan = SourceScan::of_chat_v2();
+        let derived = forbidden_crate_root_names();
+        assert!(
+            derived.len() > 20,
+            "the derivation found only {} crate-root names, so it is not reading lib.rs",
+            derived.len()
+        );
+
+        let mut violations = Vec::new();
+        for (needle, module) in &derived {
+            for finding in scan.findings(needle) {
+                violations.push(format!(
+                    "{} — {needle} is `{module}` hoisted to the crate root",
+                    finding.describe()
+                ));
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "chat_v2 must not reach a crate-root re-export; v2 defines its own \
+             types, and these names are v1's surface under a shorter spelling:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_derivation_covers_the_spellings_that_defeated_every_gate() {
+        // The two the review found, named explicitly — not as the rule, but as
+        // proof that the rule reaches them. If the derivation ever stops
+        // covering these, it has stopped reading the re-export surface.
+        let derived = forbidden_crate_root_names();
+        for (name, module) in [
+            (["MLS", "Context"].concat(), "api"),
+            (["Mls", "Engine"].concat(), "engine"),
+        ] {
+            let needle = format!("crate::{name}");
+            let found = derived
+                .iter()
+                .find(|(candidate, _)| *candidate == needle)
+                .unwrap_or_else(|| panic!("{needle} must be derived from the crate root"));
+            assert_eq!(found.1, module, "{needle} comes from `{module}`");
+        }
+    }
+
+    #[test]
     fn the_isolation_check_can_actually_fail() {
         // A gate that cannot fail is not a gate. This proves the matcher would
-        // catch a real import rather than silently passing on every input —
-        // including the brace form, which is what an import organizer emits and
-        // which the previous substring matcher missed entirely.
-        let forbidden = forbidden_imports();
+        // catch a real import rather than silently passing on every input,
+        // across every evasion form the review found: the brace form an import
+        // organizer emits, a string literal holding a slash pair, and the
+        // crate-root spellings that name no module path at all.
+        let mut needles = forbidden_imports();
+        needles.extend(forbidden_crate_root_names().into_iter().map(|(n, _)| n));
+
         for offending in [
             format!("use crate::{V1_MODULE}::types::ConversationState;"),
             format!(
@@ -128,9 +192,12 @@ mod isolation {
                 "crate", "{", "}"
             ),
             format!("let doc = \"https://x\"; use crate::{V1_MODULE}::X;"),
+            format!("use crate::{};", ["MLS", "Context"].concat()),
+            format!("use crate::{};", ["Mls", "Engine"].concat()),
+            format!("use crate::{}{}{};", "{", ["MLS", "Context"].concat(), "}"),
         ] {
             assert!(
-                forbidden
+                needles
                     .iter()
                     .any(|needle| SourceScan::line_contains(&offending, needle)),
                 "the matcher must flag: {offending}"
@@ -141,10 +208,24 @@ mod isolation {
         // which has to name the forbidden path in order to forbid it.
         let documented = format!("//! - No module may use crate::{V1_MODULE}::... here.");
         assert!(
-            !forbidden
+            !needles
                 .iter()
                 .any(|needle| SourceScan::line_contains(&documented, needle)),
             "a mention inside a comment must not count as a violation"
         );
+
+        // The over-refusal control: chat_v2's own paths must stay legal, or the
+        // gate would forbid the tree it is protecting.
+        for legitimate in [
+            "use crate::chat_v2::ids::Seq;",
+            "use crate::chat_v2::transcript::EnvelopeVerification;",
+        ] {
+            assert!(
+                !needles
+                    .iter()
+                    .any(|needle| SourceScan::line_contains(legitimate, needle)),
+                "the gate must not flag chat_v2's own paths: {legitimate}"
+            );
+        }
     }
 }

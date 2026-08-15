@@ -178,6 +178,146 @@ impl SourceScan {
     }
 }
 
+/// A name the crate root hoists out of a module, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrateRootName {
+    /// The bare name, reachable as `crate::<name>`.
+    pub name: String,
+    /// The module the crate root re-exported it from.
+    pub module: String,
+}
+
+/// Every name reachable as `crate::<name>` because `lib.rs` re-exports it.
+///
+/// This exists because a needle list keyed to *module paths* is defeated by
+/// construction the moment the crate root globs a module. `src/lib.rs` carries
+/// six `pub use <mod>::*;` lines, so `use crate::MLSContext;` reaches v1's whole
+/// SQLCipher group and crypto surface — `create_group`, `encrypt_message`,
+/// `delete_group` — while naming neither `crate::orchestrator` nor
+/// `mls_context`, and every gate passed it. `use crate::MlsEngine;` is the same
+/// hole through `engine`.
+///
+/// Listing the two spellings would have been a patch. Deriving the set from the
+/// re-export surface makes the coverage automatic: add a `pub use` glob to
+/// `lib.rs`, or a `pub` item to a module already globbed, and it is forbidden in
+/// `chat_v2` without anyone remembering to extend a list.
+///
+/// # Why not a compile-fail test
+///
+/// The obvious stronger mechanism is a `trybuild` compile-fail case carrying
+/// the evasion spellings, and it does not work here — for a reason worth
+/// recording so nobody reaches for it again. `trybuild` asserts that code
+/// **fails to compile**. `use crate::MLSContext;` inside `chat_v2` compiles
+/// perfectly, which *is* the defect; there is no compile error to assert.
+/// Turning it into one means narrowing the `lib.rs` globs, and those are the
+/// crate's public API, consumed by the UniFFI scaffolding and by downstream
+/// platforms — not this lane's to narrow. So the mechanism is a derivation,
+/// and no dependency was added.
+///
+/// # What it reads, and what it does not
+///
+/// Both re-export forms in `lib.rs`: `pub use <mod>::*;`, whose source module is
+/// then scanned for `pub` items, and `pub use <mod>::<Name>;`, which names its
+/// own. Renames (`pub use x as y;`) and crate-level aliases are skipped — they
+/// hoist a name this scan would misreport, and a rename of a v1 module into
+/// `chat_v2`'s reach would be a deliberate act rather than an editor accident.
+///
+/// It is **depth one**. A module that itself globs a third module hoists that
+/// module's names too, and those are not derived here. Nothing in `lib.rs` does
+/// that today, and the assertion on the derived count is what would make its
+/// arrival visible.
+pub fn crate_root_glob_exports() -> Vec<CrateRootName> {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
+
+    let mut found = Vec::new();
+    for line in lib.lines() {
+        let code = code_only(line);
+        let trimmed = code.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("pub use ")
+            .and_then(|rest| rest.strip_suffix(';'))
+        else {
+            continue;
+        };
+        if rest.contains(" as ") {
+            continue;
+        }
+        let Some((module, tail)) = rest.split_once("::") else {
+            continue;
+        };
+        if !is_plain_ident(module) {
+            continue;
+        }
+
+        if tail == "*" {
+            for name in module_pub_items(&src, module) {
+                found.push(CrateRootName {
+                    name,
+                    module: module.to_owned(),
+                });
+            }
+        } else if is_plain_ident(tail) {
+            found.push(CrateRootName {
+                name: tail.to_owned(),
+                module: module.to_owned(),
+            });
+        }
+    }
+    found
+}
+
+fn is_plain_ident(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+/// The `pub` items a module declares, as the crate root would hoist them.
+fn module_pub_items(src: &Path, module: &str) -> Vec<String> {
+    let path = [
+        src.join(format!("{module}.rs")),
+        src.join(module).join("mod.rs"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists())
+    .unwrap_or_else(|| panic!("a glob-re-exported module must have a source file: {module}"));
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
+
+    let keywords = [
+        "struct ", "enum ", "trait ", "type ", "fn ", "const ", "static ", "union ", "mod ",
+    ];
+    let mut names = Vec::new();
+    for line in source.lines() {
+        let code = code_only(line);
+        let trimmed = code.trim();
+        let Some(rest) = trimmed.strip_prefix("pub ") else {
+            continue;
+        };
+        // `pub async fn`, `pub unsafe fn`, `pub extern "C" fn` all reach `fn`.
+        let rest = rest
+            .strip_prefix("async ")
+            .or_else(|| rest.strip_prefix("unsafe "))
+            .unwrap_or(rest);
+        let Some(after) = keywords
+            .iter()
+            .find_map(|keyword| rest.strip_prefix(keyword))
+        else {
+            continue;
+        };
+        let name: String = after
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        if !name.is_empty() {
+            names.push(name);
+        }
+    }
+    names
+}
+
 /// Strips a line comment, with knowledge of what is inside a literal.
 ///
 /// The evasion this closes: `let url = "https://x"; use crate::orchestrator::Y;`
