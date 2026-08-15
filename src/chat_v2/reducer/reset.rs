@@ -40,6 +40,44 @@
 //! seq, so the existing rule that entries below an opening are never visible is
 //! what keeps the pre-reset history inaccessible. Both halves are pinned by
 //! tests below.
+//!
+//! # Correction to `HANDOFF.md` §4: this is not a reanchor
+//!
+//! An earlier draft of the handoff said the non-leaf activator "opens its first
+//! `Reset` interval at the reset row via `reanchor`". **It does not, and it
+//! cannot.** [`super::reanchor::ReanchorAuthority`] is a closed two-variant enum
+//! naming the only sources §6 accepts as reanchor proof — a verified Welcome and
+//! a verified post-join opening — and reset activation is neither. Widening it
+//! would have dissolved the prohibition that enum exists to enforce, so case 2
+//! got its own private path ([`ApplicationReducer::open_activator_genesis`]) and
+//! `ReanchorAuthority` was left untouched.
+//!
+//! No new authority marker type was introduced for reset either. The row's
+//! [`OuterEntryFingerprint`] is already constructible only by the
+//! envelope-verification layer, which is the same structural gate
+//! `ReanchorAuthority` provides; a single-variant marker enum alongside it would
+//! be invented surface excluding nothing the fingerprint does not already
+//! exclude.
+//!
+//! # "Not an old leaf" means not a leaf *at the reset*
+//!
+//! A device removed at seq 3 can activate a reset at seq 20, so a non-leaf
+//! activator may still carry an older closed interval. The admitting sentence is
+//! §5, verbatim:
+//!
+//! > `activateReset` is uniformly active-admin-only: an active registered device
+//! > of an active admin DID may activate without being an old-generation leaf.
+//!
+//! Interval history is therefore not an admission criterion. Whether the device
+//! is currently active, registered, and admin is the *authority* layer's
+//! question and is answered server-side; the reducer's job is only the schedule
+//! constraint, which is that the new opening must clear any earlier close
+//! strictly. That separation is why the refusals here are the neutral interval
+//! errors rather than a reset-specific one — a bespoke error would encode
+//! admission policy into the schedule layer, where it does not belong.
+//!
+//! This reading is pinned by
+//! `a_previously_removed_activator_opens_after_a_strict_gap`.
 
 use super::{ApplicationReducer, ReducerError, SequentialClose, TouchingBoundary};
 use crate::chat_v2::coordinate::Coordinate;
@@ -504,6 +542,15 @@ mod tests {
         // "Not an old leaf" does not mean "never a leaf". A device removed at
         // seq 3 and later activating a reset at seq 20 opens a fresh interval,
         // and the gap between them stays inaccessible.
+        //
+        // The exact sentence this rests on is §5: "`activateReset` is uniformly
+        // active-admin-only: an active registered device of an active admin DID
+        // may activate without being an old-generation leaf." Interval history
+        // is not an admission criterion, so a device with a closed interval is
+        // admitted and constrained only by the strict-gap schedule rule.
+        // Admission itself is the authority layer's question, answered
+        // server-side, which is why the refusal below is a neutral interval
+        // error and not a reset-specific one.
         let mut reducer = old_leaf();
         reducer
             .close_interval(&SequentialClose {

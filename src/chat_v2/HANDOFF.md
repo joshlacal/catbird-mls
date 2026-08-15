@@ -1,12 +1,12 @@
 # chat_v2 — Task 3 handoff
 
 State of the clean chat protocol (`blue.catbird.chat.*`) client implementation
-as of the eleventh sealed slice. Written for the session that continues it.
+as of the fourteenth sealed slice. Written for the session that continues it.
 
 Workspace: `catbird-mls-task3-ws` (isolated jj workspace; Josh's default
 workspace is untouched and must stay that way).
 
-Verification at handoff: **399 lib tests pass, 0 failures.** `cargo fmt
+Verification at handoff: **431 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib --all-targets` reports zero warnings under
 `chat_v2`, `wasm32-unknown-unknown` builds.
 
@@ -14,7 +14,7 @@ Verification at handoff: **399 lib tests pass, 0 failures.** `cargo fmt
 
 ## 1. Sealed commits
 
-Eleven, oldest first. All additive; the only pre-existing file touched is
+Fourteen, oldest first. All additive; the only pre-existing file touched is
 `src/lib.rs` (three lines declaring the module).
 
 | Change | Commit | What |
@@ -30,6 +30,28 @@ Eleven, oldest first. All additive; the only pre-existing file touched is
 | `zxryzskq` | `7c8f7a20` | Interval closure, verified reanchor, touching boundaries (6b) |
 | `oukpxxkq` | `3d54a64c` | Reset-activator classification (6c) |
 | `nzvoxxxn` | `0b02a553` | The two Terminal modes (6d) |
+| `twsmwtww` | `a16e4fe5` | Handoff refresh for the built reducer |
+| `kszmquql` | `6309353f` | Canonical signing transcript, byte-identical to mls-ds (S7a) |
+| `xyxvwryy` | `6d88c594` | Strict signed-wrapper decode and Ed25519 verification (S7b) |
+
+### The detached-HEAD trap — read before concluding a server file is missing
+
+`mls-ds`'s working tree is checked out at a **detached revision that predates
+the clean-chat work**. `server/src/chat_protocol/transcript.rs` and
+`server/tests/fixtures/*.json` are **not on disk there**, and a filesystem
+search finds only stale copies under `.codex-workspaces/` lanes. They are
+tracked on `main` and must be read through git:
+
+```sh
+cd Catbird+Petrel/mls-ds
+/usr/bin/git ls-tree -r --name-only main -- server/src/chat_protocol/
+/usr/bin/git show main:server/src/chat_protocol/transcript.rs
+```
+
+This session nearly concluded the transcript implementation did not exist.
+Absence proofs need positive controls: before reporting a server file missing,
+check `git ls-tree` on `main`, not just the working tree. Git stays read-only
+here — `show`/`ls-tree`/`rev-parse` only, never a checkout.
 
 ### Known pre-existing breakage, not ours
 
@@ -107,6 +129,11 @@ chat_v2/
   provenance.rs fingerprints, close kinds, hint-vs-authority split
   coordinate.rs full coordinate + transition relations
   interval.rs   interval provenance, adjacency, schedule terminal proof
+  transcript/   canonical signing transcript (S7a) + strict decode/verify (S7b)
+    value.rs    the canonical value model; UUID-as-bytes lives here
+    strict_json.rs  the strict JSON profile and STANDARD base64
+    signed.rs   two-field wrapper, verify_strict, key-ID binding
+    vectors/    vendored server golden vectors + PROVENANCE.md
   reducer/
     mod.rs      sequencing core (6a)
     reanchor.rs closure, reanchor, touching boundaries (6b)
@@ -263,15 +290,61 @@ implementation rather than inventing one. `mls-ds` main,
   JSON-decode/projection half is hand-rolled. Mirror the hand-roll with shared
   vectors rather than substituting a differently-opinionated crate.
 
-**PROGRAM INVARIANT I-1 (dual bytes encoding)** — binding on all clients, and
-verified against current code at handoff. Signed request bodies use the
-certified transcript canonical form with **bare STANDARD base64** for bytes, and
-the signature binds to *that* form. Jacquard's `{"$bytes": ...}` DAG-JSON
-encoding is authoritative **only** for responses and unsigned params. The two
-forms are mutually exclusive. The server extracts signed-body bytes via
-mutation projection, never a generated-DTO parse; S7 must do the client half, so
-every signer and verifier round-trips against
-`decode_canonical_signed_mutation`'s semantics.
+**PROGRAM INVARIANT I-1 — CORRECTED AND RATIFIED 2026-08-15.** The earlier
+wording of I-1 (kept below for recognition) was **defective, not merely
+imprecise**: a client implementing it literally would sign a canonical *JSON*
+form and produce valid-looking signatures that every server rejects — which is
+the exact failure class I-1 exists to prevent. The erratum is sealed at the
+program level in `docs/mls-v2/2026-08-15-invariant-i1-erratum.md` (workspace
+root, commit `80969765`) and supersedes every earlier statement by name.
+
+> ~~Signed request bodies use the certified transcript canonical form with bare
+> STANDARD base64 for bytes, and the signature binds to *that* form.~~
+
+The corrected invariant, in two halves that must not be conflated:
+
+- **Wire input.** A signed request body is strict JSON in which bytes fields are
+  **bare canonical STANDARD base64** — padded, standard alphabet, and
+  re-encode-compared so a non-canonical spelling of the same bytes is refused.
+  Jacquard's `{"$bytes": …}` DAG-JSON remains authoritative **only** for
+  responses and unsigned params.
+- **The signed transcript.** What Ed25519 actually signs is
+
+  ```text
+  transcript = domain-with-trailing-NUL || DAG-CBOR(projected body)
+  digest     = SHA-256(transcript)
+  ```
+
+  **Base64 never appears in the signed bytes at all.** It is only how bytes
+  arrive before projection.
+
+`src/chat_v2/transcript/` is the reference implementation (commit `6309353f`).
+
+### The four byte-identity traps
+
+Each is pinned by a test that fails if someone "corrects" it.
+
+1. **Signing domains carry a literal trailing NUL, and the domain appears
+   TWICE** — once as the transcript prefix, and again inside the body as the
+   `signatureDomain` field, whose UTF-8 bytes must equal the domain NUL
+   included. The golden fixture really does contain
+   `"CATBIRD-CHAT-BLOB-DELETE "`. Retyping a domain without the NUL is the
+   natural mistake and changes every signature that kind produces.
+2. **UUIDs serialize as 16 RAW bytes**, per the fixture's `uuidByteFields` list
+   (`actorDeviceId`, `blobId`, `idempotencyKey`), while **DIDs, key thumbprints,
+   and timestamps stay strings**. Emitting a UUID's hyphenated ASCII form gives
+   a structurally valid transcript with entirely different bytes.
+3. **The signed wrapper is exactly two fields** — `body` and `signature`, the
+   latter 64 bytes. A third field is refused, not ignored.
+4. **DAG-CBOR map keys are ordered LENGTH-FIRST**, not byte-lexicographically.
+   The golden body emits `$type, keyId, blobId, actorDid`; the `BTreeMap`
+   holding it iterates `actorDid, blobId, keyId, $type`. **Never reimplement
+   this ordering** — share `serde_ipld_dagcbor` with the server, which is what
+   makes the agreement structural instead of a rule someone has to remember.
+
+Plus: verification is dalek's `verify_strict` (not `verify`), and the body's
+`keyId` must be re-derived from the supplied public key and compared **before**
+the signature is checked.
 
 **Never serialize generated DTOs** for transcripts or fingerprints. They emit
 fields alphabetically and carry a flattened `extra_data` catch-all, and the spec
