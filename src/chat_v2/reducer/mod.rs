@@ -17,10 +17,12 @@
 //! - once a schedule is terminalized, nothing later is accepted.
 //!
 //! Interval closure, reanchor after a gap, and legal touching boundaries live
-//! in [`reanchor`]. The reset-activator classification and the two Terminal
-//! paths are still separate concerns and land in their own sub-slices. What is
-//! built refuses them by name rather than half-implementing them, so an unbuilt
-//! path cannot be mistaken for a permissive one.
+//! in [`reanchor`]. The three reset-activator roles live in [`reset`], which
+//! classifies rather than trusts a caller's claim about which role a device
+//! held. The two Terminal paths are still a separate concern and land in their
+//! own sub-slice; what is built refuses them by name rather than
+//! half-implementing them, so an unbuilt path cannot be mistaken for a
+//! permissive one.
 //!
 //! # Why sequences alone are never enough
 //!
@@ -30,8 +32,10 @@
 //! a row an adversary can most easily arrange to look correct.
 
 pub mod reanchor;
+pub mod reset;
 
 pub use reanchor::{ReanchorAuthority, SequentialClose, TouchingBoundary};
+pub use reset::{ResetActivation, ResetParticipation, ResetRole};
 
 use super::coordinate::Coordinate;
 use super::ids::Seq;
@@ -106,6 +110,13 @@ pub enum ReducerError {
     /// that proof would leave the schedule un-terminalized while looking
     /// finished — so it is refused by name rather than silently mishandled.
     TerminalRequiresScheduleProof { seq: Seq },
+    /// A reset activation retired nothing and opened nothing on this schedule.
+    ///
+    /// A registered sibling or roster-only device may legitimately *see* the
+    /// reset control row, but §6 gives a reset exactly three effects on an
+    /// exact-device schedule and "no effect" is not one of them. Routing the row
+    /// to a reducer it does not touch is a caller mistake worth naming.
+    ResetAffectsNoInterval { seq: Seq },
     /// An interval-level rule was violated.
     Interval(IntervalError),
 }
@@ -164,6 +175,10 @@ impl fmt::Display for ReducerError {
             Self::TerminalRequiresScheduleProof { seq } => write!(
                 f,
                 "terminal close at {seq} must atomically install the schedule proof"
+            ),
+            Self::ResetAffectsNoInterval { seq } => write!(
+                f,
+                "reset at {seq} retires no interval and opens none on this schedule"
             ),
             Self::Interval(err) => write!(f, "{err}"),
         }
