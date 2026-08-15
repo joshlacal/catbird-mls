@@ -225,8 +225,8 @@ grammar; consequently, `did:web:a.b` is invalid despite satisfying the
 ruling in `ids/did.rs`, because a reader seeing only the grammar would conclude
 it is valid.
 
-**OPEN — under a veto window, not yet ratified: may a previously removed device
-activate a reset?** The reading built into `reducer/reset.rs` is **yes**. §5
+**RATIFIED (Josh, 2026-08-15): a previously removed device MAY activate a
+reset.** The reading built into `reducer/reset.rs` is **yes**. §5
 says `activateReset` is "uniformly active-admin-only: an active registered
 device of an active admin DID may activate **without being an old-generation
 leaf**", so interval history is not an admission criterion — "not an old leaf"
@@ -241,9 +241,10 @@ That is why the refusals there are the neutral interval errors rather than a
 reset-specific one — a bespoke error would encode admission policy into the
 schedule layer, where it does not belong.
 
-Josh has a veto window on this. If it is overruled it is a **one-line change**,
-and the anchors are exact: the §5 sentence is quoted verbatim in
-`reducer/reset.rs`'s module docs and again in the comment on
+Josh held a veto window on this and declined to exercise it on 2026-08-15,
+ratifying the staged active-admin interpretation. The window is CLOSED; no code
+change follows. The anchors remain exact for future readers: the §5 sentence is
+quoted verbatim in `reducer/reset.rs`'s module docs and again in the comment on
 `a_previously_removed_activator_opens_after_a_strict_gap`. Do not re-derive the
 reasoning — read those two places.
 
@@ -654,7 +655,11 @@ Traps recorded because each cost time or would have:
   nothing. An earlier version did exactly that and failed.
 - **Segmentation and normalization are different crates.** Both report Unicode
   17.0.0 and a test asserts they agree with each other and with the pin; a
-  mismatch would be a cross-version seam.
+  mismatch would be a cross-version seam. The `unicode-normalization` 0.1.25
+  addition sat under a new-dependency veto window; Josh declined the veto on
+  2026-08-15 — strict Unicode 17 NFC **validation** stays, and normalization is
+  never applied (the "checked, never applied" rule below is ratified behavior,
+  not a provisional choice).
 - **Byte bounds are UTF-8 bytes, not characters** — character-counting accepts
   roughly twice the permitted data.
 - **The AT URI and external-link grammars disagree about percent signs on
