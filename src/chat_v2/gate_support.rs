@@ -41,6 +41,13 @@
 //!
 //! They prove a token is absent **from `src/chat_v2`**. That is the whole
 //! claim, and it is worth stating because the natural reading is stronger.
+//! The claim leans on two assumptions the final re-probe showed can fail, so
+//! both are now asserted rather than assumed by
+//! `no_module_relocation_and_no_root_aliasing` in `chat_v2/mod.rs`: the files
+//! in the directory are the files in the module tree (a `#[path]` attribute
+//! can relocate one outside the walk), and the needle roots are the only
+//! spellings of themselves (`use crate as x;` mints a new one). Both
+//! mechanisms are refused outright; neither has a legitimate use here.
 //!
 //! A thin wrapper living in the v1 tree — a function in `src/orchestrator` that
 //! calls the forbidden thing, re-exported under an innocent name — is invisible

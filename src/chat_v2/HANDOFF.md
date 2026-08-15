@@ -59,7 +59,8 @@ section no longer carries open work.
 | review micro-round | `4e2fa917` | depth-two guard made enforced, nested-tail re-exports derived, vector verdict below |
 | ratifications | `32166d6d` | §5 active-admin interpretation + unicode-normalization dep, both ratified by Josh |
 | spot-check closures | `c44bb56e` | the four `use`-shape escapes the micro-round spot-check found, all closed |
-| F-5 single-super | (this seal) | `chat_v2/mod.rs`'s own `super` is the crate root; both needle families now carry the super spelling |
+| F-5 single-super | `b995b0c1` | `chat_v2/mod.rs`'s own `super` is the crate root; both needle families now carry the super spelling |
+| F-6/F-7 walk boundary | (this seal) | `#[path]` relocation and crate-root aliasing refused as mechanisms; reviewer's final verdict recorded |
 
 **Micro-round (post-re-verification), three closures.** (1) The derivation's
 depth-one limit was *documented* as guarded by a count assertion that did not
@@ -114,6 +115,27 @@ module's own legitimate `super::<Name>` reference would over-refuse toward
 the safe direction; the recorded resolution is to spell the local item by its
 full `crate::chat_v2::…` path. All six spellings are pinned in
 `the_isolation_check_can_actually_fail`.
+
+**F-6/F-7, the walk boundary, found by the final adversarial sweep and closed
+in the next seal.** Three rounds of probing attacked what the gates match
+(needles) and how they read declarations (the parser); the final sweep
+attacked what they WALK. `SourceScan::of_chat_v2()` scans a directory, and
+Rust module membership is not directory membership: a `#[path]` attribute
+relocated a chat_v2 module's file outside the walk (F-6 — invisible to every
+gate at once, the include-hole's blast radius through a different door), and
+`use crate as v1root;` minted a root spelling no needle family covers (F-7).
+Both proven by compilation with bogus-name controls. Closed by refusing the
+MECHANISMS in `no_module_relocation_and_no_root_aliasing`: relocation
+attributes and root aliasing have no legitimate use in this tree, so their
+appearance is a failure regardless of what they point at. The reviewer's
+final verdict on the gate stack: sound and genuinely adversarial — every
+gate made to fail on demand across three rounds, each fix class-level and
+holding against unenumerated shapes. The accurate claim, stated so nobody
+reads it stronger: **no file under `src/chat_v2` names v1 under any spelling
+the derivation covers, the scanned set is asserted to be the compiled set,
+and the needle roots are asserted to be the only root spellings.** What
+remains outside the boundary is the chartered F8 wrapper (a v1-tree accomplice
+edit), which no directory-scoped scan can see.
 
 **F9 is the one worth reading before touching a gate.** `use crate::MLSContext;`
 inside `chat_v2` compiled, reached v1's SQLCipher group and crypto surface, and

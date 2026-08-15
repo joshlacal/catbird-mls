@@ -126,6 +126,79 @@ mod isolation {
             .collect()
     }
 
+    /// The walk boundary, asserted rather than assumed.
+    ///
+    /// Every needle gate scans the DIRECTORY `src/chat_v2`, and Rust module
+    /// membership is not directory membership. The final re-probe proved two
+    /// deliberate-act escapes through that seam, each with a compile-time
+    /// positive control: a `#[path]` attribute relocating a chat_v2 module's
+    /// source file outside the walk (invisible to every gate at once — the
+    /// same blast radius the unresolved-include assertion exists to prevent),
+    /// and a crate-root alias (`use crate as x;`) that reaches v1 under a
+    /// spelling no needle family covers. Neither mechanism has a legitimate
+    /// use in this tree, so both are refused outright — the mechanism, not
+    /// the instance — which keeps the scanned set provably the compiled set
+    /// and the needle roots provably the only root spellings.
+    ///
+    /// A known residue, recorded rather than covered: a `cfg_attr`-wrapped
+    /// path attribute is matched by the second relocation needle, but stranger
+    /// attribute machinery would be a review event, same category as the
+    /// chartered F8 wrapper.
+    #[test]
+    fn no_module_relocation_and_no_root_aliasing() {
+        let scan = SourceScan::of_chat_v2();
+        assert!(
+            scan.file_count() > 0,
+            "the walk found no sources, so this test would pass vacuously"
+        );
+
+        // Assembled at runtime so this file does not flag itself; the
+        // whitespace inside the alias needles is removed by the same
+        // normalization applied to the scanned code, so a spaced or wrapped
+        // spelling of either mechanism still matches.
+        let relocations = [["#[", "path"].concat(), [",", " path", " ="].concat()];
+        let aliases = [
+            ["crate", " as "].concat(),
+            ["super", " as "].concat(),
+            ["catbird_mls", " as "].concat(),
+            ["extern ", "crate "].concat(),
+        ];
+
+        // Positive controls, built through the real matcher: each mechanism's
+        // canonical spelling and its spaced variant must be findable, or the
+        // silence below means nothing.
+        for control in [
+            format!("{}{} = \"../smuggled.rs\"]", "#[", "path"),
+            format!("{}{} {} = \"../smuggled.rs\"]", "#[", " ", "path"),
+            format!("cfg_attr(test,{} = \"../smuggled.rs\")", " path"),
+            format!("use {}{}v1root;", "crate", " as "),
+            format!("pub use {}{}v1root;", "super", " as "),
+            format!("{}{}mls;", "extern ", "crate "),
+        ] {
+            assert!(
+                relocations
+                    .iter()
+                    .chain(aliases.iter())
+                    .any(|needle| SourceScan::line_contains(&control, needle)),
+                "a mechanism control must be matchable: {control}"
+            );
+        }
+
+        let violations: Vec<String> = relocations
+            .iter()
+            .chain(aliases.iter())
+            .flat_map(|needle| scan.findings(needle))
+            .map(|finding| finding.describe())
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "chat_v2 must not relocate a module's file outside the scanned tree \
+             or alias a needle root under a new name; both mechanisms defeat \
+             every gate at once and neither has a legitimate use here:\n{}",
+            violations.join("\n")
+        );
+    }
+
     #[test]
     fn chat_v2_never_imports_the_superseded_orchestrator() {
         let scan = SourceScan::of_chat_v2();
