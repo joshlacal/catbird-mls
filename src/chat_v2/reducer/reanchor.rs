@@ -58,6 +58,14 @@ pub enum ReanchorAuthority {
 }
 
 /// An authenticated control row that closes this device's open interval.
+///
+/// The fields are public, and the `outer_entry_fingerprint` is what keeps that
+/// from meaning "anyone can assemble a close": only the envelope-verification
+/// layer can mint one. What construction does **not** check is that the other
+/// fields describe the same row as that fingerprint — a caller holding a
+/// genuine fingerprint could pair it with a different sequence or kind. The
+/// reducer cannot detect that, because it never sees the bytes the fingerprint
+/// was taken over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequentialClose {
     /// The closing row's append sequence.
@@ -322,7 +330,7 @@ mod tests {
             seq: seq(at),
             kind,
             transition_id: TransitionId::parse(TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x11; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x11; 32]),
             context,
         }
     }
@@ -334,7 +342,7 @@ mod tests {
             previous,
             kind,
             transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
         }
     }
 
@@ -590,7 +598,7 @@ mod tests {
             close_kind,
             opening_kind,
             transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
             previous,
             opening_context,
         }

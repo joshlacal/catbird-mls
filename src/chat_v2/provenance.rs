@@ -24,6 +24,7 @@
 //! fingerprint at all — cannot manufacture one.
 
 use super::ids::{BareDid, CanonicalTimestamp, ConversationId, DeviceId, Seq, TransitionId};
+use super::transcript::EnvelopeVerification;
 use core::fmt;
 
 /// The raw SHA-256 of an entry's canonical signing transcript.
@@ -58,21 +59,42 @@ impl fmt::Display for RequestDigest {
 
 /// The immutable outer fingerprint of an authenticated append-log entry.
 ///
-/// Constructed only by the envelope-verification layer, after the entry shape,
-/// conversation binding, canonical transcript, and Ed25519 signature have all
-/// been checked. That ordering is the protocol's central rule — validation
-/// precedes fingerprinting, which precedes any use of the row as reducer
-/// provenance — and making the constructor the verifier's job is what keeps an
-/// unverified row from producing one.
+/// Constructible **only** by the envelope-verification layer, which is enforced
+/// rather than requested: the constructor takes an [`EnvelopeVerification`]
+/// token whose own constructor is visible no further than
+/// [`crate::chat_v2::transcript`]. A module holding thirty-two bytes and no
+/// token cannot produce one of these.
+///
+/// That closes the mint. It is not by itself the whole ordering rule —
+/// validation precedes fingerprinting, which precedes any use of the row as
+/// reducer provenance — because a fingerprint can still be computed over a row
+/// a caller assembled. What the token guarantees is that every fingerprint in
+/// existence is a real digest over a canonical projection; what enforces the
+/// *signature* half, on the application path, is that the value is reachable
+/// only through a sender-bound verified entry. See [`EnvelopeVerification`] for
+/// the exact division, including what the control path does not yet guarantee.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OuterEntryFingerprint([u8; 32]);
 
 impl OuterEntryFingerprint {
-    /// Adopts a fingerprint computed by the envelope-verification layer.
+    /// Adopts a fingerprint the envelope-verification layer just computed.
     ///
-    /// Callers outside that layer should be receiving an already-constructed
-    /// value rather than calling this.
-    pub fn from_verified(fingerprint: [u8; 32]) -> Self {
+    /// The token is the gate. Callers outside that layer receive an
+    /// already-constructed value; they cannot call this.
+    pub fn from_verified(fingerprint: [u8; 32], _computed_here: EnvelopeVerification) -> Self {
+        Self(fingerprint)
+    }
+
+    /// Mints a fingerprint from arbitrary bytes, for tests only.
+    ///
+    /// Absent from a release build, in the same structural way the reference
+    /// store is: the schedule types are exercised across the whole tree with
+    /// stand-in provenance, and routing every one of those fixtures through a
+    /// real transcript would test the transcript rather than the schedule. A
+    /// symbol that does not exist outside `cfg(test)` cannot leak into the path
+    /// this gate protects.
+    #[cfg(test)]
+    pub fn for_tests(fingerprint: [u8; 32]) -> Self {
         Self(fingerprint)
     }
 
@@ -292,7 +314,7 @@ mod tests {
             ConversationId::parse(conversation).unwrap(),
             seq(close_seq),
             TransitionId::parse(TRANSITION).unwrap(),
-            OuterEntryFingerprint::from_verified([0x5a; 32]),
+            OuterEntryFingerprint::for_tests([0x5a; 32]),
             BareDid::parse(DID).unwrap(),
             DeviceId::parse(CLOSER_DEVICE).unwrap(),
         )
@@ -397,7 +419,7 @@ mod tests {
         // inputs, so they are never interchangeable. Equal bytes here must
         // still be different types.
         let digest = RequestDigest::new([0x11; 32]);
-        let fingerprint = OuterEntryFingerprint::from_verified([0x11; 32]);
+        let fingerprint = OuterEntryFingerprint::for_tests([0x11; 32]);
         assert_eq!(digest.as_bytes(), fingerprint.as_bytes());
         assert_eq!(digest.to_string(), fingerprint.to_string());
         // `digest == fingerprint` does not compile, which is the point.
@@ -405,7 +427,7 @@ mod tests {
 
     #[test]
     fn fingerprints_render_as_lowercase_hex() {
-        let fingerprint = OuterEntryFingerprint::from_verified([0xab; 32]);
+        let fingerprint = OuterEntryFingerprint::for_tests([0xab; 32]);
         assert_eq!(fingerprint.to_string(), "ab".repeat(32));
         assert_eq!(fingerprint.to_string().len(), 64);
     }

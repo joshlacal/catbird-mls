@@ -437,7 +437,7 @@ mod tests {
             seq: seq(at),
             kind,
             transition_id: TransitionId::parse(transition).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([fingerprint; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([fingerprint; 32]),
             context,
         }
     }
@@ -447,7 +447,7 @@ mod tests {
             seq: seq(at),
             kind,
             transition_id: TransitionId::parse(transition).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([fingerprint; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([fingerprint; 32]),
         }
     }
 
@@ -768,7 +768,7 @@ mod tests {
             binding(DEVICE),
             seq(10),
             TransitionId::parse(TRANSITION).unwrap(),
-            OuterEntryFingerprint::from_verified([0x5a; 32]),
+            OuterEntryFingerprint::for_tests([0x5a; 32]),
         );
         assert!(proof.binding().matches(&binding(DEVICE)));
         assert!(
@@ -793,7 +793,7 @@ mod tests {
             binding(DEVICE),
             seq(10),
             TransitionId::parse(TRANSITION).unwrap(),
-            OuterEntryFingerprint::from_verified([0x5a; 32]),
+            OuterEntryFingerprint::for_tests([0x5a; 32]),
         );
 
         assert_eq!(closed.close().unwrap().seq, seq(3));

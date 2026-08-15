@@ -244,7 +244,7 @@ mod tests {
         PersistedEntry {
             seq: Seq::new(seq_value).unwrap(),
             entry_id: EntryId::parse(ENTRY).unwrap(),
-            fingerprint: OuterEntryFingerprint::from_verified([0x11; 32]),
+            fingerprint: OuterEntryFingerprint::for_tests([0x11; 32]),
             outcome,
         }
     }
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(stored.entry_id, EntryId::parse(ENTRY).unwrap());
         assert_eq!(
             stored.fingerprint,
-            OuterEntryFingerprint::from_verified([0x11; 32])
+            OuterEntryFingerprint::for_tests([0x11; 32])
         );
     }
 }

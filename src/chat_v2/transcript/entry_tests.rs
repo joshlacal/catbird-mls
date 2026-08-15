@@ -144,8 +144,19 @@ fn a_well_formed_signed_entry_verifies_end_to_end() {
     assert_eq!(entry.mutation().kind(), SignedMutationKind::ApplicationSend);
 
     // The fingerprint is produced as part of verification, so provenance can
-    // never be recorded for a row whose signature was not checked.
-    assert_eq!(entry.fingerprint().fingerprint().as_bytes().len(), 32);
+    // never be recorded for a row whose signature was not checked — and it is
+    // reachable only after the sender leaf has been bound, so it can never be
+    // recorded for a row whose sender was not checked either.
+    let sender = BasicCredential::new(
+        BareDid::parse(DID).unwrap(),
+        DeviceId::parse(DEVICE).unwrap(),
+    );
+    let bound = entry
+        .bind_sender(&sender.to_identity_bytes())
+        .expect("the matching leaf must bind");
+    assert_eq!(bound.fingerprint().fingerprint().as_bytes().len(), 32);
+    assert_eq!(bound.sender(), &sender);
+    assert_eq!(bound.entry().seq(), 42);
 }
 
 #[test]
@@ -263,13 +274,10 @@ fn the_authenticated_sender_must_be_the_verified_outer_actor() {
     );
     assert_eq!(entry.outer_actor().unwrap(), expected);
 
-    // The matching leaf is accepted and returned.
-    assert_eq!(
-        entry
-            .require_sender_is_outer_actor(&expected.to_identity_bytes())
-            .unwrap(),
-        expected
-    );
+    // The matching leaf is accepted, and what it yields is the capability the
+    // fingerprint hangs off.
+    let bound = entry.bind_sender(&expected.to_identity_bytes()).unwrap();
+    assert_eq!(bound.sender(), &expected);
 }
 
 #[test]
@@ -282,9 +290,7 @@ fn a_sibling_device_leaf_is_a_security_refusal_not_a_near_miss() {
         BareDid::parse(DID).unwrap(),
         DeviceId::parse(SIBLING).unwrap(),
     );
-    let err = entry
-        .require_sender_is_outer_actor(&sibling.to_identity_bytes())
-        .unwrap_err();
+    let err = entry.bind_sender(&sibling.to_identity_bytes()).unwrap_err();
 
     assert!(matches!(err, EntryError::SenderIdentityMismatch { .. }));
     assert!(err.to_string().starts_with("SECURITY:"), "got {err}");
@@ -299,7 +305,7 @@ fn a_different_did_leaf_is_refused_too() {
     );
     assert!(matches!(
         entry
-            .require_sender_is_outer_actor(&impostor.to_identity_bytes())
+            .bind_sender(&impostor.to_identity_bytes())
             .unwrap_err(),
         EntryError::SenderIdentityMismatch { .. }
     ));
@@ -315,8 +321,8 @@ fn a_malformed_leaf_identity_is_refused_rather_than_compared_loosely() {
         DID.as_bytes().to_vec(),
     ] {
         assert_eq!(
-            entry.require_sender_is_outer_actor(&identity),
-            Err(EntryError::MalformedActor),
+            entry.bind_sender(&identity).err(),
+            Some(EntryError::MalformedActor),
             "identity {identity:?}"
         );
     }

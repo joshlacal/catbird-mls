@@ -74,7 +74,7 @@ fn opening(at: i64, kind: OpeningKind, context: Coordinate) -> IntervalOpening<C
         seq: seq(at),
         kind,
         transition_id: TransitionId::parse(TRANSITION).unwrap(),
-        outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x11; 32]),
+        outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x11; 32]),
         context,
     }
 }
@@ -95,7 +95,7 @@ fn closing(at: i64, kind: CloseKind, previous: Coordinate) -> SequentialClose {
         previous,
         kind,
         transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-        outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+        outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
     }
 }
 
@@ -105,7 +105,7 @@ fn terminal(at: i64, previous: Coordinate) -> TerminalClose {
         recipient: binding(),
         previous,
         transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-        outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x5a; 32]),
+        outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x5a; 32]),
     }
 }
 
@@ -258,7 +258,7 @@ fn every_entry_point_refuses_a_row_beneath_the_mark() {
             close_kind: CloseKind::Replace,
             opening_kind: OpeningKind::Add,
             transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
             previous: coordinate(1),
             opening_context: coordinate(2),
         })
@@ -275,7 +275,7 @@ fn every_entry_point_refuses_a_row_beneath_the_mark() {
             seq: seq(below),
             recipient: binding(),
             transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
             previous: coordinate(1),
             participation: ResetParticipation::Activator {
                 opening_context: coordinate(2),
@@ -294,7 +294,7 @@ fn every_entry_point_refuses_a_row_beneath_the_mark() {
             seq: seq(below),
             recipient: binding(),
             transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
             previous: coordinate(1),
             participation: ResetParticipation::Activator {
                 opening_context: coordinate(2),
@@ -340,7 +340,7 @@ fn a_touching_boundary_still_shares_one_seq_across_two_intervals() {
             close_kind: CloseKind::Reset,
             opening_kind: OpeningKind::Reset,
             transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
             previous: coordinate(1),
             opening_context: coordinate(2),
         })
@@ -373,7 +373,7 @@ fn a_previously_removed_activator_still_opens_after_a_strict_gap() {
             seq: seq(20),
             recipient: binding(),
             transition_id: TransitionId::parse(OTHER_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
             previous: coordinate(0),
             participation: ResetParticipation::Activator {
                 opening_context: coordinate(2),

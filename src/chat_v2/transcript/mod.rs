@@ -41,11 +41,12 @@ pub mod fingerprint;
 pub mod signed;
 pub mod strict_json;
 pub mod value;
+pub mod witness;
 
 pub use contract::{project_ref, project_signed_body, ProjectionError, TYPE_PREFIX};
 pub use entry::{
-    outer_actor_of, signed_body_conversation_id, EntryError, VerifiedApplicationEntry,
-    DIRECT_CONVERSATION_KINDS,
+    outer_actor_of, signed_body_conversation_id, EntryError, SenderBoundApplicationEntry,
+    VerifiedApplicationEntry, DIRECT_CONVERSATION_KINDS,
 };
 pub use fingerprint::{
     application_entry_fingerprint, control_entry_fingerprint, ControlEntryKind,
@@ -61,6 +62,7 @@ pub use strict_json::{
     StrictJsonError, MAX_SIGNED_JSON_BYTES,
 };
 pub use value::{CanonicalBody, CanonicalValue};
+pub use witness::EnvelopeVerification;
 
 use core::fmt;
 use sha2::{Digest, Sha256};

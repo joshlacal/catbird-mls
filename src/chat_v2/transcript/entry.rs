@@ -228,8 +228,7 @@ impl VerifiedApplicationEntry {
         })
     }
 
-    /// Requires the authenticated MLS sender leaf to be the verified outer
-    /// actor.
+    /// Binds the authenticated MLS sender leaf to the verified outer actor.
     ///
     /// **This is the check that makes the outer identity usable.** Until it
     /// passes, the outer signature says only "someone holding this key signed a
@@ -237,10 +236,20 @@ impl VerifiedApplicationEntry {
     /// The spec requires it after decryption, and it is a hard refusal rather
     /// than a warning because a mismatch means a real member's leaf is being
     /// presented alongside a different actor's signature.
-    pub fn require_sender_is_outer_actor(
+    ///
+    /// It used to be possible to skip: the check was a method nobody outside
+    /// the tests called, while `fingerprint()` sat on this type and handed the
+    /// reducer provenance without it. Now the fingerprint lives on
+    /// [`SenderBoundApplicationEntry`], which this is the only way to obtain, so
+    /// recording provenance for an unbound entry is unrepresentable rather than
+    /// merely discouraged.
+    ///
+    /// Borrowing rather than consuming: the check is a pure comparison, and a
+    /// caller with two candidate leaves should be able to ask twice.
+    pub fn bind_sender(
         &self,
         mls_leaf_identity: &[u8],
-    ) -> Result<BasicCredential, EntryError> {
+    ) -> Result<SenderBoundApplicationEntry<'_>, EntryError> {
         let outer = self.outer_actor()?;
         let authenticated =
             BasicCredential::parse(mls_leaf_identity).map_err(|_| EntryError::MalformedActor)?;
@@ -250,7 +259,10 @@ impl VerifiedApplicationEntry {
                 authenticated: Box::new(authenticated),
             });
         }
-        Ok(authenticated)
+        Ok(SenderBoundApplicationEntry {
+            entry: self,
+            sender: authenticated,
+        })
     }
 
     /// The actor the verified outer signature names, as a credential.
@@ -282,10 +294,44 @@ impl VerifiedApplicationEntry {
     pub fn mutation(&self) -> &VerifiedMutation {
         &self.mutation
     }
+}
 
+/// A verified application entry whose MLS sender leaf has been bound to its
+/// verified outer actor.
+///
+/// The only holder of an application row's outer fingerprint, and the only way
+/// to get one is [`VerifiedApplicationEntry::bind_sender`]. That is the whole
+/// point of the type: the fingerprint is what the reducer accepts as
+/// provenance, so making it reachable only from here means "shape, binding,
+/// signature, *and* sender identity were all checked" is a property of the
+/// value rather than a sequence someone has to remember.
+///
+/// Borrowed from the entry rather than owning it, so binding is a check that
+/// yields a capability and not a transformation that could be skipped by simply
+/// not calling it — there is nothing else to call.
+#[derive(Debug)]
+pub struct SenderBoundApplicationEntry<'a> {
+    entry: &'a VerifiedApplicationEntry,
+    sender: BasicCredential,
+}
+
+impl SenderBoundApplicationEntry<'_> {
     /// The outer fingerprint, ready to be recorded as reducer provenance.
     pub fn fingerprint(&self) -> &FingerprintProducts {
-        &self.fingerprint
+        &self.entry.fingerprint
+    }
+
+    /// The credential both the outer signature and the MLS leaf agree on.
+    ///
+    /// One value because the comparison passed; two names for it would invite a
+    /// caller to display the wrong one.
+    pub fn sender(&self) -> &BasicCredential {
+        &self.sender
+    }
+
+    /// The entry this binding was taken over.
+    pub fn entry(&self) -> &VerifiedApplicationEntry {
+        self.entry
     }
 }
 

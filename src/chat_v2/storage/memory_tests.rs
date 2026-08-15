@@ -53,7 +53,7 @@ fn frame(seq_value: i64) -> PersistedEntry {
     PersistedEntry {
         seq: Seq::new(seq_value).unwrap(),
         entry_id: EntryId::parse(ENTRY).unwrap(),
-        fingerprint: OuterEntryFingerprint::from_verified([0x11; 32]),
+        fingerprint: OuterEntryFingerprint::for_tests([0x11; 32]),
         outcome: EntryOutcome::Frame {
             canonical_body: format!("frame-{seq_value}").into_bytes(),
         },
@@ -307,7 +307,7 @@ async fn rejections_are_returned_alongside_frames() {
     let rejection = PersistedEntry {
         seq: Seq::new(2).unwrap(),
         entry_id: EntryId::parse(ENTRY).unwrap(),
-        fingerprint: OuterEntryFingerprint::from_verified([0x22; 32]),
+        fingerprint: OuterEntryFingerprint::for_tests([0x22; 32]),
         outcome: EntryOutcome::Rejection {
             detail: "semantic-invalid frame".to_owned(),
         },
@@ -573,7 +573,7 @@ fn opening(at: i64) -> IntervalOpening<Coordinate> {
         seq: Seq::new(at).unwrap(),
         kind: OpeningKind::Creation,
         transition_id: TransitionId::parse(TRANSITION).unwrap(),
-        outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x5a; 32]),
+        outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x5a; 32]),
         context: coordinate(0),
     }
 }

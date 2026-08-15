@@ -58,9 +58,20 @@ use core::fmt;
 
 /// An authenticated context-changing control row addressed to this recipient.
 ///
-/// Construction implies the envelope layer has already verified the row's
-/// shape, transcript, signature, and fingerprint; the reducer's job is only to
-/// decide whether it fits this device's schedule.
+/// The reducer's job is only to decide whether the row fits this device's
+/// schedule; the envelope layer is what establishes that the row is genuine.
+///
+/// **That is a convention here, not a structural guarantee, and this type is
+/// the one place in the family where it is *only* a convention.** Its siblings —
+/// [`SequentialClose`], [`TouchingBoundary`], [`ResetActivation`],
+/// [`TerminalClose`] — each carry an
+/// [`OuterEntryFingerprint`](crate::chat_v2::provenance::OuterEntryFingerprint),
+/// which only the envelope-verification layer can mint, so one of those cannot
+/// be assembled out of nothing. This one carries no fingerprint: it is a pair of
+/// coordinates and a sequence, all of which a caller can invent. Nothing here
+/// detects that, and nothing in this module can — the fix, if it is ever wanted,
+/// is to carry the row's fingerprint too, which is a protocol-surface decision
+/// rather than a refactor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequentialControl {
     /// The row's append sequence.
@@ -813,7 +824,7 @@ mod tests {
             seq: seq(at),
             kind: OpeningKind::Creation,
             transition_id: TransitionId::parse(TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x11; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x11; 32]),
             context,
         }
     }

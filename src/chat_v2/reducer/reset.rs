@@ -332,7 +332,7 @@ mod tests {
             seq: seq(at),
             kind,
             transition_id: TransitionId::parse(TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x11; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x11; 32]),
             context,
         }
     }
@@ -346,7 +346,7 @@ mod tests {
             seq: seq(at),
             recipient: binding(),
             transition_id: TransitionId::parse(RESET_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
             previous,
             participation,
         }
@@ -563,7 +563,7 @@ mod tests {
                 previous: coordinate(0),
                 kind: CloseKind::Remove,
                 transition_id: TransitionId::parse(TRANSITION).unwrap(),
-                outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x44; 32]),
+                outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x44; 32]),
             })
             .unwrap();
 
@@ -602,7 +602,7 @@ mod tests {
                     previous: coordinate(0),
                     kind: CloseKind::Remove,
                     transition_id: TransitionId::parse(TRANSITION).unwrap(),
-                    outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x44; 32]),
+                    outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x44; 32]),
                 })
                 .unwrap();
 

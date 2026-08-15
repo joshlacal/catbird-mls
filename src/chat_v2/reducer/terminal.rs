@@ -248,7 +248,7 @@ mod tests {
             seq: seq(at),
             kind,
             transition_id: TransitionId::parse(TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x11; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x11; 32]),
             context,
         }
     }
@@ -260,7 +260,7 @@ mod tests {
             previous,
             kind,
             transition_id: TransitionId::parse(CLOSING_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
         }
     }
 
@@ -270,7 +270,7 @@ mod tests {
             recipient: binding(),
             previous,
             transition_id: TransitionId::parse(TERMINAL_TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x5a; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x5a; 32]),
         }
     }
 
@@ -414,7 +414,7 @@ mod tests {
                 seq: seq(3),
                 recipient: binding(),
                 transition_id: TransitionId::parse(CLOSING_TRANSITION).unwrap(),
-                outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+                outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
                 previous: coordinate(0),
                 participation: ResetParticipation::Retired,
             })
@@ -564,7 +564,7 @@ mod tests {
                 close_kind: CloseKind::Replace,
                 opening_kind: OpeningKind::Add,
                 transition_id: TransitionId::parse(CLOSING_TRANSITION).unwrap(),
-                outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+                outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
                 previous: coordinate(0),
                 opening_context: coordinate(1),
             }),
@@ -578,7 +578,7 @@ mod tests {
                     seq: seq(50),
                     recipient: binding(),
                     transition_id: TransitionId::parse(CLOSING_TRANSITION).unwrap(),
-                    outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+                    outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
                     previous: coordinate(0),
                     participation: ResetParticipation::Retired,
                 })

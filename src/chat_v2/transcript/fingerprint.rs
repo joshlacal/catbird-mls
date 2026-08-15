@@ -42,6 +42,7 @@
 //! can produce one.
 
 use super::value::BodyRef;
+use super::witness::EnvelopeVerification;
 use super::{CanonicalBody, CanonicalValue};
 use crate::chat_v2::ids::MAX_SAFE_INTEGER;
 use crate::chat_v2::provenance::OuterEntryFingerprint;
@@ -161,6 +162,15 @@ impl core::error::Error for FingerprintError {}
 /// The server-authored row fields both fingerprints bind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryRow {
+    // The fields are public and this type is deliberately *not* gated: it is
+    // the input to a pure function, and the golden vectors are assembled from
+    // the server's fixture exactly this way. Computing a fingerprint over a row
+    // a caller invented is therefore possible — and meaningless, because it is
+    // a fingerprint of that invented row and of nothing else. What carries
+    // authority is not the fingerprint's existence but where it came from: on
+    // the application path, `SenderBoundApplicationEntry` is the only holder of
+    // one, and it exists only after shape, binding, signature, and sender
+    // identity have all been checked.
     /// The append row's replay identity. Never the signed transition ID.
     pub entry_id: [u8; 16],
     /// The conversation this row belongs to.
@@ -235,6 +245,14 @@ impl ControlServerFields {
     ///
     /// Refuses ordinary kinds, and refuses a field name its kind does not
     /// declare.
+    ///
+    /// The **value** is not checked and cannot be: a tombstone or recovery
+    /// object is server-authored content this layer has no schema opinion
+    /// about. So the gate here is "the right kind carries the right field
+    /// name", which is what stops an acceptance's `recovery` being presented as
+    /// a close's `tombstone`. It is not "this content is genuine", and the
+    /// caller — the wire projection that decoded the row — is what that rests
+    /// on.
     pub fn single(
         kind: ControlEntryKind,
         field: &str,
@@ -286,7 +304,12 @@ fn finish(
     digest.update(&canonical_projection);
     Ok(FingerprintProducts {
         canonical_projection,
-        fingerprint: OuterEntryFingerprint::from_verified(digest.finalize().into()),
+        // The one place in the crate that can mint one of these, and it does so
+        // over bytes it has just computed itself.
+        fingerprint: OuterEntryFingerprint::from_verified(
+            digest.finalize().into(),
+            EnvelopeVerification::by_this_layer(),
+        ),
     })
 }
 

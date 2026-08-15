@@ -65,7 +65,7 @@ fn opening(at: i64) -> IntervalOpening<Coordinate> {
         seq: seq(at),
         kind: OpeningKind::Creation,
         transition_id: TransitionId::parse(TRANSITION).unwrap(),
-        outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x5a; 32]),
+        outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x5a; 32]),
         context: coordinate(0),
     }
 }
@@ -83,7 +83,7 @@ fn closed_interval(device: &str, from: i64, to: i64) -> AccessInterval<Coordinat
             seq: seq(to),
             kind: CloseKind::Remove,
             transition_id: TransitionId::parse(TRANSITION).unwrap(),
-            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x99; 32]),
+            outer_entry_fingerprint: OuterEntryFingerprint::for_tests([0x99; 32]),
         })
         .expect("fixture close must be legal");
     interval
