@@ -36,12 +36,17 @@
 //!    with the server rather than reimplemented.
 
 pub mod contract;
+pub mod entry;
 pub mod fingerprint;
 pub mod signed;
 pub mod strict_json;
 pub mod value;
 
 pub use contract::{project_ref, project_signed_body, ProjectionError, TYPE_PREFIX};
+pub use entry::{
+    outer_actor_of, signed_body_conversation_id, EntryError, VerifiedApplicationEntry,
+    DIRECT_CONVERSATION_KINDS,
+};
 pub use fingerprint::{
     application_entry_fingerprint, control_entry_fingerprint, ControlEntryKind,
     ControlServerFields, EntryRow, FingerprintError, FingerprintProducts,
@@ -336,6 +341,8 @@ impl SigningTranscript {
 
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod entry_tests;
 #[cfg(test)]
 mod fingerprint_tests;
 #[cfg(test)]
