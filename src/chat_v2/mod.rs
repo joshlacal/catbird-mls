@@ -82,14 +82,22 @@ mod isolation {
     const V1_MODULE: &str = "orchestrator";
 
     /// Every path prefix that would couple v2 to the superseded protocol.
+    ///
+    /// The bare `super` root is not redundant with `crate`: this file's own
+    /// `super` IS the crate root — `chat_v2/mod.rs` is the one file in the
+    /// tree at depth one — so `use super::orchestrator::…;` there resolves
+    /// while spelling neither `crate` nor a double super. The single-`super`
+    /// needle also covers every deeper file by substring: `super::super::…`
+    /// contains it.
     fn forbidden_imports() -> Vec<String> {
-        ["crate", "super::super", "catbird_mls"]
+        ["crate", "super", "catbird_mls"]
             .iter()
             .map(|root| format!("{root}::{V1_MODULE}"))
             .collect()
     }
 
-    /// Every `crate::<Name>` the crate root's re-export globs make reachable.
+    /// Every `crate::<Name>` the crate root's re-export globs make reachable —
+    /// in BOTH spellings a chat_v2 file can reach it by.
     ///
     /// Module-path needles cannot cover these, and that is not a gap to be
     /// patched with two more literals — it is structural. `src/lib.rs` globs six
@@ -98,10 +106,23 @@ mod isolation {
     /// from the re-export surface, so a new glob, a new `pub` item in a module
     /// already globbed, or a name a globbed module re-exports (the depth-two
     /// form) is covered without anyone extending a list.
+    ///
+    /// Each name is spelled two ways: `crate::<Name>`, and `super::<Name>` —
+    /// the spelling from `chat_v2/mod.rs`, whose `super` is the crate root,
+    /// and by substring containment the spelling from any deeper file's
+    /// `super::super::<Name>` chain too. A collision with a chat_v2 module's
+    /// own `super::<Name>` reference would over-refuse, and that is the
+    /// accepted direction: the failure names the line, and the resolution is
+    /// to spell the local item by its full `crate::chat_v2::…` path.
     fn forbidden_crate_root_names() -> Vec<(String, String)> {
         crate_root_glob_exports()
             .into_iter()
-            .map(|export| (format!("crate::{}", export.name), export.module))
+            .flat_map(|export| {
+                [
+                    (format!("crate::{}", export.name), export.module.clone()),
+                    (format!("super::{}", export.name), export.module),
+                ]
+            })
             .collect()
     }
 
@@ -392,6 +413,18 @@ mod isolation {
                 "use crate::{};",
                 ["Message", "Processing", "Result"].concat()
             ),
+            // F-5: from chat_v2/mod.rs a SINGLE super is the crate root, so
+            // the module path and the derived names both have a super spelling
+            // naming neither `crate` nor a double super. Deeper files' longer
+            // super chains are covered by substring containment, pinned by the
+            // double-super pair.
+            format!("use super::{V1_MODULE}::types::ConversationState;"),
+            format!(
+                "use super::{};",
+                ["Message", "Processing", "Result"].concat()
+            ),
+            format!("use super::super::{V1_MODULE}::types::ConversationState;"),
+            format!("use super::super::{};", ["MLS", "Context"].concat()),
         ] {
             assert!(
                 needles

@@ -58,7 +58,8 @@ section no longer carries open work.
 | high-water durability | `adcabf3e` | the mark's store round-trip proved on the case that cannot be derived |
 | review micro-round | `4e2fa917` | depth-two guard made enforced, nested-tail re-exports derived, vector verdict below |
 | ratifications | `32166d6d` | §5 active-admin interpretation + unicode-normalization dep, both ratified by Josh |
-| spot-check closures | (this seal) | the four `use`-shape escapes the micro-round spot-check found, all closed |
+| spot-check closures | `c44bb56e` | the four `use`-shape escapes the micro-round spot-check found, all closed |
+| F-5 single-super | (this seal) | `chat_v2/mod.rs`'s own `super` is the crate root; both needle families now carry the super spelling |
 
 **Micro-round (post-re-verification), three closures.** (1) The derivation's
 depth-one limit was *documented* as guarded by a count assertion that did not
@@ -97,6 +98,22 @@ forbidden, pinned by `the_named_depth_two_re_export_is_derived`), the four
 shapes are permanent controls in `the_shapes_the_spot_check_found_are_now_read`,
 and the depth-two GLOB form stays refused rather than recursed into. Renames
 stay skipped, by their recorded rationale.
+
+**F-5, found by the closure re-probe, closed in the next seal.** The re-probe
+confirmed all four escapes dead and the fail-closed arm biting on a shape
+nobody enumerated (a wrapped use tree takes six of nine gates down, naming the
+line). It then found a fifth escape in the NEEDLE LIST, not the parser:
+`chat_v2/mod.rs` is the tree's one depth-one file, so its `super` IS the crate
+root, and both `use super::orchestrator::…;` and `use super::<DerivedName>;`
+there resolved past every gate — proven by compilation with a bogus-name
+positive control. Closed by spelling both needle families both ways: the
+module-path root list carries bare `super` (substring-contained in every
+deeper file's `super::super::…` chain), and every derived name is spelled
+`crate::<Name>` AND `super::<Name>`. A future collision with a chat_v2
+module's own legitimate `super::<Name>` reference would over-refuse toward
+the safe direction; the recorded resolution is to spell the local item by its
+full `crate::chat_v2::…` path. All six spellings are pinned in
+`the_isolation_check_can_actually_fail`.
 
 **F9 is the one worth reading before touching a gate.** `use crate::MLSContext;`
 inside `chat_v2` compiled, reached v1's SQLCipher group and crypto surface, and
