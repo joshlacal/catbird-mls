@@ -157,11 +157,20 @@ mod isolation {
         // normalization applied to the scanned code, so a spaced or wrapped
         // spelling of either mechanism still matches.
         let relocations = [["#[", "path"].concat(), [",", " path", " ="].concat()];
+        // The brace-self forms are their own needles because of a recorded
+        // normalization interaction: brace-stripping collapses
+        // `crate::{self as x}` to `crate::selfasx`, so no `<root> as ` needle
+        // can ever match it — the very rule that CLOSES the brace-path evasion
+        // opens this one. Post-normalization, `<root>::self` matches the
+        // brace-self spelling exactly, without touching the normalizer.
         let aliases = [
             ["crate", " as "].concat(),
             ["super", " as "].concat(),
             ["catbird_mls", " as "].concat(),
             ["extern ", "crate "].concat(),
+            ["crate", "::self"].concat(),
+            ["super", "::self"].concat(),
+            ["catbird_mls", "::self"].concat(),
         ];
 
         // Positive controls, built through the real matcher: each mechanism's
@@ -174,6 +183,8 @@ mod isolation {
             format!("use {}{}v1root;", "crate", " as "),
             format!("pub use {}{}v1root;", "super", " as "),
             format!("{}{}mls;", "extern ", "crate "),
+            format!("use {}::{}self as v1root{};", "crate", "{", "}"),
+            format!("use {}::{}self as v1root{};", "super", "{", "}"),
         ] {
             assert!(
                 relocations

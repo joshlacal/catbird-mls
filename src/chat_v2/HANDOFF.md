@@ -60,7 +60,8 @@ section no longer carries open work.
 | ratifications | `32166d6d` | §5 active-admin interpretation + unicode-normalization dep, both ratified by Josh |
 | spot-check closures | `c44bb56e` | the four `use`-shape escapes the micro-round spot-check found, all closed |
 | F-5 single-super | `b995b0c1` | `chat_v2/mod.rs`'s own `super` is the crate root; both needle families now carry the super spelling |
-| F-6/F-7 walk boundary | (this seal) | `#[path]` relocation and crate-root aliasing refused as mechanisms; reviewer's final verdict recorded |
+| F-6/F-7 walk boundary | `e547ae03` | `#[path]` relocation and crate-root aliasing refused as mechanisms; reviewer's final verdict recorded |
+| brace-self alias | (this seal) | the normalization-interaction spelling (`crate::{self as x}`) added to the alias needles; review program CLOSED |
 
 **Micro-round (post-re-verification), three closures.** (1) The derivation's
 depth-one limit was *documented* as guarded by a count assertion that did not
@@ -136,6 +137,33 @@ the derivation covers, the scanned set is asserted to be the compiled set,
 and the needle roots are asserted to be the only root spellings.** What
 remains outside the boundary is the chartered F8 wrapper (a v1-tree accomplice
 edit), which no directory-scoped scan can see.
+
+**The brace-self alias, the fourth round's parting shot, closed in the next
+seal — and the recorded interaction behind it.** `use crate::{self as v1root};`
+escaped the alias needles for a reason worth keeping: brace-stripping
+normalization collapses it to `crate::selfasv1root`, so no `<root> as `
+needle can ever match — the SAME rule that closes the brace-path evasion by
+fusing `crate::{orchestrator::X}` opens this one by fusing the root to its
+alias. Any future needle written as `<token> as ` inherits this. The fix
+adds `<root>::self` needles (post-normalization they match the brace-self
+spelling exactly) rather than touching the normalizer, which round one
+depends on. Both spellings the sweep proved (`crate::{self as …}` in a deep
+file, `super::{self as …}` in mod.rs) are pinned as positive controls.
+
+**The adversarial review program is CLOSED, on the reviewer's own advice.**
+Four rounds, every finding sealed before the next probe: four parser shapes,
+the single-super needle gap, the walk boundary (`#[path]` + root aliasing),
+and the brace-self interaction. Final verdict, unchanged across the last two
+rounds: NO BLOCKING OBJECTION — each fix class-level, each holding against
+shapes not in its own test list. The reviewer's closing judgment, adopted as
+the program's stance: the remaining escapes all require deliberately studying
+the gate to find, which is where testing stops being the control and review
+is. **Do not run a fifth round of needle-hardening** — the cost curve has
+turned, and the next real increment is the compile-time barrier the chartered
+F8 wrapper item already names. The accurate claim as the tree lands: no file
+under `src/chat_v2` names v1 under any spelling the derivation covers; the
+scanned set is asserted equal to the compiled set; the needle roots are
+asserted to be the only root spellings, brace-self forms included.
 
 **F9 is the one worth reading before touching a gate.** `use crate::MLSContext;`
 inside `chat_v2` compiled, reached v1's SQLCipher group and crypto surface, and
