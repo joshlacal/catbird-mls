@@ -95,7 +95,7 @@ fn closed_interval(device: &str, from: i64, to: i64) -> AccessInterval<Coordinat
 fn a_fresh_schedule_restores_as_empty_rather_than_incoherent() {
     // No intervals and no context is the legitimate starting state, not a
     // violation of the open-implies-context invariant.
-    let restored = ApplicationReducer::rehydrate(binding(DEVICE), Vec::new(), None, None)
+    let restored = ApplicationReducer::rehydrate(binding(DEVICE), Vec::new(), None, None, None)
         .expect("an empty schedule must restore");
     assert!(!restored.has_open_interval());
     assert!(restored.intervals().is_empty());
@@ -112,6 +112,7 @@ fn restoring_refuses_a_schedule_holding_another_devices_intervals() {
         vec![open_interval(SIBLING_DEVICE, 1)],
         Some(coordinate(0)),
         None,
+        Some(seq(1)),
     )
     .unwrap_err();
     assert!(
@@ -125,9 +126,14 @@ fn restoring_refuses_a_context_that_disagrees_with_the_intervals() {
     // Both directions. An open interval without a context panics the sequencing
     // path; a context without an open interval would sequence rows through a
     // gap that grants no access.
-    let err =
-        ApplicationReducer::rehydrate(binding(DEVICE), vec![open_interval(DEVICE, 1)], None, None)
-            .unwrap_err();
+    let err = ApplicationReducer::rehydrate(
+        binding(DEVICE),
+        vec![open_interval(DEVICE, 1)],
+        None,
+        None,
+        Some(seq(1)),
+    )
+    .unwrap_err();
     assert_eq!(
         err,
         ReducerError::RestoredScheduleIncoherent {
@@ -136,8 +142,9 @@ fn restoring_refuses_a_context_that_disagrees_with_the_intervals() {
         }
     );
 
-    let err = ApplicationReducer::rehydrate(binding(DEVICE), Vec::new(), Some(coordinate(0)), None)
-        .unwrap_err();
+    let err =
+        ApplicationReducer::rehydrate(binding(DEVICE), Vec::new(), Some(coordinate(0)), None, None)
+            .unwrap_err();
     assert_eq!(
         err,
         ReducerError::RestoredScheduleIncoherent {
@@ -166,7 +173,8 @@ fn the_hazard_an_unordered_list_creates_is_real() {
         "the fixture must actually be out of order for this to prove anything"
     );
 
-    let err = ApplicationReducer::rehydrate(binding(DEVICE), unordered, None, None).unwrap_err();
+    let err = ApplicationReducer::rehydrate(binding(DEVICE), unordered, None, None, Some(seq(20)))
+        .unwrap_err();
     assert_eq!(
         err,
         ReducerError::RestoredIntervalsOutOfOrder {
@@ -185,6 +193,7 @@ fn restoring_refuses_overlapping_intervals() {
         vec![closed_interval(DEVICE, 1, 5), closed_interval(DEVICE, 3, 9)],
         None,
         None,
+        Some(seq(9)),
     )
     .unwrap_err();
     assert_eq!(
@@ -209,7 +218,8 @@ fn restoring_refuses_a_non_final_open_interval() {
     );
     assert!(intervals[0].is_open());
 
-    let err = ApplicationReducer::rehydrate(binding(DEVICE), intervals, None, None).unwrap_err();
+    let err = ApplicationReducer::rehydrate(binding(DEVICE), intervals, None, None, Some(seq(9)))
+        .unwrap_err();
     assert_eq!(
         err,
         ReducerError::RestoredNonFinalIntervalOpen {
@@ -229,10 +239,97 @@ fn a_touching_boundary_survives_restoration() {
         vec![closed_interval(DEVICE, 1, 9), open_interval(DEVICE, 9)],
         Some(coordinate(0)),
         None,
+        Some(seq(9)),
     )
     .expect("a touching boundary is legal and must restore");
     assert!(restored.has_open_interval());
     assert_eq!(restored.intervals().len(), 2);
+}
+
+// ---- the restored high-water mark ------------------------------------------
+
+#[test]
+fn restoring_refuses_a_mark_below_the_schedule_it_came_with() {
+    // The floor. Every opening, close, and terminal sequence the restored
+    // schedule records was necessarily consumed, so a mark below one of them is
+    // a store that lost track — and restoring it would reopen the replay window
+    // the mark exists to close.
+    let err = ApplicationReducer::rehydrate(
+        binding(DEVICE),
+        vec![closed_interval(DEVICE, 1, 20)],
+        None,
+        None,
+        Some(seq(19)),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        ReducerError::RestoredHighWaterBelowSchedule {
+            high_water: Some(seq(19)),
+            recorded: seq(20),
+        }
+    );
+
+    // Absent is below everything, and is refused with the same name rather
+    // than being silently treated as "unknown, so allow anything".
+    let err = ApplicationReducer::rehydrate(
+        binding(DEVICE),
+        vec![closed_interval(DEVICE, 1, 20)],
+        None,
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        ReducerError::RestoredHighWaterBelowSchedule {
+            high_water: None,
+            recorded: seq(20),
+        }
+    );
+}
+
+#[test]
+fn a_mark_above_the_schedule_is_the_case_the_intervals_cannot_express() {
+    // This is why the mark is a parameter rather than something derived here.
+    // A schedule opened at 10 that consumed a control row at 500 records only
+    // the 10; deriving the mark would restore it as 10 and re-admit every
+    // sequence between. So a mark above everything recorded is accepted, and
+    // the restored reducer enforces it.
+    let mut restored = ApplicationReducer::rehydrate(
+        binding(DEVICE),
+        vec![open_interval(DEVICE, 10)],
+        Some(coordinate(0)),
+        None,
+        Some(seq(500)),
+    )
+    .expect("a mark above the schedule is legitimate");
+    assert_eq!(restored.high_water(), Some(seq(500)));
+
+    let replay = SequentialControl {
+        seq: seq(400),
+        recipient: binding(DEVICE),
+        previous: coordinate(0),
+        next: coordinate(1),
+    };
+    assert_eq!(
+        restored.apply_sequential_control(&replay),
+        Err(ReducerError::NotAdvancing {
+            expected_after: seq(500),
+            found: seq(400),
+        }),
+        "the restored mark must be enforced, not merely stored"
+    );
+
+    let row = SequentialControl {
+        seq: seq(501),
+        recipient: binding(DEVICE),
+        previous: coordinate(0),
+        next: coordinate(1),
+    };
+    restored
+        .apply_sequential_control(&row)
+        .expect("a row above the restored mark must apply");
 }
 
 // ---- the restored reducer on the paths the checks protect ------------------
@@ -250,6 +347,7 @@ fn a_restored_multi_interval_schedule_reanchors_against_its_latest_close() {
         ],
         None,
         None,
+        Some(seq(20)),
     )
     .expect("an ordered schedule must restore");
 
@@ -287,6 +385,7 @@ fn a_restored_open_schedule_closes_its_latest_interval() {
         vec![closed_interval(DEVICE, 1, 5), open_interval(DEVICE, 10)],
         Some(coordinate(0)),
         None,
+        Some(seq(10)),
     )
     .expect("an ordered schedule must restore");
     assert!(restored.has_open_interval());

@@ -122,6 +122,12 @@ impl ApplicationReducer {
         if !self.has_open_interval() {
             return Err(ReducerError::NothingToClose { seq: close.seq });
         }
+        // The interval's own rule first, so a close inside its own opening
+        // keeps the specific refusal, then the schedule-level one: a close
+        // below a control row already consumed inside this interval would
+        // retroactively cut off entries the schedule has already shown.
+        self.require_close_after_opening(close.seq)?;
+        self.require_advances_high_water(close.seq)?;
         self.require_expected_predecessor(close.seq, &close.previous)?;
 
         let proof = CloseProof {
@@ -135,6 +141,7 @@ impl ApplicationReducer {
             .expect("an open interval was just confirmed")
             .apply_close(proof)?;
         self.clear_expected();
+        self.record_applied(close.seq);
         Ok(())
     }
 
@@ -185,12 +192,18 @@ impl ApplicationReducer {
                 ));
             }
         }
+        // Adjacency is checked against the previous interval above; this is the
+        // schedule-level floor, which also covers the case that has no previous
+        // interval to be adjacent to.
+        self.require_advances_high_water(opening.seq)?;
 
         let context = opening.context.clone();
+        let opening_seq = opening.seq;
         let binding = self.binding().clone();
         self.intervals_mut()
             .push(AccessInterval::open(binding, opening));
         self.set_expected(context);
+        self.record_applied(opening_seq);
         Ok(())
     }
 
@@ -222,7 +235,12 @@ impl ApplicationReducer {
         }
 
         // The close side: the shared row must build on the old expected
-        // context, exactly as an ordinary close would.
+        // context, exactly as an ordinary close would, and must land above
+        // everything already consumed. One row, so the mark is checked once
+        // here and moved once below — the successor opening at the same
+        // sequence is the same event, not a second one.
+        self.require_close_after_opening(boundary.seq)?;
+        self.require_advances_high_water(boundary.seq)?;
         self.require_expected_predecessor(boundary.seq, &boundary.previous)?;
 
         let proof = CloseProof {
@@ -250,6 +268,7 @@ impl ApplicationReducer {
         self.intervals_mut()
             .push(AccessInterval::open(binding, opening));
         self.set_expected(boundary.opening_context.clone());
+        self.record_applied(boundary.seq);
         Ok(())
     }
 }

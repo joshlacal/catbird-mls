@@ -39,6 +39,8 @@ pub mod reset;
 pub mod terminal;
 
 #[cfg(test)]
+mod high_water_tests;
+#[cfg(test)]
 mod restore_tests;
 
 pub use reanchor::{ReanchorAuthority, SequentialClose, TouchingBoundary};
@@ -97,7 +99,12 @@ pub enum ReducerError {
     },
     /// A row arrived after the schedule was irreversibly terminalized.
     PostTerminal { terminal_seq: Seq, row_seq: Seq },
-    /// A row's seq did not advance past the interval's opening.
+    /// A row's seq did not advance past everything already consumed.
+    ///
+    /// `expected_after` is the schedule's high-water mark — the greatest
+    /// sequence it has already applied — and not merely the current interval's
+    /// opening. The two coincide until the first row lands inside an interval,
+    /// which is exactly when the weaker comparison starts admitting replays.
     NotAdvancing { expected_after: Seq, found: Seq },
     /// A reanchor arrived while an interval was still open.
     ///
@@ -193,6 +200,19 @@ pub enum ReducerError {
     RestoredNonFinalIntervalOpen {
         /// The opening sequence of the interval that was left open.
         opening_seq: Seq,
+    },
+    /// A restored high-water mark sat below the schedule it came with.
+    ///
+    /// The mark is supplied by the caller because the interval list cannot
+    /// express it, but it can still be checked against a floor: every opening,
+    /// close, and terminal sequence the restored schedule records was
+    /// necessarily consumed. A mark below one of those is a store that lost
+    /// track, and restoring it would reopen the replay window the mark closes.
+    RestoredHighWaterBelowSchedule {
+        /// What the caller supplied.
+        high_water: Option<Seq>,
+        /// The greatest sequence the restored schedule itself records.
+        recorded: Seq,
     },
     /// An interval-level rule was violated.
     Interval(IntervalError),
@@ -297,6 +317,21 @@ impl fmt::Display for ReducerError {
                 "restored interval opened at {opening_seq} is still open but is not \
                  the last; only the most recent interval may be open"
             ),
+            Self::RestoredHighWaterBelowSchedule {
+                high_water,
+                recorded,
+            } => match high_water {
+                Some(mark) => write!(
+                    f,
+                    "restored high-water mark {mark} is below sequence {recorded}, \
+                     which this schedule records as already consumed"
+                ),
+                None => write!(
+                    f,
+                    "restored schedule records sequence {recorded} as consumed but \
+                     came with no high-water mark"
+                ),
+            },
             Self::Interval(err) => write!(f, "{err}"),
         }
     }
@@ -311,6 +346,11 @@ pub struct ApplicationReducer {
     intervals: Vec<AccessInterval<Coordinate>>,
     expected: Option<Coordinate>,
     terminal: Option<ApplicationScheduleTerminalProof>,
+    /// The greatest sequence this schedule has already consumed.
+    ///
+    /// See [`ApplicationReducer::high_water`] for why an interval-relative
+    /// comparison is not enough on its own.
+    high_water: Option<Seq>,
 }
 
 impl ApplicationReducer {
@@ -321,6 +361,7 @@ impl ApplicationReducer {
             intervals: Vec::new(),
             expected: None,
             terminal: None,
+            high_water: None,
         }
     }
 
@@ -356,11 +397,20 @@ impl ApplicationReducer {
     /// overlapping schedule, so the reducer's own paths never had to defend
     /// against one; durable storage can hand over anything that was written, so
     /// the structural checks live here rather than being assumed upstream.
+    /// - the restored high-water mark is at least the greatest sequence the
+    ///   restored schedule itself records. It is a **parameter** rather than
+    ///   something derived here, because the schedule cannot express it: the
+    ///   sequential control rows consumed *inside* an open interval move the
+    ///   mark and leave no trace in the interval list. Deriving it would
+    ///   silently restore a mark below the truth and reopen the replay window
+    ///   this mark exists to close, so the caller is made to state it and the
+    ///   floor below is all this function can check.
     pub fn rehydrate(
         binding: RecipientBinding,
         intervals: Vec<AccessInterval<Coordinate>>,
         expected: Option<Coordinate>,
         terminal: Option<ApplicationScheduleTerminalProof>,
+        high_water: Option<Seq>,
     ) -> Result<Self, ReducerError> {
         for interval in &intervals {
             if !binding.matches(interval.binding()) {
@@ -416,11 +466,36 @@ impl ApplicationReducer {
             });
         }
 
+        // The floor: every sequence the restored schedule itself records was
+        // consumed, so the mark cannot sit below any of them. It may legally
+        // sit above all of them — that is exactly the consumed-control case the
+        // interval list cannot express.
+        let recorded = intervals
+            .iter()
+            .flat_map(|interval| {
+                [
+                    Some(interval.opening().seq),
+                    interval.close().map(|close| close.seq),
+                ]
+            })
+            .chain([terminal.as_ref().map(ApplicationScheduleTerminalProof::seq)])
+            .flatten()
+            .max();
+        if let Some(recorded) = recorded {
+            if high_water.is_none_or(|mark| mark < recorded) {
+                return Err(ReducerError::RestoredHighWaterBelowSchedule {
+                    high_water,
+                    recorded,
+                });
+            }
+        }
+
         Ok(Self {
             binding,
             intervals,
             expected,
             terminal,
+            high_water,
         })
     }
 
@@ -454,6 +529,29 @@ impl ApplicationReducer {
         self.intervals.last().is_some_and(AccessInterval::is_open)
     }
 
+    /// The greatest sequence this schedule has already consumed.
+    ///
+    /// Every row this reducer accepts must sit strictly above it, and accepting
+    /// one moves it. `None` means nothing has been consumed yet.
+    ///
+    /// The interval list cannot stand in for this. An interval records only
+    /// where it opened and where it closed, so the sequential control rows
+    /// consumed *within* it leave no mark — and comparing a later row against
+    /// the interval's **opening** therefore accepts anything above the opening,
+    /// including a sequence the schedule already moved past. That is what let a
+    /// terminal at seq 2 land after a control at seq 100: irreversible proof
+    /// deposited below consumed history, with the entries between them already
+    /// treated as visible.
+    ///
+    /// A touching boundary does not violate the rule despite sharing a
+    /// sequence. Sharing happens **within one row**: the boundary is one
+    /// authenticated event, checked once against the mark it inherits and then
+    /// recorded once. The successor interval's opening is not a second
+    /// consumption.
+    pub fn high_water(&self) -> Option<Seq> {
+        self.high_water
+    }
+
     /// Installs the first accessible interval.
     ///
     /// The caller must have compared all five opening fields against the
@@ -480,9 +578,11 @@ impl ApplicationReducer {
         }
 
         let context = opening.context.clone();
+        let opening_seq = opening.seq;
         self.intervals
             .push(AccessInterval::open(self.binding.clone(), opening));
         self.expected = Some(context);
+        self.record_applied(opening_seq);
         Ok(())
     }
 
@@ -496,15 +596,13 @@ impl ApplicationReducer {
         self.require_not_terminal(row.seq)?;
         self.require_recipient(&row.recipient)?;
 
-        let Some(open) = self.intervals.last().filter(|i| i.is_open()) else {
+        if !self.has_open_interval() {
             return Err(ReducerError::NoOpenInterval { seq: row.seq });
-        };
-        if !row.seq.is_strictly_after(open.opening().seq) {
-            return Err(ReducerError::NotAdvancing {
-                expected_after: open.opening().seq,
-                found: row.seq,
-            });
         }
+        // The high-water mark is at least this interval's opening, so this one
+        // comparison is both "after the opening" and "after everything already
+        // consumed inside it".
+        self.require_advances_high_water(row.seq)?;
 
         let expected = self
             .expected
@@ -519,6 +617,7 @@ impl ApplicationReducer {
         }
 
         self.expected = Some(row.next.clone());
+        self.record_applied(row.seq);
         Ok(())
     }
 
@@ -590,6 +689,57 @@ impl ApplicationReducer {
             });
         }
         Ok(())
+    }
+
+    /// Requires a row to sit strictly above everything already consumed.
+    ///
+    /// The one comparison every accepting path makes. Kept separate from the
+    /// interval-relative rules because it is a *schedule* rule: it holds across
+    /// closes, gaps, and reanchors, where "this interval's opening" does not
+    /// exist or no longer means anything.
+    fn require_advances_high_water(&self, seq: Seq) -> Result<(), ReducerError> {
+        match self.high_water {
+            Some(mark) if !seq.is_strictly_after(mark) => Err(ReducerError::NotAdvancing {
+                expected_after: mark,
+                found: seq,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Requires a close to land strictly after its own interval's opening.
+    ///
+    /// [`AccessInterval::apply_close`] enforces this too, but only at the point
+    /// where it mutates. Asking first keeps every fallible check ahead of every
+    /// state change, and keeps the specific `CloseNotAfterOpening` refusal
+    /// rather than the schedule-level one for a close inside its own opening.
+    fn require_close_after_opening(&self, close_seq: Seq) -> Result<(), ReducerError> {
+        let Some(open) = self.open_interval() else {
+            return Ok(());
+        };
+        let opening_seq = open.opening().seq;
+        if !close_seq.is_strictly_after(opening_seq) {
+            return Err(ReducerError::Interval(
+                super::interval::IntervalError::CloseNotAfterOpening {
+                    opening_seq,
+                    close_seq,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records a row as consumed, moving the high-water mark to its sequence.
+    ///
+    /// Called only after a row has been accepted, and only once per row — a
+    /// touching boundary is one row and calls this once, which is why sharing a
+    /// sequence between its close and its opening is not a violation.
+    fn record_applied(&mut self, seq: Seq) {
+        debug_assert!(
+            self.high_water.is_none_or(|mark| seq > mark),
+            "every accepting path checks the high-water mark before applying"
+        );
+        self.high_water = Some(seq);
     }
 
     fn require_recipient(&self, found: &RecipientBinding) -> Result<(), ReducerError> {

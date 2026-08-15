@@ -95,10 +95,7 @@ impl ApplicationReducer {
         self.require_recipient(&terminal.recipient)?;
 
         match self.open_interval() {
-            Some(open) => {
-                let opening_seq = open.opening().seq;
-                self.close_open_interval_terminally(terminal, opening_seq)
-            }
+            Some(_) => self.close_open_interval_terminally(terminal),
             None => self.install_schedule_proof_across_the_gap(terminal),
         }
     }
@@ -107,17 +104,17 @@ impl ApplicationReducer {
     fn close_open_interval_terminally(
         &mut self,
         terminal: &TerminalClose,
-        opening_seq: Seq,
     ) -> Result<TerminalMode, ReducerError> {
         // Every fallible check runs first, so that the close and the proof land
-        // together or not at all. A creation-open plus terminal close at the
-        // same seq is the named negative this rejects.
-        if !terminal.seq.is_strictly_after(opening_seq) {
-            return Err(ReducerError::NotAdvancing {
-                expected_after: opening_seq,
-                found: terminal.seq,
-            });
-        }
+        // together or not at all.
+        //
+        // One comparison covers two rules. The high-water mark is never below
+        // this interval's opening, so it still rejects the named
+        // creation-open-plus-terminal-close-at-the-same-seq negative, and it
+        // additionally rejects a terminal below a control row this interval has
+        // already consumed — irreversible proof deposited underneath history
+        // the schedule has already shown.
+        self.require_advances_high_water(terminal.seq)?;
         self.require_expected_predecessor(terminal.seq, &terminal.previous)?;
 
         self.intervals_mut()
@@ -150,11 +147,12 @@ impl ApplicationReducer {
         let close = last
             .close()
             .expect("a non-open interval always carries a close proof");
+        let close_kind = close.kind;
         let close_seq = close.seq;
 
         // Exhaustive and wildcard-free. §6 names Remove and Reset, and the
         // other two are refused rather than waved through.
-        match close.kind {
+        match close_kind {
             CloseKind::Remove | CloseKind::Reset => {}
             CloseKind::Replace | CloseKind::Terminal => {
                 // A Replace close always touches an `Add` successor on the one
@@ -166,17 +164,15 @@ impl ApplicationReducer {
                 // caught above. Both are refused by name.
                 return Err(ReducerError::TerminalAfterUnsupportedClose {
                     close_seq,
-                    kind: close.kind,
+                    kind: close_kind,
                 });
             }
         }
 
-        if !terminal.seq.is_strictly_after(close_seq) {
-            return Err(ReducerError::NotAdvancing {
-                expected_after: close_seq,
-                found: terminal.seq,
-            });
-        }
+        // The close is the last thing this schedule consumed, so the high-water
+        // mark and the close sequence are the same number here; the schedule
+        // rule is the one stated, because it is the one that stays true.
+        self.require_advances_high_water(terminal.seq)?;
 
         // `terminal.previous` is deliberately not consulted. See the module
         // documentation: the outer Terminal authority verified the predecessor,
@@ -194,6 +190,7 @@ impl ApplicationReducer {
             terminal.transition_id,
             terminal.outer_entry_fingerprint,
         ));
+        self.record_applied(terminal.seq);
     }
 }
 

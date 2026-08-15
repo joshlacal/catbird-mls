@@ -248,6 +248,9 @@ impl ApplicationReducer {
                 ));
             }
         }
+        // And above everything consumed, which is what covers an activator with
+        // no earlier interval at all.
+        self.require_advances_high_water(reset.seq)?;
 
         let opening = IntervalOpening {
             seq: reset.seq,
@@ -260,6 +263,7 @@ impl ApplicationReducer {
         self.intervals_mut()
             .push(AccessInterval::open(binding, opening));
         self.set_expected(opening_context.clone());
+        self.record_applied(reset.seq);
         Ok(())
     }
 }
