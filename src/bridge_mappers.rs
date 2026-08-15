@@ -6,6 +6,26 @@ use crate::orchestrator_bridge::{
 
 pub(crate) const SECURITY_STORAGE_CAPABILITIES_VERSION: u16 = 3;
 
+/// The `SecurityStorageCapabilities.version` this build's bridge constructor
+/// requires, exposed so platform test suites can pin their hand-declared value
+/// against the library they actually ship.
+///
+/// TEST-TIME USE ONLY. Production platform code MUST keep declaring a literal
+/// version: the declaration is an attestation of which contract the platform
+/// has actually implemented, so echoing this value back into
+/// `SecurityStorageCapabilities` would make the check compare the library to
+/// itself and defeat the gate entirely. The whole point of
+/// `validate_security_capabilities` is to refuse a platform whose
+/// implementation predates the contract it is being handed.
+///
+/// Without this, the constant is `pub(crate)` and absent from the UniFFI
+/// surface, so a stale platform literal compiles and unit-tests clean and only
+/// fails when the real library rejects bridge construction at app runtime.
+#[uniffi::export]
+pub fn security_storage_capabilities_version() -> u16 {
+    SECURITY_STORAGE_CAPABILITIES_VERSION
+}
+
 pub(crate) fn validate_security_capabilities(
     capabilities: &SecurityStorageCapabilities,
 ) -> Result<(), OrchestratorBridgeError> {
@@ -163,6 +183,51 @@ mod tests {
     use crate::orchestrator_bridge::{
         FFISequencerReceipt, OrchestratorBridgeError, SecurityStorageCapabilities,
     };
+
+    #[test]
+    fn exported_version_matches_the_constant_the_validator_enforces() {
+        // The export exists so platform suites can pin their literal against
+        // the shipped library. If it ever drifts from the constant the
+        // validator compares, every platform guard built on it silently
+        // stops guarding.
+        assert_eq!(
+            super::security_storage_capabilities_version(),
+            super::SECURITY_STORAGE_CAPABILITIES_VERSION,
+        );
+    }
+
+    #[test]
+    fn exported_version_is_what_the_validator_actually_rejects_against() {
+        let stale = SecurityStorageCapabilities {
+            version: super::security_storage_capabilities_version() - 1,
+            reset_state: true,
+            quarantine: true,
+            pending_message_protection: true,
+            sequencer_receipts: true,
+            recovery_backoff: true,
+            pending_deletion: true,
+            authorized_device_resolution: true,
+        };
+
+        match super::validate_security_capabilities(&stale) {
+            Err(OrchestratorBridgeError::MissingSecurityCapability {
+                capability,
+                required_version,
+                declared_version,
+            }) => {
+                assert_eq!(capability, "contract_version");
+                assert_eq!(
+                    required_version,
+                    super::security_storage_capabilities_version()
+                );
+                assert_eq!(
+                    declared_version,
+                    super::security_storage_capabilities_version() - 1
+                );
+            }
+            other => panic!("expected a contract_version rejection, got {other:?}"),
+        }
+    }
 
     #[test]
     fn missing_enabled_capability_is_a_typed_construction_error() {
