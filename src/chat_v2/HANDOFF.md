@@ -1,12 +1,12 @@
 # chat_v2 — Task 3 handoff
 
 State of the clean chat protocol (`blue.catbird.chat.*`) client implementation
-as of the fourteenth sealed slice. Written for the session that continues it.
+as of the eighteenth sealed slice. Written for the session that continues it.
 
 Workspace: `catbird-mls-task3-ws` (isolated jj workspace; Josh's default
 workspace is untouched and must stay that way).
 
-Verification at handoff: **431 lib tests pass, 0 failures.** `cargo fmt
+Verification at handoff: **479 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib --all-targets` reports zero warnings under
 `chat_v2`, `wasm32-unknown-unknown` builds.
 
@@ -14,7 +14,7 @@ Verification at handoff: **431 lib tests pass, 0 failures.** `cargo fmt
 
 ## 1. Sealed commits
 
-Fourteen, oldest first. All additive; the only pre-existing file touched is
+Eighteen, oldest first. All additive; the only pre-existing file touched is
 `src/lib.rs` (three lines declaring the module).
 
 | Change | Commit | What |
@@ -33,6 +33,10 @@ Fourteen, oldest first. All additive; the only pre-existing file touched is
 | `twsmwtww` | `a16e4fe5` | Handoff refresh for the built reducer |
 | `kszmquql` | `6309353f` | Canonical signing transcript, byte-identical to mls-ds (S7a) |
 | `xyxvwryy` | `6d88c594` | Strict signed-wrapper decode and Ed25519 verification (S7b) |
+| `ykrlymzw` | `0b6da15f` | Vector provenance, ratified I-1 correction, two doc anchors |
+| `rlqxsxqt` | `beb865c5` | The two outer entry fingerprint domains (S7c) |
+| `wvyrrrox` | `8b71a345` | Wire JSON projection through the lexicon contract (S7d-pre) |
+| `ysqxmrrk` | `a57914c4` | Application entry verification and sender binding (S7d) |
 
 ### The detached-HEAD trap — read before concluding a server file is missing
 
@@ -129,11 +133,14 @@ chat_v2/
   provenance.rs fingerprints, close kinds, hint-vs-authority split
   coordinate.rs full coordinate + transition relations
   interval.rs   interval provenance, adjacency, schedule terminal proof
-  transcript/   canonical signing transcript (S7a) + strict decode/verify (S7b)
+  transcript/   envelope verification, complete (S7a-S7d)
     value.rs    the canonical value model; UUID-as-bytes lives here
     strict_json.rs  the strict JSON profile and STANDARD base64
     signed.rs   two-field wrapper, verify_strict, key-ID binding
-    vectors/    vendored server golden vectors + PROVENANCE.md
+    fingerprint.rs  both fingerprint domains, 13 control kinds, serverFields
+    contract.rs the embedded lexicon projection; the four ref-name special cases
+    entry.rs    application entry shape, conversation binding, sender identity
+    vectors/    vendored server golden vectors + lexicon + PROVENANCE.md
   reducer/
     mod.rs      sequencing core (6a)
     reanchor.rs closure, reanchor, touching boundaries (6b)
@@ -261,114 +268,79 @@ through `apply_terminal`. Do not "finish the conversion" by relaxing it.
 
 ---
 
-## 5. Slice 7 — envelope verification
+## 5. Envelope verification — complete (S7a–S7d)
 
-**Dependencies are ratified by Josh**: promote `ed25519-dalek` v2 and
-`serde_ipld_dagcbor` 0.6 to *direct* dependencies of `catbird-mls`. These are
-the exact crates and versions `mls-ds` declares directly
-(`server/Cargo.toml:43,109`), both already resolve to identical versions
-(2.2.0 and 0.6.4), and both are already linked transitively — `ed25519-dalek`
-via `openmls_basic_credential`, `serde_ipld_dagcbor` via `jacquard-common` ←
-`catbird-atproto`. So this is promotion only: no new resolution, no new
-supply-chain surface. Surface the `Cargo.toml` diff before sealing, as agreed.
+Built in `transcript/`. Every claim below is pinned by golden vectors lifted
+from the server, not by an expectation written here.
 
-**Byte-identity with the server is the requirement**, so anchor on the server's
-implementation rather than inventing one. `mls-ds` main,
-`server/src/chat_protocol/transcript.rs`:
+**The transcript reproduces the server byte for byte**, and the server's own
+signature over its own key verifies against a transcript this crate rebuilds
+from wire JSON. Format agreement would not pass those tests; only byte
+agreement does.
 
-- `decode_canonical_signed_mutation` at `:1267`, with `verify_ed25519_strict`,
-  `verify_signed_mutation`, `decode_and_verify_signed_mutation` immediately
-  after.
-- The two fingerprint domains are frozen there as byte constants.
-- Signing transcripts are built through a hand-rolled closed `RawJson` type
-  that rejects floats and negative integers outright and decodes with
-  duplicate/null rejection, projecting only through an **embedded copy of the
-  lexicon contract** (`include_str!` of `blue.catbird.chat.defs.json`) before
-  any generated DTO exists.
-- `serde_ipld_dagcbor` is used in `transcript.rs` (18 sites) and heavily in
-  `state_machine.rs` (47). So the DAG-CBOR half is a real crate; only the
-  JSON-decode/projection half is hand-rolled. Mirror the hand-roll with shared
-  vectors rather than substituting a differently-opinionated crate.
+### What each slice built
 
-**PROGRAM INVARIANT I-1 — CORRECTED AND RATIFIED 2026-08-15.** The earlier
-wording of I-1 (kept below for recognition) was **defective, not merely
-imprecise**: a client implementing it literally would sign a canonical *JSON*
-form and produce valid-looking signatures that every server rejects — which is
-the exact failure class I-1 exists to prevent. The erratum is sealed at the
-program level in `docs/mls-v2/2026-08-15-invariant-i1-erratum.md` (workspace
-root, commit `80969765`) and supersedes every earlier statement by name.
+| Slice | Commit | What |
+|---|---|---|
+| S7a | `6309353f` | Canonical value model, DAG-CBOR transcript, 25 signing domains, request digest |
+| S7b | `6d88c594` | Strict JSON profile, STANDARD base64, two-field wrapper, `verify_strict`, key-ID binding |
+| S7c | `beb865c5` | Both fingerprint domains, 13 control kinds, `serverFields` rules |
+| S7d-pre | `8b71a345` | Wire JSON → `CanonicalBody` through the embedded lexicon contract |
+| S7d | `a57914c4` | Application entry shape, conversation binding, sender identity |
 
-> ~~Signed request bodies use the certified transcript canonical form with bare
-> STANDARD base64 for bytes, and the signature binds to *that* form.~~
+### Things that will be got wrong if not read
 
-The corrected invariant, in two halves that must not be conflated:
+Beyond the four byte-identity traps in section 1:
 
-- **Wire input.** A signed request body is strict JSON in which bytes fields are
-  **bare canonical STANDARD base64** — padded, standard alphabet, and
-  re-encode-compared so a non-canonical spelling of the same bytes is refused.
-  Jacquard's `{"$bytes": …}` DAG-JSON remains authoritative **only** for
-  responses and unsigned params.
-- **The signed transcript.** What Ed25519 actually signs is
+- **The lexicon does not encode the UUID-bytes rule.** `operationId` and
+  `deviceId` are format-less plain strings in the contract. A field is sixteen
+  raw bytes exactly when its schema is a `ref` to `#operationId` or
+  `#deviceId` — a hardcoded set of four ref names in `contract.rs`, mirrored
+  from the server, short-circuited before the schema is read. Deriving the rule
+  from the schema yields text UUIDs and signatures that verify nowhere.
+- **The conversation binding does not always read `prior`.** `creationBody` and
+  `leaveCancellationBody` carry `conversationId` directly; every other
+  conversation-scoped kind carries it under `prior.conversationId`. A test
+  derives that pair from the contract rather than trusting the constant.
+- **`ControlServerFields` refuses in both directions.** Eleven control kinds
+  must carry an empty `serverFields` map; exactly two carry one field each
+  (`recovery` for acceptance, `tombstone` for close). Handing content to an
+  ordinary kind, or emptiness to a special one, is refused by name — a silent
+  well-formed fingerprint over the wrong bytes is the worst failure available
+  in this family.
+- **The two fingerprint projections are different shapes on purpose.**
+  Application binds six fields, control binds eight (the same six plus
+  `entryKind` and `serverFields`). `entryKind` is what stops one kind's
+  fingerprint being presented as another's. Unifying the shapes changes every
+  fingerprint on one side; the CBOR map headers are asserted directly.
 
-  ```text
-  transcript = domain-with-trailing-NUL || DAG-CBOR(projected body)
-  digest     = SHA-256(transcript)
-  ```
+### Two refusals are security events, not format errors
 
-  **Base64 never appears in the signed bytes at all.** It is only how bytes
-  arrive before projection.
+`EntryError::ConversationBindingViolated` and
+`EntryError::SenderIdentityMismatch` both render with a `SECURITY:` prefix, and
+a test asserts that prefix so it cannot be softened as a wording nit. The first
+is the replay case — a row legitimately signed for a different conversation —
+and is checked **before** the signature, because reporting "bad signature" for a
+replay attempt hides what happened. The second refuses a same-DID sibling device
+as firmly as a stranger, since visibility is per exact `(DID, deviceId)`.
 
-`src/chat_v2/transcript/` is the reference implementation (commit `6309353f`).
+### Where the reducer and the envelope meet
 
-### The four byte-identity traps
+`OuterEntryFingerprint` is produced only by verified-entry paths, and the
+reducer accepts provenance only in that form. A row cannot reach interval
+provenance without having had its shape, binding, and signature checked first.
+That was the design intent recorded back in `provenance.rs`; it is now
+structural rather than promised.
 
-Each is pinned by a test that fails if someone "corrects" it.
+### Conventions worth keeping
 
-1. **Signing domains carry a literal trailing NUL, and the domain appears
-   TWICE** — once as the transcript prefix, and again inside the body as the
-   `signatureDomain` field, whose UTF-8 bytes must equal the domain NUL
-   included. The golden fixture really does contain
-   `"CATBIRD-CHAT-BLOB-DELETE "`. Retyping a domain without the NUL is the
-   natural mistake and changes every signature that kind produces.
-2. **UUIDs serialize as 16 RAW bytes**, per the fixture's `uuidByteFields` list
-   (`actorDeviceId`, `blobId`, `idempotencyKey`), while **DIDs, key thumbprints,
-   and timestamps stay strings**. Emitting a UUID's hyphenated ASCII form gives
-   a structurally valid transcript with entirely different bytes.
-3. **The signed wrapper is exactly two fields** — `body` and `signature`, the
-   latter 64 bytes. A third field is refused, not ignored.
-4. **DAG-CBOR map keys are ordered LENGTH-FIRST**, not byte-lexicographically.
-   The golden body emits `$type, keyId, blobId, actorDid`; the `BTreeMap`
-   holding it iterates `actorDid, blobId, keyId, $type`. **Never reimplement
-   this ordering** — share `serde_ipld_dagcbor` with the server, which is what
-   makes the agreement structural instead of a rule someone has to remember.
-
-Plus: verification is dalek's `verify_strict` (not `verify`), and the body's
-`keyId` must be re-derived from the supplied public key and compared **before**
-the signature is checked.
-
-**Never serialize generated DTOs** for transcripts or fingerprints. They emit
-fields alphabetically and carry a flattened `extra_data` catch-all, and the spec
-forbids DTO bytes as transcript or fingerprint input. `chat_v2` owns its
-encoder.
-
-Lift golden vectors from the server suites so the two implementations cannot
-drift silently. If the investigation turns up any reason these crates *cannot*
-achieve byte-identity with the server encoder, surface it before sealing rather
-than working around it.
-
-S7 also owns: the exact five-field application-entry shape check, conversation
-binding (`entry.conversationId == signedRequest.body.prior.conversationId`),
-canonical send transcript reconstruction and strict Ed25519 verification
-**before** decryption or attribution, the immutable outer fingerprint, and the
-same for all 13 control kinds including their `serverFields` projection
-(`{}` for ordinary, `{recovery}` for acceptance, `{tombstone}` for close — see
-`wire.rs::ENTRY_KINDS_WITH_SERVER_FIELDS`).
-
-After decryption, the authenticated MLS sender leaf and BasicCredential must
-equal the verified signed outer actor DID and device. The outer identity is
-never display authority by itself. `ids/credential.rs` has the comparison type.
-
----
+- **Never serialize a generated DTO** for a transcript or fingerprint. DTOs emit
+  fields alphabetically and carry a flattened `extra_data` catch-all.
+- **Vendored vectors carry provenance.** Source repo, path, commit hash, and
+  SHA-256 per source file, in `vectors/PROVENANCE.md`. A vendored vector failing
+  against the encoder is **a finding to report, never a vector to adjust**.
+- **`VerifiedApplicationEntry` is deliberately not `PartialEq`.** Comparing two
+  verified authorities by value is not a meaningful operation.
 
 ## 6. Slices 8 and 9 — outline
 
