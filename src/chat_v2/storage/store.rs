@@ -162,14 +162,37 @@ pub trait ChatV2Store: ChatV2StoreBounds {
     /// `(DID, deviceId)` MLS leaf, never shared across a DID's devices, so a key
     /// that omitted the device would let one device's schedule answer for a
     /// sibling's and hand it history it never had.
+    ///
+    /// # A decomposing implementation must persist the high-water mark
+    ///
+    /// The whole reducer is the unit here, and one of its fields cannot be
+    /// recovered from the others: [`ApplicationReducer::high_water`] is the
+    /// greatest sequence the schedule has consumed, and the sequential control
+    /// rows consumed *inside* an open interval leave no trace in the interval
+    /// list. A schedule that opened at 1 and consumed a row at 500 records only
+    /// the 1.
+    ///
+    /// So an implementation that writes columns instead of the value must write
+    /// that mark too. Reconstructing a schedule from its intervals restores a
+    /// mark below the truth and silently re-admits every sequence between,
+    /// which is the replay window the mark exists to close — and
+    /// [`ApplicationReducer::rehydrate`] cannot catch it, because a lower mark
+    /// is indistinguishable from a schedule that legitimately consumed less.
+    /// Its floor check catches a mark below the *recorded* sequences and
+    /// nothing finer.
+    ///
+    /// The no-default gate forces every method to be implemented; nothing can
+    /// force a field to be serialized, so this is stated rather than enforced.
     async fn put_schedule(&self, schedule: &ApplicationReducer) -> Result<(), StorageError>;
 
     /// Reads the schedule for one exact device.
     ///
     /// `None` when this store holds none. Implementations reconstruct it with
     /// [`ApplicationReducer::rehydrate`], which refuses a schedule whose
-    /// intervals name another device or whose expected context disagrees with
-    /// its intervals.
+    /// intervals name another device, whose expected context disagrees with its
+    /// intervals, whose intervals are unordered, overlapping, or open anywhere
+    /// but last, or whose high-water mark sits below the sequences the schedule
+    /// itself records.
     async fn schedule(
         &self,
         binding: &RecipientBinding,

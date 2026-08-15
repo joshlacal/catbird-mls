@@ -605,7 +605,57 @@ async fn a_schedule_round_trips_with_its_intervals_and_expected_context() {
     assert_eq!(restored.intervals(), original.intervals());
     assert_eq!(restored.expected_context(), original.expected_context());
     assert_eq!(restored.terminal_proof(), original.terminal_proof());
+    assert_eq!(restored.high_water(), original.high_water());
     assert!(restored.has_open_interval());
+}
+
+#[tokio::test]
+async fn the_high_water_mark_survives_the_round_trip_when_it_cannot_be_derived() {
+    // The discriminating case, and the reason the previous test's equality
+    // assertion is not enough on its own. A schedule that opened at 1 and
+    // consumed a control row at 500 records only the 1 in its intervals — the
+    // mark is 500 and nothing in the interval list says so. An implementation
+    // that reconstructed a schedule from its intervals instead of persisting
+    // the whole value would restore a mark of 1 here and silently re-admit
+    // every sequence between, which is exactly the replay window the mark
+    // closes.
+    let store = store();
+    let mut original = open_schedule(DEVICE);
+    original
+        .apply_sequential_control(&SequentialControl {
+            seq: Seq::new(500).unwrap(),
+            recipient: binding(OWNER, DEVICE),
+            previous: coordinate(0),
+            next: coordinate(1),
+        })
+        .expect("a control row inside the open interval must apply");
+    assert_eq!(original.high_water(), Some(Seq::new(500).unwrap()));
+    assert_eq!(
+        original.intervals()[0].opening().seq,
+        Seq::new(1).unwrap(),
+        "the interval list must not be able to express the mark, or this proves nothing"
+    );
+
+    store.put_schedule(&original).await.unwrap();
+    let mut restored = store
+        .schedule(&binding(OWNER, DEVICE))
+        .await
+        .unwrap()
+        .expect("the schedule must be readable");
+    assert_eq!(restored.high_water(), Some(Seq::new(500).unwrap()));
+
+    // And the restored mark is enforced, not merely carried: a replay below it
+    // is refused on the very next row.
+    let replay = SequentialControl {
+        seq: Seq::new(400).unwrap(),
+        recipient: binding(OWNER, DEVICE),
+        previous: coordinate(1),
+        next: coordinate(2),
+    };
+    assert!(
+        restored.apply_sequential_control(&replay).is_err(),
+        "a row beneath the restored mark must be refused"
+    );
 }
 
 #[tokio::test]
