@@ -35,8 +35,18 @@
 //!    is `serde_ipld_dagcbor`'s doing, which is exactly why the crate is shared
 //!    with the server rather than reimplemented.
 
+pub mod signed;
+pub mod strict_json;
 pub mod value;
 
+pub use signed::{
+    verify_ed25519_strict, SignedMutationError, SignedWrapper, VerifiedMutation,
+    ED25519_SIGNATURE_LEN,
+};
+pub use strict_json::{
+    decode_standard_base64, decode_strict_json, encode_standard_base64, StrictJson,
+    StrictJsonError, MAX_SIGNED_JSON_BYTES,
+};
 pub use value::{CanonicalBody, CanonicalValue};
 
 use core::fmt;
@@ -316,5 +326,7 @@ impl SigningTranscript {
     }
 }
 
+#[cfg(test)]
+mod signed_tests;
 #[cfg(test)]
 mod tests;
