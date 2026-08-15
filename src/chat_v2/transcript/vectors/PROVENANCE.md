@@ -41,6 +41,41 @@ fingerprints):
 |---|---|
 | `server/tests/fixtures/mls_chat_control_fingerprint_source.json` | `f33406a5d99dba3b604da108c4df2e53d70531b9fa0be14b21e2db94ba07b311` |
 
+## The embedded lexicon contract
+
+`blue.catbird.chat.defs.json` is the contract the projection walks, and it must
+be **the same bytes the server embeds** — the server reaches it through
+`include_str!("../../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json")`.
+
+| | |
+|---|---|
+| Source path | `lexicon/blue/catbird/chat/blue.catbird.chat.defs.json` |
+| Source revision | `425e149fc8682623c0a94e58ce51793c73df7ecc` |
+| SHA-256 | `9791a2828a7d4d286b6f2f5362ac2f31691598cd7f3761e8ceef3abb09d3fcfc` |
+| Size / defs | 131,642 bytes / 200 definitions |
+
+**Verified identical across every live copy in the workspace** at vendoring
+time — the server's embedded copy, `PetrelCatbird/lexicons/` (the canonical
+codegen source), `mls-ds-lane-e-ws/`, `nest-chat-auth-ws/`, and
+`nest-merge-ws/` all hash to the same value. There is no divergence between the
+codegen source of truth and what the server actually embeds, so projecting
+through this copy is projecting through the server's contract.
+
+To re-check:
+
+```sh
+cd Catbird+Petrel/mls-ds
+/usr/bin/git show <rev>:lexicon/blue/catbird/chat/blue.catbird.chat.defs.json | shasum -a 256
+shasum -a 256 ../PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json
+```
+
+**The contract does not encode the UUID-bytes rule.** `operationId` and
+`deviceId` are declared as plain strings with no `format`. What makes them
+sixteen raw bytes is a hardcoded set of four reference names in the projection
+code, mirrored from the server. See `contract.rs`'s module documentation; a test
+pins that these definitions really are plain strings, so nobody tries to derive
+the rule from the schema.
+
 ## What was lifted
 
 Both vendored files come from the **same source file at the same revision**, so
