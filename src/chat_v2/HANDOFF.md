@@ -1,16 +1,16 @@
 # chat_v2 — Task 3 handoff
 
 State of the clean chat protocol (`blue.catbird.chat.*`) client implementation
-as of the twenty-second sealed slice. Written for the session that continues it.
+as of the twenty-fifth sealed slice. Written for the session that continues it.
 
 Workspace: `catbird-mls-task3-ws` (isolated jj workspace; Josh's default
 workspace is untouched and must stay that way).
 
 > ## ⚠ CONSUMING THIS REVISION REQUIRES REGENERATING BINDINGS
 >
-> The UniFFI surface **changed** in `b8fdd164`'s successor (the FFI slice): the
-> recovery projection and its rung enum were added, and the status probe's
-> capability lists moved.
+> The UniFFI surface **changed** in `967deea2` (S9b) and again in `eaf655ff`
+> (S9d): the recovery projection and its rung enum were added, and the status
+> probe's capability lists moved twice.
 >
 > A client built against a rebuilt library **without regenerated Swift/Kotlin
 > panics at runtime with a checksum mismatch.** It is not a compile error, so
@@ -24,7 +24,7 @@ workspace is untouched and must stay that way).
 > landing pass, not to this workspace — nothing ships from here — but the
 > obligation travels with the revision.
 
-Verification at handoff: **546 lib tests pass, 0 failures.** `cargo fmt
+Verification at handoff: **580 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib --all-targets` reports zero warnings under
 `chat_v2`, `wasm32-unknown-unknown` builds.
 
@@ -32,7 +32,7 @@ Verification at handoff: **546 lib tests pass, 0 failures.** `cargo fmt
 
 ## 1. Sealed commits
 
-Twenty-two, oldest first. All additive; the only pre-existing file touched is
+Twenty-five, oldest first. All additive; the only pre-existing file touched is
 `src/lib.rs` (three lines declaring the module).
 
 | Change | Commit | What |
@@ -59,6 +59,11 @@ Twenty-two, oldest first. All additive; the only pre-existing file touched is
 | `puwwnvty` | `acd8d075` | Encrypted media and reaction predicates (S8a) |
 | `rlxukvvz` | `43693690` | Restricted AT URI and external link predicates (S8b) |
 | `vrzwlopk` | `7cb107dc` | The bounded recovery ladder and its absence gate (S9a) |
+| `unrqvtzr` | `0cfdfc40` | Handoff refresh for content predicates and the ladder |
+| `uqkyovyq` | `b8fdd164` | The NFC check completing the reaction predicate (S8b-pre) |
+| `szlxmzrz` | `967deea2` | The single recovery projection on the FFI surface (S9b) |
+| `zlmxmxww` | `b0a8c2f5` | Poisoned-state containment (S9c) |
+| `xwnzpuqk` | `eaf655ff` | Participation status and the direct-traffic gate (S9d) |
 
 ### The detached-HEAD trap — read before concluding a server file is missing
 
@@ -168,8 +173,10 @@ chat_v2/
     reaction.rs grapheme cluster + control-free; NFC refuses by name
     at_uri.rs   the restricted canonical AT URI
     link.rs     external links
+  participation.rs  pending vs active-zero-leaf; direct/group gate asymmetry
   recovery/     bounded ladder (S9a) + the forbidden-mechanism absence gate
     ladder.rs   four rungs, skip/descent/exhaustion refused by name
+    poison.rs   deterministic-only poison, containment, different-DID fulfiller
   reducer/
     mod.rs      sequencing core (6a)
     reanchor.rs closure, reanchor, touching boundaries (6b)
@@ -371,91 +378,73 @@ structural rather than promised.
 - **`VerifiedApplicationEntry` is deliberately not `PartialEq`.** Comparing two
   verified authorities by value is not a meaningful operation.
 
-## 6. Content predicates and recovery — partially built
+## 6. Content predicates, recovery, and participation — complete
 
-### Built (S8a/S8b, `content/`)
+Everything §8 and §9 describe is built. **Storage isolation is the only thing
+left before this protocol is usable end to end**, which is why
+`chat_v2_status()` still reports `is_operational = false`.
 
-Everything in §8 **except the NFC half of the reaction predicate**.
+### Built (S8a/S8b/S8b-pre, `content/`)
 
-The character of this code differs from `transcript/` and the difference
+The character of this code differs from `transcript/`, and the difference
 matters: **application content is encrypted, so the server never sees it.**
-Confirmed by inspection — `mls-ds` declares no Unicode dependency and has no
-grapheme or normalization code — with a positive control run on the search
-first. Two consequences:
+Confirmed by inspection, with a positive control run on the search first. Two
+consequences:
 
 - **There are no golden vectors to lift.** The "a failing vector is a finding"
-  rule has no analogue here. The vectors are constructed from spec text, and to
-  stop them drifting from the declared bounds the tests read the **embedded
-  contract's own** `minimum` / `maximum` / `enum` values and assert agreement.
+  rule has no analogue. Vectors are constructed from spec text, and the tests
+  read the **embedded contract's own** `minimum`/`maximum`/`enum` values and
+  assert agreement rather than restating them.
 - **Every client is the whole enforcement, independently.** Nothing upstream
-  catches a disagreement, which is why the Unicode version is asserted rather
-  than assumed.
+  catches a disagreement, which is why both Unicode versions are asserted.
 
-Things worth knowing before changing any of it:
+Traps recorded because each cost time or would have:
 
-- **`unicode-segmentation` is promoted** (transitive via `catbird-atproto`), and
-  a test asserts `UNICODE_VERSION == (17, 0, 0)` rather than trusting the pin.
 - **Extended vs legacy grapheme clusters differ on SpacingMark and Prepend, NOT
-  on ZWJ.** A ZWJ emoji sequence is one cluster under *both*, so it proves
-  nothing; the discriminating test uses Devanagari and Thai and asserts the
-  legacy count is 2. An earlier version of that test used a ZWJ sequence and
-  failed for exactly this reason.
-- **Byte bounds are UTF-8 bytes, not characters**, proven with two- and
-  three-byte characters — a character-counting implementation accepts roughly
-  twice the permitted data.
-- **The AT URI and external links disagree about percent signs on purpose.**
-  The AT URI refuses them outright so one record has one spelling; a web URL
-  cannot have that property. A test pins the disagreement so nobody
-  "harmonizes" it.
-- **The AT URI cap is derived**, not restated, from its six parts.
-- **The collection authority is lowercase but the terminal name is
-  case-sensitive**, so `app.bsky.feed.Post` is canonical. A single lowercase
-  check over the whole NSID rejects the valid form.
+  on ZWJ.** A ZWJ sequence is one cluster under both, so a test using one proves
+  nothing. An earlier version did exactly that and failed.
+- **Segmentation and normalization are different crates.** Both report Unicode
+  17.0.0 and a test asserts they agree with each other and with the pin; a
+  mismatch would be a cross-version seam.
+- **Byte bounds are UTF-8 bytes, not characters** — character-counting accepts
+  roughly twice the permitted data.
+- **The AT URI and external-link grammars disagree about percent signs on
+  purpose**, and a test pins the disagreement so nobody harmonizes it.
+- **NFC is checked, never applied.** Reactions reduce by `(verified DID, NFC
+  grapheme)`, so a decomposed value and its composed twin land in different
+  buckets — one person's reaction rendering as two.
 
-### Built (S9a, `recovery/`)
+### Built (S9a/S9c/S9d, `recovery/` and `participation.rs`)
 
-The bounded four-rung ladder — catch-up, pending Welcome, target-device recovery
-request, reset request — refusing a skip, a descent, and escalation past the top,
-each by name. No force or restart-at constructor: starting over is a new episode.
+The bounded four-rung ladder, refusing skip, descent, and past-top by name;
+**the absence gate**; poisoned-state containment; and the participation gate.
 
-**The absence gate is the important half.** v1 states the same prohibition in
-its docs *and* ships `force_rejoin_unlocked`, with production epochs of 700-800
-as the result — a comment demonstrably does not hold. So a test walks the whole
-tree and fails on `create_external_commit`, `join_by_external_commit`,
-`external_commit_builder`, or `force_rejoin`, with a positive control, runtime-
-assembled needles, and a third test requiring every entry to carry a real reason
-so it cannot be deleted casually.
+- **The absence gate is the enforcement shape for every "we will never" in this
+  tree.** v1 documents the prohibition *and* ships `force_rejoin_unlocked`, with
+  700-800 production epochs as the result. The gate walks the tree, has a
+  positive control, assembles needles at runtime, and requires every entry to
+  carry a reason so a deleter must read why first.
+- **A poisoned device requests, never activates.** Its next rung is the
+  target-device recovery request. Fulfiller selection is by **different DID**,
+  and a test pins that a *healthy sibling of the victim's own DID is refused* —
+  poison plausibly affects every device of one principal.
+- **Containment freezes sending and ratchet advancement together**, as one value
+  so a caller cannot apply half. Half is worse than none.
+- **Direct and group are gated differently on purpose**, with an identical
+  roster refused as a direct and permitted as a group. Pending →
+  `ConversationNotAccepted`; active-zero-leaf → `RecipientNotReady`. Reporting
+  the first for a recovery gap tells a user their peer ignored them.
+- **Acceptance changes only status.** A freshly accepted participant is
+  *addable but not yet sendable*, and the refusal is the leaf one.
 
-### NOT built — and both are blocked on a decision, not on effort
+### Still outstanding
 
-**1. The NFC half of the reaction predicate.** `require_reaction_value` refuses
-every value with `NfcCheckUnavailable`. Skipping the check would accept
-decomposed sequences a conforming peer rejects and split one logical reaction
-across two reduce buckets, since reactions reduce by `(verified DID, NFC
-grapheme)`. A test pins that a decomposed sequence and its composed form are
-both one cluster with different bytes, which is why it cannot be waved through.
-
-The dependency choice is the blocker, and the obvious answer is wrong:
-`icu_normalizer` is in `Cargo.lock` but reaches us **only** via
-`openmls_sqlite_storage`, which is **excluded on wasm32** — so promoting it adds
-ICU4X plus its data crate to the wasm build rather than being free. Check the
-actual tree with `cargo tree -p catbird_mls -i <crate>`, not the lockfile.
-`unicode-normalization` is genuinely new but small, is a *check* rather than a
-transform (matching reject-never-normalize), and its version is assertable.
-
-**2. The rest of S9.** Poison handling (detect deterministic Commit/Welcome
-failure, freeze unsafe send and ratchet advancement, sign `recoveryKind=replace`
-outside MLS, select a healthy **different-DID** fulfiller, escalate
-all-peers-poisoned to active-admin reset or direct close); the
-pending-invite-before-Add rule with direct traffic disabled until both
-participants are active and leafed; and the single recovery projection plus
-extending `ffi.rs`.
-
-The FFI extension is a **cross-lane** question, not a local one. Reducer and
-interval shapes have now stopped moving, so it is finally possible — but it is
-where iOS and Android begin consuming this, and a rebuilt library without
-regenerated Swift/Kotlin gives a runtime checksum-mismatch panic rather than a
-compile error. Sequence it with the client lanes.
+**Storage isolation, and it must be physical.** v2 needs its own storage trait
+with every method required — v1's 20-of-34 default-no-op methods are a silent
+data-loss footgun — and platforms must open a separate store. v1's storage is
+flat with no namespace concept, and the OpenMLS store has no prefix mechanism,
+so a shared context would put v1 and v2 groups in one table keyed only by group
+id.
 
 
 ## 7. FFI notes for whoever extends `ffi.rs`
