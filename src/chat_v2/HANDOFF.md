@@ -224,6 +224,7 @@ chat_v2/
     page.rs     PageCommit — the atomic unit; entries + ratchet + cursor as one
     store.rs    the ChatV2Store trait, every method required + the no-default gate
     memory.rs   a NON-DURABLE reference implementation; never a production store
+    memory_tests.rs  its behaviour tests; what any platform store must also meet
   ffi.rs        skeletal UniFFI surface (cfg'd out on wasm32)
 ```
 

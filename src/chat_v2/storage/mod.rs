@@ -50,6 +50,9 @@ pub mod memory;
 pub mod page;
 pub mod store;
 
+#[cfg(test)]
+mod memory_tests;
+
 pub use error::{RecordKind, StorageError};
 pub use memory::MemoryStore;
 pub use page::{EntryOutcome, PageCommit, PersistedEntry, RatchetCheckpoint};
