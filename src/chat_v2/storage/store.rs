@@ -37,6 +37,7 @@
 use super::super::cursor::AfterSeq;
 use super::super::interval::RecipientBinding;
 use super::super::journal::{JournalEntry, OperationIdentity};
+use super::super::reducer::ApplicationReducer;
 use super::page::{PageCommit, PersistedEntry, RatchetCheckpoint};
 use super::{StorageError, StoreScope};
 use async_trait::async_trait;
@@ -139,6 +140,26 @@ pub trait ChatV2Store: ChatV2StoreBounds {
     /// committed, and the only way to find out is to resubmit the identical
     /// stored bytes and read the result the server kept.
     async fn outstanding_journal_entries(&self) -> Result<Vec<JournalEntry>, StorageError>;
+
+    /// Durably records one exact-device application access schedule.
+    ///
+    /// Keyed by the reducer's own binding — `(conversation, recipient DID,
+    /// recipient device)`. §9 makes application visibility per exact
+    /// `(DID, deviceId)` MLS leaf, never shared across a DID's devices, so a key
+    /// that omitted the device would let one device's schedule answer for a
+    /// sibling's and hand it history it never had.
+    async fn put_schedule(&self, schedule: &ApplicationReducer) -> Result<(), StorageError>;
+
+    /// Reads the schedule for one exact device.
+    ///
+    /// `None` when this store holds none. Implementations reconstruct it with
+    /// [`ApplicationReducer::rehydrate`], which refuses a schedule whose
+    /// intervals name another device or whose expected context disagrees with
+    /// its intervals.
+    async fn schedule(
+        &self,
+        binding: &RecipientBinding,
+    ) -> Result<Option<ApplicationReducer>, StorageError>;
 }
 
 /// Enforces that [`ChatV2Store`] never grows a default method body.

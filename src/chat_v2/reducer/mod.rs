@@ -137,6 +137,24 @@ pub enum ReducerError {
     /// exact-device schedule and "no effect" is not one of them. Routing the row
     /// to a reducer it does not touch is a caller mistake worth naming.
     ResetAffectsNoInterval { seq: Seq },
+    /// A restored schedule's expected context disagreed with its intervals.
+    ///
+    /// Every path in this module maintains the invariant that an interval is
+    /// open exactly when an expected context is installed: an opening installs
+    /// one, a close clears it, and [`ApplicationReducer::apply_sequential_control`]
+    /// relies on it directly — it reaches for the expected context of an open
+    /// interval and treats its absence as unreachable.
+    ///
+    /// Restoring durable state is the one way into this type that does not run
+    /// those paths, so it is the one way the invariant could be violated. A
+    /// violation would not be a wrong answer, it would be a panic in a sealed
+    /// path, which is why restoring refuses it here instead.
+    RestoredScheduleIncoherent {
+        /// Whether the restored intervals leave one open.
+        has_open_interval: bool,
+        /// Whether a restored expected context was supplied.
+        has_expected_context: bool,
+    },
     /// An interval-level rule was violated.
     Interval(IntervalError),
 }
@@ -209,6 +227,15 @@ impl fmt::Display for ReducerError {
                 f,
                 "terminal at {seq} has no historical schedule to finalize"
             ),
+            Self::RestoredScheduleIncoherent {
+                has_open_interval,
+                has_expected_context,
+            } => write!(
+                f,
+                "restored schedule has open_interval={has_open_interval} but \
+                 expected_context={has_expected_context}; an interval is open \
+                 exactly when a context is expected"
+            ),
             Self::Interval(err) => write!(f, "{err}"),
         }
     }
@@ -234,6 +261,64 @@ impl ApplicationReducer {
             expected: None,
             terminal: None,
         }
+    }
+
+    /// Restores a schedule from durable storage.
+    ///
+    /// The counterpart to the rule-enforcing entry points above: those decide
+    /// whether a row may change a schedule, while this one reinstates a schedule
+    /// those rules already accepted. It deliberately does **not** re-derive that
+    /// history — replaying admission decisions against rows that are no longer
+    /// held would refuse a schedule that was legitimately built.
+    ///
+    /// It does enforce the two invariants that later paths assume, because
+    /// restoring is the only way into this type that bypasses the paths which
+    /// normally maintain them:
+    ///
+    /// - every interval, and any terminal proof, names this reducer's exact
+    ///   recipient. A schedule holding a sibling device's intervals would make
+    ///   that device's history visible here, and visibility is per exact
+    ///   `(DID, deviceId)`.
+    /// - an interval is open exactly when an expected context is present.
+    ///   Violating this does not produce a wrong answer, it panics
+    ///   [`ApplicationReducer::apply_sequential_control`].
+    pub fn rehydrate(
+        binding: RecipientBinding,
+        intervals: Vec<AccessInterval<Coordinate>>,
+        expected: Option<Coordinate>,
+        terminal: Option<ApplicationScheduleTerminalProof>,
+    ) -> Result<Self, ReducerError> {
+        for interval in &intervals {
+            if !binding.matches(interval.binding()) {
+                return Err(ReducerError::RecipientMismatch {
+                    expected: binding.clone(),
+                    found: interval.binding().clone(),
+                });
+            }
+        }
+        if let Some(proof) = &terminal {
+            if !binding.matches(proof.binding()) {
+                return Err(ReducerError::RecipientMismatch {
+                    expected: binding.clone(),
+                    found: proof.binding().clone(),
+                });
+            }
+        }
+
+        let has_open_interval = intervals.last().is_some_and(AccessInterval::is_open);
+        if has_open_interval != expected.is_some() {
+            return Err(ReducerError::RestoredScheduleIncoherent {
+                has_open_interval,
+                has_expected_context: expected.is_some(),
+            });
+        }
+
+        Ok(Self {
+            binding,
+            intervals,
+            expected,
+            terminal,
+        })
     }
 
     /// The immutable audience this reducer is bound to.

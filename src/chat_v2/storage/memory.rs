@@ -29,6 +29,7 @@ use super::super::cursor::AfterSeq;
 use super::super::ids::Seq;
 use super::super::interval::RecipientBinding;
 use super::super::journal::{JournalEntry, OperationIdentity};
+use super::super::reducer::ApplicationReducer;
 use super::page::{PageCommit, PersistedEntry, RatchetCheckpoint};
 use super::store::ChatV2Store;
 use super::{RecordKind, StorageError, StoreScope};
@@ -43,6 +44,7 @@ struct State {
     entries: HashMap<RecipientBinding, BTreeMap<Seq, PersistedEntry>>,
     checkpoints: HashMap<RecipientBinding, RatchetCheckpoint>,
     journal: HashMap<OperationIdentity, JournalEntry>,
+    schedules: HashMap<RecipientBinding, ApplicationReducer>,
 }
 
 /// A non-durable [`ChatV2Store`] for tests and for proving the trait's shape.
@@ -183,6 +185,25 @@ impl ChatV2Store for MemoryStore {
         Ok(state.journal.get(identity).cloned())
     }
 
+    async fn put_schedule(&self, schedule: &ApplicationReducer) -> Result<(), StorageError> {
+        let binding = schedule.binding();
+        self.scope.require_binding_owner(binding)?;
+        let mut state = self.guard("put_schedule")?;
+        // Keyed by the exact binding, device included. A conversation-only key
+        // would let a sibling device's schedule answer for this one.
+        state.schedules.insert(binding.clone(), schedule.clone());
+        Ok(())
+    }
+
+    async fn schedule(
+        &self,
+        binding: &RecipientBinding,
+    ) -> Result<Option<ApplicationReducer>, StorageError> {
+        self.scope.require_binding_owner(binding)?;
+        let state = self.guard("schedule")?;
+        Ok(state.schedules.get(binding).cloned())
+    }
+
     async fn outstanding_journal_entries(&self) -> Result<Vec<JournalEntry>, StorageError> {
         let state = self.guard("outstanding_journal_entries")?;
         Ok(state
@@ -201,11 +222,15 @@ impl ChatV2Store for MemoryStore {
 mod tests {
     use super::super::page::EntryOutcome;
     use super::*;
+    use crate::chat_v2::coordinate::{Coordinate, Lifecycle};
     use crate::chat_v2::ids::{
         BareDid, CanonicalTimestamp, ConversationId, DeviceId, EntryId, IdempotencyKey, MessageId,
     };
+    use crate::chat_v2::ids::{SafeInteger, TransitionId};
+    use crate::chat_v2::interval::IntervalOpening;
     use crate::chat_v2::journal::{JournalState, OperationId};
-    use crate::chat_v2::provenance::OuterEntryFingerprint;
+    use crate::chat_v2::provenance::{OpeningKind, OuterEntryFingerprint};
+    use crate::chat_v2::reducer::{ReducerError, SequentialControl};
 
     const OWNER: &str = "did:plc:z72i7hdynmk6r22z27h6tvur";
     const STRANGER: &str = "did:plc:44ybard66vv44zksje25o7dz";
@@ -727,6 +752,197 @@ mod tests {
             .is_isolation_breach());
         assert!(store
             .journal_entry(&transition_identity(STRANGER))
+            .await
+            .unwrap_err()
+            .is_isolation_breach());
+    }
+
+    // ---- the exact-device schedule ----------------------------------------
+
+    const TRANSITION: &str = "0e1d2c3b-4a59-4687-9876-5432100fedcb";
+
+    fn coordinate(state_version: i64) -> Coordinate {
+        Coordinate {
+            conversation_id: ConversationId::parse(CONVERSATION).unwrap(),
+            generation: SafeInteger::ZERO,
+            state_version: SafeInteger::new(state_version).unwrap(),
+            group_id: [0x01; 32],
+            epoch: SafeInteger::ZERO,
+            group_context_hash: [0x02; 32],
+            confirmation_tag: [0x03; 32],
+            lifecycle: Lifecycle::Active,
+        }
+    }
+
+    fn opening(at: i64) -> IntervalOpening<Coordinate> {
+        IntervalOpening {
+            seq: Seq::new(at).unwrap(),
+            kind: OpeningKind::Creation,
+            transition_id: TransitionId::parse(TRANSITION).unwrap(),
+            outer_entry_fingerprint: OuterEntryFingerprint::from_verified([0x5a; 32]),
+            context: coordinate(0),
+        }
+    }
+
+    /// A reducer with one open interval, built through the rule-enforcing path.
+    fn open_schedule(device: &str) -> ApplicationReducer {
+        let binding = binding(OWNER, device);
+        let mut reducer = ApplicationReducer::new(binding.clone());
+        reducer
+            .install_initial_opening(&binding, opening(1))
+            .expect("the fixture opening must install");
+        reducer
+    }
+
+    #[tokio::test]
+    async fn a_schedule_round_trips_with_its_intervals_and_expected_context() {
+        let store = store();
+        let original = open_schedule(DEVICE);
+        store.put_schedule(&original).await.unwrap();
+
+        let restored = store
+            .schedule(&binding(OWNER, DEVICE))
+            .await
+            .unwrap()
+            .expect("the schedule must be readable");
+
+        assert_eq!(restored.binding(), original.binding());
+        assert_eq!(restored.intervals(), original.intervals());
+        assert_eq!(restored.expected_context(), original.expected_context());
+        assert_eq!(restored.terminal_proof(), original.terminal_proof());
+        assert!(restored.has_open_interval());
+    }
+
+    #[tokio::test]
+    async fn a_restored_schedule_still_sequences() {
+        // The point of the coherence check, made concrete. A restored reducer
+        // has to be usable on the path that reaches for the expected context of
+        // an open interval — the path that panics if the invariant was not kept.
+        let store = store();
+        store.put_schedule(&open_schedule(DEVICE)).await.unwrap();
+        let mut restored = store
+            .schedule(&binding(OWNER, DEVICE))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let row = SequentialControl {
+            seq: Seq::new(4).unwrap(),
+            recipient: binding(OWNER, DEVICE),
+            previous: coordinate(0),
+            next: coordinate(1),
+        };
+        restored
+            .apply_sequential_control(&row)
+            .expect("a restored schedule must sequence exactly as the original would");
+        assert_eq!(restored.expected_context(), Some(&coordinate(1)));
+    }
+
+    #[tokio::test]
+    async fn sibling_devices_keep_separate_schedules() {
+        // Visibility is per exact (DID, deviceId). A key that omitted the device
+        // would hand one device the other's interval history.
+        let store = store();
+        store.put_schedule(&open_schedule(DEVICE)).await.unwrap();
+        store
+            .put_schedule(&open_schedule(SIBLING_DEVICE))
+            .await
+            .unwrap();
+
+        let own = store
+            .schedule(&binding(OWNER, DEVICE))
+            .await
+            .unwrap()
+            .unwrap();
+        let sibling = store
+            .schedule(&binding(OWNER, SIBLING_DEVICE))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(own.binding(), &binding(OWNER, DEVICE));
+        assert_eq!(sibling.binding(), &binding(OWNER, SIBLING_DEVICE));
+        assert!(
+            !own.binding().matches(sibling.binding()),
+            "two devices of one principal are different audiences"
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_refuses_a_schedule_holding_another_devices_intervals() {
+        // The check that makes the round trip safe rather than merely
+        // convenient. Storage hands back what it was given, so restoration is
+        // where a schedule stitched together from two devices must be caught.
+        let sibling_interval = open_schedule(SIBLING_DEVICE).intervals().to_vec();
+        let err = ApplicationReducer::rehydrate(
+            binding(OWNER, DEVICE),
+            sibling_interval,
+            Some(coordinate(0)),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ReducerError::RecipientMismatch { .. }),
+            "expected a recipient refusal, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_refuses_a_context_that_disagrees_with_the_intervals() {
+        // Both directions. An open interval without a context panics the
+        // sequencing path; a context without an open interval would sequence
+        // rows through a gap that grants no access.
+        let open = open_schedule(DEVICE).intervals().to_vec();
+        let err =
+            ApplicationReducer::rehydrate(binding(OWNER, DEVICE), open, None, None).unwrap_err();
+        assert_eq!(
+            err,
+            ReducerError::RestoredScheduleIncoherent {
+                has_open_interval: true,
+                has_expected_context: false,
+            }
+        );
+
+        let err = ApplicationReducer::rehydrate(
+            binding(OWNER, DEVICE),
+            Vec::new(),
+            Some(coordinate(0)),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            ReducerError::RestoredScheduleIncoherent {
+                has_open_interval: false,
+                has_expected_context: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_schedule_restores_as_empty_rather_than_incoherent() {
+        // No intervals and no context is the legitimate starting state, not a
+        // violation of the invariant.
+        let restored =
+            ApplicationReducer::rehydrate(binding(OWNER, DEVICE), Vec::new(), None, None)
+                .expect("an empty schedule must restore");
+        assert!(!restored.has_open_interval());
+        assert!(restored.intervals().is_empty());
+        assert_eq!(restored.expected_context(), None);
+    }
+
+    #[tokio::test]
+    async fn another_principals_schedule_is_refused_on_read_and_write() {
+        let store = store();
+        let foreign_binding = binding(STRANGER, DEVICE);
+        let foreign = ApplicationReducer::new(foreign_binding.clone());
+        assert!(store
+            .put_schedule(&foreign)
+            .await
+            .unwrap_err()
+            .is_isolation_breach());
+        assert!(store
+            .schedule(&foreign_binding)
             .await
             .unwrap_err()
             .is_isolation_breach());
