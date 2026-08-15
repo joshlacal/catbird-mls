@@ -231,6 +231,119 @@ fn a_collection_needs_an_authority_and_a_name() {
     );
 }
 
+// ---- the collection authority is a REVERSED domain -------------------------------
+
+#[test]
+fn the_collection_tld_is_its_first_segment_not_its_last() {
+    // An NSID's authority is the owner's domain written backwards, so
+    // `app.bsky.feed.post` belongs to `bsky.app` and its TLD is `app`. Reading
+    // it forwards puts the TLD rules on the wrong label, and each of these four
+    // is a different consequence of that.
+
+    // A digit-leading label is legal domain syntax; only a digit-leading TLD is
+    // not. `org.4chan.post` is `4chan.org`, whose TLD is `org`.
+    assert!(
+        RestrictedAtUri::parse(&uri(DID, "org.4chan.post", RKEY)).is_ok(),
+        "a digit-leading second label is a legal domain label"
+    );
+
+    // `test` is reserved as a TLD. Here it is a middle label of `test.bsky.app`,
+    // whose TLD is `app`, so the collection is fine.
+    assert!(
+        RestrictedAtUri::parse(&uri(DID, "app.bsky.test.record", RKEY)).is_ok(),
+        "a reserved word is only reserved in TLD position"
+    );
+
+    // And the two that must now be refused, which the forward reading accepted:
+    // `test.foo.record` really does have TLD `test`, which is reserved.
+    assert_eq!(
+        RestrictedAtUri::parse(&uri(DID, "test.foo.record", RKEY)),
+        Err(AtUriError::Collection),
+        "a reserved TLD in first position must be refused"
+    );
+    // `3ao.thing.foo` really does have TLD `3ao`, which begins with a digit.
+    assert_eq!(
+        RestrictedAtUri::parse(&uri(DID, "3ao.thing.foo", RKEY)),
+        Err(AtUriError::Collection),
+        "a digit-leading TLD must be refused"
+    );
+}
+
+#[test]
+fn every_reserved_tld_is_refused_in_first_position_and_allowed_in_the_middle() {
+    // The sweep behind the two named cases, so the rule is checked against the
+    // whole list rather than the one entry that came to mind.
+    for tld in RESERVED_TLDS {
+        let reserved_first = format!("{tld}.example.record");
+        assert_eq!(
+            RestrictedAtUri::parse(&uri(DID, &reserved_first, RKEY)),
+            Err(AtUriError::Collection),
+            "{reserved_first}"
+        );
+
+        let reserved_middle = format!("com.example.{tld}.record");
+        assert!(
+            RestrictedAtUri::parse(&uri(DID, &reserved_middle, RKEY)).is_ok(),
+            "{reserved_middle} has TLD `com`, so the reserved word is an ordinary label"
+        );
+    }
+}
+
+#[test]
+fn the_handle_authority_still_reads_forwards() {
+    // The direction is a property of the position, not of the grammar, and the
+    // two positions must not have been swapped wholesale. A handle is
+    // leaf-first, so `example.test` is reserved and `test.example` is not.
+    assert_eq!(
+        RestrictedAtUri::parse(&uri("example.test", COLLECTION, RKEY)),
+        Err(AtUriError::Authority),
+        "a handle's TLD is its last label"
+    );
+    assert!(RestrictedAtUri::parse(&uri("test.example.com", COLLECTION, RKEY)).is_ok());
+}
+
+#[test]
+fn an_nsid_segment_is_bounded_at_sixty_three_bytes() {
+    // Adopted from the NSID grammar the 317-byte total already comes from.
+    // Applied to the terminal name as well as to the authority labels, since
+    // taking one bound from that grammar and not the other is arbitrary.
+    let longest = "a".repeat(NSID_SEGMENT_MAX_LEN);
+    assert!(RestrictedAtUri::parse(&uri(DID, &format!("com.example.{longest}"), RKEY)).is_ok());
+    assert_eq!(
+        RestrictedAtUri::parse(&uri(DID, &format!("com.example.{longest}a"), RKEY)),
+        Err(AtUriError::Collection),
+        "a 64-byte terminal name must be refused"
+    );
+    assert_eq!(
+        RestrictedAtUri::parse(&uri(DID, &format!("com.{longest}a.record"), RKEY)),
+        Err(AtUriError::Collection),
+        "a 64-byte authority label must be refused"
+    );
+}
+
+#[test]
+fn the_record_key_charset_is_deliberately_left_loose() {
+    // §8 enumerates the rkey restrictions and a character set is not among
+    // them, so this does not adopt the upstream record-key charset. Recorded as
+    // a decision rather than left to be rediscovered: a client refusing a key a
+    // server considers valid silently drops legitimate embeds, and the
+    // printable-ASCII and no-percent rules already exclude most of the range.
+    for rkey in ["3jui7kd54zh2y", "self", "a!b", "x~y", "a$b"] {
+        assert!(
+            RestrictedAtUri::parse(&uri(DID, COLLECTION, rkey)).is_ok(),
+            "{rkey}"
+        );
+    }
+    // What §8 does say about record keys is still enforced.
+    for rkey in [".", ".."] {
+        assert_eq!(
+            RestrictedAtUri::parse(&uri(DID, COLLECTION, rkey)),
+            Err(AtUriError::RecordKey),
+            "{rkey}"
+        );
+    }
+}
+
 // ---- the shared hostname grammar -------------------------------------------------
 
 #[test]

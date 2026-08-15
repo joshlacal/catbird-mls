@@ -32,8 +32,22 @@
 //! hostname grammar. Two grammars for one production is how they drift, and this
 //! one already carries the two-label rule and the reserved-TLD list — including
 //! `.invalid`, which is what rejects the ATProto `handle.invalid` sentinel.
+//!
+//! # The URI has two dotted names in it, and they run in opposite directions
+//!
+//! The authority is a hostname, written leaf-first: `alice.example.net` has TLD
+//! `net`, its **last** label. The collection is an NSID, whose authority is the
+//! same kind of domain written **backwards**: `app.bsky.feed.post` belongs to
+//! `bsky.app`, so its TLD is `app`, its **first** segment.
+//!
+//! Sharing one grammar is still right — see [`validate_collection`] for the four
+//! wrong answers that came from reading the collection forwards — but sharing it
+//! means splitting "which labels are legal" from "which label is the TLD", and
+//! letting each caller say where its TLD is.
 
-use crate::chat_v2::ids::{validate_handle_hostname, BareDid};
+use crate::chat_v2::ids::{
+    validate_domain_labels, validate_handle_hostname, validate_tld_label, BareDid,
+};
 use core::fmt;
 
 /// The `at://` scheme, lowercase and exact.
@@ -43,6 +57,12 @@ pub const SCHEME: &str = "at://";
 pub const NSID_MAX_LEN: usize = 317;
 /// Maximum record key length.
 pub const RKEY_MAX_LEN: usize = 512;
+/// Maximum length of one dot-separated NSID segment.
+///
+/// The same 63-byte bound the domain grammar puts on a label, applied to the
+/// terminal name too: the 317-byte NSID total comes from that grammar, and
+/// adopting one bound from it without the other would be arbitrary.
+pub const NSID_SEGMENT_MAX_LEN: usize = crate::chat_v2::ids::LABEL_MAX_LEN;
 
 /// The derived maximum, `5 + 261 + 1 + 317 + 1 + 512`.
 ///
@@ -232,20 +252,62 @@ fn validate_authority(authority: &str) -> Result<(), AtUriError> {
 /// The split is the point. `app.bsky.feed.Post` is canonical — the authority
 /// labels are lowercase and only the terminal name carries case — while
 /// `App.Bsky.feed.post` is not.
+///
+/// # The authority is a **reversed** domain, and that changes which label is
+/// the TLD
+///
+/// An NSID's authority is the owner's domain written backwards: the collection
+/// `app.bsky.feed.post` belongs to `bsky.app`, so its TLD is `app` — the
+/// **first** segment. This module originally validated the authority as a
+/// forward hostname, which put both TLD rules on the last segment and got four
+/// classes of answer wrong:
+///
+/// - `org.4chan.post` was rejected because `4chan` was read as a digit-leading
+///   TLD. It is an ordinary domain label, where a leading digit is legal, and
+///   the real TLD is `org`.
+/// - `app.bsky.test.record` was rejected because `test` was read as a reserved
+///   TLD. It is a middle label of `test.bsky.app`, and the TLD is `app`.
+/// - `test.foo.record` was accepted, though its TLD really is `test`, which is
+///   reserved in production.
+/// - `3ao.thing.foo` was accepted, though its TLD really is `3ao`, which begins
+///   with a digit.
+///
+/// The two halves now come from [`validate_domain_labels`] and
+/// [`validate_tld_label`], the same pair a forward handle uses — one grammar,
+/// read in two directions, rather than two grammars that can drift.
+///
+/// # What is adopted from the NSID grammar, and what is left loose
+///
+/// Adopted: the per-segment 63-byte bound, applied to the terminal name as well
+/// as to the authority labels, because the 317-byte total this module already
+/// enforces comes from the same upstream grammar and taking one bound without
+/// the other is arbitrary.
+///
+/// Left loose, deliberately: the record key's character set. §8 enumerates its
+/// rkey restrictions — no percent sign, no query, fragment, or extra segment,
+/// not `.` or `..`, at most 512 bytes, case-sensitive — and a charset is not
+/// among them. The surrounding printable-ASCII and no-percent rules already
+/// exclude most of what a tighter set would, and a client that rejected a
+/// record key a server considers valid would silently drop legitimate embeds.
 fn validate_collection(collection: &str) -> Result<(), AtUriError> {
     if collection.is_empty() || collection.len() > NSID_MAX_LEN {
         return Err(AtUriError::Collection);
     }
     let (authority, name) = collection.rsplit_once('.').ok_or(AtUriError::Collection)?;
 
-    // The domain authority must be lowercase and hostname-shaped.
+    // The domain authority must be lowercase and domain-shaped.
     if authority != authority.to_ascii_lowercase() {
         return Err(AtUriError::Collection);
     }
-    validate_handle_hostname(authority).map_err(|_| AtUriError::Collection)?;
+    let labels = validate_domain_labels(authority).map_err(|_| AtUriError::Collection)?;
+    // Reversed, so the TLD is the first segment. `labels` has at least two
+    // entries, so this cannot be empty.
+    validate_tld_label(labels[0]).map_err(|_| AtUriError::Collection)?;
 
-    // The terminal name is case-sensitive but still ASCII-alphabetic.
+    // The terminal name is case-sensitive but still ASCII-alphabetic, and is a
+    // segment like any other for the purposes of the length bound.
     if name.is_empty()
+        || name.len() > NSID_SEGMENT_MAX_LEN
         || !name.chars().all(|ch| ch.is_ascii_alphabetic())
         || !name.starts_with(|ch: char| ch.is_ascii_alphabetic())
     {

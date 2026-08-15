@@ -234,6 +234,21 @@ impl fmt::Display for BareDid {
 /// Rejects ports, paths, percent escapes, IP literals, single-label names
 /// including `localhost`, trailing dots, uppercase, and reserved TLDs.
 pub fn validate_handle_hostname(hostname: &str) -> Result<(), DidError> {
+    let labels = validate_domain_labels(hostname)?;
+    // A hostname is written leaf-first, so its TLD is the *last* label.
+    validate_tld_label(labels[labels.len() - 1])
+}
+
+/// Validates the shared label grammar of a dotted domain, returning its labels.
+///
+/// Everything the production hostname rule says *except* which label is the
+/// TLD — because that is not a property of the grammar, it is a property of the
+/// direction the name is written in. A handle is leaf-first (`alice.example.net`,
+/// TLD last); an ATProto NSID's authority is the same domain **reversed**
+/// (`net.example.alice`, TLD first). Sharing this function is what stops the two
+/// readings drifting into two grammars, which is the mistake that put the
+/// hostname rule on an NSID and rejected `org.4chan.post`.
+pub fn validate_domain_labels(hostname: &str) -> Result<Vec<&str>, DidError> {
     let len = hostname.len();
     if len == 0 || len > HOSTNAME_MAX_LEN {
         return Err(DidError::HostnameLength { actual: len });
@@ -278,10 +293,19 @@ pub fn validate_handle_hostname(hostname: &str) -> Result<(), DidError> {
         }
     }
 
-    // `labels` has at least two entries, so the final label exists.
-    let tld = labels[labels.len() - 1];
+    Ok(labels)
+}
+
+/// Validates the label that is the domain's TLD.
+///
+/// Which label that *is* differs by direction, so the caller names it. Both
+/// rules are TLD-specific and neither applies to an ordinary label: a
+/// digit-leading label is legal domain syntax and only a digit-leading **TLD**
+/// is not, which is what makes `4chan.org` a real domain and `org.4chan.post` a
+/// valid NSID.
+pub fn validate_tld_label(tld: &str) -> Result<(), DidError> {
     if !tld.starts_with(|c: char| c.is_ascii_lowercase()) {
-        // This is also what rejects a dotted-quad IPv4 literal, whose final
+        // This is also what rejects a dotted-quad IPv4 literal, whose TLD-position
         // label is numeric.
         return Err(DidError::TldNotAlphabetic {
             tld: tld.to_owned(),

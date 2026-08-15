@@ -22,8 +22,8 @@ pub use credential::{
     BasicCredential, CredentialError, BASIC_CREDENTIAL_MAX_LEN, BASIC_CREDENTIAL_MIN_LEN,
 };
 pub use did::{
-    validate_handle_hostname, BareDid, DidError, DidMethod, BARE_DID_MAX_LEN, BARE_DID_MIN_LEN,
-    RESERVED_TLDS,
+    validate_domain_labels, validate_handle_hostname, validate_tld_label, BareDid, DidError,
+    DidMethod, BARE_DID_MAX_LEN, BARE_DID_MIN_LEN, LABEL_MAX_LEN, RESERVED_TLDS,
 };
 pub use key_id::{KeyId, KeyIdError, ED25519_PUBLIC_KEY_LEN, KEY_ID_LEN};
 pub use seq::{IntegerError, SafeInteger, Seq, MAX_SAFE_INTEGER};
