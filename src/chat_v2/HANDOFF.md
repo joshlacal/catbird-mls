@@ -26,22 +26,32 @@ workspace is untouched and must stay that way).
 > landing pass, not to this workspace — nothing ships from here — but the
 > obligation travels with the revision.
 
-Verification at handoff: **638 lib tests pass, 0 failures.** `cargo fmt
+Verification at handoff: **684 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib` reports zero warnings under `chat_v2`,
 `wasm32-unknown-unknown` builds.
 
-### Known open, handed to the fix round
+> The count in this line has been stale twice. It is the output of
+> `cargo test --lib` at the tip listed in section 1, and nothing else.
 
-Two items from the adversarial review are **deliberately not fixed here**, and
-`rehydrate` was hardened to refuse what they would make unrepresentable rather
-than to paper over them:
+### The fix round is complete
 
-- **No seq high-water mark** (review F2). Controls compare against the interval
-  *opening* only, so a close or terminal can land below an already-consumed row.
-  The specified feed cannot produce that ordering.
-- **`AccessInterval::apply_close` silently overwrites an existing close.** It
-  checks only `close.seq > opening.seq`. Unreachable through the reducer today,
-  but it is a public method and storage is now a caller.
+Every finding from the adversarial review of `83ff47d8` is closed. The two items
+the storage lane handed forward — the missing seq high-water mark and
+`apply_close` overwriting an existing close — are both fixed here, so this
+section no longer carries open work.
+
+| Finding | Commit | What closed it |
+|---|---|---|
+| F1 direct-traffic cardinality | `cc3bec3e` | a direct's roster is exactly the sender and one distinct other |
+| F2 no seq high-water mark | `90a76b40` | one mark per schedule, checked and recorded by every accepting path |
+| F3 `ReanchorAuthority` unread | `ab0b71ff` | variants carry the verified row; `reanchor` checks it matches the opening |
+| F4 fingerprint mint ungated | `4fd32260` | a sealed `EnvelopeVerification` token only `transcript` can produce |
+| F5 sender binding skippable | `4fd32260` | `fingerprint()` moved to `SenderBoundApplicationEntry` |
+| F6 three gate evasions | `7b0eae69` | one hardened scanner; brace form, `include!`, and string literals all closed |
+| F7 NSID authority direction | `f63585e5` | the TLD rules moved to the first segment, where a reversed domain keeps its TLD |
+| F8 gate scope | `7b0eae69` | the `src/chat_v2`-only limitation stated in `gate_support.rs` and below |
+| minors | `99de99f3`, `142050a2` | reaction cap, avatar MIME, double close, FFI doc, signing-domain vectors |
+| restore-bypass sweep | `2a9200e4` | swept the whole tree; one finding in `journal.rs`, fixed |
 
 A note on the lint command: `cargo clippy --all-targets` exits **101**, and that
 is the pre-existing `tests/sequencer_did_sync_tests.rs` breakage documented in
@@ -101,6 +111,16 @@ promotions and one new dependency).
 | `olrmypzv` | `b947ec01` | Correct the readiness probe to protocol completeness (S10f) |
 | `lwouupwq` | `8fa1427d` | Handoff refresh for S10f and the reference-store gating |
 | `ptkyzxrn` | `0075e5c5` | Refuse structurally corrupt restored schedules (review follow-up) |
+| `vtzppxwx` | `c47683e7` | Handoff refresh for the restore hardening |
+| `yynwtlqo` | `cc3bec3e` | A direct's roster is exactly the sender and one other (F1) |
+| `rqspwsrz` | `90a76b40` | The schedule's seq high-water mark (F2) |
+| `xwtumvzq` | `4fd32260` | Close the fingerprint mint and bind the sender to it (F4, F5) |
+| `lonyvztp` | `ab0b71ff` | A reanchor authority carries the row it stands on (F3) |
+| `rumknqur` | `7b0eae69` | One hardened scanner behind every gate (F6, F8) |
+| `zpunqyms` | `f63585e5` | An NSID authority is a reversed domain, so its TLD is first (F7) |
+| `muwnpzxr` | `99de99f3` | Four minors: reaction cap, avatar MIME, double close, FFI doc |
+| `urvnorpl` | `142050a2` | Re-lift the dropped signing-domain vectors |
+| `kquvuzsm` | `2a9200e4` | Sweep the restore-bypass pattern across the whole tree |
 
 ### The detached-HEAD trap — read before concluding a server file is missing
 
@@ -194,6 +214,29 @@ and the anchors are exact: the §5 sentence is quoted verbatim in
 `a_previously_removed_activator_opens_after_a_strict_gap`. Do not re-derive the
 reasoning — read those two places.
 
+**The NSID collection authority is a REVERSED domain** (ruled by the lead in the
+fix round). `app.bsky.feed.post` belongs to `bsky.app`, so its TLD is `app` —
+the *first* segment — and the TLD rules (lowercase-letter start, reserved-TLD
+list) apply there. The four cases that pin it are in `content/uri_tests.rs`:
+`org.4chan.post` and `app.bsky.test.record` are valid, `test.foo.record` and
+`3ao.thing.foo` are not. A handle authority still reads forwards, and a test
+pins that too, so the two directions cannot be swapped wholesale. One grammar
+serves both: `validate_domain_labels` plus `validate_tld_label`, with each
+caller naming where its TLD is.
+
+**The restricted AT URI does not adopt the upstream rkey charset**, and does
+adopt the NSID 63-byte per-segment bound. §8 enumerates its rkey restrictions
+and a character set is not among them; a client refusing a key the server
+accepts would silently drop legitimate embeds. The segment bound comes from the
+same grammar the 317-byte NSID total already comes from. Both recorded in
+`at_uri.rs` and pinned by tests, so neither reads as an omission.
+
+**A direct's traffic gate takes the sender's DID.** §9's "both exact
+participants" cannot be checked without knowing who one of the two is meant to
+be, so `require_traffic_allowed` refuses a roster that is not exactly the sender
+and one distinct other. Three local refusals, none of which carries an endpoint
+code — a server never sees the roster.
+
 **Chartered open question — scan budget.** The frozen contract gives a server
 no way to say "I scanned a large inaccessible region, found nothing visible, and
 have not reached the end". Empty forces `nextAfterSeq == afterSeq`, and
@@ -210,6 +253,7 @@ client-side `>=`.
 
 ```
 chat_v2/
+  gate_support.rs  the shared source scanner behind all five gates (cfg(test))
   ids/          identity grammars, all reject-never-normalize
   endpoint_error/  91 codes, policy classification, serde extraction
   cursor.rs     AfterSeq / SnapshotSeq / EventCursor
@@ -226,6 +270,7 @@ chat_v2/
     fingerprint.rs  both fingerprint domains, 13 control kinds, serverFields
     contract.rs the embedded lexicon projection; the four ref-name special cases
     entry.rs    application entry shape, conversation binding, sender identity
+    witness.rs  the sealed token that closes the fingerprint mint
     vectors/    vendored server golden vectors + lexicon + PROVENANCE.md
   content/      application content predicates (S8); no server to mirror
     media.rs    MIME sets, checked ciphertext arithmetic, byte bounds
@@ -237,7 +282,7 @@ chat_v2/
     ladder.rs   four rungs, skip/descent/exhaustion refused by name
     poison.rs   deterministic-only poison, containment, different-DID fulfiller
   reducer/
-    mod.rs      sequencing core (6a) + rehydrate, the restore feed
+    mod.rs      sequencing core (6a) + the schedule seq high-water mark + rehydrate, the restore feed
     restore_tests.rs  what rehydrate accepts back; why restore checks shape
     reanchor.rs closure, reanchor, touching boundaries (6b)
     reset.rs    the three reset-activator roles (6c)
@@ -261,11 +306,11 @@ itself. **Keep it passing.** v1 and v2 never interoperate.
 
 Storage isolation is **built** (S10a-S10e) and is physical. See section 6.5.
 
-There are now **four** gates, not two, and they catch different things. That is
+There are now **five** gates, not two, and they catch different things. That is
 not redundancy — it was verified. Injecting a real
 `use crate::hybrid_storage::HybridStorageProvider;` into a `chat_v2` file leaves
 *both* original gates passing, because the isolation gate forbids
-`crate::orchestrator` and that store does not live there. Keep all four green:
+`crate::orchestrator` and that store does not live there. Keep all five green:
 
 | Gate | Where | Catches |
 |---|---|---|
@@ -273,6 +318,25 @@ not redundancy — it was verified. Injecting a real
 | forbidden recovery mechanism | `recovery/mod.rs` | external commits, `force_rejoin` |
 | no default trait method | `storage/store.rs` | a store method that could silently discard state |
 | physical separation | `storage/mod.rs` | reaching a v1 or OpenMLS store by any path |
+| reference store absent from release | `storage/mod.rs` | `mod memory;` losing its `#[cfg(test)]` |
+
+They share one scanner, `chat_v2/gate_support.rs`, and the sharing is the point:
+each had its own copy of "walk, strip comments, match a substring", and the
+copies shared three evasions that a review reproduced by mutation — a brace-form
+`use` tree, code reached through `include!` of a non-`.rs` file, and a string
+literal containing `//` that truncated the line. All three are closed and each
+is a permanent positive control there. **Do not reintroduce a local matcher**;
+extend the shared one, so the next evasion is fixed once rather than five times.
+
+**What these gates prove, exactly.** That a token is absent *from
+`src/chat_v2`*. A thin wrapper in the v1 tree — a function in
+`src/orchestrator` that calls the forbidden thing, re-exported under an innocent
+name — is invisible here, and importing that name would satisfy every gate.
+Widening the walk is not the fix: scanning v1 would flag v1's legitimate use of
+its own mechanisms on every run. The real guard is that adding such a wrapper
+means editing the v1 tree deliberately, which is a review event rather than the
+editor accident these gates exist to catch. Stated so the gates are not read as
+proving more than they do.
 
 ---
 
@@ -295,8 +359,43 @@ device)`. Initial opening install comparing all five fields;
 `reanchor` gated on `ReanchorAuthority`, `apply_touching_boundary` processing
 one shared row once.
 
+### The schedule high-water mark (fix round, F2)
+
+`ApplicationReducer` carries one `high_water: Option<Seq>` — the greatest
+sequence it has applied — and **every** accepting path requires a row strictly
+above it before touching state, then records the row once. Before this, each
+path compared against the interval it landed in, and an interval records only
+where it opened and where it closed: a control row consumed at seq 100 left no
+mark, so a terminal at seq 2 was accepted and deposited irreversible proof
+beneath consumed history.
+
+Three things about it that a refactor could quietly undo:
+
+- **A touching boundary is one row, checked once and recorded once.** The shared
+  seq between its close and its opening is a single consumption. A rule written
+  as "strictly greater than everything including my own opening" would break a
+  ratified schedule.
+- **`rehydrate` takes the mark as a parameter and cannot derive it.** Rows
+  consumed inside an open interval leave no trace in the interval list, so a
+  derived mark restores below the truth and reopens the replay window. Restore
+  checks a floor only: the greatest sequence the restored schedule itself
+  records. A platform store that decomposes a schedule **must persist this
+  mark**.
+- **The refusal is the existing `NotAdvancing`**, whose `expected_after` now
+  carries the mark. The old comparison was a weaker form of the same rule, not a
+  different rule, so no previously pinned refusal changed value.
+
 Two design points that must survive refactoring:
 
+- **`ReanchorAuthority` carries the row it stands on.** It is still a closed
+  two-variant enum with no constructor from a hint — and each variant now holds
+  a private-field `VerifiedOpeningRow` carrying the verified row's
+  `OuterEntryFingerprint`, which only the envelope layer can mint. `reanchor`
+  requires that fingerprint to equal the opening's, refusing
+  `ReanchorAuthorityMismatch` otherwise. The nullary variants were a claim
+  anyone could write, and the argument was bound to `_authority` and never read.
+  Do not add a `From<CloseHint>`, an "unchecked" variant, or a public payload
+  constructor.
 - **`ReanchorAuthority` has no constructor from a hint.** It is a closed
   two-variant enum (`VerifiedWelcome`, `VerifiedPostJoinOpening`). The spec says
   "an arbitrary current head and a mid-interval row are never reanchor proof";
@@ -437,11 +536,33 @@ as firmly as a stranger, since visibility is per exact `(DID, deviceId)`.
 
 ### Where the reducer and the envelope meet
 
-`OuterEntryFingerprint` is produced only by verified-entry paths, and the
-reducer accepts provenance only in that form. A row cannot reach interval
-provenance without having had its shape, binding, and signature checked first.
-That was the design intent recorded back in `provenance.rs`; it is now
-structural rather than promised.
+`OuterEntryFingerprint` is produced only by the envelope-verification layer, and
+that is now **enforced** rather than documented: its constructor takes an
+`EnvelopeVerification` token whose own constructor is `pub(super)` inside
+`transcript`, so no other module can mint one. Tests use `#[cfg(test)]
+for_tests`, which does not exist in a release build.
+
+On the application path the ordering is enforced by type too. `verify()` yields
+a `VerifiedApplicationEntry` that cannot produce a fingerprint at all;
+`bind_sender()` — the sender-identity comparison — is the only route to a
+`SenderBoundApplicationEntry`, which alone exposes `fingerprint()`. Recording
+provenance for a row whose sender was never checked is unrepresentable rather
+than merely discouraged. It was previously possible, and the check was called by
+nothing outside its own tests.
+
+**What that does not cover, stated so nobody reads it as more:**
+
+- `EntryRow` is public with public fields, deliberately — it is the input to a
+  pure function and the golden vectors are assembled that way. A fingerprint
+  over an invented row is computable and meaningless.
+- The **control** path has no verified-entry type, because control verification
+  is not built in this tree. There the token is the only structural guarantee
+  and "verify before fingerprint" remains a convention.
+- `SequentialControl` is the one reducer row struct carrying no fingerprint, so
+  its "construction implies verification" claim is a convention its doc now
+  admits to. Its four siblings carry fingerprints and so cannot be assembled
+  from nothing — though construction still does not check that their other
+  fields describe the same row as the fingerprint.
 
 ### Conventions worth keeping
 
