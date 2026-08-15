@@ -59,6 +59,21 @@ serde_ipld_dagcbor = "0.6"
 # than trusting the pin — a silent data-version bump would otherwise change
 # which reactions are accepted.
 unicode-segmentation = "1.13"
+# A NEW direct dependency, not a promotion — unlike the two above, this crate was
+# not previously in the tree. Chosen over icu_normalizer, which only LOOKS free:
+# it appears in Cargo.lock but reaches this crate solely via
+# openmls_sqlite_storage, which is excluded on wasm32, so promoting it would add
+# ICU4X plus its data crate to the wasm build for one predicate.
+#
+# It provides `is_nfc`, a CHECK rather than a transform, which is what this tree
+# needs — reactions are rejected when not already NFC, never normalized, because
+# composing a peer's value would change bytes a signature covers.
+#
+# Version 0.1.25 reports UNICODE_VERSION = (17, 0, 0), matching the segmenter
+# above. A test asserts both against each other and against the protocol pin: a
+# value accepted as one grapheme under one Unicode version but NFC-checked under
+# another would be a cross-version seam.
+unicode-normalization = "0.1"
 chacha20poly1305 = "0.10"
 aes-gcm = "0.10"
 p256 = { version = "0.13", features = ["ecdsa"] }

@@ -24,15 +24,27 @@
 //! sequence contains, and nothing upstream will catch it — so the version is
 //! pinned and asserted rather than assumed.
 //!
-//! # NFC is not yet built and refuses by name
+//! # NFC is checked, never applied
 //!
-//! Checking NFC needs a normalization implementation, and unlike the segmenter
-//! that is not already linked on every target this crate builds for. Rather than
-//! quietly skipping the check — which would accept decomposed sequences that a
-//! conforming peer rejects, and silently split one logical reaction into two
-//! reduce buckets — [`ReactionError::NfcCheckUnavailable`] refuses by name until
-//! the dependency is settled. An unbuilt path must never read as a permissive
-//! one.
+//! [`unicode_normalization::is_nfc`] answers whether a value already *is* NFC.
+//! Nothing here normalizes: this tree rejects rather than normalizes throughout,
+//! and silently composing a peer's reaction would change bytes that a signature
+//! covers.
+//!
+//! Skipping the check was never an option, and the reason is specific rather
+//! than general. Reactions reduce by `(verified DID, NFC grapheme)`, so a
+//! decomposed value and its composed form — visually identical, one cluster
+//! each, different bytes — would reduce into **two separate buckets**. One
+//! person's single reaction would render as two.
+//!
+//! # Both Unicode versions must agree, and they do
+//!
+//! Segmentation and normalization come from different crates, and a value
+//! accepted as one grapheme under one Unicode version but NFC-checked under
+//! another is a cross-version seam. `unicode-segmentation` 1.13.3 and
+//! `unicode-normalization` 0.1.25 both report `UNICODE_VERSION` of 17.0.0, which
+//! is what the protocol pins. A test asserts all three agree rather than
+//! trusting the pins.
 
 use core::fmt;
 use unicode_segmentation::UnicodeSegmentation;
@@ -57,12 +69,13 @@ pub enum ReactionError {
     ControlCharacter { position: usize },
     /// The value was not exactly one extended grapheme cluster.
     NotOneGraphemeCluster { clusters: usize },
-    /// **Not yet built.** NFC checking has no implementation on this build.
+    /// The value was not already in Unicode NFC.
     ///
-    /// Refused rather than skipped: accepting a decomposed sequence would let
-    /// one logical reaction reduce into two buckets, since reactions reduce by
-    /// `(verified DID, NFC grapheme)`.
-    NfcCheckUnavailable,
+    /// Refused rather than normalized. Reactions reduce by `(verified DID, NFC
+    /// grapheme)`, so accepting a decomposed value would reduce it into a
+    /// different bucket from its composed twin — one person's single reaction
+    /// rendering as two.
+    NotNfc,
 }
 
 impl fmt::Display for ReactionError {
@@ -83,9 +96,7 @@ impl fmt::Display for ReactionError {
                 f,
                 "reaction is {clusters} extended grapheme clusters, must be exactly one"
             ),
-            Self::NfcCheckUnavailable => f.write_str(
-                "NFC verification is not built; a reaction cannot be accepted without it",
-            ),
+            Self::NotNfc => f.write_str("reaction is not in Unicode NFC"),
         }
     }
 }
@@ -131,14 +142,30 @@ pub fn require_reaction_shape(value: &str) -> Result<(), ReactionError> {
 
 /// The protocol's reaction acceptance rule.
 ///
-/// Currently refuses every value by name, because NFC verification is unbuilt
-/// and a reaction cannot be accepted without it. The shape rules still run
-/// first, so a value that is malformed for another reason reports that reason —
-/// a caller debugging a rejected reaction should not be told "NFC unavailable"
-/// when the real problem is that they sent three grapheme clusters.
+/// Shape first, then NFC. The ordering is for the caller's benefit: someone who
+/// sent three grapheme clusters should be told that rather than being told
+/// their value is not NFC, which would be true but useless.
+///
+/// Nothing here normalizes. A value that is not already NFC is refused, because
+/// composing it would change bytes a signature covers and because the two forms
+/// reduce into different buckets.
 pub fn require_reaction_value(value: &str) -> Result<(), ReactionError> {
     require_reaction_shape(value)?;
-    Err(ReactionError::NfcCheckUnavailable)
+    if !unicode_normalization::is_nfc(value) {
+        return Err(ReactionError::NotNfc);
+    }
+    Ok(())
+}
+
+/// Whether the linked normalizer carries the Unicode version the protocol pins.
+///
+/// Separate from [`segmenter_unicode_version`] because they come from different
+/// crates. A value accepted as one grapheme under one Unicode version but
+/// NFC-checked under another is a cross-version seam, so both are exposed and
+/// both are asserted.
+pub fn normalizer_unicode_version() -> (u64, u64, u64) {
+    let (major, minor, patch) = unicode_normalization::UNICODE_VERSION;
+    (u64::from(major), u64::from(minor), u64::from(patch))
 }
 
 /// Whether a character is a control character for this predicate.
@@ -311,29 +338,65 @@ mod tests {
     }
 
     #[test]
-    fn the_full_predicate_refuses_by_name_until_nfc_exists() {
-        // The standing convention: an unbuilt path refuses rather than permits.
-        // Skipping NFC would accept decomposed sequences that a conforming peer
-        // rejects, and split one logical reaction across two reduce buckets.
-        assert_eq!(
-            require_reaction_value("a"),
-            Err(ReactionError::NfcCheckUnavailable)
-        );
-        assert_eq!(
-            require_reaction_value("\u{1F600}"),
-            Err(ReactionError::NfcCheckUnavailable)
-        );
+    fn the_full_predicate_now_accepts_a_valid_reaction() {
+        // The converted refusal. This used to be NfcCheckUnavailable for every
+        // input; the predicate is complete and these are genuinely accepted.
+        for value in [
+            "a",
+            "\u{1F600}",
+            "\u{00E9}",                   // composed e-acute: already NFC
+            "\u{1F469}\u{200D}\u{1F4BB}", // ZWJ sequence, no composition to do
+            "\u{0915}\u{093E}",           // devanagari: NFC leaves it alone
+        ] {
+            assert_eq!(require_reaction_value(value), Ok(()), "{value:?}");
+        }
     }
 
     #[test]
-    fn shape_problems_are_reported_ahead_of_the_missing_nfc_check() {
-        // A caller debugging a rejected reaction must not be told "NFC
-        // unavailable" when they actually sent three clusters.
+    fn a_decomposed_reaction_is_refused_rather_than_composed() {
+        // The other half of the conversion, and the reason the check exists.
+        // Nothing normalizes: composing a peer's value would change bytes a
+        // signature covers.
+        let decomposed = "e\u{0301}";
+        assert_eq!(
+            require_reaction_value(decomposed),
+            Err(ReactionError::NotNfc)
+        );
+
+        // Its composed twin is accepted, so the two really do land in different
+        // buckets — which is exactly the reduce-splitting this prevents.
+        let composed = "\u{00E9}";
+        assert_eq!(require_reaction_value(composed), Ok(()));
+        assert_ne!(decomposed, composed);
+    }
+
+    #[test]
+    fn shape_problems_are_reported_ahead_of_the_nfc_check() {
+        // A caller who sent three clusters must be told that rather than being
+        // told their value is not NFC, which would be true but useless.
         assert_eq!(
             require_reaction_value("abc"),
             Err(ReactionError::NotOneGraphemeCluster { clusters: 3 })
         );
         assert_eq!(require_reaction_value(""), Err(ReactionError::Empty));
+
+        // A decomposed multi-cluster value reports the cluster count, not NFC.
+        assert_eq!(
+            require_reaction_value("e\u{0301}e\u{0301}"),
+            Err(ReactionError::NotOneGraphemeCluster { clusters: 2 })
+        );
+    }
+
+    #[test]
+    fn the_segmenter_and_the_normalizer_agree_on_the_unicode_version() {
+        // The cross-version seam the lead asked to be checked explicitly. These
+        // are different crates; a value accepted as one grapheme under one
+        // Unicode version but NFC-checked under another would be a real
+        // interoperability hazard. They agree, and this asserts it rather than
+        // trusting two independent version pins.
+        assert_eq!(segmenter_unicode_version(), REQUIRED_UNICODE_VERSION);
+        assert_eq!(normalizer_unicode_version(), REQUIRED_UNICODE_VERSION);
+        assert_eq!(segmenter_unicode_version(), normalizer_unicode_version());
     }
 
     #[test]

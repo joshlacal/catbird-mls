@@ -45,8 +45,8 @@ pub use media::{
     BLURHASH_MIN_BYTES, IMAGE_CIPHERTEXT_MAX, IMAGE_DIMENSION_MAX, WAVEFORM_LEN,
 };
 pub use reaction::{
-    require_reaction_shape, require_reaction_value, segmenter_unicode_version, ReactionError,
-    REACTION_MAX_BYTES, REQUIRED_UNICODE_VERSION,
+    normalizer_unicode_version, require_reaction_shape, require_reaction_value,
+    segmenter_unicode_version, ReactionError, REACTION_MAX_BYTES, REQUIRED_UNICODE_VERSION,
 };
 
 #[cfg(test)]
