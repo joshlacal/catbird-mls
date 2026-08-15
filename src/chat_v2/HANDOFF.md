@@ -26,7 +26,7 @@ workspace is untouched and must stay that way).
 > landing pass, not to this workspace — nothing ships from here — but the
 > obligation travels with the revision.
 
-Verification at handoff: **684 lib tests pass, 0 failures.** `cargo fmt
+Verification at handoff: **690 lib tests pass, 0 failures.** `cargo fmt
 --check` clean, `cargo clippy --lib` reports zero warnings under `chat_v2`,
 `wasm32-unknown-unknown` builds.
 
@@ -52,6 +52,19 @@ section no longer carries open work.
 | F8 gate scope | `7b0eae69` | the `src/chat_v2`-only limitation stated in `gate_support.rs` and below |
 | minors | `99de99f3`, `142050a2` | reaction cap, avatar MIME, double close, FFI doc, signing-domain vectors |
 | restore-bypass sweep | `2a9200e4` | swept the whole tree; one finding in `journal.rs`, fixed |
+| F9 crate-root re-exports | `6674e049` | the forbidden `crate::<Name>` set is derived from `lib.rs`'s globs |
+| F1 addendum | `bd6be439` | `SenderNotAParticipant` carries the server's `NotParticipant` |
+| expects and their predicates | `b8196784` | the duplicated close predicate collapsed; `is_open()` pinned |
+| high-water durability | `adcabf3e` | the mark's store round-trip proved on the case that cannot be derived |
+
+**F9 is the one worth reading before touching a gate.** `use crate::MLSContext;`
+inside `chat_v2` compiled, reached v1's SQLCipher group and crypto surface, and
+passed all five gates — because `src/lib.rs` globs six modules to the crate root
+and every needle was keyed to a *module path* the short spelling never names.
+Listing the two spellings would have left the hole. The forbidden set is now
+**derived** from the re-export surface, so a new glob in `lib.rs`, or a new `pub`
+item in a module already globbed, is covered without anyone extending a list.
+Do not replace that derivation with a list.
 
 A note on the lint command: `cargo clippy --all-targets` exits **101**, and that
 is the pre-existing `tests/sequencer_did_sync_tests.rs` breakage documented in
@@ -320,6 +333,16 @@ not redundancy — it was verified. Injecting a real
 | physical separation | `storage/mod.rs` | reaching a v1 or OpenMLS store by any path |
 | reference store absent from release | `storage/mod.rs` | `mod memory;` losing its `#[cfg(test)]` |
 
+The isolation gate carries a second needle set, **derived rather than written**:
+every `crate::<Name>` that `lib.rs`'s `pub use <mod>::*;` globs hoist to the
+crate root — 72 names today, across `api`, `engine`, `error`, `keychain`,
+`platform_lifecycle`, and `types`. Module-path needles cannot cover those, and
+that is structural rather than an oversight, which is why the coverage is
+derived. A compile-fail test was evaluated and rejected: the offending import
+*compiles*, so there is nothing for `trybuild` to assert, and making it a compile
+error would mean narrowing the `lib.rs` globs — the crate's public API, consumed
+by the UniFFI scaffolding, and not this lane's to narrow.
+
 They share one scanner, `chat_v2/gate_support.rs`, and the sharing is the point:
 each had its own copy of "walk, strip comments, match a substring", and the
 copies shared three evasions that a review reproduced by mutation — a brace-form
@@ -379,8 +402,12 @@ Three things about it that a refactor could quietly undo:
   consumed inside an open interval leave no trace in the interval list, so a
   derived mark restores below the truth and reopens the replay window. Restore
   checks a floor only: the greatest sequence the restored schedule itself
-  records. A platform store that decomposes a schedule **must persist this
-  mark**.
+  records — a mark *lower* than the truth is indistinguishable from a schedule
+  that legitimately consumed less, so nothing finer is catchable. A platform
+  store that decomposes a schedule **must persist this mark**; `put_schedule`
+  says so, a store test proves the round-trip on a schedule whose mark the
+  interval list cannot express, and the no-default gate cannot help here because
+  nothing can force a field to be serialized.
 - **The refusal is the existing `NotAdvancing`**, whose `expected_after` now
   carries the mark. The old comparison was a weaker form of the same rule, not a
   different rule, so no previously pinned refusal changed value.
