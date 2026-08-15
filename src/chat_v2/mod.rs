@@ -54,6 +54,7 @@ pub mod ffi;
 pub mod ids;
 pub mod interval;
 pub mod journal;
+pub mod participation;
 pub mod provenance;
 pub mod recovery;
 pub mod reducer;

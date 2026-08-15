@@ -444,12 +444,10 @@ pub fn chat_v2_status() -> ChatV2Status {
             "envelope-verification".to_owned(),
             "application-content-predicates".to_owned(),
             "recovery-ladder".to_owned(),
+            "poison-containment".to_owned(),
+            "participation-gating".to_owned(),
         ],
-        outstanding_capabilities: vec![
-            "poison-handling".to_owned(),
-            "pending-invite-gating".to_owned(),
-            "storage".to_owned(),
-        ],
+        outstanding_capabilities: vec!["storage".to_owned()],
     }
 }
 
@@ -661,6 +659,8 @@ mod tests {
             "envelope-verification",
             "application-content-predicates",
             "recovery-ladder",
+            "poison-containment",
+            "participation-gating",
         ] {
             assert!(
                 status
