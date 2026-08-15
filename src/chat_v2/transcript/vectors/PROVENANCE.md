@@ -80,16 +80,29 @@ be **the same bytes the server embeds** — the server reaches it through
 | | |
 |---|---|
 | Source path | `lexicon/blue/catbird/chat/blue.catbird.chat.defs.json` |
-| Source revision | `425e149fc8682623c0a94e58ce51793c73df7ecc` |
-| SHA-256 | `9791a2828a7d4d286b6f2f5362ac2f31691598cd7f3761e8ceef3abb09d3fcfc` |
-| Size / defs | 131,642 bytes / 200 definitions |
+| Source revision | `b1814a6c338c8aa5948e6d3059bd9a6450b95931` (mls-ds, local/unpushed) |
+| SHA-256 | `7a0411afdfde050c255c9b415f700c7e0d93041679d2cde23497797428bdab03` |
+| Size / defs | 131,653 bytes / 200 definitions |
+| Prior SHA-256 | `9791a2828a7d4d286b6f2f5362ac2f31691598cd7f3761e8ceef3abb09d3fcfc` @ `425e149f`, 131,642 bytes |
 
-**Verified identical across every live copy in the workspace** at vendoring
-time — the server's embedded copy, `PetrelCatbird/lexicons/` (the canonical
-codegen source), `mls-ds-lane-e-ws/`, `nest-chat-auth-ws/`, and
-`nest-merge-ws/` all hash to the same value. There is no divergence between the
-codegen source of truth and what the server actually embeds, so projecting
-through this copy is projecting through the server's contract.
+**The one change between those two digests** is `resetRequestView.status`, whose
+enum gained `"revoked"` **appended last** (`pending, stale, consumed, expired,
+revoked`). Ratified 2026-08-15; the server encodes
+`ResetRequestStatus::Revoked = 5` at `state_machine.rs`'s
+`reset_request_status_code`, and appending last is what keeps codes 1–4 — and so
+every digest over a non-revoked row — byte-identical. The definition count is
+unchanged at 200, and no signed body references `resetRequestView`, so no
+signing projection in this crate moves. The signing-domain and fingerprint
+vectors are unaffected, which the suite proves rather than assumes.
+
+**Verified identical across every live copy at sync time** — this vendored copy,
+`PetrelCatbird/lexicons/` (the canonical codegen source), and the mls-ds mirror
+the server embeds all hash to `7a0411af…`. Two *other actors'* workspaces
+(`mls-ds-lane-e-ws/`, and the canonical `mls-ds/` and `catbird-mls-task3-ws/`
+working copies) still hold the prior bytes; those are separate working-copy
+commits of the same repositories and pick the change up when they rebase. They
+were deliberately not touched. `nest-chat-auth-ws/` and `nest-merge-ws/`, listed
+here at the original vendoring, no longer carry a copy at all.
 
 To re-check:
 

@@ -525,7 +525,7 @@
     },
     "resetRequestView": {
       "type": "object", "required": ["resetRequestId", "conversationId", "requesterDid", "requesterDeviceId", "prior", "reason", "status", "requestedAt", "expiresAt"],
-      "properties": {"resetRequestId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "requesterDid": {"type": "ref", "ref": "#bareDid"}, "requesterDeviceId": {"type": "ref", "ref": "#deviceId"}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "reason": {"type": "ref", "ref": "#resetReason"}, "status": {"type": "string", "enum": ["pending", "stale", "consumed", "expired"]}, "requestedAt": {"type": "ref", "ref": "#canonicalDatetime"}, "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"}}
+      "properties": {"resetRequestId": {"type": "ref", "ref": "#operationId"}, "conversationId": {"type": "ref", "ref": "#operationId"}, "requesterDid": {"type": "ref", "ref": "#bareDid"}, "requesterDeviceId": {"type": "ref", "ref": "#deviceId"}, "prior": {"type": "ref", "ref": "#conversationCoordinates"}, "reason": {"type": "ref", "ref": "#resetReason"}, "status": {"type": "string", "enum": ["pending", "stale", "consumed", "expired", "revoked"]}, "requestedAt": {"type": "ref", "ref": "#canonicalDatetime"}, "expiresAt": {"type": "ref", "ref": "#canonicalDatetime"}}
     },
 
     "leafRecoveryRequestBody": {
