@@ -53,7 +53,7 @@ use super::interval::{
     AccessInterval, ApplicationScheduleTerminalProof, IntervalError, IntervalOpening,
     RecipientBinding,
 };
-use super::provenance::CloseKind;
+use super::provenance::{CloseKind, OuterEntryFingerprint};
 use core::fmt;
 
 /// An authenticated context-changing control row addressed to this recipient.
@@ -212,6 +212,19 @@ pub enum ReducerError {
         /// The opening sequence of the interval that was left open.
         opening_seq: Seq,
     },
+    /// A reanchor's authority named a different row from the one it installed.
+    ///
+    /// Both fingerprints may be individually genuine; that is what makes this
+    /// worth refusing. §6 requires the reanchor to come from the *matching*
+    /// verified opening row, so pairing one row's proof with another row's
+    /// opening is the arbitrary-current-head case wearing a verified
+    /// fingerprint.
+    ReanchorAuthorityMismatch {
+        /// What the authority stands on.
+        authority: OuterEntryFingerprint,
+        /// What the opening being installed carries.
+        opening: OuterEntryFingerprint,
+    },
     /// A restored high-water mark sat below the schedule it came with.
     ///
     /// The mark is supplied by the caller because the interval list cannot
@@ -327,6 +340,11 @@ impl fmt::Display for ReducerError {
                 f,
                 "restored interval opened at {opening_seq} is still open but is not \
                  the last; only the most recent interval may be open"
+            ),
+            Self::ReanchorAuthorityMismatch { authority, opening } => write!(
+                f,
+                "reanchor authority names row {authority} but the opening installs \
+                 row {opening}; the matching verified row is the only proof"
             ),
             Self::RestoredHighWaterBelowSchedule {
                 high_water,

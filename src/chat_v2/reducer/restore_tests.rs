@@ -355,7 +355,7 @@ fn a_restored_multi_interval_schedule_reanchors_against_its_latest_close() {
     let err = restored
         .reanchor(
             &binding(DEVICE),
-            ReanchorAuthority::VerifiedWelcome,
+            ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0x5a; 32])),
             opening(15),
         )
         .unwrap_err();
@@ -368,7 +368,7 @@ fn a_restored_multi_interval_schedule_reanchors_against_its_latest_close() {
     restored
         .reanchor(
             &binding(DEVICE),
-            ReanchorAuthority::VerifiedWelcome,
+            ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0x5a; 32])),
             opening(30),
         )
         .expect("a reanchor strictly after the latest close must be accepted");

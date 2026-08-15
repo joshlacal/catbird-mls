@@ -550,7 +550,7 @@ mod tests {
         expect_post_terminal(
             probe.reanchor(
                 &binding(),
-                ReanchorAuthority::VerifiedWelcome,
+                ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0x11; 32])),
                 opening(50, OpeningKind::Add, coordinate(0)),
             ),
             "reanchor",

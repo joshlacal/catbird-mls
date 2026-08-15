@@ -22,6 +22,16 @@
 //! strict gap after the close; sharing a seq is a touching boundary, not a
 //! reanchor.
 //!
+//! **The closed set alone was not enough, and the difference is worth
+//! understanding.** Both variants used to be nullary, so naming one cost a
+//! caller nothing — and `reanchor` never read the argument. A hint-holder could
+//! not *construct* a Welcome, but could write `VerifiedWelcome` and be believed.
+//! Each variant now carries a private field holding the verified row's outer
+//! entry fingerprint, which only the envelope-verification layer can mint, and
+//! `reanchor` requires it to be the fingerprint of the opening being installed.
+//! Holding the authority is now evidence, and the evidence is checked against
+//! the thing it is evidence for.
+//!
 //! # Touching boundary
 //!
 //! `Replace -> Add` and `Reset -> Reset` share one authenticated row that both
@@ -38,13 +48,30 @@ use crate::chat_v2::ids::{Seq, TransitionId};
 use crate::chat_v2::interval::{AccessInterval, CloseProof, IntervalOpening, RecipientBinding};
 use crate::chat_v2::provenance::{CloseKind, OpeningKind, OuterEntryFingerprint};
 
+/// The verified row a reanchor authority stands on.
+///
+/// One private field: the row's outer entry fingerprint, which only the
+/// envelope-verification layer can mint. That is what makes holding a
+/// [`ReanchorAuthority`] *evidence* rather than an assertion — the enum's
+/// variants cannot be written down without one of these, and one of these
+/// cannot be written down without a fingerprint that came from a verified
+/// envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VerifiedOpeningRow {
+    outer_entry_fingerprint: OuterEntryFingerprint,
+}
+
 /// Proof that a reanchor opening may be trusted.
 ///
 /// Closed on purpose, with no variant for a current head, tombstone, event, or
-/// inventory summary — the spec names those as never being reanchor proof. A
-/// value of this type can only be produced by naming one of the two legitimate
-/// sources, so code that has only a hint cannot reach [`ApplicationReducer::reanchor`]
-/// at all.
+/// inventory summary — the spec names those as never being reanchor proof.
+///
+/// The closed set was the whole guarantee, and it was not enough. Both variants
+/// used to be nullary, so `ReanchorAuthority::VerifiedWelcome` was a thing any
+/// caller could write while holding nothing at all, and `reanchor` bound the
+/// argument to `_authority` and never read it — a marker that recorded a claim
+/// rather than proving one. Each variant now carries a [`VerifiedOpeningRow`],
+/// and `reanchor` checks that the row it names is the row being installed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReanchorAuthority {
     /// A Welcome addressed to this exact device, verified and matching.
@@ -52,9 +79,34 @@ pub enum ReanchorAuthority {
     /// This is the ordinary re-Add path: the device was removed, later added
     /// again, and the Add's Welcome establishes the new MLS state without any
     /// backfill of the gap.
-    VerifiedWelcome,
+    VerifiedWelcome(VerifiedOpeningRow),
     /// A verified post-join opening control row for this exact device.
-    VerifiedPostJoinOpening,
+    VerifiedPostJoinOpening(VerifiedOpeningRow),
+}
+
+impl ReanchorAuthority {
+    /// A verified Welcome as reanchor proof, named by its outer fingerprint.
+    pub fn verified_welcome(outer_entry_fingerprint: OuterEntryFingerprint) -> Self {
+        Self::VerifiedWelcome(VerifiedOpeningRow {
+            outer_entry_fingerprint,
+        })
+    }
+
+    /// A verified post-join opening row as reanchor proof.
+    pub fn verified_post_join_opening(outer_entry_fingerprint: OuterEntryFingerprint) -> Self {
+        Self::VerifiedPostJoinOpening(VerifiedOpeningRow {
+            outer_entry_fingerprint,
+        })
+    }
+
+    /// The fingerprint of the row this authority stands on.
+    pub fn outer_entry_fingerprint(&self) -> OuterEntryFingerprint {
+        match self {
+            Self::VerifiedWelcome(row) | Self::VerifiedPostJoinOpening(row) => {
+                row.outer_entry_fingerprint
+            }
+        }
+    }
 }
 
 /// An authenticated control row that closes this device's open interval.
@@ -157,15 +209,30 @@ impl ApplicationReducer {
     ///
     /// The caller must already have compared all five opening fields against
     /// the authenticated row via [`IntervalOpening::matches_exactly`]; the
-    /// `authority` argument records *which* legitimate source proved it.
+    /// `authority` argument names *which* legitimate source proved it, and
+    /// carries that row's outer fingerprint.
+    ///
+    /// The fingerprints must agree. §6 requires the reanchor to come "from the
+    /// matching verified Welcome or post-join opening row whose seq, kind,
+    /// signed transition ID, outer-entry fingerprint, and context all match" —
+    /// so an authority naming one row while the opening installs another is
+    /// precisely the arbitrary-current-head case the rule forbids, even though
+    /// both halves are individually genuine.
     pub fn reanchor(
         &mut self,
         recipient: &RecipientBinding,
-        _authority: ReanchorAuthority,
+        authority: ReanchorAuthority,
         opening: IntervalOpening<Coordinate>,
     ) -> Result<(), ReducerError> {
         self.require_not_terminal(opening.seq)?;
         self.require_recipient(recipient)?;
+
+        if authority.outer_entry_fingerprint() != opening.outer_entry_fingerprint {
+            return Err(ReducerError::ReanchorAuthorityMismatch {
+                authority: authority.outer_entry_fingerprint(),
+                opening: opening.outer_entry_fingerprint,
+            });
+        }
 
         if let Some(open) = self.open_interval() {
             return Err(ReducerError::NotAwaitingReanchor {
@@ -446,7 +513,7 @@ mod tests {
         reducer
             .reanchor(
                 &binding(),
-                ReanchorAuthority::VerifiedWelcome,
+                ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0x11; 32])),
                 opening(10, OpeningKind::Add, coordinate(5)),
             )
             .expect("a verified re-Add must reanchor");
@@ -463,7 +530,7 @@ mod tests {
         reducer
             .reanchor(
                 &binding(),
-                ReanchorAuthority::VerifiedWelcome,
+                ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0x11; 32])),
                 opening(10, OpeningKind::Add, coordinate(5)),
             )
             .unwrap();
@@ -495,7 +562,9 @@ mod tests {
             reducer
                 .reanchor(
                     &binding(),
-                    ReanchorAuthority::VerifiedWelcome,
+                    ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests(
+                        [0x11; 32]
+                    )),
                     opening(3, OpeningKind::Add, coordinate(5)),
                 )
                 .unwrap_err(),
@@ -514,7 +583,9 @@ mod tests {
             reducer
                 .reanchor(
                     &binding(),
-                    ReanchorAuthority::VerifiedWelcome,
+                    ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests(
+                        [0x11; 32]
+                    )),
                     opening(2, OpeningKind::Add, coordinate(5)),
                 )
                 .unwrap_err(),
@@ -532,7 +603,9 @@ mod tests {
             reducer
                 .reanchor(
                     &binding(),
-                    ReanchorAuthority::VerifiedWelcome,
+                    ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests(
+                        [0x11; 32]
+                    )),
                     opening(5, OpeningKind::Add, coordinate(5)),
                 )
                 .unwrap_err(),
@@ -555,7 +628,9 @@ mod tests {
             reducer
                 .reanchor(
                     &binding_for(SIBLING),
-                    ReanchorAuthority::VerifiedWelcome,
+                    ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests(
+                        [0x11; 32]
+                    )),
                     opening(10, OpeningKind::Add, coordinate(5)),
                 )
                 .unwrap_err(),
@@ -569,18 +644,67 @@ mod tests {
         // The spec's explicit prohibition: "An arbitrary current head and a
         // mid-interval row are never reanchor proof." ReanchorAuthority is a
         // closed two-variant enum with no constructor from a head, tombstone,
-        // event, or inventory summary, so code holding only a hint cannot form
-        // the argument this function requires. This test records the intent;
-        // the compiler is what enforces it.
+        // event, or inventory summary — and each variant now carries a private
+        // field holding a verified row's fingerprint, so code holding only a
+        // hint cannot form the argument even by naming a variant. This test
+        // records the intent; the compiler is what enforces it.
         let sources = [
-            ReanchorAuthority::VerifiedWelcome,
-            ReanchorAuthority::VerifiedPostJoinOpening,
+            ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0x11; 32])),
+            ReanchorAuthority::verified_post_join_opening(OuterEntryFingerprint::for_tests(
+                [0x11; 32],
+            )),
         ];
         assert_eq!(
             sources.len(),
             2,
             "exactly two legitimate provenance sources exist"
         );
+        for source in sources {
+            assert_eq!(
+                source.outer_entry_fingerprint(),
+                OuterEntryFingerprint::for_tests([0x11; 32]),
+                "an authority is exactly the row it stands on"
+            );
+        }
+    }
+
+    #[test]
+    fn an_authority_naming_a_different_row_is_refused() {
+        // The finding this closes: the authority argument was bound to
+        // `_authority` and never read, so `VerifiedWelcome` was a claim rather
+        // than proof. Both fingerprints here are individually genuine — this is
+        // a caller pairing one verified row's proof with another verified row's
+        // opening, which is the arbitrary-current-head case wearing a real
+        // fingerprint.
+        let mut reducer = removed_at_three();
+        let err = reducer
+            .reanchor(
+                &binding(),
+                ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0xee; 32])),
+                opening(10, OpeningKind::Add, coordinate(5)),
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ReducerError::ReanchorAuthorityMismatch {
+                authority: OuterEntryFingerprint::for_tests([0xee; 32]),
+                opening: OuterEntryFingerprint::for_tests([0x11; 32]),
+            }
+        );
+        assert!(!reducer.has_open_interval(), "the refusal must not reopen");
+        assert_eq!(reducer.intervals().len(), 1);
+
+        // The positive control: the identical call with the matching authority
+        // is accepted, so the refusal is reading the comparison rather than
+        // rejecting every reanchor.
+        reducer
+            .reanchor(
+                &binding(),
+                ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0x11; 32])),
+                opening(10, OpeningKind::Add, coordinate(5)),
+            )
+            .expect("the matching verified row must reanchor");
+        assert!(reducer.has_open_interval());
     }
 
     // ---- touching boundary ------------------------------------------------

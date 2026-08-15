@@ -216,7 +216,7 @@ fn a_reanchor_may_not_land_below_a_consumed_control_row() {
     let err = reducer
         .reanchor(
             &binding(),
-            ReanchorAuthority::VerifiedWelcome,
+            ReanchorAuthority::verified_welcome(OuterEntryFingerprint::for_tests([0x11; 32])),
             opening(6, OpeningKind::Add, coordinate(5)),
         )
         .unwrap_err();
