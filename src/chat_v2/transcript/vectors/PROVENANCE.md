@@ -90,13 +90,38 @@ the hash above covers both.
   cases**, each with its `serverFields`, `uuidBytePaths`, `base64BytePaths`,
   canonical DAG-CBOR hex, and fingerprint
 
-Per case, twelve keys were kept and the rest dropped as belonging to later
-slices: `unsignedSigningProjectionCanonicalDagCborHex`, `signingTranscriptHex`,
-`signedRequestRef`, `signingDomain`, and `historicalPublicKeyRef` are the
-signing-side vectors, and `historicalPublicKeys` /
-`authoritativeReferenceBindings` go with them. **Dropping is not editing** — no
-kept value is altered, and the omitted keys are still in the source file at the
-recorded revision for whichever slice needs them.
+Per case, fourteen keys are now kept. Twelve came with the original S7c
+vendoring; `signingDomain` and `signingTranscriptHex` were **re-lifted from the
+same source file at the same recorded revision** once it became clear what their
+absence cost — see below. Still dropped as belonging to later slices:
+`unsignedSigningProjectionCanonicalDagCborHex`, `signedRequestRef`, and
+`historicalPublicKeyRef`, together with the top-level `historicalPublicKeys` /
+`authoritativeReferenceBindings`. **Dropping is not editing** — no kept value is
+altered, and the omitted keys are still in the source file at the recorded
+revision for whichever slice needs them.
+
+#### Why the two signing keys came back
+
+The domain table in `transcript/mod.rs` is transcribed by hand from the server's
+`signed_mutation_kinds!` macro, and a single wrong byte produces signatures that
+verify locally and nowhere else. With `signingDomain` dropped, exactly **one** of
+the twenty-five domains — `CATBIRD-CHAT-BLOB-DELETE`, from the transcript
+vectors' `signedMutator` — was pinned against server bytes. The other
+twenty-four rested on the transcription being right.
+
+Re-lifting these two keys pins **fourteen of the twenty-five**: the thirteen
+control entries plus blob-delete. `fingerprint_tests.rs` asserts, per case, that
+this crate holds exactly one domain spelled identically to the server's
+(terminal NUL included) and that the case's transcript begins with those bytes.
+
+The remaining **eleven have no server vector in this fixture at all** and are
+pinned only by the transcribed table: `deviceEnrollmentBody`,
+`keyPackageReplenishmentBody`, `deviceAuthenticationRebindBody`,
+`deviceRevocationBody`, `blobUploadPreparationBody`, `applicationSendBody`,
+`typingBody`, `leafRecoveryRequestBody`, `leafRecoveryCancellationBody`,
+`welcomeAcknowledgementBody`, and `welcomeRejectionBody`. A test names that list,
+so lifting a server vector for one of them means moving it out of the list
+rather than quietly leaving the accounting stale.
 
 The `uuidBytePaths` / `base64BytePaths` lists are what make these usable without
 reimplementing the lexicon contract: they declare, by dotted path and at every

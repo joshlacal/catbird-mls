@@ -8,7 +8,7 @@
 //! at every depth, including inside `serverFields`.
 
 use super::fingerprint::*;
-use super::CanonicalValue;
+use super::{CanonicalValue, SignedMutationKind};
 use crate::chat_v2::ids::CanonicalUuid;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
@@ -217,6 +217,117 @@ fn every_control_fingerprint_vector_reproduces_exactly() {
     for kind in ControlEntryKind::ALL {
         assert!(seen.contains(kind), "{kind:?} was never exercised");
     }
+}
+
+// ---- the signing domains the server actually used ---------------------------
+
+#[test]
+fn every_control_case_pins_a_signing_domain_this_crate_spells_identically() {
+    // The domain table is transcribed from the server's macro, and a single
+    // wrong byte produces signatures that verify locally and nowhere else. Until
+    // the `signingDomain` and `signingTranscriptHex` keys were re-lifted, only
+    // BLOB-DELETE was pinned against server bytes and the other twenty-four
+    // rested on the transcription being right.
+    //
+    // No entryKind-to-domain table is written here on purpose. The case's
+    // domain is looked up *in this crate's own set*, so the assertion is "the
+    // server used a domain we have, spelled to the byte" rather than a second
+    // mapping that could drift from the first.
+    let vectors = vectors();
+    let cases = vectors["controlEntryFingerprints"]["cases"]
+        .as_array()
+        .expect("cases array");
+
+    let mut pinned: Vec<&[u8]> = Vec::new();
+    for case in cases {
+        let entry_kind = case["entryKind"].as_str().unwrap();
+        let declared = case["signingDomain"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{entry_kind} must carry its signing domain"));
+        assert!(
+            declared.ends_with('\0'),
+            "{entry_kind}: the server's domain includes its terminal NUL"
+        );
+
+        let matching: Vec<&SignedMutationKind> = SignedMutationKind::ALL
+            .iter()
+            .filter(|kind| kind.domain() == declared.as_bytes())
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "{entry_kind}: exactly one of this crate's domains must be {declared:?}"
+        );
+
+        // And the domain really is the transcript's prefix, NUL included, which
+        // is the property the constant exists to serve.
+        let transcript = case["signingTranscriptHex"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{entry_kind} must carry its signing transcript"));
+        assert!(
+            transcript.starts_with(&hex::encode(declared.as_bytes())),
+            "{entry_kind}: the transcript must begin with the domain bytes"
+        );
+
+        assert!(
+            !pinned.contains(&declared.as_bytes()),
+            "{entry_kind}: two cases pinned the same domain"
+        );
+        pinned.push(declared.as_bytes());
+    }
+    assert_eq!(pinned.len(), 13);
+}
+
+#[test]
+fn fourteen_of_the_twenty_five_domains_are_server_pinned_and_eleven_are_not() {
+    // The honest accounting, recorded rather than left to be assumed. The
+    // vendored fixture covers the thirteen control entries plus BLOB-DELETE
+    // from the signed-mutator vector. The remaining eleven have no server
+    // vector in this fixture at all, so they are pinned only by the transcribed
+    // constant table — real coverage, but a weaker kind, and a reader deciding
+    // whether to trust a domain should know which kind they have.
+    let vectors = vectors();
+    let mut pinned: Vec<String> = vectors["controlEntryFingerprints"]["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|case| case["signingDomain"].as_str().unwrap().to_owned())
+        .collect();
+    pinned.push(
+        String::from_utf8(SignedMutationKind::BlobDeletion.domain().to_vec())
+            .expect("a domain is ASCII plus its NUL"),
+    );
+
+    let unpinned: Vec<&str> = SignedMutationKind::ALL
+        .iter()
+        .filter(|kind| {
+            !pinned
+                .iter()
+                .any(|domain| domain.as_bytes() == kind.domain())
+        })
+        .map(|kind| kind.body_name())
+        .collect();
+
+    assert_eq!(pinned.len(), 14, "server-pinned domains");
+    assert_eq!(
+        unpinned,
+        vec![
+            "deviceEnrollmentBody",
+            "keyPackageReplenishmentBody",
+            "deviceAuthenticationRebindBody",
+            "deviceRevocationBody",
+            "blobUploadPreparationBody",
+            "applicationSendBody",
+            "typingBody",
+            "leafRecoveryRequestBody",
+            "leafRecoveryCancellationBody",
+            "welcomeAcknowledgementBody",
+            "welcomeRejectionBody",
+        ],
+        "these eleven rest on the transcribed table; lifting a server vector for \
+         one of them means moving it out of this list"
+    );
+    assert_eq!(pinned.len() + unpinned.len(), SignedMutationKind::ALL.len());
 }
 
 #[test]
