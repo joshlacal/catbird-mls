@@ -42,6 +42,9 @@
 //! equality, the cumulative bare-DID length rule, and the two-code auto-retry
 //! set were each settled against evidence and are pinned by tests.
 
+#[cfg(test)]
+mod gate_support;
+
 pub mod append_log;
 pub mod content;
 pub mod coordinate;
@@ -70,7 +73,7 @@ pub mod wire;
 /// catch that, so the rule is checked here instead of merely written down.
 #[cfg(test)]
 mod isolation {
-    use std::path::Path;
+    use super::gate_support::SourceScan;
 
     /// The superseded module's name, spelled once.
     ///
@@ -86,57 +89,24 @@ mod isolation {
             .collect()
     }
 
-    fn source_files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
-        let entries = std::fs::read_dir(dir).expect("chat_v2 source tree must be readable");
-        for entry in entries {
-            let path = entry.expect("directory entry must be readable").path();
-            if path.is_dir() {
-                source_files(&path, found);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                found.push(path);
-            }
-        }
-    }
-
-    /// Strips `//`-comments so the module documentation, which necessarily
-    /// names the forbidden paths in order to forbid them, is not itself a
-    /// violation.
-    fn code_only(line: &str) -> &str {
-        match line.find("//") {
-            Some(index) => &line[..index],
-            None => line,
-        }
-    }
-
     #[test]
     fn chat_v2_never_imports_the_superseded_orchestrator() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/chat_v2");
-        let mut files = Vec::new();
-        source_files(&root, &mut files);
+        let scan = SourceScan::of_chat_v2();
         assert!(
-            !files.is_empty(),
+            scan.file_count() > 0,
             "the walk found no sources, so this test would pass vacuously"
         );
+        assert!(
+            scan.unresolved_includes.is_empty(),
+            "code reached by an unscanned include is code this gate never saw: {:?}",
+            scan.unresolved_includes
+        );
 
-        let forbidden = forbidden_imports();
-        let mut violations = Vec::new();
-        for file in &files {
-            let text = std::fs::read_to_string(file).expect("source file must be readable");
-            for (number, line) in text.lines().enumerate() {
-                let code = code_only(line);
-                for forbidden in &forbidden {
-                    if code.contains(forbidden.as_str()) {
-                        violations.push(format!(
-                            "{}:{}: {}",
-                            file.display(),
-                            number + 1,
-                            line.trim()
-                        ));
-                    }
-                }
-            }
-        }
-
+        let violations: Vec<String> = forbidden_imports()
+            .iter()
+            .flat_map(|needle| scan.findings(needle))
+            .map(|finding| finding.describe())
+            .collect();
         assert!(
             violations.is_empty(),
             "chat_v2 must not depend on the superseded v1 orchestrator; found:\n{}",
@@ -147,15 +117,25 @@ mod isolation {
     #[test]
     fn the_isolation_check_can_actually_fail() {
         // A gate that cannot fail is not a gate. This proves the matcher would
-        // catch a real import rather than silently passing on every input.
+        // catch a real import rather than silently passing on every input —
+        // including the brace form, which is what an import organizer emits and
+        // which the previous substring matcher missed entirely.
         let forbidden = forbidden_imports();
-        let offending = format!("use crate::{V1_MODULE}::types::ConversationState;");
-        assert!(
-            forbidden
-                .iter()
-                .any(|needle| code_only(&offending).contains(needle.as_str())),
-            "the matcher must flag a genuine v1 import"
-        );
+        for offending in [
+            format!("use crate::{V1_MODULE}::types::ConversationState;"),
+            format!(
+                "use {}::{}{V1_MODULE}::types::ConversationState, ids::Seq{};",
+                "crate", "{", "}"
+            ),
+            format!("let doc = \"https://x\"; use crate::{V1_MODULE}::X;"),
+        ] {
+            assert!(
+                forbidden
+                    .iter()
+                    .any(|needle| SourceScan::line_contains(&offending, needle)),
+                "the matcher must flag: {offending}"
+            );
+        }
 
         // And that stripping comments is what spares the module documentation,
         // which has to name the forbidden path in order to forbid it.
@@ -163,7 +143,7 @@ mod isolation {
         assert!(
             !forbidden
                 .iter()
-                .any(|needle| code_only(&documented).contains(needle.as_str())),
+                .any(|needle| SourceScan::line_contains(&documented, needle)),
             "a mention inside a comment must not count as a violation"
         );
     }

@@ -200,13 +200,16 @@ mod required_methods {
 
     /// Removes `//` comments so documentation that shows a method body, or
     /// mentions one, is not mistaken for a declaration.
+    ///
+    /// Delegates to the shared scanner's string-aware stripper. The local
+    /// version cut every line at its first `//`, so a method declaration
+    /// sharing a line with any string holding a slash pair vanished from the
+    /// scan — the same evasion the tree-walking gates had, in a gate that reads
+    /// one file.
     fn strip_comments(source: &str) -> String {
         source
             .lines()
-            .map(|line| match line.find("//") {
-                Some(index) => &line[..index],
-                None => line,
-            })
+            .map(crate::chat_v2::gate_support::code_only)
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -391,6 +394,23 @@ mod required_methods {
             "the scanner must skip the decoy and find the real trait's methods"
         );
         assert_eq!(scanned[0].0, "store");
+    }
+
+    #[test]
+    fn a_default_hidden_behind_a_string_literal_is_still_found() {
+        // The evasion the shared stripper closes here. The old local version
+        // cut this line at the `//` inside the URL, so the defaulted method
+        // after it was never scanned.
+        let offending = format!(
+            "{} {{\n    async fn store(&self) -> Result<(), E> {{ let d = \"https://x\"; Ok(()) }}\n}}",
+            guarded_trait()
+        );
+        let scanned = guarded_methods(&offending);
+        assert_eq!(scanned.len(), 1);
+        assert!(
+            scanned[0].1,
+            "a default body must not be hidden by a string literal on its line"
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ pub use poison::{
 /// for when recovery is not working.
 #[cfg(test)]
 mod absence {
-    use std::path::Path;
+    use crate::chat_v2::gate_support::SourceScan;
 
     /// The forbidden mechanisms, assembled at runtime so this gate's own source
     /// is not a violation of itself.
@@ -55,56 +55,25 @@ mod absence {
         ]
     }
 
-    fn source_files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
-        let entries = std::fs::read_dir(dir).expect("chat_v2 source tree must be readable");
-        for entry in entries {
-            let path = entry.expect("directory entry must be readable").path();
-            if path.is_dir() {
-                source_files(&path, found);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                found.push(path);
-            }
-        }
-    }
-
-    /// Strips `//` comments, so documentation that names a forbidden mechanism
-    /// in order to forbid it is not itself a violation.
-    fn code_only(line: &str) -> &str {
-        match line.find("//") {
-            Some(index) => &line[..index],
-            None => line,
-        }
-    }
-
     #[test]
     fn chat_v2_never_reaches_for_a_forbidden_recovery_mechanism() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/chat_v2");
-        let mut files = Vec::new();
-        source_files(&root, &mut files);
+        let scan = SourceScan::of_chat_v2();
         assert!(
-            !files.is_empty(),
+            scan.file_count() > 0,
             "the walk found no sources, so this test would pass vacuously"
         );
+        assert!(
+            scan.unresolved_includes.is_empty(),
+            "code reached by an unscanned include is code this gate never saw: {:?}",
+            scan.unresolved_includes
+        );
 
-        let forbidden = forbidden_mechanisms();
         let mut violations = Vec::new();
-        for file in &files {
-            let text = std::fs::read_to_string(file).expect("source file must be readable");
-            for (number, line) in text.lines().enumerate() {
-                let code = code_only(line);
-                for (needle, why) in &forbidden {
-                    if code.contains(needle.as_str()) {
-                        violations.push(format!(
-                            "{}:{}: {} — {why}",
-                            file.display(),
-                            number + 1,
-                            line.trim()
-                        ));
-                    }
-                }
+        for (needle, why) in &forbidden_mechanisms() {
+            for finding in scan.findings(needle) {
+                violations.push(format!("{} — {why}", finding.describe()));
             }
         }
-
         assert!(
             violations.is_empty(),
             "chat_v2 must never use a forbidden recovery mechanism; found:\n{}",
@@ -116,18 +85,21 @@ mod absence {
     fn the_absence_gate_can_actually_fail() {
         // A control that cannot fail is not a control. This proves the matcher
         // would catch a real reintroduction rather than passing on every input,
-        // and that comment-stripping is what spares the documentation above.
+        // that comment-stripping is what spares the documentation above, and
+        // that a string literal on the line cannot hide the reintroduction.
         let forbidden = forbidden_mechanisms();
-        let offending = format!(
-            "    let group = {}(&provider)?;",
-            ["create", "external", "commit"].join("_")
-        );
-        assert!(
-            forbidden
-                .iter()
-                .any(|(needle, _)| code_only(&offending).contains(needle.as_str())),
-            "the matcher must flag a genuine reintroduction"
-        );
+        let mechanism = ["create", "external", "commit"].join("_");
+        for offending in [
+            format!("    let group = {mechanism}(&provider)?;"),
+            format!("    let url = \"https://mls.example\"; {mechanism}(&provider)?;"),
+        ] {
+            assert!(
+                forbidden
+                    .iter()
+                    .any(|(needle, _)| SourceScan::line_contains(&offending, needle)),
+                "the matcher must flag: {offending}"
+            );
+        }
 
         let documented = format!(
             "//! - No {}, at any rung.",
@@ -136,7 +108,7 @@ mod absence {
         assert!(
             forbidden
                 .iter()
-                .all(|(needle, _)| !code_only(&documented).contains(needle.as_str())),
+                .all(|(needle, _)| !SourceScan::line_contains(&documented, needle)),
             "a mention inside a comment must not count as a violation"
         );
     }

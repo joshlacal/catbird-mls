@@ -144,6 +144,7 @@ impl StoreScope {
 /// there first.
 #[cfg(test)]
 mod physical_separation {
+    use crate::chat_v2::gate_support::SourceScan;
     use std::path::Path;
 
     /// The v1 storage mechanisms v2 must never reach, each with its reason.
@@ -179,57 +180,25 @@ mod physical_separation {
         ]
     }
 
-    fn source_files(dir: &Path, found: &mut Vec<std::path::PathBuf>) {
-        let entries = std::fs::read_dir(dir).expect("chat_v2 source tree must be readable");
-        for entry in entries {
-            let path = entry.expect("directory entry must be readable").path();
-            if path.is_dir() {
-                source_files(&path, found);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                found.push(path);
-            }
-        }
-    }
-
-    /// Strips `//` comments, so documentation naming a forbidden store in order
-    /// to forbid it — as this module's own docs do at length — is not a
-    /// violation.
-    fn code_only(line: &str) -> &str {
-        match line.find("//") {
-            Some(index) => &line[..index],
-            None => line,
-        }
-    }
-
     #[test]
     fn chat_v2_never_reaches_a_v1_store() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/chat_v2");
-        let mut files = Vec::new();
-        source_files(&root, &mut files);
+        let scan = SourceScan::of_chat_v2();
         assert!(
-            !files.is_empty(),
+            scan.file_count() > 0,
             "the walk found no sources, so this test would pass vacuously"
         );
+        assert!(
+            scan.unresolved_includes.is_empty(),
+            "code reached by an unscanned include is code this gate never saw: {:?}",
+            scan.unresolved_includes
+        );
 
-        let forbidden = forbidden_stores();
         let mut violations = Vec::new();
-        for file in &files {
-            let text = std::fs::read_to_string(file).expect("source file must be readable");
-            for (number, line) in text.lines().enumerate() {
-                let code = code_only(line);
-                for (needle, why) in &forbidden {
-                    if code.contains(needle.as_str()) {
-                        violations.push(format!(
-                            "{}:{}: {} — {why}",
-                            file.display(),
-                            number + 1,
-                            line.trim()
-                        ));
-                    }
-                }
+        for (needle, why) in &forbidden_stores() {
+            for finding in scan.findings(needle) {
+                violations.push(format!("{} — {why}", finding.describe()));
             }
         }
-
         assert!(
             violations.is_empty(),
             "v2 storage must be physically separate from v1's; found:\n{}",
@@ -241,40 +210,38 @@ mod physical_separation {
     fn the_separation_gate_can_actually_fail() {
         // A control that cannot fail is not a control. These are the exact
         // spellings the real v1 modules use, so the matcher is proven against
-        // the thing it exists to catch rather than against an invented string.
+        // the thing it exists to catch rather than against an invented string —
+        // including the two forms the previous matcher missed: a brace-form
+        // import, and a line whose string literal holds a slash pair.
         let forbidden = forbidden_stores();
+        let provider = ["Hybrid", "Storage", "Provider"].concat();
+        let backend = ["MLS", "Storage", "Backend"].concat();
+        let sqlite = ["openmls", "sqlite", "storage"].join("_");
         for offending in [
+            format!("use {sqlite}::SqliteStorageProvider;"),
+            format!("    let provider = {provider}::new();"),
+            format!("impl {backend} for ChatV2Store {{"),
             format!(
-                "use {}::SqliteStorageProvider;",
-                ["openmls", "sqlite", "storage"].join("_")
+                "use crate::{}{}::SqliteStorageProvider{};",
+                "{", sqlite, "}"
             ),
-            format!(
-                "    let provider = {}::new();",
-                ["Hybrid", "Storage", "Provider"].concat()
-            ),
-            format!(
-                "impl {} for ChatV2Store {{",
-                ["MLS", "Storage", "Backend"].concat()
-            ),
+            format!("let doc = \"https://x\"; let p = {provider}::new();"),
         ] {
             assert!(
                 forbidden
                     .iter()
-                    .any(|(needle, _)| code_only(&offending).contains(needle.as_str())),
+                    .any(|(needle, _)| SourceScan::line_contains(&offending, needle)),
                 "the matcher must flag: {offending}"
             );
         }
 
         // And that comment stripping is what spares this module's own docs,
         // which necessarily name every store they forbid.
-        let documented = format!(
-            "//! - v1's {} is flat and has no namespace to parallel.",
-            ["MLS", "Storage", "Backend"].concat()
-        );
+        let documented = format!("//! - v1's {backend} is flat and has no namespace to parallel.");
         assert!(
             forbidden
                 .iter()
-                .all(|(needle, _)| !code_only(&documented).contains(needle.as_str())),
+                .all(|(needle, _)| !SourceScan::line_contains(&documented, needle)),
             "a mention inside a comment must not count as a violation"
         );
     }
