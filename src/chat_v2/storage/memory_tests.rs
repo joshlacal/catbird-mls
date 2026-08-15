@@ -464,7 +464,8 @@ async fn rehydration_reconstructs_any_durable_state() {
         [0xcd; 64],
         CanonicalTimestamp::parse(SIGNED_AT).unwrap(),
         JournalState::InFlight { attempts: 7 },
-    );
+    )
+    .expect("in-flight progress is a state a real run reaches");
     store.put_journal_entry(&stored).await.unwrap();
 
     let restored = store

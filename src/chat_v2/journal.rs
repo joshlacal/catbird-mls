@@ -215,6 +215,20 @@ impl JournalEntry {
     /// nothing in this module that regenerates a body, a digest, or a signature,
     /// because doing so would produce a fresh `signedAt` and convert a
     /// recoverable ambiguous outcome into a permanent conflict.
+    ///
+    /// # The one state it refuses
+    ///
+    /// "Accepts any state" has an exception, and it is the exception the
+    /// restore-bypass pattern always produces: a state the *maintaining* path
+    /// refuses to create. [`JournalEntry::record_stale_tombstone`] rejects
+    /// anything that is not a `sendMessage`, because only `sendMessage` has that
+    /// outcome — so `StaleTombstoned` on a non-`MessageId` identity is a
+    /// combination nothing could have written. Restoring it would permanently
+    /// retire an operation the server never retired, and `should_submit` would
+    /// report `false` forever with no way back.
+    ///
+    /// Restoring a *legitimately* recorded state is untouched: this refuses one
+    /// contradiction, not any progress a real run could have made.
     pub fn rehydrate(
         identity: OperationIdentity,
         canonical_body: Vec<u8>,
@@ -222,15 +236,20 @@ impl JournalEntry {
         signature: [u8; 64],
         signed_at: CanonicalTimestamp,
         state: JournalState,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, JournalError> {
+        if matches!(state, JournalState::StaleTombstoned)
+            && !matches!(identity.operation_id, OperationId::MessageId(_))
+        {
+            return Err(JournalError::StaleTombstoneNotApplicable { identity });
+        }
+        Ok(Self {
             identity,
             request_digest,
             signature,
             signed_at,
             canonical_body,
             state,
-        }
+        })
     }
 
     /// The idempotency triple.
@@ -450,6 +469,68 @@ mod tests {
             [0xcd; 64],
             timestamp(),
         )
+    }
+
+    fn restored(
+        identity: OperationIdentity,
+        state: JournalState,
+    ) -> Result<JournalEntry, JournalError> {
+        JournalEntry::rehydrate(
+            identity,
+            b"canonical-body".to_vec(),
+            [0xab; 32],
+            [0xcd; 64],
+            timestamp(),
+            state,
+        )
+    }
+
+    #[test]
+    fn restoring_refuses_a_state_the_maintaining_path_could_not_have_written() {
+        // The restore-bypass pattern, found by sweeping for it: an invariant
+        // enforced by the only path that can set a state, and a constructor
+        // that skips that path. `record_stale_tombstone` refuses anything that
+        // is not a sendMessage, so this combination is one nothing could have
+        // written — and restoring it would permanently retire an operation the
+        // server never retired, with `should_submit` false forever and no way
+        // back.
+        let err = restored(transition_identity(), JournalState::StaleTombstoned).unwrap_err();
+        assert_eq!(
+            err,
+            JournalError::StaleTombstoneNotApplicable {
+                identity: transition_identity()
+            }
+        );
+
+        // The same refusal the live path gives, which is the point: restore
+        // does not get a weaker rule than the transition it stands in for.
+        let mut live = entry(transition_identity());
+        assert_eq!(live.record_stale_tombstone().unwrap_err(), err);
+    }
+
+    #[test]
+    fn restoring_still_accepts_every_state_a_real_run_reaches() {
+        // The over-refusal control. Restore exists to bring back durable
+        // progress, so a check that narrowed it to what `prepare` produces
+        // would defeat it — only the one contradiction above is refused.
+        for state in [
+            JournalState::Prepared,
+            JournalState::InFlight { attempts: 1 },
+            JournalState::InFlight { attempts: 9 },
+            JournalState::Completed,
+            JournalState::Conflicted,
+        ] {
+            assert!(
+                restored(transition_identity(), state.clone()).is_ok(),
+                "{state:?} must restore on a transition operation"
+            );
+            assert!(restored(message_identity(), state.clone()).is_ok());
+        }
+        // And the tombstone itself, on the one operation kind that has it.
+        let tombstoned = restored(message_identity(), JournalState::StaleTombstoned)
+            .expect("sendMessage is exactly where a stale tombstone belongs");
+        assert!(tombstoned.state().is_terminal());
+        assert!(!tombstoned.should_submit());
     }
 
     #[test]
