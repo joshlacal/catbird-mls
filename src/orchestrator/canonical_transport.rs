@@ -24,7 +24,7 @@ use openmls_traits::signatures::Signer;
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::Serialize;
 use std::{collections::BTreeMap, str::FromStr};
-use uuid::{Uuid, Version};
+use uuid::{Uuid, Variant, Version};
 
 const REPLENISH_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REPLENISH\0";
 
@@ -338,7 +338,10 @@ fn canonical_uuid_bytes(value: &str, field: &str) -> Result<Vec<u8>, TransportEr
 pub(crate) fn validate_uuid(value: &str, field: &str) -> Result<Uuid, TransportError> {
     let uuid = Uuid::parse_str(value)
         .map_err(|_| TransportError::Serialization(format!("{field} is not a UUID")))?;
-    if uuid.get_version() != Some(Version::Random) || uuid.to_string() != value {
+    if uuid.get_version() != Some(Version::Random)
+        || uuid.get_variant() != Variant::RFC4122
+        || uuid.to_string() != value
+    {
         return Err(TransportError::Serialization(format!(
             "{field} is not canonical lowercase UUIDv4"
         )));

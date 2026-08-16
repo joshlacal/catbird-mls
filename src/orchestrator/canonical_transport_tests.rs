@@ -290,6 +290,7 @@ fn canonical_transport_rejects_noncanonical_identifiers_and_bounds() {
     assert!(validate_uuid("11111111-1111-4111-8111-111111111111", "deviceId").is_ok());
     assert!(validate_uuid("11111111-1111-4111-8111-111111111111", "deviceId").is_ok());
     assert!(validate_uuid("11111111-1111-4111-8111-11111111111A", "deviceId").is_err());
+    assert!(validate_uuid("11111111-1111-4111-c111-111111111111", "deviceId").is_err());
     assert!(validate_datetime("2026-08-16T12:00:00.000Z").is_ok());
     assert!(validate_datetime("2026-08-16t12:00:00.00Z").is_err());
     assert!(validate_jkt("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_ok());
