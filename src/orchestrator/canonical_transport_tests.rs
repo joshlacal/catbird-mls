@@ -1,7 +1,9 @@
 use super::canonical_transport::{
-    canonical_route, get_conversations, get_entries, map_wire_error, replenish_key_packages,
-    route_for_nsid, CanonicalOperation, ReplenishKeyPackagesInput, TransportAuth, TransportError,
+    canonical_replenishment_transcript, canonical_route, derive_key_id, get_conversations,
+    get_entries, map_wire_error, replenish_key_packages, route_for_nsid, CanonicalOperation,
+    ReplenishKeyPackagesInput, TransportAuth, TransportError,
 };
+use std::str::FromStr;
 
 fn auth() -> TransportAuth {
     TransportAuth {
@@ -131,23 +133,19 @@ fn replenishment_serializes_generated_signed_envelope_and_binds_signature() {
     use serde_json::Value;
 
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).expect("signer");
-    let request = replenish_key_packages(
-        &auth(),
-        &signer,
-        ReplenishKeyPackagesInput {
-            actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
-            actor_device_id: auth().device_id,
-            auth_generation: 1,
-            idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
-            key_id: "device-key-id".into(),
-            dpop_jkt: "device-jkt".into(),
-            signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
-            key_packages: vec![key_package()],
-            signed_at: "2026-08-16T12:00:00.000Z".into(),
-            transcript: b"canonical-replenishment-transcript".to_vec(),
-        },
-    )
-    .expect("signed request");
+    let key_id = derive_key_id(signer.public());
+    let input = ReplenishKeyPackagesInput {
+        actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+        actor_device_id: auth().device_id,
+        auth_generation: 1,
+        idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+        key_id,
+        dpop_jkt: "device-jkt".into(),
+        signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+        key_packages: vec![key_package()],
+        signed_at: "2026-08-16T12:00:00.000Z".into(),
+    };
+    let request = replenish_key_packages(&auth(), &signer, input).expect("signed request");
 
     let value: Value = serde_json::from_slice(request.body.as_ref().expect("body")).unwrap();
     assert_eq!(
@@ -170,12 +168,52 @@ fn replenishment_serializes_generated_signed_envelope_and_binds_signature() {
                 .unwrap(),
         )
         .unwrap();
-    assert_eq!(
-        signature,
-        signer
-            .sign(b"canonical-replenishment-transcript")
-            .expect("sign transcript")
-    );
+    let expected = canonical_replenishment_transcript(
+        &ReplenishKeyPackagesInput {
+            actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+            actor_device_id: auth().device_id,
+            auth_generation: 1,
+            idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+            key_id: derive_key_id(signer.public()),
+            dpop_jkt: "device-jkt".into(),
+            signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+            key_packages: vec![key_package()],
+            signed_at: "2026-08-16T12:00:00.000Z".into(),
+        },
+        signer.public(),
+        &crate::atproto::blue_catbird::chat::CanonicalDatetime::from_str(
+            "2026-08-16T12:00:00.000Z",
+        )
+        .unwrap(),
+        &derive_key_id(signer.public()),
+    )
+    .unwrap();
+    assert_eq!(signature, signer.sign(&expected).expect("sign transcript"));
+
+    let mut changed = ReplenishKeyPackagesInput {
+        actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+        actor_device_id: auth().device_id,
+        auth_generation: 2,
+        idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+        key_id: derive_key_id(signer.public()),
+        dpop_jkt: "device-jkt".into(),
+        signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+        key_packages: vec![key_package()],
+        signed_at: "2026-08-16T12:00:00.000Z".into(),
+    };
+    changed.key_packages[0].bytes =
+        crate::atproto::jacquard_common::deps::bytes::Bytes::from_static(b"changed");
+    let changed_request = replenish_key_packages(&auth(), &signer, changed).unwrap();
+    let changed_value: Value =
+        serde_json::from_slice(changed_request.body.as_ref().unwrap()).unwrap();
+    let changed_signature = base64::engine::general_purpose::STANDARD
+        .decode(
+            changed_value["signedRequest"]["signature"]["$bytes"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_ne!(signature, changed_signature);
 }
 
 #[test]
@@ -194,7 +232,6 @@ fn replenishment_rejects_wrong_device_legacy_shape_and_missing_auth() {
         signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
         key_packages: vec![key_package()],
         signed_at: "2026-08-16T12:00:00.000Z".into(),
-        transcript: b"transcript".to_vec(),
     };
     assert!(matches!(
         replenish_key_packages(&auth(), &signer, input()),
@@ -215,6 +252,32 @@ fn replenishment_rejects_wrong_device_legacy_shape_and_missing_auth() {
     assert_eq!(
         get_entries(&missing, "conversation", 0, 10),
         Err(TransportError::MissingAuthentication)
+    );
+}
+
+#[test]
+fn replenishment_rejects_key_id_not_derived_from_signing_key() {
+    use openmls::prelude::SignatureScheme;
+    use openmls_basic_credential::SignatureKeyPair;
+
+    let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+    let result = replenish_key_packages(
+        &auth(),
+        &signer,
+        ReplenishKeyPackagesInput {
+            actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+            actor_device_id: auth().device_id,
+            auth_generation: 1,
+            idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+            key_id: "wrong-key-id".into(),
+            dpop_jkt: "device-jkt".into(),
+            signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+            key_packages: vec![key_package()],
+            signed_at: "2026-08-16T12:00:00.000Z".into(),
+        },
+    );
+    assert!(
+        matches!(result, Err(TransportError::Serialization(message)) if message.contains("keyId"))
     );
 }
 

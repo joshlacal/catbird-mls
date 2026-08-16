@@ -21,8 +21,10 @@ use crate::atproto::jacquard_common::xrpc::XrpcEndpoint;
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
+use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::Serialize;
-use std::str::FromStr;
+use std::{collections::BTreeMap, str::FromStr};
+use uuid::{Uuid, Version};
 
 const REPLENISH_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REPLENISH\0";
 
@@ -104,9 +106,8 @@ pub(crate) fn map_wire_error(operation: CanonicalOperation, code: &str) -> Trans
 
 /// Inputs needed to construct `blue.catbird.chat.replenishKeyPackages`.
 ///
-/// The transcript must be the exact canonical DAG-CBOR transcript produced by
-/// the clean-chat projector. In particular, this function never hashes JSON
-/// or generated DTO bytes as a substitute.
+/// The body fields are the sole source of truth for the signed transcript.
+/// Callers cannot supply an arbitrary byte string to sign.
 pub(crate) struct ReplenishKeyPackagesInput {
     pub(crate) actor_did: String,
     pub(crate) actor_device_id: String,
@@ -117,13 +118,11 @@ pub(crate) struct ReplenishKeyPackagesInput {
     pub(crate) signature_domain: String,
     pub(crate) key_packages: Vec<crate::atproto::blue_catbird::chat::KeyPackageArtifact<String>>,
     pub(crate) signed_at: String,
-    pub(crate) transcript: Vec<u8>,
 }
 
 /// Construct and serialize one canonical key-package replenishment request.
 ///
-/// This signs only the caller-provided canonical transcript. The returned
-/// wrapper uses the generated `SignedKeyPackageReplenishment` and
+/// The returned wrapper uses the generated `SignedKeyPackageReplenishment` and
 /// `ReplenishKeyPackages` types, so the wire shape cannot silently drift from
 /// the lexicon. No public FFI is introduced; a platform can call this from an
 /// existing internal adapter once its transcript and DPoP facilities are
@@ -143,18 +142,24 @@ pub(crate) fn replenish_key_packages(
     if input.dpop_jkt != auth.dpop_jkt {
         return Err(TransportError::DpopBindingMismatch);
     }
-    if input.transcript.is_empty() {
-        return Err(TransportError::EmptySigningTranscript);
-    }
     if input.signature_domain != REPLENISH_SIGNATURE_DOMAIN {
         return Err(TransportError::InvalidSignatureDomain);
     }
     if signer.signature_scheme() != SignatureScheme::ED25519 || signer.public().len() != 32 {
         return Err(TransportError::UnsupportedSigningScheme);
     }
-
+    let public_key = signer.public().to_vec();
+    let derived_key_id = derive_key_id(&public_key);
+    if input.key_id != derived_key_id {
+        return Err(TransportError::Serialization(
+            "keyId does not match the Ed25519 public-key thumbprint".into(),
+        ));
+    }
+    let signed_at = parse_datetime(input.signed_at.clone())?;
+    let transcript =
+        canonical_replenishment_transcript(&input, &public_key, &signed_at, &derived_key_id)?;
     let signature = signer
-        .sign(&input.transcript)
+        .sign(&transcript)
         .map_err(|_| TransportError::Signing)?;
     let body = crate::atproto::blue_catbird::chat::KeyPackageReplenishmentBody::<String> {
         actor_device_id: input.actor_device_id,
@@ -169,7 +174,7 @@ pub(crate) fn replenish_key_packages(
         key_packages: input.key_packages,
         signature_domain: REPLENISH_SIGNATURE_DOMAIN.to_owned(),
         signature_public_key: Bytes::from(signer.public().to_vec()),
-        signed_at: parse_datetime(input.signed_at)?,
+        signed_at,
         extra_data: None,
     };
     let signed = crate::atproto::blue_catbird::chat::SignedKeyPackageReplenishment::<String> {
@@ -188,6 +193,143 @@ pub(crate) fn replenish_key_packages(
         dpop: auth.dpop_proof.clone(),
         body: Some(serialize_json(&request)?),
     })
+}
+
+pub(crate) fn derive_key_id(public_key: &[u8]) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use sha2::{Digest, Sha256};
+    URL_SAFE_NO_PAD.encode(Sha256::digest(public_key))
+}
+
+#[derive(Debug)]
+enum CanonicalValue {
+    Text(String),
+    Bytes(Vec<u8>),
+    Integer(u64),
+    Array(Vec<CanonicalValue>),
+    Map(BTreeMap<String, CanonicalValue>),
+}
+
+impl Serialize for CanonicalValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Text(value) => serializer.serialize_str(value),
+            Self::Bytes(value) => serializer.serialize_bytes(value),
+            Self::Integer(value) => serializer.serialize_u64(*value),
+            Self::Array(values) => {
+                let mut seq = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    seq.serialize_element(value)?;
+                }
+                seq.end()
+            }
+            Self::Map(values) => {
+                let mut map = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+pub(crate) fn canonical_replenishment_transcript(
+    input: &ReplenishKeyPackagesInput,
+    public_key: &[u8],
+    signed_at: &crate::atproto::blue_catbird::chat::CanonicalDatetime,
+    key_id: &str,
+) -> Result<Vec<u8>, TransportError> {
+    let device_id = canonical_uuid_bytes(&input.actor_device_id, "actorDeviceId")?;
+    let idempotency_key = canonical_uuid_bytes(&input.idempotency_key, "idempotencyKey")?;
+    let auth_generation = u64::try_from(input.auth_generation)
+        .map_err(|_| TransportError::Serialization("authGeneration must be non-negative".into()))?;
+    let mut body = BTreeMap::new();
+    body.insert(
+        "$type".into(),
+        CanonicalValue::Text("blue.catbird.chat.defs#keyPackageReplenishmentBody".into()),
+    );
+    body.insert("actorDeviceId".into(), CanonicalValue::Bytes(device_id));
+    body.insert(
+        "actorDid".into(),
+        CanonicalValue::Text(input.actor_did.clone()),
+    );
+    body.insert(
+        "authGeneration".into(),
+        CanonicalValue::Integer(auth_generation),
+    );
+    body.insert(
+        "dpopJkt".into(),
+        CanonicalValue::Text(input.dpop_jkt.clone()),
+    );
+    body.insert(
+        "idempotencyKey".into(),
+        CanonicalValue::Bytes(idempotency_key),
+    );
+    body.insert("keyId".into(), CanonicalValue::Text(key_id.into()));
+    let packages = input
+        .key_packages
+        .iter()
+        .map(|package| {
+            let mut value = BTreeMap::new();
+            value.insert(
+                "bytes".into(),
+                CanonicalValue::Bytes(package.bytes.to_vec()),
+            );
+            value.insert(
+                "contentType".into(),
+                CanonicalValue::Text(package.content_type.clone()),
+            );
+            value.insert(
+                "framing".into(),
+                CanonicalValue::Text(package.framing.clone()),
+            );
+            value.insert(
+                "keyPackageRef".into(),
+                CanonicalValue::Bytes(package.key_package_ref.to_vec()),
+            );
+            value.insert(
+                "sha256".into(),
+                CanonicalValue::Bytes(package.sha256.to_vec()),
+            );
+            CanonicalValue::Map(value)
+        })
+        .collect();
+    body.insert("keyPackages".into(), CanonicalValue::Array(packages));
+    body.insert(
+        "signatureDomain".into(),
+        CanonicalValue::Text(REPLENISH_SIGNATURE_DOMAIN.into()),
+    );
+    body.insert(
+        "signaturePublicKey".into(),
+        CanonicalValue::Bytes(public_key.to_vec()),
+    );
+    body.insert(
+        "signedAt".into(),
+        CanonicalValue::Text(signed_at.to_string()),
+    );
+    let projection = serde_ipld_dagcbor::to_vec(&CanonicalValue::Map(body))
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let mut transcript = REPLENISH_SIGNATURE_DOMAIN.as_bytes().to_vec();
+    transcript.extend_from_slice(&projection);
+    if transcript.is_empty() {
+        return Err(TransportError::EmptySigningTranscript);
+    }
+    Ok(transcript)
+}
+
+fn canonical_uuid_bytes(value: &str, field: &str) -> Result<Vec<u8>, TransportError> {
+    let uuid = Uuid::parse_str(value)
+        .map_err(|_| TransportError::Serialization(format!("{field} is not a UUID")))?;
+    if uuid.get_version() != Some(Version::Random) {
+        return Err(TransportError::Serialization(format!(
+            "{field} is not a UUIDv4"
+        )));
+    }
+    Ok(uuid.as_bytes().to_vec())
 }
 
 fn parse_datetime(
