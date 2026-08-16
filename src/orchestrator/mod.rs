@@ -1,4 +1,5 @@
 pub mod api_client;
+pub(crate) mod canonical_transport;
 pub mod constants;
 pub mod credential_binding;
 pub mod credentials;
@@ -18,6 +19,9 @@ pub mod storage;
 pub mod sync;
 pub mod types;
 pub mod welcome_recovery;
+
+#[cfg(test)]
+mod canonical_transport_tests;
 
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
