@@ -951,3 +951,32 @@ fn signed_post_preparation_requires_exact_authenticated_generation() {
             if message.contains("authGeneration")
     ));
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn prepare_clean_chat_signed_request_delegates_to_prepare_clean_chat_request() {
+    use super::canonical_transport::{
+        prepare_clean_chat_signed_request, CleanChatAuthContextFfi, CleanChatOperationFfi,
+    };
+    let auth = auth();
+    let context = CleanChatAuthContextFfi {
+        authorization: auth.authorization.clone(),
+        dpop_proof: auth.dpop_proof.clone(),
+        dpop_jkt: auth.dpop_jkt.clone(),
+        device_id: auth.device_id.clone(),
+        auth_generation: None,
+    };
+    let result = prepare_clean_chat_signed_request(
+        context,
+        CleanChatOperationFfi::EnrollDevice,
+        enrollment_request_json(&auth.device_id, &auth.dpop_jkt, 0),
+    );
+    assert!(result.is_ok());
+    let prepared = result.unwrap();
+    assert_eq!(prepared.method, "POST");
+    assert_eq!(prepared.path, "/xrpc/blue.catbird.chat.enrollDevice");
+    assert_eq!(prepared.authorization, "Bearer gateway-token");
+    assert_eq!(prepared.dpop, "signed-dpop-proof");
+    assert!(prepared.body.is_some());
+}
+

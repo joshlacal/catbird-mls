@@ -34,8 +34,8 @@ pub use canonical_transport::{
 #[cfg(not(target_arch = "wasm32"))]
 pub use canonical_transport::{
     decode_clean_chat_blob, decode_clean_chat_error, decode_clean_chat_response,
-    prepare_clean_chat_request, CleanChatAuthContextFfi, CleanChatOperationFfi,
-    CleanChatPreparedRequestFfi, CleanChatTransportFfiError,
+    prepare_clean_chat_request, prepare_clean_chat_signed_request, CleanChatAuthContextFfi,
+    CleanChatOperationFfi, CleanChatPreparedRequestFfi, CleanChatTransportFfiError,
 };
 pub use constants::*;
 pub use credential_binding::{

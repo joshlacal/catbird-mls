@@ -641,6 +641,16 @@ pub fn prepare_clean_chat_request(
     })
 }
 
+/// Convenience alias for `prepare_clean_chat_request` for mutation signing callers.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn prepare_clean_chat_signed_request(
+    auth: CleanChatAuthContextFfi,
+    operation: CleanChatOperationFfi,
+    request_json: Vec<u8>,
+) -> Result<CleanChatPreparedRequestFfi, CleanChatTransportFfiError> {
+    prepare_clean_chat_request(auth, operation, request_json)
+}
+
 /// Preserve an `getBlob` octet-stream response without attempting JSON or
 /// UTF-8 decoding. Blob ciphertext is opaque to this transport layer.
 pub fn decode_clean_chat_blob_response(body: &[u8]) -> Result<Vec<u8>, TransportError> {

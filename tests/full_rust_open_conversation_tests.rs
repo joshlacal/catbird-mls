@@ -144,7 +144,7 @@ async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn needs_rejoin_returns_recovery_vocabulary_instead_of_generic_error() {
+async fn stale_needs_rejoin_on_healthy_local_group_clears_without_recovery_io() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     let _did = world.register_device("Alice").await.unwrap();
@@ -170,13 +170,37 @@ async fn needs_rejoin_returns_recovery_vocabulary_instead_of_generic_error() {
         .orchestrator
         .ensure_conversation_ready(&convo.conversation_id)
         .await
-        .expect("needs_rejoin should project a recovery state");
+        .expect("stale needs_rejoin on a healthy local group should clear");
 
     assert_eq!(
-        result.recovery_state,
-        ConversationRecoveryState::NeedsRejoin
+        result,
+        ConversationReadyResult {
+            recovery_state: ConversationRecoveryState::Healthy,
+            epoch: Some(0),
+            send_allowed: true,
+        }
     );
-    assert!(!result.send_allowed);
+    assert_eq!(
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&convo.conversation_id),
+        Some(&ConversationState::Active)
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .welcome_fetch_count(&convo.conversation_id),
+        0
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .external_commit_count(&convo.conversation_id),
+        0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

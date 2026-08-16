@@ -218,7 +218,7 @@ where
                 let projected = self.project_conversation_recovery_state(convo_id).await;
                 let epoch = match self.local_group_epoch_result(convo_id).await {
                     Ok(epoch) => epoch,
-                    Err(err)
+                    Err(_err)
                         if matches!(
                             projected,
                             ConversationRecoveryState::NeedsRejoin
