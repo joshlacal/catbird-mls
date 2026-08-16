@@ -393,7 +393,10 @@ fn public_replenishment_binds_generation_and_device_context() {
     mismatch.auth_generation = Some(2);
     assert!(matches!(
         super::canonical_transport::prepare_replenishment(&mismatch, &signer, input()),
-        Err(TransportError::Serialization(message)) if message.contains("authGeneration")
+        Err(TransportError::AuthGenerationMismatch {
+            expected: 2,
+            actual: 1
+        })
     ));
 }
 
@@ -442,4 +445,74 @@ fn uniffi_surface_parses_generated_json_before_preparing_wire_request() {
         prepared.path,
         "/xrpc/blue.catbird.chat.getConversations?limit=25&pageCursor=opaque-cursor"
     );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn signed_post_preparation_requires_exact_authenticated_generation() {
+    use openmls::prelude::SignatureScheme;
+    use openmls_basic_credential::SignatureKeyPair;
+
+    let signer = SignatureKeyPair::new(SignatureScheme::ED25519).expect("signer");
+    let auth = CleanChatAuthContext::new(
+        "Bearer gateway-token".into(),
+        "signed-dpop-proof".into(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        "11111111-1111-4111-8111-111111111111".into(),
+    )
+    .with_auth_generation(1);
+    let input = ReplenishKeyPackagesInput {
+        actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+        actor_device_id: auth.device_id.clone(),
+        auth_generation: 1,
+        idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+        key_id: derive_key_id(signer.public()),
+        dpop_jkt: auth.dpop_jkt.clone(),
+        signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+        key_packages: vec![key_package()],
+        signed_at: "2026-08-16T12:00:00.000Z".into(),
+    };
+    let signed = super::canonical_transport::prepare_replenishment(&auth, &signer, input)
+        .expect("signed generated request");
+    let generated: crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackages<
+        String,
+    > = serde_json::from_slice(signed.body.as_ref().expect("signed body"))
+        .expect("generated request parses");
+    let generated_json = serde_json::to_vec(&generated).expect("generated request JSON");
+    let request = CleanChatRequest::ReplenishKeyPackages(generated);
+
+    let missing_generation = CleanChatAuthContext {
+        auth_generation: None,
+        ..auth.clone()
+    };
+    assert!(matches!(
+        request.prepare(&missing_generation),
+        Err(TransportError::MissingAuthGeneration)
+    ));
+
+    let mismatched_generation = auth.clone().with_auth_generation(2);
+    assert!(matches!(
+        request.prepare(&mismatched_generation),
+        Err(TransportError::AuthGenerationMismatch {
+            expected: 2,
+            actual: 1
+        })
+    ));
+
+    let ffi_missing = super::canonical_transport::CleanChatAuthContextFfi {
+        authorization: missing_generation.authorization,
+        dpop_proof: missing_generation.dpop_proof,
+        dpop_jkt: missing_generation.dpop_jkt,
+        device_id: missing_generation.device_id,
+        auth_generation: None,
+    };
+    assert!(matches!(
+        super::canonical_transport::prepare_clean_chat_request(
+            ffi_missing,
+            super::canonical_transport::CleanChatOperationFfi::ReplenishKeyPackages,
+            generated_json,
+        ),
+        Err(super::canonical_transport::CleanChatTransportFfiError::InvalidRequest { message })
+            if message.contains("authGeneration")
+    ));
 }

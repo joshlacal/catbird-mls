@@ -125,6 +125,12 @@ pub enum TransportError {
     DeviceBindingMismatch { body: String, authenticated: String },
     #[error("signed body DPoP JKT does not match authenticated DPoP JKT")]
     DpopBindingMismatch,
+    #[error("signed clean-chat mutations require an authenticated authGeneration")]
+    MissingAuthGeneration,
+    #[error(
+        "signed body authGeneration {actual} does not match authenticated generation {expected}"
+    )]
+    AuthGenerationMismatch { expected: i64, actual: i64 },
     #[error("signed body domain is not the canonical key-package replenishment domain")]
     InvalidSignatureDomain,
     #[error("canonical signing transcript is empty")]
@@ -697,10 +703,14 @@ pub fn prepare_replenishment(
     signer: &SignatureKeyPair,
     input: ReplenishKeyPackagesInput,
 ) -> Result<PreparedRequest, TransportError> {
-    if auth.auth_generation != Some(input.auth_generation) {
-        return Err(TransportError::Serialization(
-            "replenishment authGeneration does not match authenticated context".into(),
-        ));
+    let expected = auth
+        .auth_generation
+        .ok_or(TransportError::MissingAuthGeneration)?;
+    if expected != input.auth_generation {
+        return Err(TransportError::AuthGenerationMismatch {
+            expected,
+            actual: input.auth_generation,
+        });
     }
     if input.dpop_jkt != auth.dpop_jkt || input.actor_device_id != auth.device_id {
         return Err(if input.dpop_jkt != auth.dpop_jkt {
@@ -1054,16 +1064,13 @@ fn validate_signed_request_context(
             return Err(TransportError::DpopBindingMismatch);
         }
     }
-    if let Some(expected) = auth_generation {
-        if body
-            .get("authGeneration")
-            .and_then(serde_json::Value::as_i64)
-            != Some(expected)
-        {
-            return Err(TransportError::Serialization(
-                "signed request authGeneration does not match authenticated context".into(),
-            ));
-        }
+    let actual = body
+        .get("authGeneration")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or(TransportError::MissingAuthGeneration)?;
+    let expected = auth_generation.ok_or(TransportError::MissingAuthGeneration)?;
+    if expected != actual {
+        return Err(TransportError::AuthGenerationMismatch { expected, actual });
     }
     Ok(())
 }
