@@ -7,17 +7,41 @@
 //! through the legacy `blue.catbird.mlsChat.*` surface.
 
 use crate::atproto::blue_catbird::chat::{
+    accept_conversation::AcceptConversationRequest,
+    acknowledge_welcome::AcknowledgeWelcomeRequest,
+    activate_reset::ActivateResetRequest,
+    cancel_leaf_recovery::CancelLeafRecoveryRequest,
+    cancel_leave::CancelLeaveRequest,
+    close_conversation::CloseConversationRequest,
     create_conversation::CreateConversationRequest,
+    delete_blob::DeleteBlobRequest,
     enroll_device::EnrollDeviceRequest,
+    get_blob::GetBlobRequest,
+    get_blob_usage::GetBlobUsageRequest,
+    get_conversation_state::GetConversationStateRequest,
     get_conversations::{GetConversations, GetConversationsRequest},
+    get_devices::GetDevicesRequest,
     get_entries::{GetEntries, GetEntriesRequest},
+    get_leaf_recovery_inbox::GetLeafRecoveryInboxRequest,
+    get_own_devices::GetOwnDevicesRequest,
+    get_pending_welcomes::GetPendingWelcomesRequest,
+    get_subscription_ticket::GetSubscriptionTicketRequest,
+    prepare_blob_upload::PrepareBlobUploadRequest,
+    publish_typing::PublishTypingRequest,
+    rebind_device_authentication::RebindDeviceAuthenticationRequest,
+    reject_welcome::RejectWelcomeRequest,
     replenish_key_packages::{ReplenishKeyPackages, ReplenishKeyPackagesRequest},
+    request_leaf_recovery::RequestLeafRecoveryRequest,
     request_leave::RequestLeaveRequest,
+    request_reset::RequestResetRequest,
+    revoke_device::RevokeDeviceRequest,
     send_message::SendMessageRequest,
     submit_transition::SubmitTransitionRequest,
+    subscribe_events::SubscribeEventsEndpoint,
+    upload_blob::UploadBlobRequest,
 };
 use crate::atproto::jacquard_common::deps::bytes::Bytes;
-use crate::atproto::jacquard_common::xrpc::XrpcEndpoint;
+use crate::atproto::jacquard_common::xrpc::{SubscriptionEndpoint, XrpcEndpoint};
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
@@ -131,6 +155,13 @@ pub enum TransportError {
         "signed body authGeneration {actual} does not match authenticated generation {expected}"
     )]
     AuthGenerationMismatch { expected: i64, actual: i64 },
+    #[error("device enrollment expectedAuthGeneration must be zero (actual {actual})")]
+    InvalidEnrollmentGeneration { actual: i64 },
+    #[error("clean-chat {operation:?} is not representable by this JSON transport: {reason}")]
+    UnsupportedOperation {
+        operation: CanonicalOperation,
+        reason: &'static str,
+    },
     #[error("signed body domain is not the canonical key-package replenishment domain")]
     InvalidSignatureDomain,
     #[error("canonical signing transcript is empty")]
@@ -159,95 +190,262 @@ pub enum TransportError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum CleanChatRequest {
+    AcceptConversation(AcceptConversationRequestBody),
+    AcknowledgeWelcome(AcknowledgeWelcomeRequestBody),
+    ActivateReset(ActivateResetRequestBody),
+    CancelLeafRecovery(CancelLeafRecoveryRequestBody),
+    CancelLeave(CancelLeaveRequestBody),
+    CloseConversation(CloseConversationRequestBody),
     GetConversations(GetConversations<String>),
     CreateConversation(CreateConversationRequestBody),
+    DeleteBlob(DeleteBlobRequestBody),
     SendMessage(SendMessageRequestBody),
+    GetBlob(GetBlobRequestBody),
+    GetBlobUsage(GetBlobUsageRequestBody),
+    GetConversationState(GetConversationStateRequestBody),
+    GetDevices(GetDevicesRequestBody),
     GetEntries(GetEntries<String>),
+    GetLeafRecoveryInbox(GetLeafRecoveryInboxRequestBody),
+    GetOwnDevices(GetOwnDevicesRequestBody),
+    GetPendingWelcomes(GetPendingWelcomesRequestBody),
+    GetSubscriptionTicket(GetSubscriptionTicketRequestBody),
+    PrepareBlobUpload(PrepareBlobUploadRequestBody),
+    PublishTyping(PublishTypingRequestBody),
+    RebindDeviceAuthentication(RebindDeviceAuthenticationRequestBody),
+    RejectWelcome(RejectWelcomeRequestBody),
     ReplenishKeyPackages(ReplenishKeyPackagesRequestBody),
+    RequestLeafRecovery(RequestLeafRecoveryRequestBody),
     EnrollDevice(EnrollDeviceRequestBody),
     RequestLeave(RequestLeaveRequestBody),
+    RequestReset(RequestResetRequestBody),
+    RevokeDevice(RevokeDeviceRequestBody),
     SubmitTransition(SubmitTransitionRequestBody),
+    SubscribeEvents(SubscribeEventsRequestBody),
+    UploadBlob(UploadBlobRequestBody),
 }
 
+pub type AcceptConversationRequestBody =
+    crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversation<String>;
+pub type AcknowledgeWelcomeRequestBody =
+    crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcome<String>;
+pub type ActivateResetRequestBody =
+    crate::atproto::blue_catbird::chat::activate_reset::ActivateReset<String>;
+pub type CancelLeafRecoveryRequestBody =
+    crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecovery<String>;
+pub type CancelLeaveRequestBody =
+    crate::atproto::blue_catbird::chat::cancel_leave::CancelLeave<String>;
+pub type CloseConversationRequestBody =
+    crate::atproto::blue_catbird::chat::close_conversation::CloseConversation<String>;
 pub type CreateConversationRequestBody =
     crate::atproto::blue_catbird::chat::create_conversation::CreateConversation<String>;
+pub type DeleteBlobRequestBody =
+    crate::atproto::blue_catbird::chat::delete_blob::DeleteBlob<String>;
 pub type SendMessageRequestBody =
     crate::atproto::blue_catbird::chat::send_message::SendMessage<String>;
+pub type GetBlobRequestBody = crate::atproto::blue_catbird::chat::get_blob::GetBlob<String>;
+pub type GetBlobUsageRequestBody = crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsage;
+pub type GetConversationStateRequestBody =
+    crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationState<String>;
+pub type GetDevicesRequestBody =
+    crate::atproto::blue_catbird::chat::get_devices::GetDevices<String>;
+pub type GetLeafRecoveryInboxRequestBody =
+    crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInbox<String>;
+pub type GetOwnDevicesRequestBody =
+    crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevices<String>;
+pub type GetPendingWelcomesRequestBody =
+    crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomes<String>;
+pub type GetSubscriptionTicketRequestBody =
+    crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicket<String>;
+pub type PrepareBlobUploadRequestBody =
+    crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUpload<String>;
+pub type PublishTypingRequestBody =
+    crate::atproto::blue_catbird::chat::publish_typing::PublishTyping<String>;
+pub type RebindDeviceAuthenticationRequestBody =
+    crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthentication<
+        String,
+    >;
+pub type RejectWelcomeRequestBody =
+    crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcome<String>;
 pub type ReplenishKeyPackagesRequestBody =
     crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackages<String>;
+pub type RequestLeafRecoveryRequestBody =
+    crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecovery<String>;
 pub type EnrollDeviceRequestBody =
     crate::atproto::blue_catbird::chat::enroll_device::EnrollDevice<String>;
 pub type RequestLeaveRequestBody =
     crate::atproto::blue_catbird::chat::request_leave::RequestLeave<String>;
+pub type RequestResetRequestBody =
+    crate::atproto::blue_catbird::chat::request_reset::RequestReset<String>;
+pub type RevokeDeviceRequestBody =
+    crate::atproto::blue_catbird::chat::revoke_device::RevokeDevice<String>;
 pub type SubmitTransitionRequestBody =
     crate::atproto::blue_catbird::chat::submit_transition::SubmitTransition<String>;
+pub type SubscribeEventsRequestBody =
+    crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEvents<String>;
+pub type UploadBlobRequestBody = crate::atproto::blue_catbird::chat::upload_blob::UploadBlob;
 
 /// A generated clean-chat success body, selected by the canonical operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum CleanChatResponse {
+    AcceptConversation(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>),
+    AcknowledgeWelcome(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeOutput<String>),
+    ActivateReset(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetOutput<String>),
+    CancelLeafRecovery(crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryOutput<String>),
+    CancelLeave(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveOutput<String>),
+    CloseConversation(crate::atproto::blue_catbird::chat::close_conversation::CloseConversationOutput<String>),
     GetConversations(
         crate::atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<String>,
     ),
     CreateConversation(
         crate::atproto::blue_catbird::chat::create_conversation::CreateConversationOutput<String>,
     ),
+    DeleteBlob(crate::atproto::blue_catbird::chat::delete_blob::DeleteBlobOutput<String>),
     SendMessage(crate::atproto::blue_catbird::chat::send_message::SendMessageOutput<String>),
+    GetBlob(crate::atproto::blue_catbird::chat::get_blob::GetBlobOutput),
+    GetBlobUsage(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageOutput<String>),
+    GetConversationState(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>),
+    GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>),
     GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>),
+    GetLeafRecoveryInbox(crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxOutput<String>),
+    GetOwnDevices(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>),
+    GetPendingWelcomes(crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutput<String>),
+    GetSubscriptionTicket(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketOutput<String>),
+    PrepareBlobUpload(crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadOutput<String>),
+    PublishTyping(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingOutput<String>),
+    RebindDeviceAuthentication(crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthenticationOutput<String>),
+    RejectWelcome(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeOutput<String>),
     ReplenishKeyPackages(
         crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesOutput<
             String,
         >,
     ),
+    RequestLeafRecovery(crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryOutput<String>),
     EnrollDevice(crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String>),
     RequestLeave(crate::atproto::blue_catbird::chat::request_leave::RequestLeaveOutput<String>),
+    RequestReset(crate::atproto::blue_catbird::chat::request_reset::RequestResetOutput<String>),
+    RevokeDevice(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceOutput<String>),
     SubmitTransition(
         crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput<String>,
     ),
+    SubscribeEvents(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage<String>),
+    UploadBlob(crate::atproto::blue_catbird::chat::upload_blob::UploadBlobOutput<String>),
 }
 
 /// A generated clean-chat error body, selected by the canonical operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanChatError {
+    AcceptConversation(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError),
+    AcknowledgeWelcome(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeError),
+    ActivateReset(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetError),
+    CancelLeafRecovery(crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryError),
+    CancelLeave(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveError),
+    CloseConversation(crate::atproto::blue_catbird::chat::close_conversation::CloseConversationError),
     GetConversations(crate::atproto::blue_catbird::chat::get_conversations::GetConversationsError),
     CreateConversation(
         crate::atproto::blue_catbird::chat::create_conversation::CreateConversationError,
     ),
+    DeleteBlob(crate::atproto::blue_catbird::chat::delete_blob::DeleteBlobError),
     SendMessage(crate::atproto::blue_catbird::chat::send_message::SendMessageError),
+    GetBlob(crate::atproto::blue_catbird::chat::get_blob::GetBlobError),
+    GetBlobUsage(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageError),
+    GetConversationState(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError),
+    GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError),
     GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesError),
+    GetLeafRecoveryInbox(crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxError),
+    GetOwnDevices(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesError),
+    GetPendingWelcomes(crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesError),
+    GetSubscriptionTicket(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketError),
+    PrepareBlobUpload(crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadError),
+    PublishTyping(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingError),
+    RebindDeviceAuthentication(crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthenticationError),
+    RejectWelcome(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeError),
     ReplenishKeyPackages(
         crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesError,
     ),
+    RequestLeafRecovery(crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryError),
     EnrollDevice(crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceError),
     RequestLeave(crate::atproto::blue_catbird::chat::request_leave::RequestLeaveError),
+    RequestReset(crate::atproto::blue_catbird::chat::request_reset::RequestResetError),
+    RevokeDevice(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceError),
     SubmitTransition(crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionError),
+    SubscribeEvents(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsError),
+    UploadBlob(crate::atproto::blue_catbird::chat::upload_blob::UploadBlobError),
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanChatOperationFfi {
+    AcceptConversation,
+    AcknowledgeWelcome,
+    ActivateReset,
+    CancelLeafRecovery,
+    CancelLeave,
+    CloseConversation,
     GetConversations,
     CreateConversation,
+    DeleteBlob,
     SendMessage,
+    GetBlob,
+    GetBlobUsage,
+    GetConversationState,
+    GetDevices,
     GetEntries,
+    GetLeafRecoveryInbox,
+    GetOwnDevices,
+    GetPendingWelcomes,
+    GetSubscriptionTicket,
+    PrepareBlobUpload,
+    PublishTyping,
+    RebindDeviceAuthentication,
+    RejectWelcome,
     ReplenishKeyPackages,
+    RequestLeafRecovery,
     EnrollDevice,
     RequestLeave,
+    RequestReset,
+    RevokeDevice,
     SubmitTransition,
+    SubscribeEvents,
+    UploadBlob,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl From<CleanChatOperationFfi> for CanonicalOperation {
     fn from(operation: CleanChatOperationFfi) -> Self {
         match operation {
+            CleanChatOperationFfi::AcceptConversation => Self::AcceptConversation,
+            CleanChatOperationFfi::AcknowledgeWelcome => Self::AcknowledgeWelcome,
+            CleanChatOperationFfi::ActivateReset => Self::ActivateReset,
+            CleanChatOperationFfi::CancelLeafRecovery => Self::CancelLeafRecovery,
+            CleanChatOperationFfi::CancelLeave => Self::CancelLeave,
+            CleanChatOperationFfi::CloseConversation => Self::CloseConversation,
             CleanChatOperationFfi::GetConversations => Self::GetConversations,
             CleanChatOperationFfi::CreateConversation => Self::CreateConversation,
+            CleanChatOperationFfi::DeleteBlob => Self::DeleteBlob,
             CleanChatOperationFfi::SendMessage => Self::SendMessage,
+            CleanChatOperationFfi::GetBlob => Self::GetBlob,
+            CleanChatOperationFfi::GetBlobUsage => Self::GetBlobUsage,
+            CleanChatOperationFfi::GetConversationState => Self::GetConversationState,
+            CleanChatOperationFfi::GetDevices => Self::GetDevices,
             CleanChatOperationFfi::GetEntries => Self::GetEntries,
+            CleanChatOperationFfi::GetLeafRecoveryInbox => Self::GetLeafRecoveryInbox,
+            CleanChatOperationFfi::GetOwnDevices => Self::GetOwnDevices,
+            CleanChatOperationFfi::GetPendingWelcomes => Self::GetPendingWelcomes,
+            CleanChatOperationFfi::GetSubscriptionTicket => Self::GetSubscriptionTicket,
+            CleanChatOperationFfi::PrepareBlobUpload => Self::PrepareBlobUpload,
+            CleanChatOperationFfi::PublishTyping => Self::PublishTyping,
+            CleanChatOperationFfi::RebindDeviceAuthentication => Self::RebindDeviceAuthentication,
+            CleanChatOperationFfi::RejectWelcome => Self::RejectWelcome,
             CleanChatOperationFfi::ReplenishKeyPackages => Self::ReplenishKeyPackages,
+            CleanChatOperationFfi::RequestLeafRecovery => Self::RequestLeafRecovery,
             CleanChatOperationFfi::EnrollDevice => Self::EnrollDevice,
             CleanChatOperationFfi::RequestLeave => Self::RequestLeave,
+            CleanChatOperationFfi::RequestReset => Self::RequestReset,
+            CleanChatOperationFfi::RevokeDevice => Self::RevokeDevice,
             CleanChatOperationFfi::SubmitTransition => Self::SubmitTransition,
+            CleanChatOperationFfi::SubscribeEvents => Self::SubscribeEvents,
+            CleanChatOperationFfi::UploadBlob => Self::UploadBlob,
         }
     }
 }
@@ -256,14 +454,38 @@ impl From<CleanChatOperationFfi> for CanonicalOperation {
 impl From<CanonicalOperation> for CleanChatOperationFfi {
     fn from(operation: CanonicalOperation) -> Self {
         match operation {
+            CanonicalOperation::AcceptConversation => Self::AcceptConversation,
+            CanonicalOperation::AcknowledgeWelcome => Self::AcknowledgeWelcome,
+            CanonicalOperation::ActivateReset => Self::ActivateReset,
+            CanonicalOperation::CancelLeafRecovery => Self::CancelLeafRecovery,
+            CanonicalOperation::CancelLeave => Self::CancelLeave,
+            CanonicalOperation::CloseConversation => Self::CloseConversation,
             CanonicalOperation::GetConversations => Self::GetConversations,
             CanonicalOperation::CreateConversation => Self::CreateConversation,
+            CanonicalOperation::DeleteBlob => Self::DeleteBlob,
             CanonicalOperation::SendMessage => Self::SendMessage,
+            CanonicalOperation::GetBlob => Self::GetBlob,
+            CanonicalOperation::GetBlobUsage => Self::GetBlobUsage,
+            CanonicalOperation::GetConversationState => Self::GetConversationState,
+            CanonicalOperation::GetDevices => Self::GetDevices,
             CanonicalOperation::GetEntries => Self::GetEntries,
+            CanonicalOperation::GetLeafRecoveryInbox => Self::GetLeafRecoveryInbox,
+            CanonicalOperation::GetOwnDevices => Self::GetOwnDevices,
+            CanonicalOperation::GetPendingWelcomes => Self::GetPendingWelcomes,
+            CanonicalOperation::GetSubscriptionTicket => Self::GetSubscriptionTicket,
+            CanonicalOperation::PrepareBlobUpload => Self::PrepareBlobUpload,
+            CanonicalOperation::PublishTyping => Self::PublishTyping,
+            CanonicalOperation::RebindDeviceAuthentication => Self::RebindDeviceAuthentication,
+            CanonicalOperation::RejectWelcome => Self::RejectWelcome,
             CanonicalOperation::ReplenishKeyPackages => Self::ReplenishKeyPackages,
+            CanonicalOperation::RequestLeafRecovery => Self::RequestLeafRecovery,
             CanonicalOperation::EnrollDevice => Self::EnrollDevice,
             CanonicalOperation::RequestLeave => Self::RequestLeave,
+            CanonicalOperation::RequestReset => Self::RequestReset,
+            CanonicalOperation::RevokeDevice => Self::RevokeDevice,
             CanonicalOperation::SubmitTransition => Self::SubmitTransition,
+            CanonicalOperation::SubscribeEvents => Self::SubscribeEvents,
+            CanonicalOperation::UploadBlob => Self::UploadBlob,
         }
     }
 }
@@ -333,20 +555,67 @@ fn parse_ffi_request(
         };
     }
     match operation {
+        CanonicalOperation::AcceptConversation => {
+            parse!(AcceptConversationRequestBody, AcceptConversation)
+        }
+        CanonicalOperation::AcknowledgeWelcome => {
+            parse!(AcknowledgeWelcomeRequestBody, AcknowledgeWelcome)
+        }
+        CanonicalOperation::ActivateReset => parse!(ActivateResetRequestBody, ActivateReset),
+        CanonicalOperation::CancelLeafRecovery => {
+            parse!(CancelLeafRecoveryRequestBody, CancelLeafRecovery)
+        }
+        CanonicalOperation::CancelLeave => parse!(CancelLeaveRequestBody, CancelLeave),
+        CanonicalOperation::CloseConversation => {
+            parse!(CloseConversationRequestBody, CloseConversation)
+        }
         CanonicalOperation::GetConversations => parse!(GetConversations<String>, GetConversations),
         CanonicalOperation::CreateConversation => {
             parse!(CreateConversationRequestBody, CreateConversation)
         }
+        CanonicalOperation::DeleteBlob => parse!(DeleteBlobRequestBody, DeleteBlob),
         CanonicalOperation::SendMessage => parse!(SendMessageRequestBody, SendMessage),
+        CanonicalOperation::GetBlob => parse!(GetBlobRequestBody, GetBlob),
+        CanonicalOperation::GetBlobUsage => parse!(GetBlobUsageRequestBody, GetBlobUsage),
+        CanonicalOperation::GetConversationState => {
+            parse!(GetConversationStateRequestBody, GetConversationState)
+        }
+        CanonicalOperation::GetDevices => parse!(GetDevicesRequestBody, GetDevices),
         CanonicalOperation::GetEntries => parse!(GetEntries<String>, GetEntries),
+        CanonicalOperation::GetLeafRecoveryInbox => {
+            parse!(GetLeafRecoveryInboxRequestBody, GetLeafRecoveryInbox)
+        }
+        CanonicalOperation::GetOwnDevices => parse!(GetOwnDevicesRequestBody, GetOwnDevices),
+        CanonicalOperation::GetPendingWelcomes => {
+            parse!(GetPendingWelcomesRequestBody, GetPendingWelcomes)
+        }
+        CanonicalOperation::GetSubscriptionTicket => {
+            parse!(GetSubscriptionTicketRequestBody, GetSubscriptionTicket)
+        }
+        CanonicalOperation::PrepareBlobUpload => {
+            parse!(PrepareBlobUploadRequestBody, PrepareBlobUpload)
+        }
+        CanonicalOperation::PublishTyping => parse!(PublishTypingRequestBody, PublishTyping),
+        CanonicalOperation::RebindDeviceAuthentication => parse!(
+            RebindDeviceAuthenticationRequestBody,
+            RebindDeviceAuthentication
+        ),
+        CanonicalOperation::RejectWelcome => parse!(RejectWelcomeRequestBody, RejectWelcome),
         CanonicalOperation::ReplenishKeyPackages => {
             parse!(ReplenishKeyPackagesRequestBody, ReplenishKeyPackages)
         }
+        CanonicalOperation::RequestLeafRecovery => {
+            parse!(RequestLeafRecoveryRequestBody, RequestLeafRecovery)
+        }
         CanonicalOperation::EnrollDevice => parse!(EnrollDeviceRequestBody, EnrollDevice),
         CanonicalOperation::RequestLeave => parse!(RequestLeaveRequestBody, RequestLeave),
+        CanonicalOperation::RequestReset => parse!(RequestResetRequestBody, RequestReset),
+        CanonicalOperation::RevokeDevice => parse!(RevokeDeviceRequestBody, RevokeDevice),
         CanonicalOperation::SubmitTransition => {
             parse!(SubmitTransitionRequestBody, SubmitTransition)
         }
+        CanonicalOperation::SubscribeEvents => parse!(SubscribeEventsRequestBody, SubscribeEvents),
+        CanonicalOperation::UploadBlob => parse!(UploadBlobRequestBody, UploadBlob),
     }
 }
 
@@ -383,18 +652,64 @@ pub fn decode_clean_chat_response(
     let response =
         CleanChatResponse::decode(operation.into(), &response_json).map_err(ffi_error)?;
     match response {
+        CleanChatResponse::AcceptConversation(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::AcknowledgeWelcome(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::ActivateReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::CancelLeafRecovery(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::CancelLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::CloseConversation(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::GetConversations(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::CreateConversation(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
         }
+        CleanChatResponse::DeleteBlob(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::SendMessage(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetBlob(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetBlobUsage(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetConversationState(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::GetDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetLeafRecoveryInbox(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::GetOwnDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetPendingWelcomes(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::GetSubscriptionTicket(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::PrepareBlobUpload(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::PublishTyping(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::RebindDeviceAuthentication(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::RejectWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::ReplenishKeyPackages(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::RequestLeafRecovery(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::EnrollDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::RequestLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::RequestReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::RevokeDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::SubmitTransition(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::SubscribeEvents(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::UploadBlob(value) => serde_json::to_vec(&value).map_err(ffi_error),
     }
 }
 
@@ -408,30 +723,86 @@ pub fn decode_clean_chat_error(
 ) -> Result<Vec<u8>, CleanChatTransportFfiError> {
     let error = CleanChatError::decode(operation.into(), &error_json).map_err(ffi_error)?;
     match error {
+        CleanChatError::AcceptConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::AcknowledgeWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::ActivateReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::CancelLeafRecovery(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::CancelLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::CloseConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::GetConversations(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::CreateConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::DeleteBlob(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::SendMessage(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetBlob(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetBlobUsage(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetConversationState(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::GetDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetLeafRecoveryInbox(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::GetOwnDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetPendingWelcomes(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetSubscriptionTicket(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::PrepareBlobUpload(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::PublishTyping(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::RebindDeviceAuthentication(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::RejectWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::ReplenishKeyPackages(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
         }
+        CleanChatError::RequestLeafRecovery(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::EnrollDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::RequestLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::RequestReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::RevokeDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::SubmitTransition(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::SubscribeEvents(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::UploadBlob(value) => serde_json::to_vec(&value).map_err(ffi_error),
     }
 }
 
 impl CleanChatRequest {
     pub fn operation(&self) -> CanonicalOperation {
         match self {
+            Self::AcceptConversation(_) => CanonicalOperation::AcceptConversation,
+            Self::AcknowledgeWelcome(_) => CanonicalOperation::AcknowledgeWelcome,
+            Self::ActivateReset(_) => CanonicalOperation::ActivateReset,
+            Self::CancelLeafRecovery(_) => CanonicalOperation::CancelLeafRecovery,
+            Self::CancelLeave(_) => CanonicalOperation::CancelLeave,
+            Self::CloseConversation(_) => CanonicalOperation::CloseConversation,
             Self::GetConversations(_) => CanonicalOperation::GetConversations,
             Self::CreateConversation(_) => CanonicalOperation::CreateConversation,
+            Self::DeleteBlob(_) => CanonicalOperation::DeleteBlob,
             Self::SendMessage(_) => CanonicalOperation::SendMessage,
+            Self::GetBlob(_) => CanonicalOperation::GetBlob,
+            Self::GetBlobUsage(_) => CanonicalOperation::GetBlobUsage,
+            Self::GetConversationState(_) => CanonicalOperation::GetConversationState,
+            Self::GetDevices(_) => CanonicalOperation::GetDevices,
             Self::GetEntries(_) => CanonicalOperation::GetEntries,
+            Self::GetLeafRecoveryInbox(_) => CanonicalOperation::GetLeafRecoveryInbox,
+            Self::GetOwnDevices(_) => CanonicalOperation::GetOwnDevices,
+            Self::GetPendingWelcomes(_) => CanonicalOperation::GetPendingWelcomes,
+            Self::GetSubscriptionTicket(_) => CanonicalOperation::GetSubscriptionTicket,
+            Self::PrepareBlobUpload(_) => CanonicalOperation::PrepareBlobUpload,
+            Self::PublishTyping(_) => CanonicalOperation::PublishTyping,
+            Self::RebindDeviceAuthentication(_) => CanonicalOperation::RebindDeviceAuthentication,
+            Self::RejectWelcome(_) => CanonicalOperation::RejectWelcome,
             Self::ReplenishKeyPackages(_) => CanonicalOperation::ReplenishKeyPackages,
+            Self::RequestLeafRecovery(_) => CanonicalOperation::RequestLeafRecovery,
             Self::EnrollDevice(_) => CanonicalOperation::EnrollDevice,
             Self::RequestLeave(_) => CanonicalOperation::RequestLeave,
+            Self::RequestReset(_) => CanonicalOperation::RequestReset,
+            Self::RevokeDevice(_) => CanonicalOperation::RevokeDevice,
             Self::SubmitTransition(_) => CanonicalOperation::SubmitTransition,
+            Self::SubscribeEvents(_) => CanonicalOperation::SubscribeEvents,
+            Self::UploadBlob(_) => CanonicalOperation::UploadBlob,
         }
     }
 
@@ -440,45 +811,48 @@ impl CleanChatRequest {
     pub fn prepare(&self, auth: &CleanChatAuthContext) -> Result<PreparedRequest, TransportError> {
         let internal = auth.as_internal();
         match self {
-            Self::GetConversations(request) => {
-                let value = serde_json::to_value(request)
-                    .map_err(|error| TransportError::Serialization(error.to_string()))?;
-                let mut query = format!("limit={}", value["limit"]);
-                if let Some(cursor) = value["pageCursor"].as_str() {
-                    query.push_str("&pageCursor=");
-                    query.push_str(&encode_query(cursor));
-                }
-                read_request(&internal, self.operation(), query)
-            }
-            Self::GetEntries(request) => {
-                let value = serde_json::to_value(request)
-                    .map_err(|error| TransportError::Serialization(error.to_string()))?;
-                let query = format!(
-                    "afterSeq={}&conversationId={}&limit={}",
-                    value["afterSeq"],
-                    encode_query(value["conversationId"].as_str().unwrap_or_default()),
-                    value["limit"]
-                );
-                read_request(&internal, self.operation(), query)
-            }
+            Self::GetConversations(request) => query_request(&internal, self.operation(), request),
+            Self::GetBlob(request) => query_request(&internal, self.operation(), request),
+            Self::GetBlobUsage(request) => query_request(&internal, self.operation(), request),
+            Self::GetConversationState(request) => query_request(&internal, self.operation(), request),
+            Self::GetDevices(request) => query_request(&internal, self.operation(), request),
+            Self::GetEntries(request) => query_request(&internal, self.operation(), request),
+            Self::GetLeafRecoveryInbox(request) => query_request(&internal, self.operation(), request),
+            Self::GetOwnDevices(request) => query_request(&internal, self.operation(), request),
+            Self::GetPendingWelcomes(request) => query_request(&internal, self.operation(), request),
+            Self::UploadBlob(_) => Err(TransportError::UnsupportedOperation {
+                operation: self.operation(),
+                reason: "uploadBlob uses an octet-stream body and upload-ticket query; use the platform blob transport",
+            }),
+            Self::SubscribeEvents(_) => Err(TransportError::UnsupportedOperation {
+                operation: self.operation(),
+                reason: "subscribeEvents is a WebSocket subscription; use the platform streaming adapter",
+            }),
+            Self::AcceptConversation(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::AcknowledgeWelcome(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::ActivateReset(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::CancelLeafRecovery(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::CancelLeave(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::CloseConversation(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::CreateConversation(request) => {
                 prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
             }
+            Self::DeleteBlob(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::SendMessage(request) => {
                 prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
             }
-            Self::ReplenishKeyPackages(request) => {
-                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
-            }
-            Self::EnrollDevice(request) => {
-                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
-            }
-            Self::RequestLeave(request) => {
-                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
-            }
-            Self::SubmitTransition(request) => {
-                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
-            }
+            Self::PrepareBlobUpload(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::PublishTyping(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::GetSubscriptionTicket(request) => prepare_unsigned_json_request(&internal, self.operation(), request),
+            Self::RebindDeviceAuthentication(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::RejectWelcome(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::ReplenishKeyPackages(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::RequestLeafRecovery(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::EnrollDevice(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::RequestLeave(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::RequestReset(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::RevokeDevice(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::SubmitTransition(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
         }
     }
 }
@@ -494,6 +868,12 @@ impl CleanChatResponse {
             };
         }
         match operation {
+            CanonicalOperation::AcceptConversation => decode!(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>, AcceptConversation),
+            CanonicalOperation::AcknowledgeWelcome => decode!(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeOutput<String>, AcknowledgeWelcome),
+            CanonicalOperation::ActivateReset => decode!(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetOutput<String>, ActivateReset),
+            CanonicalOperation::CancelLeafRecovery => decode!(crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryOutput<String>, CancelLeafRecovery),
+            CanonicalOperation::CancelLeave => decode!(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveOutput<String>, CancelLeave),
+            CanonicalOperation::CloseConversation => decode!(crate::atproto::blue_catbird::chat::close_conversation::CloseConversationOutput<String>, CloseConversation),
             CanonicalOperation::GetConversations => decode!(
                 crate::atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<
                     String
@@ -506,20 +886,34 @@ impl CleanChatResponse {
                 >,
                 CreateConversation
             ),
+            CanonicalOperation::DeleteBlob => decode!(crate::atproto::blue_catbird::chat::delete_blob::DeleteBlobOutput<String>, DeleteBlob),
             CanonicalOperation::SendMessage => decode!(
                 crate::atproto::blue_catbird::chat::send_message::SendMessageOutput<String>,
                 SendMessage
             ),
+            CanonicalOperation::GetBlob => decode!(crate::atproto::blue_catbird::chat::get_blob::GetBlobOutput, GetBlob),
+            CanonicalOperation::GetBlobUsage => decode!(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageOutput<String>, GetBlobUsage),
+            CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>, GetConversationState),
+            CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>, GetDevices),
             CanonicalOperation::GetEntries => decode!(
                 crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>,
                 GetEntries
             ),
+            CanonicalOperation::GetLeafRecoveryInbox => decode!(crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxOutput<String>, GetLeafRecoveryInbox),
+            CanonicalOperation::GetOwnDevices => decode!(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>, GetOwnDevices),
+            CanonicalOperation::GetPendingWelcomes => decode!(crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutput<String>, GetPendingWelcomes),
+            CanonicalOperation::GetSubscriptionTicket => decode!(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketOutput<String>, GetSubscriptionTicket),
+            CanonicalOperation::PrepareBlobUpload => decode!(crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadOutput<String>, PrepareBlobUpload),
+            CanonicalOperation::PublishTyping => decode!(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingOutput<String>, PublishTyping),
+            CanonicalOperation::RebindDeviceAuthentication => decode!(crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthenticationOutput<String>, RebindDeviceAuthentication),
+            CanonicalOperation::RejectWelcome => decode!(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeOutput<String>, RejectWelcome),
             CanonicalOperation::ReplenishKeyPackages => decode!(
                 crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesOutput<
                     String
                 >,
                 ReplenishKeyPackages
             ),
+            CanonicalOperation::RequestLeafRecovery => decode!(crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryOutput<String>, RequestLeafRecovery),
             CanonicalOperation::EnrollDevice => decode!(
                 crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String>,
                 EnrollDevice
@@ -528,12 +922,16 @@ impl CleanChatResponse {
                 crate::atproto::blue_catbird::chat::request_leave::RequestLeaveOutput<String>,
                 RequestLeave
             ),
+            CanonicalOperation::RequestReset => decode!(crate::atproto::blue_catbird::chat::request_reset::RequestResetOutput<String>, RequestReset),
+            CanonicalOperation::RevokeDevice => decode!(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceOutput<String>, RevokeDevice),
             CanonicalOperation::SubmitTransition => decode!(
                 crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput<
                     String
                 >,
                 SubmitTransition
             ),
+            CanonicalOperation::SubscribeEvents => decode!(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage<String>, SubscribeEvents),
+            CanonicalOperation::UploadBlob => decode!(crate::atproto::blue_catbird::chat::upload_blob::UploadBlobOutput<String>, UploadBlob),
         }
     }
 }
@@ -549,6 +947,12 @@ impl CleanChatError {
             };
         }
         match operation {
+            CanonicalOperation::AcceptConversation => decode!(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError, AcceptConversation),
+            CanonicalOperation::AcknowledgeWelcome => decode!(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeError, AcknowledgeWelcome),
+            CanonicalOperation::ActivateReset => decode!(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetError, ActivateReset),
+            CanonicalOperation::CancelLeafRecovery => decode!(crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryError, CancelLeafRecovery),
+            CanonicalOperation::CancelLeave => decode!(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveError, CancelLeave),
+            CanonicalOperation::CloseConversation => decode!(crate::atproto::blue_catbird::chat::close_conversation::CloseConversationError, CloseConversation),
             CanonicalOperation::GetConversations => decode!(
                 crate::atproto::blue_catbird::chat::get_conversations::GetConversationsError,
                 GetConversations
@@ -557,18 +961,32 @@ impl CleanChatError {
                 crate::atproto::blue_catbird::chat::create_conversation::CreateConversationError,
                 CreateConversation
             ),
+            CanonicalOperation::DeleteBlob => decode!(crate::atproto::blue_catbird::chat::delete_blob::DeleteBlobError, DeleteBlob),
             CanonicalOperation::SendMessage => decode!(
                 crate::atproto::blue_catbird::chat::send_message::SendMessageError,
                 SendMessage
             ),
+            CanonicalOperation::GetBlob => decode!(crate::atproto::blue_catbird::chat::get_blob::GetBlobError, GetBlob),
+            CanonicalOperation::GetBlobUsage => decode!(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageError, GetBlobUsage),
+            CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError, GetConversationState),
+            CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError, GetDevices),
             CanonicalOperation::GetEntries => decode!(
                 crate::atproto::blue_catbird::chat::get_entries::GetEntriesError,
                 GetEntries
             ),
+            CanonicalOperation::GetLeafRecoveryInbox => decode!(crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxError, GetLeafRecoveryInbox),
+            CanonicalOperation::GetOwnDevices => decode!(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesError, GetOwnDevices),
+            CanonicalOperation::GetPendingWelcomes => decode!(crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesError, GetPendingWelcomes),
+            CanonicalOperation::GetSubscriptionTicket => decode!(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketError, GetSubscriptionTicket),
+            CanonicalOperation::PrepareBlobUpload => decode!(crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadError, PrepareBlobUpload),
+            CanonicalOperation::PublishTyping => decode!(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingError, PublishTyping),
+            CanonicalOperation::RebindDeviceAuthentication => decode!(crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthenticationError, RebindDeviceAuthentication),
+            CanonicalOperation::RejectWelcome => decode!(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeError, RejectWelcome),
             CanonicalOperation::ReplenishKeyPackages => decode!(
                 crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesError,
                 ReplenishKeyPackages
             ),
+            CanonicalOperation::RequestLeafRecovery => decode!(crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryError, RequestLeafRecovery),
             CanonicalOperation::EnrollDevice => decode!(
                 crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceError,
                 EnrollDevice
@@ -577,10 +995,14 @@ impl CleanChatError {
                 crate::atproto::blue_catbird::chat::request_leave::RequestLeaveError,
                 RequestLeave
             ),
+            CanonicalOperation::RequestReset => decode!(crate::atproto::blue_catbird::chat::request_reset::RequestResetError, RequestReset),
+            CanonicalOperation::RevokeDevice => decode!(crate::atproto::blue_catbird::chat::revoke_device::RevokeDeviceError, RevokeDevice),
             CanonicalOperation::SubmitTransition => decode!(
                 crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionError,
                 SubmitTransition
             ),
+            CanonicalOperation::SubscribeEvents => decode!(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsError, SubscribeEvents),
+            CanonicalOperation::UploadBlob => decode!(crate::atproto::blue_catbird::chat::upload_blob::UploadBlobError, UploadBlob),
         }
     }
 }
@@ -589,7 +1011,11 @@ impl CleanChatError {
 /// API error. Unknown codes remain visible and non-retryable until their
 /// lexicon contract is explicitly added.
 pub fn map_wire_error(operation: CanonicalOperation, code: &str) -> TransportError {
-    let retryable = matches!(code, "CursorExpired" | "AuthenticationGenerationConflict");
+    // A generation conflict means the caller's device/auth binding is stale.
+    // Replaying the same signed mutation would be unsafe; the platform must
+    // rebind or refresh its authenticated context before constructing a new
+    // request. Cursor expiry is the only safe transparent retry.
+    let retryable = matches!(code, "CursorExpired");
     TransportError::Remote {
         operation,
         code: code.to_owned(),
@@ -1021,6 +1447,7 @@ fn prepare_json_request<T: Serialize>(
     validate_signed_request_context(
         auth,
         auth_generation,
+        operation,
         &serde_json::from_slice(&body)
             .map_err(|error| TransportError::Serialization(error.to_string()))?,
     )?;
@@ -1034,9 +1461,26 @@ fn prepare_json_request<T: Serialize>(
     })
 }
 
-fn validate_signed_request_context(
+fn prepare_unsigned_json_request<T: Serialize>(
+    auth: &TransportAuth,
+    operation: CanonicalOperation,
+    request: &T,
+) -> Result<PreparedRequest, TransportError> {
+    auth.validate()?;
+    Ok(PreparedRequest {
+        operation,
+        method: "POST".into(),
+        path: canonical_route(operation).path.to_owned(),
+        authorization: auth.authorization.clone(),
+        dpop: auth.dpop_proof.clone(),
+        body: Some(serialize_json(request)?),
+    })
+}
+
+pub(crate) fn validate_signed_request_context(
     auth: &TransportAuth,
     auth_generation: Option<i64>,
+    operation: CanonicalOperation,
     value: &serde_json::Value,
 ) -> Result<(), TransportError> {
     let Some(body) = value
@@ -1047,6 +1491,41 @@ fn validate_signed_request_context(
             "clean-chat signed request is missing signedRequest.body".into(),
         ));
     };
+    if operation == CanonicalOperation::EnrollDevice {
+        let device = body
+            .get("deviceId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                TransportError::Serialization("enrollment body is missing deviceId".into())
+            })?;
+        if device != auth.device_id {
+            return Err(TransportError::DeviceBindingMismatch {
+                body: device.to_owned(),
+                authenticated: auth.device_id.clone(),
+            });
+        }
+        let jkt = body
+            .get("dpopJkt")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                TransportError::Serialization("enrollment body is missing dpopJkt".into())
+            })?;
+        if jkt != auth.dpop_jkt {
+            return Err(TransportError::DpopBindingMismatch);
+        }
+        let expected = body
+            .get("expectedAuthGeneration")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                TransportError::Serialization(
+                    "enrollment body is missing expectedAuthGeneration".into(),
+                )
+            })?;
+        if expected != 0 {
+            return Err(TransportError::InvalidEnrollmentGeneration { actual: expected });
+        }
+        return Ok(());
+    }
     if let Some(device) = body
         .get("actorDeviceId")
         .or_else(|| body.get("deviceId"))
@@ -1085,6 +1564,42 @@ fn encode_query(value: &str) -> String {
             _ => format!("%{byte:02X}").chars().collect(),
         })
         .collect()
+}
+
+fn query_request<T: Serialize>(
+    auth: &TransportAuth,
+    operation: CanonicalOperation,
+    request: &T,
+) -> Result<PreparedRequest, TransportError> {
+    let value = serde_json::to_value(request)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let object = value.as_object().ok_or_else(|| {
+        TransportError::Serialization("generated query request is not an object".into())
+    })?;
+    let mut fields = Vec::new();
+    for (key, value) in object {
+        if key == "$type" {
+            continue;
+        }
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    fields.push(format_query_field(key, value));
+                }
+            }
+            serde_json::Value::Null => {}
+            value => fields.push(format_query_field(key, value)),
+        }
+    }
+    read_request(auth, operation, fields.join("&"))
+}
+
+fn format_query_field(key: &str, value: &serde_json::Value) -> String {
+    let value = match value {
+        serde_json::Value::String(value) => value.clone(),
+        _ => value.to_string(),
+    };
+    format!("{}={}", encode_query(key), encode_query(&value))
 }
 
 fn read_request(
@@ -1170,29 +1685,84 @@ pub fn prepare_get_entries(
 }
 
 /// Canonical operations with a generated `blue.catbird.chat.*` endpoint.
+///
+/// This inventory mirrors every generated `blue_catbird::chat` endpoint,
+/// including the feature-gated subscription endpoint. `subscribeEvents` and
+/// `uploadBlob` are represented and decoded through generated DTOs, but their
+/// actual streaming/octet-stream exchange is intentionally returned as a
+/// typed `UnsupportedOperation` by [`CleanChatRequest::prepare`]. Platform
+/// adapters must execute those two media-specific transports themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalOperation {
+    AcceptConversation,
+    AcknowledgeWelcome,
+    ActivateReset,
+    CancelLeafRecovery,
+    CancelLeave,
+    CloseConversation,
     GetConversations,
     CreateConversation,
+    DeleteBlob,
     SendMessage,
+    GetBlob,
+    GetBlobUsage,
+    GetConversationState,
+    GetDevices,
     GetEntries,
+    GetLeafRecoveryInbox,
+    GetOwnDevices,
+    GetPendingWelcomes,
+    GetSubscriptionTicket,
+    PrepareBlobUpload,
+    PublishTyping,
+    RebindDeviceAuthentication,
+    RejectWelcome,
     ReplenishKeyPackages,
+    RequestLeafRecovery,
     EnrollDevice,
     RequestLeave,
+    RequestReset,
+    RevokeDevice,
     SubmitTransition,
+    SubscribeEvents,
+    UploadBlob,
 }
 
 impl CanonicalOperation {
     /// Every operation in the route inventory.
     pub const ALL: &'static [Self] = &[
+        Self::AcceptConversation,
+        Self::AcknowledgeWelcome,
+        Self::ActivateReset,
+        Self::CancelLeafRecovery,
+        Self::CancelLeave,
+        Self::CloseConversation,
         Self::GetConversations,
         Self::CreateConversation,
+        Self::DeleteBlob,
         Self::SendMessage,
+        Self::GetBlob,
+        Self::GetBlobUsage,
+        Self::GetConversationState,
+        Self::GetDevices,
         Self::GetEntries,
+        Self::GetLeafRecoveryInbox,
+        Self::GetOwnDevices,
+        Self::GetPendingWelcomes,
+        Self::GetSubscriptionTicket,
+        Self::PrepareBlobUpload,
+        Self::PublishTyping,
+        Self::RebindDeviceAuthentication,
+        Self::RejectWelcome,
         Self::ReplenishKeyPackages,
+        Self::RequestLeafRecovery,
         Self::EnrollDevice,
         Self::RequestLeave,
+        Self::RequestReset,
+        Self::RevokeDevice,
         Self::SubmitTransition,
+        Self::SubscribeEvents,
+        Self::UploadBlob,
     ];
 
     pub fn route(self) -> CanonicalRoute {
@@ -1225,14 +1795,40 @@ fn route(path: &'static str) -> CanonicalRoute {
 /// Resolve an operation through the generated canonical endpoint marker.
 pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
     match operation {
+        CanonicalOperation::AcceptConversation => route(AcceptConversationRequest::PATH),
+        CanonicalOperation::AcknowledgeWelcome => route(AcknowledgeWelcomeRequest::PATH),
+        CanonicalOperation::ActivateReset => route(ActivateResetRequest::PATH),
+        CanonicalOperation::CancelLeafRecovery => route(CancelLeafRecoveryRequest::PATH),
+        CanonicalOperation::CancelLeave => route(CancelLeaveRequest::PATH),
+        CanonicalOperation::CloseConversation => route(CloseConversationRequest::PATH),
         CanonicalOperation::GetConversations => route(GetConversationsRequest::PATH),
         CanonicalOperation::CreateConversation => route(CreateConversationRequest::PATH),
+        CanonicalOperation::DeleteBlob => route(DeleteBlobRequest::PATH),
         CanonicalOperation::SendMessage => route(SendMessageRequest::PATH),
+        CanonicalOperation::GetBlob => route(GetBlobRequest::PATH),
+        CanonicalOperation::GetBlobUsage => route(GetBlobUsageRequest::PATH),
+        CanonicalOperation::GetConversationState => route(GetConversationStateRequest::PATH),
+        CanonicalOperation::GetDevices => route(GetDevicesRequest::PATH),
         CanonicalOperation::GetEntries => route(GetEntriesRequest::PATH),
+        CanonicalOperation::GetLeafRecoveryInbox => route(GetLeafRecoveryInboxRequest::PATH),
+        CanonicalOperation::GetOwnDevices => route(GetOwnDevicesRequest::PATH),
+        CanonicalOperation::GetPendingWelcomes => route(GetPendingWelcomesRequest::PATH),
+        CanonicalOperation::GetSubscriptionTicket => route(GetSubscriptionTicketRequest::PATH),
+        CanonicalOperation::PrepareBlobUpload => route(PrepareBlobUploadRequest::PATH),
+        CanonicalOperation::PublishTyping => route(PublishTypingRequest::PATH),
+        CanonicalOperation::RebindDeviceAuthentication => {
+            route(RebindDeviceAuthenticationRequest::PATH)
+        }
+        CanonicalOperation::RejectWelcome => route(RejectWelcomeRequest::PATH),
         CanonicalOperation::ReplenishKeyPackages => route(ReplenishKeyPackagesRequest::PATH),
+        CanonicalOperation::RequestLeafRecovery => route(RequestLeafRecoveryRequest::PATH),
         CanonicalOperation::EnrollDevice => route(EnrollDeviceRequest::PATH),
         CanonicalOperation::RequestLeave => route(RequestLeaveRequest::PATH),
+        CanonicalOperation::RequestReset => route(RequestResetRequest::PATH),
+        CanonicalOperation::RevokeDevice => route(RevokeDeviceRequest::PATH),
         CanonicalOperation::SubmitTransition => route(SubmitTransitionRequest::PATH),
+        CanonicalOperation::SubscribeEvents => route(SubscribeEventsEndpoint::PATH),
+        CanonicalOperation::UploadBlob => route(UploadBlobRequest::PATH),
     }
 }
 

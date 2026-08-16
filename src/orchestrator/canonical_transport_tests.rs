@@ -59,6 +59,30 @@ fn canonical_generated_query_uses_the_generated_page_cursor_shape() {
 fn canonical_route_inventory_covers_only_generated_endpoints() {
     let expected = [
         (
+            CanonicalOperation::AcceptConversation,
+            "blue.catbird.chat.acceptConversation",
+        ),
+        (
+            CanonicalOperation::AcknowledgeWelcome,
+            "blue.catbird.chat.acknowledgeWelcome",
+        ),
+        (
+            CanonicalOperation::ActivateReset,
+            "blue.catbird.chat.activateReset",
+        ),
+        (
+            CanonicalOperation::CancelLeafRecovery,
+            "blue.catbird.chat.cancelLeafRecovery",
+        ),
+        (
+            CanonicalOperation::CancelLeave,
+            "blue.catbird.chat.cancelLeave",
+        ),
+        (
+            CanonicalOperation::CloseConversation,
+            "blue.catbird.chat.closeConversation",
+        ),
+        (
             CanonicalOperation::GetConversations,
             "blue.catbird.chat.getConversations",
         ),
@@ -67,16 +91,69 @@ fn canonical_route_inventory_covers_only_generated_endpoints() {
             "blue.catbird.chat.createConversation",
         ),
         (
+            CanonicalOperation::DeleteBlob,
+            "blue.catbird.chat.deleteBlob",
+        ),
+        (
             CanonicalOperation::SendMessage,
             "blue.catbird.chat.sendMessage",
+        ),
+        (CanonicalOperation::GetBlob, "blue.catbird.chat.getBlob"),
+        (
+            CanonicalOperation::GetBlobUsage,
+            "blue.catbird.chat.getBlobUsage",
+        ),
+        (
+            CanonicalOperation::GetConversationState,
+            "blue.catbird.chat.getConversationState",
+        ),
+        (
+            CanonicalOperation::GetDevices,
+            "blue.catbird.chat.getDevices",
         ),
         (
             CanonicalOperation::GetEntries,
             "blue.catbird.chat.getEntries",
         ),
         (
+            CanonicalOperation::GetLeafRecoveryInbox,
+            "blue.catbird.chat.getLeafRecoveryInbox",
+        ),
+        (
+            CanonicalOperation::GetOwnDevices,
+            "blue.catbird.chat.getOwnDevices",
+        ),
+        (
+            CanonicalOperation::GetPendingWelcomes,
+            "blue.catbird.chat.getPendingWelcomes",
+        ),
+        (
+            CanonicalOperation::GetSubscriptionTicket,
+            "blue.catbird.chat.getSubscriptionTicket",
+        ),
+        (
+            CanonicalOperation::PrepareBlobUpload,
+            "blue.catbird.chat.prepareBlobUpload",
+        ),
+        (
+            CanonicalOperation::PublishTyping,
+            "blue.catbird.chat.publishTyping",
+        ),
+        (
+            CanonicalOperation::RebindDeviceAuthentication,
+            "blue.catbird.chat.rebindDeviceAuthentication",
+        ),
+        (
+            CanonicalOperation::RejectWelcome,
+            "blue.catbird.chat.rejectWelcome",
+        ),
+        (
             CanonicalOperation::ReplenishKeyPackages,
             "blue.catbird.chat.replenishKeyPackages",
+        ),
+        (
+            CanonicalOperation::RequestLeafRecovery,
+            "blue.catbird.chat.requestLeafRecovery",
         ),
         (
             CanonicalOperation::EnrollDevice,
@@ -87,14 +164,31 @@ fn canonical_route_inventory_covers_only_generated_endpoints() {
             "blue.catbird.chat.requestLeave",
         ),
         (
+            CanonicalOperation::RequestReset,
+            "blue.catbird.chat.requestReset",
+        ),
+        (
+            CanonicalOperation::RevokeDevice,
+            "blue.catbird.chat.revokeDevice",
+        ),
+        (
             CanonicalOperation::SubmitTransition,
             "blue.catbird.chat.submitTransition",
+        ),
+        (
+            CanonicalOperation::SubscribeEvents,
+            "blue.catbird.chat.subscribeEvents",
+        ),
+        (
+            CanonicalOperation::UploadBlob,
+            "blue.catbird.chat.uploadBlob",
         ),
     ];
 
     for (operation, nsid) in expected {
         assert_eq!(canonical_route(operation).nsid, nsid);
     }
+    assert_eq!(CanonicalOperation::ALL.len(), expected.len());
 }
 
 #[test]
@@ -124,6 +218,45 @@ fn clean_read_requests_use_generated_names_and_transport_auth() {
         request.path,
         "/xrpc/blue.catbird.chat.getEntries?afterSeq=4&conversationId=conversation%2F1&limit=100"
     );
+}
+
+#[test]
+fn media_specific_routes_have_typed_blockers() {
+    let subscription = CleanChatRequest::SubscribeEvents(
+        crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEvents {
+            cursor: "cursor".into(),
+            ticket: "ticket".into(),
+        },
+    );
+    assert!(matches!(
+        subscription.prepare(&CleanChatAuthContext::new(
+            auth().authorization,
+            auth().dpop_proof,
+            auth().dpop_jkt,
+            auth().device_id,
+        )),
+        Err(TransportError::UnsupportedOperation {
+            operation: CanonicalOperation::SubscribeEvents,
+            ..
+        })
+    ));
+    let upload = CleanChatRequest::UploadBlob(
+        crate::atproto::blue_catbird::chat::upload_blob::UploadBlob {
+            body: crate::atproto::jacquard_common::deps::bytes::Bytes::from_static(b"blob"),
+        },
+    );
+    assert!(matches!(
+        upload.prepare(&CleanChatAuthContext::new(
+            auth().authorization,
+            auth().dpop_proof,
+            auth().dpop_jkt,
+            auth().device_id,
+        )),
+        Err(TransportError::UnsupportedOperation {
+            operation: CanonicalOperation::UploadBlob,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -333,6 +466,132 @@ fn generated_wire_errors_keep_operation_and_retry_contract() {
             retryable: false,
         }
     );
+    assert_eq!(
+        map_wire_error(
+            CanonicalOperation::EnrollDevice,
+            "AuthenticationGenerationConflict"
+        ),
+        TransportError::Remote {
+            operation: CanonicalOperation::EnrollDevice,
+            code: "AuthenticationGenerationConflict".into(),
+            retryable: false,
+        }
+    );
+}
+
+fn enrollment_request_json(device_id: &str, dpop_jkt: &str, expected_generation: i64) -> Vec<u8> {
+    serde_json::json!({
+        "signedRequest": {
+            "body": {
+                "actorDid": "did:plc:z72i7hdynmk67x4h5wqf3s6a",
+                "capability": {
+                    "addByValue": "allowed",
+                    "applicationFrameProfile": "v1",
+                    "attachmentProfile": "v1",
+                    "cipherSuite": "0x004D",
+                    "controlProfile": "v1",
+                    "credentialType": "basic",
+                    "externalPubGroupInfo": "allowed",
+                    "metadataProfile": "v1",
+                    "mlsVersion": "1.0",
+                    "protocolVersion": "1",
+                    "ratchetTreeGroupInfo": "allowed",
+                    "removeByValue": "allowed",
+                    "typingProfile": "v1",
+                    "updatePath": "allowed"
+                },
+                "deviceId": device_id,
+                "deviceName": "test device",
+                "dpopJkt": dpop_jkt,
+                "expectedAuthGeneration": expected_generation,
+                "idempotencyKey": "22222222-2222-4222-8222-222222222222",
+                "keyId": "test-key",
+                "keyPackages": [],
+                "signatureDomain": "CATBIRD-CHAT-DEVICE-ENROLL\u{0000}",
+                "signaturePublicKey": {"$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+                "signedAt": "2026-08-16T12:00:00.000Z"
+            },
+            "signature": {"$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}
+        }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+#[test]
+fn enrollment_binds_device_and_jkt_without_ordinary_auth_generation() {
+    let auth = auth();
+    let body: serde_json::Value =
+        serde_json::from_slice(&enrollment_request_json(&auth.device_id, &auth.dpop_jkt, 0))
+            .unwrap();
+    assert!(super::canonical_transport::validate_signed_request_context(
+        &auth,
+        None,
+        CanonicalOperation::EnrollDevice,
+        &body,
+    )
+    .is_ok());
+
+    let wrong_device: serde_json::Value = serde_json::from_slice(&enrollment_request_json(
+        "99999999-9999-4999-8999-999999999999",
+        &auth.dpop_jkt,
+        0,
+    ))
+    .unwrap();
+    assert!(matches!(
+        super::canonical_transport::validate_signed_request_context(
+            &auth,
+            None,
+            CanonicalOperation::EnrollDevice,
+            &wrong_device,
+        ),
+        Err(TransportError::DeviceBindingMismatch { .. })
+    ));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn enrollment_ffi_binds_device_and_requires_zero_expected_generation() {
+    use super::canonical_transport::{
+        prepare_clean_chat_request, CleanChatAuthContextFfi, CleanChatOperationFfi,
+        CleanChatTransportFfiError,
+    };
+    let auth = auth();
+    let context = CleanChatAuthContextFfi {
+        authorization: auth.authorization.clone(),
+        dpop_proof: auth.dpop_proof.clone(),
+        dpop_jkt: auth.dpop_jkt.clone(),
+        device_id: auth.device_id.clone(),
+        auth_generation: None,
+    };
+    assert!(prepare_clean_chat_request(
+        context.clone(),
+        CleanChatOperationFfi::EnrollDevice,
+        enrollment_request_json(&auth.device_id, &auth.dpop_jkt, 0),
+    )
+    .is_ok());
+    assert!(matches!(
+        prepare_clean_chat_request(
+            context.clone(),
+            CleanChatOperationFfi::EnrollDevice,
+            enrollment_request_json(&auth.device_id, &auth.dpop_jkt, 1),
+        ),
+        Err(CleanChatTransportFfiError::InvalidRequest { message })
+            if message.contains("expectedAuthGeneration")
+    ));
+    assert!(matches!(
+        prepare_clean_chat_request(
+            context,
+            CleanChatOperationFfi::EnrollDevice,
+            enrollment_request_json(
+                "99999999-9999-4999-8999-999999999999",
+                &auth.dpop_jkt,
+                0,
+            ),
+        ),
+        Err(CleanChatTransportFfiError::InvalidRequest { message })
+            if message.contains("device")
+    ));
 }
 
 #[test]
