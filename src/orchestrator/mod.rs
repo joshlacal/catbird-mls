@@ -1,5 +1,5 @@
 pub mod api_client;
-pub(crate) mod canonical_transport;
+pub mod canonical_transport;
 pub mod constants;
 pub mod credential_binding;
 pub mod credentials;
@@ -25,6 +25,12 @@ mod canonical_transport_tests;
 
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
+pub use canonical_transport::{
+    canonical_route, map_wire_error, prepare_get_conversations, prepare_get_entries,
+    prepare_replenishment, route_for_nsid, CanonicalOperation, CleanChatAuthContext,
+    CleanChatError, CleanChatRequest, CleanChatResponse, PreparedRequest,
+    ReplenishKeyPackagesInput, TransportError,
+};
 pub use constants::*;
 pub use credential_binding::{
     extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,

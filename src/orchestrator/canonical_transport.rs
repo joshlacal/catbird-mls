@@ -1,4 +1,4 @@
-//! Internal transport for the generated clean-chat XRPC surface.
+//! Transport for the generated clean-chat XRPC surface.
 //!
 //! This is intentionally a transport seam, not a second protocol
 //! implementation. The platform owns OAuth/DPoP proof construction and the
@@ -42,6 +42,54 @@ pub(crate) struct TransportAuth {
     pub(crate) device_id: String,
 }
 
+/// Authenticated transport context supplied by a platform adapter.
+///
+/// The access token and DPoP proof remain opaque: Nest owns their issuance,
+/// refresh, nonce, and proof policy. Rust binds the generated signed request
+/// to the same authenticated device/JKT and refuses to prepare a request with
+/// missing authentication material. This is deliberately a small transport
+/// context rather than a second token or credential schema.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanChatAuthContext {
+    pub authorization: String,
+    pub dpop_proof: String,
+    pub dpop_jkt: String,
+    pub device_id: String,
+    /// Optional generation binding for signed mutation requests.
+    pub auth_generation: Option<i64>,
+}
+
+impl CleanChatAuthContext {
+    pub fn new(
+        authorization: String,
+        dpop_proof: String,
+        dpop_jkt: String,
+        device_id: String,
+    ) -> Self {
+        Self {
+            authorization,
+            dpop_proof,
+            dpop_jkt,
+            device_id,
+            auth_generation: None,
+        }
+    }
+
+    pub fn with_auth_generation(mut self, auth_generation: i64) -> Self {
+        self.auth_generation = Some(auth_generation);
+        self
+    }
+
+    fn as_internal(&self) -> TransportAuth {
+        TransportAuth {
+            authorization: self.authorization.clone(),
+            dpop_proof: self.dpop_proof.clone(),
+            dpop_jkt: self.dpop_jkt.clone(),
+            device_id: self.device_id.clone(),
+        }
+    }
+}
+
 impl TransportAuth {
     fn validate(&self) -> Result<(), TransportError> {
         if self.authorization.trim().is_empty() || self.dpop_proof.trim().is_empty() {
@@ -58,16 +106,17 @@ impl TransportAuth {
 
 /// A serialized request ready for the platform's HTTP client.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedRequest {
-    pub(crate) method: &'static str,
-    pub(crate) path: String,
-    pub(crate) authorization: String,
-    pub(crate) dpop: String,
-    pub(crate) body: Option<Vec<u8>>,
+pub struct PreparedRequest {
+    pub operation: CanonicalOperation,
+    pub method: String,
+    pub path: String,
+    pub authorization: String,
+    pub dpop: String,
+    pub body: Option<Vec<u8>>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum TransportError {
+pub enum TransportError {
     #[error("clean-chat transport authentication is missing")]
     MissingAuthentication,
     #[error("clean-chat transport device binding is missing")]
@@ -82,6 +131,8 @@ pub(crate) enum TransportError {
     EmptySigningTranscript,
     #[error("generated clean-chat request serialization failed: {0}")]
     Serialization(String),
+    #[error("generated clean-chat response decoding failed: {0}")]
+    Decoding(String),
     #[error("device signing failed")]
     Signing,
     #[error("clean-chat signed mutations require an Ed25519 device key")]
@@ -94,10 +145,246 @@ pub(crate) enum TransportError {
     },
 }
 
+/// One generated clean-chat request.
+///
+/// Each variant is the generated Jacquard DTO for that endpoint. Keeping the
+/// variants here avoids a hand-maintained parallel wire schema while giving
+/// native Rust and WASM callers one route-typed request surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum CleanChatRequest {
+    GetConversations(GetConversations<String>),
+    CreateConversation(CreateConversationRequestBody),
+    SendMessage(SendMessageRequestBody),
+    GetEntries(GetEntries<String>),
+    ReplenishKeyPackages(ReplenishKeyPackagesRequestBody),
+    EnrollDevice(EnrollDeviceRequestBody),
+    RequestLeave(RequestLeaveRequestBody),
+    SubmitTransition(SubmitTransitionRequestBody),
+}
+
+pub type CreateConversationRequestBody =
+    crate::atproto::blue_catbird::chat::create_conversation::CreateConversation<String>;
+pub type SendMessageRequestBody =
+    crate::atproto::blue_catbird::chat::send_message::SendMessage<String>;
+pub type ReplenishKeyPackagesRequestBody =
+    crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackages<String>;
+pub type EnrollDeviceRequestBody =
+    crate::atproto::blue_catbird::chat::enroll_device::EnrollDevice<String>;
+pub type RequestLeaveRequestBody =
+    crate::atproto::blue_catbird::chat::request_leave::RequestLeave<String>;
+pub type SubmitTransitionRequestBody =
+    crate::atproto::blue_catbird::chat::submit_transition::SubmitTransition<String>;
+
+/// A generated clean-chat success body, selected by the canonical operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
+pub enum CleanChatResponse {
+    GetConversations(
+        crate::atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<String>,
+    ),
+    CreateConversation(
+        crate::atproto::blue_catbird::chat::create_conversation::CreateConversationOutput<String>,
+    ),
+    SendMessage(crate::atproto::blue_catbird::chat::send_message::SendMessageOutput<String>),
+    GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>),
+    ReplenishKeyPackages(
+        crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesOutput<
+            String,
+        >,
+    ),
+    EnrollDevice(crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String>),
+    RequestLeave(crate::atproto::blue_catbird::chat::request_leave::RequestLeaveOutput<String>),
+    SubmitTransition(
+        crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput<String>,
+    ),
+}
+
+/// A generated clean-chat error body, selected by the canonical operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CleanChatError {
+    GetConversations(crate::atproto::blue_catbird::chat::get_conversations::GetConversationsError),
+    CreateConversation(
+        crate::atproto::blue_catbird::chat::create_conversation::CreateConversationError,
+    ),
+    SendMessage(crate::atproto::blue_catbird::chat::send_message::SendMessageError),
+    GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesError),
+    ReplenishKeyPackages(
+        crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesError,
+    ),
+    EnrollDevice(crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceError),
+    RequestLeave(crate::atproto::blue_catbird::chat::request_leave::RequestLeaveError),
+    SubmitTransition(crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionError),
+}
+
+impl CleanChatRequest {
+    pub fn operation(&self) -> CanonicalOperation {
+        match self {
+            Self::GetConversations(_) => CanonicalOperation::GetConversations,
+            Self::CreateConversation(_) => CanonicalOperation::CreateConversation,
+            Self::SendMessage(_) => CanonicalOperation::SendMessage,
+            Self::GetEntries(_) => CanonicalOperation::GetEntries,
+            Self::ReplenishKeyPackages(_) => CanonicalOperation::ReplenishKeyPackages,
+            Self::EnrollDevice(_) => CanonicalOperation::EnrollDevice,
+            Self::RequestLeave(_) => CanonicalOperation::RequestLeave,
+            Self::SubmitTransition(_) => CanonicalOperation::SubmitTransition,
+        }
+    }
+
+    /// Serialize the generated request and attach the authenticated transport
+    /// context. GET query parameters use the generated field names exactly.
+    pub fn prepare(&self, auth: &CleanChatAuthContext) -> Result<PreparedRequest, TransportError> {
+        let internal = auth.as_internal();
+        match self {
+            Self::GetConversations(request) => {
+                let value = serde_json::to_value(request)
+                    .map_err(|error| TransportError::Serialization(error.to_string()))?;
+                let mut query = format!("limit={}", value["limit"]);
+                if let Some(cursor) = value["pageCursor"].as_str() {
+                    query.push_str("&pageCursor=");
+                    query.push_str(&encode_query(cursor));
+                }
+                read_request(&internal, self.operation(), query)
+            }
+            Self::GetEntries(request) => {
+                let value = serde_json::to_value(request)
+                    .map_err(|error| TransportError::Serialization(error.to_string()))?;
+                let query = format!(
+                    "afterSeq={}&conversationId={}&limit={}",
+                    value["afterSeq"],
+                    encode_query(value["conversationId"].as_str().unwrap_or_default()),
+                    value["limit"]
+                );
+                read_request(&internal, self.operation(), query)
+            }
+            Self::CreateConversation(request) => {
+                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
+            }
+            Self::SendMessage(request) => {
+                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
+            }
+            Self::ReplenishKeyPackages(request) => {
+                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
+            }
+            Self::EnrollDevice(request) => {
+                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
+            }
+            Self::RequestLeave(request) => {
+                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
+            }
+            Self::SubmitTransition(request) => {
+                prepare_json_request(&internal, auth.auth_generation, self.operation(), request)
+            }
+        }
+    }
+}
+
+impl CleanChatResponse {
+    /// Decode a successful endpoint response with its generated output type.
+    pub fn decode(operation: CanonicalOperation, body: &[u8]) -> Result<Self, TransportError> {
+        macro_rules! decode {
+            ($ty:path, $variant:ident) => {
+                serde_json::from_slice::<$ty>(body)
+                    .map(Self::$variant)
+                    .map_err(|error| TransportError::Decoding(error.to_string()))
+            };
+        }
+        match operation {
+            CanonicalOperation::GetConversations => decode!(
+                crate::atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<
+                    String
+                >,
+                GetConversations
+            ),
+            CanonicalOperation::CreateConversation => decode!(
+                crate::atproto::blue_catbird::chat::create_conversation::CreateConversationOutput<
+                    String
+                >,
+                CreateConversation
+            ),
+            CanonicalOperation::SendMessage => decode!(
+                crate::atproto::blue_catbird::chat::send_message::SendMessageOutput<String>,
+                SendMessage
+            ),
+            CanonicalOperation::GetEntries => decode!(
+                crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>,
+                GetEntries
+            ),
+            CanonicalOperation::ReplenishKeyPackages => decode!(
+                crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesOutput<
+                    String
+                >,
+                ReplenishKeyPackages
+            ),
+            CanonicalOperation::EnrollDevice => decode!(
+                crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String>,
+                EnrollDevice
+            ),
+            CanonicalOperation::RequestLeave => decode!(
+                crate::atproto::blue_catbird::chat::request_leave::RequestLeaveOutput<String>,
+                RequestLeave
+            ),
+            CanonicalOperation::SubmitTransition => decode!(
+                crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput<
+                    String
+                >,
+                SubmitTransition
+            ),
+        }
+    }
+}
+
+impl CleanChatError {
+    /// Decode a typed generated XRPC error body for the selected endpoint.
+    pub fn decode(operation: CanonicalOperation, body: &[u8]) -> Result<Self, TransportError> {
+        macro_rules! decode {
+            ($ty:path, $variant:ident) => {
+                serde_json::from_slice::<$ty>(body)
+                    .map(Self::$variant)
+                    .map_err(|error| TransportError::Decoding(error.to_string()))
+            };
+        }
+        match operation {
+            CanonicalOperation::GetConversations => decode!(
+                crate::atproto::blue_catbird::chat::get_conversations::GetConversationsError,
+                GetConversations
+            ),
+            CanonicalOperation::CreateConversation => decode!(
+                crate::atproto::blue_catbird::chat::create_conversation::CreateConversationError,
+                CreateConversation
+            ),
+            CanonicalOperation::SendMessage => decode!(
+                crate::atproto::blue_catbird::chat::send_message::SendMessageError,
+                SendMessage
+            ),
+            CanonicalOperation::GetEntries => decode!(
+                crate::atproto::blue_catbird::chat::get_entries::GetEntriesError,
+                GetEntries
+            ),
+            CanonicalOperation::ReplenishKeyPackages => decode!(
+                crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesError,
+                ReplenishKeyPackages
+            ),
+            CanonicalOperation::EnrollDevice => decode!(
+                crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceError,
+                EnrollDevice
+            ),
+            CanonicalOperation::RequestLeave => decode!(
+                crate::atproto::blue_catbird::chat::request_leave::RequestLeaveError,
+                RequestLeave
+            ),
+            CanonicalOperation::SubmitTransition => decode!(
+                crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionError,
+                SubmitTransition
+            ),
+        }
+    }
+}
+
 /// Map a generated clean-chat wire error without collapsing it into a legacy
 /// API error. Unknown codes remain visible and non-retryable until their
 /// lexicon contract is explicitly added.
-pub(crate) fn map_wire_error(operation: CanonicalOperation, code: &str) -> TransportError {
+pub fn map_wire_error(operation: CanonicalOperation, code: &str) -> TransportError {
     let retryable = matches!(code, "CursorExpired" | "AuthenticationGenerationConflict");
     TransportError::Remote {
         operation,
@@ -110,16 +397,16 @@ pub(crate) fn map_wire_error(operation: CanonicalOperation, code: &str) -> Trans
 ///
 /// The body fields are the sole source of truth for the signed transcript.
 /// Callers cannot supply an arbitrary byte string to sign.
-pub(crate) struct ReplenishKeyPackagesInput {
-    pub(crate) actor_did: String,
-    pub(crate) actor_device_id: String,
-    pub(crate) auth_generation: i64,
-    pub(crate) idempotency_key: String,
-    pub(crate) key_id: String,
-    pub(crate) dpop_jkt: String,
-    pub(crate) signature_domain: String,
-    pub(crate) key_packages: Vec<crate::atproto::blue_catbird::chat::KeyPackageArtifact<String>>,
-    pub(crate) signed_at: String,
+pub struct ReplenishKeyPackagesInput {
+    pub actor_did: String,
+    pub actor_device_id: String,
+    pub auth_generation: i64,
+    pub idempotency_key: String,
+    pub key_id: String,
+    pub dpop_jkt: String,
+    pub signature_domain: String,
+    pub key_packages: Vec<crate::atproto::blue_catbird::chat::KeyPackageArtifact<String>>,
+    pub signed_at: String,
 }
 
 /// Construct and serialize one canonical key-package replenishment request.
@@ -196,12 +483,38 @@ pub(crate) fn replenish_key_packages(
         extra_data: None,
     };
     Ok(PreparedRequest {
-        method: "POST",
+        operation: CanonicalOperation::ReplenishKeyPackages,
+        method: "POST".into(),
         path: ReplenishKeyPackagesRequest::PATH.to_owned(),
         authorization: auth.authorization.clone(),
         dpop: auth.dpop_proof.clone(),
         body: Some(serialize_json(&request)?),
     })
+}
+
+/// Sign and prepare the generated key-package replenishment request using a
+/// platform-owned authenticated context.
+pub fn prepare_replenishment(
+    auth: &CleanChatAuthContext,
+    signer: &SignatureKeyPair,
+    input: ReplenishKeyPackagesInput,
+) -> Result<PreparedRequest, TransportError> {
+    if auth.auth_generation != Some(input.auth_generation) {
+        return Err(TransportError::Serialization(
+            "replenishment authGeneration does not match authenticated context".into(),
+        ));
+    }
+    if input.dpop_jkt != auth.dpop_jkt || input.actor_device_id != auth.device_id {
+        return Err(if input.dpop_jkt != auth.dpop_jkt {
+            TransportError::DpopBindingMismatch
+        } else {
+            TransportError::DeviceBindingMismatch {
+                body: input.actor_device_id,
+                authenticated: auth.device_id.clone(),
+            }
+        });
+    }
+    replenish_key_packages(&auth.as_internal(), signer, input)
 }
 
 pub(crate) fn derive_key_id(public_key: &[u8]) -> String {
@@ -470,7 +783,7 @@ pub(crate) fn validate_datetime(value: &str) -> Result<(), TransportError> {
     let punctuation = [4, 7, 10, 13, 16, 19, 23];
     if bytes.len() != 24
         || !punctuation.iter().enumerate().all(|(index, position)| {
-            let expected = [b'-', b'-', b'T', b':', b':', b'.', b'Z'][index];
+            let expected = b"--T::.Z"[index];
             bytes[*position] == expected
         })
         || bytes
@@ -487,6 +800,74 @@ pub(crate) fn validate_datetime(value: &str) -> Result<(), TransportError> {
 
 fn serialize_json(value: &impl Serialize) -> Result<Vec<u8>, TransportError> {
     serde_json::to_vec(value).map_err(|error| TransportError::Serialization(error.to_string()))
+}
+
+fn prepare_json_request<T: Serialize>(
+    auth: &TransportAuth,
+    auth_generation: Option<i64>,
+    operation: CanonicalOperation,
+    request: &T,
+) -> Result<PreparedRequest, TransportError> {
+    auth.validate()?;
+    let body = serialize_json(request)?;
+    validate_signed_request_context(
+        auth,
+        auth_generation,
+        &serde_json::from_slice(&body)
+            .map_err(|error| TransportError::Serialization(error.to_string()))?,
+    )?;
+    Ok(PreparedRequest {
+        operation,
+        method: "POST".into(),
+        path: canonical_route(operation).path.to_owned(),
+        authorization: auth.authorization.clone(),
+        dpop: auth.dpop_proof.clone(),
+        body: Some(body),
+    })
+}
+
+fn validate_signed_request_context(
+    auth: &TransportAuth,
+    auth_generation: Option<i64>,
+    value: &serde_json::Value,
+) -> Result<(), TransportError> {
+    let Some(body) = value
+        .get("signedRequest")
+        .and_then(|value| value.get("body"))
+    else {
+        return Err(TransportError::Serialization(
+            "clean-chat signed request is missing signedRequest.body".into(),
+        ));
+    };
+    if let Some(device) = body
+        .get("actorDeviceId")
+        .or_else(|| body.get("deviceId"))
+        .and_then(serde_json::Value::as_str)
+    {
+        if device != auth.device_id {
+            return Err(TransportError::DeviceBindingMismatch {
+                body: device.to_owned(),
+                authenticated: auth.device_id.clone(),
+            });
+        }
+    }
+    if let Some(jkt) = body.get("dpopJkt").and_then(serde_json::Value::as_str) {
+        if jkt != auth.dpop_jkt {
+            return Err(TransportError::DpopBindingMismatch);
+        }
+    }
+    if let Some(expected) = auth_generation {
+        if body
+            .get("authGeneration")
+            .and_then(serde_json::Value::as_i64)
+            != Some(expected)
+        {
+            return Err(TransportError::Serialization(
+                "signed request authGeneration does not match authenticated context".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn encode_query(value: &str) -> String {
@@ -509,7 +890,8 @@ fn read_request(
     auth.validate()?;
     let route = canonical_route(operation);
     Ok(PreparedRequest {
-        method: "GET",
+        operation,
+        method: "GET".into(),
         path: format!("{}?{}", route.path, query),
         authorization: auth.authorization.clone(),
         dpop: auth.dpop_proof.clone(),
@@ -538,6 +920,16 @@ pub(crate) fn get_conversations(
     read_request(auth, CanonicalOperation::GetConversations, query)
 }
 
+/// Prepare the canonical generated `getConversations` query for a platform
+/// HTTP client.
+pub fn prepare_get_conversations(
+    auth: &CleanChatAuthContext,
+    limit: i64,
+    page_cursor: Option<&str>,
+) -> Result<PreparedRequest, TransportError> {
+    get_conversations(&auth.as_internal(), limit, page_cursor)
+}
+
 /// Build the generated `getEntries` transport-auth query.
 pub(crate) fn get_entries(
     auth: &TransportAuth,
@@ -561,9 +953,20 @@ pub(crate) fn get_entries(
     read_request(auth, CanonicalOperation::GetEntries, query)
 }
 
+/// Prepare the canonical generated `getEntries` query for a platform HTTP
+/// client.
+pub fn prepare_get_entries(
+    auth: &CleanChatAuthContext,
+    conversation_id: &str,
+    after_seq: i64,
+    limit: i64,
+) -> Result<PreparedRequest, TransportError> {
+    get_entries(&auth.as_internal(), conversation_id, after_seq, limit)
+}
+
 /// Canonical operations with a generated `blue.catbird.chat.*` endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CanonicalOperation {
+pub enum CanonicalOperation {
     GetConversations,
     CreateConversation,
     SendMessage,
@@ -576,7 +979,7 @@ pub(crate) enum CanonicalOperation {
 
 impl CanonicalOperation {
     /// Every operation in the route inventory.
-    pub(crate) const ALL: &'static [Self] = &[
+    pub const ALL: &'static [Self] = &[
         Self::GetConversations,
         Self::CreateConversation,
         Self::SendMessage,
@@ -586,13 +989,25 @@ impl CanonicalOperation {
         Self::RequestLeave,
         Self::SubmitTransition,
     ];
+
+    pub fn route(self) -> CanonicalRoute {
+        canonical_route(self)
+    }
+
+    pub fn nsid(self) -> &'static str {
+        self.route().nsid
+    }
+
+    pub fn path(self) -> &'static str {
+        self.route().path
+    }
 }
 
 /// The generated NSID and path for one canonical operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CanonicalRoute {
-    pub(crate) nsid: &'static str,
-    pub(crate) path: &'static str,
+pub struct CanonicalRoute {
+    pub nsid: &'static str,
+    pub path: &'static str,
 }
 
 fn route(path: &'static str) -> CanonicalRoute {
@@ -603,7 +1018,7 @@ fn route(path: &'static str) -> CanonicalRoute {
 }
 
 /// Resolve an operation through the generated canonical endpoint marker.
-pub(crate) fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
+pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
     match operation {
         CanonicalOperation::GetConversations => route(GetConversationsRequest::PATH),
         CanonicalOperation::CreateConversation => route(CreateConversationRequest::PATH),
@@ -619,7 +1034,7 @@ pub(crate) fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
 /// Resolve only a canonical generated NSID. Legacy `mlsChat` names are
 /// intentionally not aliases: accepting one here would make it possible for a
 /// platform adapter to silently downgrade a clean-chat request.
-pub(crate) fn route_for_nsid(nsid: &str) -> Option<CanonicalRoute> {
+pub fn route_for_nsid(nsid: &str) -> Option<CanonicalRoute> {
     CanonicalOperation::ALL
         .iter()
         .copied()

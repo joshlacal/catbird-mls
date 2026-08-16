@@ -2,7 +2,8 @@ use super::canonical_transport::{
     canonical_replenishment_transcript, canonical_route, derive_key_id, get_conversations,
     get_entries, map_wire_error, replenish_key_packages, route_for_nsid, validate_auth_generation,
     validate_bare_did, validate_datetime, validate_jkt, validate_key_packages, validate_uuid,
-    CanonicalOperation, ReplenishKeyPackagesInput, TransportAuth, TransportError,
+    CanonicalOperation, CleanChatAuthContext, CleanChatError, CleanChatRequest, CleanChatResponse,
+    ReplenishKeyPackagesInput, TransportAuth, TransportError,
 };
 use std::str::FromStr;
 
@@ -332,4 +333,90 @@ fn generated_wire_errors_keep_operation_and_retry_contract() {
             retryable: false,
         }
     );
+}
+
+#[test]
+fn public_clean_chat_request_surface_uses_generated_types_and_auth_context() {
+    let auth = CleanChatAuthContext::new(
+        "Bearer gateway-token".into(),
+        "signed-dpop-proof".into(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        "11111111-1111-4111-8111-111111111111".into(),
+    );
+    let request = CleanChatRequest::GetConversations(
+        crate::atproto::blue_catbird::chat::get_conversations::GetConversations {
+            limit: 25,
+            page_cursor: Some("opaque-cursor".into()),
+        },
+    );
+    let prepared = request.prepare(&auth).expect("public request prepares");
+    assert_eq!(prepared.operation, CanonicalOperation::GetConversations);
+    assert_eq!(prepared.method, "GET");
+    assert_eq!(
+        prepared.path,
+        "/xrpc/blue.catbird.chat.getConversations?limit=25&pageCursor=opaque-cursor"
+    );
+    assert_eq!(prepared.authorization, "Bearer gateway-token");
+    assert_eq!(prepared.dpop, "signed-dpop-proof");
+}
+
+#[test]
+fn public_replenishment_binds_generation_and_device_context() {
+    use openmls::prelude::SignatureScheme;
+    use openmls_basic_credential::SignatureKeyPair;
+
+    let signer = SignatureKeyPair::new(SignatureScheme::ED25519).expect("signer");
+    let auth = CleanChatAuthContext::new(
+        "Bearer gateway-token".into(),
+        "signed-dpop-proof".into(),
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        "11111111-1111-4111-8111-111111111111".into(),
+    )
+    .with_auth_generation(1);
+    let key_id = derive_key_id(signer.public());
+    let input = || ReplenishKeyPackagesInput {
+        actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+        actor_device_id: auth.device_id.clone(),
+        auth_generation: 1,
+        idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+        key_id: key_id.clone(),
+        dpop_jkt: auth.dpop_jkt.clone(),
+        signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+        key_packages: vec![key_package()],
+        signed_at: "2026-08-16T12:00:00.000Z".into(),
+    };
+    let prepared = super::canonical_transport::prepare_replenishment(&auth, &signer, input())
+        .expect("public replenishment prepares");
+    assert_eq!(prepared.operation, CanonicalOperation::ReplenishKeyPackages);
+
+    let mut mismatch = auth.clone();
+    mismatch.auth_generation = Some(2);
+    assert!(matches!(
+        super::canonical_transport::prepare_replenishment(&mismatch, &signer, input()),
+        Err(TransportError::Serialization(message)) if message.contains("authGeneration")
+    ));
+}
+
+#[test]
+fn public_clean_chat_response_and_error_decode_to_generated_route_types() {
+    let response = serde_json::json!({
+        "hasMore": false,
+        "inventorySessionId": "session",
+        "items": [],
+        "snapshotEventCursor": "cursor",
+        "snapshotExpiresAt": "2026-08-16T12:00:00.000Z"
+    });
+    let decoded = CleanChatResponse::decode(
+        CanonicalOperation::GetConversations,
+        &serde_json::to_vec(&response).unwrap(),
+    )
+    .expect("generated response decodes");
+    assert!(matches!(decoded, CleanChatResponse::GetConversations(_)));
+
+    let error = CleanChatError::decode(
+        CanonicalOperation::GetEntries,
+        br#"{"error":"DeviceRevoked","message":"revoked"}"#,
+    )
+    .expect("generated error decodes");
+    assert!(matches!(error, CleanChatError::GetEntries(_)));
 }
