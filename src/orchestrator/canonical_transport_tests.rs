@@ -1,7 +1,8 @@
 use super::canonical_transport::{
     canonical_replenishment_transcript, canonical_route, derive_key_id, get_conversations,
-    get_entries, map_wire_error, replenish_key_packages, route_for_nsid, CanonicalOperation,
-    ReplenishKeyPackagesInput, TransportAuth, TransportError,
+    get_entries, map_wire_error, replenish_key_packages, route_for_nsid, validate_auth_generation,
+    validate_bare_did, validate_datetime, validate_jkt, validate_key_packages, validate_uuid,
+    CanonicalOperation, ReplenishKeyPackagesInput, TransportAuth, TransportError,
 };
 use std::str::FromStr;
 
@@ -9,7 +10,7 @@ fn auth() -> TransportAuth {
     TransportAuth {
         authorization: "Bearer gateway-token".into(),
         dpop_proof: "signed-dpop-proof".into(),
-        dpop_jkt: "device-jkt".into(),
+        dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
         device_id: "11111111-1111-4111-8111-111111111111".into(),
     }
 }
@@ -18,10 +19,10 @@ fn key_package() -> crate::atproto::blue_catbird::chat::KeyPackageArtifact<Strin
     use crate::atproto::jacquard_common::deps::bytes::Bytes;
     crate::atproto::blue_catbird::chat::KeyPackageArtifact {
         bytes: Bytes::from_static(b"key-package"),
-        content_type: "application/octet-stream".into(),
-        framing: "mls-key-package".into(),
-        key_package_ref: Bytes::from_static(b"ref"),
-        sha256: Bytes::from_static(b"sha256"),
+        content_type: "keyPackage".into(),
+        framing: "mlsMessage".into(),
+        key_package_ref: Bytes::from(vec![1; 32]),
+        sha256: Bytes::from(vec![2; 32]),
         extra_data: None,
     }
 }
@@ -140,7 +141,7 @@ fn replenishment_serializes_generated_signed_envelope_and_binds_signature() {
         auth_generation: 1,
         idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
         key_id,
-        dpop_jkt: "device-jkt".into(),
+        dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
         signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
         key_packages: vec![key_package()],
         signed_at: "2026-08-16T12:00:00.000Z".into(),
@@ -156,7 +157,10 @@ fn replenishment_serializes_generated_signed_envelope_and_binds_signature() {
         value["signedRequest"]["body"]["actorDeviceId"],
         auth().device_id
     );
-    assert_eq!(value["signedRequest"]["body"]["dpopJkt"], "device-jkt");
+    assert_eq!(
+        value["signedRequest"]["body"]["dpopJkt"],
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    );
     assert_eq!(
         value["signedRequest"]["body"]["keyPackages"][0]["bytes"]["$bytes"],
         "a2V5LXBhY2thZ2U="
@@ -175,7 +179,7 @@ fn replenishment_serializes_generated_signed_envelope_and_binds_signature() {
             auth_generation: 1,
             idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
             key_id: derive_key_id(signer.public()),
-            dpop_jkt: "device-jkt".into(),
+            dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
             key_packages: vec![key_package()],
             signed_at: "2026-08-16T12:00:00.000Z".into(),
@@ -196,13 +200,13 @@ fn replenishment_serializes_generated_signed_envelope_and_binds_signature() {
         auth_generation: 2,
         idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
         key_id: derive_key_id(signer.public()),
-        dpop_jkt: "device-jkt".into(),
+        dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
         signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
         key_packages: vec![key_package()],
         signed_at: "2026-08-16T12:00:00.000Z".into(),
     };
     changed.key_packages[0].bytes =
-        crate::atproto::jacquard_common::deps::bytes::Bytes::from_static(b"changed");
+        crate::atproto::jacquard_common::deps::bytes::Bytes::from_static(b"changed!");
     let changed_request = replenish_key_packages(&auth(), &signer, changed).unwrap();
     let changed_value: Value =
         serde_json::from_slice(changed_request.body.as_ref().unwrap()).unwrap();
@@ -228,7 +232,7 @@ fn replenishment_rejects_wrong_device_legacy_shape_and_missing_auth() {
         auth_generation: 1,
         idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
         key_id: "device-key-id".into(),
-        dpop_jkt: "device-jkt".into(),
+        dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
         signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
         key_packages: vec![key_package()],
         signed_at: "2026-08-16T12:00:00.000Z".into(),
@@ -239,7 +243,7 @@ fn replenishment_rejects_wrong_device_legacy_shape_and_missing_auth() {
     ));
 
     let mut bad_auth = auth();
-    bad_auth.dpop_jkt = "different-jkt".into();
+    bad_auth.dpop_jkt = format!("B{}", &auth().dpop_jkt[1..]);
     let mut good_input = input();
     good_input.actor_device_id = bad_auth.device_id.clone();
     assert_eq!(
@@ -270,7 +274,7 @@ fn replenishment_rejects_key_id_not_derived_from_signing_key() {
             auth_generation: 1,
             idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
             key_id: "wrong-key-id".into(),
-            dpop_jkt: "device-jkt".into(),
+            dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
             key_packages: vec![key_package()],
             signed_at: "2026-08-16T12:00:00.000Z".into(),
@@ -279,6 +283,26 @@ fn replenishment_rejects_key_id_not_derived_from_signing_key() {
     assert!(
         matches!(result, Err(TransportError::Serialization(message)) if message.contains("keyId"))
     );
+}
+
+#[test]
+fn canonical_transport_rejects_noncanonical_identifiers_and_bounds() {
+    assert!(validate_uuid("11111111-1111-4111-8111-111111111111", "deviceId").is_ok());
+    assert!(validate_uuid("11111111-1111-4111-8111-111111111111", "deviceId").is_ok());
+    assert!(validate_uuid("11111111-1111-4111-8111-11111111111A", "deviceId").is_err());
+    assert!(validate_datetime("2026-08-16T12:00:00.000Z").is_ok());
+    assert!(validate_datetime("2026-08-16t12:00:00.00Z").is_err());
+    assert!(validate_jkt("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").is_ok());
+    assert!(validate_jkt("not-a-jkt").is_err());
+    assert!(validate_auth_generation(1).is_ok());
+    assert!(validate_auth_generation(9_007_199_254_740_991).is_ok());
+    assert!(validate_auth_generation(0).is_err());
+    assert!(validate_auth_generation(9_007_199_254_740_992).is_err());
+    assert!(validate_bare_did("did:plc:z72i7hdynmk67x4h5wqf3s6a").is_ok());
+    assert!(validate_bare_did("did:plc:Z72i7hdynmk67x4h5wqf3s6a").is_err());
+    assert!(validate_bare_did("did:web:localhost").is_err());
+    assert!(validate_key_packages(&[key_package()]).is_ok());
+    assert!(validate_key_packages(&[]).is_err());
 }
 
 #[test]

@@ -50,6 +50,8 @@ impl TransportAuth {
         if self.dpop_jkt.trim().is_empty() || self.device_id.trim().is_empty() {
             return Err(TransportError::MissingDeviceBinding);
         }
+        validate_uuid(&self.device_id, "deviceId")?;
+        validate_jkt(&self.dpop_jkt)?;
         Ok(())
     }
 }
@@ -133,6 +135,12 @@ pub(crate) fn replenish_key_packages(
     input: ReplenishKeyPackagesInput,
 ) -> Result<PreparedRequest, TransportError> {
     auth.validate()?;
+    validate_bare_did(&input.actor_did)?;
+    validate_uuid(&input.actor_device_id, "actorDeviceId")?;
+    validate_uuid(&input.idempotency_key, "idempotencyKey")?;
+    validate_auth_generation(input.auth_generation)?;
+    validate_jkt(&input.dpop_jkt)?;
+    validate_key_packages(&input.key_packages)?;
     if input.actor_device_id != auth.device_id {
         return Err(TransportError::DeviceBindingMismatch {
             body: input.actor_device_id,
@@ -155,6 +163,7 @@ pub(crate) fn replenish_key_packages(
             "keyId does not match the Ed25519 public-key thumbprint".into(),
         ));
     }
+    validate_datetime(&input.signed_at)?;
     let signed_at = parse_datetime(input.signed_at.clone())?;
     let transcript =
         canonical_replenishment_transcript(&input, &public_key, &signed_at, &derived_key_id)?;
@@ -322,14 +331,128 @@ pub(crate) fn canonical_replenishment_transcript(
 }
 
 fn canonical_uuid_bytes(value: &str, field: &str) -> Result<Vec<u8>, TransportError> {
+    let uuid = validate_uuid(value, field)?;
+    Ok(uuid.as_bytes().to_vec())
+}
+
+pub(crate) fn validate_uuid(value: &str, field: &str) -> Result<Uuid, TransportError> {
     let uuid = Uuid::parse_str(value)
         .map_err(|_| TransportError::Serialization(format!("{field} is not a UUID")))?;
-    if uuid.get_version() != Some(Version::Random) {
+    if uuid.get_version() != Some(Version::Random) || uuid.to_string() != value {
         return Err(TransportError::Serialization(format!(
-            "{field} is not a UUIDv4"
+            "{field} is not canonical lowercase UUIDv4"
         )));
     }
-    Ok(uuid.as_bytes().to_vec())
+    Ok(uuid)
+}
+
+pub(crate) fn validate_jkt(value: &str) -> Result<(), TransportError> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    if value.len() != 43
+        || URL_SAFE_NO_PAD
+            .decode(value)
+            .ok()
+            .is_none_or(|bytes| bytes.len() != 32)
+        || URL_SAFE_NO_PAD.encode(URL_SAFE_NO_PAD.decode(value).unwrap()) != value
+    {
+        return Err(TransportError::Serialization(
+            "dpopJkt is not canonical 43-character base64url".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_auth_generation(value: i64) -> Result<(), TransportError> {
+    if !(1..=9_007_199_254_740_991).contains(&value) {
+        return Err(TransportError::Serialization(
+            "authGeneration is outside the canonical safe integer range".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_bare_did(value: &str) -> Result<(), TransportError> {
+    let valid = value.is_ascii()
+        && (12..=261).contains(&value.len())
+        && if let Some(plc) = value.strip_prefix("did:plc:") {
+            plc.len() == 24
+                && plc
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+        } else if let Some(host) = value.strip_prefix("did:web:") {
+            validate_hostname(host)
+        } else {
+            false
+        };
+    if !valid {
+        return Err(TransportError::Serialization(
+            "actorDid is not a production bare DID".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_hostname(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 || host.ends_with('.') || host.eq("localhost") {
+        return false;
+    }
+    let labels: Vec<_> = host.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            !(!label.is_empty() && label.len() <= 63 && label.is_ascii())
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                || !label.as_bytes()[0].is_ascii_alphanumeric()
+                || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+        })
+    {
+        return false;
+    }
+    let tld = labels.last().unwrap();
+    !tld.as_bytes()[0].is_ascii_digit()
+        && !matches!(
+            *tld,
+            "alt"
+                | "arpa"
+                | "example"
+                | "internal"
+                | "invalid"
+                | "local"
+                | "localhost"
+                | "onion"
+                | "test"
+        )
+}
+
+pub(crate) fn validate_key_packages(
+    packages: &[crate::atproto::blue_catbird::chat::KeyPackageArtifact<String>],
+) -> Result<(), TransportError> {
+    if !(1..=100).contains(&packages.len()) {
+        return Err(TransportError::Serialization(
+            "keyPackages count is outside 1..=100".into(),
+        ));
+    }
+    let mut previous: Option<&[u8]> = None;
+    for package in packages {
+        if !(8..=65_536).contains(&package.bytes.len())
+            || package.sha256.len() != 32
+            || package.key_package_ref.len() != 32
+            || package.content_type != "keyPackage"
+            || package.framing != "mlsMessage"
+        {
+            return Err(TransportError::Serialization(
+                "keyPackageArtifact violates canonical bounds".into(),
+            ));
+        }
+        if previous.is_some_and(|prior| prior >= package.key_package_ref.as_ref()) {
+            return Err(TransportError::Serialization(
+                "keyPackageRef values must be strictly increasing".into(),
+            ));
+        }
+        previous = Some(package.key_package_ref.as_ref());
+    }
+    Ok(())
 }
 
 fn parse_datetime(
@@ -337,6 +460,26 @@ fn parse_datetime(
 ) -> Result<crate::atproto::blue_catbird::chat::CanonicalDatetime, TransportError> {
     crate::atproto::blue_catbird::chat::CanonicalDatetime::from_str(&value)
         .map_err(|_| TransportError::Serialization("signedAt is not a canonical datetime".into()))
+}
+
+pub(crate) fn validate_datetime(value: &str) -> Result<(), TransportError> {
+    let bytes = value.as_bytes();
+    let punctuation = [4, 7, 10, 13, 16, 19, 23];
+    if bytes.len() != 24
+        || !punctuation.iter().enumerate().all(|(index, position)| {
+            let expected = [b'-', b'-', b'T', b':', b':', b'.', b'Z'][index];
+            bytes[*position] == expected
+        })
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !punctuation.contains(&index) && !byte.is_ascii_digit())
+    {
+        return Err(TransportError::Serialization(
+            "signedAt is not exact UTC milliseconds".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn serialize_json(value: &impl Serialize) -> Result<Vec<u8>, TransportError> {
