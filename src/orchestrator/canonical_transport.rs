@@ -217,6 +217,204 @@ pub enum CleanChatError {
     SubmitTransition(crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionError),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanChatOperationFfi {
+    GetConversations,
+    CreateConversation,
+    SendMessage,
+    GetEntries,
+    ReplenishKeyPackages,
+    EnrollDevice,
+    RequestLeave,
+    SubmitTransition,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<CleanChatOperationFfi> for CanonicalOperation {
+    fn from(operation: CleanChatOperationFfi) -> Self {
+        match operation {
+            CleanChatOperationFfi::GetConversations => Self::GetConversations,
+            CleanChatOperationFfi::CreateConversation => Self::CreateConversation,
+            CleanChatOperationFfi::SendMessage => Self::SendMessage,
+            CleanChatOperationFfi::GetEntries => Self::GetEntries,
+            CleanChatOperationFfi::ReplenishKeyPackages => Self::ReplenishKeyPackages,
+            CleanChatOperationFfi::EnrollDevice => Self::EnrollDevice,
+            CleanChatOperationFfi::RequestLeave => Self::RequestLeave,
+            CleanChatOperationFfi::SubmitTransition => Self::SubmitTransition,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<CanonicalOperation> for CleanChatOperationFfi {
+    fn from(operation: CanonicalOperation) -> Self {
+        match operation {
+            CanonicalOperation::GetConversations => Self::GetConversations,
+            CanonicalOperation::CreateConversation => Self::CreateConversation,
+            CanonicalOperation::SendMessage => Self::SendMessage,
+            CanonicalOperation::GetEntries => Self::GetEntries,
+            CanonicalOperation::ReplenishKeyPackages => Self::ReplenishKeyPackages,
+            CanonicalOperation::EnrollDevice => Self::EnrollDevice,
+            CanonicalOperation::RequestLeave => Self::RequestLeave,
+            CanonicalOperation::SubmitTransition => Self::SubmitTransition,
+        }
+    }
+}
+
+/// UniFFI-safe authenticated transport context. Token/proof contents remain
+/// opaque to Rust; the device/JKT/generation are checked against signed bodies.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct CleanChatAuthContextFfi {
+    pub authorization: String,
+    pub dpop_proof: String,
+    pub dpop_jkt: String,
+    pub device_id: String,
+    pub auth_generation: Option<i64>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<CleanChatAuthContextFfi> for CleanChatAuthContext {
+    fn from(context: CleanChatAuthContextFfi) -> Self {
+        Self {
+            authorization: context.authorization,
+            dpop_proof: context.dpop_proof,
+            dpop_jkt: context.dpop_jkt,
+            device_id: context.device_id,
+            auth_generation: context.auth_generation,
+        }
+    }
+}
+
+/// UniFFI-safe prepared request. The request body is the generated DTO's JSON
+/// bytes; platform clients own the actual HTTP execution.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct CleanChatPreparedRequestFfi {
+    pub operation: CleanChatOperationFfi,
+    pub method: String,
+    pub path: String,
+    pub authorization: String,
+    pub dpop: String,
+    pub body: Option<Vec<u8>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(uniffi::Error, Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CleanChatTransportFfiError {
+    #[error("invalid clean-chat transport request: {message}")]
+    InvalidRequest { message: String },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn ffi_error(error: impl std::fmt::Display) -> CleanChatTransportFfiError {
+    CleanChatTransportFfiError::InvalidRequest {
+        message: error.to_string(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_ffi_request(
+    operation: CanonicalOperation,
+    body: &[u8],
+) -> Result<CleanChatRequest, CleanChatTransportFfiError> {
+    macro_rules! parse {
+        ($ty:path, $variant:ident) => {
+            serde_json::from_slice::<$ty>(body)
+                .map(CleanChatRequest::$variant)
+                .map_err(ffi_error)
+        };
+    }
+    match operation {
+        CanonicalOperation::GetConversations => parse!(GetConversations<String>, GetConversations),
+        CanonicalOperation::CreateConversation => {
+            parse!(CreateConversationRequestBody, CreateConversation)
+        }
+        CanonicalOperation::SendMessage => parse!(SendMessageRequestBody, SendMessage),
+        CanonicalOperation::GetEntries => parse!(GetEntries<String>, GetEntries),
+        CanonicalOperation::ReplenishKeyPackages => {
+            parse!(ReplenishKeyPackagesRequestBody, ReplenishKeyPackages)
+        }
+        CanonicalOperation::EnrollDevice => parse!(EnrollDeviceRequestBody, EnrollDevice),
+        CanonicalOperation::RequestLeave => parse!(RequestLeaveRequestBody, RequestLeave),
+        CanonicalOperation::SubmitTransition => {
+            parse!(SubmitTransitionRequestBody, SubmitTransition)
+        }
+    }
+}
+
+/// Prepare one generated clean-chat route for iOS/Android. `request_json` must
+/// be the platform's generated DTO JSON, not a hand-maintained wire schema.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub fn prepare_clean_chat_request(
+    auth: CleanChatAuthContextFfi,
+    operation: CleanChatOperationFfi,
+    request_json: Vec<u8>,
+) -> Result<CleanChatPreparedRequestFfi, CleanChatTransportFfiError> {
+    let operation = operation.into();
+    let request = parse_ffi_request(operation, &request_json)?;
+    let prepared = request.prepare(&auth.into()).map_err(ffi_error)?;
+    Ok(CleanChatPreparedRequestFfi {
+        operation: prepared.operation.into(),
+        method: prepared.method,
+        path: prepared.path,
+        authorization: prepared.authorization,
+        dpop: prepared.dpop,
+        body: prepared.body,
+    })
+}
+
+/// Strictly decode a successful clean-chat response through its generated
+/// output type and return canonical generated JSON for the platform adapter.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub fn decode_clean_chat_response(
+    operation: CleanChatOperationFfi,
+    response_json: Vec<u8>,
+) -> Result<Vec<u8>, CleanChatTransportFfiError> {
+    let response =
+        CleanChatResponse::decode(operation.into(), &response_json).map_err(ffi_error)?;
+    match response {
+        CleanChatResponse::GetConversations(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::CreateConversation(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::SendMessage(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::ReplenishKeyPackages(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::EnrollDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::RequestLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::SubmitTransition(value) => serde_json::to_vec(&value).map_err(ffi_error),
+    }
+}
+
+/// Strictly decode one generated clean-chat XRPC error body and return its
+/// canonical generated JSON for the platform adapter.
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub fn decode_clean_chat_error(
+    operation: CleanChatOperationFfi,
+    error_json: Vec<u8>,
+) -> Result<Vec<u8>, CleanChatTransportFfiError> {
+    let error = CleanChatError::decode(operation.into(), &error_json).map_err(ffi_error)?;
+    match error {
+        CleanChatError::GetConversations(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::CreateConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::SendMessage(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::ReplenishKeyPackages(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::EnrollDevice(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::RequestLeave(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::SubmitTransition(value) => serde_json::to_vec(&value).map_err(ffi_error),
+    }
+}
+
 impl CleanChatRequest {
     pub fn operation(&self) -> CanonicalOperation {
         match self {

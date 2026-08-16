@@ -420,3 +420,26 @@ fn public_clean_chat_response_and_error_decode_to_generated_route_types() {
     .expect("generated error decodes");
     assert!(matches!(error, CleanChatError::GetEntries(_)));
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn uniffi_surface_parses_generated_json_before_preparing_wire_request() {
+    let auth = super::canonical_transport::CleanChatAuthContextFfi {
+        authorization: "Bearer gateway-token".into(),
+        dpop_proof: "signed-dpop-proof".into(),
+        dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+        device_id: "11111111-1111-4111-8111-111111111111".into(),
+        auth_generation: None,
+    };
+    let prepared = super::canonical_transport::prepare_clean_chat_request(
+        auth,
+        super::canonical_transport::CleanChatOperationFfi::GetConversations,
+        br#"{"limit":25,"pageCursor":"opaque-cursor"}"#.to_vec(),
+    )
+    .expect("FFI request prepares");
+    assert_eq!(prepared.method, "GET");
+    assert_eq!(
+        prepared.path,
+        "/xrpc/blue.catbird.chat.getConversations?limit=25&pageCursor=opaque-cursor"
+    );
+}

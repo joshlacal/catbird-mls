@@ -31,6 +31,12 @@ pub use canonical_transport::{
     CleanChatError, CleanChatRequest, CleanChatResponse, PreparedRequest,
     ReplenishKeyPackagesInput, TransportError,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use canonical_transport::{
+    decode_clean_chat_error, decode_clean_chat_response, prepare_clean_chat_request,
+    CleanChatAuthContextFfi, CleanChatOperationFfi, CleanChatPreparedRequestFfi,
+    CleanChatTransportFfiError,
+};
 pub use constants::*;
 pub use credential_binding::{
     extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,
