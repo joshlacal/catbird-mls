@@ -641,6 +641,20 @@ pub fn prepare_clean_chat_request(
     })
 }
 
+/// Preserve an `getBlob` octet-stream response without attempting JSON or
+/// UTF-8 decoding. Blob ciphertext is opaque to this transport layer.
+pub fn decode_clean_chat_blob_response(body: &[u8]) -> Result<Vec<u8>, TransportError> {
+    Ok(body.to_vec())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[uniffi::export]
+pub fn decode_clean_chat_blob(
+    response_bytes: Vec<u8>,
+) -> Result<Vec<u8>, CleanChatTransportFfiError> {
+    decode_clean_chat_blob_response(&response_bytes).map_err(ffi_error)
+}
+
 /// Strictly decode a successful clean-chat response through its generated
 /// output type and return canonical generated JSON for the platform adapter.
 #[cfg(not(target_arch = "wasm32"))]
@@ -891,7 +905,10 @@ impl CleanChatResponse {
                 crate::atproto::blue_catbird::chat::send_message::SendMessageOutput<String>,
                 SendMessage
             ),
-            CanonicalOperation::GetBlob => decode!(crate::atproto::blue_catbird::chat::get_blob::GetBlobOutput, GetBlob),
+            CanonicalOperation::GetBlob => Err(TransportError::UnsupportedOperation {
+                operation: CanonicalOperation::GetBlob,
+                reason: "getBlob returns an octet-stream; use decode_clean_chat_blob_response",
+            }),
             CanonicalOperation::GetBlobUsage => decode!(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageOutput<String>, GetBlobUsage),
             CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>, GetConversationState),
             CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>, GetDevices),
@@ -1014,8 +1031,9 @@ pub fn map_wire_error(operation: CanonicalOperation, code: &str) -> TransportErr
     // A generation conflict means the caller's device/auth binding is stale.
     // Replaying the same signed mutation would be unsafe; the platform must
     // rebind or refresh its authenticated context before constructing a new
-    // request. Cursor expiry is the only safe transparent retry.
-    let retryable = matches!(code, "CursorExpired");
+    // Both generation conflicts and cursor expiry require a fresh operation
+    // context. Replaying the unchanged request is never a safe retry.
+    let retryable = false;
     TransportError::Remote {
         operation,
         code: code.to_owned(),
@@ -1526,6 +1544,50 @@ pub(crate) fn validate_signed_request_context(
         }
         return Ok(());
     }
+    if operation == CanonicalOperation::RebindDeviceAuthentication {
+        let device = body
+            .get("actorDeviceId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                TransportError::Serialization("rebind body is missing actorDeviceId".into())
+            })?;
+        if device != auth.device_id {
+            return Err(TransportError::DeviceBindingMismatch {
+                body: device.to_owned(),
+                authenticated: auth.device_id.clone(),
+            });
+        }
+        let current_jkt = body
+            .get("currentDpopJkt")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                TransportError::Serialization("rebind body is missing currentDpopJkt".into())
+            })?;
+        validate_jkt(current_jkt)?;
+        let new_jkt = body
+            .get("newDpopJkt")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                TransportError::Serialization("rebind body is missing newDpopJkt".into())
+            })?;
+        validate_jkt(new_jkt)?;
+        if new_jkt != auth.dpop_jkt {
+            return Err(TransportError::DpopBindingMismatch);
+        }
+        let actual = body
+            .get("expectedAuthGeneration")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| {
+                TransportError::Serialization(
+                    "rebind body is missing expectedAuthGeneration".into(),
+                )
+            })?;
+        let expected = auth_generation.ok_or(TransportError::MissingAuthGeneration)?;
+        if expected != actual {
+            return Err(TransportError::AuthGenerationMismatch { expected, actual });
+        }
+        return Ok(());
+    }
     if let Some(device) = body
         .get("actorDeviceId")
         .or_else(|| body.get("deviceId"))
@@ -1573,9 +1635,14 @@ fn query_request<T: Serialize>(
 ) -> Result<PreparedRequest, TransportError> {
     let value = serde_json::to_value(request)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
-    let object = value.as_object().ok_or_else(|| {
-        TransportError::Serialization("generated query request is not an object".into())
-    })?;
+    let Some(object) = value.as_object() else {
+        if value.is_null() {
+            return read_request(auth, operation, String::new());
+        }
+        return Err(TransportError::Serialization(
+            "generated query request is not an object".into(),
+        ));
+    };
     let mut fields = Vec::new();
     for (key, value) in object {
         if key == "$type" {
@@ -1609,10 +1676,15 @@ fn read_request(
 ) -> Result<PreparedRequest, TransportError> {
     auth.validate()?;
     let route = canonical_route(operation);
+    let path = if query.is_empty() {
+        route.path.to_owned()
+    } else {
+        format!("{}?{}", route.path, query)
+    };
     Ok(PreparedRequest {
         operation,
         method: "GET".into(),
-        path: format!("{}?{}", route.path, query),
+        path,
         authorization: auth.authorization.clone(),
         dpop: auth.dpop_proof.clone(),
         body: None,

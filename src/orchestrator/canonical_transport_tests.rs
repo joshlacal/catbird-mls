@@ -221,6 +221,182 @@ fn clean_read_requests_use_generated_names_and_transport_auth() {
 }
 
 #[test]
+fn parameterless_get_blob_usage_has_no_trailing_query_delimiter() {
+    let request = CleanChatRequest::GetBlobUsage(
+        crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsage,
+    );
+    let auth = CleanChatAuthContext::new(
+        auth().authorization,
+        auth().dpop_proof,
+        auth().dpop_jkt,
+        auth().device_id,
+    );
+    let prepared = request.prepare(&auth).expect("getBlobUsage prepares");
+    assert_eq!(prepared.path, "/xrpc/blue.catbird.chat.getBlobUsage");
+    assert!(prepared.body.is_none());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let ffi_auth = super::canonical_transport::CleanChatAuthContextFfi {
+            authorization: auth.authorization,
+            dpop_proof: auth.dpop_proof,
+            dpop_jkt: auth.dpop_jkt,
+            device_id: auth.device_id,
+            auth_generation: None,
+        };
+        let prepared = super::canonical_transport::prepare_clean_chat_request(
+            ffi_auth,
+            super::canonical_transport::CleanChatOperationFfi::GetBlobUsage,
+            b"null".to_vec(),
+        )
+        .expect("FFI getBlobUsage prepares");
+        assert_eq!(prepared.path, "/xrpc/blue.catbird.chat.getBlobUsage");
+    }
+}
+
+#[test]
+fn get_blob_preserves_arbitrary_binary_response_bytes() {
+    let body = [0_u8, 0xff, 0x80, b'\n', 0_u8];
+    assert_eq!(
+        super::canonical_transport::decode_clean_chat_blob_response(&body).unwrap(),
+        body
+    );
+    assert!(matches!(
+        CleanChatResponse::decode(CanonicalOperation::GetBlob, &body),
+        Err(TransportError::UnsupportedOperation {
+            operation: CanonicalOperation::GetBlob,
+            ..
+        })
+    ));
+
+    #[cfg(not(target_arch = "wasm32"))]
+    assert_eq!(
+        super::canonical_transport::decode_clean_chat_blob(body.to_vec()).unwrap(),
+        body
+    );
+}
+
+fn rebind_request_json(
+    actor_device_id: &str,
+    current_dpop_jkt: &str,
+    new_dpop_jkt: &str,
+    expected_generation: i64,
+) -> Vec<u8> {
+    serde_json::json!({
+        "signedRequest": {
+            "body": {
+                "actorDeviceId": actor_device_id,
+                "actorDid": "did:plc:z72i7hdynmk67x4h5wqf3s6a",
+                "currentDpopJkt": current_dpop_jkt,
+                "expectedAuthGeneration": expected_generation,
+                "idempotencyKey": "22222222-2222-4222-8222-222222222222",
+                "keyId": "test-key",
+                "newDpopJkt": new_dpop_jkt,
+                "signatureDomain": "CATBIRD-CHAT-DEVICE-REBIND\u{0000}",
+                "signedAt": "2026-08-16T12:00:00.000Z"
+            },
+            "signature": {"$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}
+        }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+#[test]
+fn rebind_binds_device_generation_and_new_jkt() {
+    let auth = auth();
+    let valid: serde_json::Value = serde_json::from_slice(&rebind_request_json(
+        &auth.device_id,
+        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        &auth.dpop_jkt,
+        7,
+    ))
+    .unwrap();
+    assert!(super::canonical_transport::validate_signed_request_context(
+        &auth,
+        Some(7),
+        CanonicalOperation::RebindDeviceAuthentication,
+        &valid,
+    )
+    .is_ok());
+
+    let wrong_device: serde_json::Value = serde_json::from_slice(&rebind_request_json(
+        "99999999-9999-4999-8999-999999999999",
+        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        &auth.dpop_jkt,
+        7,
+    ))
+    .unwrap();
+    assert!(matches!(
+        super::canonical_transport::validate_signed_request_context(
+            &auth,
+            Some(7),
+            CanonicalOperation::RebindDeviceAuthentication,
+            &wrong_device,
+        ),
+        Err(TransportError::DeviceBindingMismatch { .. })
+    ));
+    let wrong_generation: serde_json::Value = serde_json::from_slice(&rebind_request_json(
+        &auth.device_id,
+        "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+        &auth.dpop_jkt,
+        8,
+    ))
+    .unwrap();
+    assert!(matches!(
+        super::canonical_transport::validate_signed_request_context(
+            &auth,
+            Some(7),
+            CanonicalOperation::RebindDeviceAuthentication,
+            &wrong_generation,
+        ),
+        Err(TransportError::AuthGenerationMismatch {
+            expected: 7,
+            actual: 8
+        })
+    ));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn rebind_ffi_binds_device_generation_and_new_jkt() {
+    let auth = auth();
+    let context = super::canonical_transport::CleanChatAuthContextFfi {
+        authorization: auth.authorization,
+        dpop_proof: auth.dpop_proof,
+        dpop_jkt: auth.dpop_jkt.clone(),
+        device_id: auth.device_id.clone(),
+        auth_generation: Some(7),
+    };
+    let prepared = super::canonical_transport::prepare_clean_chat_request(
+        context.clone(),
+        super::canonical_transport::CleanChatOperationFfi::RebindDeviceAuthentication,
+        rebind_request_json(
+            &auth.device_id,
+            "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            &auth.dpop_jkt,
+            7,
+        ),
+    )
+    .expect("valid rebind prepares");
+    assert_eq!(prepared.method, "POST");
+    assert!(matches!(
+        super::canonical_transport::prepare_clean_chat_request(
+            context,
+            super::canonical_transport::CleanChatOperationFfi::RebindDeviceAuthentication,
+            rebind_request_json(
+                &auth.device_id,
+                "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+                &auth.dpop_jkt,
+                8,
+            ),
+        ),
+        Err(super::canonical_transport::CleanChatTransportFfiError::InvalidRequest { message })
+            if message.contains("authGeneration")
+    ));
+}
+
+#[test]
 fn media_specific_routes_have_typed_blockers() {
     let subscription = CleanChatRequest::SubscribeEvents(
         crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEvents {
@@ -455,7 +631,7 @@ fn generated_wire_errors_keep_operation_and_retry_contract() {
         TransportError::Remote {
             operation: CanonicalOperation::GetConversations,
             code: "CursorExpired".into(),
-            retryable: true,
+            retryable: false,
         }
     );
     assert_eq!(
