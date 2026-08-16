@@ -1,21 +1,277 @@
-//! Canonical clean-chat XRPC route inventory.
+//! Internal transport for the generated clean-chat XRPC surface.
 //!
-//! The orchestrator deliberately keeps MLS bytes and recovery state behind the
-//! existing [`MLSAPIClient`](super::api_client::MLSAPIClient) trait. Canonical
-//! `blue.catbird.chat.*` procedures carry signed generated envelopes, so this
-//! module exposes only the generated route markers that a platform transport
-//! must use. It does not synthesize a signed request or reinterpret legacy
-//! callback arguments as a clean-chat request.
-
-#![allow(dead_code)]
+//! This is intentionally a transport seam, not a second protocol
+//! implementation. The platform owns OAuth/DPoP proof construction and the
+//! clean-chat transcript projector. We consume those exact values, bind them
+//! to the generated request, and serialize the generated DTO without routing
+//! through the legacy `blue.catbird.mlsChat.*` surface.
 
 use crate::atproto::blue_catbird::chat::{
-    create_conversation::CreateConversationRequest, enroll_device::EnrollDeviceRequest,
-    get_conversations::GetConversationsRequest, get_entries::GetEntriesRequest,
-    replenish_key_packages::ReplenishKeyPackagesRequest, request_leave::RequestLeaveRequest,
-    send_message::SendMessageRequest, submit_transition::SubmitTransitionRequest,
+    create_conversation::CreateConversationRequest,
+    enroll_device::EnrollDeviceRequest,
+    get_conversations::{GetConversations, GetConversationsRequest},
+    get_entries::{GetEntries, GetEntriesRequest},
+    replenish_key_packages::{ReplenishKeyPackages, ReplenishKeyPackagesRequest},
+    request_leave::RequestLeaveRequest,
+    send_message::SendMessageRequest,
+    submit_transition::SubmitTransitionRequest,
 };
+use crate::atproto::jacquard_common::deps::bytes::Bytes;
 use crate::atproto::jacquard_common::xrpc::XrpcEndpoint;
+use openmls::prelude::SignatureScheme;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::signatures::Signer;
+use serde::Serialize;
+use std::str::FromStr;
+
+const REPLENISH_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REPLENISH\0";
+
+/// The already-authenticated transport material supplied by the platform.
+///
+/// `authorization` and `dpop_proof` are opaque on purpose: Nest/DPoP owns
+/// their construction and refresh/nonce policy. The Rust orchestrator only
+/// ensures that both are present and that the signed mutation's JKT/device
+/// agree with the same authenticated device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TransportAuth {
+    pub(crate) authorization: String,
+    pub(crate) dpop_proof: String,
+    pub(crate) dpop_jkt: String,
+    pub(crate) device_id: String,
+}
+
+impl TransportAuth {
+    fn validate(&self) -> Result<(), TransportError> {
+        if self.authorization.trim().is_empty() || self.dpop_proof.trim().is_empty() {
+            return Err(TransportError::MissingAuthentication);
+        }
+        if self.dpop_jkt.trim().is_empty() || self.device_id.trim().is_empty() {
+            return Err(TransportError::MissingDeviceBinding);
+        }
+        Ok(())
+    }
+}
+
+/// A serialized request ready for the platform's HTTP client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedRequest {
+    pub(crate) method: &'static str,
+    pub(crate) path: String,
+    pub(crate) authorization: String,
+    pub(crate) dpop: String,
+    pub(crate) body: Option<Vec<u8>>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum TransportError {
+    #[error("clean-chat transport authentication is missing")]
+    MissingAuthentication,
+    #[error("clean-chat transport device binding is missing")]
+    MissingDeviceBinding,
+    #[error("signed body device {body} does not match authenticated device {authenticated}")]
+    DeviceBindingMismatch { body: String, authenticated: String },
+    #[error("signed body DPoP JKT does not match authenticated DPoP JKT")]
+    DpopBindingMismatch,
+    #[error("signed body domain is not the canonical key-package replenishment domain")]
+    InvalidSignatureDomain,
+    #[error("canonical signing transcript is empty")]
+    EmptySigningTranscript,
+    #[error("generated clean-chat request serialization failed: {0}")]
+    Serialization(String),
+    #[error("device signing failed")]
+    Signing,
+    #[error("clean-chat signed mutations require an Ed25519 device key")]
+    UnsupportedSigningScheme,
+    #[error("clean-chat {operation:?} failed with {code} (retryable={retryable})")]
+    Remote {
+        operation: CanonicalOperation,
+        code: String,
+        retryable: bool,
+    },
+}
+
+/// Map a generated clean-chat wire error without collapsing it into a legacy
+/// API error. Unknown codes remain visible and non-retryable until their
+/// lexicon contract is explicitly added.
+pub(crate) fn map_wire_error(operation: CanonicalOperation, code: &str) -> TransportError {
+    let retryable = matches!(code, "CursorExpired" | "AuthenticationGenerationConflict");
+    TransportError::Remote {
+        operation,
+        code: code.to_owned(),
+        retryable,
+    }
+}
+
+/// Inputs needed to construct `blue.catbird.chat.replenishKeyPackages`.
+///
+/// The transcript must be the exact canonical DAG-CBOR transcript produced by
+/// the clean-chat projector. In particular, this function never hashes JSON
+/// or generated DTO bytes as a substitute.
+pub(crate) struct ReplenishKeyPackagesInput {
+    pub(crate) actor_did: String,
+    pub(crate) actor_device_id: String,
+    pub(crate) auth_generation: i64,
+    pub(crate) idempotency_key: String,
+    pub(crate) key_id: String,
+    pub(crate) dpop_jkt: String,
+    pub(crate) signature_domain: String,
+    pub(crate) key_packages: Vec<crate::atproto::blue_catbird::chat::KeyPackageArtifact<String>>,
+    pub(crate) signed_at: String,
+    pub(crate) transcript: Vec<u8>,
+}
+
+/// Construct and serialize one canonical key-package replenishment request.
+///
+/// This signs only the caller-provided canonical transcript. The returned
+/// wrapper uses the generated `SignedKeyPackageReplenishment` and
+/// `ReplenishKeyPackages` types, so the wire shape cannot silently drift from
+/// the lexicon. No public FFI is introduced; a platform can call this from an
+/// existing internal adapter once its transcript and DPoP facilities are
+/// available.
+pub(crate) fn replenish_key_packages(
+    auth: &TransportAuth,
+    signer: &SignatureKeyPair,
+    input: ReplenishKeyPackagesInput,
+) -> Result<PreparedRequest, TransportError> {
+    auth.validate()?;
+    if input.actor_device_id != auth.device_id {
+        return Err(TransportError::DeviceBindingMismatch {
+            body: input.actor_device_id,
+            authenticated: auth.device_id.clone(),
+        });
+    }
+    if input.dpop_jkt != auth.dpop_jkt {
+        return Err(TransportError::DpopBindingMismatch);
+    }
+    if input.transcript.is_empty() {
+        return Err(TransportError::EmptySigningTranscript);
+    }
+    if input.signature_domain != REPLENISH_SIGNATURE_DOMAIN {
+        return Err(TransportError::InvalidSignatureDomain);
+    }
+    if signer.signature_scheme() != SignatureScheme::ED25519 || signer.public().len() != 32 {
+        return Err(TransportError::UnsupportedSigningScheme);
+    }
+
+    let signature = signer
+        .sign(&input.transcript)
+        .map_err(|_| TransportError::Signing)?;
+    let body = crate::atproto::blue_catbird::chat::KeyPackageReplenishmentBody::<String> {
+        actor_device_id: input.actor_device_id,
+        actor_did: crate::atproto::jacquard_common::types::string::Did::<String>::from_str(
+            &input.actor_did,
+        )
+        .map_err(|_| TransportError::Serialization("actorDid is not a valid DID".into()))?,
+        auth_generation: input.auth_generation,
+        dpop_jkt: input.dpop_jkt,
+        idempotency_key: input.idempotency_key,
+        key_id: input.key_id,
+        key_packages: input.key_packages,
+        signature_domain: REPLENISH_SIGNATURE_DOMAIN.to_owned(),
+        signature_public_key: Bytes::from(signer.public().to_vec()),
+        signed_at: parse_datetime(input.signed_at)?,
+        extra_data: None,
+    };
+    let signed = crate::atproto::blue_catbird::chat::SignedKeyPackageReplenishment::<String> {
+        body,
+        signature: Bytes::from(signature),
+        extra_data: None,
+    };
+    let request = ReplenishKeyPackages::<String> {
+        signed_request: signed,
+        extra_data: None,
+    };
+    Ok(PreparedRequest {
+        method: "POST",
+        path: ReplenishKeyPackagesRequest::PATH.to_owned(),
+        authorization: auth.authorization.clone(),
+        dpop: auth.dpop_proof.clone(),
+        body: Some(serialize_json(&request)?),
+    })
+}
+
+fn parse_datetime(
+    value: String,
+) -> Result<crate::atproto::blue_catbird::chat::CanonicalDatetime, TransportError> {
+    crate::atproto::blue_catbird::chat::CanonicalDatetime::from_str(&value)
+        .map_err(|_| TransportError::Serialization("signedAt is not a canonical datetime".into()))
+}
+
+fn serialize_json(value: &impl Serialize) -> Result<Vec<u8>, TransportError> {
+    serde_json::to_vec(value).map_err(|error| TransportError::Serialization(error.to_string()))
+}
+
+fn encode_query(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
+}
+
+fn read_request(
+    auth: &TransportAuth,
+    operation: CanonicalOperation,
+    query: String,
+) -> Result<PreparedRequest, TransportError> {
+    auth.validate()?;
+    let route = canonical_route(operation);
+    Ok(PreparedRequest {
+        method: "GET",
+        path: format!("{}?{}", route.path, query),
+        authorization: auth.authorization.clone(),
+        dpop: auth.dpop_proof.clone(),
+        body: None,
+    })
+}
+
+/// Build the generated `getConversations` query, retaining `pageCursor` (the
+/// generated field) rather than reviving the legacy `cursor` spelling.
+pub(crate) fn get_conversations(
+    auth: &TransportAuth,
+    limit: i64,
+    page_cursor: Option<&str>,
+) -> Result<PreparedRequest, TransportError> {
+    let request = GetConversations {
+        limit,
+        page_cursor: page_cursor.map(ToOwned::to_owned),
+    };
+    let value = serde_json::to_value(request)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let mut query = format!("limit={}", value["limit"]);
+    if let Some(cursor) = value["pageCursor"].as_str() {
+        query.push_str("&pageCursor=");
+        query.push_str(&encode_query(cursor));
+    }
+    read_request(auth, CanonicalOperation::GetConversations, query)
+}
+
+/// Build the generated `getEntries` transport-auth query.
+pub(crate) fn get_entries(
+    auth: &TransportAuth,
+    conversation_id: &str,
+    after_seq: i64,
+    limit: i64,
+) -> Result<PreparedRequest, TransportError> {
+    let request = GetEntries {
+        after_seq,
+        conversation_id: conversation_id.to_owned(),
+        limit,
+    };
+    let value = serde_json::to_value(request)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let query = format!(
+        "afterSeq={}&conversationId={}&limit={}",
+        value["afterSeq"],
+        encode_query(value["conversationId"].as_str().unwrap_or_default()),
+        value["limit"]
+    );
+    read_request(auth, CanonicalOperation::GetEntries, query)
+}
 
 /// Canonical operations with a generated `blue.catbird.chat.*` endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

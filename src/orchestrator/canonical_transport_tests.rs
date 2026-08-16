@@ -1,4 +1,28 @@
-use super::canonical_transport::{canonical_route, route_for_nsid, CanonicalOperation};
+use super::canonical_transport::{
+    canonical_route, get_conversations, get_entries, map_wire_error, replenish_key_packages,
+    route_for_nsid, CanonicalOperation, ReplenishKeyPackagesInput, TransportAuth, TransportError,
+};
+
+fn auth() -> TransportAuth {
+    TransportAuth {
+        authorization: "Bearer gateway-token".into(),
+        dpop_proof: "signed-dpop-proof".into(),
+        dpop_jkt: "device-jkt".into(),
+        device_id: "11111111-1111-4111-8111-111111111111".into(),
+    }
+}
+
+fn key_package() -> crate::atproto::blue_catbird::chat::KeyPackageArtifact<String> {
+    use crate::atproto::jacquard_common::deps::bytes::Bytes;
+    crate::atproto::blue_catbird::chat::KeyPackageArtifact {
+        bytes: Bytes::from_static(b"key-package"),
+        content_type: "application/octet-stream".into(),
+        framing: "mls-key-package".into(),
+        key_package_ref: Bytes::from_static(b"ref"),
+        sha256: Bytes::from_static(b"sha256"),
+        extra_data: None,
+    }
+}
 
 #[test]
 fn canonical_routes_never_emit_the_legacy_mls_chat_namespace() {
@@ -76,5 +100,148 @@ fn legacy_nsid_is_not_accepted_as_a_canonical_route() {
     assert_eq!(
         route_for_nsid("blue.catbird.chat.getEntries").map(|route| route.path),
         Some("/xrpc/blue.catbird.chat.getEntries")
+    );
+}
+
+#[test]
+fn clean_read_requests_use_generated_names_and_transport_auth() {
+    let request = get_conversations(&auth(), 25, Some("a cursor")).expect("query request");
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path,
+        "/xrpc/blue.catbird.chat.getConversations?limit=25&pageCursor=a%20cursor"
+    );
+    assert_eq!(request.authorization, "Bearer gateway-token");
+    assert_eq!(request.dpop, "signed-dpop-proof");
+    assert!(request.body.is_none());
+
+    let request = get_entries(&auth(), "conversation/1", 4, 100).expect("entries request");
+    assert_eq!(
+        request.path,
+        "/xrpc/blue.catbird.chat.getEntries?afterSeq=4&conversationId=conversation%2F1&limit=100"
+    );
+}
+
+#[test]
+fn replenishment_serializes_generated_signed_envelope_and_binds_signature() {
+    use base64::Engine as _;
+    use openmls::prelude::SignatureScheme;
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_traits::signatures::Signer;
+    use serde_json::Value;
+
+    let signer = SignatureKeyPair::new(SignatureScheme::ED25519).expect("signer");
+    let request = replenish_key_packages(
+        &auth(),
+        &signer,
+        ReplenishKeyPackagesInput {
+            actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+            actor_device_id: auth().device_id,
+            auth_generation: 1,
+            idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+            key_id: "device-key-id".into(),
+            dpop_jkt: "device-jkt".into(),
+            signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+            key_packages: vec![key_package()],
+            signed_at: "2026-08-16T12:00:00.000Z".into(),
+            transcript: b"canonical-replenishment-transcript".to_vec(),
+        },
+    )
+    .expect("signed request");
+
+    let value: Value = serde_json::from_slice(request.body.as_ref().expect("body")).unwrap();
+    assert_eq!(
+        value["signedRequest"]["body"]["signatureDomain"],
+        "CATBIRD-CHAT-DEVICE-REPLENISH\0"
+    );
+    assert_eq!(
+        value["signedRequest"]["body"]["actorDeviceId"],
+        auth().device_id
+    );
+    assert_eq!(value["signedRequest"]["body"]["dpopJkt"], "device-jkt");
+    assert_eq!(
+        value["signedRequest"]["body"]["keyPackages"][0]["bytes"]["$bytes"],
+        "a2V5LXBhY2thZ2U="
+    );
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(
+            value["signedRequest"]["signature"]["$bytes"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        signature,
+        signer
+            .sign(b"canonical-replenishment-transcript")
+            .expect("sign transcript")
+    );
+}
+
+#[test]
+fn replenishment_rejects_wrong_device_legacy_shape_and_missing_auth() {
+    use openmls::prelude::SignatureScheme;
+    use openmls_basic_credential::SignatureKeyPair;
+
+    let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+    let input = || ReplenishKeyPackagesInput {
+        actor_did: "did:plc:z72i7hdynmk67x4h5wqf3s6a".into(),
+        actor_device_id: "99999999-9999-4999-8999-999999999999".into(),
+        auth_generation: 1,
+        idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+        key_id: "device-key-id".into(),
+        dpop_jkt: "device-jkt".into(),
+        signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+        key_packages: vec![key_package()],
+        signed_at: "2026-08-16T12:00:00.000Z".into(),
+        transcript: b"transcript".to_vec(),
+    };
+    assert!(matches!(
+        replenish_key_packages(&auth(), &signer, input()),
+        Err(TransportError::DeviceBindingMismatch { .. })
+    ));
+
+    let mut bad_auth = auth();
+    bad_auth.dpop_jkt = "different-jkt".into();
+    let mut good_input = input();
+    good_input.actor_device_id = bad_auth.device_id.clone();
+    assert_eq!(
+        replenish_key_packages(&bad_auth, &signer, good_input),
+        Err(TransportError::DpopBindingMismatch)
+    );
+
+    let mut missing = auth();
+    missing.dpop_proof.clear();
+    assert_eq!(
+        get_entries(&missing, "conversation", 0, 10),
+        Err(TransportError::MissingAuthentication)
+    );
+}
+
+#[test]
+fn generated_wire_errors_keep_operation_and_retry_contract() {
+    assert_eq!(
+        map_wire_error(CanonicalOperation::GetEntries, "DeviceRevoked"),
+        TransportError::Remote {
+            operation: CanonicalOperation::GetEntries,
+            code: "DeviceRevoked".into(),
+            retryable: false,
+        }
+    );
+    assert_eq!(
+        map_wire_error(CanonicalOperation::GetConversations, "CursorExpired"),
+        TransportError::Remote {
+            operation: CanonicalOperation::GetConversations,
+            code: "CursorExpired".into(),
+            retryable: true,
+        }
+    );
+    assert_eq!(
+        map_wire_error(CanonicalOperation::ReplenishKeyPackages, "FutureCode"),
+        TransportError::Remote {
+            operation: CanonicalOperation::ReplenishKeyPackages,
+            code: "FutureCode".into(),
+            retryable: false,
+        }
     );
 }
