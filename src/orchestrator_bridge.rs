@@ -8,14 +8,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::orchestrator::{
-    AddMembersServerResult, ConversationListPage, ConversationMetadata, ConversationState,
-    ConversationView, CreateConversationResult, CredentialStore, DebugWipeLocalGroupResult,
-    DeferredRecoveryReport, DeviceInfo, EngineEvent, GroupState, IncomingEnvelope, JoinMethod,
-    KeyPackageRef, KeyPackageStats, KeyPackageSyncResult, MLSAPIClient, MLSOrchestrator,
-    MLSStorageBackend, MemberRole, MemberView, Message, OrchestratorConfig, OrchestratorError,
-    PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState,
-    ProcessExternalCommitResult, ResetRecordOutcome, SendMessageResponse, StartupReconcileReport,
-    SyncCursor,
+    AddMembersServerResult, CleanChatSigningAuthority, ConversationListPage, ConversationMetadata,
+    ConversationState, ConversationView, CreateConversationResult, CredentialStore,
+    DebugWipeLocalGroupResult, DeferredRecoveryReport, DeviceInfo, EngineEvent, GroupState,
+    IncomingEnvelope, JoinMethod, KeyPackageRef, KeyPackageStats, KeyPackageSyncResult,
+    MLSAPIClient, MLSOrchestrator, MLSStorageBackend, MemberRole, MemberView, Message,
+    OrchestratorConfig, OrchestratorError, PendingLocalDelete, PersistedRecoveryBackoff,
+    PersistedRecoveryState, ProcessExternalCommitResult, ResetRecordOutcome, SendMessageResponse,
+    StartupReconcileReport, SyncCursor,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::orchestrator::{
@@ -475,6 +475,17 @@ pub trait OrchestratorCredentialCallback: Send + Sync {
     ) -> Result<(), OrchestratorBridgeError>;
     fn get_signing_key(&self, user_did: String)
         -> Result<Option<Vec<u8>>, OrchestratorBridgeError>;
+    /// Sign an exact clean-chat transcript inside platform-owned key custody.
+    /// Only the public key, signature, and atomic binding snapshot return;
+    /// private key bytes never cross this callback boundary. Binding fields
+    /// are intentionally returned by the authority rather than supplied by
+    /// the caller, preventing an echo of untrusted claims.
+    fn sign_clean_chat_transcript(
+        &self,
+        user_did: String,
+        transcript: Vec<u8>,
+        key_id: String,
+    ) -> Result<Option<CleanChatSigningAuthorityFfi>, OrchestratorBridgeError>;
     fn delete_signing_key(&self, user_did: String) -> Result<(), OrchestratorBridgeError>;
     fn store_mls_did(
         &self,
@@ -494,6 +505,16 @@ pub trait OrchestratorCredentialCallback: Send + Sync {
         &self,
         user_did: String,
     ) -> Result<Option<Vec<Vec<u8>>>, OrchestratorBridgeError>;
+}
+
+/// Public-key/signature result for the non-exporting signed-request callback.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct CleanChatSigningAuthorityFfi {
+    pub public_key: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub device_id: String,
+    pub dpop_jkt: String,
+    pub auth_generation: Option<i64>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2408,6 +2429,30 @@ impl CredentialStore for CredentialAdapter {
         self.0
             .get_signing_key(user_did.to_string())
             .map_err(bridge_err)
+    }
+
+    async fn sign_clean_chat_transcript(
+        &self,
+        user_did: &str,
+        transcript: &[u8],
+        key_id: &str,
+    ) -> crate::orchestrator::Result<Option<CleanChatSigningAuthority>> {
+        let authority = self
+            .0
+            .sign_clean_chat_transcript(
+                user_did.to_string(),
+                transcript.to_vec(),
+                key_id.to_string(),
+            )
+            .map_err(bridge_err)?
+            .map(|authority| CleanChatSigningAuthority {
+                public_key: authority.public_key,
+                signature: authority.signature,
+                device_id: authority.device_id,
+                dpop_jkt: authority.dpop_jkt,
+                auth_generation: authority.auth_generation,
+            });
+        Ok(authority)
     }
 
     async fn delete_signing_key(&self, user_did: &str) -> crate::orchestrator::Result<()> {
@@ -4403,6 +4448,15 @@ mod tests {
             user_did: String,
         ) -> Result<Option<Vec<u8>>, OrchestratorBridgeError> {
             Ok(self.signing_keys.lock().unwrap().get(&user_did).cloned())
+        }
+
+        fn sign_clean_chat_transcript(
+            &self,
+            _user_did: String,
+            _transcript: Vec<u8>,
+            _key_id: String,
+        ) -> Result<Option<CleanChatSigningAuthorityFfi>, OrchestratorBridgeError> {
+            Ok(None)
         }
 
         fn delete_signing_key(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {

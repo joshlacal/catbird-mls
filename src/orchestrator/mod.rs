@@ -41,7 +41,7 @@ pub use constants::*;
 pub use credential_binding::{
     extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,
 };
-pub use credentials::CredentialStore;
+pub use credentials::{CleanChatSigningAuthority, CredentialStore};
 pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
 pub use mls_provider::MlsCryptoContext;

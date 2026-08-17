@@ -9,8 +9,7 @@ use web_time::Instant;
 use super::api_client::MLSAPIClient;
 #[cfg(not(target_arch = "wasm32"))]
 use super::canonical_transport::{
-    prepare_signed_request_with_signer, CanonicalOperation, CleanChatSigningContext,
-    PreparedRequest, TransportError,
+    CanonicalOperation, CleanChatSigningContext, PreparedRequest, TransportError,
 };
 use super::constants;
 use super::credentials::CredentialStore;
@@ -463,19 +462,15 @@ where
                 "signing actor DID does not match the initialized orchestrator actor".into(),
             ));
         }
-        let key_data = self
+        let prepared =
+            super::canonical_transport::prepare_signed_body(&binding, operation, &body_json)?;
+        let authority = self
             .credentials()
-            .get_signing_key(&user_did)
+            .sign_clean_chat_transcript(&user_did, &prepared.transcript, &prepared.key_id)
             .await
             .map_err(|error| TransportError::Credential(error.to_string()))?
             .ok_or(TransportError::MissingSigningKey)?;
-        let signer: openmls_basic_credential::SignatureKeyPair = serde_json::from_slice(&key_data)
-            .map_err(|_| {
-                TransportError::Credential(
-                    "configured signing key is not a valid Ed25519 key pair".into(),
-                )
-            })?;
-        prepare_signed_request_with_signer(&binding, operation, body_json, &signer)
+        super::canonical_transport::prepare_signed_request_with_authority(prepared, authority)
     }
 
     /// Access the configuration.

@@ -13,9 +13,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-// Import StorageId to wrap public keys for storage
-use openmls_basic_credential::StorageId;
-
 use crate::error::MLSError;
 use crate::mls_context::MLSContext as MLSContextInner;
 use crate::orchestrator::mls_provider::MlsCryptoContext;
@@ -1997,14 +1994,11 @@ impl MLSContext {
         let signer: SignatureKeyPair =
             serde_json::from_slice(&key_data).map_err(|_| MLSError::SerializationError)?;
 
-        // Store in provider (HybridStorage will route to Keychain)
-        // We need to extract the public key to use as the key
-        // Assuming SignatureKeyPair has a .public() method or similar
-        // OpenMLS SignatureKeyPair usually has .public() returning SignaturePublicKey
-
-        // Use the provider's write method
-        // Wrap the public key bytes in StorageId which implements SignaturePublicKey trait
-        let storage_id = StorageId::from(signer.public().to_vec());
+        // Store in provider (HybridStorage will route to Keychain).  The
+        // storage key must be the same scheme-qualified id that
+        // `SignatureKeyPair::read` derives; using only the raw public bytes
+        // makes an imported signer disappear on the next context restart.
+        let storage_id = signer.id();
         inner
             .provider
             .storage()

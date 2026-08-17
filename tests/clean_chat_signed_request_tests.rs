@@ -2,7 +2,8 @@ mod e2e_harness;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_mls::orchestrator::{
-    CanonicalOperation, CleanChatSigningContext, CredentialStore, TransportError,
+    CanonicalOperation, CleanChatSigningAuthority, CleanChatSigningContext, CredentialStore,
+    TransportError,
 };
 use e2e_harness::TestWorld;
 use openmls::prelude::SignatureScheme;
@@ -20,6 +21,7 @@ fn replenishment_body(signer: &SignatureKeyPair) -> Vec<u8> {
         URL_SAFE_NO_PAD.encode(Sha256::digest(signer.public()))
     };
     let body = json!({
+        "$type": "blue.catbird.chat.defs#keyPackageReplenishmentBody",
         "actorDid": format!("did:plc:{ACTOR_NAME}"),
         "actorDeviceId": DEVICE_ID,
         "authGeneration": 1,
@@ -27,15 +29,14 @@ fn replenishment_body(signer: &SignatureKeyPair) -> Vec<u8> {
         "idempotencyKey": "22222222-2222-4222-8222-222222222222",
         "keyId": key_id,
         "keyPackages": [{
-            "bytes": {"$bytes": STANDARD.encode(b"key-package")},
+            "bytes": STANDARD.encode(b"key-package"),
             "contentType": "keyPackage",
             "framing": "mlsMessage",
-            "keyPackageRef": {"$bytes": STANDARD.encode([1u8; 32])},
-            "sha256": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
-                2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+            "keyPackageRef": STANDARD.encode([1u8; 32]),
+            "sha256": STANDARD.encode([2u8; 32])
         }],
         "signatureDomain": "CATBIRD-CHAT-DEVICE-REPLENISH\0",
-        "signaturePublicKey": {"$bytes": STANDARD.encode(signer.public())},
+        "signaturePublicKey": STANDARD.encode(signer.public()),
         "signedAt": "2026-08-16T12:00:00.000Z"
     });
     serde_json::to_vec(&body).unwrap()
@@ -64,6 +65,9 @@ async fn configured_credential_store_signs_without_transport_headers() {
         .store_signing_key(&client.did, &serialized)
         .await
         .unwrap();
+    client
+        .credentials
+        .set_clean_chat_binding(&client.did, DEVICE_ID, DPOP_JKT, Some(1));
 
     let prepared = client
         .orchestrator
@@ -78,13 +82,75 @@ async fn configured_credential_store_signs_without_transport_headers() {
     assert!(prepared.authorization.is_empty());
     assert!(prepared.dpop.is_empty());
     let wire: Value = serde_json::from_slice(prepared.body.as_deref().unwrap()).unwrap();
+    assert_eq!(wire["signedRequest"].as_object().unwrap().len(), 2);
+    assert!(wire["signedRequest"]["signature"].is_string());
     assert_eq!(
-        wire["signedRequest"]["signature"]["$bytes"]
-            .as_str()
-            .unwrap()
-            .len(),
+        wire["signedRequest"]["body"]["$type"],
+        "blue.catbird.chat.defs#keyPackageReplenishmentBody"
+    );
+    assert_eq!(
+        wire["signedRequest"]["signature"].as_str().unwrap().len(),
         88
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_orchestrator_requires_atomic_authority_snapshot() {
+    let mut world = TestWorld::new();
+    world.add_client(ACTOR_NAME).await;
+    let client = world.client(ACTOR_NAME);
+    client.orchestrator.initialize(&client.did).await.unwrap();
+    let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+    client
+        .credentials
+        .set_clean_chat_authority(CleanChatSigningAuthority {
+            public_key: signer.public().to_vec(),
+            signature: vec![0; 64],
+            device_id: DEVICE_ID.into(),
+            dpop_jkt: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+            auth_generation: Some(1),
+        });
+
+    let result = client
+        .orchestrator
+        .prepare_clean_chat_signed_request(
+            binding(),
+            CanonicalOperation::ReplenishKeyPackages,
+            replenishment_body(&signer),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(TransportError::SigningAuthorityMismatch { field: "dpopJkt" })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_orchestrator_rejects_authority_signature_for_another_transcript() {
+    let mut world = TestWorld::new();
+    world.add_client(ACTOR_NAME).await;
+    let client = world.client(ACTOR_NAME);
+    client.orchestrator.initialize(&client.did).await.unwrap();
+    let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+    client
+        .credentials
+        .set_clean_chat_authority(CleanChatSigningAuthority {
+            public_key: signer.public().to_vec(),
+            signature: vec![0; 64],
+            device_id: DEVICE_ID.into(),
+            dpop_jkt: DPOP_JKT.into(),
+            auth_generation: Some(1),
+        });
+
+    let result = client
+        .orchestrator
+        .prepare_clean_chat_signed_request(
+            binding(),
+            CanonicalOperation::ReplenishKeyPackages,
+            replenishment_body(&signer),
+        )
+        .await;
+    assert!(matches!(result, Err(TransportError::SignatureVerification)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -117,6 +183,9 @@ async fn signed_orchestrator_rejects_invalid_configured_key_material() {
         .store_signing_key(&client.did, b"not-a-signature-key")
         .await
         .unwrap();
+    client
+        .credentials
+        .set_clean_chat_binding(&client.did, DEVICE_ID, DPOP_JKT, Some(1));
     let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
 
     let result = client
@@ -127,9 +196,10 @@ async fn signed_orchestrator_rejects_invalid_configured_key_material() {
             replenishment_body(&signer),
         )
         .await;
-    assert!(
-        matches!(result, Err(TransportError::Credential(message)) if message.contains("Ed25519"))
-    );
+    assert!(matches!(
+        result,
+        Err(TransportError::Credential(message)) if message.contains("test signer is invalid")
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
