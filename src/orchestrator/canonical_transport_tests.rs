@@ -1073,6 +1073,7 @@ mod signed_request_orchestrator_red_tests {
     use openmls::prelude::SignatureScheme;
     use openmls_basic_credential::SignatureKeyPair;
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
 
     const ACTOR_DID: &str = "did:plc:z72i7hdynmk67x4h5wqf3s6a";
 
@@ -1287,6 +1288,19 @@ mod signed_request_orchestrator_red_tests {
         SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public_key)
     }
 
+    fn fixture_signing_key(seed_hex: &str, public_key_hex: &str) -> SignatureKeyPair {
+        let seed: [u8; 32] = hex::decode(seed_hex)
+            .expect("fixture signing seed hex")
+            .try_into()
+            .expect("fixture signing seed length");
+        let public_key = hex::decode(public_key_hex).expect("fixture public key hex");
+        let derived_public = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(public_key, derived_public, "fixture signing key is stable");
+        SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public_key)
+    }
+
     #[test]
     fn signed_orchestrator_matches_server_strict_control_transcript_vectors() {
         let fixture: Value = serde_json::from_str(include_str!(
@@ -1302,7 +1316,6 @@ mod signed_request_orchestrator_red_tests {
             .expect("server transcript cases");
         assert_eq!(cases.len(), 13, "all strict control mutations stay covered");
         assert_eq!(transcript_cases.len(), cases.len());
-        let finish_signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
 
         for case in cases {
             let body = fixture_wire_value(case["body"].clone());
@@ -1340,20 +1353,62 @@ mod signed_request_orchestrator_red_tests {
                 .find(|candidate| candidate["signedRequestRef"] == case["signedRequestRef"])
                 .expect("strict server transcript counterpart");
             assert_eq!(
-                hex::encode(prepared.transcript),
+                hex::encode(&prepared.transcript),
                 transcript_case["signingTranscriptHex"]
                     .as_str()
                     .expect("fixture transcript"),
                 "server transcript mismatch for {}",
                 case["signedRequestRef"]
             );
+            let signing_domain = transcript_case["signingDomain"]
+                .as_str()
+                .expect("control fixture signing domain");
+            let canonical_body = prepared
+                .transcript
+                .get(signing_domain.len()..)
+                .expect("control transcript includes signing domain");
+            assert_eq!(
+                hex::encode(canonical_body),
+                transcript_case["unsignedSigningProjectionCanonicalDagCborHex"]
+            );
+            assert_eq!(
+                STANDARD.encode(Sha256::digest(&prepared.transcript)),
+                transcript_case["requestDigest"]
+            );
+            let mut fingerprint_input = b"CATBIRD-CHAT-CONTROL-ENTRY-FINGERPRINT\0".to_vec();
+            fingerprint_input.extend_from_slice(
+                &hex::decode(
+                    transcript_case["canonicalDagCborHex"]
+                        .as_str()
+                        .expect("control canonical fingerprint CBOR"),
+                )
+                .expect("control canonical fingerprint CBOR hex"),
+            );
+            assert_eq!(
+                hex::encode(Sha256::digest(fingerprint_input)),
+                transcript_case["fingerprintSha256Hex"]
+            );
 
-            let mut generated_body = body.clone();
-            generated_body["keyId"] = Value::String(derive_key_id(finish_signer.public()));
+            let key_ref = case["historicalPublicKeyRef"]
+                .as_str()
+                .expect("historical key reference");
+            let finish_signer = fixture_signing_key(
+                fixture["testOnlySigningSeedsHex"][key_ref]
+                    .as_str()
+                    .expect("fixture signing seed"),
+                contract["controlEntryFingerprints"]["historicalPublicKeys"][key_ref]
+                    .as_str()
+                    .expect("fixture historical public key"),
+            );
+            assert_eq!(
+                derive_key_id(finish_signer.public()),
+                body["keyId"].as_str().expect("control fixture keyId"),
+                "control body keyId must remain bound to its fixture signer"
+            );
             let wire = prepare_signed_request_with_signer(
                 &binding,
                 operation,
-                serde_json::to_vec(&generated_body).expect("generated fixture serializes"),
+                serde_json::to_vec(&body).expect("generated fixture serializes"),
                 &finish_signer,
             )
             .unwrap_or_else(|error| {
@@ -1366,10 +1421,39 @@ mod signed_request_orchestrator_red_tests {
                 serde_json::from_slice(wire.body.as_deref().unwrap()).expect("signed wire JSON");
             assert_eq!(wire["signedRequest"].as_object().unwrap().len(), 2);
             assert!(wire["signedRequest"].get("$type").is_none());
+            let expected_wrapper = serde_json::json!({
+                "body": body,
+                "signature": transcript_case["signature"]
+            });
+            assert_eq!(wire["signedRequest"], expected_wrapper);
+            assert_eq!(
+                hex::encode(
+                    serde_json::to_vec(&wire["signedRequest"]).expect("control wrapper serializes")
+                ),
+                hex::encode(
+                    serde_json::to_vec(&expected_wrapper)
+                        .expect("control fixture wrapper serializes")
+                )
+            );
+            assert_eq!(
+                wire["signedRequest"]["signature"], transcript_case["signature"],
+                "emitted control signature must equal the approved fixture"
+            );
         }
 
         let mut blob = contract["signedMutator"]["body"].clone();
         blob = fixture_wire_value(blob);
+        let blob_signer = fixture_signing_key(
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+            contract["signedMutator"]["publicKeyHex"]
+                .as_str()
+                .expect("blob fixture public key"),
+        );
+        assert_eq!(
+            derive_key_id(blob_signer.public()),
+            blob["keyId"].as_str().expect("blob fixture keyId"),
+            "blob body keyId must remain bound to its fixture signer"
+        );
         let blob_binding = CleanChatSigningContext {
             actor_did: blob["actorDid"].as_str().expect("blob actor DID").into(),
             device_id: blob["actorDeviceId"]
@@ -1390,23 +1474,68 @@ mod signed_request_orchestrator_red_tests {
         )
         .expect("blob deletion fixture projects");
         assert_eq!(
-            hex::encode(prepared.transcript),
+            hex::encode(&prepared.transcript),
             contract["signedMutator"]["transcriptHex"]
                 .as_str()
                 .expect("blob fixture transcript")
         );
-        blob["keyId"] = Value::String(derive_key_id(finish_signer.public()));
+        let blob_domain = blob["signatureDomain"]
+            .as_str()
+            .expect("blob signing domain");
+        assert_eq!(
+            hex::encode(
+                prepared
+                    .transcript
+                    .get(blob_domain.len()..)
+                    .expect("blob transcript includes signing domain")
+            ),
+            contract["signedMutator"]["canonicalUnsignedDagCborHex"]
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&prepared.transcript)),
+            contract["signedMutator"]["canonicalRequestDigestHex"]
+        );
         let wire = prepare_signed_request_with_signer(
             &blob_binding,
             CanonicalOperation::DeleteBlob,
             serde_json::to_vec(&blob).expect("blob generated fixture serializes"),
-            &finish_signer,
+            &blob_signer,
         )
         .expect("blob generated DTO wrapper decodes");
         let wire: Value =
             serde_json::from_slice(wire.body.as_deref().unwrap()).expect("blob signed wire JSON");
         assert_eq!(wire["signedRequest"].as_object().unwrap().len(), 2);
         assert!(wire["signedRequest"].get("$type").is_none());
+        let expected_blob_signature = STANDARD.encode(
+            hex::decode(
+                contract["signedMutator"]["signatureHex"]
+                    .as_str()
+                    .expect("blob fixture signature"),
+            )
+            .expect("blob fixture signature hex"),
+        );
+        let expected_wrapper = serde_json::json!({
+            "body": blob,
+            "signature": expected_blob_signature
+        });
+        assert_eq!(wire["signedRequest"], expected_wrapper);
+        assert_eq!(
+            hex::encode(
+                serde_json::to_vec(&wire["signedRequest"]).expect("blob wrapper serializes")
+            ),
+            hex::encode(
+                serde_json::to_vec(&expected_wrapper).expect("blob fixture wrapper serializes")
+            )
+        );
+        assert_eq!(
+            hex::encode(
+                STANDARD
+                    .decode(wire["signedRequest"]["signature"].as_str().unwrap())
+                    .expect("blob signature base64")
+            ),
+            contract["signedMutator"]["signatureHex"],
+            "emitted blob signature must equal the approved fixture"
+        );
     }
 
     #[test]
