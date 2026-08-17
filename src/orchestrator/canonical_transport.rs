@@ -114,6 +114,19 @@ impl CleanChatAuthContext {
     }
 }
 
+/// The binding material used while constructing a clean-chat signature.
+///
+/// This deliberately contains no access token or DPoP proof. Those values are
+/// transport credentials owned by the caller's selected gateway (direct DS or
+/// Nest proxy); signing must not require, mint, or export either value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanChatSigningContext {
+    pub actor_did: String,
+    pub device_id: String,
+    pub dpop_jkt: String,
+    pub auth_generation: Option<i64>,
+}
+
 impl TransportAuth {
     fn validate(&self) -> Result<(), TransportError> {
         if self.authorization.trim().is_empty() || self.dpop_proof.trim().is_empty() {
@@ -164,6 +177,10 @@ pub enum TransportError {
     },
     #[error("signed body domain is not the canonical key-package replenishment domain")]
     InvalidSignatureDomain,
+    #[error("clean-chat signed request has no configured Ed25519 device key")]
+    MissingSigningKey,
+    #[error("clean-chat credential store failed: {0}")]
+    Credential(String),
     #[error("canonical signing transcript is empty")]
     EmptySigningTranscript,
     #[error("generated clean-chat request serialization failed: {0}")]
@@ -516,16 +533,40 @@ impl From<CleanChatAuthContextFfi> for CleanChatAuthContext {
 }
 
 /// UniFFI-safe prepared request. The request body is the generated DTO's JSON
-/// bytes; platform clients own the actual HTTP execution.
+/// bytes; platform clients own the actual HTTP execution. Unsigned requests
+/// carry their already-authenticated transport headers as `Some`; signed
+/// requests deliberately return `None` so the selected direct-DS or Nest
+/// adapter can attach its own transport credentials.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
 pub struct CleanChatPreparedRequestFfi {
     pub operation: CleanChatOperationFfi,
     pub method: String,
     pub path: String,
-    pub authorization: String,
-    pub dpop: String,
+    pub authorization: Option<String>,
+    pub dpop: Option<String>,
     pub body: Option<Vec<u8>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct CleanChatSigningContextFfi {
+    pub actor_did: String,
+    pub device_id: String,
+    pub dpop_jkt: String,
+    pub auth_generation: Option<i64>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<CleanChatSigningContextFfi> for CleanChatSigningContext {
+    fn from(context: CleanChatSigningContextFfi) -> Self {
+        Self {
+            actor_did: context.actor_did,
+            device_id: context.device_id,
+            dpop_jkt: context.dpop_jkt,
+            auth_generation: context.auth_generation,
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -635,8 +676,8 @@ pub fn prepare_clean_chat_request(
         operation: prepared.operation.into(),
         method: prepared.method,
         path: prepared.path,
-        authorization: prepared.authorization,
-        dpop: prepared.dpop,
+        authorization: Some(prepared.authorization),
+        dpop: Some(prepared.dpop),
         body: prepared.body,
     })
 }
@@ -1175,11 +1216,616 @@ pub(crate) fn derive_key_id(public_key: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(public_key))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
+#[cfg(not(target_arch = "wasm32"))]
+const DEVICE_REBIND_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REBIND\0";
+#[cfg(not(target_arch = "wasm32"))]
+const DEVICE_REVOKE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REVOKE\0";
+#[cfg(not(target_arch = "wasm32"))]
+const CREATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CREATE\0";
+#[cfg(not(target_arch = "wasm32"))]
+const COMMIT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-COMMIT\0";
+#[cfg(not(target_arch = "wasm32"))]
+const POLICY_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-POLICY\0";
+#[cfg(not(target_arch = "wasm32"))]
+const ACCEPT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-ACCEPT\0";
+#[cfg(not(target_arch = "wasm32"))]
+const MESSAGE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-MESSAGE\0";
+#[cfg(not(target_arch = "wasm32"))]
+const METADATA_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-METADATA\0";
+#[cfg(not(target_arch = "wasm32"))]
+const TYPING_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-TYPING\0";
+#[cfg(not(target_arch = "wasm32"))]
+const BLOB_PREPARE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-BLOB-PREPARE\0";
+#[cfg(not(target_arch = "wasm32"))]
+const BLOB_DELETE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-BLOB-DELETE\0";
+#[cfg(not(target_arch = "wasm32"))]
+const RESET_REQUEST_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-RESET-REQUEST\0";
+#[cfg(not(target_arch = "wasm32"))]
+const RESET_ACTIVATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-RESET-ACTIVATE\0";
+#[cfg(not(target_arch = "wasm32"))]
+const LEAF_RECOVERY_REQUEST_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\0";
+#[cfg(not(target_arch = "wasm32"))]
+const LEAF_RECOVERY_CANCEL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAF-RECOVERY-CANCEL\0";
+#[cfg(not(target_arch = "wasm32"))]
+const LEAF_RECOVERY_FULFILL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\0";
+#[cfg(not(target_arch = "wasm32"))]
+const CLOSE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CLOSE\0";
+#[cfg(not(target_arch = "wasm32"))]
+const LEAVE_REQUEST_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAVE-REQUEST\0";
+#[cfg(not(target_arch = "wasm32"))]
+const LEAVE_ZERO_LEAF_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAVE-ZERO-LEAF\0";
+#[cfg(not(target_arch = "wasm32"))]
+const LEAVE_CANCEL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAVE-CANCEL\0";
+#[cfg(not(target_arch = "wasm32"))]
+const LEAVE_FULFILL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAVE-FULFILL-COMMIT\0";
+#[cfg(not(target_arch = "wasm32"))]
+const WELCOME_ACK_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-WELCOME-ACK\0";
+#[cfg(not(target_arch = "wasm32"))]
+const WELCOME_REJECT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-WELCOME-REJECT\0";
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy)]
+struct SignedRequestSpec {
+    domain: &'static str,
+    body_type: &'static str,
+    variant: Option<&'static str>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn signed_request_spec(
+    operation: CanonicalOperation,
+    variant: Option<&str>,
+) -> Result<SignedRequestSpec, TransportError> {
+    let spec = match operation {
+        CanonicalOperation::AcceptConversation => SignedRequestSpec {
+            domain: ACCEPT_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#participantAcceptanceBody",
+            variant: None,
+        },
+        CanonicalOperation::AcknowledgeWelcome => SignedRequestSpec {
+            domain: WELCOME_ACK_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#welcomeAcknowledgementBody",
+            variant: None,
+        },
+        CanonicalOperation::ActivateReset => SignedRequestSpec {
+            domain: RESET_ACTIVATE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#resetActivationBody",
+            variant: None,
+        },
+        CanonicalOperation::CancelLeafRecovery => SignedRequestSpec {
+            domain: LEAF_RECOVERY_CANCEL_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#leafRecoveryCancellationBody",
+            variant: None,
+        },
+        CanonicalOperation::CancelLeave => SignedRequestSpec {
+            domain: LEAVE_CANCEL_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#leaveCancellationBody",
+            variant: None,
+        },
+        CanonicalOperation::CloseConversation => SignedRequestSpec {
+            domain: CLOSE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#conversationCloseBody",
+            variant: None,
+        },
+        CanonicalOperation::CreateConversation => SignedRequestSpec {
+            domain: CREATE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#creationBody",
+            variant: None,
+        },
+        CanonicalOperation::DeleteBlob => SignedRequestSpec {
+            domain: BLOB_DELETE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#blobDeletionBody",
+            variant: None,
+        },
+        CanonicalOperation::SendMessage => SignedRequestSpec {
+            domain: MESSAGE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#applicationSendBody",
+            variant: None,
+        },
+        CanonicalOperation::PrepareBlobUpload => SignedRequestSpec {
+            domain: BLOB_PREPARE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#blobUploadPreparationBody",
+            variant: None,
+        },
+        CanonicalOperation::PublishTyping => SignedRequestSpec {
+            domain: TYPING_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#typingBody",
+            variant: None,
+        },
+        CanonicalOperation::RebindDeviceAuthentication => SignedRequestSpec {
+            domain: DEVICE_REBIND_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
+            variant: None,
+        },
+        CanonicalOperation::RejectWelcome => SignedRequestSpec {
+            domain: WELCOME_REJECT_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#welcomeRejectionBody",
+            variant: None,
+        },
+        CanonicalOperation::ReplenishKeyPackages => SignedRequestSpec {
+            domain: REPLENISH_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#keyPackageReplenishmentBody",
+            variant: None,
+        },
+        CanonicalOperation::RequestLeafRecovery => SignedRequestSpec {
+            domain: LEAF_RECOVERY_REQUEST_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#leafRecoveryRequestBody",
+            variant: None,
+        },
+        CanonicalOperation::EnrollDevice => SignedRequestSpec {
+            domain: DEVICE_ENROLL_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#deviceEnrollmentBody",
+            variant: None,
+        },
+        CanonicalOperation::RequestReset => SignedRequestSpec {
+            domain: RESET_REQUEST_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#resetRequestBody",
+            variant: None,
+        },
+        CanonicalOperation::RevokeDevice => SignedRequestSpec {
+            domain: DEVICE_REVOKE_SIGNATURE_DOMAIN,
+            body_type: "blue.catbird.chat.defs#deviceRevocationBody",
+            variant: None,
+        },
+        CanonicalOperation::RequestLeave => match variant {
+            Some("blue.catbird.chat.defs#signedLeaveRequest") => SignedRequestSpec {
+                domain: LEAVE_REQUEST_SIGNATURE_DOMAIN,
+                body_type: "blue.catbird.chat.defs#leaveRequestBody",
+                variant: Some("blue.catbird.chat.defs#signedLeaveRequest"),
+            },
+            Some("blue.catbird.chat.defs#signedZeroLeafLeave") => SignedRequestSpec {
+                domain: LEAVE_ZERO_LEAF_SIGNATURE_DOMAIN,
+                body_type: "blue.catbird.chat.defs#zeroLeafLeaveBody",
+                variant: Some("blue.catbird.chat.defs#signedZeroLeafLeave"),
+            },
+            _ => {
+                return Err(TransportError::Serialization(
+                    "requestLeave signedRequest requires a known union $type".into(),
+                ))
+            }
+        },
+        CanonicalOperation::SubmitTransition => match variant {
+            Some("blue.catbird.chat.defs#signedCommitTransition") => SignedRequestSpec {
+                domain: COMMIT_SIGNATURE_DOMAIN,
+                body_type: "blue.catbird.chat.defs#commitTransitionBody",
+                variant: Some("blue.catbird.chat.defs#signedCommitTransition"),
+            },
+            Some("blue.catbird.chat.defs#signedPolicyTransition") => SignedRequestSpec {
+                domain: POLICY_SIGNATURE_DOMAIN,
+                body_type: "blue.catbird.chat.defs#policyTransitionBody",
+                variant: Some("blue.catbird.chat.defs#signedPolicyTransition"),
+            },
+            Some("blue.catbird.chat.defs#signedLeafRecoveryFulfillment") => SignedRequestSpec {
+                domain: LEAF_RECOVERY_FULFILL_SIGNATURE_DOMAIN,
+                body_type: "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
+                variant: Some("blue.catbird.chat.defs#signedLeafRecoveryFulfillment"),
+            },
+            Some("blue.catbird.chat.defs#signedMetadataTransition") => SignedRequestSpec {
+                domain: METADATA_SIGNATURE_DOMAIN,
+                body_type: "blue.catbird.chat.defs#metadataTransitionBody",
+                variant: Some("blue.catbird.chat.defs#signedMetadataTransition"),
+            },
+            Some("blue.catbird.chat.defs#signedLeaveCommitFulfillment") => SignedRequestSpec {
+                domain: LEAVE_FULFILL_SIGNATURE_DOMAIN,
+                body_type: "blue.catbird.chat.defs#leaveCommitFulfillmentBody",
+                variant: Some("blue.catbird.chat.defs#signedLeaveCommitFulfillment"),
+            },
+            _ => {
+                return Err(TransportError::Serialization(
+                    "submitTransition signedRequest requires a known union $type".into(),
+                ))
+            }
+        },
+        operation => {
+            return Err(TransportError::UnsupportedOperation {
+                operation,
+                reason: "only generated signed mutation endpoints may use the signed orchestrator",
+            })
+        }
+    };
+    Ok(spec)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn extract_signed_body(
+    value: serde_json::Value,
+) -> Result<(serde_json::Value, Option<String>), TransportError> {
+    let object = value.as_object().ok_or_else(|| {
+        TransportError::Serialization("signed request body must be a JSON object".into())
+    })?;
+    if let Some(signed_request) = object.get("signedRequest") {
+        let signed_request = signed_request.as_object().ok_or_else(|| {
+            TransportError::Serialization("signedRequest must be a JSON object".into())
+        })?;
+        let body = signed_request
+            .get("body")
+            .ok_or_else(|| TransportError::Serialization("signedRequest is missing body".into()))?;
+        return Ok((
+            body.clone(),
+            signed_request
+                .get("$type")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+        ));
+    }
+    let variant = object
+        .get("$type")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Ok((value, variant))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn required_string<'a>(
+    body: &'a serde_json::Value,
+    field: &str,
+) -> Result<&'a str, TransportError> {
+    body.get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| TransportError::Serialization(format!("signed body is missing {field}")))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_signed_body_for_signing(
+    binding: &CleanChatSigningContext,
+    operation: CanonicalOperation,
+    body: &serde_json::Value,
+    signer: &SignatureKeyPair,
+    spec: SignedRequestSpec,
+) -> Result<(), TransportError> {
+    validate_bare_did(&binding.actor_did)?;
+    let body_actor_did = required_string(body, "actorDid")?;
+    validate_bare_did(body_actor_did)?;
+    if body_actor_did != binding.actor_did {
+        return Err(TransportError::Serialization(
+            "signed body actorDid does not match authenticated actor".into(),
+        ));
+    }
+
+    let device_field = if operation == CanonicalOperation::EnrollDevice {
+        "deviceId"
+    } else {
+        "actorDeviceId"
+    };
+    let device = required_string(body, device_field)?;
+    validate_uuid(device, device_field)?;
+    validate_jkt(&binding.dpop_jkt)?;
+    if device != binding.device_id {
+        return Err(TransportError::DeviceBindingMismatch {
+            body: device.to_owned(),
+            authenticated: binding.device_id.clone(),
+        });
+    }
+
+    match operation {
+        CanonicalOperation::EnrollDevice => {
+            let jkt = required_string(body, "dpopJkt")?;
+            validate_jkt(jkt)?;
+            if jkt != binding.dpop_jkt {
+                return Err(TransportError::DpopBindingMismatch);
+            }
+            let expected = body
+                .get("expectedAuthGeneration")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| {
+                    TransportError::Serialization(
+                        "enrollment body is missing expectedAuthGeneration".into(),
+                    )
+                })?;
+            if expected != 0 {
+                return Err(TransportError::InvalidEnrollmentGeneration { actual: expected });
+            }
+        }
+        CanonicalOperation::RebindDeviceAuthentication => {
+            let current = required_string(body, "currentDpopJkt")?;
+            validate_jkt(current)?;
+            let new = required_string(body, "newDpopJkt")?;
+            validate_jkt(new)?;
+            if new != binding.dpop_jkt {
+                return Err(TransportError::DpopBindingMismatch);
+            }
+            let actual = body
+                .get("expectedAuthGeneration")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or_else(|| {
+                    TransportError::Serialization(
+                        "rebind body is missing expectedAuthGeneration".into(),
+                    )
+                })?;
+            validate_auth_generation(actual)?;
+            let expected = binding
+                .auth_generation
+                .ok_or(TransportError::MissingAuthGeneration)?;
+            if actual != expected {
+                return Err(TransportError::AuthGenerationMismatch { expected, actual });
+            }
+        }
+        _ => {
+            if let Some(jkt) = body.get("dpopJkt").and_then(serde_json::Value::as_str) {
+                validate_jkt(jkt)?;
+                if jkt != binding.dpop_jkt {
+                    return Err(TransportError::DpopBindingMismatch);
+                }
+            }
+            let actual = body
+                .get("authGeneration")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or(TransportError::MissingAuthGeneration)?;
+            validate_auth_generation(actual)?;
+            let expected = binding
+                .auth_generation
+                .ok_or(TransportError::MissingAuthGeneration)?;
+            if actual != expected {
+                return Err(TransportError::AuthGenerationMismatch { expected, actual });
+            }
+        }
+    }
+
+    let domain = required_string(body, "signatureDomain")?;
+    if domain != spec.domain {
+        return Err(TransportError::Serialization(format!(
+            "signatureDomain does not match {operation:?}"
+        )));
+    }
+    let key_id = required_string(body, "keyId")?;
+    let expected_key_id = derive_key_id(signer.public());
+    if key_id != expected_key_id {
+        return Err(TransportError::Serialization(
+            "keyId does not match the configured Ed25519 public-key thumbprint".into(),
+        ));
+    }
+    if let Some(public_key) = body.get("signaturePublicKey") {
+        let public_key = decode_json_bytes(public_key, "signaturePublicKey")?;
+        if public_key != signer.public() {
+            return Err(TransportError::Serialization(
+                "signaturePublicKey does not match the configured Ed25519 key".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_json_bytes(value: &serde_json::Value, field: &str) -> Result<Vec<u8>, TransportError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let encoded = value
+        .get("$bytes")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| TransportError::Serialization(format!("{field} is not a byte value")))?;
+    let decoded = STANDARD
+        .decode(encoded)
+        .map_err(|_| TransportError::Serialization(format!("{field} is not canonical bytes")))?;
+    if STANDARD.encode(&decoded) != encoded {
+        return Err(TransportError::Serialization(format!(
+            "{field} is not canonical bytes"
+        )));
+    }
+    Ok(decoded)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_uuid_field(field: &str) -> bool {
+    matches!(
+        field,
+        "actorDeviceId" | "deviceId" | "idempotencyKey" | "conversationId"
+    ) || (field.ends_with("Id") && field != "keyId")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_byte_array_field(field: &str) -> bool {
+    field == "sha256"
+        || field.ends_with("Sha256")
+        || matches!(field, "groupContextHash" | "confirmationTag")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn decode_json_byte_array(
+    value: &serde_json::Value,
+    field: &str,
+) -> Result<Vec<u8>, TransportError> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| TransportError::Serialization(format!("{field} is not a byte array")))?;
+    values
+        .iter()
+        .map(|value| {
+            let byte = value.as_u64().ok_or_else(|| {
+                TransportError::Serialization(format!("{field} is not a byte array"))
+            })?;
+            u8::try_from(byte)
+                .map_err(|_| TransportError::Serialization(format!("{field} is not a byte array")))
+        })
+        .collect()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn canonicalize_json_value(
+    value: &serde_json::Value,
+    field: Option<&str>,
+) -> Result<CanonicalValue, TransportError> {
+    if field.is_some_and(is_byte_array_field) {
+        return Ok(CanonicalValue::Bytes(decode_json_byte_array(
+            value,
+            field.unwrap_or("bytes"),
+        )?));
+    }
+    match value {
+        serde_json::Value::Null => Err(TransportError::Serialization(
+            "null is not permitted in a canonical signed body".into(),
+        )),
+        serde_json::Value::Bool(value) => Ok(CanonicalValue::Bool(*value)),
+        serde_json::Value::Number(value) => value
+            .as_u64()
+            .filter(|value| *value <= 9_007_199_254_740_991)
+            .map(CanonicalValue::Integer)
+            .ok_or_else(|| {
+                TransportError::Serialization(
+                    "canonical signed body integers must be non-negative safe integers".into(),
+                )
+            }),
+        serde_json::Value::String(value) => {
+            if field.is_some_and(is_uuid_field) {
+                return Ok(CanonicalValue::Bytes(canonical_uuid_bytes(
+                    value,
+                    field.unwrap_or("uuid"),
+                )?));
+            }
+            Ok(CanonicalValue::Text(value.clone()))
+        }
+        serde_json::Value::Array(values) => Ok(CanonicalValue::Array(
+            values
+                .iter()
+                .map(|value| canonicalize_json_value(value, field))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        serde_json::Value::Object(values) => {
+            if values.len() == 1 && values.contains_key("$bytes") {
+                return Ok(CanonicalValue::Bytes(decode_json_bytes(
+                    value,
+                    field.unwrap_or("bytes"),
+                )?));
+            }
+            let mut map = BTreeMap::new();
+            for (key, value) in values {
+                if key == "$type" {
+                    let tag = value.as_str().ok_or_else(|| {
+                        TransportError::Serialization("$type must be a string".into())
+                    })?;
+                    map.insert(key.clone(), CanonicalValue::Text(tag.to_owned()));
+                } else {
+                    map.insert(key.clone(), canonicalize_json_value(value, Some(key))?);
+                }
+            }
+            Ok(CanonicalValue::Map(map))
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn canonical_signed_transcript(
+    body: &serde_json::Value,
+    spec: SignedRequestSpec,
+) -> Result<Vec<u8>, TransportError> {
+    let body = body.as_object().ok_or_else(|| {
+        TransportError::Serialization("signed request body must be a JSON object".into())
+    })?;
+    let mut projection = body.clone();
+    projection.remove("$type");
+    projection.insert(
+        "$type".into(),
+        serde_json::Value::String(spec.body_type.into()),
+    );
+    let canonical = canonicalize_json_value(&serde_json::Value::Object(projection), None)?;
+    let projection = serde_ipld_dagcbor::to_vec(&canonical)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let mut transcript = spec.domain.as_bytes().to_vec();
+    transcript.extend_from_slice(&projection);
+    if transcript.is_empty() {
+        return Err(TransportError::EmptySigningTranscript);
+    }
+    Ok(transcript)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn serialize_signed_generated_request(
+    request: CleanChatRequest,
+) -> Result<Vec<u8>, TransportError> {
+    let operation = request.operation();
+    match request {
+        CleanChatRequest::AcceptConversation(request) => serialize_json(&request),
+        CleanChatRequest::AcknowledgeWelcome(request) => serialize_json(&request),
+        CleanChatRequest::ActivateReset(request) => serialize_json(&request),
+        CleanChatRequest::CancelLeafRecovery(request) => serialize_json(&request),
+        CleanChatRequest::CancelLeave(request) => serialize_json(&request),
+        CleanChatRequest::CloseConversation(request) => serialize_json(&request),
+        CleanChatRequest::CreateConversation(request) => serialize_json(&request),
+        CleanChatRequest::DeleteBlob(request) => serialize_json(&request),
+        CleanChatRequest::SendMessage(request) => serialize_json(&request),
+        CleanChatRequest::PrepareBlobUpload(request) => serialize_json(&request),
+        CleanChatRequest::PublishTyping(request) => serialize_json(&request),
+        CleanChatRequest::RebindDeviceAuthentication(request) => serialize_json(&request),
+        CleanChatRequest::RejectWelcome(request) => serialize_json(&request),
+        CleanChatRequest::ReplenishKeyPackages(request) => serialize_json(&request),
+        CleanChatRequest::RequestLeafRecovery(request) => serialize_json(&request),
+        CleanChatRequest::EnrollDevice(request) => serialize_json(&request),
+        CleanChatRequest::RequestLeave(request) => serialize_json(&request),
+        CleanChatRequest::RequestReset(request) => serialize_json(&request),
+        CleanChatRequest::RevokeDevice(request) => serialize_json(&request),
+        CleanChatRequest::SubmitTransition(request) => serialize_json(&request),
+        _ => Err(TransportError::UnsupportedOperation {
+            operation,
+            reason: "only generated signed mutation endpoints may use the signed orchestrator",
+        }),
+    }
+}
+
+/// Sign and prepare one generated clean-chat mutation using the configured
+/// device signer. The caller supplies only the generated body JSON; the
+/// private key remains inside this Rust call and never crosses the FFI.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn prepare_signed_request_with_signer(
+    binding: &CleanChatSigningContext,
+    operation: CanonicalOperation,
+    body_json: Vec<u8>,
+    signer: &SignatureKeyPair,
+) -> Result<PreparedRequest, TransportError> {
+    if signer.signature_scheme() != SignatureScheme::ED25519 || signer.public().len() != 32 {
+        return Err(TransportError::UnsupportedSigningScheme);
+    }
+    let value: serde_json::Value = serde_json::from_slice(&body_json)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let (mut body, variant_from_input) = extract_signed_body(value)?;
+    let variant = variant_from_input.as_deref();
+    let spec = signed_request_spec(operation, variant)?;
+    let body_object = body.as_object_mut().ok_or_else(|| {
+        TransportError::Serialization("signed request body must be a JSON object".into())
+    })?;
+    if body_object.contains_key("signature") {
+        return Err(TransportError::Serialization(
+            "signed body must not contain an outer signature".into(),
+        ));
+    }
+    body_object.remove("$type");
+    validate_signed_body_for_signing(binding, operation, &body, signer, spec)?;
+    let transcript = canonical_signed_transcript(&body, spec)?;
+    let signature = signer
+        .sign(&transcript)
+        .map_err(|_| TransportError::Signing)?;
+
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let mut signed_request = serde_json::Map::new();
+    if let Some(variant) = spec.variant {
+        signed_request.insert("$type".into(), serde_json::Value::String(variant.into()));
+    }
+    signed_request.insert("body".into(), body);
+    signed_request.insert(
+        "signature".into(),
+        serde_json::json!({"$bytes": STANDARD.encode(signature)}),
+    );
+    let request_json = serde_json::json!({"signedRequest": signed_request});
+    let request_json = serde_json::to_vec(&request_json)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let request = parse_ffi_request(operation, &request_json)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let request_json = serialize_signed_generated_request(request)?;
+    Ok(PreparedRequest {
+        operation,
+        method: "POST".into(),
+        path: canonical_route(operation).path.to_owned(),
+        authorization: String::new(),
+        dpop: String::new(),
+        body: Some(request_json),
+    })
+}
+
 #[derive(Debug)]
 enum CanonicalValue {
     Text(String),
     Bytes(Vec<u8>),
     Integer(u64),
+    Bool(bool),
     Array(Vec<CanonicalValue>),
     Map(BTreeMap<String, CanonicalValue>),
 }
@@ -1193,6 +1839,7 @@ impl Serialize for CanonicalValue {
             Self::Text(value) => serializer.serialize_str(value),
             Self::Bytes(value) => serializer.serialize_bytes(value),
             Self::Integer(value) => serializer.serialize_u64(*value),
+            Self::Bool(value) => serializer.serialize_bool(*value),
             Self::Array(values) => {
                 let mut seq = serializer.serialize_seq(Some(values.len()))?;
                 for value in values {

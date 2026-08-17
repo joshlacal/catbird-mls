@@ -7,6 +7,11 @@ use tokio::sync::Mutex;
 use web_time::Instant;
 
 use super::api_client::MLSAPIClient;
+#[cfg(not(target_arch = "wasm32"))]
+use super::canonical_transport::{
+    prepare_signed_request_with_signer, CanonicalOperation, CleanChatSigningContext,
+    PreparedRequest, TransportError,
+};
 use super::constants;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
@@ -434,6 +439,43 @@ where
     /// Access the credential store.
     pub fn credentials(&self) -> &Arc<C> {
         &self.credentials
+    }
+
+    /// Prepare a canonical signed clean-chat mutation using the immutable
+    /// device key held by the configured credential store.
+    ///
+    /// The signing context intentionally has no Authorization header or DPoP
+    /// proof. Those are gateway transport credentials and are combined by the
+    /// selected direct-DS/Nest adapter after this method returns.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn prepare_clean_chat_signed_request(
+        &self,
+        binding: CleanChatSigningContext,
+        operation: CanonicalOperation,
+        body_json: Vec<u8>,
+    ) -> std::result::Result<PreparedRequest, TransportError> {
+        let user_did = self
+            .require_user_did()
+            .await
+            .map_err(|error| TransportError::Credential(error.to_string()))?;
+        if binding.actor_did != user_did {
+            return Err(TransportError::Serialization(
+                "signing actor DID does not match the initialized orchestrator actor".into(),
+            ));
+        }
+        let key_data = self
+            .credentials()
+            .get_signing_key(&user_did)
+            .await
+            .map_err(|error| TransportError::Credential(error.to_string()))?
+            .ok_or(TransportError::MissingSigningKey)?;
+        let signer: openmls_basic_credential::SignatureKeyPair = serde_json::from_slice(&key_data)
+            .map_err(|_| {
+                TransportError::Credential(
+                    "configured signing key is not a valid Ed25519 key pair".into(),
+                )
+            })?;
+        prepare_signed_request_with_signer(&binding, operation, body_json, &signer)
     }
 
     /// Access the configuration.

@@ -17,6 +17,11 @@ use crate::orchestrator::{
     ProcessExternalCommitResult, ResetRecordOutcome, SendMessageResponse, StartupReconcileReport,
     SyncCursor,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use crate::orchestrator::{
+    CleanChatOperationFfi, CleanChatPreparedRequestFfi, CleanChatSigningContextFfi,
+    CleanChatTransportFfiError,
+};
 
 use crate::api::MLSContext;
 use crate::engine::{
@@ -2530,6 +2535,37 @@ impl OrchestratorBridge {
     pub fn initialize(&self, user_did: String) -> Result<(), OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.initialize(&user_did))?;
         Ok(())
+    }
+
+    /// Prepare a canonical clean-chat signed mutation.
+    ///
+    /// This method accepts only actor/device binding metadata. It deliberately
+    /// returns no Authorization or DPoP proof: direct-DS and Nest-proxy
+    /// adapters attach their own transport credentials after signing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_clean_chat_signed_request(
+        &self,
+        binding: CleanChatSigningContextFfi,
+        operation: CleanChatOperationFfi,
+        body_json: Vec<u8>,
+    ) -> Result<CleanChatPreparedRequestFfi, CleanChatTransportFfiError> {
+        let prepared =
+            crate::async_runtime::block_on(self.inner.prepare_clean_chat_signed_request(
+                binding.into(),
+                operation.into(),
+                body_json,
+            ))
+            .map_err(|error| CleanChatTransportFfiError::InvalidRequest {
+                message: error.to_string(),
+            })?;
+        Ok(CleanChatPreparedRequestFfi {
+            operation: prepared.operation.into(),
+            method: prepared.method,
+            path: prepared.path,
+            authorization: None,
+            dpop: None,
+            body: prepared.body,
+        })
     }
 
     /// Shut down the orchestrator.

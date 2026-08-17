@@ -951,3 +951,287 @@ fn signed_post_preparation_requires_exact_authenticated_generation() {
             if message.contains("authGeneration")
     ));
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+mod signed_request_orchestrator_red_tests {
+    use super::super::canonical_transport::{
+        derive_key_id, prepare_signed_request_with_signer, CanonicalOperation,
+        CleanChatSigningContext,
+    };
+    use super::auth;
+    use openmls::prelude::SignatureScheme;
+    use openmls_basic_credential::SignatureKeyPair;
+    use serde_json::Value;
+
+    const ACTOR_DID: &str = "did:plc:z72i7hdynmk67x4h5wqf3s6a";
+
+    fn replenishment_wire(signer: &SignatureKeyPair) -> Value {
+        let input = super::ReplenishKeyPackagesInput {
+            actor_did: ACTOR_DID.into(),
+            actor_device_id: auth().device_id,
+            auth_generation: 1,
+            idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+            key_id: derive_key_id(signer.public()),
+            dpop_jkt: auth().dpop_jkt,
+            signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+            key_packages: vec![super::key_package()],
+            signed_at: "2026-08-16T12:00:00.000Z".into(),
+        };
+        let prepared =
+            super::super::canonical_transport::replenish_key_packages(&auth(), signer, input)
+                .expect("existing generated replenishment fixture");
+        let request: Value =
+            serde_json::from_slice(prepared.body.as_deref().expect("generated body")).unwrap();
+        request
+    }
+
+    fn replenishment_body(signer: &SignatureKeyPair) -> Value {
+        replenishment_wire(signer)["signedRequest"]["body"].clone()
+    }
+
+    fn clean_auth(generation: Option<i64>) -> CleanChatSigningContext {
+        CleanChatSigningContext {
+            actor_did: ACTOR_DID.into(),
+            dpop_jkt: auth().dpop_jkt,
+            device_id: auth().device_id,
+            auth_generation: generation,
+        }
+    }
+
+    #[test]
+    fn signed_orchestrator_signs_generated_body_from_configured_authority() {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let body = replenishment_body(&signer);
+        let prepared = prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .expect("supported mutation signs");
+
+        assert_eq!(prepared.operation, CanonicalOperation::ReplenishKeyPackages);
+        assert_eq!(prepared.method, "POST");
+        assert_eq!(
+            prepared.path,
+            "/xrpc/blue.catbird.chat.replenishKeyPackages"
+        );
+        assert!(prepared.authorization.is_empty());
+        assert!(prepared.dpop.is_empty());
+        let wire: Value = serde_json::from_slice(prepared.body.as_deref().unwrap()).unwrap();
+        assert_eq!(wire["signedRequest"]["body"], body);
+        assert_eq!(
+            wire["signedRequest"]["signature"],
+            replenishment_wire(&signer)["signedRequest"]["signature"]
+        );
+        assert_eq!(
+            wire["signedRequest"]["signature"]["$bytes"]
+                .as_str()
+                .unwrap()
+                .len(),
+            88
+        );
+    }
+
+    #[test]
+    fn signed_orchestrator_is_deterministic_and_rejects_binding_tampering() {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let body = replenishment_body(&signer);
+        let body_json = serde_json::to_vec(&body).unwrap();
+        let first = prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            body_json.clone(),
+            &signer,
+        )
+        .unwrap();
+        let reordered = serde_json::json!({
+            "signedAt": body["signedAt"],
+            "keyPackages": body["keyPackages"],
+            "signatureDomain": body["signatureDomain"],
+            "keyId": body["keyId"],
+            "idempotencyKey": body["idempotencyKey"],
+            "dpopJkt": body["dpopJkt"],
+            "authGeneration": body["authGeneration"],
+            "actorDid": body["actorDid"],
+            "actorDeviceId": body["actorDeviceId"],
+            "signaturePublicKey": body["signaturePublicKey"]
+        });
+        let second = prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&reordered).unwrap(),
+            &signer,
+        )
+        .unwrap();
+        assert_eq!(first.body, second.body);
+
+        let mut tampered = body;
+        tampered["authGeneration"] = Value::from(2);
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&tampered).unwrap(),
+            &signer,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn signed_orchestrator_rejects_missing_key_context_and_unsigned_operations() {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let body = replenishment_body(&signer);
+        let missing_generation = prepare_signed_request_with_signer(
+            &clean_auth(None),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        );
+        assert!(missing_generation.is_err());
+
+        for operation in [
+            CanonicalOperation::GetConversations,
+            CanonicalOperation::GetSubscriptionTicket,
+            CanonicalOperation::GetBlob,
+            CanonicalOperation::UploadBlob,
+            CanonicalOperation::SubscribeEvents,
+        ] {
+            assert!(
+                prepare_signed_request_with_signer(
+                    &clean_auth(Some(1)),
+                    operation,
+                    serde_json::to_vec(&body).unwrap(),
+                    &signer,
+                )
+                .is_err(),
+                "{operation:?} must not enter signed orchestrator"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_orchestrator_rejects_domain_actor_device_generation_and_key_id_mismatches() {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let body = replenishment_body(&signer);
+
+        let mut wrong_domain = body.clone();
+        wrong_domain["signatureDomain"] = Value::from("CATBIRD-CHAT-MESSAGE\u{0000}");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_domain).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_actor = body.clone();
+        wrong_actor["actorDid"] = Value::from("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_actor).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_device = body.clone();
+        wrong_device["actorDeviceId"] = Value::from("99999999-9999-4999-8999-999999999999");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_device).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_generation = body.clone();
+        wrong_generation["authGeneration"] = Value::from(2);
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_generation).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_jkt = body.clone();
+        wrong_jkt["dpopJkt"] = Value::from("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_jkt).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_key_id = body.clone();
+        wrong_key_id["keyId"] = Value::from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_key_id).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_public_key = body.clone();
+        wrong_public_key["signaturePublicKey"] =
+            serde_json::json!({"$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_public_key).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_actor_binding = clean_auth(Some(1));
+        wrong_actor_binding.actor_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into();
+        assert!(prepare_signed_request_with_signer(
+            &wrong_actor_binding,
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_device_binding = clean_auth(Some(1));
+        wrong_device_binding.device_id = "99999999-9999-4999-8999-999999999999".into();
+        assert!(prepare_signed_request_with_signer(
+            &wrong_device_binding,
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_jkt_binding = clean_auth(Some(1));
+        wrong_jkt_binding.dpop_jkt = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+        assert!(prepare_signed_request_with_signer(
+            &wrong_jkt_binding,
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let wrong_generation_binding = clean_auth(Some(2));
+        assert!(prepare_signed_request_with_signer(
+            &wrong_generation_binding,
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut body_signature = body.clone();
+        body_signature["signature"] = serde_json::json!({"$bytes": "AAAA"});
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body_signature).unwrap(),
+            &signer,
+        )
+        .is_err());
+    }
+}
