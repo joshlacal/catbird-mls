@@ -1442,8 +1442,7 @@ const SIGNED_JSON_MAX_BYTES: usize = 16 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const SIGNED_JSON_MAX_DEPTH: usize = 64;
 #[cfg(not(target_arch = "wasm32"))]
-const CHAT_DEFS_JSON: &str =
-    include_str!("../../../../mls-ds/lexicon/blue/catbird/chat/blue.catbird.chat.defs.json");
+const CHAT_DEFS_JSON: &str = include_str!("generated/blue.catbird.chat.defs.json");
 
 /// A duplicate-detecting, null-free JSON tree. `serde_json::Value` is not
 /// suitable at this boundary because it silently keeps the last duplicate
@@ -1602,6 +1601,13 @@ fn chat_contract() -> &'static serde_json::Value {
     CONTRACT.get_or_init(|| {
         serde_json::from_str(CHAT_DEFS_JSON).expect("canonical chat lexicon must be valid JSON")
     })
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn chat_schema_provenance() -> &'static serde_json::Value {
+    chat_contract()
+        .get("_catbird_mls_provenance")
+        .expect("generated chat schema provenance must be present")
 }
 
 #[cfg(not(target_arch = "wasm32"))]

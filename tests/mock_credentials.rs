@@ -71,6 +71,7 @@ impl MockCredentials {
     /// Install an explicit authority snapshot for negative binding tests.
     /// The signing key itself remains in the Rust-only mock state and never
     /// participates in the callback-shaped authority record.
+    #[allow(dead_code)]
     pub fn set_clean_chat_authority(&self, authority: CleanChatSigningAuthority) {
         let mut map = self.state.lock().unwrap();
         map.entry("__test_authority__".to_string())
@@ -79,6 +80,7 @@ impl MockCredentials {
     }
 
     /// Install the trusted binding snapshot used by the Rust-only signer mock.
+    #[allow(dead_code)]
     pub fn set_clean_chat_binding(
         &self,
         user_did: &str,

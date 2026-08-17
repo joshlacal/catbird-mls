@@ -18,7 +18,7 @@ path = "src/bin/echo_bot.rs"
 required-features = ["echo-bot"]
 
 [dependencies]
-catbird-atproto = { path = "../catbird-atproto", features = ["streaming"] }
+catbird-atproto = { path = "../catbird-atproto", version = "0.1.0", features = ["streaming"] }
 # OpenMLS 0.8.0 — major upgrade from 0.7.2
 # Breaking changes handled:
 # - ProcessMessageError now includes StorageError variant

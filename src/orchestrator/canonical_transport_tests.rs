@@ -276,6 +276,60 @@ fn get_blob_preserves_arbitrary_binary_response_bytes() {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn packaged_chat_schema_has_pinned_provenance() {
+    let provenance = super::canonical_transport::chat_schema_provenance();
+    assert_eq!(
+        provenance["sourcePath"],
+        "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json"
+    );
+    assert_eq!(
+        provenance["sourceSha256"],
+        "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a"
+    );
+    assert_eq!(provenance["generator"], "scripts/generate_chat_schema.py");
+    assert_eq!(provenance["generatorVersion"], 5);
+    assert_eq!(
+        provenance["sourceRevision"],
+        "954d7ab20f362b731ee13f87eea89ae83558c624"
+    );
+    assert_eq!(
+        provenance["sourceTree"],
+        "6779729a15bec425fa520b9197bf60bebdb9e32b"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn packaged_server_vectors_have_pinned_provenance() {
+    for (artifact, source_path, source_sha256, vector_case_count) in [
+        (
+            include_str!("generated/mls_chat_control_fingerprint_source.json"),
+            "mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json",
+            "f33406a5d99dba3b604da108c4df2e53d70531b9fa0be14b21e2db94ba07b311",
+            13,
+        ),
+        (
+            include_str!("generated/mls_chat_contract_vectors.json"),
+            "mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json",
+            "96044be0c06e3dd43cbe77b7ac29c1ecfcee1922782b1c5e74258768b1aa3c6d",
+            14,
+        ),
+    ] {
+        let artifact: serde_json::Value =
+            serde_json::from_str(artifact).expect("generated vector JSON");
+        let provenance = artifact
+            .get("_catbird_mls_provenance")
+            .expect("generated vector provenance");
+        assert_eq!(provenance["sourcePath"], source_path);
+        assert_eq!(provenance["sourceSha256"], source_sha256);
+        assert_eq!(provenance["generator"], "scripts/generate_chat_schema.py");
+        assert_eq!(provenance["generatorVersion"], 5);
+        assert_eq!(provenance["vectorCaseCount"], vector_case_count);
+    }
+}
+
 fn rebind_request_json(
     actor_device_id: &str,
     current_dpop_jkt: &str,
@@ -1100,13 +1154,12 @@ mod signed_request_orchestrator_red_tests {
     #[test]
     fn signed_orchestrator_matches_server_strict_control_transcript_vectors() {
         let fixture: Value = serde_json::from_str(include_str!(
-            "../../../../mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json"
+            "generated/mls_chat_control_fingerprint_source.json"
         ))
         .expect("server control fingerprint fixture is valid JSON");
-        let contract: Value = serde_json::from_str(include_str!(
-            "../../../../mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json"
-        ))
-        .expect("server contract fixture is valid JSON");
+        let contract: Value =
+            serde_json::from_str(include_str!("generated/mls_chat_contract_vectors.json"))
+                .expect("server contract fixture is valid JSON");
         let cases = fixture["cases"].as_array().expect("server fixture cases");
         let transcript_cases = contract["controlEntryFingerprints"]["cases"]
             .as_array()
