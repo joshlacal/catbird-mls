@@ -1,7 +1,7 @@
 {
   "_catbird_mls_provenance": {
     "generator": "scripts/generate_chat_schema.py",
-    "generatorVersion": 6,
+    "generatorVersion": 7,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
     "sourceRevision": "954d7ab20f362b731ee13f87eea89ae83558c624",
     "sourceSha256": "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a",

@@ -289,7 +289,7 @@ fn packaged_chat_schema_has_pinned_provenance() {
         "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a"
     );
     assert_eq!(provenance["generator"], "scripts/generate_chat_schema.py");
-    assert_eq!(provenance["generatorVersion"], 6);
+    assert_eq!(provenance["generatorVersion"], 7);
     assert_eq!(
         provenance["sourceRevision"],
         "954d7ab20f362b731ee13f87eea89ae83558c624"
@@ -297,6 +297,46 @@ fn packaged_chat_schema_has_pinned_provenance() {
     assert_eq!(
         provenance["sourceTree"],
         "6779729a15bec425fa520b9197bf60bebdb9e32b"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generator_rejects_wrong_petrel_source_bytes() {
+    let has_monorepo_authorities = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .any(|path| path.join("PetrelCatbird").is_dir() && path.join("mls-ds").is_dir());
+    if !has_monorepo_authorities {
+        // Canonical-depth/package copies intentionally have no sibling source
+        // repositories. The generator gate runs from the canonical monorepo.
+        return;
+    }
+    let temporary = tempfile::tempdir().expect("temporary source directory");
+    let wrong_source = temporary.path().join("wrong-chat-defs.json");
+    std::fs::write(
+        &wrong_source,
+        format!(
+            "{}\n",
+            include_str!("generated/blue.catbird.chat.defs.json")
+        ),
+    )
+    .expect("wrong source writes");
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/generate_chat_schema.py");
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg("--validate-source")
+        .arg(&wrong_source)
+        .output()
+        .expect("generator launches");
+    assert!(
+        !output.status.success(),
+        "wrong Petrel source must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("canonical PetrelCatbird source SHA-256"),
+        "unexpected generator error: {stderr}"
     );
 }
 
@@ -331,7 +371,7 @@ fn packaged_server_vectors_have_pinned_provenance() {
         assert_eq!(provenance["sourcePath"], source_path);
         assert_eq!(provenance["sourceSha256"], source_sha256);
         assert_eq!(provenance["generator"], "scripts/generate_chat_schema.py");
-        assert_eq!(provenance["generatorVersion"], 6);
+        assert_eq!(provenance["generatorVersion"], 7);
         assert_eq!(provenance["vectorCaseCount"], vector_case_count);
         assert_eq!(
             provenance["sourceRevision"],
@@ -1232,6 +1272,21 @@ mod signed_request_orchestrator_red_tests {
         }
     }
 
+    fn server_signing_key(fixture: &Value) -> SignatureKeyPair {
+        let seed = [0x5c_u8; 32];
+        let public_key = hex::decode(
+            fixture["publicKeyHex"]
+                .as_str()
+                .expect("server signing public key"),
+        )
+        .expect("server signing public key hex");
+        let derived_public = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(public_key, derived_public, "server fixture seed is stable");
+        SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public_key)
+    }
+
     #[test]
     fn signed_orchestrator_matches_server_strict_control_transcript_vectors() {
         let fixture: Value = serde_json::from_str(include_str!(
@@ -1381,7 +1436,7 @@ mod signed_request_orchestrator_red_tests {
             25,
             "13 control cases plus one blob case plus 11 signing-domain cases"
         );
-        let finish_signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let finish_signer = server_signing_key(&fixture);
 
         for case in cases {
             let body = fixture_wire_value(case["body"].clone());
@@ -1409,17 +1464,10 @@ mod signed_request_orchestrator_red_tests {
                 case["bodyName"]
             );
 
-            let mut generated_body = body.clone();
-            generated_body["keyId"] = Value::String(derive_key_id(finish_signer.public()));
-            if generated_body.get("signaturePublicKey").is_some() {
-                generated_body["signaturePublicKey"] =
-                    Value::String(STANDARD.encode(finish_signer.public()));
-            }
             let wire = prepare_signed_request_with_signer(
                 &binding,
                 operation,
-                serde_json::to_vec(&generated_body)
-                    .expect("signed-domain generated fixture serializes"),
+                serde_json::to_vec(&body).expect("signed-domain generated fixture serializes"),
                 &finish_signer,
             )
             .unwrap_or_else(|error| {
@@ -1436,11 +1484,32 @@ mod signed_request_orchestrator_red_tests {
             assert_eq!(wrapper.len(), 2, "server wrapper is closed");
             assert!(wrapper.get("$type").is_none(), "wrapper has no union tag");
             assert_eq!(
-                wrapper["body"]["$type"], generated_body["$type"],
+                wrapper["body"]["$type"], body["$type"],
                 "body retains its exact type tag"
+            );
+            assert_eq!(
+                wire["signedRequest"], case["wrapper"],
+                "complete signed wrapper must equal the server fixture"
             );
             assert!(wrapper["signature"].is_string(), "signature is bare base64");
             assert_eq!(wrapper["signature"].as_str().unwrap().len(), 88);
+            assert_eq!(
+                hex::encode(
+                    STANDARD
+                        .decode(wrapper["signature"].as_str().unwrap())
+                        .expect("generated signature base64")
+                ),
+                case["signatureHex"],
+                "signature bytes must equal the server fixture"
+            );
+            assert_eq!(
+                hex::encode(
+                    serde_json::to_vec(&wire["signedRequest"])
+                        .expect("generated wrapper serializes")
+                ),
+                case["wrapperJsonHex"],
+                "complete wrapper bytes must equal the server fixture"
+            );
         }
     }
 
@@ -1549,6 +1618,38 @@ mod signed_request_orchestrator_red_tests {
             &signer,
         );
         assert!(missing_generation.is_err());
+
+        let root_tag_confusion = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#notARealSignedWrapper",
+            "signedRequest": {"body": body.clone()}
+        });
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&root_tag_confusion).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "unknown root wrapper tags must reject"
+        );
+
+        let wrapper_tag_confusion = serde_json::json!({
+            "signedRequest": {
+                "$type": "blue.catbird.chat.defs#notARealSignedWrapper",
+                "body": body.clone()
+            }
+        });
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&wrapper_tag_confusion).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "non-union wrapper tags must reject"
+        );
 
         for operation in [
             CanonicalOperation::GetConversations,

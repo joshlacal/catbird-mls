@@ -2503,7 +2503,14 @@ fn signed_spec_for_body(
                 ))
             }
         },
-        _ => return signed_request_spec(operation, None),
+        _ => {
+            if outer_variant.is_some() {
+                return Err(TransportError::Serialization(
+                    "signed wrapper tag is not allowed for non-union operation".into(),
+                ));
+            }
+            return signed_request_spec(operation, None);
+        }
     };
     if outer_variant.is_some_and(|outer| outer != variant) {
         return Err(TransportError::Serialization(
@@ -2516,14 +2523,18 @@ fn signed_spec_for_body(
 #[cfg(not(target_arch = "wasm32"))]
 fn extract_strict_signed_body(
     value: StrictSignedJson,
-) -> Result<(StrictSignedJson, Option<String>), TransportError> {
+) -> Result<(StrictSignedJson, Option<String>, Option<String>), TransportError> {
     let StrictSignedJson::Object(mut root) = value else {
         return Err(TransportError::Serialization(
             "signed request body must be a JSON object".into(),
         ));
     };
     if let Some(signed_request) = root.remove("signedRequest") {
-        if root.iter().any(|(key, _)| key != "$type") {
+        let root_variant = root
+            .remove("$type")
+            .map(|value| strict_text(&value, "$type").map(str::to_owned))
+            .transpose()?;
+        if !root.is_empty() {
             return Err(TransportError::Serialization(
                 "signed request wrapper has unknown fields".into(),
             ));
@@ -2533,7 +2544,10 @@ fn extract_strict_signed_body(
                 "signedRequest must be an object".into(),
             ));
         };
-        let outer_variant = wrapper.remove("$type");
+        let outer_variant = wrapper
+            .remove("$type")
+            .map(|value| strict_text(&value, "signedRequest.$type").map(str::to_owned))
+            .transpose()?;
         let body = wrapper
             .remove("body")
             .ok_or_else(|| TransportError::Serialization("signedRequest is missing body".into()))?;
@@ -2542,12 +2556,9 @@ fn extract_strict_signed_body(
                 "signedRequest body input has unknown fields".into(),
             ));
         }
-        let outer_variant = outer_variant
-            .map(|value| strict_text(&value, "signedRequest.$type").map(str::to_owned))
-            .transpose()?;
-        return Ok((body, outer_variant));
+        return Ok((body, root_variant, outer_variant));
     }
-    Ok((StrictSignedJson::Object(root), None))
+    Ok((StrictSignedJson::Object(root), None, None))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2557,7 +2568,16 @@ pub(crate) fn prepare_signed_body(
     body_json: &[u8],
 ) -> Result<SignedBodyProjection, TransportError> {
     let value = parse_strict_signed_json(body_json)?;
-    let (body, outer_variant) = extract_strict_signed_body(value)?;
+    let (body, root_variant, wrapper_variant) = extract_strict_signed_body(value)?;
+    let outer_variant = match (root_variant, wrapper_variant) {
+        (Some(root), Some(wrapper)) if root != wrapper => {
+            return Err(TransportError::Serialization(
+                "signed wrapper tags do not match".into(),
+            ))
+        }
+        (Some(root), _) | (_, Some(root)) => Some(root),
+        (None, None) => None,
+    };
     let body_type = match &body {
         StrictSignedJson::Object(values) => strict_text(
             values.get("$type").ok_or_else(|| {

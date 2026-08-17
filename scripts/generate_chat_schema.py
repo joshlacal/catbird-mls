@@ -47,10 +47,11 @@ FIXTURE_SOURCES = (
 )
 ARTIFACT_RELATIVE = Path("src/orchestrator/generated/blue.catbird.chat.defs.json")
 GENERATOR_NAME = "scripts/generate_chat_schema.py"
-GENERATOR_VERSION = 6
+GENERATOR_VERSION = 7
 PROVENANCE_KEY = "_catbird_mls_provenance"
 CANONICAL_SOURCE_REVISION = "954d7ab20f362b731ee13f87eea89ae83558c624"
 CANONICAL_SOURCE_TREE = "6779729a15bec425fa520b9197bf60bebdb9e32b"
+CANONICAL_SOURCE_SHA256 = "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a"
 SERVER_SOURCE_REVISION = "1336d821566aacb93c3a580091518a6eb68ed63c"
 SERVER_SOURCE_TREE = "5796505b80b76490f5ada54febe2d8439e1b00eb"
 SERVER_VECTOR_SET = "signed-mutation"
@@ -83,30 +84,63 @@ def load_source(path: Path, *, require_defs: bool = False) -> tuple[dict, str]:
     return source, digest
 
 
-def server_revision() -> tuple[str, str]:
-    server_root = repository_root() / "mls-ds"
+def read_vcs_revision(
+    repository: Path,
+    description: str,
+    expected_revision: str,
+    expected_tree: str,
+) -> tuple[str, str]:
     try:
         revision = subprocess.run(
-            ["git", "-C", str(server_root), "rev-parse", "HEAD"],
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
         tree = subprocess.run(
-            ["git", "-C", str(server_root), "rev-parse", "HEAD^{tree}"],
+            ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
             check=True,
             capture_output=True,
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError(f"unable to inspect pinned mls-ds source revision: {error}") from error
-    if (revision, tree) != (SERVER_SOURCE_REVISION, SERVER_SOURCE_TREE):
+        raise ValueError(f"unable to inspect pinned {description} revision: {error}") from error
+    if (revision, tree) != (expected_revision, expected_tree):
         raise ValueError(
-            "mls-ds source revision is not the Sol-approved corpus "
-            f"(expected {SERVER_SOURCE_REVISION}/{SERVER_SOURCE_TREE}, "
+            f"{description} revision is not the pinned source "
+            f"(expected {expected_revision}/{expected_tree}, "
             f"found {revision}/{tree})"
         )
     return revision, tree
+
+
+def canonical_revision() -> tuple[str, str]:
+    return read_vcs_revision(
+        repository_root() / "PetrelCatbird",
+        "canonical PetrelCatbird",
+        CANONICAL_SOURCE_REVISION,
+        CANONICAL_SOURCE_TREE,
+    )
+
+
+def server_revision() -> tuple[str, str]:
+    return read_vcs_revision(
+        repository_root() / "mls-ds",
+        "Sol-approved mls-ds",
+        SERVER_SOURCE_REVISION,
+        SERVER_SOURCE_TREE,
+    )
+
+
+def validate_canonical_source(path: Path) -> tuple[dict, str, str, str]:
+    revision, tree = canonical_revision()
+    source, digest = load_source(path, require_defs=True)
+    if digest != CANONICAL_SOURCE_SHA256:
+        raise ValueError(
+            "canonical PetrelCatbird source SHA-256 does not match the pinned source "
+            f"(expected {CANONICAL_SOURCE_SHA256}, found {digest})"
+        )
+    return source, digest, revision, tree
 
 
 def fixture_case_count(source: dict, source_relative: Path) -> int:
@@ -140,8 +174,8 @@ def expected_artifact(
     if source_relative == SOURCE_RELATIVE:
         artifact[PROVENANCE_KEY].update(
             {
-                "sourceRevision": CANONICAL_SOURCE_REVISION,
-                "sourceTree": CANONICAL_SOURCE_TREE,
+                "sourceRevision": source_revision or CANONICAL_SOURCE_REVISION,
+                "sourceTree": source_tree or CANONICAL_SOURCE_TREE,
             }
         )
     if vector_case_count is not None:
@@ -184,8 +218,8 @@ def check_artifact(
     if source_relative == SOURCE_RELATIVE:
         expected_provenance.update(
             {
-                "sourceRevision": CANONICAL_SOURCE_REVISION,
-                "sourceTree": CANONICAL_SOURCE_TREE,
+                "sourceRevision": source_revision or CANONICAL_SOURCE_REVISION,
+                "sourceTree": source_tree or CANONICAL_SOURCE_TREE,
             }
         )
     if vector_case_count is not None:
@@ -216,10 +250,25 @@ def main() -> int:
         action="store_true",
         help="verify the mls-ds lexicon is an exact byte mirror of PetrelCatbird",
     )
+    parser.add_argument(
+        "--validate-source",
+        help="validate a canonical PetrelCatbird source file and its pinned VCS evidence",
+    )
     args = parser.parse_args()
+
+    if args.validate_source:
+        _, digest, revision, tree = validate_canonical_source(
+            Path(args.validate_source).resolve()
+        )
+        print(
+            f"{args.validate_source}: verified canonical PetrelCatbird "
+            f"revision {revision}, tree {tree}, SHA-256 {digest}"
+        )
+        return 0
 
     if args.check_mirror:
         server_revision()
+        _, digest, _, _ = validate_canonical_source(source_path(SOURCE_RELATIVE))
         canonical = source_path(SOURCE_RELATIVE).read_bytes()
         mirror = source_path(MIRROR_RELATIVE).read_bytes()
         if canonical != mirror:
@@ -230,10 +279,12 @@ def main() -> int:
                 f"(canonical {canonical_digest}, mirror {mirror_digest})"
             )
         print(
-            f"{MIRROR_RELATIVE}: verified exact mirror of {SOURCE_RELATIVE}"
+            f"{MIRROR_RELATIVE}: verified exact mirror of {SOURCE_RELATIVE} "
+            f"(canonical SHA-256 {digest})"
         )
         return 0
 
+    pinned_canonical_revision, pinned_canonical_tree = canonical_revision()
     pinned_server_revision, pinned_server_tree = server_revision()
     artifacts = (
         (
@@ -242,7 +293,7 @@ def main() -> int:
             source_path(args.source),
             True,
             None,
-            None,
+            CANONICAL_SOURCE_SHA256,
         ),
         *(
             (
@@ -279,8 +330,14 @@ def main() -> int:
             digest,
             source_relative,
             vector_case_count=vector_case_count,
-            source_revision=pinned_server_revision if vector_case_count is not None else None,
-            source_tree=pinned_server_tree if vector_case_count is not None else None,
+            source_revision=(
+                pinned_server_revision
+                if vector_case_count is not None
+                else pinned_canonical_revision
+            ),
+            source_tree=(
+                pinned_server_tree if vector_case_count is not None else pinned_canonical_tree
+            ),
         )
         if args.check:
             check_artifact(
@@ -289,8 +346,16 @@ def main() -> int:
                 digest,
                 source_relative,
                 vector_case_count=vector_case_count,
-                source_revision=pinned_server_revision if vector_case_count is not None else None,
-                source_tree=pinned_server_tree if vector_case_count is not None else None,
+                source_revision=(
+                    pinned_server_revision
+                    if vector_case_count is not None
+                    else pinned_canonical_revision
+                ),
+                source_tree=(
+                    pinned_server_tree
+                    if vector_case_count is not None
+                    else pinned_canonical_tree
+                ),
             )
             print(f"{destination}: verified source SHA-256 {digest}")
         else:

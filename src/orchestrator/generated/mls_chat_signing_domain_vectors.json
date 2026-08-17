@@ -1,7 +1,7 @@
 {
   "_catbird_mls_provenance": {
     "generator": "scripts/generate_chat_schema.py",
-    "generatorVersion": 6,
+    "generatorVersion": 7,
     "sourcePath": "mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json",
     "sourceRevision": "1336d821566aacb93c3a580091518a6eb68ed63c",
     "sourceSha256": "40bd067558c98648a565cbd58a3e17cd4756da6df5428bd71dfce948182f0226",
