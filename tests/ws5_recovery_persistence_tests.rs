@@ -69,16 +69,9 @@ async fn restart_orchestrator(
     std::path::PathBuf,
 ) {
     let client = world.client(name);
-    let temp_dir = std::env::temp_dir().join(format!(
-        "catbird_mls_ws5_restart_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-    ));
-    std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
-    let db_path = temp_dir.join("mls.db");
+    let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
+    let temp_path = temp_dir.into_path();
+    let db_path = temp_path.join("mls.db");
 
     struct NoopKeychain;
     #[async_trait::async_trait]
@@ -113,7 +106,7 @@ async fn restart_orchestrator(
         .initialize(&client.did)
         .await
         .expect("restart initialize failed");
-    (orchestrator, temp_dir)
+    (orchestrator, temp_path)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
