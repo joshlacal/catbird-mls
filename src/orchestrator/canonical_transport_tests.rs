@@ -289,7 +289,7 @@ fn packaged_chat_schema_has_pinned_provenance() {
         "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a"
     );
     assert_eq!(provenance["generator"], "scripts/generate_chat_schema.py");
-    assert_eq!(provenance["generatorVersion"], 5);
+    assert_eq!(provenance["generatorVersion"], 6);
     assert_eq!(
         provenance["sourceRevision"],
         "954d7ab20f362b731ee13f87eea89ae83558c624"
@@ -316,6 +316,12 @@ fn packaged_server_vectors_have_pinned_provenance() {
             "96044be0c06e3dd43cbe77b7ac29c1ecfcee1922782b1c5e74258768b1aa3c6d",
             14,
         ),
+        (
+            include_str!("generated/mls_chat_signing_domain_vectors.json"),
+            "mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json",
+            "40bd067558c98648a565cbd58a3e17cd4756da6df5428bd71dfce948182f0226",
+            11,
+        ),
     ] {
         let artifact: serde_json::Value =
             serde_json::from_str(artifact).expect("generated vector JSON");
@@ -325,8 +331,18 @@ fn packaged_server_vectors_have_pinned_provenance() {
         assert_eq!(provenance["sourcePath"], source_path);
         assert_eq!(provenance["sourceSha256"], source_sha256);
         assert_eq!(provenance["generator"], "scripts/generate_chat_schema.py");
-        assert_eq!(provenance["generatorVersion"], 5);
+        assert_eq!(provenance["generatorVersion"], 6);
         assert_eq!(provenance["vectorCaseCount"], vector_case_count);
+        assert_eq!(
+            provenance["sourceRevision"],
+            "1336d821566aacb93c3a580091518a6eb68ed63c"
+        );
+        assert_eq!(
+            provenance["sourceTree"],
+            "5796505b80b76490f5ada54febe2d8439e1b00eb"
+        );
+        assert_eq!(provenance["vectorSet"], "signed-mutation");
+        assert_eq!(provenance["vectorSetCount"], 25);
     }
 }
 
@@ -1151,6 +1167,71 @@ mod signed_request_orchestrator_red_tests {
         }
     }
 
+    fn signing_domain_operation(body_name: &str) -> CanonicalOperation {
+        match body_name {
+            "deviceEnrollmentBody" => CanonicalOperation::EnrollDevice,
+            "keyPackageReplenishmentBody" => CanonicalOperation::ReplenishKeyPackages,
+            "deviceAuthenticationRebindBody" => CanonicalOperation::RebindDeviceAuthentication,
+            "deviceRevocationBody" => CanonicalOperation::RevokeDevice,
+            "blobUploadPreparationBody" => CanonicalOperation::PrepareBlobUpload,
+            "applicationSendBody" => CanonicalOperation::SendMessage,
+            "typingBody" => CanonicalOperation::PublishTyping,
+            "leafRecoveryRequestBody" => CanonicalOperation::RequestLeafRecovery,
+            "leafRecoveryCancellationBody" => CanonicalOperation::CancelLeafRecovery,
+            "welcomeAcknowledgementBody" => CanonicalOperation::AcknowledgeWelcome,
+            "welcomeRejectionBody" => CanonicalOperation::RejectWelcome,
+            other => panic!("unmapped signed-domain fixture {other}"),
+        }
+    }
+
+    fn signing_domain_binding(
+        body: &Value,
+        operation: CanonicalOperation,
+    ) -> CleanChatSigningContext {
+        let device_field = if operation == CanonicalOperation::EnrollDevice {
+            "deviceId"
+        } else {
+            "actorDeviceId"
+        };
+        let dpop_jkt = match operation {
+            CanonicalOperation::EnrollDevice | CanonicalOperation::ReplenishKeyPackages => body
+                ["dpopJkt"]
+                .as_str()
+                .expect("signed-domain dpopJkt")
+                .to_owned(),
+            CanonicalOperation::RebindDeviceAuthentication => body["newDpopJkt"]
+                .as_str()
+                .expect("signed-domain newDpopJkt")
+                .to_owned(),
+            _ => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        };
+        let auth_generation = match operation {
+            CanonicalOperation::EnrollDevice => None,
+            CanonicalOperation::RebindDeviceAuthentication => Some(
+                body["expectedAuthGeneration"]
+                    .as_i64()
+                    .expect("signed-domain expected auth generation"),
+            ),
+            _ => Some(
+                body["authGeneration"]
+                    .as_i64()
+                    .expect("signed-domain auth generation"),
+            ),
+        };
+        CleanChatSigningContext {
+            actor_did: body["actorDid"]
+                .as_str()
+                .expect("signed-domain actor DID")
+                .into(),
+            device_id: body[device_field]
+                .as_str()
+                .expect("signed-domain device ID")
+                .into(),
+            dpop_jkt,
+            auth_generation,
+        }
+    }
+
     #[test]
     fn signed_orchestrator_matches_server_strict_control_transcript_vectors() {
         let fixture: Value = serde_json::from_str(include_str!(
@@ -1271,6 +1352,96 @@ mod signed_request_orchestrator_red_tests {
             serde_json::from_slice(wire.body.as_deref().unwrap()).expect("blob signed wire JSON");
         assert_eq!(wire["signedRequest"].as_object().unwrap().len(), 2);
         assert!(wire["signedRequest"].get("$type").is_none());
+    }
+
+    #[test]
+    fn signed_orchestrator_matches_all_eleven_server_signing_domain_vectors() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "generated/mls_chat_signing_domain_vectors.json"
+        ))
+        .expect("server signing-domain fixture is valid JSON");
+        let cases = fixture["cases"].as_array().expect("server fixture cases");
+        assert_eq!(cases.len(), 11);
+        assert_eq!(
+            fixture["_catbird_mls_provenance"]["vectorSet"],
+            "signed-mutation"
+        );
+        assert_eq!(fixture["_catbird_mls_provenance"]["vectorSetCount"], 25);
+        let controls: Value = serde_json::from_str(include_str!(
+            "generated/mls_chat_control_fingerprint_source.json"
+        ))
+        .expect("server control fixture is valid JSON");
+        assert_eq!(
+            controls["cases"]
+                .as_array()
+                .expect("server control cases")
+                .len()
+                + 1
+                + cases.len(),
+            25,
+            "13 control cases plus one blob case plus 11 signing-domain cases"
+        );
+        let finish_signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+
+        for case in cases {
+            let body = fixture_wire_value(case["body"].clone());
+            let operation = signing_domain_operation(
+                case["bodyName"].as_str().expect("signed-domain body name"),
+            );
+            let binding = signing_domain_binding(&body, operation);
+            let prepared = super::super::canonical_transport::prepare_signed_body(
+                &binding,
+                operation,
+                &serde_json::to_vec(&body).expect("signed-domain fixture serializes"),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "strict server signing-domain fixture {} must project: {error}",
+                    case["bodyName"]
+                )
+            });
+            assert_eq!(
+                hex::encode(&prepared.transcript),
+                case["transcriptHex"]
+                    .as_str()
+                    .expect("signed-domain fixture transcript"),
+                "server transcript mismatch for {}",
+                case["bodyName"]
+            );
+
+            let mut generated_body = body.clone();
+            generated_body["keyId"] = Value::String(derive_key_id(finish_signer.public()));
+            if generated_body.get("signaturePublicKey").is_some() {
+                generated_body["signaturePublicKey"] =
+                    Value::String(STANDARD.encode(finish_signer.public()));
+            }
+            let wire = prepare_signed_request_with_signer(
+                &binding,
+                operation,
+                serde_json::to_vec(&generated_body)
+                    .expect("signed-domain generated fixture serializes"),
+                &finish_signer,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "generated strict wrapper {} must decode: {error}",
+                    case["bodyName"]
+                )
+            });
+            let wire: Value =
+                serde_json::from_slice(wire.body.as_deref().unwrap()).expect("signed wire JSON");
+            let wrapper = wire["signedRequest"]
+                .as_object()
+                .expect("signedRequest wrapper");
+            assert_eq!(wrapper.len(), 2, "server wrapper is closed");
+            assert!(wrapper.get("$type").is_none(), "wrapper has no union tag");
+            assert_eq!(
+                wrapper["body"]["$type"], generated_body["$type"],
+                "body retains its exact type tag"
+            );
+            assert!(wrapper["signature"].is_string(), "signature is bare base64");
+            assert_eq!(wrapper["signature"].as_str().unwrap().len(), 88);
+        }
     }
 
     #[test]

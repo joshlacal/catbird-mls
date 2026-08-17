@@ -15,6 +15,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -29,19 +30,31 @@ FIXTURE_SOURCES = (
         Path("mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json"),
         Path("src/orchestrator/generated/mls_chat_control_fingerprint_source.json"),
         13,
+        "f33406a5d99dba3b604da108c4df2e53d70531b9fa0be14b21e2db94ba07b311",
     ),
     (
         Path("mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json"),
         Path("src/orchestrator/generated/mls_chat_contract_vectors.json"),
         14,
+        "96044be0c06e3dd43cbe77b7ac29c1ecfcee1922782b1c5e74258768b1aa3c6d",
+    ),
+    (
+        Path("mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json"),
+        Path("src/orchestrator/generated/mls_chat_signing_domain_vectors.json"),
+        11,
+        "40bd067558c98648a565cbd58a3e17cd4756da6df5428bd71dfce948182f0226",
     ),
 )
 ARTIFACT_RELATIVE = Path("src/orchestrator/generated/blue.catbird.chat.defs.json")
 GENERATOR_NAME = "scripts/generate_chat_schema.py"
-GENERATOR_VERSION = 5
+GENERATOR_VERSION = 6
 PROVENANCE_KEY = "_catbird_mls_provenance"
 CANONICAL_SOURCE_REVISION = "954d7ab20f362b731ee13f87eea89ae83558c624"
 CANONICAL_SOURCE_TREE = "6779729a15bec425fa520b9197bf60bebdb9e32b"
+SERVER_SOURCE_REVISION = "1336d821566aacb93c3a580091518a6eb68ed63c"
+SERVER_SOURCE_TREE = "5796505b80b76490f5ada54febe2d8439e1b00eb"
+SERVER_VECTOR_SET = "signed-mutation"
+SERVER_VECTOR_SET_COUNT = 25
 
 
 def repository_root() -> Path:
@@ -70,11 +83,52 @@ def load_source(path: Path, *, require_defs: bool = False) -> tuple[dict, str]:
     return source, digest
 
 
+def server_revision() -> tuple[str, str]:
+    server_root = repository_root() / "mls-ds"
+    try:
+        revision = subprocess.run(
+            ["git", "-C", str(server_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        tree = subprocess.run(
+            ["git", "-C", str(server_root), "rev-parse", "HEAD^{tree}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError(f"unable to inspect pinned mls-ds source revision: {error}") from error
+    if (revision, tree) != (SERVER_SOURCE_REVISION, SERVER_SOURCE_TREE):
+        raise ValueError(
+            "mls-ds source revision is not the Sol-approved corpus "
+            f"(expected {SERVER_SOURCE_REVISION}/{SERVER_SOURCE_TREE}, "
+            f"found {revision}/{tree})"
+        )
+    return revision, tree
+
+
+def fixture_case_count(source: dict, source_relative: Path) -> int:
+    if source_relative.name == "mls_chat_contract_vectors.json":
+        controls = source.get("controlEntryFingerprints", {}).get("cases")
+        signed_mutator = source.get("signedMutator")
+        if not isinstance(controls, list) or not isinstance(signed_mutator, dict):
+            raise ValueError(f"{source_relative} does not contain the strict contract corpus")
+        return len(controls) + 1
+    cases = source.get("cases")
+    if not isinstance(cases, list):
+        raise ValueError(f"{source_relative} does not contain a vector cases array")
+    return len(cases)
+
+
 def expected_artifact(
     source: dict,
     digest: str,
     source_relative: Path,
     vector_case_count: int | None = None,
+    source_revision: str | None = None,
+    source_tree: str | None = None,
 ) -> bytes:
     artifact = dict(source)
     artifact[PROVENANCE_KEY] = {
@@ -94,6 +148,10 @@ def expected_artifact(
         artifact[PROVENANCE_KEY].update(
             {
                 "vectorCaseCount": vector_case_count,
+                "sourceRevision": source_revision,
+                "sourceTree": source_tree,
+                "vectorSet": SERVER_VECTOR_SET,
+                "vectorSetCount": SERVER_VECTOR_SET_COUNT,
             }
         )
     return (json.dumps(artifact, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
@@ -107,6 +165,8 @@ def check_artifact(
     digest: str,
     source_relative: Path,
     vector_case_count: int | None = None,
+    source_revision: str | None = None,
+    source_tree: str | None = None,
 ) -> None:
     actual = path.read_bytes()
     if actual != expected:
@@ -132,6 +192,10 @@ def check_artifact(
         expected_provenance.update(
             {
                 "vectorCaseCount": vector_case_count,
+                "sourceRevision": source_revision,
+                "sourceTree": source_tree,
+                "vectorSet": SERVER_VECTOR_SET,
+                "vectorSetCount": SERVER_VECTOR_SET_COUNT,
             }
         )
     if provenance != expected_provenance:
@@ -155,6 +219,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.check_mirror:
+        server_revision()
         canonical = source_path(SOURCE_RELATIVE).read_bytes()
         mirror = source_path(MIRROR_RELATIVE).read_bytes()
         if canonical != mirror:
@@ -169,12 +234,14 @@ def main() -> int:
         )
         return 0
 
+    pinned_server_revision, pinned_server_tree = server_revision()
     artifacts = (
         (
             SOURCE_RELATIVE,
             artifact_path(args.artifact),
             source_path(args.source),
             True,
+            None,
             None,
         ),
         *(
@@ -184,14 +251,36 @@ def main() -> int:
                 source_path(source_relative),
                 False,
                 vector_case_count,
+                source_sha256,
             )
-            for source_relative, artifact_relative, vector_case_count in FIXTURE_SOURCES
+            for source_relative, artifact_relative, vector_case_count, source_sha256 in FIXTURE_SOURCES
         ),
     )
-    for source_relative, destination, source, require_defs, vector_case_count in artifacts:
+    for (
+        source_relative,
+        destination,
+        source,
+        require_defs,
+        vector_case_count,
+        expected_source_sha256,
+    ) in artifacts:
         loaded, digest = load_source(source, require_defs=require_defs)
+        if expected_source_sha256 is not None and digest != expected_source_sha256:
+            raise ValueError(
+                f"{source} has SHA-256 {digest}, expected the approved corpus "
+                f"{expected_source_sha256}"
+            )
+        if vector_case_count is not None and fixture_case_count(loaded, source_relative) != vector_case_count:
+            raise ValueError(
+                f"{source} has the wrong corpus count; expected {vector_case_count}"
+            )
         expected = expected_artifact(
-            loaded, digest, source_relative, vector_case_count=vector_case_count
+            loaded,
+            digest,
+            source_relative,
+            vector_case_count=vector_case_count,
+            source_revision=pinned_server_revision if vector_case_count is not None else None,
+            source_tree=pinned_server_tree if vector_case_count is not None else None,
         )
         if args.check:
             check_artifact(
@@ -200,6 +289,8 @@ def main() -> int:
                 digest,
                 source_relative,
                 vector_case_count=vector_case_count,
+                source_revision=pinned_server_revision if vector_case_count is not None else None,
+                source_tree=pinned_server_tree if vector_case_count is not None else None,
             )
             print(f"{destination}: verified source SHA-256 {digest}")
         else:

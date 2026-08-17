@@ -1,10 +1,14 @@
 {
   "_catbird_mls_provenance": {
     "generator": "scripts/generate_chat_schema.py",
-    "generatorVersion": 5,
+    "generatorVersion": 6,
     "sourcePath": "mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json",
+    "sourceRevision": "1336d821566aacb93c3a580091518a6eb68ed63c",
     "sourceSha256": "96044be0c06e3dd43cbe77b7ac29c1ecfcee1922782b1c5e74258768b1aa3c6d",
-    "vectorCaseCount": 14
+    "sourceTree": "5796505b80b76490f5ada54febe2d8439e1b00eb",
+    "vectorCaseCount": 14,
+    "vectorSet": "signed-mutation",
+    "vectorSetCount": 25
   },
   "applicationEntryFingerprint": {
     "base64BytePaths": [
