@@ -276,6 +276,116 @@ fn get_blob_preserves_arbitrary_binary_response_bytes() {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn packaged_chat_schema_has_pinned_provenance() {
+    let provenance = super::canonical_transport::chat_schema_provenance();
+    assert_eq!(
+        provenance["sourcePath"],
+        "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json"
+    );
+    assert_eq!(
+        provenance["sourceSha256"],
+        "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a"
+    );
+    assert_eq!(provenance["generator"], "scripts/generate_chat_schema.py");
+    assert_eq!(provenance["generatorVersion"], 7);
+    assert_eq!(
+        provenance["sourceRevision"],
+        "954d7ab20f362b731ee13f87eea89ae83558c624"
+    );
+    assert_eq!(
+        provenance["sourceTree"],
+        "6779729a15bec425fa520b9197bf60bebdb9e32b"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn generator_rejects_wrong_petrel_source_bytes() {
+    let has_monorepo_authorities = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .any(|path| path.join("PetrelCatbird").is_dir() && path.join("mls-ds").is_dir());
+    if !has_monorepo_authorities {
+        // Canonical-depth/package copies intentionally have no sibling source
+        // repositories. The generator gate runs from the canonical monorepo.
+        return;
+    }
+    let temporary = tempfile::tempdir().expect("temporary source directory");
+    let wrong_source = temporary.path().join("wrong-chat-defs.json");
+    std::fs::write(
+        &wrong_source,
+        format!(
+            "{}\n",
+            include_str!("generated/blue.catbird.chat.defs.json")
+        ),
+    )
+    .expect("wrong source writes");
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/generate_chat_schema.py");
+    let output = std::process::Command::new("python3")
+        .arg(script)
+        .arg("--validate-source")
+        .arg(&wrong_source)
+        .output()
+        .expect("generator launches");
+    assert!(
+        !output.status.success(),
+        "wrong Petrel source must fail closed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("canonical PetrelCatbird source SHA-256"),
+        "unexpected generator error: {stderr}"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn packaged_server_vectors_have_pinned_provenance() {
+    for (artifact, source_path, source_sha256, vector_case_count) in [
+        (
+            include_str!("generated/mls_chat_control_fingerprint_source.json"),
+            "mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json",
+            "f33406a5d99dba3b604da108c4df2e53d70531b9fa0be14b21e2db94ba07b311",
+            13,
+        ),
+        (
+            include_str!("generated/mls_chat_contract_vectors.json"),
+            "mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json",
+            "96044be0c06e3dd43cbe77b7ac29c1ecfcee1922782b1c5e74258768b1aa3c6d",
+            14,
+        ),
+        (
+            include_str!("generated/mls_chat_signing_domain_vectors.json"),
+            "mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json",
+            "40bd067558c98648a565cbd58a3e17cd4756da6df5428bd71dfce948182f0226",
+            11,
+        ),
+    ] {
+        let artifact: serde_json::Value =
+            serde_json::from_str(artifact).expect("generated vector JSON");
+        let provenance = artifact
+            .get("_catbird_mls_provenance")
+            .expect("generated vector provenance");
+        assert_eq!(provenance["sourcePath"], source_path);
+        assert_eq!(provenance["sourceSha256"], source_sha256);
+        assert_eq!(provenance["generator"], "scripts/generate_chat_schema.py");
+        assert_eq!(provenance["generatorVersion"], 7);
+        assert_eq!(provenance["vectorCaseCount"], vector_case_count);
+        assert_eq!(
+            provenance["sourceRevision"],
+            "1336d821566aacb93c3a580091518a6eb68ed63c"
+        );
+        assert_eq!(
+            provenance["sourceTree"],
+            "5796505b80b76490f5ada54febe2d8439e1b00eb"
+        );
+        assert_eq!(provenance["vectorSet"], "signed-mutation");
+        assert_eq!(provenance["vectorSetCount"], 25);
+    }
+}
+
 fn rebind_request_json(
     actor_device_id: &str,
     current_dpop_jkt: &str,
@@ -951,7 +1061,6 @@ fn signed_post_preparation_requires_exact_authenticated_generation() {
             if message.contains("authGeneration")
     ));
 }
-
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn prepare_clean_chat_signed_request_delegates_to_prepare_clean_chat_request() {
@@ -980,3 +1089,1005 @@ fn prepare_clean_chat_signed_request_delegates_to_prepare_clean_chat_request() {
     assert!(prepared.body.is_some());
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+mod signed_request_orchestrator_red_tests {
+    use super::super::canonical_transport::{
+        derive_key_id, prepare_signed_request_with_signer, CanonicalOperation,
+        CleanChatSigningContext,
+    };
+    use super::auth;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use openmls::prelude::SignatureScheme;
+    use openmls_basic_credential::SignatureKeyPair;
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    const ACTOR_DID: &str = "did:plc:z72i7hdynmk67x4h5wqf3s6a";
+
+    fn replenishment_wire(signer: &SignatureKeyPair) -> Value {
+        let input = super::ReplenishKeyPackagesInput {
+            actor_did: ACTOR_DID.into(),
+            actor_device_id: auth().device_id,
+            auth_generation: 1,
+            idempotency_key: "22222222-2222-4222-8222-222222222222".into(),
+            key_id: derive_key_id(signer.public()),
+            dpop_jkt: auth().dpop_jkt,
+            signature_domain: "CATBIRD-CHAT-DEVICE-REPLENISH\0".into(),
+            key_packages: vec![super::key_package()],
+            signed_at: "2026-08-16T12:00:00.000Z".into(),
+        };
+        let prepared =
+            super::super::canonical_transport::replenish_key_packages(&auth(), signer, input)
+                .expect("existing generated replenishment fixture");
+        let request: Value =
+            serde_json::from_slice(prepared.body.as_deref().expect("generated body")).unwrap();
+        request
+    }
+
+    fn replenishment_body(signer: &SignatureKeyPair) -> Value {
+        let mut body = replenishment_wire(signer)["signedRequest"]["body"].clone();
+        for field in ["bytes", "keyPackageRef"] {
+            let encoded = body["keyPackages"][0][field]["$bytes"]
+                .as_str()
+                .expect("generated byte helper");
+            body["keyPackages"][0][field] = Value::String(encoded.into());
+        }
+        let sha256 = body["keyPackages"][0]["sha256"]
+            .as_array()
+            .expect("generated artifact hash array")
+            .iter()
+            .map(|value| value.as_u64().unwrap() as u8)
+            .collect::<Vec<_>>();
+        body["keyPackages"][0]["sha256"] =
+            Value::String(base64::engine::general_purpose::STANDARD.encode(sha256));
+        let public_key = body["signaturePublicKey"]["$bytes"]
+            .as_str()
+            .expect("generated public-key bytes");
+        body["signaturePublicKey"] = Value::String(public_key.into());
+        body["$type"] = Value::String("blue.catbird.chat.defs#keyPackageReplenishmentBody".into());
+        body
+    }
+
+    fn clean_auth(generation: Option<i64>) -> CleanChatSigningContext {
+        CleanChatSigningContext {
+            actor_did: ACTOR_DID.into(),
+            dpop_jkt: auth().dpop_jkt,
+            device_id: auth().device_id,
+            auth_generation: generation,
+        }
+    }
+
+    fn fixture_wire_value(value: Value) -> Value {
+        fixture_wire_value_at(&value, None, false)
+    }
+
+    fn fixture_wire_value_at(value: &Value, field_name: Option<&str>, coordinate: bool) -> Value {
+        match value {
+            Value::Object(object) if object.len() == 1 && object.contains_key("$uuid") => {
+                let uuid = object["$uuid"]
+                    .as_str()
+                    .expect("fixture UUID marker is a string");
+                if coordinate && field_name == Some("conversationId") {
+                    let bytes = uuid::Uuid::parse_str(uuid)
+                        .expect("fixture UUID marker is canonical")
+                        .into_bytes();
+                    Value::String(STANDARD.encode(bytes))
+                } else {
+                    Value::String(uuid.into())
+                }
+            }
+            Value::Object(object) if object.len() == 1 && object.contains_key("$bytesHex") => {
+                let bytes = object["$bytesHex"]
+                    .as_str()
+                    .expect("fixture bytes marker is a string");
+                Value::String(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(hex::decode(bytes).expect("fixture bytes are hexadecimal")),
+                )
+            }
+            Value::Object(object) => {
+                let this_coordinate =
+                    coordinate || matches!(field_name, Some("aad" | "coordinate"));
+                Value::Object(
+                    object
+                        .iter()
+                        .map(|(key, value)| {
+                            (
+                                key.clone(),
+                                fixture_wire_value_at(value, Some(key), this_coordinate),
+                            )
+                        })
+                        .collect(),
+                )
+            }
+            Value::Array(values) => Value::Array(
+                values
+                    .iter()
+                    .map(|value| fixture_wire_value_at(value, field_name, coordinate))
+                    .collect(),
+            ),
+            value => value.clone(),
+        }
+    }
+
+    fn fixture_operation(signed_request_ref: &str) -> CanonicalOperation {
+        match signed_request_ref {
+            "blue.catbird.chat.defs#signedCommitTransition"
+            | "blue.catbird.chat.defs#signedPolicyTransition"
+            | "blue.catbird.chat.defs#signedMetadataTransition"
+            | "blue.catbird.chat.defs#signedLeafRecoveryFulfillment"
+            | "blue.catbird.chat.defs#signedLeaveCommitFulfillment" => {
+                CanonicalOperation::SubmitTransition
+            }
+            "blue.catbird.chat.defs#signedCreation" => CanonicalOperation::CreateConversation,
+            "blue.catbird.chat.defs#signedParticipantAcceptance" => {
+                CanonicalOperation::AcceptConversation
+            }
+            "blue.catbird.chat.defs#signedConversationClose" => {
+                CanonicalOperation::CloseConversation
+            }
+            "blue.catbird.chat.defs#signedResetRequest" => CanonicalOperation::RequestReset,
+            "blue.catbird.chat.defs#signedResetActivation" => CanonicalOperation::ActivateReset,
+            "blue.catbird.chat.defs#signedLeaveRequest"
+            | "blue.catbird.chat.defs#signedZeroLeafLeave" => CanonicalOperation::RequestLeave,
+            "blue.catbird.chat.defs#signedLeaveCancellation" => CanonicalOperation::CancelLeave,
+            other => panic!("unmapped strict server fixture {other}"),
+        }
+    }
+
+    fn signing_domain_operation(body_name: &str) -> CanonicalOperation {
+        match body_name {
+            "deviceEnrollmentBody" => CanonicalOperation::EnrollDevice,
+            "keyPackageReplenishmentBody" => CanonicalOperation::ReplenishKeyPackages,
+            "deviceAuthenticationRebindBody" => CanonicalOperation::RebindDeviceAuthentication,
+            "deviceRevocationBody" => CanonicalOperation::RevokeDevice,
+            "blobUploadPreparationBody" => CanonicalOperation::PrepareBlobUpload,
+            "applicationSendBody" => CanonicalOperation::SendMessage,
+            "typingBody" => CanonicalOperation::PublishTyping,
+            "leafRecoveryRequestBody" => CanonicalOperation::RequestLeafRecovery,
+            "leafRecoveryCancellationBody" => CanonicalOperation::CancelLeafRecovery,
+            "welcomeAcknowledgementBody" => CanonicalOperation::AcknowledgeWelcome,
+            "welcomeRejectionBody" => CanonicalOperation::RejectWelcome,
+            other => panic!("unmapped signed-domain fixture {other}"),
+        }
+    }
+
+    fn signing_domain_binding(
+        body: &Value,
+        operation: CanonicalOperation,
+    ) -> CleanChatSigningContext {
+        let device_field = if operation == CanonicalOperation::EnrollDevice {
+            "deviceId"
+        } else {
+            "actorDeviceId"
+        };
+        let dpop_jkt = match operation {
+            CanonicalOperation::EnrollDevice | CanonicalOperation::ReplenishKeyPackages => body
+                ["dpopJkt"]
+                .as_str()
+                .expect("signed-domain dpopJkt")
+                .to_owned(),
+            CanonicalOperation::RebindDeviceAuthentication => body["newDpopJkt"]
+                .as_str()
+                .expect("signed-domain newDpopJkt")
+                .to_owned(),
+            _ => "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        };
+        let auth_generation = match operation {
+            CanonicalOperation::EnrollDevice => None,
+            CanonicalOperation::RebindDeviceAuthentication => Some(
+                body["expectedAuthGeneration"]
+                    .as_i64()
+                    .expect("signed-domain expected auth generation"),
+            ),
+            _ => Some(
+                body["authGeneration"]
+                    .as_i64()
+                    .expect("signed-domain auth generation"),
+            ),
+        };
+        CleanChatSigningContext {
+            actor_did: body["actorDid"]
+                .as_str()
+                .expect("signed-domain actor DID")
+                .into(),
+            device_id: body[device_field]
+                .as_str()
+                .expect("signed-domain device ID")
+                .into(),
+            dpop_jkt,
+            auth_generation,
+        }
+    }
+
+    fn server_signing_key(fixture: &Value) -> SignatureKeyPair {
+        let seed = [0x5c_u8; 32];
+        let public_key = hex::decode(
+            fixture["publicKeyHex"]
+                .as_str()
+                .expect("server signing public key"),
+        )
+        .expect("server signing public key hex");
+        let derived_public = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(public_key, derived_public, "server fixture seed is stable");
+        SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public_key)
+    }
+
+    fn fixture_signing_key(seed_hex: &str, public_key_hex: &str) -> SignatureKeyPair {
+        let seed: [u8; 32] = hex::decode(seed_hex)
+            .expect("fixture signing seed hex")
+            .try_into()
+            .expect("fixture signing seed length");
+        let public_key = hex::decode(public_key_hex).expect("fixture public key hex");
+        let derived_public = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        assert_eq!(public_key, derived_public, "fixture signing key is stable");
+        SignatureKeyPair::from_raw(SignatureScheme::ED25519, seed.to_vec(), public_key)
+    }
+
+    #[test]
+    fn signed_orchestrator_matches_server_strict_control_transcript_vectors() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "generated/mls_chat_control_fingerprint_source.json"
+        ))
+        .expect("server control fingerprint fixture is valid JSON");
+        let contract: Value =
+            serde_json::from_str(include_str!("generated/mls_chat_contract_vectors.json"))
+                .expect("server contract fixture is valid JSON");
+        let cases = fixture["cases"].as_array().expect("server fixture cases");
+        let transcript_cases = contract["controlEntryFingerprints"]["cases"]
+            .as_array()
+            .expect("server transcript cases");
+        assert_eq!(cases.len(), 13, "all strict control mutations stay covered");
+        assert_eq!(transcript_cases.len(), cases.len());
+
+        for case in cases {
+            let body = fixture_wire_value(case["body"].clone());
+            let binding = CleanChatSigningContext {
+                actor_did: body["actorDid"].as_str().expect("fixture actor DID").into(),
+                device_id: body["actorDeviceId"]
+                    .as_str()
+                    .expect("fixture actor device ID")
+                    .into(),
+                dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                auth_generation: Some(
+                    body["authGeneration"]
+                        .as_i64()
+                        .expect("fixture auth generation"),
+                ),
+            };
+            let operation = fixture_operation(
+                case["signedRequestRef"]
+                    .as_str()
+                    .expect("fixture signed request ref"),
+            );
+            let prepared = super::super::canonical_transport::prepare_signed_body(
+                &binding,
+                operation,
+                &serde_json::to_vec(&body).expect("wire fixture serializes"),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "strict server fixture {} must project: {error}",
+                    case["signedRequestRef"]
+                )
+            });
+            let transcript_case = transcript_cases
+                .iter()
+                .find(|candidate| candidate["signedRequestRef"] == case["signedRequestRef"])
+                .expect("strict server transcript counterpart");
+            assert_eq!(
+                hex::encode(&prepared.transcript),
+                transcript_case["signingTranscriptHex"]
+                    .as_str()
+                    .expect("fixture transcript"),
+                "server transcript mismatch for {}",
+                case["signedRequestRef"]
+            );
+            let signing_domain = transcript_case["signingDomain"]
+                .as_str()
+                .expect("control fixture signing domain");
+            let canonical_body = prepared
+                .transcript
+                .get(signing_domain.len()..)
+                .expect("control transcript includes signing domain");
+            assert_eq!(
+                hex::encode(canonical_body),
+                transcript_case["unsignedSigningProjectionCanonicalDagCborHex"]
+            );
+            assert_eq!(
+                STANDARD.encode(Sha256::digest(&prepared.transcript)),
+                transcript_case["requestDigest"]
+            );
+            let mut fingerprint_input = b"CATBIRD-CHAT-CONTROL-ENTRY-FINGERPRINT\0".to_vec();
+            fingerprint_input.extend_from_slice(
+                &hex::decode(
+                    transcript_case["canonicalDagCborHex"]
+                        .as_str()
+                        .expect("control canonical fingerprint CBOR"),
+                )
+                .expect("control canonical fingerprint CBOR hex"),
+            );
+            assert_eq!(
+                hex::encode(Sha256::digest(fingerprint_input)),
+                transcript_case["fingerprintSha256Hex"]
+            );
+
+            let key_ref = case["historicalPublicKeyRef"]
+                .as_str()
+                .expect("historical key reference");
+            let finish_signer = fixture_signing_key(
+                fixture["testOnlySigningSeedsHex"][key_ref]
+                    .as_str()
+                    .expect("fixture signing seed"),
+                contract["controlEntryFingerprints"]["historicalPublicKeys"][key_ref]
+                    .as_str()
+                    .expect("fixture historical public key"),
+            );
+            assert_eq!(
+                derive_key_id(finish_signer.public()),
+                body["keyId"].as_str().expect("control fixture keyId"),
+                "control body keyId must remain bound to its fixture signer"
+            );
+            let wire = prepare_signed_request_with_signer(
+                &binding,
+                operation,
+                serde_json::to_vec(&body).expect("generated fixture serializes"),
+                &finish_signer,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "generated DTO wrapper {} must decode: {error}",
+                    case["signedRequestRef"]
+                )
+            });
+            let wire: Value =
+                serde_json::from_slice(wire.body.as_deref().unwrap()).expect("signed wire JSON");
+            assert_eq!(wire["signedRequest"].as_object().unwrap().len(), 2);
+            assert!(wire["signedRequest"].get("$type").is_none());
+            let expected_wrapper = serde_json::json!({
+                "body": body,
+                "signature": transcript_case["signature"]
+            });
+            assert_eq!(wire["signedRequest"], expected_wrapper);
+            assert_eq!(
+                hex::encode(
+                    serde_json::to_vec(&wire["signedRequest"]).expect("control wrapper serializes")
+                ),
+                hex::encode(
+                    serde_json::to_vec(&expected_wrapper)
+                        .expect("control fixture wrapper serializes")
+                )
+            );
+            assert_eq!(
+                wire["signedRequest"]["signature"], transcript_case["signature"],
+                "emitted control signature must equal the approved fixture"
+            );
+        }
+
+        let mut blob = contract["signedMutator"]["body"].clone();
+        blob = fixture_wire_value(blob);
+        let blob_signer = fixture_signing_key(
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+            contract["signedMutator"]["publicKeyHex"]
+                .as_str()
+                .expect("blob fixture public key"),
+        );
+        assert_eq!(
+            derive_key_id(blob_signer.public()),
+            blob["keyId"].as_str().expect("blob fixture keyId"),
+            "blob body keyId must remain bound to its fixture signer"
+        );
+        let blob_binding = CleanChatSigningContext {
+            actor_did: blob["actorDid"].as_str().expect("blob actor DID").into(),
+            device_id: blob["actorDeviceId"]
+                .as_str()
+                .expect("blob actor device ID")
+                .into(),
+            dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            auth_generation: Some(
+                blob["authGeneration"]
+                    .as_i64()
+                    .expect("blob auth generation"),
+            ),
+        };
+        let prepared = super::super::canonical_transport::prepare_signed_body(
+            &blob_binding,
+            CanonicalOperation::DeleteBlob,
+            &serde_json::to_vec(&blob).expect("blob fixture serializes"),
+        )
+        .expect("blob deletion fixture projects");
+        assert_eq!(
+            hex::encode(&prepared.transcript),
+            contract["signedMutator"]["transcriptHex"]
+                .as_str()
+                .expect("blob fixture transcript")
+        );
+        let blob_domain = blob["signatureDomain"]
+            .as_str()
+            .expect("blob signing domain");
+        assert_eq!(
+            hex::encode(
+                prepared
+                    .transcript
+                    .get(blob_domain.len()..)
+                    .expect("blob transcript includes signing domain")
+            ),
+            contract["signedMutator"]["canonicalUnsignedDagCborHex"]
+        );
+        assert_eq!(
+            hex::encode(Sha256::digest(&prepared.transcript)),
+            contract["signedMutator"]["canonicalRequestDigestHex"]
+        );
+        let wire = prepare_signed_request_with_signer(
+            &blob_binding,
+            CanonicalOperation::DeleteBlob,
+            serde_json::to_vec(&blob).expect("blob generated fixture serializes"),
+            &blob_signer,
+        )
+        .expect("blob generated DTO wrapper decodes");
+        let wire: Value =
+            serde_json::from_slice(wire.body.as_deref().unwrap()).expect("blob signed wire JSON");
+        assert_eq!(wire["signedRequest"].as_object().unwrap().len(), 2);
+        assert!(wire["signedRequest"].get("$type").is_none());
+        let expected_blob_signature = STANDARD.encode(
+            hex::decode(
+                contract["signedMutator"]["signatureHex"]
+                    .as_str()
+                    .expect("blob fixture signature"),
+            )
+            .expect("blob fixture signature hex"),
+        );
+        let expected_wrapper = serde_json::json!({
+            "body": blob,
+            "signature": expected_blob_signature
+        });
+        assert_eq!(wire["signedRequest"], expected_wrapper);
+        assert_eq!(
+            hex::encode(
+                serde_json::to_vec(&wire["signedRequest"]).expect("blob wrapper serializes")
+            ),
+            hex::encode(
+                serde_json::to_vec(&expected_wrapper).expect("blob fixture wrapper serializes")
+            )
+        );
+        assert_eq!(
+            hex::encode(
+                STANDARD
+                    .decode(wire["signedRequest"]["signature"].as_str().unwrap())
+                    .expect("blob signature base64")
+            ),
+            contract["signedMutator"]["signatureHex"],
+            "emitted blob signature must equal the approved fixture"
+        );
+    }
+
+    #[test]
+    fn signed_orchestrator_matches_all_eleven_server_signing_domain_vectors() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "generated/mls_chat_signing_domain_vectors.json"
+        ))
+        .expect("server signing-domain fixture is valid JSON");
+        let cases = fixture["cases"].as_array().expect("server fixture cases");
+        assert_eq!(cases.len(), 11);
+        assert_eq!(
+            fixture["_catbird_mls_provenance"]["vectorSet"],
+            "signed-mutation"
+        );
+        assert_eq!(fixture["_catbird_mls_provenance"]["vectorSetCount"], 25);
+        let controls: Value = serde_json::from_str(include_str!(
+            "generated/mls_chat_control_fingerprint_source.json"
+        ))
+        .expect("server control fixture is valid JSON");
+        assert_eq!(
+            controls["cases"]
+                .as_array()
+                .expect("server control cases")
+                .len()
+                + 1
+                + cases.len(),
+            25,
+            "13 control cases plus one blob case plus 11 signing-domain cases"
+        );
+        let finish_signer = server_signing_key(&fixture);
+
+        for case in cases {
+            let body = fixture_wire_value(case["body"].clone());
+            let operation = signing_domain_operation(
+                case["bodyName"].as_str().expect("signed-domain body name"),
+            );
+            let binding = signing_domain_binding(&body, operation);
+            let prepared = super::super::canonical_transport::prepare_signed_body(
+                &binding,
+                operation,
+                &serde_json::to_vec(&body).expect("signed-domain fixture serializes"),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "strict server signing-domain fixture {} must project: {error}",
+                    case["bodyName"]
+                )
+            });
+            assert_eq!(
+                hex::encode(&prepared.transcript),
+                case["transcriptHex"]
+                    .as_str()
+                    .expect("signed-domain fixture transcript"),
+                "server transcript mismatch for {}",
+                case["bodyName"]
+            );
+
+            let wire = prepare_signed_request_with_signer(
+                &binding,
+                operation,
+                serde_json::to_vec(&body).expect("signed-domain generated fixture serializes"),
+                &finish_signer,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "generated strict wrapper {} must decode: {error}",
+                    case["bodyName"]
+                )
+            });
+            let wire: Value =
+                serde_json::from_slice(wire.body.as_deref().unwrap()).expect("signed wire JSON");
+            let wrapper = wire["signedRequest"]
+                .as_object()
+                .expect("signedRequest wrapper");
+            assert_eq!(wrapper.len(), 2, "server wrapper is closed");
+            assert!(wrapper.get("$type").is_none(), "wrapper has no union tag");
+            assert_eq!(
+                wrapper["body"]["$type"], body["$type"],
+                "body retains its exact type tag"
+            );
+            assert_eq!(
+                wire["signedRequest"], case["wrapper"],
+                "complete signed wrapper must equal the server fixture"
+            );
+            assert!(wrapper["signature"].is_string(), "signature is bare base64");
+            assert_eq!(wrapper["signature"].as_str().unwrap().len(), 88);
+            assert_eq!(
+                hex::encode(
+                    STANDARD
+                        .decode(wrapper["signature"].as_str().unwrap())
+                        .expect("generated signature base64")
+                ),
+                case["signatureHex"],
+                "signature bytes must equal the server fixture"
+            );
+            assert_eq!(
+                hex::encode(
+                    serde_json::to_vec(&wire["signedRequest"])
+                        .expect("generated wrapper serializes")
+                ),
+                case["wrapperJsonHex"],
+                "complete wrapper bytes must equal the server fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_orchestrator_signs_generated_body_from_configured_authority() {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let body = replenishment_body(&signer);
+        let prepared = prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .expect("supported mutation signs");
+
+        assert_eq!(prepared.operation, CanonicalOperation::ReplenishKeyPackages);
+        assert_eq!(prepared.method, "POST");
+        assert_eq!(
+            prepared.path,
+            "/xrpc/blue.catbird.chat.replenishKeyPackages"
+        );
+        assert!(prepared.authorization.is_empty());
+        assert!(prepared.dpop.is_empty());
+        let wire: Value = serde_json::from_slice(prepared.body.as_deref().unwrap()).unwrap();
+        let wrapper = wire["signedRequest"].as_object().unwrap();
+        assert_eq!(wrapper.len(), 2, "server wrapper is closed");
+        assert!(
+            wrapper.get("$type").is_none(),
+            "union tag is not on wrapper"
+        );
+        assert!(wrapper["signature"].is_string(), "signature is bare base64");
+        assert_eq!(
+            wrapper["signature"].as_str().unwrap().len(),
+            88,
+            "signature uses canonical standard base64"
+        );
+        assert_eq!(
+            wrapper["body"]["$type"],
+            "blue.catbird.chat.defs#keyPackageReplenishmentBody"
+        );
+        assert_eq!(wire["signedRequest"]["body"], body);
+        let expected_wire = replenishment_wire(&signer);
+        let expected_signature = expected_wire["signedRequest"]["signature"]["$bytes"]
+            .as_str()
+            .expect("generated signature bytes");
+        assert_eq!(wire["signedRequest"]["signature"], expected_signature);
+        assert_eq!(
+            wire["signedRequest"]["signature"].as_str().unwrap().len(),
+            88
+        );
+    }
+
+    #[test]
+    fn signed_orchestrator_is_deterministic_and_rejects_binding_tampering() {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let body = replenishment_body(&signer);
+        let body_json = serde_json::to_vec(&body).unwrap();
+        let first = prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            body_json.clone(),
+            &signer,
+        )
+        .unwrap();
+        let reordered = serde_json::json!({
+            "$type": body["$type"],
+            "signedAt": body["signedAt"],
+            "keyPackages": body["keyPackages"],
+            "signatureDomain": body["signatureDomain"],
+            "keyId": body["keyId"],
+            "idempotencyKey": body["idempotencyKey"],
+            "dpopJkt": body["dpopJkt"],
+            "authGeneration": body["authGeneration"],
+            "actorDid": body["actorDid"],
+            "actorDeviceId": body["actorDeviceId"],
+            "signaturePublicKey": body["signaturePublicKey"]
+        });
+        let second = prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&reordered).unwrap(),
+            &signer,
+        )
+        .unwrap();
+        assert_eq!(first.body, second.body);
+
+        let mut tampered = body;
+        tampered["authGeneration"] = Value::from(2);
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&tampered).unwrap(),
+            &signer,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn signed_orchestrator_rejects_missing_key_context_and_unsigned_operations() {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let body = replenishment_body(&signer);
+        let missing_generation = prepare_signed_request_with_signer(
+            &clean_auth(None),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        );
+        assert!(missing_generation.is_err());
+
+        let root_tag_confusion = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#notARealSignedWrapper",
+            "signedRequest": {"body": body.clone()}
+        });
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&root_tag_confusion).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "unknown root wrapper tags must reject"
+        );
+
+        let wrapper_tag_confusion = serde_json::json!({
+            "signedRequest": {
+                "$type": "blue.catbird.chat.defs#notARealSignedWrapper",
+                "body": body.clone()
+            }
+        });
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&wrapper_tag_confusion).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "non-union wrapper tags must reject"
+        );
+
+        for operation in [
+            CanonicalOperation::GetConversations,
+            CanonicalOperation::GetSubscriptionTicket,
+            CanonicalOperation::GetBlob,
+            CanonicalOperation::UploadBlob,
+            CanonicalOperation::SubscribeEvents,
+        ] {
+            assert!(
+                prepare_signed_request_with_signer(
+                    &clean_auth(Some(1)),
+                    operation,
+                    serde_json::to_vec(&body).unwrap(),
+                    &signer,
+                )
+                .is_err(),
+                "{operation:?} must not enter signed orchestrator"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_orchestrator_rejects_domain_actor_device_generation_and_key_id_mismatches() {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        let body = replenishment_body(&signer);
+
+        let mut wrong_domain = body.clone();
+        wrong_domain["signatureDomain"] = Value::from("CATBIRD-CHAT-MESSAGE\u{0000}");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_domain).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_actor = body.clone();
+        wrong_actor["actorDid"] = Value::from("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_actor).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_device = body.clone();
+        wrong_device["actorDeviceId"] = Value::from("99999999-9999-4999-8999-999999999999");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_device).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_generation = body.clone();
+        wrong_generation["authGeneration"] = Value::from(2);
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_generation).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_jkt = body.clone();
+        wrong_jkt["dpopJkt"] = Value::from("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_jkt).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_key_id = body.clone();
+        wrong_key_id["keyId"] = Value::from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_key_id).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_public_key = body.clone();
+        wrong_public_key["signaturePublicKey"] =
+            serde_json::json!({"$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="});
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&wrong_public_key).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_actor_binding = clean_auth(Some(1));
+        wrong_actor_binding.actor_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into();
+        assert!(prepare_signed_request_with_signer(
+            &wrong_actor_binding,
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_device_binding = clean_auth(Some(1));
+        wrong_device_binding.device_id = "99999999-9999-4999-8999-999999999999".into();
+        assert!(prepare_signed_request_with_signer(
+            &wrong_device_binding,
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut wrong_jkt_binding = clean_auth(Some(1));
+        wrong_jkt_binding.dpop_jkt = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into();
+        assert!(prepare_signed_request_with_signer(
+            &wrong_jkt_binding,
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let wrong_generation_binding = clean_auth(Some(2));
+        assert!(prepare_signed_request_with_signer(
+            &wrong_generation_binding,
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let mut body_signature = body.clone();
+        body_signature["signature"] = serde_json::json!({"$bytes": "AAAA"});
+        assert!(prepare_signed_request_with_signer(
+            &clean_auth(Some(1)),
+            CanonicalOperation::ReplenishKeyPackages,
+            serde_json::to_vec(&body_signature).unwrap(),
+            &signer,
+        )
+        .is_err());
+
+        let body_bytes = serde_json::to_string(&body).unwrap();
+        let duplicate = body_bytes.replacen(
+            r#""actorDid":"did:plc:z72i7hdynmk67x4h5wqf3s6a""#,
+            r#""actorDid":"did:plc:z72i7hdynmk67x4h5wqf3s6a","actorDid":"did:plc:z72i7hdynmk67x4h5wqf3s6a""#,
+            1,
+        );
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                duplicate.into_bytes(),
+                &signer,
+            )
+            .is_err(),
+            "duplicate JSON keys must reject before DTO decode"
+        );
+
+        let mut unknown = body.clone();
+        unknown["unexpected"] = Value::Bool(true);
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&unknown).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "generated extra_data must not enter the transcript"
+        );
+
+        let mut null_field = body.clone();
+        null_field["dpopJkt"] = Value::Null;
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&null_field).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "explicit null must reject"
+        );
+
+        let mut key_thumbprint = body.clone();
+        key_thumbprint["authorKeyId"] =
+            Value::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into());
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&key_thumbprint).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "unknown key thumbprint fields must not be UUID-classified"
+        );
+
+        let mut wrong_tag = body.clone();
+        wrong_tag["$type"] = Value::String("blue.catbird.chat.defs#applicationSendBody".into());
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&wrong_tag).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "wrong body tag must reject"
+        );
+
+        let mut missing_tag = body.clone();
+        missing_tag.as_object_mut().unwrap().remove("$type");
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&missing_tag).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "missing body tag must reject"
+        );
+
+        let mut invalid_timestamp = body.clone();
+        invalid_timestamp["signedAt"] = Value::String("2026-08-16T12:00:00Z".into());
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&invalid_timestamp).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "non-canonical timestamp spelling must reject"
+        );
+
+        let mut out_of_bounds = body.clone();
+        out_of_bounds["keyPackages"] = Value::Array(Vec::new());
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&out_of_bounds).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "required key package bounds must reject"
+        );
+
+        let mut unsorted_packages = body.clone();
+        let first_package = unsorted_packages["keyPackages"][0].clone();
+        let mut lower_package = first_package.clone();
+        lower_package["keyPackageRef"] = Value::String(STANDARD.encode([0_u8; 32]));
+        unsorted_packages["keyPackages"] = Value::Array(vec![first_package, lower_package]);
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&unsorted_packages).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "key package refs must be strictly increasing"
+        );
+
+        let mut wrong_constant = body.clone();
+        wrong_constant["keyPackages"][0]["contentType"] = Value::String("wrong".into());
+        assert!(
+            prepare_signed_request_with_signer(
+                &clean_auth(Some(1)),
+                CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&wrong_constant).unwrap(),
+                &signer,
+            )
+            .is_err(),
+            "closed content type vocabulary must reject"
+        );
+    }
+}

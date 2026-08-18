@@ -3,6 +3,21 @@ use async_trait::async_trait;
 use super::credential_binding::{check_identity_claim, CredentialVerification};
 use super::error::Result;
 
+/// Public signing result returned by a credential authority.
+///
+/// This record intentionally contains no private-key material. A platform
+/// credential store owns the key and signs the exact transcript supplied by
+/// the orchestrator, returning only the signature, public key, and the one
+/// atomic device-authentication snapshot used for the binding check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanChatSigningAuthority {
+    pub public_key: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub device_id: String,
+    pub dpop_jkt: String,
+    pub auth_generation: Option<i64>,
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub trait CredentialStoreBounds: Send + Sync {}
 
@@ -29,6 +44,26 @@ pub trait CredentialStore: CredentialStoreBounds {
 
     /// Delete the signing key for a user DID.
     async fn delete_signing_key(&self, user_did: &str) -> Result<()>;
+
+    /// Sign one canonical clean-chat transcript without exporting the private
+    /// key. Implementations must resolve the key and binding tuple from one
+    /// atomic authority snapshot and return only the public key, signature,
+    /// and snapshot metadata. The caller's claimed device/JKT/generation are
+    /// deliberately not callback arguments, so an implementation cannot
+    /// accidentally turn caller-controlled binding fields into authority.
+    ///
+    /// The default is deliberately unsupported. In particular, it must not
+    /// fall back to `get_signing_key`, because callback implementations may
+    /// expose that legacy method across FFI and raw private-key bytes must not
+    /// cross the boundary for signed requests.
+    async fn sign_clean_chat_transcript(
+        &self,
+        _user_did: &str,
+        _transcript: &[u8],
+        _key_id: &str,
+    ) -> Result<Option<CleanChatSigningAuthority>> {
+        Ok(None)
+    }
 
     /// Store the MLS DID (device-specific identity) for a user.
     async fn store_mls_did(&self, user_did: &str, mls_did: &str) -> Result<()>;

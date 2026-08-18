@@ -1,0 +1,1493 @@
+{
+  "_catbird_mls_provenance": {
+    "generator": "scripts/generate_chat_schema.py",
+    "generatorVersion": 7,
+    "sourcePath": "mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json",
+    "sourceRevision": "1336d821566aacb93c3a580091518a6eb68ed63c",
+    "sourceSha256": "96044be0c06e3dd43cbe77b7ac29c1ecfcee1922782b1c5e74258768b1aa3c6d",
+    "sourceTree": "5796505b80b76490f5ada54febe2d8439e1b00eb",
+    "vectorCaseCount": 14,
+    "vectorSet": "signed-mutation",
+    "vectorSetCount": 25
+  },
+  "applicationEntryFingerprint": {
+    "base64BytePaths": [
+      "requestDigest",
+      "signature"
+    ],
+    "canonicalDagCborHex": "a663736571182a67656e747279496450018f3f6a7b2c4d918a5e0f123456789a697369676e61747572655840666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666666a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6d72657175657374446967657374582055555555555555555555555555555555555555555555555555555555555555556e636f6e766572736174696f6e4964503b241101e2bb42558caf4136c566a962",
+    "conversationId": "3b241101-e2bb-4255-8caf-4136c566a962",
+    "domain": "CATBIRD-CHAT-APPLICATION-ENTRY-FINGERPRINT\u0000",
+    "entryId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+    "fingerprintSha256Hex": "5b91d403a6dbc8b9bbc1904399283dc1bfc2de706e71f927d1e7527305598b18",
+    "receivedAt": "2026-07-22T14:05:09.123Z",
+    "requestDigest": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=",
+    "seq": 42,
+    "signature": "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZg==",
+    "uuidBytePaths": [
+      "entryId",
+      "conversationId"
+    ]
+  },
+  "applicationIntervalProvenance": {
+    "appendEntryIds": {
+      "creation": "bc3de8cb-55fd-4a9c-85e0-bd4e35df6371",
+      "reset": "24a78c75-550f-41e4-b354-26129b8efb84"
+    },
+    "closeAuthorityCases": [
+      {
+        "hasTerminalSeqHint": true,
+        "hasVerifiedSignedControlRow": false,
+        "valid": false
+      },
+      {
+        "hasTerminalSeqHint": true,
+        "hasVerifiedSignedControlRow": true,
+        "valid": true
+      }
+    ],
+    "intervals": [
+      {
+        "closing": {
+          "kind": "reset",
+          "outerEntryFingerprint": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+          "recipientDeviceId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+          "recipientDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+          "seq": 5,
+          "transitionId": "6621be81-96ae-41a3-9aa9-fdfa3ffebe70"
+        },
+        "endSeq": 5,
+        "opening": {
+          "context": {
+            "confirmationTag": "REREREREREREREREREREREREREREREREREREREREREQ=",
+            "conversationId": "3b241101-e2bb-4255-8caf-4136c566a962",
+            "epoch": 0,
+            "generation": 0,
+            "groupContextHash": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+            "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "lifecycle": "active",
+            "stateVersion": 0
+          },
+          "kind": "creation",
+          "outerEntryFingerprint": "ERERERERERERERERERERERERERERERERERERERERERE=",
+          "seq": 1,
+          "transitionId": "a788694c-0794-4d29-8e86-30d17c0e8c7b"
+        },
+        "recipientDeviceId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+        "recipientDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+        "startSeq": 1
+      },
+      {
+        "opening": {
+          "context": {
+            "confirmationTag": "Z2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2dnZ2c=",
+            "conversationId": "3b241101-e2bb-4255-8caf-4136c566a962",
+            "epoch": 0,
+            "generation": 1,
+            "groupContextHash": "VlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlY=",
+            "groupId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+            "lifecycle": "active",
+            "stateVersion": 0
+          },
+          "kind": "reset",
+          "outerEntryFingerprint": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+          "seq": 5,
+          "transitionId": "6621be81-96ae-41a3-9aa9-fdfa3ffebe70"
+        },
+        "recipientDeviceId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+        "recipientDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+        "startSeq": 5
+      }
+    ],
+    "recipientDeviceId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+    "recipientDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+    "requiredOneFieldNegatives": [
+      "recipientDid",
+      "recipientDeviceId",
+      "openingSeq",
+      "openingKind",
+      "openingTransitionId",
+      "openingOuterEntryFingerprint",
+      "openingContext",
+      "closingTransitionId",
+      "closingOuterEntryFingerprint",
+      "closeKind",
+      "entryIdSubstitution",
+      "sameIntervalEndEqualsStart",
+      "terminalProofMissing",
+      "terminalRewritesPriorClose",
+      "terminalGrantsGapHistory"
+    ],
+    "resetActivatorCases": [
+      {
+        "activeAdmin": true,
+        "hasPreResetAccess": false,
+        "openingKind": "reset",
+        "valid": true,
+        "wasOldLeaf": false
+      },
+      {
+        "activeAdmin": true,
+        "hasPreResetAccess": true,
+        "openingKind": "reset",
+        "valid": true,
+        "wasOldLeaf": true
+      },
+      {
+        "activeAdmin": false,
+        "hasPreResetAccess": false,
+        "openingKind": "reset",
+        "valid": false,
+        "wasOldLeaf": false
+      }
+    ],
+    "sameIntervalCloseCases": [
+      {
+        "closingKind": "terminal",
+        "endSeq": 1,
+        "openingKind": "creation",
+        "startSeq": 1,
+        "valid": false
+      },
+      {
+        "closingKind": "terminal",
+        "endSeq": 2,
+        "openingKind": "creation",
+        "startSeq": 1,
+        "valid": true
+      }
+    ],
+    "terminalScheduleCases": [
+      {
+        "grantsGapHistory": false,
+        "hasExactSignedRecipientConversationProof": true,
+        "previousMatchesExpected": true,
+        "priorIntervalState": "open",
+        "rewritesPriorIntervalClose": false,
+        "valid": true
+      },
+      {
+        "grantsGapHistory": false,
+        "hasExactSignedRecipientConversationProof": true,
+        "previousMatchesExpected": false,
+        "priorIntervalState": "closedRemove",
+        "rewritesPriorIntervalClose": false,
+        "valid": true
+      },
+      {
+        "grantsGapHistory": false,
+        "hasExactSignedRecipientConversationProof": true,
+        "previousMatchesExpected": false,
+        "priorIntervalState": "closedReset",
+        "rewritesPriorIntervalClose": false,
+        "valid": true
+      },
+      {
+        "grantsGapHistory": false,
+        "hasExactSignedRecipientConversationProof": false,
+        "previousMatchesExpected": false,
+        "priorIntervalState": "closedRemove",
+        "rewritesPriorIntervalClose": false,
+        "valid": false
+      },
+      {
+        "grantsGapHistory": false,
+        "hasExactSignedRecipientConversationProof": true,
+        "previousMatchesExpected": false,
+        "priorIntervalState": "closedRemove",
+        "rewritesPriorIntervalClose": true,
+        "valid": false
+      },
+      {
+        "grantsGapHistory": true,
+        "hasExactSignedRecipientConversationProof": true,
+        "previousMatchesExpected": false,
+        "priorIntervalState": "closedReset",
+        "rewritesPriorIntervalClose": false,
+        "valid": false
+      }
+    ],
+    "touchingScheduleCases": [
+      {
+        "closingKind": "replace",
+        "openingKind": "add",
+        "sameTransitionAndFingerprint": true,
+        "valid": true
+      },
+      {
+        "closingKind": "reset",
+        "openingKind": "reset",
+        "sameTransitionAndFingerprint": true,
+        "valid": true
+      },
+      {
+        "closingKind": "replace",
+        "openingKind": "add",
+        "sameTransitionAndFingerprint": false,
+        "valid": false
+      },
+      {
+        "closingKind": "remove",
+        "openingKind": "add",
+        "sameTransitionAndFingerprint": true,
+        "valid": false
+      },
+      {
+        "closingKind": "terminal",
+        "openingKind": "add",
+        "sameTransitionAndFingerprint": true,
+        "valid": false
+      }
+    ]
+  },
+  "applicationSemanticConstraints": {
+    "aeadSizeCases": [
+      {
+        "ciphertextSize": 17,
+        "kind": "image",
+        "plaintextSize": 1,
+        "valid": true
+      },
+      {
+        "ciphertextSize": 10485760,
+        "kind": "image",
+        "plaintextSize": 10485744,
+        "valid": true
+      },
+      {
+        "ciphertextSize": 8388608,
+        "kind": "audio",
+        "plaintextSize": 8388592,
+        "valid": true
+      },
+      {
+        "ciphertextSize": 10485760,
+        "kind": "metadataAvatar",
+        "plaintextSize": 10485744,
+        "valid": true
+      },
+      {
+        "ciphertextSize": 18,
+        "kind": "image",
+        "plaintextSize": 1,
+        "valid": false
+      },
+      {
+        "ciphertextSize": 16,
+        "kind": "audio",
+        "plaintextSize": 0,
+        "valid": false
+      },
+      {
+        "ciphertextSize": 24,
+        "kind": "metadataAvatar",
+        "plaintextSize": 9,
+        "valid": false
+      },
+      {
+        "ciphertextSize": 10485761,
+        "kind": "image",
+        "plaintextSize": 10485745,
+        "valid": false
+      },
+      {
+        "ciphertextSize": 17,
+        "kind": "image",
+        "plaintextSize": 9007199254740991,
+        "valid": false
+      }
+    ],
+    "applicationAttachmentBinding": {
+      "blobId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+      "ciphertextSha256": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=",
+      "ciphertextSize": 17,
+      "purpose": "attachment"
+    },
+    "atUriCases": [
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": true
+      },
+      {
+        "uri": "at://did:web:example.com/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": true
+      },
+      {
+        "uri": "at://alice.bsky.social/app.bsky.feed.PostType/CaseSensitive-Rkey",
+        "valid": true
+      },
+      {
+        "uri": "at://alice.bsky.social/a--b.bsky.feed.PostType/rkey:~._-",
+        "valid": true
+      },
+      {
+        "uri": "AT://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:EWVI7NXZYOUN6ZHXHRS64OIZ/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:web:EXAMPLE.COM/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:web:example.com:lowercasepath/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:web:example.com:CaseSensitivePath/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:web:127.0.0.1/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:web:localhost/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:web:example.com:443/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:web:example%2ecom/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://handle.invalid/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.alt/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.arpa/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.example/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.internal/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.invalid/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.local/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.localhost/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.onion/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://a.test/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://Alice.bsky.social/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/APP.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/1app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/%41",
+        "valid": false
+      },
+      {
+        "uri": "at://did:example:abc%2fdef/app.bsky.feed.post/3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz//3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3jzfcijpj2z2a#fragment",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3jzfcijpj2z2a?query=x",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post//3jzfcijpj2z2a",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/.",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/..",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3jzfcijpj2z2a/extra",
+        "valid": false
+      },
+      {
+        "uri": "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.pos-/3jzfcijpj2z2a",
+        "valid": false
+      }
+    ],
+    "atUriLengthCases": [
+      {
+        "authorityLabelLengths": [
+          63,
+          63,
+          63,
+          61
+        ],
+        "collectionLabelLengths": [
+          63,
+          63,
+          63,
+          61,
+          63
+        ],
+        "expectedLength": 1097,
+        "recordKeyLength": 512,
+        "valid": true
+      },
+      {
+        "authorityLabelLengths": [
+          63,
+          63,
+          63,
+          61
+        ],
+        "collectionLabelLengths": [
+          63,
+          63,
+          63,
+          61,
+          63
+        ],
+        "expectedLength": 1098,
+        "recordKeyLength": 513,
+        "valid": false
+      }
+    ],
+    "cidCases": [
+      {
+        "cid": "bafyreigh4yjzzjiwjrlm4xe5yiu456ncqc6tfnf5ctup2sii7knhdineru",
+        "valid": true
+      },
+      {
+        "cid": "QmNLei78zWmzUdbeRB3CiUfAizWUrbeeZh5K1rhAQKCh51",
+        "valid": true
+      },
+      {
+        "cid": "BAFYREIGH4YJZZJIWJRLM4XE5YIU456NCQC6TFNF5CTUP2SII7KNHDINERU",
+        "valid": false
+      }
+    ],
+    "externalLinkCases": [
+      {
+        "uri": "https://example.com/path?q=x%20y",
+        "valid": true
+      },
+      {
+        "uri": "http://example.com/",
+        "valid": false
+      },
+      {
+        "uri": "https:///path",
+        "valid": false
+      },
+      {
+        "uri": "https://user@example.com/",
+        "valid": false
+      },
+      {
+        "uri": "https://example.com\\evil",
+        "valid": false
+      },
+      {
+        "uri": "https://example.com/a b",
+        "valid": false
+      },
+      {
+        "uri": "https://example.com/\u0001",
+        "valid": false
+      },
+      {
+        "uri": "https://example.com:99999/path",
+        "valid": false
+      },
+      {
+        "uri": "https://example.com/%ZZ",
+        "valid": false
+      }
+    ],
+    "invalidApplicationPurpose": "metadata",
+    "invalidMetadataPurpose": "attachment",
+    "metadataAvatarBinding": {
+      "blobId": "018f3f6a-7b2c-4d91-8a5e-0f123456789b",
+      "ciphertextSha256": "VlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlY=",
+      "ciphertextSize": 17,
+      "purpose": "metadata"
+    },
+    "reactionCases": [
+      {
+        "emoji": "👍",
+        "valid": true
+      },
+      {
+        "emoji": "👨‍👩‍👧‍👦",
+        "valid": true
+      },
+      {
+        "emoji": "é",
+        "valid": false
+      },
+      {
+        "emoji": "👍👍",
+        "valid": false
+      },
+      {
+        "emoji": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "valid": false
+      },
+      {
+        "emoji": "\n",
+        "valid": false
+      },
+      {
+        "emoji": "\u0000",
+        "valid": false
+      }
+    ]
+  },
+  "canonicalOrdering": {
+    "bytesBase64": [
+      "/w==",
+      "AA==",
+      "AQ==",
+      "fw=="
+    ],
+    "expectedBytesBase64": [
+      "AA==",
+      "AQ==",
+      "fw==",
+      "/w=="
+    ],
+    "expectedStrings": [
+      "a",
+      "z",
+      "é",
+      "😀"
+    ],
+    "strings": [
+      "é",
+      "z",
+      "😀",
+      "a"
+    ]
+  },
+  "cleanAuth": {
+    "ambiguousResponseLossAfterDsCommitRemainsPinnedPendingUntilNestDurablyRecordsSuccess": true,
+    "authCapabilityExpiresAt": "authTimePlus300Seconds",
+    "authCapabilityFirstBodyPinFields": [
+      "canonicalRequestDigest",
+      "signature",
+      "sub",
+      "device_id",
+      "dpopJkt",
+      "key_id",
+      "signing_key_sha256",
+      "enrollment_transcript_sha256"
+    ],
+    "authCapabilityStates": [
+      "unpinned",
+      "pinnedPending",
+      "terminalSuccess"
+    ],
+    "authEvidencePurpose": "blue.catbird.chat.enrollDevice",
+    "authTimeSource": "nestCallbackCompletionNotUpstreamAuthTime",
+    "authTxnConsumedOnce": true,
+    "authTxnGrammar": "canonicalLowercaseUuidV4",
+    "authTxnSource": "nestServerGeneratedPerGrantAttemptDistinctFromProviderStateAndClientInput",
+    "changedBodyCanReuseAuthCapability": false,
+    "chatInstanceGrammar": "canonicalLowercaseUuidV4",
+    "deliveryServiceAuthTimeAgeCheckIndependent": true,
+    "deliveryServiceExactReplayReturnsStoredResultWithoutReexecution": true,
+    "enrollmentGrantBindings": [
+      "sub",
+      "lxm",
+      "device_id",
+      "key_id",
+      "signing_key_sha256",
+      "dpopJkt",
+      "enrollment_transcript_sha256",
+      "auth_time",
+      "auth_txn"
+    ],
+    "enrollmentGrantExpArithmetic": "checkedNumericDate",
+    "enrollmentGrantExpFormula": "min(iatPlus120,authTimePlus300)",
+    "enrollmentGrantExpirationCases": [
+      {
+        "authTime": 1699999900,
+        "expectedExp": 1700000120,
+        "iat": 1700000000,
+        "limitingBound": "iatPlus120"
+      },
+      {
+        "authTime": 1700000000,
+        "expectedExp": 1700000300,
+        "iat": 1700000290,
+        "limitingBound": "authTimePlus300"
+      },
+      {
+        "authTime": 1700000000,
+        "expectedExp": 1700000300,
+        "iat": 1700000180,
+        "limitingBound": "equal"
+      }
+    ],
+    "ephemeralBrowserPreferredBestEffort": true,
+    "expiredCapabilityRequiresNewAuthorizationCodeFlow": true,
+    "freshAuthorizationAttestsCredentialEntryOrUserPresence": false,
+    "htuHtmWidenReplayKey": false,
+    "invalidEnrollmentGrantNumericDates": [
+      {
+        "authTime": 1700000000,
+        "iat": -1
+      },
+      {
+        "authTime": -1,
+        "iat": 1700000000
+      },
+      {
+        "authTime": 1700000000,
+        "iat": 9007199254740900
+      },
+      {
+        "authTime": 9007199254740800,
+        "iat": 1700000000
+      }
+    ],
+    "invalidPrePinAttemptBurnsOrPinsCapability": false,
+    "maxAuthTimeAgeSeconds": 300,
+    "maxEvidenceLifetimeSeconds": 300,
+    "maxTokenLifetimeSeconds": 120,
+    "nestDurableSuccessClosesAuthCapability": true,
+    "nestDurableSuccessStoresTerminalResultBinding": true,
+    "nestOwnsSessionDpopPrivateKey": true,
+    "ordinaryTokenExpirationCases": [
+      {
+        "exp": 1700000120,
+        "iat": 1700000000,
+        "valid": true
+      },
+      {
+        "exp": 1700000121,
+        "iat": 1700000000,
+        "valid": false
+      }
+    ],
+    "pinnedPendingRetryGetsFreshAuthTxnAndTokenProofJtis": true,
+    "pinnedPendingRetryRetainsOriginalAuthTime": true,
+    "prePinChecks": [
+      "strictCanonicalDecode",
+      "bounds",
+      "capabilityBodyBindings",
+      "bodyEd25519SignatureUnderSuppliedImmutableSigningKey"
+    ],
+    "promptLoginRequestedBestEffort": true,
+    "promptOrUpstreamAuthTimeIsSecurityPredicate": false,
+    "proofJtiGrammar": "canonicalBase64urlNoPadDecoded12To32Bytes",
+    "proofReplayKey": [
+      "jkt",
+      "decodedJtiBytes"
+    ],
+    "proofReplayNamespace": "dpopProofJti",
+    "purposeBoundAuthorizationCodeOnly": true,
+    "rebindCompletedReplayProofJkt": "recordedNewDpopJkt",
+    "rebindFirstExecutionProofJkt": "newDpopJkt",
+    "refreshRestoreCookieEvidenceAllowed": false,
+    "requiredTokenClaims": [
+      "iss",
+      "sub",
+      "aud",
+      "lxm",
+      "iat",
+      "exp",
+      "jti",
+      "cnf.jkt",
+      "device_id",
+      "chat_instance"
+    ],
+    "terminalExactClientRetrySource": "nestStoredTerminalResultBindingNoDownstreamGrant",
+    "terminalSuccessCanMintDownstreamGrant": false,
+    "tokenJtiGrammar": "canonicalLowercaseUuidV4",
+    "tokenReplayNamespace": "cleanAccessTokenJti",
+    "userReauthenticationClaimed": false
+  },
+  "controlEntryFingerprintGeneration": {
+    "checkCommand": "python3 mls-ds/server/tests/generate_mls_chat_contract_vectors.py --check",
+    "command": "python3 mls-ds/server/tests/generate_mls_chat_contract_vectors.py --write",
+    "derivation": "test-only Ed25519 seed -> public key/keyId; semantic tagged body -> canonical DAG-CBOR; domain transcript -> SHA-256 digest + Ed25519 signature; closed outer projection -> canonical DAG-CBOR + domain-separated SHA-256",
+    "generator": "mls-ds/server/tests/generate_mls_chat_contract_vectors.py",
+    "generatorSha256Hex": "b9af036fc211d047d23def957719ce2702c320622e14d78f688a4031088affe1",
+    "schemaVersion": 1,
+    "semanticSource": "mls-ds/server/tests/fixtures/mls_chat_control_fingerprint_source.json",
+    "semanticSourceSha256Hex": "f33406a5d99dba3b604da108c4df2e53d70531b9fa0be14b21e2db94ba07b311",
+    "target": "mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json"
+  },
+  "controlEntryFingerprints": {
+    "authoritativeReferenceBindings": {
+      "blue.catbird.chat.defs#leaveCancellationEntry": {
+        "actorDeviceMayDifferOnlyWithinSameDid": true,
+        "cancellationActorDeviceId": "72727272-7272-4272-b272-727272727272",
+        "cancellationActorDeviceStatus": "active",
+        "cancellationAuthGeneration": 1,
+        "cancellationHistoricalPublicKeyRef": "activeAdminDevice7272",
+        "cancellationKeyId": "OQpJSMbjoMkp9Mz8qJRGo6zAieMT1g9qNZJr8WtW6i8",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "leaveRequestIdIsGlobalSignedRequestKey": true,
+        "referenceActorDeviceId": "70707070-7070-4070-b070-707070707070",
+        "referenceAuthGeneration": 1,
+        "referenceEntryDistinctAndStrictlyEarlier": true,
+        "referenceEntryId": "89898989-8989-4989-8989-898989898989",
+        "referenceEntryKind": "blue.catbird.chat.defs#leaveRequestEntry",
+        "referenceField": "leaveRequestId",
+        "referenceHistoricalPublicKeyRef": "requesterDevice7070",
+        "referenceKeyId": "nPA28lsnpJybeU3AHnUN7Kj8EqPuYa7O13Rtuo1zAYA",
+        "referenceSeq": 51,
+        "referenceSignedRequestRef": "blue.catbird.chat.defs#signedLeaveRequest",
+        "referenceValue": "00000000-0000-4000-8000-000000000041",
+        "requesterDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+        "retainedReferenceIndependentlyVerifiable": true
+      }
+    },
+    "cases": [
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571182a67656e7472794964508080808080804080808080808080808069656e7472794b696e647822626c75652e636174626972642e636861742e6465667323636f6d6d6974456e747279697369676e61747572655840ec54a8d4288c19b7bddf7c51efb48c6a7f4e779c942c9da7bfd5040ed63dddc793cdd61f51d0048992cf2d1a3bb2e23cdc044e741a8825c94bf6e65071fdd5076a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d726571756573744469676573745820fb4767b454cd10e2e9d4240688a81e2b4b0247468f20a93f3da2b0900265dcca6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "80808080-8080-4080-8080-808080808080",
+        "entryKind": "blue.catbird.chat.defs#commitEntry",
+        "fingerprintSha256Hex": "72cd810563f1efda023868125a7695891ec1850b5d228658d939097aa0ec645c",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "+0dntFTNEOLp1CQGiKgeK0sCR0aPIKk/PaKwkAJl3Mo=",
+        "seq": 42,
+        "serverFields": {},
+        "signature": "7FSo1CiMGbe933xR77SMan9Od5yULJ2nv9UEDtY93ceTzdYfUdAEiZLPLRo7suI83AROdBqIJclL9uZQcf3VBw==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedCommitTransition",
+        "signingDomain": "CATBIRD-CHAT-COMMIT\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d434f4d4d495400af63616164a5657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006c7472616e736974696f6e4964505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6e636f6e766572736174696f6e496450111111111111411191111111111111116f70726f746f636f6c56657273696f6e6131646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a652474797065782b626c75652e636174626972642e636861742e6465667323636f6d6d69745472616e736974696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a66636f6d6d6974a4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e7454797065737075626c69634d657373616765436f6d6d6974686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a26b6c6561664368616e67657380727061727469636970616e744368616e67657380687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000016d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000086f7369676e6174757265446f6d61696e74434154424952442d434841542d434f4d4d495400706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f7244657669636549645000000000000040008000000000000006726f726967696e5472616e736974696f6e49645000000000000040008000000000000007727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e49645000000000000040008000000000000005",
+        "unsignedSigningProjectionCanonicalDagCborHex": "af63616164a5657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006c7472616e736974696f6e4964505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6e636f6e766572736174696f6e496450111111111111411191111111111111116f70726f746f636f6c56657273696f6e6131646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a652474797065782b626c75652e636174626972642e636861742e6465667323636f6d6d69745472616e736974696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a66636f6d6d6974a4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e7454797065737075626c69634d657373616765436f6d6d6974686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a26b6c6561664368616e67657380727061727469636970616e744368616e67657380687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000016d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000086f7369676e6174757265446f6d61696e74434154424952442d434841542d434f4d4d495400706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f7244657669636549645000000000000040008000000000000006726f726967696e5472616e736974696f6e49645000000000000040008000000000000007727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e49645000000000000040008000000000000005",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571182b67656e7472794964508181818181814181818181818181818169656e7472794b696e647822626c75652e636174626972642e636861742e6465667323706f6c696379456e747279697369676e6174757265584089a94b186e47bea51ac8e0a52740d90c24899f81c853fba39d99252b7b709dfaabc2f10fb597158da28c070469c24668f56b2498a6991ba37ce089d8a08f550b6a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d7265717565737444696765737458205dd00fa4a7d15a197084ccdc19eeeb4854b8699b027575614add565efbaf5ed06e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "81818181-8181-4181-8181-818181818181",
+        "entryKind": "blue.catbird.chat.defs#policyEntry",
+        "fingerprintSha256Hex": "11b684c51b63a527b313a4c620a5113f510a8e00d13f4e21c5b9c551f04dfcfa",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "XdAPpKfRWhlwhMzcGe7rSFS4aZsCdXVhSt1WXvuvXtA=",
+        "seq": 43,
+        "serverFields": {},
+        "signature": "ialLGG5HvqUayOClJ0DZDCSJn4HIU/ujnZklK3twnfqrwvEPtZcVjaKMBwRpwkZo9WskmKaZG6N84InYoI9VCw==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedPolicyTransition",
+        "signingDomain": "CATBIRD-CHAT-POLICY\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d504f4c49435900ac646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a652474797065782b626c75652e636174626972642e636861742e6465667323706f6c6963795472616e736974696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000096d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579500000000000004000800000000000000f6f7369676e6174757265446f6d61696e74434154424952442d434841542d504f4c49435900727061727469636970616e744368616e67657381a564726f6c65666d656d6265726524747970657825626c75652e636174626972642e636861742e64656673236164645061727469636970616e74667374617475736770656e64696e67677573657244696478206469643a706c633a616c6963656669787475726561616161616161616161616174696e7669746174696f6e50726f76656e616e6365a36c696e7669746564427944696478206469643a706c633a616c6963656669787475726561616161616161616161616171696e766974656442794465766963654964500000000000004000800000000000000e76696e7669746174696f6e5472616e736974696f6e4964500000000000004000800000000000000d",
+        "unsignedSigningProjectionCanonicalDagCborHex": "ac646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a652474797065782b626c75652e636174626972642e636861742e6465667323706f6c6963795472616e736974696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000096d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579500000000000004000800000000000000f6f7369676e6174757265446f6d61696e74434154424952442d434841542d504f4c49435900727061727469636970616e744368616e67657381a564726f6c65666d656d6265726524747970657825626c75652e636174626972642e636861742e64656673236164645061727469636970616e74667374617475736770656e64696e67677573657244696478206469643a706c633a616c6963656669787475726561616161616161616161616174696e7669746174696f6e50726f76656e616e6365a36c696e7669746564427944696478206469643a706c633a616c6963656669787475726561616161616161616161616171696e766974656442794465766963654964500000000000004000800000000000000e76696e7669746174696f6e5472616e736974696f6e4964500000000000004000800000000000000d",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571182c67656e7472794964508282828282824282828282828282828269656e7472794b696e647824626c75652e636174626972642e636861742e64656673236d65746164617461456e747279697369676e61747572655840e9ea99e0ad7f61a1192f5a459fb540183f1bd89b07c926cfa4909a57b5355696b2e920f661475a519ffc2a5bd83f42e3bfd9b7189ec279c93a43f2659a6e73096a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d726571756573744469676573745820cedad3e422b7b3b88b5cc6114b337f2eb7375e2ce9c84f05d2dd0faef73b86266e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "82828282-8282-4282-8282-828282828282",
+        "entryKind": "blue.catbird.chat.defs#metadataEntry",
+        "fingerprintSha256Hex": "56c0fe3288b1a7fc5262de8f990caa43b8d6825c7877dc293054de20fbb2dd14",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "ztrT5CK3s7iLXMYRSzN/Lrc3XizpyE8F0t0Prvc7hiY=",
+        "seq": 44,
+        "serverFields": {},
+        "signature": "6eqZ4K1/YaEZL1pFn7VAGD8b2JsHySbPpJCaV7U1Vpay6SD2YUdaUZ/8KlvYP0Ljv9m3GJ7Ceck6Q/Jlmm5zCQ==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedMetadataTransition",
+        "signingDomain": "CATBIRD-CHAT-METADATA\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d4d4554414441544100ac646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a652474797065782d626c75652e636174626972642e636861742e64656673236d657461646174615472616e736974696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000106d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000176f7369676e6174757265446f6d61696e76434154424952442d434841542d4d4554414441544100706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f7244657669636549645000000000000040008000000000000015726f726967696e5472616e736974696f6e49645000000000000040008000000000000016727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e49645000000000000040008000000000000014",
+        "unsignedSigningProjectionCanonicalDagCborHex": "ac646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a652474797065782d626c75652e636174626972642e636861742e64656673236d657461646174615472616e736974696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000106d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000176f7369676e6174757265446f6d61696e76434154424952442d434841542d4d4554414441544100706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f7244657669636549645000000000000040008000000000000015726f726967696e5472616e736974696f6e49645000000000000040008000000000000016727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e49645000000000000040008000000000000014",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571182d67656e7472794964508383838383834383838383838383838369656e7472794b696e647824626c75652e636174626972642e636861742e64656673236372656174696f6e456e747279697369676e61747572655840f44b40a3e6cacdcc3c2f186e8a54d1b5ab149cb1284ea126ab082b6c17e3e090175dd790080af4e9bd897e0f1d98777407829bcd24ad719e37a8840dd9b285056a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582078c684e079418dee63ef264cd2b061d97e17b46b97835eaa357bd72f8039ed3f6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "83838383-8383-4383-8383-838383838383",
+        "entryKind": "blue.catbird.chat.defs#creationEntry",
+        "fingerprintSha256Hex": "8d8bc1b96d78474e13d3d00e44750cb6338bd0cf2440637c431968d375bb62e9",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "eMaE4HlBje5j7yZM0rBh2X4XtGuXg16qNXvXL4A57T8=",
+        "seq": 45,
+        "serverFields": {},
+        "signature": "9EtAo+bKzcw8LxhuilTRtasUnLEoTqEmqwgrbBfj4JAXXdeQCAr06b2Jfg8dmHd0B4KbzSStcZ43qIQN2bKFBQ==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedCreation",
+        "signingDomain": "CATBIRD-CHAT-CREATE\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d43524541544500b0646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657823626c75652e636174626972642e636861742e64656673236372656174696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a723857745736693867616273656e6365f5686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a2696163746f724c656166a3677573657244696478206469643a706c633a616c69636566697874757265616161616161616161616161686465766963654964500000000000004000800000000000001c6a6c6561664f726967696e6767656e657369736c7061727469636970616e747381a364726f6c656561646d696e667374617475736770656e64696e67677573657244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000196d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e636f6e766572736174696f6e496450111111111111411191111111111111116e6964656d706f74656e63794b657950000000000000400080000000000000206f7369676e6174757265446f6d61696e74434154424952442d434841542d4352454154450070636f6e766572736174696f6e4b696e64666469726563747067656e6573697347726f7570496e666fa4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e74547970656967726f7570496e666f706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f724465766963654964500000000000004000800000000000001e726f726967696e5472616e736974696f6e4964500000000000004000800000000000001f727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e4964500000000000004000800000000000001d",
+        "unsignedSigningProjectionCanonicalDagCborHex": "b0646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657823626c75652e636174626972642e636861742e64656673236372656174696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a723857745736693867616273656e6365f5686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a2696163746f724c656166a3677573657244696478206469643a706c633a616c69636566697874757265616161616161616161616161686465766963654964500000000000004000800000000000001c6a6c6561664f726967696e6767656e657369736c7061727469636970616e747381a364726f6c656561646d696e667374617475736770656e64696e67677573657244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000196d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e636f6e766572736174696f6e496450111111111111411191111111111111116e6964656d706f74656e63794b657950000000000000400080000000000000206f7369676e6174757265446f6d61696e74434154424952442d434841542d4352454154450070636f6e766572736174696f6e4b696e64666469726563747067656e6573697347726f7570496e666fa4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e74547970656967726f7570496e666f706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f724465766963654964500000000000004000800000000000001e726f726967696e5472616e736974696f6e4964500000000000004000800000000000001f727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e4964500000000000004000800000000000001d",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature",
+          "serverFields.recovery.boundCoordinate.groupId",
+          "serverFields.recovery.boundCoordinate.groupContextHash",
+          "serverFields.recovery.boundCoordinate.confirmationTag",
+          "serverFields.recovery.reservation.boundCoordinate.groupId",
+          "serverFields.recovery.reservation.boundCoordinate.groupContextHash",
+          "serverFields.recovery.reservation.boundCoordinate.confirmationTag",
+          "serverFields.recovery.reservation.keyPackageRef",
+          "serverFields.recovery.reservation.keyPackage.bytes",
+          "serverFields.recovery.reservation.keyPackage.sha256",
+          "serverFields.recovery.reservation.keyPackage.keyPackageRef"
+        ],
+        "canonicalDagCborHex": "a863736571182e67656e7472794964508484848484844484848484848484848469656e7472794b696e647831626c75652e636174626972642e636861742e64656673237061727469636970616e74416363657074616e6365456e747279697369676e61747572655840b26bf645afd32180bdc49f5a7de228798f61dc25fccfc05126418459f5d3d1abf99fbc273d5fec74cb52405b986e44ce7ac6196148597a266e2d4d509216b5036a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a1687265636f76657279aa66737461747573646f70656e696578706972657341747818323032362d30372d32325431343a31303a30392e3132335a6b72657175657374656441747818323032362d30372d32325431343a30353a30392e3132335a6b7265736572766174696f6ead667374617475736661637469766567707572706f73656c6c6561665265636f76657279696578706972657341747818323032362d30372d32325431343a31303a30392e3132335a6a6b65795061636b616765a56562797465734800000005000000016673686132353658204a181c72fece92f9908a6b8ad31911578f3827302b963e8008955b097a51e884676672616d696e676a6d6c734d6573736167656b636f6e74656e74547970656a6b65795061636b6167656d6b65795061636b61676552656658204b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b6b6369706865725375697465782d4d4c535f3235365f5857494e475f4348414348413230504f4c59313330355f5348413235365f456432353531396c72657175657374657244696478206469643a706c633a616c696365666978747572656161616161616161616161616d6b65795061636b61676552656658204b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b6e636f6e766572736174696f6e496450111111111111411191111111111111116e7265717565737465724b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a72385774573669386f626f756e64436f6f7264696e617465a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c65666163746976656a67656e65726174696f6e184e6c737461746556657273696f6e184f6e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e33333333333333333333333333333333333333333333333333333333333333717265636f7665727952657175657374496450a1a1a1a1a1a141a1a1a1a1a1a1a1a1a1717265717565737465724465766963654964507272727272724272b272727272727272777265717565737465724175746847656e65726174696f6e016c7265636f766572794b696e64636164646c72657175657374657244696478206469643a706c633a616c696365666978747572656161616161616161616161616e636f6e766572736174696f6e496450111111111111411191111111111111116f626f756e64436f6f7264696e617465a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c65666163746976656a67656e65726174696f6e184e6c737461746556657273696f6e184f6e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e33333333333333333333333333333333333333333333333333333333333333717265636f7665727952657175657374496450a1a1a1a1a1a141a1a1a1a1a1a1a1a1a1717265717565737465724465766963654964507272727272724272b2727272727272726d7265717565737444696765737458206198d5b6e7310bec49231e25fde4bcfb2a2bb971a3fbed1fac440aadcd1c09c96e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "84848484-8484-4484-8484-848484848484",
+        "entryKind": "blue.catbird.chat.defs#participantAcceptanceEntry",
+        "fingerprintSha256Hex": "182d56033f43c4ac1de45f345d6922beea357d91f7fe8164a04bf8ffb597ab21",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "YZjVtucxC+xJIx4l/eS8+yoruXGj++0frEQKrc0cCck=",
+        "seq": 46,
+        "serverFields": {
+          "recovery": {
+            "boundCoordinate": {
+              "confirmationTag": "CUREREREREREREREREREREREREREREREREREREREREQ=",
+              "conversationId": "11111111-1111-4111-9111-111111111111",
+              "epoch": 3,
+              "generation": 78,
+              "groupContextHash": "fjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+              "groupId": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+              "lifecycle": "active",
+              "stateVersion": 79
+            },
+            "conversationId": "11111111-1111-4111-9111-111111111111",
+            "expiresAt": "2026-07-22T14:10:09.123Z",
+            "recoveryKind": "add",
+            "recoveryRequestId": "a1a1a1a1-a1a1-41a1-a1a1-a1a1a1a1a1a1",
+            "requestedAt": "2026-07-22T14:05:09.123Z",
+            "requesterDeviceId": "72727272-7272-4272-b272-727272727272",
+            "requesterDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+            "reservation": {
+              "boundCoordinate": {
+                "confirmationTag": "CUREREREREREREREREREREREREREREREREREREREREQ=",
+                "conversationId": "11111111-1111-4111-9111-111111111111",
+                "epoch": 3,
+                "generation": 78,
+                "groupContextHash": "fjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+                "groupId": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+                "lifecycle": "active",
+                "stateVersion": 79
+              },
+              "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+              "conversationId": "11111111-1111-4111-9111-111111111111",
+              "expiresAt": "2026-07-22T14:10:09.123Z",
+              "keyPackage": {
+                "bytes": "AAAABQAAAAE=",
+                "contentType": "keyPackage",
+                "framing": "mlsMessage",
+                "keyPackageRef": "S0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0s=",
+                "sha256": "Shgccv7OkvmQimuK0xkRV484JzArlj6ACJVbCXpR6IQ="
+              },
+              "keyPackageRef": "S0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0s=",
+              "purpose": "leafRecovery",
+              "recoveryRequestId": "a1a1a1a1-a1a1-41a1-a1a1-a1a1a1a1a1a1",
+              "requesterAuthGeneration": 1,
+              "requesterDeviceId": "72727272-7272-4272-b272-727272727272",
+              "requesterDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+              "requesterKeyId": "OQpJSMbjoMkp9Mz8qJRGo6zAieMT1g9qNZJr8WtW6i8",
+              "status": "active"
+            },
+            "status": "open"
+          }
+        },
+        "signature": "smv2Ra/TIYC9xJ9afeIoeY9h3CX8z8BRJkGEWfXT0av5n7wnPV/sdMtSQFuYbkTOesYZYUhZeiZuLU1Qkha1Aw==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedParticipantAcceptance",
+        "signingDomain": "CATBIRD-CHAT-ACCEPT\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d41434345505400ad646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657830626c75652e636174626972642e636861742e64656673237061727469636970616e74416363657074616e6365426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000216d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000286f7369676e6174757265446f6d61696e74434154424952442d434841542d41434345505400717265636f76657279526571756573744964500000000000004000800000000000002274696e7669746174696f6e50726f76656e616e6365a36c696e7669746564427944696478206469643a706c633a616c6963656669787475726561616161616161616161616171696e766974656442794465766963654964500000000000004000800000000000002776696e7669746174696f6e5472616e736974696f6e49645000000000000040008000000000000026",
+        "unsignedSigningProjectionCanonicalDagCborHex": "ad646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657830626c75652e636174626972642e636861742e64656673237061727469636970616e74416363657074616e6365426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000216d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000286f7369676e6174757265446f6d61696e74434154424952442d434841542d41434345505400717265636f76657279526571756573744964500000000000004000800000000000002274696e7669746174696f6e50726f76656e616e6365a36c696e7669746564427944696478206469643a706c633a616c6963656669787475726561616161616161616161616171696e766974656442794465766963654964500000000000004000800000000000002776696e7669746174696f6e5472616e736974696f6e49645000000000000040008000000000000026",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId",
+          "serverFields.recovery.recoveryRequestId",
+          "serverFields.recovery.conversationId",
+          "serverFields.recovery.requesterDeviceId",
+          "serverFields.recovery.boundCoordinate.conversationId",
+          "serverFields.recovery.reservation.recoveryRequestId",
+          "serverFields.recovery.reservation.conversationId",
+          "serverFields.recovery.reservation.boundCoordinate.conversationId",
+          "serverFields.recovery.reservation.requesterDeviceId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature",
+          "serverFields.tombstone.retired.groupId",
+          "serverFields.tombstone.retired.groupContextHash",
+          "serverFields.tombstone.retired.confirmationTag"
+        ],
+        "canonicalDagCborHex": "a8637365710a67656e7472794964506666666666664666a66666666666666669656e7472794b696e64782d626c75652e636174626972642e636861742e6465667323636f6e766572736174696f6e436c6f7365456e747279697369676e6174757265584076461fa126ffc5e3ac4ab88f736df7dc021ab205ac5bf4ce96af2f4f4f4104802978e69b9833dd216b2bece918c0303cbbfda64cfcaa6dc860d7dde992b6ad0d6a726563656976656441747818323032362d30372d32325431323a33343a35362e3030305a6c7365727665724669656c6473a169746f6d6273746f6e65a76772657469726564a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c656a737570657273656465646a67656e65726174696f6e184e6c737461746556657273696f6e18506e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e3333333333333333333333333333333333333333333333333333333333333368636c6f73656441747818323032362d30372d32325431323a33343a35362e3030305a6b636c6f736564427944696478206469643a706c633a616c696365666978747572656161616161616161616161616b7465726d696e616c5365710a6e636f6e766572736174696f6e4964501111111111114111911111111111111170636c6f73656442794465766963654964507272727272724272b27272727272727270636f6e766572736174696f6e4b696e646567726f75706d726571756573744469676573745820077ed633d1e780b4a1524bd3b7de2bc42c1358937bcfffa4fe8b08019f8fc25d6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "66666666-6666-4666-a666-666666666666",
+        "entryKind": "blue.catbird.chat.defs#conversationCloseEntry",
+        "fingerprintSha256Hex": "39009aff7d5685b763a84bb3956604eeff30b0d4720e041a612b3b62760eea5a",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T12:34:56.000Z",
+        "requestDigest": "B37WM9HngLShUkvTt94rxCwTWJN7z/+k/osIAZ+Pwl0=",
+        "seq": 10,
+        "serverFields": {
+          "tombstone": {
+            "closedAt": "2026-07-22T12:34:56.000Z",
+            "closedByDeviceId": "72727272-7272-4272-b272-727272727272",
+            "closedByDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+            "conversationId": "11111111-1111-4111-9111-111111111111",
+            "conversationKind": "group",
+            "retired": {
+              "confirmationTag": "CUREREREREREREREREREREREREREREREREREREREREQ=",
+              "conversationId": "11111111-1111-4111-9111-111111111111",
+              "epoch": 3,
+              "generation": 78,
+              "groupContextHash": "fjMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+              "groupId": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=",
+              "lifecycle": "superseded",
+              "stateVersion": 80
+            },
+            "terminalSeq": 10
+          }
+        },
+        "signature": "dkYfoSb/xeOsSriPc2333AIasgWsW/TOlq8vT09BBIApeOabmDPdIWsr7OkYwDA8u/2mTPyqbchg193pkratDQ==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedConversationClose",
+        "signingDomain": "CATBIRD-CHAT-CLOSE\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d434c4f534500ac652474797065782c626c75652e636174626972642e636861742e6465667323636f6e766572736174696f6e436c6f7365426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c65666163746976656a67656e65726174696f6e184e6c737461746556657273696f6e184f6e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e333333333333333333333333333333333333333333333333333333333333336772657469726564a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c656a737570657273656465646a67656e65726174696f6e184e6c737461746556657273696f6e18506e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e33333333333333333333333333333333333333333333333333333333333333686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e49645003adfab0b0884e86b9920f611d2eb64a6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579506767676767674767a7676767676767676f7369676e6174757265446f6d61696e73434154424952442d434841542d434c4f53450070636f6e766572736174696f6e4b696e646567726f7570",
+        "unsignedSigningProjectionCanonicalDagCborHex": "ac652474797065782c626c75652e636174626972642e636861742e6465667323636f6e766572736174696f6e436c6f7365426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c65666163746976656a67656e65726174696f6e184e6c737461746556657273696f6e184f6e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e333333333333333333333333333333333333333333333333333333333333336772657469726564a86565706f6368036767726f7570496458202222222222222222222222222222222222222222222222222222222222222222696c6966656379636c656a737570657273656465646a67656e65726174696f6e184e6c737461746556657273696f6e18506e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e546167582009444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e746578744861736858207e33333333333333333333333333333333333333333333333333333333333333686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e49645003adfab0b0884e86b9920f611d2eb64a6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579506767676767674767a7676767676767676f7369676e6174757265446f6d61696e73434154424952442d434841542d434c4f53450070636f6e766572736174696f6e4b696e646567726f7570",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId",
+          "serverFields.tombstone.conversationId",
+          "serverFields.tombstone.retired.conversationId",
+          "serverFields.tombstone.closedByDeviceId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183067656e7472794964508686868686864686868686868686868669656e7472794b696e647828626c75652e636174626972642e636861742e6465667323726573657452657175657374456e747279697369676e617475726558406931aeb1da3549841c003f77d76d31fe4b31d705fd818aebec31ada0b2970d032888f51e120fa05a98bc42e4abcb404af682fc98e2db38a895be09d09dc4b7006a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d726571756573744469676573745820a7e96a4462436671e62519d7184f93fe7ac41a53b5160006716de40bdf73e8096e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "86868686-8686-4686-8686-868686868686",
+        "entryKind": "blue.catbird.chat.defs#resetRequestEntry",
+        "fingerprintSha256Hex": "8dccd0477b767c5f9169fc549514aa2f084a108f3cf1065f0353492346425e43",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "p+lqRGJDZnHmJRnXGE+T/nrEGlO1FgAGcW3kC99z6Ak=",
+        "seq": 48,
+        "serverFields": {},
+        "signature": "aTGusdo1SYQcAD93120x/ksx1wX9gYrr7DGtoLKXDQMoiPUeEg+gWpi8QuSry0BK9oL8mOLbOKiVvgnQncS3AA==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedResetRequest",
+        "signingDomain": "CATBIRD-CHAT-RESET-REQUEST\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d52455345542d5245515545535400ab6524747970657827626c75652e636174626972642e636861742e6465667323726573657452657175657374426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a66726561736f6e6e6c6f63616c53746174654c6f7374686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579500000000000004000800000000000002c6e726573657452657175657374496450000000000000400080000000000000296f7369676e6174757265446f6d61696e781b434154424952442d434841542d52455345542d5245515545535400",
+        "unsignedSigningProjectionCanonicalDagCborHex": "ab6524747970657827626c75652e636174626972642e636861742e6465667323726573657452657175657374426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a66726561736f6e6e6c6f63616c53746174654c6f7374686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579500000000000004000800000000000002c6e726573657452657175657374496450000000000000400080000000000000296f7369676e6174757265446f6d61696e781b434154424952442d434841542d52455345542d5245515545535400",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183167656e7472794964508787878787874787878787878787878769656e7472794b696e64782b626c75652e636174626972642e636861742e6465667323726573657441637469766174696f6e456e747279697369676e617475726558407cd63c26dc680bb23d0f601756a329a43cc338fbcd6251cb1d0708fa819fa1a1526e1181a4d7822cc23f96bf6e4bd91bd3f0d93cf2c847024d54c4e8d988bd086a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582089b96b1b1dcc1f69e995ca520e51ed4ff5359fd5f451b8668e1aad700cc34cf26e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "87878787-8787-4787-8787-878787878787",
+        "entryKind": "blue.catbird.chat.defs#resetActivationEntry",
+        "fingerprintSha256Hex": "6959ff3c587585dd78d42475fd95b9df75d3fb19b8137efcb4588e3eb5a08b3a",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "iblrGx3MH2nplcpSDlHtT/U1n9X0UbhmjhqtcAzDTPI=",
+        "seq": 49,
+        "serverFields": {},
+        "signature": "fNY8JtxoC7I9D2AXVqMppDzDOPvNYlHLHQcI+oGfoaFSbhGBpNeCLMI/lr9uS9kb0/DZPPLIRwJNVMTo2Yi9CA==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedResetActivation",
+        "signingDomain": "CATBIRD-CHAT-RESET-ACTIVATE\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d52455345542d414354495641544500b1652474797065782a626c75652e636174626972642e636861742e6465667323726573657441637469766174696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6772657469726564a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a2696163746f724c656166a3677573657244696478206469643a706c633a616c6963656669787475726561616161616161616161616168646576696365496450000000000000400080000000000000336a6c6561664f726967696e6767656e657369736c7061727469636970616e747381a364726f6c656561646d696e667374617475736770656e64696e67677573657244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a69737563636573736f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6c7472616e736974696f6e4964500000000000004000800000000000002e6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000376e7265736574526571756573744964500000000000004000800000000000002d6f7369676e6174757265446f6d61696e781c434154424952442d434841542d52455345542d41435449564154450070636f6e766572736174696f6e4b696e64666469726563747067656e6573697347726f7570496e666fa4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e74547970656967726f7570496e666f706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f7244657669636549645000000000000040008000000000000035726f726967696e5472616e736974696f6e49645000000000000040008000000000000036727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e49645000000000000040008000000000000034",
+        "unsignedSigningProjectionCanonicalDagCborHex": "b1652474797065782a626c75652e636174626972642e636861742e6465667323726573657441637469766174696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6772657469726564a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a2696163746f724c656166a3677573657244696478206469643a706c633a616c6963656669787475726561616161616161616161616168646576696365496450000000000000400080000000000000336a6c6561664f726967696e6767656e657369736c7061727469636970616e747381a364726f6c656561646d696e667374617475736770656e64696e67677573657244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a69737563636573736f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6c7472616e736974696f6e4964500000000000004000800000000000002e6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000376e7265736574526571756573744964500000000000004000800000000000002d6f7369676e6174757265446f6d61696e781c434154424952442d434841542d52455345542d41435449564154450070636f6e766572736174696f6e4b696e64666469726563747067656e6573697347726f7570496e666fa4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e74547970656967726f7570496e666f706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f7244657669636549645000000000000040008000000000000035726f726967696e5472616e736974696f6e49645000000000000040008000000000000036727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e49645000000000000040008000000000000034",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183267656e7472794964508888888888884888888888888888888869656e7472794b696e647833626c75652e636174626972642e636861742e64656673236c6561665265636f7665727946756c66696c6c6d656e74456e747279697369676e61747572655840e4d1b224bcb7ca6d4521c76307d7de947e4a5abda18d32a7c84949f8be39092df972b45e7d06ea6e9624711731cf9cd9ef99e6b478683bdc2723817d03fbc10d6a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582015c94b2c865739c3266468f0ac42bacb73dbffc5d2b03665d8d4814e95753fc36e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "88888888-8888-4888-8888-888888888888",
+        "entryKind": "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry",
+        "fingerprintSha256Hex": "ea2aeb10bb5d03cd1b528e62afafedbc49326606c4bb506c0b7198f6ba62707f",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "FclLLIZXOcMmZGjwrEK6y3Pb/8XSsDZl2NSBTpV1P8M=",
+        "seq": 50,
+        "serverFields": {},
+        "signature": "5NGyJLy3ym1FIcdjB9felH5KWr2hjTKnyElJ+L45CS35crRefQbqbpYkcRcxz5zZ75nmtHhoO9wnI4F9A/vBDQ==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedLeafRecoveryFulfillment",
+        "signingDomain": "CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d4c4541462d5245434f564552592d46554c46494c4c00b063616164a5657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006c7472616e736974696f6e4964505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6e636f6e766572736174696f6e496450111111111111411191111111111111116f70726f746f636f6c56657273696f6e6131646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657832626c75652e636174626972642e636861742e64656673236c6561665265636f7665727946756c66696c6c6d656e74426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a66636f6d6d6974a4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e7454797065737075626c69634d657373616765436f6d6d6974686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a26b6c6561664368616e67657380727061727469636970616e744368616e67657380687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000396d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000406f7369676e6174757265446f6d61696e7823434154424952442d434841542d4c4541462d5245434f564552592d46554c46494c4c00706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f724465766963654964500000000000004000800000000000003e726f726967696e5472616e736974696f6e4964500000000000004000800000000000003f727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e4964500000000000004000800000000000003d717265636f766572795265717565737449645000000000000040008000000000000038",
+        "unsignedSigningProjectionCanonicalDagCborHex": "b063616164a5657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006c7472616e736974696f6e4964505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6e636f6e766572736174696f6e496450111111111111411191111111111111116f70726f746f636f6c56657273696f6e6131646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657832626c75652e636174626972642e636861742e64656673236c6561665265636f7665727946756c66696c6c6d656e74426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a66636f6d6d6974a4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e7454797065737075626c69634d657373616765436f6d6d6974686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a26b6c6561664368616e67657380727061727469636970616e744368616e67657380687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000396d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000406f7369676e6174757265446f6d61696e7823434154424952442d434841542d4c4541462d5245434f564552592d46554c46494c4c00706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f724465766963654964500000000000004000800000000000003e726f726967696e5472616e736974696f6e4964500000000000004000800000000000003f727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e4964500000000000004000800000000000003d717265636f766572795265717565737449645000000000000040008000000000000038",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183367656e7472794964508989898989894989898989898989898969656e7472794b696e647828626c75652e636174626972642e636861742e64656673236c6561766552657175657374456e747279697369676e61747572655840fab21ee65d0cdad75f4dba1ea9f470f4db01ba7c2208d29a629294ea5a45231eb92cbb62414adf52e8e19ceb24c9ef74a327e2b618d6aa38bc91c3c95c0d970d6a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d7265717565737444696765737458202f753ecc436765f3b3dae38ed9041d09012022a13a1510ba592793d0cac087b66e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "89898989-8989-4989-8989-898989898989",
+        "entryKind": "blue.catbird.chat.defs#leaveRequestEntry",
+        "fingerprintSha256Hex": "db1854c6486199f175b7074d19256587c74c1c7811512ea667c92591f7a023cf",
+        "historicalPublicKeyRef": "requesterDevice7070",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "L3U+zENnZfOz2uOO2QQdCQEgIqE6FRC6WSeT0MrAh7Y=",
+        "seq": 51,
+        "serverFields": {},
+        "signature": "+rIe5l0M2tdfTboeqfRw9NsBunwiCNKaYpKU6lpFIx65LLtiQUrfUujhnOskye90oyfithjWqji8kcPJXA2XDQ==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedLeaveRequest",
+        "signingDomain": "CATBIRD-CHAT-LEAVE-REQUEST\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d4c454156452d5245515545535400aa6524747970657827626c75652e636174626972642e636861742e64656673236c6561766552657175657374426f6479656b65794964782b6e504132386c736e704a796265553341486e554e374b6a38457150755961374f31335274756f317a415941657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6d6163746f724465766963654964507070707070704070b0707070707070706e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000446e6c6561766552657175657374496450000000000000400080000000000000416f7369676e6174757265446f6d61696e781b434154424952442d434841542d4c454156452d5245515545535400",
+        "unsignedSigningProjectionCanonicalDagCborHex": "aa6524747970657827626c75652e636174626972642e636861742e64656673236c6561766552657175657374426f6479656b65794964782b6e504132386c736e704a796265553341486e554e374b6a38457150755961374f31335274756f317a415941657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6d6163746f724465766963654964507070707070704070b0707070707070706e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000446e6c6561766552657175657374496450000000000000400080000000000000416f7369676e6174757265446f6d61696e781b434154424952442d434841542d4c454156452d5245515545535400",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183467656e7472794964508a8a8a8a8a8a4a8a8a8a8a8a8a8a8a8a69656e7472794b696e647829626c75652e636174626972642e636861742e64656673237a65726f4c6561664c65617665456e747279697369676e61747572655840af32d129eefc7f91015c18f0dbb3194c896642ed63550df575e45b9d74512b67afafe34fb5c3283bd26bba5ddd156d25dc2c19e1f3f51e52aedd295a7c6493066a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582058b3609ae357b1f82c8d53aa8db87f037da9342e886d902423bc2981d5c7377b6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "8a8a8a8a-8a8a-4a8a-8a8a-8a8a8a8a8a8a",
+        "entryKind": "blue.catbird.chat.defs#zeroLeafLeaveEntry",
+        "fingerprintSha256Hex": "f10dab25e6a366c761b5999bcdd13294c6d55c9774b01787138070d0d4261fec",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "WLNgmuNXsfgsjVOqjbh/A32pNC6IbZAkI7wpgdXHN3s=",
+        "seq": 52,
+        "serverFields": {},
+        "signature": "rzLRKe78f5EBXBjw27MZTIlmQu1jVQ31deRbnXRRK2evr+NPtcMoO9Jrul3dFW0l3CwZ4fP1HlKu3SlafGSTBg==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedZeroLeafLeave",
+        "signingDomain": "CATBIRD-CHAT-LEAVE-ZERO-LEAF\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d4c454156452d5a45524f2d4c45414600ab646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657828626c75652e636174626972642e636861742e64656673237a65726f4c6561664c65617665426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000456d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000496f7369676e6174757265446f6d61696e781d434154424952442d434841542d4c454156452d5a45524f2d4c45414600",
+        "unsignedSigningProjectionCanonicalDagCborHex": "ab646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657828626c75652e636174626972642e636861742e64656673237a65726f4c6561664c65617665426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e496450000000000000400080000000000000456d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000496f7369676e6174757265446f6d61696e781d434154424952442d434841542d4c454156452d5a45524f2d4c45414600",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183567656e7472794964508b8b8b8b8b8b4b8b8b8b8b8b8b8b8b8b69656e7472794b696e64782d626c75652e636174626972642e636861742e64656673236c6561766543616e63656c6c6174696f6e456e747279697369676e61747572655840af810a1c38f252c810763828a5945d6cdd8c002a1a253901b89a60429f49bbbdf51bea801b2dd7ab7ec2cd54bcaa76d3bcf7f8aa9cdd8c35c7ccf24e1c6f0d056a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d726571756573744469676573745820f46c1f6d71b67339af880914a8c4036f368e020ee457fa244e63d75da8b78abc6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "8b8b8b8b-8b8b-4b8b-8b8b-8b8b8b8b8b8b",
+        "entryKind": "blue.catbird.chat.defs#leaveCancellationEntry",
+        "fingerprintSha256Hex": "f14ad9e884d6e1ddeeaee0233b3551999d883e6a0c9f66bd7adf2d621e4b13a1",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "9GwfbXG2czmviAkUqMQDbzaOAg7kV/okTmPXXai3irw=",
+        "seq": 53,
+        "serverFields": {},
+        "signature": "r4EKHDjyUsgQdjgopZRdbN2MACoaJTkBuJpgQp9Ju731G+qAGy3Xq37CzVS8qnbTvPf4qpzdjDXHzPJOHG8NBQ==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedLeaveCancellation",
+        "signingDomain": "CATBIRD-CHAT-LEAVE-CANCEL\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d4c454156452d43414e43454c00aa652474797065782c626c75652e636174626972642e636861742e64656673236c6561766543616e63656c6c6174696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e636f6e766572736174696f6e496450111111111111411191111111111111116e6964656d706f74656e63794b6579500000000000004000800000000000004c6e6c6561766552657175657374496450000000000000400080000000000000416f7369676e6174757265446f6d61696e781a434154424952442d434841542d4c454156452d43414e43454c00",
+        "unsignedSigningProjectionCanonicalDagCborHex": "aa652474797065782c626c75652e636174626972642e636861742e64656673236c6561766543616e63656c6c6174696f6e426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e636f6e766572736174696f6e496450111111111111411191111111111111116e6964656d706f74656e63794b6579500000000000004000800000000000004c6e6c6561766552657175657374496450000000000000400080000000000000416f7369676e6174757265446f6d61696e781a434154424952442d434841542d4c454156452d43414e43454c00",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      },
+      {
+        "base64BytePaths": [
+          "requestDigest",
+          "signature"
+        ],
+        "canonicalDagCborHex": "a863736571183667656e7472794964508c8c8c8c8c8c4c8c8c8c8c8c8c8c8c8c69656e7472794b696e647832626c75652e636174626972642e636861742e64656673236c65617665436f6d6d697446756c66696c6c6d656e74456e747279697369676e61747572655840a14e5262955ef53bf4c870da747e8b877641ea9782bcd96b576484f839d862e292cfefa2a22716c8035b0a2dc70013cf97180c8a424437a2ed40bc576e9101086a726563656976656441747818323032362d30372d32325431343a30353a30392e3132335a6c7365727665724669656c6473a06d72657175657374446967657374582057073f3727e88f67a88e56592079639379e987b31f9b774526c944afbf723cbf6e636f6e766572736174696f6e49645011111111111141119111111111111111",
+        "conversationId": "11111111-1111-4111-9111-111111111111",
+        "entryId": "8c8c8c8c-8c8c-4c8c-8c8c-8c8c8c8c8c8c",
+        "entryKind": "blue.catbird.chat.defs#leaveCommitFulfillmentEntry",
+        "fingerprintSha256Hex": "fce6ae5dac9636c99b00f9d39fe337d86850306d6d8456cceba9e96f5bd08d9f",
+        "historicalPublicKeyRef": "activeAdminDevice7272",
+        "receivedAt": "2026-07-22T14:05:09.123Z",
+        "requestDigest": "Vwc/Nyfoj2eojlZZIHljk3nph7Mfm3dFJslEr79yPL8=",
+        "seq": 54,
+        "serverFields": {},
+        "signature": "oU5SYpVe9Tv0yHDadH6Lh3ZB6peCvNlrV2SE+DnYYuKSz++ioicWyANbCi3HABPPlxgMikJEN6LtQLxXbpEBCA==",
+        "signedRequestRef": "blue.catbird.chat.defs#signedLeaveCommitFulfillment",
+        "signingDomain": "CATBIRD-CHAT-LEAVE-FULFILL-COMMIT\u0000",
+        "signingTranscriptHex": "434154424952442d434841542d4c454156452d46554c46494c4c2d434f4d4d495400b063616164a5657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006c7472616e736974696f6e4964505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6e636f6e766572736174696f6e496450111111111111411191111111111111116f70726f746f636f6c56657273696f6e6131646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657831626c75652e636174626972642e636861742e64656673236c65617665436f6d6d697446756c66696c6c6d656e74426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a66636f6d6d6974a4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e7454797065737075626c69634d657373616765436f6d6d6974686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a26b6c6561664368616e67657380727061727469636970616e744368616e67657380687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e4964500000000000004000800000000000004e6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000556e6c65617665526571756573744964500000000000004000800000000000004d6f7369676e6174757265446f6d61696e7822434154424952442d434841542d4c454156452d46554c46494c4c2d434f4d4d495400706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f7244657669636549645000000000000040008000000000000053726f726967696e5472616e736974696f6e49645000000000000040008000000000000054727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e49645000000000000040008000000000000052",
+        "unsignedSigningProjectionCanonicalDagCborHex": "b063616164a5657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006c7472616e736974696f6e4964505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6e636f6e766572736174696f6e496450111111111111411191111111111111116f70726f746f636f6c56657273696f6e6131646e657874a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6524747970657831626c75652e636174626972642e636861742e64656673236c65617665436f6d6d697446756c66696c6c6d656e74426f6479656b65794964782b4f51704a534d626a6f4d6b70394d7a38714a52476f367a4169654d54316739714e5a4a7238577457366938657072696f72a86565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a66636f6d6d6974a4656279746573485a5a5a5a5a5a5a5a6673686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a676672616d696e676a6d6c734d6573736167656b636f6e74656e7454797065737075626c69634d657373616765436f6d6d6974686163746f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161686d616e6966657374a26b6c6561664368616e67657380727061727469636970616e744368616e67657380687369676e656441747818323032362d30372d32325431323a33343a35352e3030305a6c7472616e736974696f6e4964500000000000004000800000000000004e6d6163746f724465766963654964507272727272724272b2727272727272726e6175746847656e65726174696f6e016e6964656d706f74656e63794b657950000000000000400080000000000000556e6c65617665526571756573744964500000000000004000800000000000004d6f7369676e6174757265446f6d61696e7822434154424952442d434841542d4c454156452d46554c46494c4c2d434f4d4d495400706d65746164617461536e617073686f74a8656e6f6e63654c5a5a5a5a5a5a5a5a5a5a5a5a6a63697068657274657874505a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a636f6f7264696e617465a66565706f6368006767726f7570496458205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6a67656e65726174696f6e006e636f6e766572736174696f6e496450111111111111411191111111111111116f636f6e6669726d6174696f6e54616758205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7067726f7570436f6e746578744861736858205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a6b617574686f7250726f6f66a969617574686f7244696478206469643a706c633a616c69636566697874757265616161616161616161616161696f726967696e536571016b617574686f724b65794964782b594c38487849697130595f614d353377666b2d3852375477432d6358455a4e76474e424e4e537251474a416c726f6c6541744f726967696e6561646d696e6e617574686f7244657669636549645000000000000040008000000000000053726f726967696e5472616e736974696f6e49645000000000000040008000000000000054727369676e61747572655075626c69634b657958205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a7464657669636553746174757341744f726967696e66616374697665766175746847656e65726174696f6e41744f726967696e016e6369706865727465787453697a65106f6d6574616461746156657273696f6e01706369706865727465787453686132353658205a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a726f726967696e5472616e736974696f6e49645000000000000040008000000000000052",
+        "uuidBytePaths": [
+          "entryId",
+          "conversationId"
+        ]
+      }
+    ],
+    "domain": "CATBIRD-CHAT-CONTROL-ENTRY-FINGERPRINT\u0000",
+    "historicalPublicKeys": {
+      "activeAdminDevice7272": "c6d0c796bb4c3c923615f8dc85e6fc35149eb6b1317de523d3a5085584f5c109",
+      "requesterDevice7070": "8ca63145907a2e6c5fb3dc0791c0189b8252da3e4143704b3b2ca4e526f25dd1"
+    },
+    "nonemptyServerFields": {
+      "blue.catbird.chat.defs#conversationCloseEntry": [
+        "tombstone"
+      ],
+      "blue.catbird.chat.defs#participantAcceptanceEntry": [
+        "recovery"
+      ]
+    },
+    "ordinaryServerFields": {},
+    "projectionFields": [
+      "entryKind",
+      "entryId",
+      "conversationId",
+      "seq",
+      "requestDigest",
+      "signature",
+      "serverFields",
+      "receivedAt"
+    ]
+  },
+  "dagCbor": {
+    "canonicalHex": "a26161016262626178",
+    "sha256Hex": "8b4a837ed1ac113b812985600a0019fdb7ce3ccc228eb55801d066d186f90c58",
+    "value": {
+      "a": 1,
+      "bb": "x"
+    }
+  },
+  "ed25519": {
+    "messageHex": "",
+    "mutatedSignatureHex": "e4564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "signatureHex": "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+  },
+  "grammar": {
+    "bareDidByteBounds": {
+      "basicCredentialMaximum": 298,
+      "basicCredentialMinimum": 49,
+      "maximum": 261,
+      "minimum": 12
+    },
+    "didCaseMutations": [
+      {
+        "accepted": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+        "rejected": "did:plc:Ewvi7nxzyoun6zhxrhs64oiz"
+      },
+      {
+        "accepted": "did:web:chat.example.com",
+        "rejected": "did:web:Chat.example.com"
+      }
+    ],
+    "invalidBareDids": [
+      "did:plc:abc#device",
+      "did:plc:EWVI7NXZYOUN6ZHXHRS64OIZ",
+      "did:web:Chat.example.com",
+      "did:web:chat.example.com:user",
+      "did:web:chat.example.com/user",
+      "did:web:chat.example.com?x=1",
+      "did:web:chat.example.com#x",
+      "did:web:chat.example.com:443",
+      "did:web:chat%2eexample.com",
+      "did:web:127.0.0.1",
+      "did:web:::1",
+      "did:web:localhost",
+      "did:web:com",
+      "did:web:chat.example.com.",
+      "did:web:a.alt",
+      "did:web:a.arpa",
+      "did:web:a.example",
+      "did:web:a.internal",
+      "did:web:a.invalid",
+      "did:web:a.local",
+      "did:web:a.localhost",
+      "did:web:a.onion",
+      "did:web:a.test",
+      "DID:plc:abc",
+      "did:key:z6Mkabc"
+    ],
+    "invalidDpopJti": [
+      "short",
+      "AAAAAAAAAAAAAAAA=",
+      "AAAAAAAAAAAAAAA+",
+      "AAAAAAAAAAA",
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    ],
+    "invalidKeyIds": [
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "short",
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA+"
+    ],
+    "invalidTimestamps": [
+      "2026-07-22T14:05:09Z",
+      "2026-07-22t14:05:09.123z",
+      "2026-07-22T14:05:09.12Z",
+      "2026-07-22T14:05:60.000Z",
+      "2026-02-30T14:05:09.123Z",
+      "2026-07-22T10:05:09.123-04:00"
+    ],
+    "invalidUuidV4": [
+      "018F3F6A-7B2C-4D91-8A5E-0F123456789A",
+      "018f3f6a7b2c4d918a5e0f123456789a",
+      "018f3f6a-7b2c-3d91-8a5e-0f123456789a",
+      "018f3f6a-7b2c-4d91-7a5e-0f123456789a",
+      "{018f3f6a-7b2c-4d91-8a5e-0f123456789a}"
+    ],
+    "validBareDids": [
+      "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+      "did:web:chat.example.com",
+      "did:web:a.co"
+    ],
+    "validDpopJti": [
+      "AAAAAAAAAAAAAAAA",
+      "AQIDBAUGBwgJCgsMDQ4PEBESExQ"
+    ],
+    "validKeyIds": [
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    ],
+    "validTimestamps": [
+      "2026-07-22T14:05:09.123Z",
+      "0001-01-01T00:00:00.000Z"
+    ],
+    "validUuidV4": [
+      "018f3f6a-7b2c-4d91-8a5e-0f123456789a"
+    ]
+  },
+  "keyPackageLifetime": {
+    "evaluationUnixSeconds": 1700000000,
+    "invalid": [
+      {
+        "notAfter": 1700000600,
+        "notBefore": 1700000000
+      },
+      {
+        "notAfter": 1700000000,
+        "notBefore": 1699999999
+      },
+      {
+        "notAfter": 1700000599,
+        "notBefore": 1699999999
+      },
+      {
+        "notAfter": 1702595501,
+        "notBefore": 1699999900
+      },
+      {
+        "notAfter": 1700000600,
+        "notBefore": 1700000601
+      }
+    ],
+    "reservationExpiryUnixSeconds": 1700000300,
+    "valid": [
+      {
+        "notAfter": 1700000600,
+        "notBefore": 1699999999
+      },
+      {
+        "notAfter": 1702595500,
+        "notBefore": 1699999900
+      }
+    ]
+  },
+  "metadataProjections": {
+    "aad": {
+      "avatarBinding": {
+        "blobId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+        "ciphertextSha256": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=",
+        "ciphertextSize": 1024,
+        "purpose": "metadata"
+      },
+      "ciphertextSize": 144,
+      "coordinate": {
+        "confirmationTag": "REREREREREREREREREREREREREREREREREREREREREQ=",
+        "conversationId": "3b241101-e2bb-4255-8caf-4136c566a962",
+        "epoch": 1,
+        "generation": 0,
+        "groupContextHash": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+        "groupId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      },
+      "metadataVersion": 1,
+      "originTransitionId": "8cb4f5d2-0d31-4b6f-a9c2-7e18f5403d61",
+      "protocol": "blue.catbird.chat.metadata",
+      "version": 1
+    },
+    "aadBase64BytePaths": [
+      "coordinate.groupId",
+      "coordinate.groupContextHash",
+      "coordinate.confirmationTag",
+      "avatarBinding.ciphertextSha256"
+    ],
+    "aadCanonicalDagCborHex": "a76776657273696f6e016870726f746f636f6c781a626c75652e636174626972642e636861742e6d657461646174616a636f6f7264696e617465a66565706f6368016767726f75704964582000000000000000000000000000000000000000000000000000000000000000006a67656e65726174696f6e006e636f6e766572736174696f6e4964503b241101e2bb42558caf4136c566a9626f636f6e6669726d6174696f6e546167582044444444444444444444444444444444444444444444444444444444444444447067726f7570436f6e7465787448617368582033333333333333333333333333333333333333333333333333333333333333336d61766174617242696e64696e67a466626c6f62496450018f3f6a7b2c4d918a5e0f123456789a67707572706f7365686d657461646174616e6369706865727465787453697a651904007063697068657274657874536861323536582055555555555555555555555555555555555555555555555555555555555555556e6369706865727465787453697a6518906f6d6574616461746156657273696f6e01726f726967696e5472616e736974696f6e4964508cb4f5d20d314b6fa9c27e18f5403d61",
+    "aadMutation": {
+      "path": "originTransitionId",
+      "value": "8cb4f5d2-0d31-4b6f-a9c2-7e18f5403d62"
+    },
+    "aadTranscriptSha256Hex": "98d440b7fd690275ca15a380cd56f3dd86ffb799d5c5eaed5699d38cb7fd5921",
+    "aadUuidBytePaths": [
+      "coordinate.conversationId",
+      "originTransitionId",
+      "avatarBinding.blobId"
+    ],
+    "exporterBase64BytePaths": [
+      "groupContextHash"
+    ],
+    "exporterCanonicalDagCborHex": "a76565706f6368016776657273696f6e016870726f746f636f6c781a626c75652e636174626972642e636861742e6d657461646174616a67656e65726174696f6e006e636f6e766572736174696f6e4964503b241101e2bb42558caf4136c566a9626f6d6574616461746156657273696f6e017067726f7570436f6e746578744861736858203333333333333333333333333333333333333333333333333333333333333333",
+    "exporterContext": {
+      "conversationId": "3b241101-e2bb-4255-8caf-4136c566a962",
+      "epoch": 1,
+      "generation": 0,
+      "groupContextHash": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+      "metadataVersion": 1,
+      "protocol": "blue.catbird.chat.metadata",
+      "version": 1
+    },
+    "exporterMutation": {
+      "path": "epoch",
+      "value": 2
+    },
+    "exporterUuidBytePaths": [
+      "conversationId"
+    ],
+    "mutatedAadTranscriptSha256Hex": "e63fa87d3b26710b76e5de44de856ff028e6ed8bfdd9fa712d04e42973061db5",
+    "mutatedExporterCanonicalDagCborHex": "a76565706f6368026776657273696f6e016870726f746f636f6c781a626c75652e636174626972642e636861742e6d657461646174616a67656e65726174696f6e006e636f6e766572736174696f6e4964503b241101e2bb42558caf4136c566a9626f6d6574616461746156657273696f6e017067726f7570436f6e746578744861736858203333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "signedAtFreshness": {
+    "completedReplayMayBypassSignedAtAge": true,
+    "completedReplayStillRequiresFreshDpopJti": true,
+    "invalidFirstExecution": [
+      "2026-07-22T11:54:59.999Z",
+      "2026-07-22T12:01:00.001Z"
+    ],
+    "oldCompletedReplay": "2020-01-01T00:00:00.000Z",
+    "pendingExpirySource": "serverReceivedAt",
+    "trustedServerInstant": "2026-07-22T12:00:00.000Z",
+    "typingAndServerTimestampSource": "trustedServerInstant",
+    "validFirstExecution": [
+      "2026-07-22T11:55:00.000Z",
+      "2026-07-22T12:00:00.000Z",
+      "2026-07-22T12:01:00.000Z"
+    ]
+  },
+  "signedMutator": {
+    "body": {
+      "$type": "blue.catbird.chat.defs#blobDeletionBody",
+      "actorDeviceId": "3b241101-e2bb-4255-8caf-4136c566a962",
+      "actorDid": "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+      "authGeneration": 1,
+      "blobId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+      "idempotencyKey": "8cb4f5d2-0d31-4b6f-a9c2-7e18f5403d61",
+      "keyId": "If4x36FUomFia_hUBG_SJxt77UtqvkWqWId-9H-XIbk",
+      "signatureDomain": "CATBIRD-CHAT-BLOB-DELETE\u0000",
+      "signedAt": "2026-07-22T14:05:09.123Z"
+    },
+    "canonicalRequestDigestHex": "9225776f6d0658e0aed1d7fe96e1299714c510e2c1b755fc8d31cda251588be4",
+    "canonicalUnsignedDagCborHex": "a96524747970657827626c75652e636174626972642e636861742e6465667323626c6f6244656c6574696f6e426f6479656b65794964782b49663478333646556f6d4669615f685542475f534a78743737557471766b57715749642d39482d5849626b66626c6f62496450018f3f6a7b2c4d918a5e0f123456789a686163746f7244696478206469643a706c633a65777669376e787a796f756e367a687872687336346f697a687369676e656441747818323032362d30372d32325431343a30353a30392e3132335a6d6163746f724465766963654964503b241101e2bb42558caf4136c566a9626e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579508cb4f5d20d314b6fa9c27e18f5403d616f7369676e6174757265446f6d61696e7819434154424952442d434841542d424c4f422d44454c45544500",
+    "mutatedRequestDigestHex": "6d15ab980910f7995c6a365efd4a71a731bf5d73efd9f1ae9afcd5b5732e11f4",
+    "mutatedTranscriptHex": "434154424952442d434841542d424c4f422d44454c45544500a96524747970657827626c75652e636174626972642e636861742e6465667323626c6f6244656c6574696f6e426f6479656b65794964782b49663478333646556f6d4669615f685542475f534a78743737557471766b57715749642d39482d5849626b66626c6f62496450018f3f6a7b2c4d918a5e0f123456789b686163746f7244696478206469643a706c633a65777669376e787a796f756e367a687872687336346f697a687369676e656441747818323032362d30372d32325431343a30353a30392e3132335a6d6163746f724465766963654964503b241101e2bb42558caf4136c566a9626e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579508cb4f5d20d314b6fa9c27e18f5403d616f7369676e6174757265446f6d61696e7819434154424952442d434841542d424c4f422d44454c45544500",
+    "mutation": {
+      "field": "blobId",
+      "value": "018f3f6a-7b2c-4d91-8a5e-0f123456789b"
+    },
+    "publicKeyHex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+    "signatureHex": "ad48db3b77336d8c383e86436ff13d3576d5942c2b623edf1525289a562886da8ffb68453536bb58457ebaf7c8ea71f9bbfd4e8b0da7e11ec7b8209c256ce009",
+    "transcriptHex": "434154424952442d434841542d424c4f422d44454c45544500a96524747970657827626c75652e636174626972642e636861742e6465667323626c6f6244656c6574696f6e426f6479656b65794964782b49663478333646556f6d4669615f685542475f534a78743737557471766b57715749642d39482d5849626b66626c6f62496450018f3f6a7b2c4d918a5e0f123456789a686163746f7244696478206469643a706c633a65777669376e787a796f756e367a687872687336346f697a687369676e656441747818323032362d30372d32325431343a30353a30392e3132335a6d6163746f724465766963654964503b241101e2bb42558caf4136c566a9626e6175746847656e65726174696f6e016e6964656d706f74656e63794b6579508cb4f5d20d314b6fa9c27e18f5403d616f7369676e6174757265446f6d61696e7819434154424952442d434841542d424c4f422d44454c45544500",
+    "uuidByteFields": [
+      "actorDeviceId",
+      "blobId",
+      "idempotencyKey"
+    ]
+  },
+  "strictJson": {
+    "invalid": [
+      "{\"a\":1,\"a\":2}",
+      "{\"a\":null}"
+    ],
+    "valid": "{\"$type\":\"blue.catbird.chat.defs#applicationSendBody\",\"messageId\":\"018f3f6a-7b2c-4d91-8a5e-0f123456789a\"}"
+  }
+}

@@ -4,8 +4,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use catbird_mls::orchestrator::credentials::CredentialStore;
+use catbird_mls::orchestrator::credentials::{CleanChatSigningAuthority, CredentialStore};
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_traits::signatures::Signer;
 
 /// Per-user credential state.
 #[derive(Debug, Clone, Default)]
@@ -13,6 +15,15 @@ struct UserCredentials {
     mls_did: Option<String>,
     device_uuid: Option<String>,
     signing_key: Option<Vec<u8>>,
+    clean_chat_binding: Option<CleanChatBindingSnapshot>,
+    clean_chat_authority: Option<CleanChatSigningAuthority>,
+}
+
+#[derive(Debug, Clone)]
+struct CleanChatBindingSnapshot {
+    device_id: String,
+    dpop_jkt: String,
+    auth_generation: Option<i64>,
 }
 
 /// In-memory `CredentialStore` with per-user isolation via `Arc<Mutex<...>>`.
@@ -67,7 +78,6 @@ impl MockCredentials {
             .copied()
             .unwrap_or(0)
     }
-
     /// Make authorized-device resolution return an infrastructure error for
     /// `root_did` until the test explicitly clears it.
     #[allow(dead_code)]
@@ -78,6 +88,36 @@ impl MockCredentials {
         } else {
             failures.remove(root_did);
         }
+    }
+
+    /// Install an explicit authority snapshot for negative binding tests.
+    /// The signing key itself remains in the Rust-only mock state and never
+    /// participates in the callback-shaped authority record.
+    #[allow(dead_code)]
+    pub fn set_clean_chat_authority(&self, authority: CleanChatSigningAuthority) {
+        let mut map = self.state.lock().unwrap();
+        map.entry("__test_authority__".to_string())
+            .or_default()
+            .clean_chat_authority = Some(authority);
+    }
+
+    /// Install the trusted binding snapshot used by the Rust-only signer mock.
+    #[allow(dead_code)]
+    pub fn set_clean_chat_binding(
+        &self,
+        user_did: &str,
+        device_id: &str,
+        dpop_jkt: &str,
+        auth_generation: Option<i64>,
+    ) {
+        let mut map = self.state.lock().unwrap();
+        map.entry(user_did.to_string())
+            .or_default()
+            .clean_chat_binding = Some(CleanChatBindingSnapshot {
+            device_id: device_id.to_owned(),
+            dpop_jkt: dpop_jkt.to_owned(),
+            auth_generation,
+        });
     }
 }
 
@@ -106,6 +146,53 @@ impl CredentialStore for MockCredentials {
             creds.signing_key = None;
         }
         Ok(())
+    }
+
+    async fn sign_clean_chat_transcript(
+        &self,
+        user_did: &str,
+        transcript: &[u8],
+        _key_id: &str,
+    ) -> Result<Option<CleanChatSigningAuthority>> {
+        let (key_data, binding, explicit) = {
+            let map = self.state.lock().unwrap();
+            (
+                map.get(user_did).and_then(|c| c.signing_key.clone()),
+                map.get(user_did).and_then(|c| c.clean_chat_binding.clone()),
+                map.get("__test_authority__")
+                    .and_then(|c| c.clean_chat_authority.clone()),
+            )
+        };
+        if let Some(authority) = explicit {
+            return Ok(Some(authority));
+        }
+        let Some(key_data) = key_data else {
+            return Ok(None);
+        };
+        let Some(binding) = binding else {
+            return Err(
+                catbird_mls::orchestrator::error::OrchestratorError::Storage(
+                    "test signing binding is missing".into(),
+                ),
+            );
+        };
+        let signer: SignatureKeyPair = serde_json::from_slice(&key_data).map_err(|_| {
+            catbird_mls::orchestrator::error::OrchestratorError::Storage(
+                "test signer is invalid".into(),
+            )
+        })?;
+        let signature = signer.sign(transcript).map_err(|_| {
+            catbird_mls::orchestrator::error::OrchestratorError::Storage(
+                "test signer failed".into(),
+            )
+        })?;
+        Ok(Some(CleanChatSigningAuthority {
+            public_key: signer.public().to_vec(),
+            signature,
+            device_id: binding.device_id,
+            dpop_jkt: binding.dpop_jkt,
+            auth_generation: binding.auth_generation,
+        }))
     }
 
     async fn store_mls_did(&self, user_did: &str, mls_did: &str) -> Result<()> {

@@ -29,20 +29,21 @@ pub use api_client::MLSAPIClient;
 pub use canonical_transport::{
     canonical_route, decode_clean_chat_blob_response, map_wire_error, prepare_get_conversations,
     prepare_get_entries, prepare_replenishment, route_for_nsid, CanonicalOperation,
-    CleanChatAuthContext, CleanChatError, CleanChatRequest, CleanChatResponse, PreparedRequest,
-    ReplenishKeyPackagesInput, TransportError,
+    CleanChatAuthContext, CleanChatError, CleanChatRequest, CleanChatResponse,
+    CleanChatSigningContext, PreparedRequest, ReplenishKeyPackagesInput, TransportError,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use canonical_transport::{
     decode_clean_chat_blob, decode_clean_chat_error, decode_clean_chat_response,
     prepare_clean_chat_request, prepare_clean_chat_signed_request, CleanChatAuthContextFfi,
-    CleanChatOperationFfi, CleanChatPreparedRequestFfi, CleanChatTransportFfiError,
+    CleanChatOperationFfi, CleanChatPreparedRequestFfi, CleanChatSigningContextFfi,
+    CleanChatTransportFfiError,
 };
 pub use constants::*;
 pub use credential_binding::{
     extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,
 };
-pub use credentials::CredentialStore;
+pub use credentials::{CleanChatSigningAuthority, CredentialStore};
 pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
 pub use mls_provider::MlsCryptoContext;
