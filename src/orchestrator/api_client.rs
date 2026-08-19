@@ -151,7 +151,7 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// support filtering — implementations that don't should ignore the parameter.
     ///
     /// `from_epoch` / `to_epoch` are inclusive bounds matching the
-    /// `blue.catbird.mlsChat.getMessages` lexicon. When `message_type =
+    /// `blue.catbird.chat.getEntries` lexicon. When `message_type =
     /// Some("commit")` and the caller knows its local and the server epoch,
     /// supplying a narrow range avoids the server's default "oldest 50 commits"
     /// behavior which leaves lagging clients permanently stuck on busy groups.
@@ -262,7 +262,7 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
 
     /// Ask the server to request a replacement Welcome from the inviter/admin.
     ///
-    /// This is the typed hook for `blue.catbird.mlsChat.reissueWelcome`.
+    /// This is the typed hook for `blue.catbird.chat.requestLeave` / welcome reissue.
     /// Backends can wire it once Phase A/B generated types and endpoints are
     /// available; until then callers see an explicit missing-API result rather
     /// than silently falling back to External Commit.
@@ -373,13 +373,13 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     }
 
     /// Upload an encrypted metadata blob to the DS via
-    /// `blue.catbird.mlsChat.putGroupMetadataBlob`.
+    /// `blue.catbird.chat.prepareBlobUpload`.
     ///
     /// `kind` is `"metadata"` or `"avatar"`. `metadata_version` is the
     /// monotonic counter from the corresponding `MetadataReference`.
     /// `reset_generation` (if known) scopes the blob to the current
     /// MLS group generation so post-reset bootstrapping clients can
-    /// find the correct blob via `getGroupMetadataBlob?convoId&resetGeneration`.
+    /// find the correct blob via `getBlob?convoId&resetGeneration`.
     ///
     /// Default implementation fails so any backend that hasn't wired the
     /// encrypted metadata path surfaces the missing impl instead of
@@ -409,7 +409,7 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     }
 
     /// Download an encrypted metadata blob from the DS via
-    /// `blue.catbird.mlsChat.getGroupMetadataBlob`. Returns the raw ciphertext
+    /// `blue.catbird.chat.getBlob`. Returns the raw ciphertext
     /// (`nonce || ciphertext || tag`) for the given `blob_locator`, which the
     /// orchestrator decrypts with the epoch metadata key from
     /// [`MlsCryptoContext::get_current_metadata`].

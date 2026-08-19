@@ -292,11 +292,11 @@ fn packaged_chat_schema_has_pinned_provenance() {
     assert_eq!(provenance["generatorVersion"], 7);
     assert_eq!(
         provenance["sourceRevision"],
-        "954d7ab20f362b731ee13f87eea89ae83558c624"
+        "13c0f5b8a108955dd705b3d682b27303a0962c58"
     );
     assert_eq!(
         provenance["sourceTree"],
-        "6779729a15bec425fa520b9197bf60bebdb9e32b"
+        "53716dd351de207ea4554021931cd513d72b4731"
     );
 }
 
@@ -375,11 +375,11 @@ fn packaged_server_vectors_have_pinned_provenance() {
         assert_eq!(provenance["vectorCaseCount"], vector_case_count);
         assert_eq!(
             provenance["sourceRevision"],
-            "1336d821566aacb93c3a580091518a6eb68ed63c"
+            "38126b069d11992310043752bc84bf5f6817212b"
         );
         assert_eq!(
             provenance["sourceTree"],
-            "5796505b80b76490f5ada54febe2d8439e1b00eb"
+            "2515b2234a4f86cf08c929d540ada696bf747c04"
         );
         assert_eq!(provenance["vectorSet"], "signed-mutation");
         assert_eq!(provenance["vectorSetCount"], 25);
@@ -1084,8 +1084,8 @@ fn prepare_clean_chat_signed_request_delegates_to_prepare_clean_chat_request() {
     let prepared = result.unwrap();
     assert_eq!(prepared.method, "POST");
     assert_eq!(prepared.path, "/xrpc/blue.catbird.chat.enrollDevice");
-    assert_eq!(prepared.authorization, "Bearer gateway-token");
-    assert_eq!(prepared.dpop, "signed-dpop-proof");
+    assert_eq!(prepared.authorization.as_deref(), Some("Bearer gateway-token"));
+    assert_eq!(prepared.dpop.as_deref(), Some("signed-dpop-proof"));
     assert!(prepared.body.is_some());
 }
 

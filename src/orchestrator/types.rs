@@ -99,6 +99,7 @@ impl ResolvedConversationContext {
 
 /// A view of an MLS conversation, mirroring the server's ConvoView.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConversationView {
     pub group_id: GroupId,
     /// Stable conversation identifier (survives group resets).
@@ -117,12 +118,14 @@ pub struct ConversationView {
 
 /// A member within a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MemberView {
     pub did: DID,
     pub role: MemberRole,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub enum MemberRole {
     Admin,
     Member,
@@ -130,6 +133,7 @@ pub enum MemberRole {
 
 /// Conversation metadata (name, description, avatar).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConversationMetadata {
     pub name: Option<String>,
     pub description: Option<String>,

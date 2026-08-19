@@ -22,13 +22,13 @@ use e2e_harness::TestWorld;
 #[test]
 fn conversation_view_deserializes_without_sequencer_did() {
     let json = serde_json::json!({
-        "group_id": "abcd",
-        "conversation_id": "abcd",
+        "groupId": "abcd",
+        "conversationId": "abcd",
         "epoch": 3,
         "members": [],
         "metadata": null,
-        "created_at": null,
-        "updated_at": null
+        "createdAt": null,
+        "updatedAt": null
     });
     let view: ConversationView = serde_json::from_value(json).expect("deserializes without field");
     assert_eq!(view.sequencer_did, None);
@@ -49,7 +49,7 @@ fn conversation_view_round_trips_sequencer_did() {
 
     let value = serde_json::to_value(&view).expect("serializes");
     assert_eq!(
-        value.get("sequencer_did").and_then(|v| v.as_str()),
+        value.get("sequencerDid").and_then(|v| v.as_str()),
         Some("did:web:ds-b.example")
     );
 
@@ -72,7 +72,7 @@ fn conversation_view_omits_none_sequencer_did() {
         sequencer_did: None,
     };
     let value = serde_json::to_value(&view).expect("serializes");
-    assert!(value.get("sequencer_did").is_none());
+    assert!(value.get("sequencerDid").is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -190,15 +190,15 @@ async fn sync_parses_persists_and_repersist_sequencer_did_on_change() {
 // Typed wire contract (real catbird-atproto generated ConvoView)
 // ---------------------------------------------------------------------------
 
-/// The REAL generated jacquard struct (`blue.catbird.mlsChat#convoView` via
-/// `catbird_mls::atproto`) carries `sequencerDid` on the wire after the WS-4
+/// The conversation view struct (`ConversationView` via
+/// `catbird_mls::orchestrator::types`) carries `sequencerDid` on the wire after the WS-4
 /// rung-2 lexicon delta. This guards the seam against lexicon/codegen drift:
 /// the typed field must parse from server wire JSON and flow into the
 /// orchestrator's `ConversationView` the way platform mappers map it
 /// (fragment-free base DID string). Parse/persist/log only — no routing.
 #[test]
 fn typed_convo_view_sequencer_did_flows_through() {
-    use catbird_mls::atproto::blue_catbird::mlsChat::ConvoView as TypedConvoView;
+    use catbird_mls::orchestrator::types::ConversationView as TypedConvoView;
 
     let wire = r#"{
         "conversationId": "convo-1",
@@ -236,7 +236,7 @@ fn typed_convo_view_sequencer_did_flows_through() {
 /// still parse into the typed struct with `None`.
 #[test]
 fn typed_convo_view_parses_without_sequencer_did() {
-    use catbird_mls::atproto::blue_catbird::mlsChat::ConvoView as TypedConvoView;
+    use catbird_mls::orchestrator::types::ConversationView as TypedConvoView;
 
     let wire = r#"{
         "conversationId": "convo-1",

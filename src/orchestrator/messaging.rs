@@ -1793,7 +1793,7 @@ where
     ///
     /// `message_type` filters the fetch: `Some("commit")` for epoch catch-up,
     /// `None` (all) for normal message polling.
-    /// `from_epoch` / `to_epoch` are inclusive bounds (spec: `blue.catbird.mlsChat.getMessages`).
+    /// `from_epoch` / `to_epoch` are inclusive bounds (spec: `blue.catbird.chat.getEntries`).
     /// Pass `None` for both when a range isn't known; the server then falls back
     /// to its default window (0..=current_epoch).
     pub async fn fetch_messages(

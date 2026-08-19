@@ -16,7 +16,7 @@ use catbird_mls::atproto::blue_catbird::chat::{
     CanonicalDatetime, KeyPackageArtifact, KeyPackageReplenishmentBody,
     SignedKeyPackageReplenishment,
 };
-use catbird_mls::atproto::blue_catbird::mlsChat::ConvoView as TypedConvoView;
+use catbird_mls::orchestrator::types::ConversationView as TypedConvoView;
 use catbird_mls::atproto::jacquard_common::deps::bytes::Bytes;
 use catbird_mls::atproto::jacquard_common::types::string::Did;
 use catbird_mls::orchestrator::canonical_transport::{

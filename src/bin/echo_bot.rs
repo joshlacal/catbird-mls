@@ -740,7 +740,7 @@ impl MLSAPIClient for HttpDSClient {
         }
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.mlsChat.getConvos"))
+            .get(self.xrpc_url("blue.catbird.chat.getConversations"))
             .bearer_auth(&self.auth_token)
             .query(&params)
             .send()
@@ -801,7 +801,7 @@ impl MLSAPIClient for HttpDSClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.createConvo"))
+            .post(self.xrpc_url("blue.catbird.chat.createConversation"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -841,7 +841,7 @@ impl MLSAPIClient for HttpDSClient {
         let body = serde_json::json!({ "convoId": convo_id });
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.leaveConvo"))
+            .post(self.xrpc_url("blue.catbird.chat.requestLeave"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -873,7 +873,7 @@ impl MLSAPIClient for HttpDSClient {
         }
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.commitGroupChange"))
+            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -908,7 +908,7 @@ impl MLSAPIClient for HttpDSClient {
         });
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.commitGroupChange"))
+            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -935,7 +935,7 @@ impl MLSAPIClient for HttpDSClient {
         });
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.sendMessage"))
+            .post(self.xrpc_url("blue.catbird.chat.sendMessage"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -995,7 +995,7 @@ impl MLSAPIClient for HttpDSClient {
         }
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.mlsChat.getMessages"))
+            .get(self.xrpc_url("blue.catbird.chat.getEntries"))
             .bearer_auth(&self.auth_token)
             .query(&params)
             .send()
@@ -1043,7 +1043,7 @@ impl MLSAPIClient for HttpDSClient {
         }
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.publishKeyPackages"))
+            .post(self.xrpc_url("blue.catbird.chat.replenishKeyPackages"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -1061,7 +1061,7 @@ impl MLSAPIClient for HttpDSClient {
         let params: Vec<(&str, &str)> = dids.iter().map(|d| ("dids", d.as_str())).collect();
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.mlsChat.getKeyPackages"))
+            .get(self.xrpc_url("blue.catbird.chat.getKeyPackages"))
             .bearer_auth(&self.auth_token)
             .query(&params)
             .send()
@@ -1104,7 +1104,7 @@ impl MLSAPIClient for HttpDSClient {
     async fn get_key_package_stats(&self) -> OrcResult<KeyPackageStats> {
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.mlsChat.getKeyPackageStatus"))
+            .get(self.xrpc_url("blue.catbird.chat.getDevices"))
             .bearer_auth(&self.auth_token)
             .send()
             .await
@@ -1169,7 +1169,7 @@ impl MLSAPIClient for HttpDSClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.registerDevice"))
+            .post(self.xrpc_url("blue.catbird.chat.enrollDevice"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -1210,7 +1210,7 @@ impl MLSAPIClient for HttpDSClient {
         });
         let _resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.updateGroupInfo"))
+            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()
@@ -1222,7 +1222,7 @@ impl MLSAPIClient for HttpDSClient {
     async fn get_group_info(&self, convo_id: &str) -> OrcResult<Vec<u8>> {
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.mlsChat.getGroupInfo"))
+            .get(self.xrpc_url("blue.catbird.chat.getConversationState"))
             .bearer_auth(&self.auth_token)
             .query(&[("convoId", convo_id)])
             .send()
@@ -1251,7 +1251,7 @@ impl MLSAPIClient for HttpDSClient {
     async fn get_welcome(&self, convo_id: &str) -> OrcResult<Vec<u8>> {
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.mlsChat.getMessages"))
+            .get(self.xrpc_url("blue.catbird.chat.getEntries"))
             .bearer_auth(&self.auth_token)
             .query(&[("convoId", convo_id), ("limit", "100")])
             .send()
@@ -1290,7 +1290,7 @@ impl MLSAPIClient for HttpDSClient {
         }
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.commitGroupChange"))
+            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
             .bearer_auth(&self.auth_token)
             .json(&body)
             .send()

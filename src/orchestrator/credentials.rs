@@ -117,7 +117,7 @@ pub trait CredentialStore: CredentialStoreBounds {
     ///   KeyPackage; the orchestrator rejects before state changes.
     /// - `Ok(Some(keys))` — resolution succeeded; `keys` are the raw signing
     ///   public keys authorized for `root_did` (per ADR-009 D1: active
-    ///   `blue.catbird.mlsChat.device` records in the DID's ATProto repo,
+    ///   `blue.catbird.chat.device` records in the DID's ATProto repo,
     ///   or equivalently the DID document's `#atproto_mls` verification
     ///   method key). An EMPTY vec means "resolved, zero authorized keys" —
     ///   every presented key then fails the enforced check.

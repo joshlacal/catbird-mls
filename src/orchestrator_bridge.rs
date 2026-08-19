@@ -320,7 +320,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
     /// Fetch encrypted envelopes for a conversation.
     ///
     /// `message_type` / `from_epoch` / `to_epoch` mirror the
-    /// `blue.catbird.mlsChat.getMessages` lexicon params. Pass-through to the
+    /// `blue.catbird.chat.getEntries` lexicon params. Pass-through to the
     /// server URL — platform implementations should forward them untouched.
     /// `from_epoch` and `to_epoch` are inclusive epoch bounds; supplying them
     /// (especially with `message_type = Some("commit")`) keeps epoch catch-up
@@ -344,7 +344,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
     ) -> Result<(), OrchestratorBridgeError>;
 
     /// Publish multiple key packages in ONE request. The platform impl POSTs
-    /// the whole array to `blue.catbird.mlsChat.publishKeyPackages` (server cap
+    /// the whole array to `blue.catbird.chat.replenishKeyPackages` (server cap
     /// 100), collapsing a full replenishment refill into a single round-trip.
     fn publish_key_packages(
         &self,
@@ -389,7 +389,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
 
     /// Fetch a pending Welcome message for a conversation.
     ///
-    /// Platform impls should call the `blue.catbird.mlsChat.getGroupState`
+    /// Platform impls should call the `blue.catbird.chat.getConversationState`
     /// lexicon with `include: "welcome"` and return the raw Welcome bytes.
     ///
     /// If no Welcome is available for this device (consumed, expired, or
@@ -401,7 +401,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
 
     /// Ask the server to reissue a Welcome for this device.
     ///
-    /// Platform impls should POST to `blue.catbird.mlsChat.reissueWelcome`
+    /// Platform impls should POST to welcome reissue endpoint
     /// with the conversation id, the recipient device DID, and the reason
     /// string (e.g. `"no_matching_key_package"`). The active inviter/admin
     /// fulfills the request by resealing a Welcome to one of this device's
@@ -420,7 +420,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
 
     /// Submit an External Commit to join/rejoin a conversation.
     ///
-    /// Platform impls should POST to `blue.catbird.mlsChat.commitGroupChange`
+    /// Platform impls should POST to `blue.catbird.chat.submitTransition`
     /// with `action = "externalCommit"`, the commit bytes, optional
     /// post-commit GroupInfo, and the base64-encoded MLS confirmation tag
     /// from the new local group state. Return the server's new epoch and
@@ -443,7 +443,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
     /// Called by the orchestrator's `RecoveryTracker` when a conversation has
     /// hit `MAX_REJOIN_ATTEMPTS` external-commit failures (S1.1 of the §8
     /// recovery pyramid). The platform impl should POST to
-    /// `blue.catbird.mlsChat.reportRecoveryFailure` so the server can
+    /// `blue.catbird.chat.requestLeafRecovery` so the server can
     /// accumulate quorum reports and trigger an automatic group reset (S2)
     /// per ADR-002 §6.
     ///
@@ -472,7 +472,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
     ) -> Result<(), OrchestratorBridgeError>;
 
     /// Upload an encrypted group metadata blob via
-    /// `blue.catbird.mlsChat.putGroupMetadataBlob`. `kind` is `"metadata"` or
+    /// `blue.catbird.chat.prepareBlobUpload`. `kind` is `"metadata"` or
     /// `"avatar"`; `metadata_version` is the monotonic counter from the
     /// corresponding `MetadataReference`. Platform impls forward the args
     /// untouched into the XRPC body.
@@ -488,7 +488,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
     ) -> Result<(), OrchestratorBridgeError>;
 
     /// Download an encrypted group metadata blob via
-    /// `blue.catbird.mlsChat.getGroupMetadataBlob`. Returns the raw ciphertext
+    /// `blue.catbird.chat.getBlob`. Returns the raw ciphertext
     /// (`nonce || ciphertext || tag`) for `blob_locator`. On `BlobNotFound`
     /// (GC'd / never uploaded) return `ServerError { status: 404 }` so the
     /// orchestrator can skip metadata hydration without treating it as fatal.
@@ -500,7 +500,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
     ) -> Result<Vec<u8>, OrchestratorBridgeError>;
 
     /// Submit a non-membership commit (e.g. a metadata update) via
-    /// `blue.catbird.mlsChat.commitGroupChange`. Platform impls POST
+    /// `blue.catbird.chat.submitTransition`. Platform impls POST
     /// `{ convoId, action, commit }`; on success the server CAS-advances the
     /// authoritative `current_epoch`. `action` is e.g. `"updateMetadata"`.
     /// `confirmation_tag` is the optional base64 MLS confirmation tag.

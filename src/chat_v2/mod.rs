@@ -1,8 +1,8 @@
 //! Clean chat protocol (`blue.catbird.chat.*`, protocol version `"1"`).
 //!
 //! This tree is deliberately isolated from [`crate::orchestrator`], which
-//! implements the superseded `blue.catbird.mlsChat*` protocol. The two never
-//! interoperate: CHAT_PROTOCOL.md §1 states that the superseded namespace,
+//! previously implemented the legacy `blue.catbird.mlsChat*` protocol (now retired).
+//! The two never interoperate: CHAT_PROTOCOL.md §1 states that the legacy namespace,
 //! storage, cursors, routes, device bindings, and cryptographic state are never
 //! read or translated.
 //!
