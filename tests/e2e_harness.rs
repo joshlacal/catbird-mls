@@ -186,28 +186,44 @@ impl TestWorld {
     ) -> catbird_mls::orchestrator::error::Result<String> {
         let client = self.client(name);
         client.orchestrator.initialize(&client.did).await?;
-        let did = client.orchestrator.ensure_device_registered().await?;
-
-        // Establish test authority directly from the registering client's
-        // local persistent signer. This deliberately does not inspect any key
-        // package returned by the delivery service: a DS response under
-        // validation can never teach the resolver what is authoritative.
+        let scoped_did = client.orchestrator.ensure_device_registered().await?;
         let signing_key = client
             .orchestrator
             .mls_context()
-            .create_key_package(did.as_bytes().to_vec())?
+            .create_key_package(scoped_did.as_bytes().to_vec())?
             .signature_public_key;
+        let mut pkgs = Vec::new();
+        for _ in 0..10 {
+            let kp = client
+                .orchestrator
+                .mls_context()
+                .create_key_package(scoped_did.as_bytes().to_vec())?;
+            pkgs.push(kp.key_package_data);
+        }
+        client
+            .orchestrator
+            .api_client()
+            .publish_key_packages(&pkgs, "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519", "", Some(&scoped_did))
+            .await?;
+
         self.authorized_device_keys
             .lock()
             .unwrap()
-            .insert(did.clone(), vec![signing_key.clone()]);
+            .insert(scoped_did.clone(), vec![signing_key.clone()]);
+        self.authorized_device_keys
+            .lock()
+            .unwrap()
+            .insert(client.did.clone(), vec![signing_key.clone()]);
         for fixture_client in self.clients.values() {
             fixture_client
                 .credentials
-                .set_authorized_device_keys(&did, vec![signing_key.clone()]);
+                .set_authorized_device_keys(&scoped_did, vec![signing_key.clone()]);
+            fixture_client
+                .credentials
+                .set_authorized_device_keys(&client.did, vec![signing_key.clone()]);
         }
 
-        Ok(did)
+        Ok(client.did.clone())
     }
 
     /// Seed an independent test credential store from authority established by

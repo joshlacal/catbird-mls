@@ -294,7 +294,7 @@ where
     /// 2. Sends ciphertext to the delivery service
     /// 3. Stores the plaintext locally
     pub async fn send_message(&self, conversation_id: &str, text: &str) -> Result<Message> {
-        self.send_payload_message(conversation_id, MLSMessagePayload::text(text))
+        Box::pin(self.send_payload_message(conversation_id, MLSMessagePayload::text(text)))
             .await
     }
 
@@ -362,7 +362,7 @@ where
             return Ok(projected);
         }
 
-        let resolved = match self.resolve_conversation_context(conversation_id).await {
+        let resolved = match self.resolve_legacy_group_identifier(conversation_id).await {
             Ok(resolved) => resolved,
             Err(_) => return Ok(ConversationRecoveryState::GroupMissing),
         };
@@ -594,7 +594,7 @@ where
         }
 
         let resolved = self
-            .resolve_conversation_context(conversation_id)
+            .resolve_legacy_group_identifier(conversation_id)
             .await
             .map_err(|error| match error {
                 OrchestratorError::ConversationNotFound(_) => OrchestratorError::NotJoined {
@@ -617,13 +617,8 @@ where
             payload_len = payload_bytes.len(),
             "Encoded MLSMessagePayload for send"
         );
-
-        // Pre-send sync: catch up on any missed epoch-advancing commits (spec §5.1 step 1).
-        // Fetch pending *commits* (not app messages) to advance the local epoch before
-        // encrypting, avoiding 409 epoch mismatches on send.
         self.catch_up_pending_commits_for_send(conversation_id, "pre_send")
             .await?;
-
         // Serialize only the final authorization + encryption + delivery attempt
         // against reset transitions. Network catch-up above intentionally runs
         // outside this per-conversation lock.
@@ -685,11 +680,9 @@ where
         // refer to the same identifier.
         let message_id = uuid::Uuid::new_v4().to_string();
 
-        // Send to delivery service (with failover tracking)
         let send_result = self
-            .api_client()
-            .send_message_with_id(
-                conversation_id,
+            .send_message_prepared(
+                &resolved.conversation_id,
                 &encrypt_result.ciphertext,
                 epoch,
                 &message_id,
@@ -715,27 +708,7 @@ where
                         conversation_id,
                         "Sequencer failover threshold reached, requesting failover"
                     );
-                    match self.api_client().request_failover(conversation_id).await {
-                        Ok(resp) => {
-                            tracing::info!(
-                                conversation_id,
-                                new_sequencer = %resp.new_sequencer_did,
-                                "Failover succeeded, rejoining"
-                            );
-                            self.failover_tracker().lock().await.clear(conversation_id);
-                            tracing::info!(
-                                conversation_id,
-                                "Failover complete — will sync on next cycle"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                conversation_id,
-                                error = %e,
-                                "Failover request failed"
-                            );
-                        }
-                    }
+                    tracing::warn!(conversation_id, "Failover requested (no-op in v2)");
                 }
                 return Err(send_result.unwrap_err());
             }
@@ -814,8 +787,7 @@ where
                     .insert(retry_commit_hash, web_time::Instant::now());
 
                 let retry_send_result = self
-                    .api_client()
-                    .send_message_with_id(
+                    .send_message_prepared(
                         conversation_id,
                         &retry_encrypt.ciphertext,
                         retry_epoch,
@@ -928,7 +900,7 @@ where
         // self-commit replay state. Input for an unknown conversation must fail
         // closed without consuming state belonging to an authoritative context.
         let resolved = match self
-            .resolve_conversation_context(&envelope.conversation_id)
+            .resolve_legacy_group_identifier(&envelope.conversation_id)
             .await
         {
             Ok(resolved) => resolved,
@@ -962,7 +934,7 @@ where
         // after owning the inbound lock; decrypting against the stale group
         // would consume state outside the authoritative context.
         let resolved = match self
-            .resolve_conversation_context(&envelope.conversation_id)
+            .resolve_legacy_group_identifier(&envelope.conversation_id)
             .await
         {
             Ok(resolved) => resolved,
@@ -1903,6 +1875,146 @@ where
         }
 
         changed
+    }
+
+    pub(crate) async fn send_message_prepared(
+        &self,
+        conversation_id: &str,
+        ciphertext: &[u8],
+        epoch: u64,
+        message_id: &str,
+    ) -> Result<SendMessageResponse> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let key_id = {
+            let identity_bytes = format!("{user_did}#{actor_device_id}").into_bytes();
+            let pk = self.mls_context().identity_public_key(identity_bytes)?;
+            super::canonical_transport::derive_key_id(&pk)
+        };
+        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let group_id_bytes = resolved.group_id_bytes()?;
+        let confirmation_tag = {
+            let raw = self
+                .mls_context()
+                .get_confirmation_tag(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut tag = vec![0u8; 32];
+                tag[..raw.len()].copy_from_slice(&raw);
+                tag
+            }
+        };
+        let group_context_hash = {
+            let raw = self
+                .mls_context()
+                .get_group_context_hash(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut hash = vec![0u8; 32];
+                hash[..raw.len()].copy_from_slice(&raw);
+                hash
+            }
+        };
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#applicationSendBody",
+            "aad": {
+                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(conversation_id).unwrap_or_default().as_bytes()),
+                "generation": 0,
+                "messageId": STANDARD.encode(uuid::Uuid::parse_str(message_id).unwrap_or_default().as_bytes()),
+                "prior": {
+                    "confirmationTag": STANDARD.encode(&confirmation_tag),
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(conversation_id).unwrap_or_default().as_bytes()),
+                    "epoch": epoch,
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&group_context_hash),
+                    "groupId": STANDARD.encode(&group_id_bytes),
+                    "lifecycle": "active",
+                    "stateVersion": 0
+                },
+                "protocolVersion": "1"
+            },
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "applicationMessage": {
+                "bytes": STANDARD.encode(ciphertext),
+                "contentType": "privateMessageApplication",
+                "framing": "mlsMessage",
+                "sha256": STANDARD.encode(Sha256::digest(ciphertext))
+            },
+            "authGeneration": auth_generation,
+            "blobBindings": [],
+            "keyId": key_id,
+            "messageId": message_id,
+            "prior": {
+                "confirmationTag": STANDARD.encode(&confirmation_tag),
+                "conversationId": conversation_id,
+                "epoch": epoch,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&group_context_hash),
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::SendMessage,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+
+        if response.status != 200 {
+            if response.status == 409 {
+                return Err(OrchestratorError::ServerError {
+                    status: 409,
+                    body: String::from_utf8_lossy(&response.body).to_string(),
+                });
+            }
+            return Err(OrchestratorError::Api(format!(
+                "send_message failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            )));
+        }
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(|e| {
+                OrchestratorError::Serialization(format!("send_message response: {e}"))
+            })?;
+        let entry = resp_json.get("entry").unwrap_or(&resp_json);
+        let resp_msg_id = entry
+            .get("entryId")
+            .or_else(|| entry.get("messageId"))
+            .and_then(|m| m.as_str())
+            .unwrap_or(message_id)
+            .to_string();
+        let seq = entry.get("seq").and_then(|s| s.as_u64()).unwrap_or(1);
+        let resp_epoch = entry.get("epoch").and_then(|e| e.as_u64()).unwrap_or(epoch);
+
+        Ok(SendMessageResponse {
+            message_id: resp_msg_id,
+            seq,
+            epoch: resp_epoch,
+        })
     }
 }
 

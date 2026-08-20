@@ -75,6 +75,11 @@ pub trait CredentialStore: CredentialStoreBounds {
 
     /// Retrieve the device UUID.
     async fn get_device_uuid(&self, user_did: &str) -> Result<Option<String>>;
+    /// Retrieve the active authGeneration for a user device, default 1.
+    async fn get_auth_generation(&self, _user_did: &str) -> Result<Option<i64>> {
+        Ok(Some(1))
+    }
+
 
     /// Check if credentials exist for a user (device is registered).
     async fn has_credentials(&self, user_did: &str) -> Result<bool>;

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+use super::canonical_transport::{GatewayResponse, PreparedRequest};
 use super::error::Result;
 use super::types::*;
 
@@ -15,10 +16,10 @@ pub trait MLSAPIClientBounds {}
 #[cfg(target_arch = "wasm32")]
 impl<T: ?Sized> MLSAPIClientBounds for T {}
 
-/// Platform-agnostic API client for communicating with the MLS delivery service.
+/// Generic API gateway client for communicating with the MLS delivery service.
 ///
-/// Implementations handle authentication, network transport, and serialization.
-/// On iOS this wraps the ATProtoClient/MLSAPIClient; on desktop it can use reqwest directly.
+/// Implementations handle network transport for prepared XRPC requests and
+/// canonical read endpoints.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait MLSAPIClient: MLSAPIClientBounds {
@@ -30,7 +31,12 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// Get the currently authenticated DID, if any.
     async fn current_did(&self) -> Option<String>;
 
-    // -- Conversations --
+    // -- Prepared Request Submission --
+
+    /// Submit a prepared, device-signed XRPC request to the delivery service.
+    async fn submit_prepared_request(&self, request: PreparedRequest) -> Result<GatewayResponse>;
+
+    // -- Canonical Reads --
 
     /// Fetch conversations from the server with pagination.
     async fn get_conversations(
@@ -39,123 +45,7 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         cursor: Option<&str>,
     ) -> Result<ConversationListPage>;
 
-    /// Create a new conversation on the server.
-    async fn create_conversation(
-        &self,
-        group_id: &str,
-        initial_members: Option<&[String]>,
-        metadata: Option<&ConversationMetadata>,
-        commit_data: Option<&[u8]>,
-        welcome_data: Option<&[u8]>,
-    ) -> Result<CreateConversationResult>;
-
-    /// Bootstrap a post-auto-reset conversation by populating the existing
-    /// row's emptied MLS state in place. Use this from
-    /// `try_first_responder_bootstrap` rather than `create_conversation` —
-    /// the latter would orphan the post-reset row (id=originalConvoId,
-    /// group_id=newGroupId) by inserting a new conversations row keyed on
-    /// the new groupId. Per spec §8.5 / mls-ds task #17.
-    ///
-    /// Default implementation fails loudly so any backend that hasn't wired
-    /// this up surfaces the missing impl instead of silently falling back to
-    /// the orphaning `create_conversation` path.
-    async fn bootstrap_reset_group(
-        &self,
-        original_convo_id: &str,
-        new_group_id: &str,
-        cipher_suite: &str,
-        group_info: &[u8],
-        members: &[String],
-        welcome_message: Option<&[u8]>,
-    ) -> Result<CreateConversationResult> {
-        let _ = (
-            original_convo_id,
-            new_group_id,
-            cipher_suite,
-            group_info,
-            members,
-            welcome_message,
-        );
-        Err(crate::orchestrator::error::OrchestratorError::Api(
-            "bootstrap_reset_group not implemented".into(),
-        ))
-    }
-
-    /// Leave a conversation on the server.
-    async fn leave_conversation(&self, convo_id: &str) -> Result<()>;
-
-    /// Add members to a conversation on the server.
-    async fn add_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-    ) -> Result<AddMembersServerResult>;
-
-    /// Add members carrying an idempotency key. The delivery service uses the
-    /// key to mark a pending Welcome-reissue request answered
-    /// (`mark_reissue_request_answered_tx`). Backends that don't support an
-    /// idempotency key fall back to `add_members` (the key is then ignored —
-    /// acceptable for non-reissue add paths).
-    async fn add_members_with_idempotency(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-        idempotency_key: &str,
-    ) -> Result<AddMembersServerResult> {
-        let _ = idempotency_key;
-        self.add_members(convo_id, member_dids, commit_data, welcome_data)
-            .await
-    }
-
-    /// Remove members from a conversation on the server.
-    async fn remove_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-    ) -> Result<()>;
-
-    // -- Messages --
-
-    /// Send an encrypted MLS message to the delivery service.
-    async fn send_message(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-    ) -> Result<SendMessageResponse>;
-
-    /// Send an encrypted MLS message with an explicit client-generated message ID.
-    ///
-    /// Backends that do not support explicit message IDs can ignore `msg_id` and
-    /// fall back to `send_message`.
-    async fn send_message_with_id(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-        msg_id: &str,
-    ) -> Result<SendMessageResponse> {
-        let _ = msg_id;
-        self.send_message(convo_id, ciphertext, epoch).await
-    }
-
     /// Fetch new messages for a conversation since a cursor.
-    ///
-    /// `message_type` filters the server response: `"all"`, `"app"`, or `"commit"`.
-    /// Pass `None` (or `Some("all")`) to fetch everything. Not all backends
-    /// support filtering — implementations that don't should ignore the parameter.
-    ///
-    /// `from_epoch` / `to_epoch` are inclusive bounds matching the
-    /// `blue.catbird.chat.getEntries` lexicon. When `message_type =
-    /// Some("commit")` and the caller knows its local and the server epoch,
-    /// supplying a narrow range avoids the server's default "oldest 50 commits"
-    /// behavior which leaves lagging clients permanently stuck on busy groups.
-    /// Backends that don't honor the bounds should ignore them.
     async fn get_messages(
         &self,
         convo_id: &str,
@@ -165,50 +55,6 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)>;
-
-    // -- Key Packages --
-
-    /// Publish a key package to the server.
-    ///
-    /// `device_id` scopes the package to the publishing device so the server
-    /// can bind it to that device's signature key. Rust owns this identity (it
-    /// is generated and stored during `ensure_device_registered`); callers
-    /// pass the current device UUID. `None` falls back to legacy single-device
-    /// resolution, which the delivery service rejects for an unscoped fresh
-    /// device.
-    async fn publish_key_package(
-        &self,
-        key_package: &[u8],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> Result<()>;
-
-    /// Publish MULTIPLE key packages to the server in a SINGLE request.
-    ///
-    /// Replenishment tops the server pool back up to the target by generating
-    /// dozens of fresh key packages; publishing them one HTTP call at a time is
-    /// N sequential round-trips. The delivery service accepts an array
-    /// (`MAX_BATCH_SIZE = 100`), so a batched publish collapses the whole refill
-    /// into one POST. All packages in a batch share the same cipher suite,
-    /// expiry, and device scope (the replenishment invariant).
-    ///
-    /// The default implementation loops `publish_key_package`, preserving
-    /// behavior for backends (catmos, CLI, WASM) that don't override it; the
-    /// iOS FFI adapter overrides it with a true single-request batch upload.
-    async fn publish_key_packages(
-        &self,
-        key_packages: &[Vec<u8>],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> Result<()> {
-        for key_package in key_packages {
-            self.publish_key_package(key_package, cipher_suite, expires_at, device_id)
-                .await?;
-        }
-        Ok(())
-    }
 
     /// Get key packages for a set of DIDs.
     async fn get_key_packages(
@@ -227,37 +73,19 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         device_id: &str,
     ) -> Result<KeyPackageSyncResult>;
 
-    // -- Devices --
-
-    /// Register a device with the MLS service.
-    async fn register_device(
-        &self,
-        device_uuid: &str,
-        device_name: &str,
-        mls_did: &str,
-        signature_key: &[u8],
-        key_packages: &[Vec<u8>],
-        prepared_request_body: &[u8],
-    ) -> Result<DeviceInfo>;
-
     /// List registered devices through the device-scoped v2 query.
     async fn list_devices(&self, actor_device_id: &str) -> Result<Vec<DeviceInfo>>;
-
-    /// Remove a device by ID.
-    async fn remove_device(&self, device_id: &str) -> Result<()>;
-
-    // -- Group Info --
-
-    /// Publish GroupInfo for external joins.
-    async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()>;
 
     /// Fetch GroupInfo for an external join.
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>>;
 
-    // -- Welcome / External Commit --
+    /// Publish group info (used by tests or platform wrappers).
+    async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
+        let _ = (convo_id, group_info);
+        Ok(())
+    }
 
     /// Fetch a Welcome message for joining a conversation.
-    /// Returns the raw Welcome bytes, or an error (404 = no Welcome available).
     async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
         let _ = convo_id;
         Err(crate::orchestrator::error::OrchestratorError::Api(
@@ -265,77 +93,13 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         ))
     }
 
-    /// Ask the server to request a replacement Welcome from the inviter/admin.
-    ///
-    /// This is the typed hook for `blue.catbird.chat.requestLeave` / welcome reissue.
-    /// Backends can wire it once Phase A/B generated types and endpoints are
-    /// available; until then callers see an explicit missing-API result rather
-    /// than silently falling back to External Commit.
-    async fn request_welcome_reissue(
-        &self,
-        convo_id: &str,
-        recipient_device_did: &str,
-        reason: &str,
-    ) -> Result<super::welcome_recovery::WelcomeReissueRequestResult> {
-        let _ = (convo_id, recipient_device_did, reason);
-        Err(crate::orchestrator::error::OrchestratorError::Api(
-            "request_welcome_reissue not implemented".into(),
-        ))
-    }
-
-    /// Request sequencer failover for a conversation.
-    ///
-    /// Called when the current sequencer is unreachable after consecutive failures.
-    /// Not all backends support this; the default returns an error.
-    async fn request_failover(&self, convo_id: &str) -> Result<RequestFailoverResponse> {
-        let _ = convo_id;
-        Err(crate::orchestrator::error::OrchestratorError::Api(
-            "request_failover not implemented".into(),
-        ))
-    }
-
-    /// Report that recovery has been exhausted for a conversation.
-    ///
-    /// Called when the RecoveryTracker has maxed out External Commit attempts.
-    /// The server tracks failure reports and auto-resets when a quorum of
-    /// members report failure.
-    ///
-    /// Per ADR-002 / spec §8.6 the server binds a quorum report to the local
-    /// `epoch_authenticator` (RFC 9420 §8.7) so that a stale client can't
-    /// forge a quorum vote for an epoch it never observed. `epoch_authenticator`
-    /// is the hex-encoded authenticator for the local epoch when the report
-    /// was raised.
-    ///
-    /// `None` preserves pre-A7 behavior so platforms can soft-ship before
-    /// servers enforce the binding. Once A7 lands on the server, clients MUST
-    /// pass `Some(hex)`.
-    ///
-    /// `failure_mode` (ADR-008 D1, spec §8.6.1): one of `"local_state_loss"`
-    /// or `"group_state_unrecoverable"`. Distinguishes "this client lost
-    /// local state" (Mode A — should self-heal via §6.6 / §8.4 External
-    /// Commit + self-Remove, NOT count toward quorum auto-reset) from "the
-    /// group itself is unrecoverable for the network" (Mode B — only this
-    /// counts toward quorum). `None` preserves pre-D1 behavior; servers
-    /// without D1 enforcement count any valid vote regardless. Once D1 is
-    /// enforced, omitted `failure_mode` is treated as `local_state_loss`
-    /// (conservative).
-    async fn report_recovery_failure(
-        &self,
-        convo_id: &str,
-        failure_type: &str,
-        epoch_authenticator: Option<&str>,
-        failure_mode: Option<&str>,
-    ) -> Result<()> {
-        let _ = (convo_id, failure_type, epoch_authenticator, failure_mode);
-        Err(crate::orchestrator::error::OrchestratorError::Api(
-            "report_recovery_failure not implemented".into(),
-        ))
+    /// Publish a Welcome message for new members (used by tests / local delivery).
+    async fn publish_welcome(&self, convo_id: &str, welcome_data: &[u8]) -> Result<()> {
+        let _ = (convo_id, welcome_data);
+        Ok(())
     }
 
     /// Fetch delivery status for messages in a conversation.
-    ///
-    /// Returns `(message_id, DeliveryStatus)` pairs. Default stub returns empty
-    /// for backends that don't support federated delivery tracking.
     async fn get_delivery_status(
         &self,
         convo_id: &str,
@@ -345,83 +109,7 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         Ok(vec![])
     }
 
-    /// Send a commit (e.g. metadata update) to the server.
-    ///
-    /// The `action` parameter describes the commit type (e.g. "updateMetadata").
-    /// `confirmation_tag` is the base64-encoded MLS confirmation tag from the local group state.
-    /// Default implementation is a no-op for backends that don't support it yet.
-    async fn commit_group_change(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        action: &str,
-        confirmation_tag: Option<&str>,
-    ) -> Result<()> {
-        let _ = (convo_id, commit_data, action, confirmation_tag);
-        Ok(())
-    }
-
-    /// Send an External Commit to the processExternalCommit endpoint.
-    /// This is the correct endpoint for External Commits (NOT sendMessage).
-    /// `confirmation_tag` is the base64-encoded MLS confirmation tag from the new local group state.
-    async fn process_external_commit(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        group_info: Option<&[u8]>,
-        confirmation_tag: Option<&str>,
-    ) -> Result<ProcessExternalCommitResult> {
-        let _ = (convo_id, commit_data, group_info, confirmation_tag);
-        Err(crate::orchestrator::error::OrchestratorError::Api(
-            "process_external_commit not implemented".into(),
-        ))
-    }
-
-    /// Upload an encrypted metadata blob to the DS via
-    /// `blue.catbird.chat.prepareBlobUpload`.
-    ///
-    /// `kind` is `"metadata"` or `"avatar"`. `metadata_version` is the
-    /// monotonic counter from the corresponding `MetadataReference`.
-    /// `reset_generation` (if known) scopes the blob to the current
-    /// MLS group generation so post-reset bootstrapping clients can
-    /// find the correct blob via `getBlob?convoId&resetGeneration`.
-    ///
-    /// Default implementation fails so any backend that hasn't wired the
-    /// encrypted metadata path surfaces the missing impl instead of
-    /// silently dropping the blob.
-    async fn put_group_metadata_blob(
-        &self,
-        convo_id: &str,
-        group_id_hex: &str,
-        blob_locator: &str,
-        ciphertext: &[u8],
-        kind: &str,
-        metadata_version: u64,
-        reset_generation: Option<i32>,
-    ) -> Result<()> {
-        let _ = (
-            convo_id,
-            group_id_hex,
-            blob_locator,
-            ciphertext,
-            kind,
-            metadata_version,
-            reset_generation,
-        );
-        Err(crate::orchestrator::error::OrchestratorError::Api(
-            "put_group_metadata_blob not implemented".into(),
-        ))
-    }
-
-    /// Download an encrypted metadata blob from the DS via
-    /// `blue.catbird.chat.getBlob`. Returns the raw ciphertext
-    /// (`nonce || ciphertext || tag`) for the given `blob_locator`, which the
-    /// orchestrator decrypts with the epoch metadata key from
-    /// [`MlsCryptoContext::get_current_metadata`].
-    ///
-    /// Default fails so backends that haven't wired the encrypted metadata path
-    /// surface the missing impl (the orchestrator catches it and leaves the
-    /// group name un-hydrated rather than breaking the join).
+    /// Download an encrypted metadata blob from the DS via `blue.catbird.chat.getBlob`.
     async fn get_group_metadata_blob(
         &self,
         convo_id: &str,

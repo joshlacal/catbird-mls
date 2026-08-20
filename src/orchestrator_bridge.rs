@@ -252,11 +252,32 @@ pub trait OrchestratorStorageCallback: Send + Sync {
     ) -> Result<Vec<FFIPendingLocalDelete>, OrchestratorBridgeError>;
 }
 
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FFIGatewayResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FFIDeliveryStatusPair {
+    pub message_id: String,
+    pub status: FFIDeliveryStatus,
+}
+
 /// API client callback interface for Swift/Kotlin.
 #[uniffi::export(callback_interface)]
 pub trait OrchestratorAPICallback: Send + Sync {
     fn is_authenticated_as(&self, did: String) -> bool;
     fn current_did(&self) -> Option<String>;
+
+    fn submit_prepared_request(
+        &self,
+        method: String,
+        nsid: String,
+        body: Option<Vec<u8>>,
+        query: Option<Vec<u8>>,
+    ) -> Result<FFIGatewayResponse, OrchestratorBridgeError>;
 
     fn get_conversations(
         &self,
@@ -264,67 +285,6 @@ pub trait OrchestratorAPICallback: Send + Sync {
         cursor: Option<String>,
     ) -> Result<FFIConversationListPage, OrchestratorBridgeError>;
 
-    fn create_conversation(
-        &self,
-        group_id: String,
-        initial_members: Option<Vec<String>>,
-        metadata_name: Option<String>,
-        metadata_description: Option<String>,
-        commit_data: Option<Vec<u8>>,
-        welcome_data: Option<Vec<u8>>,
-    ) -> Result<FFICreateConversationResult, OrchestratorBridgeError>;
-
-    fn leave_conversation(&self, convo_id: String) -> Result<(), OrchestratorBridgeError>;
-
-    fn add_members(
-        &self,
-        convo_id: String,
-        member_dids: Vec<String>,
-        commit_data: Vec<u8>,
-        welcome_data: Option<Vec<u8>>,
-    ) -> Result<FFIAddMembersResult, OrchestratorBridgeError>;
-
-    /// Add members carrying an idempotency key. The delivery service uses the
-    /// key to mark a pending Welcome-reissue request answered. Platform
-    /// implementations forward `idempotency_key` into the XRPC body.
-    fn add_members_with_idempotency(
-        &self,
-        convo_id: String,
-        member_dids: Vec<String>,
-        commit_data: Vec<u8>,
-        welcome_data: Option<Vec<u8>>,
-        idempotency_key: String,
-    ) -> Result<FFIAddMembersResult, OrchestratorBridgeError>;
-
-    fn remove_members(
-        &self,
-        convo_id: String,
-        member_dids: Vec<String>,
-        commit_data: Vec<u8>,
-    ) -> Result<(), OrchestratorBridgeError>;
-
-    /// Send an encrypted message. `msg_id` is the orchestrator-generated
-    /// message ID — platform implementations MUST forward it to the server
-    /// (so local storage and server agree on the ID) and MUST return the
-    /// server's `{messageId, seq, epoch}` acknowledgment. Dropping the
-    /// response (or substituting a different msg_id) leaves locally-stored
-    /// own messages with `sequenceNumber = 0`, which breaks display ordering.
-    fn send_message(
-        &self,
-        convo_id: String,
-        ciphertext: Vec<u8>,
-        epoch: u64,
-        msg_id: String,
-    ) -> Result<FFISendMessageResponse, OrchestratorBridgeError>;
-
-    /// Fetch encrypted envelopes for a conversation.
-    ///
-    /// `message_type` / `from_epoch` / `to_epoch` mirror the
-    /// `blue.catbird.chat.getEntries` lexicon params. Pass-through to the
-    /// server URL — platform implementations should forward them untouched.
-    /// `from_epoch` and `to_epoch` are inclusive epoch bounds; supplying them
-    /// (especially with `message_type = Some("commit")`) keeps epoch catch-up
-    /// from being stranded on groups with more than 50 lifetime commits.
     fn get_messages(
         &self,
         convo_id: String,
@@ -334,25 +294,6 @@ pub trait OrchestratorAPICallback: Send + Sync {
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
     ) -> Result<FFIMessagesPage, OrchestratorBridgeError>;
-
-    fn publish_key_package(
-        &self,
-        key_package: Vec<u8>,
-        cipher_suite: String,
-        expires_at: String,
-        device_id: Option<String>,
-    ) -> Result<(), OrchestratorBridgeError>;
-
-    /// Publish multiple key packages in ONE request. The platform impl POSTs
-    /// the whole array to `blue.catbird.chat.replenishKeyPackages` (server cap
-    /// 100), collapsing a full replenishment refill into a single round-trip.
-    fn publish_key_packages(
-        &self,
-        key_packages: Vec<Vec<u8>>,
-        cipher_suite: String,
-        expires_at: String,
-        device_id: Option<String>,
-    ) -> Result<(), OrchestratorBridgeError>;
 
     fn get_key_packages(
         &self,
@@ -368,160 +309,27 @@ pub trait OrchestratorAPICallback: Send + Sync {
         device_id: String,
     ) -> Result<FFIKeyPackageSyncResult, OrchestratorBridgeError>;
 
-    fn register_device(
-        &self,
-        device_uuid: String,
-        device_name: String,
-        mls_did: String,
-        signature_key: Vec<u8>,
-        key_packages: Vec<Vec<u8>>,
-        prepared_request_body: Vec<u8>,
-    ) -> Result<FFIDeviceInfo, OrchestratorBridgeError>;
-
     fn list_devices(
         &self,
         actor_device_id: String,
     ) -> Result<Vec<FFIDeviceInfo>, OrchestratorBridgeError>;
-    fn remove_device(&self, device_id: String) -> Result<(), OrchestratorBridgeError>;
-
-    fn publish_group_info(
-        &self,
-        convo_id: String,
-        group_info: Vec<u8>,
-    ) -> Result<(), OrchestratorBridgeError>;
 
     fn get_group_info(&self, convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError>;
 
-    /// Fetch a pending Welcome message for a conversation.
-    ///
-    /// Platform impls should call the `blue.catbird.chat.getConversationState`
-    /// lexicon with `include: "welcome"` and return the raw Welcome bytes.
-    ///
-    /// If no Welcome is available for this device (consumed, expired, or
-    /// never issued), return `OrchestratorBridgeError::ServerError` with
-    /// status 404 (or 410 for an explicitly expired Welcome). The
-    /// orchestrator uses the status code to distinguish "Welcome gone,
-    /// fall back to External Commit" from "transport error".
     fn get_welcome(&self, convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError>;
 
-    /// Ask the server to reissue a Welcome for this device.
-    ///
-    /// Platform impls should POST to welcome reissue endpoint
-    /// with the conversation id, the recipient device DID, and the reason
-    /// string (e.g. `"no_matching_key_package"`). The active inviter/admin
-    /// fulfills the request by resealing a Welcome to one of this device's
-    /// CURRENT key packages — the recovery path for a Welcome sealed to a
-    /// key package whose private key this device no longer holds
-    /// (`NoMatchingKeyPackage`).
-    ///
-    /// Errors should be returned (not swallowed); the orchestrator records
-    /// the attempt either way so the reissue backoff ladder keeps moving.
-    fn request_welcome_reissue(
+    fn get_delivery_status(
         &self,
         convo_id: String,
-        recipient_device_did: String,
-        reason: String,
-    ) -> Result<(), OrchestratorBridgeError>;
+        message_ids: Vec<String>,
+    ) -> Result<Vec<FFIDeliveryStatusPair>, OrchestratorBridgeError>;
 
-    /// Submit an External Commit to join/rejoin a conversation.
-    ///
-    /// Platform impls should POST to `blue.catbird.chat.submitTransition`
-    /// with `action = "externalCommit"`, the commit bytes, optional
-    /// post-commit GroupInfo, and the base64-encoded MLS confirmation tag
-    /// from the new local group state. Return the server's new epoch and
-    /// `rejoinedAt` timestamp.
-    ///
-    /// On 409 (epoch race), return `ServerError { status: 409 }` — the
-    /// orchestrator treats this as a retryable failure without burning a
-    /// recovery attempt slot. On 429, return `ServerError { status: 429 }`
-    /// so the orchestrator can treat it as rate-limited (not a real failure).
-    fn process_external_commit(
-        &self,
-        convo_id: String,
-        commit_data: Vec<u8>,
-        group_info: Option<Vec<u8>>,
-        confirmation_tag: Option<String>,
-    ) -> Result<FFIProcessExternalCommitResult, OrchestratorBridgeError>;
-
-    /// Report that recovery has been exhausted for a conversation.
-    ///
-    /// Called by the orchestrator's `RecoveryTracker` when a conversation has
-    /// hit `MAX_REJOIN_ATTEMPTS` external-commit failures (S1.1 of the §8
-    /// recovery pyramid). The platform impl should POST to
-    /// `blue.catbird.chat.requestLeafRecovery` so the server can
-    /// accumulate quorum reports and trigger an automatic group reset (S2)
-    /// per ADR-002 §6.
-    ///
-    /// `failure_type` is one of `"external_commit_exhausted"`,
-    /// `"remote_data_error"`, or future variants.
-    ///
-    /// `epoch_authenticator` is the hex-encoded local epoch authenticator
-    /// (RFC 9420 §8.7) when present — binds the report to a specific epoch
-    /// so stale clients can't forge quorum votes. `None` is accepted by
-    /// pre-A7 servers; once A7 ships, servers MAY require it.
-    ///
-    /// `failure_mode` (ADR-008 D1, spec §8.6.1): one of `"local_state_loss"`
-    /// or `"group_state_unrecoverable"`. Mode A reports SHOULD NOT count
-    /// toward server-side quorum auto-reset (clients should self-heal
-    /// instead); Mode B reports indicate the group itself is unrecoverable
-    /// and SHOULD count. Optional during interim deployment.
-    ///
-    /// Errors should be returned (not swallowed); the orchestrator logs but
-    /// does not retry, since the local state is already terminal.
-    fn report_recovery_failure(
-        &self,
-        convo_id: String,
-        failure_type: String,
-        epoch_authenticator: Option<String>,
-        failure_mode: Option<String>,
-    ) -> Result<(), OrchestratorBridgeError>;
-
-    /// Upload an encrypted group metadata blob via
-    /// `blue.catbird.chat.prepareBlobUpload`. `kind` is `"metadata"` or
-    /// `"avatar"`; `metadata_version` is the monotonic counter from the
-    /// corresponding `MetadataReference`. Platform impls forward the args
-    /// untouched into the XRPC body.
-    fn put_group_metadata_blob(
-        &self,
-        convo_id: String,
-        group_id_hex: String,
-        blob_locator: String,
-        ciphertext: Vec<u8>,
-        kind: String,
-        metadata_version: u64,
-        reset_generation: Option<i32>,
-    ) -> Result<(), OrchestratorBridgeError>;
-
-    /// Download an encrypted group metadata blob via
-    /// `blue.catbird.chat.getBlob`. Returns the raw ciphertext
-    /// (`nonce || ciphertext || tag`) for `blob_locator`. On `BlobNotFound`
-    /// (GC'd / never uploaded) return `ServerError { status: 404 }` so the
-    /// orchestrator can skip metadata hydration without treating it as fatal.
     fn get_group_metadata_blob(
         &self,
         convo_id: String,
         group_id_hex: String,
         blob_locator: String,
     ) -> Result<Vec<u8>, OrchestratorBridgeError>;
-
-    /// Submit a non-membership commit (e.g. a metadata update) via
-    /// `blue.catbird.chat.submitTransition`. Platform impls POST
-    /// `{ convoId, action, commit }`; on success the server CAS-advances the
-    /// authoritative `current_epoch`. `action` is e.g. `"updateMetadata"`.
-    /// `confirmation_tag` is the optional base64 MLS confirmation tag.
-    ///
-    /// This MUST reach the server before the orchestrator merges the commit
-    /// locally: a local merge without server acceptance advances the client
-    /// epoch past the server and isolates the sender (every `sendMessage`
-    /// 409s). On 409 (stale/raced epoch) return `ServerError { status: 409 }`
-    /// so the orchestrator discards the pending commit instead of merging.
-    fn commit_group_change(
-        &self,
-        convo_id: String,
-        commit_data: Vec<u8>,
-        action: String,
-        confirmation_tag: Option<String>,
-    ) -> Result<(), OrchestratorBridgeError>;
 }
 
 /// Credential store callback interface for Swift/Kotlin.
@@ -613,7 +421,7 @@ pub struct FFIMessage {
     pub payload_json: Option<String>,
 }
 
-#[derive(uniffi::Enum, Clone)]
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
 pub enum FFIDeliveryStatus {
     DeliveredToAll,
     Partial { acked_count: i32, total_count: i32 },
@@ -2089,6 +1897,35 @@ impl MLSAPIClient for APIAdapter {
         self.0.current_did()
     }
 
+    async fn submit_prepared_request(
+        &self,
+        request: crate::orchestrator::canonical_transport::PreparedRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse> {
+        let route = request.operation.route();
+        let query_bytes = if request.method == "GET" && request.path.contains('?') {
+            request
+                .path
+                .split_once('?')
+                .map(|(_, q)| q.as_bytes().to_vec())
+        } else {
+            None
+        };
+        let ffi_res = self
+            .0
+            .submit_prepared_request(
+                request.method,
+                route.nsid.to_string(),
+                request.body,
+                query_bytes,
+            )
+            .map_err(bridge_err)?;
+        Ok(crate::orchestrator::canonical_transport::GatewayResponse {
+            status: ffi_res.status,
+            content_type: ffi_res.content_type,
+            body: ffi_res.body,
+        })
+    }
+
     async fn get_conversations(
         &self,
         limit: u32,
@@ -2101,136 +1938,6 @@ impl MLSAPIClient for APIAdapter {
                 cursor: ffi.cursor,
             })
             .map_err(bridge_err)
-    }
-
-    async fn create_conversation(
-        &self,
-        group_id: &str,
-        initial_members: Option<&[String]>,
-        metadata: Option<&ConversationMetadata>,
-        commit_data: Option<&[u8]>,
-        welcome_data: Option<&[u8]>,
-    ) -> crate::orchestrator::Result<CreateConversationResult> {
-        self.0
-            .create_conversation(
-                group_id.to_string(),
-                initial_members.map(|m| m.to_vec()),
-                metadata.and_then(|m| m.name.clone()),
-                metadata.and_then(|m| m.description.clone()),
-                commit_data.map(|d| d.to_vec()),
-                welcome_data.map(|d| d.to_vec()),
-            )
-            .map(|ffi| CreateConversationResult {
-                conversation: ffi_to_convo_view(&ffi.conversation),
-                commit_data: ffi.commit_data,
-                welcome_data: ffi.welcome_data,
-            })
-            .map_err(bridge_err)
-    }
-
-    async fn leave_conversation(&self, convo_id: &str) -> crate::orchestrator::Result<()> {
-        self.0
-            .leave_conversation(convo_id.to_string())
-            .map_err(bridge_err)
-    }
-
-    async fn add_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-    ) -> crate::orchestrator::Result<AddMembersServerResult> {
-        self.0
-            .add_members(
-                convo_id.to_string(),
-                member_dids.to_vec(),
-                commit_data.to_vec(),
-                welcome_data.map(|d| d.to_vec()),
-            )
-            .map(|ffi| AddMembersServerResult {
-                success: ffi.success,
-                new_epoch: ffi.new_epoch,
-                receipt: ffi.receipt.map(bridge_mappers::ffi_receipt_to_internal),
-            })
-            .map_err(bridge_err)
-    }
-
-    async fn add_members_with_idempotency(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-        idempotency_key: &str,
-    ) -> crate::orchestrator::Result<AddMembersServerResult> {
-        self.0
-            .add_members_with_idempotency(
-                convo_id.to_string(),
-                member_dids.to_vec(),
-                commit_data.to_vec(),
-                welcome_data.map(|d| d.to_vec()),
-                idempotency_key.to_string(),
-            )
-            .map(|ffi| AddMembersServerResult {
-                success: ffi.success,
-                new_epoch: ffi.new_epoch,
-                receipt: ffi.receipt.map(bridge_mappers::ffi_receipt_to_internal),
-            })
-            .map_err(bridge_err)
-    }
-
-    async fn remove_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .remove_members(
-                convo_id.to_string(),
-                member_dids.to_vec(),
-                commit_data.to_vec(),
-            )
-            .map_err(bridge_err)
-    }
-
-    async fn send_message(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-    ) -> crate::orchestrator::Result<SendMessageResponse> {
-        self.send_message_with_id(
-            convo_id,
-            ciphertext,
-            epoch,
-            &uuid::Uuid::new_v4().to_string(),
-        )
-        .await
-    }
-
-    async fn send_message_with_id(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-        msg_id: &str,
-    ) -> crate::orchestrator::Result<SendMessageResponse> {
-        let resp = self
-            .0
-            .send_message(
-                convo_id.to_string(),
-                ciphertext.to_vec(),
-                epoch,
-                msg_id.to_string(),
-            )
-            .map_err(bridge_err)?;
-        Ok(SendMessageResponse {
-            message_id: resp.message_id,
-            seq: resp.seq,
-            epoch: resp.epoch,
-        })
     }
 
     async fn get_messages(
@@ -2254,55 +1961,11 @@ impl MLSAPIClient for APIAdapter {
             .map(|ffi| {
                 let envelopes = ffi
                     .envelopes
-                    .iter()
-                    .map(|e| IncomingEnvelope {
-                        conversation_id: e.conversation_id.clone(),
-                        sender_did: e.sender_did.clone(),
-                        ciphertext: e.ciphertext.clone(),
-                        timestamp: e
-                            .timestamp
-                            .parse::<chrono::DateTime<chrono::Utc>>()
-                            .unwrap_or_else(|_| chrono::Utc::now()),
-                        server_message_id: e.server_message_id.clone(),
-                        server_epoch: None,
-                    })
+                    .into_iter()
+                    .map(|m| ffi_incoming_envelope_to_internal(m, None))
                     .collect();
                 (envelopes, ffi.cursor)
             })
-            .map_err(bridge_err)
-    }
-
-    async fn publish_key_package(
-        &self,
-        key_package: &[u8],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .publish_key_package(
-                key_package.to_vec(),
-                cipher_suite.to_string(),
-                expires_at.to_string(),
-                device_id.map(str::to_string),
-            )
-            .map_err(bridge_err)
-    }
-
-    async fn publish_key_packages(
-        &self,
-        key_packages: &[Vec<u8>],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .publish_key_packages(
-                key_packages.to_vec(),
-                cipher_suite.to_string(),
-                expires_at.to_string(),
-                device_id.map(str::to_string),
-            )
             .map_err(bridge_err)
     }
 
@@ -2313,13 +1976,13 @@ impl MLSAPIClient for APIAdapter {
     ) -> crate::orchestrator::Result<Vec<KeyPackageRef>> {
         self.0
             .get_key_packages(actor_device_id.to_string(), dids.to_vec())
-            .map(|v| {
-                v.into_iter()
-                    .map(|ffi| KeyPackageRef {
-                        did: ffi.did,
-                        key_package_data: ffi.key_package_data,
-                        hash: ffi.hash,
-                        cipher_suite: ffi.cipher_suite,
+            .map(|refs| {
+                refs.into_iter()
+                    .map(|r| KeyPackageRef {
+                        did: r.did,
+                        key_package_data: r.key_package_data,
+                        hash: r.hash,
+                        cipher_suite: r.cipher_suite,
                     })
                     .collect()
             })
@@ -2349,84 +2012,33 @@ impl MLSAPIClient for APIAdapter {
             })
             .map_err(bridge_err)
     }
-
-    async fn register_device(
-        &self,
-        device_uuid: &str,
-        device_name: &str,
-        mls_did: &str,
-        signature_key: &[u8],
-        key_packages: &[Vec<u8>],
-        prepared_request_body: &[u8],
-    ) -> crate::orchestrator::Result<DeviceInfo> {
-        self.0
-            .register_device(
-                device_uuid.to_string(),
-                device_name.to_string(),
-                mls_did.to_string(),
-                signature_key.to_vec(),
-                key_packages.to_vec(),
-                prepared_request_body.to_vec(),
-            )
-            .map(|ffi| DeviceInfo {
-                device_id: ffi.device_id,
-                mls_did: ffi.mls_did,
-                device_uuid: ffi.device_uuid,
-                created_at: ffi
-                    .created_at
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc)),
-                key_id: ffi.key_id,
-                signature_public_key: ffi.signature_public_key,
-                auth_generation: ffi.auth_generation,
-                status: ffi.status,
-                available_package_count: ffi.available_package_count,
-                reserved_package_count: ffi.reserved_package_count,
-            })
-            .map_err(bridge_err)
-    }
-
     async fn list_devices(
         &self,
         actor_device_id: &str,
     ) -> crate::orchestrator::Result<Vec<DeviceInfo>> {
         self.0
-            .list_devices(actor_device_id.to_owned())
-            .map(|v| {
-                v.into_iter()
-                    .map(|ffi| DeviceInfo {
-                        device_id: ffi.device_id,
-                        mls_did: ffi.mls_did,
-                        device_uuid: ffi.device_uuid,
-                        created_at: ffi
+            .list_devices(actor_device_id.to_string())
+            .map(|devices| {
+                devices
+                    .into_iter()
+                    .map(|d| DeviceInfo {
+                        device_id: d.device_id,
+                        mls_did: d.mls_did,
+                        device_uuid: d.device_uuid,
+                        created_at: d
                             .created_at
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                            .as_ref()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                             .map(|dt| dt.with_timezone(&chrono::Utc)),
-                        key_id: ffi.key_id,
-                        signature_public_key: ffi.signature_public_key,
-                        auth_generation: ffi.auth_generation,
-                        status: ffi.status,
-                        available_package_count: ffi.available_package_count,
-                        reserved_package_count: ffi.reserved_package_count,
+                        key_id: d.key_id,
+                        signature_public_key: d.signature_public_key,
+                        auth_generation: d.auth_generation,
+                        status: d.status,
+                        available_package_count: d.available_package_count,
+                        reserved_package_count: d.reserved_package_count,
                     })
                     .collect()
             })
-            .map_err(bridge_err)
-    }
-
-    async fn remove_device(&self, device_id: &str) -> crate::orchestrator::Result<()> {
-        self.0
-            .remove_device(device_id.to_string())
-            .map_err(bridge_err)
-    }
-
-    async fn publish_group_info(
-        &self,
-        convo_id: &str,
-        group_info: &[u8],
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .publish_group_info(convo_id.to_string(), group_info.to_vec())
             .map_err(bridge_err)
     }
 
@@ -2436,26 +2048,22 @@ impl MLSAPIClient for APIAdapter {
             .map_err(bridge_err)
     }
 
-    async fn put_group_metadata_blob(
+    async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
+        self.0.get_welcome(convo_id.to_string()).map_err(bridge_err)
+    }
+
+    async fn get_delivery_status(
         &self,
         convo_id: &str,
-        group_id_hex: &str,
-        blob_locator: &str,
-        ciphertext: &[u8],
-        kind: &str,
-        metadata_version: u64,
-        reset_generation: Option<i32>,
-    ) -> crate::orchestrator::Result<()> {
+        message_ids: &[String],
+    ) -> crate::orchestrator::Result<Vec<(String, crate::orchestrator::types::DeliveryStatus)>> {
         self.0
-            .put_group_metadata_blob(
-                convo_id.to_string(),
-                group_id_hex.to_string(),
-                blob_locator.to_string(),
-                ciphertext.to_vec(),
-                kind.to_string(),
-                metadata_version,
-                reset_generation,
-            )
+            .get_delivery_status(convo_id.to_string(), message_ids.to_vec())
+            .map(|list| {
+                list.into_iter()
+                    .map(|pair| (pair.message_id, ffi_to_delivery_status(&pair.status)))
+                    .collect()
+            })
             .map_err(bridge_err)
     }
 
@@ -2470,93 +2078,6 @@ impl MLSAPIClient for APIAdapter {
                 convo_id.to_string(),
                 group_id_hex.to_string(),
                 blob_locator.to_string(),
-            )
-            .map_err(bridge_err)
-    }
-
-    async fn commit_group_change(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        action: &str,
-        confirmation_tag: Option<&str>,
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .commit_group_change(
-                convo_id.to_string(),
-                commit_data.to_vec(),
-                action.to_string(),
-                confirmation_tag.map(|s| s.to_string()),
-            )
-            .map_err(bridge_err)
-    }
-
-    async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
-        self.0.get_welcome(convo_id.to_string()).map_err(bridge_err)
-    }
-
-    async fn request_welcome_reissue(
-        &self,
-        convo_id: &str,
-        recipient_device_did: &str,
-        reason: &str,
-    ) -> crate::orchestrator::Result<
-        crate::orchestrator::welcome_recovery::WelcomeReissueRequestResult,
-    > {
-        self.0
-            .request_welcome_reissue(
-                convo_id.to_string(),
-                recipient_device_did.to_string(),
-                reason.to_string(),
-            )
-            .map_err(bridge_err)?;
-        // The FFI surface is deliberately minimal (unit result); the caller
-        // only branches on success/failure, so synthesize the internal shape.
-        Ok(
-            crate::orchestrator::welcome_recovery::WelcomeReissueRequestResult {
-                welcome_requested: true,
-                requested_at: String::new(),
-                inviter_device: None,
-            },
-        )
-    }
-
-    async fn process_external_commit(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        group_info: Option<&[u8]>,
-        confirmation_tag: Option<&str>,
-    ) -> crate::orchestrator::Result<ProcessExternalCommitResult> {
-        let result = self
-            .0
-            .process_external_commit(
-                convo_id.to_string(),
-                commit_data.to_vec(),
-                group_info.map(|b| b.to_vec()),
-                confirmation_tag.map(|s| s.to_string()),
-            )
-            .map_err(bridge_err)?;
-        Ok(ProcessExternalCommitResult {
-            epoch: result.epoch,
-            rejoined_at: result.rejoined_at,
-            receipt: result.receipt.map(bridge_mappers::ffi_receipt_to_internal),
-        })
-    }
-
-    async fn report_recovery_failure(
-        &self,
-        convo_id: &str,
-        failure_type: &str,
-        epoch_authenticator: Option<&str>,
-        failure_mode: Option<&str>,
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .report_recovery_failure(
-                convo_id.to_string(),
-                failure_type.to_string(),
-                epoch_authenticator.map(|s| s.to_string()),
-                failure_mode.map(|s| s.to_string()),
             )
             .map_err(bridge_err)
     }
@@ -4611,69 +4132,41 @@ mod tests {
             })
         }
 
-        fn create_conversation(
+        fn submit_prepared_request(
             &self,
-            _group_id: String,
-            _initial_members: Option<Vec<String>>,
-            _metadata_name: Option<String>,
-            _metadata_description: Option<String>,
-            _commit_data: Option<Vec<u8>>,
-            _welcome_data: Option<Vec<u8>>,
-        ) -> Result<FFICreateConversationResult, OrchestratorBridgeError> {
-            Err(OrchestratorBridgeError::Api {
-                message: "not used by bridge joinOrRejoin test".to_string(),
-            })
-        }
-
-        fn leave_conversation(&self, _convo_id: String) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
-        }
-
-        fn add_members(
-            &self,
-            _convo_id: String,
-            _member_dids: Vec<String>,
-            _commit_data: Vec<u8>,
-            _welcome_data: Option<Vec<u8>>,
-        ) -> Result<FFIAddMembersResult, OrchestratorBridgeError> {
-            Ok(FFIAddMembersResult {
-                success: true,
-                new_epoch: 42,
-                receipt: self.receipt_response.lock().unwrap().clone(),
-            })
-        }
-
-        fn add_members_with_idempotency(
-            &self,
-            convo_id: String,
-            member_dids: Vec<String>,
-            commit_data: Vec<u8>,
-            welcome_data: Option<Vec<u8>>,
-            _idempotency_key: String,
-        ) -> Result<FFIAddMembersResult, OrchestratorBridgeError> {
-            self.add_members(convo_id, member_dids, commit_data, welcome_data)
-        }
-
-        fn remove_members(
-            &self,
-            _convo_id: String,
-            _member_dids: Vec<String>,
-            _commit_data: Vec<u8>,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
-        }
-
-        fn send_message(
-            &self,
-            _convo_id: String,
-            _ciphertext: Vec<u8>,
-            epoch: u64,
-            msg_id: String,
-        ) -> Result<FFISendMessageResponse, OrchestratorBridgeError> {
-            Ok(FFISendMessageResponse {
-                message_id: msg_id,
-                seq: 1,
-                epoch,
+            _method: String,
+            nsid: String,
+            body: Option<Vec<u8>>,
+            _query: Option<Vec<u8>>,
+        ) -> Result<FFIGatewayResponse, OrchestratorBridgeError> {
+            let resp_body = if nsid == "blue.catbird.chat.enrollDevice" {
+                let inner = body.as_deref().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok()).unwrap_or_default();
+                let inner_body = inner.get("signedRequest").and_then(|s| s.get("body")).or_else(|| inner.get("body")).unwrap_or(&inner);
+                let dev_id = inner_body.get("deviceId").and_then(|d| d.as_str()).unwrap_or("00000000-0000-4000-8000-000000000001");
+                let key_id = inner_body.get("keyId").and_then(|k| k.as_str()).unwrap_or("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+                let sig_pk = inner_body.get("signaturePublicKey").and_then(|s| s.as_str()).unwrap_or("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+                serde_json::to_vec(&serde_json::json!({
+                    "device": {
+                        "deviceId": dev_id,
+                        "keyId": key_id,
+                        "signaturePublicKey": {
+                            "$bytes": sig_pk
+                        },
+                        "authGeneration": 1,
+                        "status": "active",
+                        "availablePackageCount": 50,
+                        "reservedPackageCount": 0,
+                        "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        "updatedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                    }
+                })).unwrap()
+            } else {
+                serde_json::to_vec(&serde_json::json!({"result": {}})).unwrap()
+            };
+            Ok(FFIGatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: resp_body,
             })
         }
 
@@ -4692,26 +4185,13 @@ mod tests {
             })
         }
 
-        fn publish_key_package(
+        fn get_delivery_status(
             &self,
-            _key_package: Vec<u8>,
-            _cipher_suite: String,
-            _expires_at: String,
-            _device_id: Option<String>,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
+            _convo_id: String,
+            _message_ids: Vec<String>,
+        ) -> Result<Vec<FFIDeliveryStatusPair>, OrchestratorBridgeError> {
+            Ok(vec![])
         }
-
-        fn publish_key_packages(
-            &self,
-            _key_packages: Vec<Vec<u8>>,
-            _cipher_suite: String,
-            _expires_at: String,
-            _device_id: Option<String>,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
-        }
-
         fn get_key_packages(
             &self,
             _actor_device_id: String,
@@ -4738,19 +4218,7 @@ mod tests {
             })
         }
 
-        fn register_device(
-            &self,
-            _device_uuid: String,
-            _device_name: String,
-            _mls_did: String,
-            _signature_key: Vec<u8>,
-            _key_packages: Vec<Vec<u8>>,
-            _prepared_request_body: Vec<u8>,
-        ) -> Result<FFIDeviceInfo, OrchestratorBridgeError> {
-            Err(OrchestratorBridgeError::Api {
-                message: "not used by bridge joinOrRejoin test".to_string(),
-            })
-        }
+
 
         fn list_devices(
             &self,
@@ -4759,17 +4227,6 @@ mod tests {
             Ok(vec![])
         }
 
-        fn remove_device(&self, _device_id: String) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
-        }
-
-        fn publish_group_info(
-            &self,
-            _convo_id: String,
-            _group_info: Vec<u8>,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
-        }
 
         fn get_group_info(&self, _convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError> {
             Err(OrchestratorBridgeError::ServerError {
@@ -4791,54 +4248,7 @@ mod tests {
             })
         }
 
-        fn request_welcome_reissue(
-            &self,
-            _convo_id: String,
-            _recipient_device_did: String,
-            _reason: String,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Err(OrchestratorBridgeError::ServerError {
-                status: 501,
-                body: "reissue not supported by test callback".to_string(),
-            })
-        }
 
-        fn process_external_commit(
-            &self,
-            _convo_id: String,
-            _commit_data: Vec<u8>,
-            _group_info: Option<Vec<u8>>,
-            _confirmation_tag: Option<String>,
-        ) -> Result<FFIProcessExternalCommitResult, OrchestratorBridgeError> {
-            Ok(FFIProcessExternalCommitResult {
-                epoch: 43,
-                rejoined_at: "2026-07-12T00:00:00Z".into(),
-                receipt: self.receipt_response.lock().unwrap().clone(),
-            })
-        }
-
-        fn report_recovery_failure(
-            &self,
-            _convo_id: String,
-            _failure_type: String,
-            _epoch_authenticator: Option<String>,
-            _failure_mode: Option<String>,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
-        }
-
-        fn put_group_metadata_blob(
-            &self,
-            _convo_id: String,
-            _group_id_hex: String,
-            _blob_locator: String,
-            _ciphertext: Vec<u8>,
-            _kind: String,
-            _metadata_version: u64,
-            _reset_generation: Option<i32>,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
-        }
 
         fn get_group_metadata_blob(
             &self,
@@ -4852,15 +4262,6 @@ mod tests {
             })
         }
 
-        fn commit_group_change(
-            &self,
-            _convo_id: String,
-            _commit_data: Vec<u8>,
-            _action: String,
-            _confirmation_tag: Option<String>,
-        ) -> Result<(), OrchestratorBridgeError> {
-            Ok(())
-        }
     }
 
     #[derive(Default)]
@@ -5039,47 +4440,25 @@ mod tests {
     }
 
     #[test]
-    fn api_adapters_preserve_receipts_for_all_commit_callbacks() {
+    fn api_adapters_submit_prepared_requests() {
         crate::async_runtime::block_on(async {
             let callback = Arc::new(WelcomeCountingApiCallback::new(
                 "did:plc:alice",
                 Arc::new(AtomicUsize::new(0)),
             ));
-            *callback.receipt_response.lock().unwrap() = Some(test_receipt());
             let normal = APIAdapter(callback.clone());
             let client = crate::client_bridge::ClientAPIAdapter(callback);
 
             for adapter in [&normal as &dyn MLSAPIClient, &client as &dyn MLSAPIClient] {
-                let add = adapter
-                    .add_members("convo-1", &["did:plc:bob".into()], &[7], Some(&[8]))
-                    .await
-                    .expect("add members");
-                let add_receipt = add.receipt.expect("add receipt");
-                assert_eq!(add_receipt.sequencer_term, 9);
-                assert_eq!(add_receipt.signature, vec![4, 5, 6]);
-
-                let external = adapter
-                    .process_external_commit("convo-1", &[9], Some(&[10]), Some("tag"))
-                    .await
-                    .expect("external commit");
-                let external_receipt = external.receipt.expect("external receipt");
-                assert_eq!(external_receipt.sequencer_term, 9);
-                assert_eq!(external_receipt.commit_hash, vec![1, 2, 3]);
+                let req = crate::orchestrator::canonical_transport::PreparedRequest {
+                    operation: crate::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition,
+                    method: "POST".into(),
+                    path: "/xrpc/blue.catbird.chat.submitTransition".into(),
+                    body: Some(b"{}".to_vec()),
+                };
+                let resp = adapter.submit_prepared_request(req).await.expect("submit");
+                assert_eq!(resp.status, 200);
             }
-
-            let idempotent = normal
-                .add_members_with_idempotency(
-                    "convo-1",
-                    &["did:plc:bob".into()],
-                    &[7],
-                    Some(&[8]),
-                    "idem-1",
-                )
-                .await
-                .expect("idempotent add");
-            let idempotent_receipt = idempotent.receipt.expect("idempotent receipt");
-            assert_eq!(idempotent_receipt.epoch, 42);
-            assert_eq!(idempotent_receipt.sequencer_term, 9);
         });
     }
 

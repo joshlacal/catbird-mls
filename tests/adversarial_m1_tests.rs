@@ -47,3 +47,69 @@ fn public_operation_inventory_has_no_rebind_route() {
         .iter()
         .any(|operation| format!("{operation:?}").contains("Rebind")));
 }
+
+#[test]
+fn malformed_json_fails_closed_before_preparation() {
+    let result = prepare_clean_chat_request(
+        auth(),
+        CleanChatOperationFfi::GetOwnDevices,
+        b"{ not valid json".to_vec(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn uppercase_device_uuid_is_rejected() {
+    let uppercase_auth = CleanChatAuthContextFfi {
+        device_id: "11111111-1111-4111-8111-11111111111A".into(),
+        auth_generation: Some(1),
+    };
+    let result = prepare_clean_chat_request(
+        uppercase_auth,
+        CleanChatOperationFfi::GetOwnDevices,
+        serde_json::to_vec(&json!({"actorDeviceId": "11111111-1111-4111-8111-11111111111A"})).unwrap(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn non_hyphenated_device_uuid_is_rejected() {
+    let non_hyphenated_auth = CleanChatAuthContextFfi {
+        device_id: "11111111111141118111111111111111".into(),
+        auth_generation: Some(1),
+    };
+    let result = prepare_clean_chat_request(
+        non_hyphenated_auth,
+        CleanChatOperationFfi::GetOwnDevices,
+        serde_json::to_vec(&json!({"actorDeviceId": "11111111111141118111111111111111"})).unwrap(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn empty_device_id_fails_closed() {
+    let empty_auth = CleanChatAuthContextFfi {
+        device_id: String::new(),
+        auth_generation: Some(1),
+    };
+    let result = prepare_clean_chat_request(
+        empty_auth,
+        CleanChatOperationFfi::GetOwnDevices,
+        serde_json::to_vec(&json!({"actorDeviceId": ""})).unwrap(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn zero_generation_for_read_without_generation_is_accepted() {
+    let read_auth = CleanChatAuthContextFfi {
+        device_id: DEVICE.into(),
+        auth_generation: None,
+    };
+    let result = prepare_clean_chat_request(
+        read_auth,
+        CleanChatOperationFfi::GetOwnDevices,
+        serde_json::to_vec(&json!({"actorDeviceId": DEVICE})).unwrap(),
+    );
+    assert!(result.is_ok());
+}

@@ -3980,7 +3980,7 @@ impl MLSContext {
     }
 
     /// Get the MLS confirmation tag for a group.
-    /// Returns the TLS-serialized confirmation tag bytes from storage.
+    /// Returns the exact 32-byte confirmation tag bytes from storage.
     pub fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         crate::debug_log!("[MLS-FFI] get_confirmation_tag: {}", hex::encode(&group_id));
 
@@ -3990,7 +3990,6 @@ impl MLSContext {
             MLSError::ContextNotInitialized
         })?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
-
         let gid = GroupId::from_slice(&group_id);
 
         inner.with_group_ref(&gid, |_group, provider| {
@@ -4000,13 +3999,41 @@ impl MLSContext {
                 .map_err(|_| MLSError::StorageError)?;
             match tag {
                 Some(t) => {
+                    use openmls::prelude::tls_codec::Serialize;
                     let bytes = t
                         .tls_serialize_detached()
                         .map_err(|e| MLSError::Internal(format!("TLS serialize: {}", e)))?;
-                    crate::debug_log!("[MLS-FFI] Confirmation tag: {} bytes", bytes.len());
                     Ok(bytes)
                 }
                 None => Err(MLSError::Internal("No confirmation tag found".to_string())),
+            }
+        })
+    }
+
+    /// Get the SHA-256 MLS GroupContext hash for a group.
+    pub fn get_group_context_hash(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        let _storage_operation = self.begin_storage_operation("get_group_context_hash");
+        let guard = self.inner.lock().map_err(|e| {
+            crate::error_log!("[MLS-FFI] ERROR: Failed to acquire lock: {:?}", e);
+            MLSError::ContextNotInitialized
+        })?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+
+        let gid = GroupId::from_slice(&group_id);
+
+        inner.with_group_ref(&gid, |_group, provider| {
+            let context: Option<GroupContext> = provider
+                .storage()
+                .group_context(&gid)
+                .map_err(|_| MLSError::StorageError)?;
+            match context {
+                Some(gc) => {
+                    let bytes = gc
+                        .tls_serialize_detached()
+                        .map_err(|e| MLSError::Internal(format!("TLS serialize group context: {}", e)))?;
+                    Ok(sha2::Sha256::digest(&bytes).to_vec())
+                }
+                None => Err(MLSError::Internal("No group context found".to_string())),
             }
         })
     }
@@ -6025,25 +6052,25 @@ impl MLSContext {
         let credential = Credential::new(CredentialType::Basic, identity.as_bytes().to_vec());
 
         let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
-
-        // CRITICAL: Key packages must advertise support for RatchetTree extension
-        // AND the Catbird metadata extension (0xff00) so members can join groups
-        // that use encrypted group metadata in context extensions.
-        let mut supported_extensions = vec![
-            ExtensionType::RatchetTree,
-            ExtensionType::AppDataDictionary,
-            ExtensionType::Unknown(crate::metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE),
-        ];
-        if last_resort {
-            supported_extensions.push(ExtensionType::LastResort);
-        }
-
-        let capabilities = Capabilities::builder()
-            .extensions(supported_extensions)
-            .proposals(vec![ProposalType::AppDataUpdate])
-            .build();
-
-        let mut builder = KeyPackage::builder().leaf_node_capabilities(capabilities);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let lifetime = openmls::prelude::Lifetime::init(
+            now.saturating_sub(60),
+            now + 29 * 24 * 60 * 60,
+        );
+        let leaf_caps = crate::mls_context::metadata_leaf_capabilities();
+        let capabilities = Capabilities::new(
+            Some(&[openmls::prelude::ProtocolVersion::Mls10]),
+            Some(&[ciphersuite]),
+            Some(leaf_caps.extensions()),
+            Some(leaf_caps.proposals()),
+            Some(&[CredentialType::Basic]),
+        );
+        let mut builder = KeyPackage::builder()
+            .key_package_lifetime(lifetime)
+            .leaf_node_capabilities(capabilities);
         if last_resort {
             builder = builder.mark_as_last_resort();
         }
@@ -6059,13 +6086,12 @@ impl MLSContext {
             )
             .map_err(|e| MLSError::OpenMLS(format!("Failed to build KeyPackage: {:?}", e)))?;
 
-        // Serialize key package directly (raw format for compatibility)
+        // Serialize key package wrapped in MlsMessage framing (canonical wire format)
         let key_package = key_package_bundle.key_package().clone();
-
-        let key_package_data = key_package
+        let key_package_msg = openmls::prelude::MlsMessageOut::from(key_package.clone());
+        let key_package_data = key_package_msg
             .tls_serialize_detached()
             .map_err(|_| MLSError::SerializationError)?;
-
         // Get hash reference (keep both typed and bytes versions)
         let hash_ref_typed = key_package.hash_ref(inner.provider_crypto()).map_err(|e| {
             MLSError::OpenMLS(format!("Failed to compute KeyPackage hash_ref: {:?}", e))
@@ -7353,6 +7379,10 @@ impl MlsCryptoContext for MLSContext {
 
     fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         self.get_confirmation_tag(group_id)
+    }
+
+    fn get_group_context_hash(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.get_group_context_hash(group_id)
     }
 
     fn epoch_authenticator(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {

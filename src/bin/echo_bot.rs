@@ -728,6 +728,45 @@ impl MLSAPIClient for HttpDSClient {
     async fn current_did(&self) -> Option<String> {
         Some(self.did.clone())
     }
+    async fn submit_prepared_request(
+        &self,
+        request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
+    ) -> OrcResult<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        let url = format!("{}{}", self.base_url, request.path);
+        let mut builder = match request.method.as_str() {
+            "POST" => self.client.post(&url),
+            "GET" => self.client.get(&url),
+            "PUT" => self.client.put(&url),
+            "DELETE" => self.client.delete(&url),
+            _ => self.client.post(&url),
+        };
+        builder = builder.bearer_auth(&self.auth_token);
+        if let Some(body) = request.body {
+            builder = builder
+                .body(body)
+                .header("Content-Type", "application/json");
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?
+            .to_vec();
+        Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+            status,
+            content_type,
+            body,
+        })
+    }
 
     async fn get_conversations(
         &self,
@@ -772,226 +811,18 @@ impl MLSAPIClient for HttpDSClient {
         })
     }
 
-    async fn create_conversation(
-        &self,
-        group_id: &str,
-        initial_members: Option<&[String]>,
-        metadata: Option<&ConversationMetadata>,
-        commit_data: Option<&[u8]>,
-        welcome_data: Option<&[u8]>,
-    ) -> OrcResult<CreateConversationResult> {
-        let mut body = serde_json::json!({ "groupId": group_id });
-        if let Some(members) = initial_members {
-            body["initialMembers"] = serde_json::json!(members);
-        }
-        if let Some(m) = metadata {
-            body["metadata"] = serde_json::json!({
-                "name": m.name,
-                "description": m.description,
-            });
-        }
-        if let Some(d) = commit_data {
-            body["commitData"] =
-                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(d));
-        }
-        if let Some(d) = welcome_data {
-            body["welcomeData"] =
-                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(d));
-        }
-
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.createConversation"))
-            .bearer_auth(&self.auth_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("createConvo: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError { status, body });
-        }
-
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("createConvo parse: {e}")))?;
-
-        let convo = parse_convo_view(&val["convo"]).unwrap_or(ConversationView {
-            group_id: group_id.to_string(),
-            conversation_id: group_id.to_string(),
-            epoch: 0,
-            members: vec![],
-            metadata: None,
-            created_at: Some(Utc::now()),
-            updated_at: Some(Utc::now()),
-            sequencer_did: None,
-        });
-
-        Ok(CreateConversationResult {
-            conversation: convo,
-            commit_data: None,
-            welcome_data: None,
-        })
-    }
-
-    async fn leave_conversation(&self, convo_id: &str) -> OrcResult<()> {
-        let body = serde_json::json!({ "convoId": convo_id });
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.requestLeave"))
-            .bearer_auth(&self.auth_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("leaveConvo: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError { status, body });
-        }
-        Ok(())
-    }
-
-    async fn add_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-    ) -> OrcResult<AddMembersServerResult> {
-        let mut body = serde_json::json!({
-            "convoId": convo_id,
-            "memberDids": member_dids,
-            "commitData": base64::engine::general_purpose::STANDARD.encode(commit_data),
-        });
-        if let Some(w) = welcome_data {
-            body["welcomeData"] =
-                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(w));
-        }
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
-            .bearer_auth(&self.auth_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("addMembers: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError { status, body });
-        }
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("addMembers parse: {e}")))?;
-        Ok(AddMembersServerResult {
-            success: true,
-            new_epoch: val["epoch"].as_u64().unwrap_or(0),
-            receipt: None,
-        })
-    }
-
-    async fn remove_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-    ) -> OrcResult<()> {
-        let body = serde_json::json!({
-            "convoId": convo_id,
-            "memberDids": member_dids,
-            "commitData": base64::engine::general_purpose::STANDARD.encode(commit_data),
-        });
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
-            .bearer_auth(&self.auth_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("removeMembers: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError { status, body });
-        }
-        Ok(())
-    }
-
-    async fn send_message(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-    ) -> OrcResult<SendMessageResponse> {
-        let body = serde_json::json!({
-            "convoId": convo_id,
-            "ciphertext": base64::engine::general_purpose::STANDARD.encode(ciphertext),
-            "epoch": epoch,
-        });
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.sendMessage"))
-            .bearer_auth(&self.auth_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("sendMessage: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError { status, body });
-        }
-        // Parse server response: { message_id, seq, epoch, received_at }
-        #[derive(serde::Deserialize)]
-        struct ServerResp {
-            #[serde(default)]
-            message_id: String,
-            #[serde(default)]
-            seq: u64,
-            #[serde(default)]
-            epoch: u64,
-        }
-        let server_resp: ServerResp = resp.json().await.unwrap_or(ServerResp {
-            message_id: String::new(),
-            seq: 0,
-            epoch,
-        });
-        Ok(SendMessageResponse {
-            message_id: server_resp.message_id,
-            seq: server_resp.seq,
-            epoch: server_resp.epoch,
-        })
-    }
-
     async fn get_messages(
         &self,
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
-        message_type: Option<&str>,
-        from_epoch: Option<u32>,
-        to_epoch: Option<u32>,
+        _message_type: Option<&str>,
+        _from_epoch: Option<u32>,
+        _to_epoch: Option<u32>,
     ) -> OrcResult<(Vec<IncomingEnvelope>, Option<String>)> {
-        let mut params = vec![
-            ("convoId", convo_id.to_string()),
-            ("limit", limit.to_string()),
-        ];
+        let mut params = vec![("convoId", convo_id.to_string()), ("limit", limit.to_string())];
         if let Some(c) = cursor {
             params.push(("cursor", c.to_string()));
-        }
-        if let Some(mt) = message_type {
-            params.push(("type", mt.to_string()));
-        }
-        if let Some(fe) = from_epoch {
-            params.push(("fromEpoch", fe.to_string()));
-        }
-        if let Some(te) = to_epoch {
-            params.push(("toEpoch", te.to_string()));
         }
         let resp = self
             .client
@@ -1008,67 +839,33 @@ impl MLSAPIClient for HttpDSClient {
             return Err(OrchestratorError::ServerError { status, body });
         }
 
-        let val: serde_json::Value = resp
+        let body: serde_json::Value = resp
             .json()
             .await
             .map_err(|e| OrchestratorError::Api(format!("getMessages parse: {e}")))?;
 
-        let cursor = val["cursor"].as_str().map(|s| s.to_string());
-        let envelopes = val["messages"]
+        let messages = body["messages"]
             .as_array()
             .unwrap_or(&vec![])
             .iter()
             .filter_map(|m| parse_incoming_envelope(convo_id, m))
             .collect();
+        let next_cursor = body["cursor"].as_str().map(|s| s.to_string());
 
-        Ok((envelopes, cursor))
-    }
-
-    async fn publish_key_package(
-        &self,
-        key_package: &[u8],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> OrcResult<()> {
-        let mut body = serde_json::json!({
-            "keyPackages": [{
-                "data": base64::engine::general_purpose::STANDARD.encode(key_package),
-                "cipherSuite": cipher_suite,
-                "expiresAt": expires_at,
-            }],
-        });
-        if let Some(device_id) = device_id {
-            body["deviceId"] = serde_json::Value::String(device_id.to_string());
-        }
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.replenishKeyPackages"))
-            .bearer_auth(&self.auth_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("publishKeyPackages: {e}")))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError { status, body });
-        }
-        Ok(())
+        Ok((messages, next_cursor))
     }
 
     async fn get_key_packages(
         &self,
-        actor_device_id: &str,
+        _actor_device_id: &str,
         dids: &[String],
     ) -> OrcResult<Vec<KeyPackageRef>> {
-        let mut params: Vec<(&str, &str)> = vec![("actorDeviceId", actor_device_id)];
-        params.extend(dids.iter().map(|d| ("dids", d.as_str())));
+        let dids_param = dids.join(",");
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.chat.getKeyPackages"))
+            .get(self.xrpc_url("blue.catbird.chat.getPendingWelcomes"))
             .bearer_auth(&self.auth_token)
-            .query(&params)
+            .query(&[("dids", &dids_param)])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(format!("getKeyPackages: {e}")))?;
@@ -1084,49 +881,50 @@ impl MLSAPIClient for HttpDSClient {
             .await
             .map_err(|e| OrchestratorError::Api(format!("getKeyPackages parse: {e}")))?;
 
-        let refs = val["keyPackages"]
+        let packages = val["packages"]
             .as_array()
             .unwrap_or(&vec![])
             .iter()
-            .filter_map(|kp| {
-                let did = kp["did"].as_str()?.to_string();
-                let data_b64 = kp["data"].as_str()?;
-                let data = base64::engine::general_purpose::STANDARD
-                    .decode(data_b64)
-                    .ok()?;
+            .filter_map(|p| {
+                let did = p["did"].as_str()?.to_string();
+                let kp_data = p["keyPackage"]
+                    .as_str()
+                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())?;
+                let hash_ref = p["hashRef"]
+                    .as_str()
+                    .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+                    .unwrap_or_default();
                 Some(KeyPackageRef {
                     did,
-                    key_package_data: data,
-                    hash: kp["hash"].as_str().map(|s| s.to_string()),
-                    cipher_suite: kp["cipherSuite"].as_str().unwrap_or("unknown").to_string(),
+                    key_package_data: kp_data,
+                    hash: None,
+                    cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
                 })
             })
             .collect();
 
-        Ok(refs)
+        Ok(packages)
     }
 
     async fn get_key_package_stats(&self) -> OrcResult<KeyPackageStats> {
         let resp = self
             .client
-            .get(self.xrpc_url("blue.catbird.chat.getDevices"))
+            .get(self.xrpc_url("blue.catbird.chat.getPendingWelcomes"))
             .bearer_auth(&self.auth_token)
             .send()
             .await
-            .map_err(|e| OrchestratorError::Api(format!("getKeyPackageStatus: {e}")))?;
+            .map_err(|e| OrchestratorError::Api(format!("getKeyPackageStats: {e}")))?;
 
         if !resp.status().is_success() {
-            // If the endpoint doesn't exist or fails, return 0 to trigger replenishment
-            return Ok(KeyPackageStats {
-                available: 0,
-                total: 0,
-            });
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OrchestratorError::ServerError { status, body });
         }
 
         let val: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| OrchestratorError::Api(format!("getKeyPackageStatus parse: {e}")))?;
+            .map_err(|e| OrchestratorError::Api(format!("getKeyPackageStats parse: {e}")))?;
 
         Ok(KeyPackageStats {
             available: val["available"].as_u64().unwrap_or(0) as u32,
@@ -1145,74 +943,8 @@ impl MLSAPIClient for HttpDSClient {
         })
     }
 
-    async fn register_device(
-        &self,
-        device_uuid: &str,
-        device_name: &str,
-        mls_did: &str,
-        signature_key: &[u8],
-        key_packages: &[Vec<u8>],
-        prepared_request_body: &[u8],
-    ) -> OrcResult<DeviceInfo> {
-        let _ = (device_name, signature_key, key_packages);
-
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.enrollDevice"))
-            .bearer_auth(&self.auth_token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(prepared_request_body.to_vec())
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("registerDevice: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError { status, body });
-        }
-
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("registerDevice parse: {e}")))?;
-
-        Ok(DeviceInfo {
-            device_id: val["deviceId"].as_str().unwrap_or(device_uuid).to_string(),
-            mls_did: mls_did.to_string(),
-            device_uuid: device_uuid.to_string(),
-            created_at: Some(Utc::now()),
-            key_id: None,
-            signature_public_key: None,
-            auth_generation: None,
-            status: None,
-            available_package_count: None,
-            reserved_package_count: None,
-        })
-    }
-
     async fn list_devices(&self, _actor_device_id: &str) -> OrcResult<Vec<DeviceInfo>> {
         Ok(vec![])
-    }
-
-    async fn remove_device(&self, _device_id: &str) -> OrcResult<()> {
-        Ok(())
-    }
-
-    async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> OrcResult<()> {
-        let body = serde_json::json!({
-            "convoId": convo_id,
-            "groupInfo": base64::engine::general_purpose::STANDARD.encode(group_info),
-        });
-        let _resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
-            .bearer_auth(&self.auth_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("publishGroupInfo: {e}")))?;
-        Ok(())
     }
 
     async fn get_group_info(&self, convo_id: &str) -> OrcResult<Vec<u8>> {
@@ -1244,71 +976,10 @@ impl MLSAPIClient for HttpDSClient {
         Ok(data)
     }
 
-    async fn get_welcome(&self, convo_id: &str) -> OrcResult<Vec<u8>> {
-        let resp = self
-            .client
-            .get(self.xrpc_url("blue.catbird.chat.getEntries"))
-            .bearer_auth(&self.auth_token)
-            .query(&[("convoId", convo_id), ("limit", "100")])
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("getWelcome: {e}")))?;
-
-        if !resp.status().is_success() {
-            return Err(OrchestratorError::Api("No welcome available".into()));
-        }
-
-        // Welcome messages are delivered as part of normal message flow;
-        // the orchestrator's join_group handles Welcome processing.
+    async fn get_welcome(&self, _convo_id: &str) -> OrcResult<Vec<u8>> {
         Err(OrchestratorError::Api(
             "Welcome retrieval via getMessages — use join_group flow".into(),
         ))
-    }
-
-    async fn process_external_commit(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        group_info: Option<&[u8]>,
-        confirmation_tag: Option<&str>,
-    ) -> OrcResult<ProcessExternalCommitResult> {
-        let mut body = serde_json::json!({
-            "convoId": convo_id,
-            "commitData": base64::engine::general_purpose::STANDARD.encode(commit_data),
-            "changeType": "externalJoin",
-        });
-        if let Some(gi) = group_info {
-            body["groupInfo"] =
-                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(gi));
-        }
-        if let Some(tag) = confirmation_tag {
-            body["confirmationTag"] = serde_json::json!(tag);
-        }
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.chat.submitTransition"))
-            .bearer_auth(&self.auth_token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("processExternalCommit: {e}")))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OrchestratorError::ServerError { status, body });
-        }
-
-        let val: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| OrchestratorError::Api(format!("processExternalCommit parse: {e}")))?;
-
-        Ok(ProcessExternalCommitResult {
-            epoch: val["epoch"].as_u64().unwrap_or(0),
-            rejoined_at: Utc::now().to_rfc3339(),
-            receipt: None,
-        })
     }
 }
 

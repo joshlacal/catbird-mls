@@ -260,11 +260,18 @@ fn last_resort_create_marks_package_and_persists_bundle() {
     assert!(!result.hash_ref.is_empty());
     assert_eq!(ctx.get_key_package_bundle_count().unwrap(), 1);
 
-    let (kp_in, remaining) = KeyPackageIn::tls_deserialize_bytes(&result.key_package_data)
-        .expect("generated key package should deserialize");
+    let (kp_in, remaining) = if let Ok((msg, remaining)) = openmls::prelude::MlsMessageIn::tls_deserialize_bytes(&result.key_package_data) {
+        match msg.extract() {
+            openmls::prelude::MlsMessageBodyIn::KeyPackage(kp) => (kp, remaining),
+            _ => panic!("expected KeyPackage message"),
+        }
+    } else {
+        KeyPackageIn::tls_deserialize_bytes(&result.key_package_data)
+            .expect("generated key package should deserialize")
+    };
     assert!(
         remaining.is_empty(),
-        "raw KeyPackage serialization should not leave trailing bytes"
+        "KeyPackage serialization should not leave trailing bytes"
     );
 
     let provider = openmls_libcrux_crypto::Provider::new().expect("libcrux provider");

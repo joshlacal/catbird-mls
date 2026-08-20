@@ -7,7 +7,6 @@ use tokio::sync::Mutex;
 use web_time::Instant;
 
 use super::api_client::MLSAPIClient;
-#[cfg(not(target_arch = "wasm32"))]
 use super::canonical_transport::{
     CanonicalOperation, CleanChatSigningContext, PreparedRequest, TransportError,
 };
@@ -571,6 +570,19 @@ where
             .filter(|value| !value.is_empty())
             .ok_or_else(|| OrchestratorError::Credential("device not registered".into()))
     }
+    /// Resolve the scoped `actorDid#deviceId` identity string used for every
+    /// local MLSContext crypto operation.
+    pub(crate) async fn require_scoped_identity(&self) -> Result<String> {
+        let user_did = self.require_user_did().await?;
+        if let Some(mls_did) = self.credentials().get_mls_did(&user_did).await? {
+            if !mls_did.is_empty() {
+                return Ok(mls_did);
+            }
+        }
+        let device_id = self.require_actor_device_id().await?;
+        Ok(format!("{user_did}#{device_id}"))
+    }
+
 
     /// Read the lifecycle-bound user for destructive cleanup that may resume
     /// during `initialize` before the public authenticated state becomes
@@ -620,7 +632,6 @@ where
     /// The signing context intentionally has no Authorization header or DPoP
     /// proof. Those are gateway transport credentials and are combined by the
     /// selected direct-DS/Nest adapter after this method returns.
-    #[cfg(not(target_arch = "wasm32"))]
     pub async fn prepare_clean_chat_signed_request(
         &self,
         binding: CleanChatSigningContext,
@@ -638,13 +649,64 @@ where
         }
         let prepared =
             super::canonical_transport::prepare_signed_body(&binding, operation, &body_json)?;
-        let authority = self
+        let authority = if let Some(auth) = self
             .credentials()
             .sign_clean_chat_transcript(&user_did, &prepared.transcript, &prepared.key_id)
             .await
             .map_err(|error| TransportError::Credential(error.to_string()))?
-            .ok_or(TransportError::MissingSigningKey)?;
+        {
+            auth
+        } else {
+            let identity = if let Some(mls_did) = self
+                .credentials()
+                .get_mls_did(&user_did)
+                .await
+                .map_err(|e| TransportError::Credential(e.to_string()))?
+            {
+                mls_did
+            } else {
+                format!("{user_did}#{}", binding.device_id)
+            };
+            let signature = self
+                .mls_context()
+                .sign_with_identity_key(identity.into_bytes(), prepared.transcript.clone())
+                .map_err(|_| TransportError::MissingSigningKey)?;
+            let public_key = prepared
+                .body_public_key
+                .clone()
+                .ok_or(TransportError::InvalidSigningAuthority)?;
+            crate::orchestrator::credentials::CleanChatSigningAuthority {
+                public_key,
+                signature,
+                device_id: binding.device_id.clone(),
+                auth_generation: binding.auth_generation,
+            }
+        };
         super::canonical_transport::prepare_signed_request_with_authority(prepared, authority)
+    }
+
+    pub(crate) async fn submit_signed_clean_chat_request(
+        &self,
+        operation: CanonicalOperation,
+        body_json: Vec<u8>,
+    ) -> Result<super::canonical_transport::GatewayResponse> {
+        let user_did = self.require_user_did().await?;
+        let device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let binding = CleanChatSigningContext {
+            actor_did: user_did,
+            device_id,
+            auth_generation: Some(auth_generation),
+        };
+        let prepared = self
+            .prepare_clean_chat_signed_request(binding, operation, body_json)
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        self.api_client().submit_prepared_request(prepared).await
     }
 
     /// Access the configuration.

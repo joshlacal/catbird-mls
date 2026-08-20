@@ -29,11 +29,22 @@ where
             return Ok(None);
         };
 
+        let identity = if let Some(mls_did) = self.credentials().get_mls_did(user_did).await? {
+            mls_did
+        } else if let Some(device_uuid) = self.credentials().get_device_uuid(user_did).await? {
+            format!("{user_did}#{device_uuid}")
+        } else {
+            user_did.to_string()
+        };
+
         match self
             .mls_context()
-            .import_identity_key(user_did.as_bytes().to_vec(), stored_key)
+            .import_identity_key(identity.into_bytes(), stored_key.clone())
         {
             Ok(()) => {
+                let _ = self
+                    .mls_context()
+                    .import_identity_key(user_did.as_bytes().to_vec(), stored_key);
                 tracing::info!("Imported durable signing key from credential store");
                 Ok(Some(true))
             }
@@ -202,35 +213,55 @@ where
             },
         )
         .map_err(|error| OrchestratorError::Credential(error.to_string()))?;
-        let prepared_request_body = prepared.body.ok_or_else(|| {
-            OrchestratorError::Credential("prepared enrollment has no body".into())
-        })?;
+        if prepared.body.is_none() {
+            return Err(OrchestratorError::Credential("prepared enrollment has no body".into()));
+        }
 
         // Register with server (include initial key package)
-        let device_info = self
+        let response = self
             .api_client()
-            .register_device(
-                &device_uuid,
-                &get_device_name(),
-                &mls_did,
-                &kp_result.signature_public_key,
-                std::slice::from_ref(&kp_result.key_package_data),
-                &prepared_request_body,
-            )
+            .submit_prepared_request(prepared)
             .await
             .map_err(|e| {
-                // Check for device limit
                 if let OrchestratorError::ServerError { status, .. } = &e {
                     if *status == 429 {
                         return OrchestratorError::DeviceLimitReached {
-                            current: 10, // approximate
+                            current: 10,
                             max: self.config().max_devices,
                         };
                     }
                 }
                 e
             })?;
-
+        if response.status != 200 {
+            if response.status == 429 {
+                return Err(OrchestratorError::DeviceLimitReached {
+                    current: 10,
+                    max: self.config().max_devices,
+                });
+            }
+            return Err(OrchestratorError::Api(format!(
+                "device registration failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            )));
+        }
+        let output: crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String> =
+            serde_json::from_slice(&response.body).map_err(|e| {
+                OrchestratorError::Serialization(format!("enroll_device response: {e}"))
+            })?;
+        let device_info = DeviceInfo {
+            device_id: output.device.device_id.to_string(),
+            mls_did: mls_did.clone(),
+            device_uuid: device_uuid.clone(),
+            created_at: Some(chrono::Utc::now()),
+            key_id: Some(output.device.key_id.to_string()),
+            signature_public_key: Some(output.device.signature_public_key.to_vec()),
+            auth_generation: Some(output.device.auth_generation),
+            status: Some("active".into()),
+            available_package_count: Some(output.device.available_package_count as u32),
+            reserved_package_count: Some(output.device.reserved_package_count as u32),
+        };
         if device_info.device_id != device_uuid {
             return Err(OrchestratorError::Credential(format!(
                 "server substituted device ID {} for client ID {}",
@@ -298,9 +329,55 @@ where
     }
 
     /// Remove a device by ID.
-    pub async fn remove_device(&self, device_id: &str) -> Result<()> {
-        tracing::info!(device_id, "Removing device");
-        self.api_client().remove_device(device_id).await
+    pub async fn remove_device(&self, target_device_id: &str) -> Result<()> {
+        tracing::info!(target_device_id, "Removing device");
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let key_id = {
+            let identity_bytes = format!("{user_did}#{actor_device_id}").into_bytes();
+            let pk = self.mls_context().identity_public_key(identity_bytes)?;
+            super::canonical_transport::derive_key_id(&pk)
+        };
+        let target_auth_generation = match self.api_client().list_devices(&actor_device_id).await {
+            Ok(devices) => devices
+                .into_iter()
+                .find(|d| d.device_id == target_device_id || d.device_uuid == target_device_id)
+                .and_then(|d| d.auth_generation)
+                .unwrap_or(1),
+            Err(_) => 1,
+        };
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#deviceRevocationBody",
+            "actorDid": user_did,
+            "actorDeviceId": actor_device_id,
+            "authGeneration": auth_generation,
+            "targetDeviceId": target_device_id,
+            "targetAuthGeneration": target_auth_generation,
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "signatureDomain": "CATBIRD-CHAT-DEVICE-REVOKE\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::RevokeDevice,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(OrchestratorError::Api(format!(
+                "remove_device failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            )));
+        }
+        Ok(())
     }
 }
 

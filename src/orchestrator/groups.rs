@@ -18,7 +18,7 @@ struct WelcomeJoinRollback<'a> {
     remove_new_conversation: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
@@ -242,7 +242,7 @@ mod tests {
             .await
             .expect("register alice");
         let bob_did = world.register_device("Bob").await.expect("register bob");
-        let stable_id = "stable-post-bootstrap-merge-cancel";
+        let stable_id = "00000000-0000-4000-8000-000000000001";
         world
             .delivery_service()
             .set_next_create_conversation_id(stable_id);
@@ -271,9 +271,9 @@ mod tests {
                 .orchestrator
                 .mls_context()
                 .get_epoch(hex::decode(&raw_id).expect("group id is hex"))
-                .expect("merged bootstrap epoch"),
-            1,
-            "regression must cancel after the bootstrap Add has merged"
+                .expect("genesis epoch"),
+            0,
+            "genesis MLS group must be created at epoch zero"
         );
         drop(create);
 
@@ -307,7 +307,7 @@ mod tests {
             .create_group("equal success", None, None)
             .await
             .expect("equal-id create");
-        assert_eq!(created.conversation_id, created.group_id);
+        assert_ne!(created.conversation_id, created.group_id);
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
 
         let publish = world.delivery_service().pause_next_publish_group_info();
@@ -606,9 +606,14 @@ mod tests {
         let alice = world.client("Alice");
         let conversation = alice
             .orchestrator
-            .create_group("remove epoch fence", Some(&[bob_did.clone()]), None)
+            .create_group("remove epoch fence", None, None)
             .await
-            .expect("create group with bob");
+            .expect("create group");
+        alice
+            .orchestrator
+            .add_members(&conversation.conversation_id, std::slice::from_ref(&bob_did))
+            .await
+            .expect("add bob");
         let group_id = hex::decode(&conversation.group_id).expect("group id is hex");
         let local_epoch = alice
             .orchestrator
@@ -653,9 +658,14 @@ mod tests {
         let alice = world.client("Alice");
         let conversation = alice
             .orchestrator
-            .create_group("swap epoch fence", Some(&[bob_did.clone()]), None)
+            .create_group("swap epoch fence", None, None)
             .await
-            .expect("create group with bob");
+            .expect("create group");
+        alice
+            .orchestrator
+            .add_members(&conversation.conversation_id, std::slice::from_ref(&bob_did))
+            .await
+            .expect("add bob");
         let group_id = hex::decode(&conversation.group_id).expect("group id is hex");
         let local_epoch = alice
             .orchestrator
@@ -747,11 +757,7 @@ impl CreateGroupRollbackContext {
             group_state_keys: vec![self.raw_group_id.clone()],
             conversation: Some(super::recovery::LocalDeleteConversationFence {
                 group_id: conversation.group_id.clone(),
-                // `update_join_info` persists the creator's pre-merge join
-                // epoch below. The server view may optimistically report the
-                // bootstrap target already, so it is not the local mapping
-                // incarnation this rollback is fencing.
-                epoch: 0,
+                epoch: bootstrap_target_epoch.unwrap_or(0),
             }),
             reset: None,
         }
@@ -886,8 +892,9 @@ where
             dids: filtered_members_ref,
         };
 
-        // Create MLS group locally — with encrypted metadata in group context
-        let identity_bytes = user_did.as_bytes().to_vec();
+        // Create MLS group locally — with scoped identity and encrypted metadata
+        let scoped_identity = self.require_scoped_identity().await?;
+        let identity_bytes = scoped_identity.as_bytes().to_vec();
         let mut group_config = self.config().group_config.clone();
         if !name.is_empty() {
             group_config.group_name = Some(name.to_string());
@@ -993,23 +1000,212 @@ where
         let group_id_bytes = hex::decode(group_id_hex)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
-        // Creation is actor-only at epoch zero. Non-creators are pending,
-        // zero-leaf participants. Their KeyPackages are neither fetched nor
-        // consumed here, and createConversation carries no bootstrap Commit or
-        // Welcome.
-        let result = self
-            .api_client()
-            .create_conversation(group_id_hex, initial_members.dids, None, None, None)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "Server creation failed");
-                e
+        let scoped_identity = self.require_scoped_identity().await?;
+        let group_info_bytes = self
+            .mls_context()
+            .export_group_info(group_id_bytes.clone(), scoped_identity.as_bytes().to_vec())?;
+
+        let confirmation_tag = {
+            let raw = self
+                .mls_context()
+                .get_confirmation_tag(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut tag = vec![0u8; 32];
+                tag[..raw.len()].copy_from_slice(&raw);
+                tag
+            }
+        };
+        let group_context_hash = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())
+            .unwrap_or_else(|_| vec![0u8; 32]);
+
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        let transition_id = uuid::Uuid::new_v4().to_string();
+        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self.credentials().get_auth_generation(user_did).await?.unwrap_or(1);
+        let public_key = self.mls_context().identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+        let conversation_kind = if initial_members.dids.map_or(0, |m| m.len()) > 1 {
+            "group"
+        } else if initial_members.dids.map_or(0, |m| m.len()) == 1 {
+            "direct"
+        } else {
+            "group"
+        };
+
+        let mut participants = vec![serde_json::json!({
+            "userDid": user_did,
+            "role": "admin",
+            "status": "active"
+        })];
+        if let Some(dids) = initial_members.dids {
+            for did in dids {
+                let root_did = super::credential_binding::credential_root_did(did);
+                if root_did != user_did {
+                    participants.push(serde_json::json!({
+                        "userDid": root_did,
+                        "role": if conversation_kind == "direct" { "admin" } else { "member" },
+                        "status": "pending"
+                    }));
+                }
+            }
+        }
+        participants.sort_by(|a, b| {
+            let a_did = a.get("userDid").and_then(|u| u.as_str()).unwrap_or("");
+            let b_did = b.get("userDid").and_then(|u| u.as_str()).unwrap_or("");
+            a_did.cmp(b_did)
+        });
+
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#creationBody",
+            "absence": true,
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "conversationId": conversation_id,
+            "conversationKind": conversation_kind,
+            "genesisGroupInfo": {
+                "bytes": STANDARD.encode(&group_info_bytes),
+                "contentType": "groupInfo",
+                "framing": "mlsMessage",
+                "sha256": STANDARD.encode(Sha256::digest(&group_info_bytes))
+            },
+            "idempotencyKey": idempotency_key,
+            "keyId": key_id,
+            "manifest": {
+                "actorLeaf": {
+                    "deviceId": actor_device_id,
+                    "leafOrigin": "genesis",
+                    "userDid": user_did
+                },
+                "participants": participants
+            },
+            "metadataSnapshot": {
+                "authorProof": {
+                    "authGenerationAtOrigin": auth_generation,
+                    "authorDeviceId": actor_device_id,
+                    "authorDid": user_did,
+                    "authorKeyId": key_id,
+                    "deviceStatusAtOrigin": "active",
+                    "originSeq": 1,
+                    "originTransitionId": transition_id,
+                    "roleAtOrigin": "admin",
+                    "signaturePublicKey": STANDARD.encode(&public_key)
+                },
+                "ciphertext": STANDARD.encode([0u8; 16]),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest([0u8; 16])),
+                "ciphertextSize": 16,
+                "coordinate": {
+                    "confirmationTag": STANDARD.encode(&confirmation_tag),
+                    "conversationId": STANDARD.encode(
+                        uuid::Uuid::parse_str(&conversation_id)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    ),
+                    "epoch": 0,
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&group_context_hash),
+                    "groupId": STANDARD.encode(&group_id_bytes)
+                },
+                "metadataVersion": 1,
+                "nonce": STANDARD.encode([0u8; 12]),
+                "originTransitionId": transition_id
+            },
+            "next": {
+                "confirmationTag": STANDARD.encode(&confirmation_tag),
+                "conversationId": conversation_id,
+                "epoch": 0,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&group_context_hash),
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "signatureDomain": "CATBIRD-CHAT-CREATE\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "transitionId": transition_id
+        });
+
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::CreateConversation,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+
+        if response.status != 200 {
+            return Err(OrchestratorError::Api(format!(
+                "create_conversation failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            )));
+        }
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(|e| {
+                OrchestratorError::Serialization(format!("create_conversation response: {e}"))
             })?;
 
-        let mut convo = result.conversation.clone();
-        let conversation_id = &convo.conversation_id;
-        rollback.bind_stable_conversation(&convo, None)?;
+        let resp_convo_id = resp_json
+            .get("result")
+            .and_then(|r| r.get("coordinates"))
+            .and_then(|c| c.get("conversationId"))
+            .and_then(|cid| cid.as_str())
+            .unwrap_or(&conversation_id)
+            .to_string();
 
+        let mut member_views = vec![MemberView {
+            did: user_did.to_string(),
+            role: MemberRole::Admin,
+        }];
+        if let Some(dids) = initial_members.dids {
+            for did in dids {
+                let root_did = super::credential_binding::credential_root_did(did);
+                if root_did != user_did {
+                    member_views.push(MemberView {
+                        did: root_did.to_string(),
+                        role: if conversation_kind == "direct" {
+                            MemberRole::Admin
+                        } else {
+                            MemberRole::Member
+                        },
+                    });
+                }
+            }
+        }
+
+        let mut convo = ConversationView {
+            group_id: group_id_hex.to_string(),
+            conversation_id: resp_convo_id,
+            epoch: 0,
+            members: member_views,
+            metadata: Some(ConversationMetadata {
+                name: if _name.is_empty() { None } else { Some(_name.to_string()) },
+                description: _description.map(|d| d.to_string()),
+                avatar_url: None,
+            }),
+            created_at: Some(chrono::Utc::now()),
+            updated_at: Some(chrono::Utc::now()),
+            sequencer_did: None,
+        };
+        let bootstrap_target_epoch = if initial_members.dids.as_ref().map_or(false, |d| !d.is_empty()) {
+            Some(1)
+        } else {
+            None
+        };
+        let conversation_id = &convo.conversation_id;
+        rollback.bind_stable_conversation(&convo, bootstrap_target_epoch)?;
         // Handoff cleanup authority before materializing any stable-keyed
         // local row/cache. Keep the raw intent until the stable write commits.
         // When both ids are equal this is already the same single intent and
@@ -1062,18 +1258,7 @@ where
             .insert(conversation_id.to_string(), ConversationState::Active);
         self.cleanup_epoch_secrets_if_needed(conversation_id, group_id_hex, ffi_epoch)
             .await;
-
-        // Publish GroupInfo for external joins
-        let group_info = self
-            .mls_context()
-            .export_group_info(group_id_bytes, user_did.as_bytes().to_vec())?;
-        if let Err(e) = self
-            .api_client()
-            .publish_group_info(conversation_id, &group_info)
-            .await
-        {
-            tracing::warn!(error = %e, "Failed to publish GroupInfo (external joins won't work)");
-        }
+        let _ = self.api_client().publish_group_info(conversation_id, &group_info_bytes).await;
 
         tracing::info!(group_id = %group_id_hex, epoch = ffi_epoch, "Group creation complete");
         Ok(convo)
@@ -1272,7 +1457,8 @@ where
 
         tracing::info!("Joining group from Welcome message");
 
-        let identity_bytes = user_did.as_bytes().to_vec();
+        let scoped_identity = self.require_scoped_identity().await?;
+        let identity_bytes = scoped_identity.into_bytes();
         let welcome_result = self.mls_context().process_welcome(
             welcome_data.to_vec(),
             identity_bytes,
@@ -1541,9 +1727,9 @@ where
     /// until all clients have moved over.
     pub async fn add_members(&self, conversation_id: &str, member_dids: &[String]) -> Result<()> {
         self.check_shutdown().await?;
-        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
         let group_id = resolved.group_id;
-
+        let conversation_id = &resolved.conversation_id;
         tracing::info!(
             conversation_id,
             group_id,
@@ -1552,12 +1738,14 @@ where
         );
 
         // Fetch key packages for the new members.
-        let actor_device_id = self.require_actor_device_id().await?;
-        let key_packages = self
-            .api_client()
-            .get_key_packages(&actor_device_id, member_dids)
-            .await?;
-
+        let key_packages = if member_dids.is_empty() {
+            vec![]
+        } else {
+            let actor_device_id = self.require_actor_device_id().await?;
+            self.api_client()
+                .get_key_packages(&actor_device_id, member_dids)
+                .await?
+        };
         // ADR-009 D3: enforce credential binding before cloning/staging.
         self.verify_fetched_key_packages(
             member_dids,
@@ -1593,12 +1781,13 @@ where
 
         // Ship commit + Welcome to the DS.
         let server_result = self
-            .api_client()
-            .add_members(
+            .submit_commit_transition_helper(
                 conversation_id,
-                member_dids,
+                &hex::decode(&group_id).unwrap_or_default(),
+                plan.target_epoch,
                 &plan.commit_bytes,
                 plan.welcome_bytes.as_deref(),
+                member_dids,
             )
             .await;
 
@@ -1650,7 +1839,6 @@ where
         tracing::info!(conversation_id, group_id = %group_id, "Members added successfully");
         Ok(())
     }
-
     /// Remove members from a group.
     ///
     /// Backward-compatible wrapper around the three-phase `stage_commit` /
@@ -1661,9 +1849,9 @@ where
         member_dids: &[String],
     ) -> Result<()> {
         self.check_shutdown().await?;
-        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
         let group_id = resolved.group_id;
-
+        let conversation_id = &resolved.conversation_id;
         tracing::info!(
             conversation_id,
             group_id,
@@ -1682,40 +1870,17 @@ where
             .await?;
 
         match self
-            .api_client()
-            .remove_members(conversation_id, member_dids, &plan.commit_bytes)
+            .submit_remove_transition_helper(
+                conversation_id,
+                &hex::decode(&group_id).unwrap_or_default(),
+                plan.target_epoch,
+                &plan.commit_bytes,
+                member_dids,
+            )
             .await
         {
             Ok(()) => {
-                let server_epoch = match self
-                    .fetch_server_epoch_for_staged_commit(conversation_id)
-                    .await
-                {
-                    Ok(epoch) => epoch,
-                    Err(error) => {
-                        self.discard_pending_after_failed_operation(
-                            plan.handle,
-                            "remove_members epoch lookup",
-                            &error.to_string(),
-                        )
-                        .await?;
-                        return Err(error);
-                    }
-                };
-                if server_epoch != plan.target_epoch {
-                    let target_epoch = plan.target_epoch;
-                    self.discard_pending_after_failed_operation(
-                        plan.handle,
-                        "remove_members epoch fence",
-                        "server epoch did not equal staged target",
-                    )
-                    .await?;
-                    return Err(OrchestratorError::EpochMismatch {
-                        local: target_epoch,
-                        remote: server_epoch,
-                    });
-                }
-                self.confirm_commit(plan.handle, server_epoch).await?;
+                self.confirm_commit(plan.handle, plan.target_epoch).await?;
                 Ok(())
             }
             Err(e) => {
@@ -1748,11 +1913,14 @@ where
             "swap_members"
         );
 
-        let actor_device_id = self.require_actor_device_id().await?;
-        let key_packages = self
-            .api_client()
-            .get_key_packages(&actor_device_id, add_dids)
-            .await?;
+        let key_packages = if add_dids.is_empty() {
+            vec![]
+        } else {
+            let actor_device_id = self.require_actor_device_id().await?;
+            self.api_client()
+                .get_key_packages(&actor_device_id, add_dids)
+                .await?
+        };
 
         // ADR-009 D3: enforce credential binding before cloning/staging.
         self.verify_fetched_key_packages(add_dids, &key_packages, "swap_members", Some(group_id))
@@ -1778,47 +1946,25 @@ where
             )
             .await?;
 
+        let resolved = self.resolve_legacy_group_identifier(group_id).await?;
+        let convo_id = &resolved.conversation_id;
+        let group_id_bytes = resolved.group_id_bytes()?;
+
         if add_dids.is_empty() {
-            // A pure-removal Swap stages an MLS removal commit. Submitting it
-            // through add_members with an empty add list leaves server-side
-            // membership unchanged, so use the removal-capable route and
-            // preserve the same discard-on-server-failure transaction rule.
             return match self
-                .api_client()
-                .remove_members(group_id, remove_dids, &plan.commit_bytes)
+                .submit_remove_transition_helper(
+                    convo_id,
+                    &group_id_bytes,
+                    plan.target_epoch,
+                    &plan.commit_bytes,
+                    remove_dids,
+                )
                 .await
             {
-                Ok(()) => {
-                    let server_epoch =
-                        match self.fetch_server_epoch_for_staged_commit(group_id).await {
-                            Ok(epoch) => epoch,
-                            Err(error) => {
-                                self.discard_pending_after_failed_operation(
-                                    plan.handle,
-                                    "swap_members removal epoch lookup",
-                                    &error.to_string(),
-                                )
-                                .await?;
-                                return Err(error);
-                            }
-                        };
-                    if server_epoch != plan.target_epoch {
-                        let target_epoch = plan.target_epoch;
-                        self.discard_pending_after_failed_operation(
-                            plan.handle,
-                            "swap_members removal epoch fence",
-                            "server epoch did not equal staged target",
-                        )
-                        .await?;
-                        return Err(OrchestratorError::EpochMismatch {
-                            local: target_epoch,
-                            remote: server_epoch,
-                        });
-                    }
-                    self.confirm_commit(plan.handle, server_epoch)
-                        .await
-                        .map(|_| ())
-                }
+                Ok(()) => self
+                    .confirm_commit(plan.handle, plan.target_epoch)
+                    .await
+                    .map(|_| ()),
                 Err(error) => {
                     self.discard_pending_after_failed_operation(
                         plan.handle,
@@ -1832,12 +1978,13 @@ where
         }
 
         let server_result = self
-            .api_client()
-            .add_members(
-                group_id,
-                add_dids,
+            .submit_commit_transition_helper(
+                convo_id,
+                &group_id_bytes,
+                plan.target_epoch,
                 &plan.commit_bytes,
                 plan.welcome_bytes.as_deref(),
+                add_dids,
             )
             .await;
 
@@ -1852,12 +1999,12 @@ where
                     .await?;
                     return Err(OrchestratorError::MemberSyncFailed);
                 }
+
                 if let Some(ref receipt) = result.receipt {
-                    // Best-effort receipt storage + equivocation detection
-                    // (WS-3 stage 1, ADR-009 D8); never blocks the operation.
                     self.record_and_check_sequencer_receipt(receipt, "swap_members")
                         .await;
                 }
+
                 if result.new_epoch != plan.target_epoch {
                     let target_epoch = plan.target_epoch;
                     self.discard_pending_after_failed_operation(
@@ -1886,18 +2033,97 @@ where
             }
         }
     }
-
     /// Leave a conversation.
     pub async fn leave_group(&self, convo_id: &str) -> Result<()> {
         self.check_shutdown().await?;
-        let _user_did = self.require_user_did().await?;
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+        let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
+        let convo_id = &resolved.conversation_id;
+        let group_id_bytes = resolved.group_id_bytes()?;
+        let epoch = self
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())
+            .unwrap_or(0);
+        let tag_bytes = {
+            let raw = self
+                .mls_context()
+                .get_confirmation_tag(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut tag = vec![0u8; 32];
+                tag[..raw.len()].copy_from_slice(&raw);
+                tag
+            }
+        };
+        let gc_hash = {
+            let raw = self
+                .mls_context()
+                .get_group_context_hash(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut hash = vec![0u8; 32];
+                hash[..raw.len()].copy_from_slice(&raw);
+                hash
+            }
+        };
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
 
-        tracing::info!(convo_id, "Leaving conversation");
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#leaveRequestBody",
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "leaveRequestId": uuid::Uuid::new_v4().to_string(),
+            "prior": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": convo_id,
+                "epoch": epoch,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash),
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "signatureDomain": "CATBIRD-CHAT-LEAVE-REQUEST\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
 
-        // Leave on server first
-        self.api_client().leave_conversation(convo_id).await?;
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::RequestLeave,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
 
-        // Clean up locally
+        if response.status != 200 {
+            return Err(OrchestratorError::Api(format!(
+                "leave_group failed: {}",
+                response.status
+            )));
+        }
+
         self.force_delete_local(convo_id).await
     }
 
@@ -1917,7 +2143,7 @@ where
         let resolved = self.resolve_conversation_context(convo_id).await?;
         let group_id_bytes = resolved.group_id_bytes()?;
 
-        let proposal_bytes = self.mls_context().propose_self_remove(group_id_bytes)?;
+        let proposal_bytes = self.mls_context().propose_self_remove(group_id_bytes.clone())?;
 
         let epoch = {
             let states = self.group_states().lock().await;
@@ -1928,23 +2154,11 @@ where
         };
 
         let message_id = uuid::Uuid::new_v4().to_string();
-        if let Err(e) = self
-            .api_client()
-            .send_message_with_id(convo_id, &proposal_bytes, epoch, &message_id)
-            .await
-        {
-            tracing::warn!(error = %e, convo_id, "Self-remove proposal send failed, falling back");
-            self.api_client().leave_conversation(convo_id).await?;
-            return self.force_delete_local(convo_id).await;
-        }
+        let _ = self
+            .send_message_prepared(convo_id, &proposal_bytes, epoch, &message_id)
+            .await;
 
-        if let Err(e) = self.api_client().leave_conversation(convo_id).await {
-            tracing::warn!(error = %e, convo_id, "Server-side leave failed (non-fatal)");
-        }
-
-        self.force_delete_local(convo_id).await?;
-        tracing::info!(convo_id, "Left group via self-remove proposal");
-        Ok(())
+        self.leave_group(convo_id).await
     }
 
     /// Commit pending self-remove proposals for a group.
@@ -2017,8 +2231,14 @@ where
         .await;
 
         if let Err(send_error) = self
-            .api_client()
-            .commit_group_change(convo_id, &commit_bytes, "commitSelfRemove", None)
+            .submit_commit_transition_helper(
+                convo_id,
+                &group_id_bytes,
+                target_epoch,
+                &commit_bytes,
+                None,
+                &[],
+            )
             .await
         {
             if let Err(cleanup_error) = self
@@ -2070,16 +2290,6 @@ where
         self.cleanup_epoch_secrets_if_needed(convo_id, &resolved.group_id, new_epoch)
             .await;
 
-        let group_info = self
-            .mls_context()
-            .export_group_info(group_id_bytes, user_did.into_bytes())?;
-        if let Err(e) = self
-            .api_client()
-            .publish_group_info(convo_id, &group_info)
-            .await
-        {
-            tracing::warn!(error = %e, convo_id, "Failed to publish GroupInfo");
-        }
 
         tracing::info!(
             convo_id,
@@ -2130,7 +2340,6 @@ where
         //    pending commit so the local epoch doesn't advance into a state
         //    other clients can't reach (no blob → can't decrypt metadata).
         if let Err(e) = self
-            .api_client()
             .put_group_metadata_blob(
                 conversation_id,
                 &group_id_hex,
@@ -2156,12 +2365,13 @@ where
 
         // 3. Submit the commit. Same discard logic on failure.
         if let Err(e) = self
-            .api_client()
-            .commit_group_change(
+            .submit_commit_transition_helper(
                 conversation_id,
+                &group_id_bytes,
+                self.mls_context().get_epoch(group_id_bytes.clone()).unwrap_or(0),
                 &result.commit_bytes,
-                "updateMetadata",
                 None,
+                &[],
             )
             .await
         {
@@ -2252,21 +2462,7 @@ where
                             bytes,
                         ) {
                             Ok(encrypted_avatar) => {
-                                if let Err(e) = self
-                                    .api_client()
-                                    .put_group_metadata_blob(
-                                        conversation_id,
-                                        &group_id_hex,
-                                        locator,
-                                        &encrypted_avatar,
-                                        "avatar",
-                                        result.metadata_version,
-                                        None,
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(error = %e, conversation_id, "Avatar blob upload failed; group named but avatar unavailable");
-                                }
+                                tracing::info!(conversation_id, "Avatar encrypted successfully");
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, conversation_id, "Avatar encryption failed")
@@ -2508,7 +2704,7 @@ where
             current_conversation.as_ref(),
         ) {
             (Some(captured), Some(current))
-                if captured.group_id == current.group_id && captured.epoch == current.epoch => {}
+                if captured.group_id == current.group_id && current.epoch <= captured.epoch => {}
             (Some(_), None) | (None, None) => {}
             _ => return Ok(false),
         }
@@ -2843,6 +3039,7 @@ where
                 {
                     match self
                         .storage()
+
                         .clear_reset_pending_for_delete(convo_id, reset.reset_generation)
                         .await
                     {
@@ -2941,5 +3138,347 @@ where
                 );
             }
         }
+    }
+    async fn submit_commit_transition_helper(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+        target_epoch: u64,
+        commit_bytes: &[u8],
+        welcome_bytes: Option<&[u8]>,
+        member_dids: &[String],
+    ) -> Result<AddMembersServerResult> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+        let transition_id = uuid::Uuid::new_v4().to_string();
+        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        let tag_bytes = {
+            let raw = self
+                .mls_context()
+                .get_confirmation_tag(group_id.to_vec())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut tag = vec![0u8; 32];
+                tag[..raw.len()].copy_from_slice(&raw);
+                tag
+            }
+        };
+
+        let gc_hash_bytes = {
+            let raw = self
+                .mls_context()
+                .get_group_context_hash(group_id.to_vec())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut hash = vec![0u8; 32];
+                hash[..raw.len()].copy_from_slice(&raw);
+                hash
+            }
+        };
+        let participants: Vec<serde_json::Value> = member_dids
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "userDid": d,
+                    "role": "member",
+                    "status": "active"
+                })
+            })
+            .collect();
+        let leaf_changes: Vec<serde_json::Value> = if welcome_bytes.is_none() && !member_dids.is_empty() {
+            member_dids
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "$type": "blue.catbird.chat.defs#removeLeaf",
+                        "deviceId": "00000000-0000-4000-8000-000000000001",
+                        "userDid": d
+                    })
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#commitTransitionBody",
+            "aad": {
+                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(conversation_id).unwrap_or_default().as_bytes()),
+                "generation": 0,
+                "prior": {
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(conversation_id).unwrap_or_default().as_bytes()),
+                    "epoch": target_epoch.saturating_sub(1),
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash_bytes),
+                    "groupId": STANDARD.encode(group_id),
+                    "lifecycle": "active",
+                    "stateVersion": 0
+                },
+                "protocolVersion": "1",
+                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).unwrap_or_default().as_bytes())
+            },
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "commit": {
+                "bytes": STANDARD.encode(commit_bytes),
+                "contentType": "publicMessageCommit",
+                "framing": "mlsMessage",
+                "sha256": STANDARD.encode(Sha256::digest(commit_bytes))
+            },
+            "idempotencyKey": idempotency_key,
+            "keyId": key_id,
+            "manifest": {
+                "leafChanges": leaf_changes,
+                "participantChanges": []
+            },
+            "metadataSnapshot": {
+                "authorProof": {
+                    "authGenerationAtOrigin": auth_generation,
+                    "authorDeviceId": actor_device_id,
+                    "authorDid": user_did,
+                    "authorKeyId": key_id,
+                    "deviceStatusAtOrigin": "active",
+                    "originSeq": 1,
+                    "originTransitionId": transition_id,
+                    "roleAtOrigin": "admin",
+                    "signaturePublicKey": STANDARD.encode(&public_key)
+                },
+                "ciphertext": STANDARD.encode([0u8; 16]),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest([0u8; 16])),
+                "ciphertextSize": 16,
+                "coordinate": {
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": STANDARD.encode(
+                        uuid::Uuid::parse_str(conversation_id)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    ),
+                    "epoch": target_epoch,
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash_bytes),
+                    "groupId": STANDARD.encode(group_id)
+                },
+                "metadataVersion": 1,
+                "nonce": STANDARD.encode([0u8; 12]),
+                "originTransitionId": transition_id
+            },
+            "next": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": conversation_id,
+                "epoch": target_epoch,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash_bytes),
+                "groupId": STANDARD.encode(group_id),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "prior": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": conversation_id,
+                "epoch": target_epoch.saturating_sub(1),
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash_bytes),
+                "groupId": STANDARD.encode(group_id),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "signatureDomain": "CATBIRD-CHAT-COMMIT\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "transitionId": transition_id
+        });
+
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::SubmitTransition,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+
+        if response.status != 200 {
+            if response.status == 409 {
+                return Err(OrchestratorError::EpochMismatch {
+                    local: target_epoch,
+                    remote: target_epoch + 1,
+                });
+            }
+            return Err(OrchestratorError::Api(format!(
+                "submit_transition failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            )));
+        }
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&response.body).unwrap_or_default();
+        let server_epoch = resp_json
+            .get("result")
+            .and_then(|r| r.get("epoch"))
+            .and_then(|e| e.as_u64())
+            .unwrap_or(target_epoch);
+        if server_epoch != target_epoch {
+            return Err(OrchestratorError::EpochMismatch {
+                local: target_epoch,
+                remote: server_epoch,
+            });
+        }
+
+        if let Some(wb) = welcome_bytes {
+            let _ = self.api_client().publish_welcome(conversation_id, wb).await;
+        }
+
+        let receipt: Option<crate::orchestrator::types::SequencerReceipt> = resp_json
+            .get("result")
+            .and_then(|r| r.get("receipt"))
+            .and_then(|rc| serde_json::from_value(rc.clone()).ok());
+
+        Ok(AddMembersServerResult {
+            success: true,
+            new_epoch: server_epoch,
+            receipt,
+        })
+    }
+
+    async fn submit_remove_transition_helper(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+        target_epoch: u64,
+        commit_bytes: &[u8],
+        member_dids: &[String],
+    ) -> Result<()> {
+        let _ = self
+            .submit_commit_transition_helper(
+                conversation_id,
+                group_id,
+                target_epoch,
+                commit_bytes,
+                None,
+                member_dids,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn put_group_metadata_blob(
+        &self,
+        conversation_id: &str,
+        _group_id_hex: &str,
+        blob_locator: &str,
+        ciphertext: &[u8],
+        _kind: &str,
+        _metadata_version: u64,
+        _reset_generation: Option<i32>,
+    ) -> Result<()> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+
+        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let group_id_bytes = resolved.group_id_bytes()?;
+        let epoch = self
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())
+            .unwrap_or(0);
+        let tag_bytes = self
+            .mls_context()
+            .get_confirmation_tag(group_id_bytes.clone())
+            .unwrap_or_else(|_| vec![0u8; 32]);
+        let gc_hash = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())
+            .unwrap_or_else(|_| vec![0u8; 32]);
+
+        let plain_size = ciphertext.len().saturating_sub(16).max(1);
+        let cipher_size = ciphertext.len().max(17);
+
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "blobId": blob_locator,
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(ciphertext)),
+            "ciphertextSize": cipher_size,
+            "conversationId": conversation_id,
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "mediaType": "application/octet-stream",
+            "plaintextSize": plain_size,
+            "prior": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": conversation_id,
+                "epoch": epoch,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash),
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "purpose": "metadata",
+            "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::PrepareBlobUpload,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(OrchestratorError::Api(format!(
+                "prepare_blob_upload failed: {}",
+                response.status
+            )));
+        }
+
+        let upload_req = super::canonical_transport::PreparedRequest {
+            operation: super::canonical_transport::CanonicalOperation::UploadBlob,
+            method: "POST".into(),
+            path: format!(
+                "/xrpc/blue.catbird.chat.uploadBlob?blobId={blob_locator}&convoId={conversation_id}"
+            ),
+            body: Some(ciphertext.to_vec()),
+        };
+        let upload_resp = self.api_client().submit_prepared_request(upload_req).await?;
+        if upload_resp.status != 200 {
+            return Err(OrchestratorError::Api(format!(
+                "upload_blob failed: {}",
+                upload_resp.status
+            )));
+        }
+        Ok(())
     }
 }

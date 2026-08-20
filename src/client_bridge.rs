@@ -611,6 +611,35 @@ impl MLSAPIClient for ClientAPIAdapter {
         self.0.current_did()
     }
 
+    async fn submit_prepared_request(
+        &self,
+        request: crate::orchestrator::canonical_transport::PreparedRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse> {
+        let route = request.operation.route();
+        let query_bytes = if request.method == "GET" && request.path.contains('?') {
+            request
+                .path
+                .split_once('?')
+                .map(|(_, q)| q.as_bytes().to_vec())
+        } else {
+            None
+        };
+        let ffi_res = self
+            .0
+            .submit_prepared_request(
+                request.method,
+                route.nsid.to_string(),
+                request.body,
+                query_bytes,
+            )
+            .map_err(bridge_err)?;
+        Ok(crate::orchestrator::canonical_transport::GatewayResponse {
+            status: ffi_res.status,
+            content_type: ffi_res.content_type,
+            body: ffi_res.body,
+        })
+    }
+
     async fn get_conversations(
         &self,
         limit: u32,
@@ -623,114 +652,6 @@ impl MLSAPIClient for ClientAPIAdapter {
                 cursor: ffi.cursor,
             })
             .map_err(bridge_err)
-    }
-
-    async fn create_conversation(
-        &self,
-        group_id: &str,
-        initial_members: Option<&[String]>,
-        metadata: Option<&ConversationMetadata>,
-        commit_data: Option<&[u8]>,
-        welcome_data: Option<&[u8]>,
-    ) -> crate::orchestrator::Result<CreateConversationResult> {
-        self.0
-            .create_conversation(
-                group_id.to_string(),
-                initial_members.map(|m| m.to_vec()),
-                metadata.and_then(|m| m.name.clone()),
-                metadata.and_then(|m| m.description.clone()),
-                commit_data.map(|d| d.to_vec()),
-                welcome_data.map(|d| d.to_vec()),
-            )
-            .map(|ffi| CreateConversationResult {
-                conversation: ffi_to_convo_view(&ffi.conversation),
-                commit_data: ffi.commit_data,
-                welcome_data: ffi.welcome_data,
-            })
-            .map_err(bridge_err)
-    }
-
-    async fn leave_conversation(&self, convo_id: &str) -> crate::orchestrator::Result<()> {
-        self.0
-            .leave_conversation(convo_id.to_string())
-            .map_err(bridge_err)
-    }
-
-    async fn add_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-    ) -> crate::orchestrator::Result<AddMembersServerResult> {
-        self.0
-            .add_members(
-                convo_id.to_string(),
-                member_dids.to_vec(),
-                commit_data.to_vec(),
-                welcome_data.map(|d| d.to_vec()),
-            )
-            .map(|ffi| AddMembersServerResult {
-                success: ffi.success,
-                new_epoch: ffi.new_epoch,
-                receipt: ffi
-                    .receipt
-                    .map(crate::orchestrator_bridge::bridge_mappers::ffi_receipt_to_internal),
-            })
-            .map_err(bridge_err)
-    }
-
-    async fn remove_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .remove_members(
-                convo_id.to_string(),
-                member_dids.to_vec(),
-                commit_data.to_vec(),
-            )
-            .map_err(bridge_err)
-    }
-
-    async fn send_message(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-    ) -> crate::orchestrator::Result<crate::orchestrator::SendMessageResponse> {
-        self.send_message_with_id(
-            convo_id,
-            ciphertext,
-            epoch,
-            &uuid::Uuid::new_v4().to_string(),
-        )
-        .await
-    }
-
-    async fn send_message_with_id(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-        msg_id: &str,
-    ) -> crate::orchestrator::Result<crate::orchestrator::SendMessageResponse> {
-        let resp = self
-            .0
-            .send_message(
-                convo_id.to_string(),
-                ciphertext.to_vec(),
-                epoch,
-                msg_id.to_string(),
-            )
-            .map_err(bridge_err)?;
-        Ok(crate::orchestrator::SendMessageResponse {
-            message_id: resp.message_id,
-            seq: resp.seq,
-            epoch: resp.epoch,
-        })
     }
 
     async fn get_messages(
@@ -754,38 +675,21 @@ impl MLSAPIClient for ClientAPIAdapter {
             .map(|ffi| {
                 let envelopes = ffi
                     .envelopes
-                    .iter()
-                    .map(|e| IncomingEnvelope {
-                        conversation_id: e.conversation_id.clone(),
-                        sender_did: e.sender_did.clone(),
-                        ciphertext: e.ciphertext.clone(),
-                        timestamp: e
+                    .into_iter()
+                    .map(|m| IncomingEnvelope {
+                        conversation_id: m.conversation_id,
+                        sender_did: m.sender_did,
+                        ciphertext: m.ciphertext,
+                        timestamp: m
                             .timestamp
                             .parse::<chrono::DateTime<chrono::Utc>>()
                             .unwrap_or_else(|_| chrono::Utc::now()),
-                        server_message_id: e.server_message_id.clone(),
+                        server_message_id: m.server_message_id,
                         server_epoch: None,
                     })
                     .collect();
                 (envelopes, ffi.cursor)
             })
-            .map_err(bridge_err)
-    }
-
-    async fn publish_key_package(
-        &self,
-        key_package: &[u8],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .publish_key_package(
-                key_package.to_vec(),
-                cipher_suite.to_string(),
-                expires_at.to_string(),
-                device_id.map(str::to_string),
-            )
             .map_err(bridge_err)
     }
 
@@ -796,13 +700,13 @@ impl MLSAPIClient for ClientAPIAdapter {
     ) -> crate::orchestrator::Result<Vec<KeyPackageRef>> {
         self.0
             .get_key_packages(actor_device_id.to_string(), dids.to_vec())
-            .map(|v| {
-                v.into_iter()
-                    .map(|ffi| KeyPackageRef {
-                        did: ffi.did,
-                        key_package_data: ffi.key_package_data,
-                        hash: ffi.hash,
-                        cipher_suite: ffi.cipher_suite,
+            .map(|refs| {
+                refs.into_iter()
+                    .map(|r| KeyPackageRef {
+                        did: r.did,
+                        key_package_data: r.key_package_data,
+                        hash: r.hash,
+                        cipher_suite: r.cipher_suite,
                     })
                     .collect()
             })
@@ -833,83 +737,33 @@ impl MLSAPIClient for ClientAPIAdapter {
             .map_err(bridge_err)
     }
 
-    async fn register_device(
-        &self,
-        device_uuid: &str,
-        device_name: &str,
-        mls_did: &str,
-        signature_key: &[u8],
-        key_packages: &[Vec<u8>],
-        prepared_request_body: &[u8],
-    ) -> crate::orchestrator::Result<DeviceInfo> {
-        self.0
-            .register_device(
-                device_uuid.to_string(),
-                device_name.to_string(),
-                mls_did.to_string(),
-                signature_key.to_vec(),
-                key_packages.to_vec(),
-                prepared_request_body.to_vec(),
-            )
-            .map(|ffi| DeviceInfo {
-                device_id: ffi.device_id,
-                mls_did: ffi.mls_did,
-                device_uuid: ffi.device_uuid,
-                created_at: ffi
-                    .created_at
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc)),
-                key_id: ffi.key_id,
-                signature_public_key: ffi.signature_public_key,
-                auth_generation: ffi.auth_generation,
-                status: ffi.status,
-                available_package_count: ffi.available_package_count,
-                reserved_package_count: ffi.reserved_package_count,
-            })
-            .map_err(bridge_err)
-    }
-
     async fn list_devices(
         &self,
         actor_device_id: &str,
     ) -> crate::orchestrator::Result<Vec<DeviceInfo>> {
         self.0
-            .list_devices(actor_device_id.to_owned())
-            .map(|v| {
-                v.into_iter()
-                    .map(|ffi| DeviceInfo {
-                        device_id: ffi.device_id,
-                        mls_did: ffi.mls_did,
-                        device_uuid: ffi.device_uuid,
-                        created_at: ffi
+            .list_devices(actor_device_id.to_string())
+            .map(|devices| {
+                devices
+                    .into_iter()
+                    .map(|d| DeviceInfo {
+                        device_id: d.device_id,
+                        mls_did: d.mls_did,
+                        device_uuid: d.device_uuid,
+                        created_at: d
                             .created_at
-                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                            .as_ref()
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                             .map(|dt| dt.with_timezone(&chrono::Utc)),
-                        key_id: ffi.key_id,
-                        signature_public_key: ffi.signature_public_key,
-                        auth_generation: ffi.auth_generation,
-                        status: ffi.status,
-                        available_package_count: ffi.available_package_count,
-                        reserved_package_count: ffi.reserved_package_count,
+                        key_id: d.key_id,
+                        signature_public_key: d.signature_public_key,
+                        auth_generation: d.auth_generation,
+                        status: d.status,
+                        available_package_count: d.available_package_count,
+                        reserved_package_count: d.reserved_package_count,
                     })
                     .collect()
             })
-            .map_err(bridge_err)
-    }
-
-    async fn remove_device(&self, device_id: &str) -> crate::orchestrator::Result<()> {
-        self.0
-            .remove_device(device_id.to_string())
-            .map_err(bridge_err)
-    }
-
-    async fn publish_group_info(
-        &self,
-        convo_id: &str,
-        group_info: &[u8],
-    ) -> crate::orchestrator::Result<()> {
-        self.0
-            .publish_group_info(convo_id.to_string(), group_info.to_vec())
             .map_err(bridge_err)
     }
 
@@ -919,26 +773,42 @@ impl MLSAPIClient for ClientAPIAdapter {
             .map_err(bridge_err)
     }
 
-    async fn put_group_metadata_blob(
+    async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
+        self.0.get_welcome(convo_id.to_string()).map_err(bridge_err)
+    }
+
+    async fn get_delivery_status(
         &self,
         convo_id: &str,
-        group_id_hex: &str,
-        blob_locator: &str,
-        ciphertext: &[u8],
-        kind: &str,
-        metadata_version: u64,
-        reset_generation: Option<i32>,
-    ) -> crate::orchestrator::Result<()> {
+        message_ids: &[String],
+    ) -> crate::orchestrator::Result<Vec<(String, DeliveryStatus)>> {
         self.0
-            .put_group_metadata_blob(
-                convo_id.to_string(),
-                group_id_hex.to_string(),
-                blob_locator.to_string(),
-                ciphertext.to_vec(),
-                kind.to_string(),
-                metadata_version,
-                reset_generation,
-            )
+            .get_delivery_status(convo_id.to_string(), message_ids.to_vec())
+            .map(|list| {
+                list.into_iter()
+                    .map(|pair| {
+                        let status = match pair.status {
+                            crate::orchestrator_bridge::FFIDeliveryStatus::DeliveredToAll => {
+                                DeliveryStatus::DeliveredToAll
+                            }
+                            crate::orchestrator_bridge::FFIDeliveryStatus::Partial {
+                                acked_count,
+                                total_count,
+                            } => DeliveryStatus::Partial {
+                                acked_count,
+                                total_count,
+                            },
+                            crate::orchestrator_bridge::FFIDeliveryStatus::Pending => {
+                                DeliveryStatus::Pending
+                            }
+                            crate::orchestrator_bridge::FFIDeliveryStatus::LocalOnly => {
+                                DeliveryStatus::LocalOnly
+                            }
+                        };
+                        (pair.message_id, status)
+                    })
+                    .collect()
+            })
             .map_err(bridge_err)
     }
 
@@ -955,35 +825,6 @@ impl MLSAPIClient for ClientAPIAdapter {
                 blob_locator.to_string(),
             )
             .map_err(bridge_err)
-    }
-
-    async fn get_welcome(&self, convo_id: &str) -> crate::orchestrator::Result<Vec<u8>> {
-        self.0.get_welcome(convo_id.to_string()).map_err(bridge_err)
-    }
-
-    async fn process_external_commit(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        group_info: Option<&[u8]>,
-        confirmation_tag: Option<&str>,
-    ) -> crate::orchestrator::Result<crate::orchestrator::ProcessExternalCommitResult> {
-        let result = self
-            .0
-            .process_external_commit(
-                convo_id.to_string(),
-                commit_data.to_vec(),
-                group_info.map(|b| b.to_vec()),
-                confirmation_tag.map(|s| s.to_string()),
-            )
-            .map_err(bridge_err)?;
-        Ok(crate::orchestrator::ProcessExternalCommitResult {
-            epoch: result.epoch,
-            rejoined_at: result.rejoined_at,
-            receipt: result
-                .receipt
-                .map(crate::orchestrator_bridge::bridge_mappers::ffi_receipt_to_internal),
-        })
     }
 }
 

@@ -238,6 +238,12 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
 
+    fn get_group_context_hash(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "get_group_context_hash not available on this platform".to_string(),
+        })
+    }
+
     /// Return the RFC 9420 §8.7 `epoch_authenticator` for the group's current
     /// epoch. Platforms bind quorum-reset reports (§8.6) to this value so a
     /// stale client can't forge votes for an epoch it never observed.

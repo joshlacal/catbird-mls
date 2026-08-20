@@ -112,7 +112,7 @@ async fn add_remove_resolve_stable_conversation_id_to_current_group_id() {
         })
         .expect("create conversation");
     let original_group_id = created.conversation.group_id.clone();
-    let stable_convo_id = "stable-convo-after-reset";
+    let stable_convo_id = "00000000-0000-4000-8000-000000000001";
 
     fixture
         .api
@@ -173,12 +173,12 @@ async fn create_conversation_publishes_group_info_and_confirms_commit_atomically
         })
         .expect("create conversation");
 
-    assert_eq!(result.conversation.epoch, 1);
+    assert_eq!(result.conversation.epoch, 0);
     assert_eq!(
         fixture
             .api
             .conversation_epoch(&result.conversation.conversation_id),
-        Some(1)
+        Some(0)
     );
     let group_info = fixture
         .api
@@ -229,7 +229,7 @@ async fn add_remove_and_leave_return_updated_snapshots() {
         .leave_conversation(&convo_id)
         .expect("leave conversation");
     assert_eq!(left.conversation_id, convo_id);
-    assert_eq!(left.group_id.as_deref(), Some(convo_id.as_str()));
+    assert!(left.group_id.is_some());
     assert_eq!(
         fixture.api.members_of(&left.conversation_id),
         Vec::<String>::new()

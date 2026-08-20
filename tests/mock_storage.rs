@@ -1599,7 +1599,14 @@ impl MLSStorageBackend for MockStorage {
 
     async fn get_group_state(&self, group_id: &str) -> Result<Option<GroupState>> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.group_states.get(group_id).cloned())
+        let state = inner.group_states.get(group_id).cloned().or_else(|| {
+            inner
+                .group_states
+                .values()
+                .find(|s| s.conversation_id == group_id || s.group_id == group_id)
+                .cloned()
+        });
+        Ok(state)
     }
 
     async fn delete_group_state(&self, group_id: &str) -> Result<()> {
@@ -1635,19 +1642,32 @@ impl MLSStorageBackend for MockStorage {
         since_epoch: Option<i32>,
     ) -> Result<Vec<SequencerReceipt>> {
         let inner = self.inner.lock().unwrap();
+        let matched_gid = inner.conversations.values().find(|c| c.conversation_id == convo_id).map(|c| c.group_id.clone());
+        let matched_cid = inner.conversations.values().find(|c| c.group_id == convo_id).map(|c| c.conversation_id.clone());
         Ok(inner
             .sequencer_receipts
             .iter()
-            .filter(|r| r.convo_id == convo_id && since_epoch.is_none_or(|e| r.epoch >= e))
+            .filter(|r| {
+                (r.convo_id == convo_id
+                    || matched_gid.as_deref() == Some(&r.convo_id)
+                    || matched_cid.as_deref() == Some(&r.convo_id))
+                    && since_epoch.is_none_or(|e| r.epoch >= e)
+            })
             .cloned()
             .collect())
     }
 
     async fn clear_sequencer_receipts(&self, conversation_id: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
+        let matched_gid = inner.conversations.values().find(|c| c.conversation_id == conversation_id).map(|c| c.group_id.clone());
+        let matched_cid = inner.conversations.values().find(|c| c.group_id == conversation_id).map(|c| c.conversation_id.clone());
         inner
             .sequencer_receipts
-            .retain(|r| r.convo_id != conversation_id);
+            .retain(|r| {
+                r.convo_id != conversation_id
+                    && matched_gid.as_deref() != Some(&r.convo_id)
+                    && matched_cid.as_deref() != Some(&r.convo_id)
+            });
         Ok(())
     }
 

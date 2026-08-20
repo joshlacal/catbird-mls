@@ -1100,7 +1100,7 @@ where
                 s.readd_attempts += 1;
             }
         }
-        let resolved = match self.resolve_conversation_context(convo_id).await {
+        let resolved = match self.resolve_legacy_group_identifier(convo_id).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 self.escalate_fork_to_rejoin(convo_id).await;
@@ -1127,7 +1127,13 @@ where
             self.escalate_fork_to_rejoin(convo_id).await;
             return Err(OrchestratorError::RecoveryFailed("no members".into()));
         }
-        let actor_device_id = self.require_actor_device_id().await?;
+        let actor_device_id = match self.require_actor_device_id().await {
+            Ok(id) => id,
+            Err(e) => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(e);
+            }
+        };
         let kp_refs = match self
             .api_client()
             .get_key_packages(&actor_device_id, &mems)
@@ -1170,21 +1176,146 @@ where
                 return Err(OrchestratorError::RecoveryFailed(format!("{e}")));
             }
         };
-        let tag = self
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
             .mls_context()
-            .get_confirmation_tag(gid.clone())
-            .map(|t| base64::engine::general_purpose::STANDARD.encode(&t))
-            .ok();
-        if let Err(e) = self
-            .api_client()
-            .commit_group_change(
-                &resolved.conversation_id,
-                &commit,
-                "forkReadd",
-                tag.as_deref(),
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+        let target_epoch = self.mls_context().get_epoch(gid.clone()).unwrap_or(0) + 1;
+        let tag_bytes = {
+            let raw = self
+                .mls_context()
+                .get_confirmation_tag(gid.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut tag = vec![0u8; 32];
+                tag[..raw.len()].copy_from_slice(&raw);
+                tag
+            }
+        };
+        let gc_hash = {
+            let raw = self
+                .mls_context()
+                .get_group_context_hash(gid.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut hash = vec![0u8; 32];
+                hash[..raw.len()].copy_from_slice(&raw);
+                hash
+            }
+        };
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let transition_id = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#commitTransitionBody",
+            "aad": {
+                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                "generation": 0,
+                "prior": {
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                    "epoch": target_epoch.saturating_sub(1),
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash),
+                    "groupId": STANDARD.encode(&gid),
+                    "lifecycle": "active",
+                    "stateVersion": 0
+                },
+                "protocolVersion": "1",
+                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).unwrap_or_default().as_bytes())
+            },
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "commit": {
+                "bytes": STANDARD.encode(&commit),
+                "contentType": "publicMessageCommit",
+                "framing": "mlsMessage",
+                "sha256": STANDARD.encode(Sha256::digest(&commit))
+            },
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "manifest": {
+                "leafChanges": [],
+                "participantChanges": []
+            },
+            "metadataSnapshot": {
+                "authorProof": {
+                    "authGenerationAtOrigin": auth_generation,
+                    "authorDeviceId": actor_device_id,
+                    "authorDid": user_did,
+                    "authorKeyId": key_id,
+                    "deviceStatusAtOrigin": "active",
+                    "originSeq": 1,
+                    "originTransitionId": transition_id,
+                    "roleAtOrigin": "admin",
+                    "signaturePublicKey": STANDARD.encode(&public_key)
+                },
+                "ciphertext": STANDARD.encode([0u8; 16]),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest([0u8; 16])),
+                "ciphertextSize": 16,
+                "coordinate": {
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                    "epoch": target_epoch,
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash),
+                    "groupId": STANDARD.encode(&gid)
+                },
+                "metadataVersion": 1,
+                "nonce": STANDARD.encode([0u8; 12]),
+                "originTransitionId": transition_id
+            },
+            "next": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": resolved.conversation_id.clone(),
+                "epoch": target_epoch,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash),
+                "groupId": STANDARD.encode(&gid),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "prior": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": resolved.conversation_id.clone(),
+                "epoch": target_epoch.saturating_sub(1),
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash),
+                "groupId": STANDARD.encode(&gid),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "signatureDomain": "CATBIRD-CHAT-COMMIT\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "transitionId": transition_id
+        });
+
+        let send_res = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::SubmitTransition,
+                serde_json::to_vec(&body).map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
             )
-            .await
-        {
+            .await;
+
+        if let Err(e) = send_res {
             let _ = self.mls_context().clear_pending_commit(gid);
             self.escalate_fork_to_rejoin(convo_id).await;
             return Err(OrchestratorError::RecoveryFailed(format!("{e}")));
@@ -1254,15 +1385,10 @@ where
                     fds.remove(convo_id);
                 }
                 self.decrypt_fail_counts().lock().await.remove(convo_id);
-                if let Ok(gi) = self
+                let scoped_identity = self.require_scoped_identity().await?;
+                let _ = self
                     .mls_context()
-                    .export_group_info(gid, user_did.as_bytes().to_vec())
-                {
-                    let _ = self
-                        .api_client()
-                        .publish_group_info(&resolved.conversation_id, &gi)
-                        .await;
-                }
+                    .export_group_info(gid, scoped_identity.as_bytes().to_vec());
                 tracing::info!(convo_id, "Fork readd succeeded");
                 Ok(())
             }
@@ -1633,22 +1759,9 @@ where
             // network / OpenMLS storage issues that should self-heal via
             // §6.6 / §8.4 instead of triggering a global reset.
             let authenticator = self.epoch_authenticator_hex(convo_id).await;
-            if let Err(e) = self
-                .api_client()
-                .report_recovery_failure(
-                    convo_id,
-                    "external_commit_exhausted",
-                    authenticator.as_deref(),
-                    Some("local_state_loss"),
-                )
-                .await
-            {
-                tracing::warn!(
-                    convo_id,
-                    error = %e,
-                    "Failed to report recovery failure to server"
-                );
-            }
+            let _ = self
+                .submit_reset_request_prepared(convo_id, "external_commit_exhausted")
+                .await;
             return Err(OrchestratorError::RecoveryFailed(format!(
                 "Rejoin suppressed for {convo_id}: max attempts reached"
             )));
@@ -2190,8 +2303,7 @@ where
                     .await?
                     .unwrap_or_else(|| user_did.to_string());
                 let reissue_result = self
-                    .api_client()
-                    .request_welcome_reissue(convo_id, &recipient_device_did, &reason)
+                    .submit_leaf_recovery_request(convo_id, &recipient_device_did, &reason)
                     .await;
                 // Record the attempt REGARDLESS of the request outcome. A
                 // failing or unwired reissue backend (the ApiClient default
@@ -2684,17 +2796,161 @@ where
             )
             .await?;
 
-        let server_result = self
-            .api_client()
-            .add_members_with_idempotency(
-                convo_id,
-                &[recipient_user_did.clone()],
-                &plan.commit_bytes,
-                plan.welcome_bytes.as_deref(),
-                request_id,
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+        let group_id_bytes = hex::decode(&resolved.group_id).unwrap_or_default();
+        let tag_bytes = {
+            let raw = self
+                .mls_context()
+                .get_confirmation_tag(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut tag = vec![0u8; 32];
+                tag[..raw.len()].copy_from_slice(&raw);
+                tag
+            }
+        };
+        let gc_hash = {
+            let raw = self
+                .mls_context()
+                .get_group_context_hash(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut hash = vec![0u8; 32];
+                hash[..raw.len()].copy_from_slice(&raw);
+                hash
+            }
+        };
+
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let transition_id = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
+            "aad": {
+                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                "generation": 0,
+                "prior": {
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                    "epoch": plan.target_epoch.saturating_sub(1),
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash),
+                    "groupId": STANDARD.encode(&group_id_bytes),
+                    "lifecycle": "active",
+                    "stateVersion": 0
+                },
+                "protocolVersion": "1",
+                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).unwrap_or_default().as_bytes())
+            },
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "commit": {
+                "bytes": STANDARD.encode(&plan.commit_bytes),
+                "contentType": "publicMessageCommit",
+                "framing": "mlsMessage",
+                "sha256": STANDARD.encode(Sha256::digest(&plan.commit_bytes))
+            },
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "manifest": {
+                "leafChanges": [],
+                "participantChanges": []
+            },
+            "metadataSnapshot": {
+                "authorProof": {
+                    "authGenerationAtOrigin": auth_generation,
+                    "authorDeviceId": actor_device_id,
+                    "authorDid": user_did,
+                    "authorKeyId": key_id,
+                    "deviceStatusAtOrigin": "active",
+                    "originSeq": 1,
+                    "originTransitionId": transition_id,
+                    "roleAtOrigin": "admin",
+                    "signaturePublicKey": STANDARD.encode(&public_key)
+                },
+                "ciphertext": STANDARD.encode([0u8; 16]),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest([0u8; 16])),
+                "ciphertextSize": 16,
+                "coordinate": {
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                    "epoch": plan.target_epoch,
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash),
+                    "groupId": STANDARD.encode(&group_id_bytes)
+                },
+                "metadataVersion": 1,
+                "nonce": STANDARD.encode([0u8; 12]),
+                "originTransitionId": transition_id
+            },
+            "next": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": resolved.conversation_id.clone(),
+                "epoch": plan.target_epoch,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash),
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "prior": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": resolved.conversation_id.clone(),
+                "epoch": plan.target_epoch.saturating_sub(1),
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash),
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "recoveryRequestId": request_id,
+            "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "transitionId": transition_id
+        });
+
+        let server_resp = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::SubmitTransition,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
             )
             .await;
 
+        let server_result: std::result::Result<AddMembersServerResult, OrchestratorError> =
+            match server_resp {
+                Ok(resp) if resp.status == 200 => Ok(AddMembersServerResult {
+                    success: true,
+                    new_epoch: plan.target_epoch,
+                    receipt: None,
+                }),
+                Ok(resp) => Err(OrchestratorError::Api(format!(
+                    "respond_to_welcome_reissue failed with status {}",
+                    resp.status
+                ))),
+                Err(e) => Err(e),
+            };
         match server_result {
             Ok(result) => {
                 if !result.success {
@@ -2846,7 +3102,8 @@ where
         )?;
 
         // Create External Commit
-        let identity_bytes = user_did.as_bytes().to_vec();
+        let scoped_identity = self.require_scoped_identity().await?;
+        let identity_bytes = scoped_identity.into_bytes();
         let ext_commit_result = match self
             .mls_context()
             .create_external_commit(group_info, identity_bytes)
@@ -2868,22 +3125,9 @@ where
                     // server-side ratchet/GroupInfo is malformed), so this
                     // report SHOULD count toward server-side quorum auto-reset.
                     let authenticator = self.epoch_authenticator_hex(convo_id).await;
-                    if let Err(report_err) = self
-                        .api_client()
-                        .report_recovery_failure(
-                            convo_id,
-                            "remote_data_error",
-                            authenticator.as_deref(),
-                            Some("group_state_unrecoverable"),
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            convo_id,
-                            error = %report_err,
-                            "Failed to report remote data recovery failure"
-                        );
-                    }
+                    let _ = self
+                        .submit_reset_request_prepared(convo_id, "remote_data_error")
+                        .await;
                     return Err(err);
                 }
                 tracing::error!(error = %e, "External Commit creation failed");
@@ -2925,13 +3169,7 @@ where
         // Send commit to server via the processExternalCommit endpoint
         // (NOT sendMessage — that endpoint validates padding/epoch/membership which don't apply)
         let ext_commit_server_result = match self
-            .api_client()
-            .process_external_commit(
-                convo_id,
-                &ext_commit_result.commit_data,
-                ext_commit_result.group_info.as_deref(),
-                tag_b64.as_deref(),
-            )
+            .submit_external_commit_prepared(convo_id, &ext_commit_result.commit_data, target_epoch)
             .await
         {
             Ok(result) => result,
@@ -2950,6 +3188,9 @@ where
                     )));
                 }
                 self.remove_own_commit_tracking(&commit_hash).await;
+                if matches!(e, OrchestratorError::EpochMismatch { .. }) {
+                    return Err(e);
+                }
                 return Err(OrchestratorError::RecoveryFailed(format!(
                     "Failed to send external commit: {e}"
                 )));
@@ -3110,17 +3351,10 @@ where
         // will process every envelope durably before advancing either field;
         // recovery deliberately leaves the complete existing cursor unchanged.
 
-        // Publish updated GroupInfo
-        let group_info = self
+        let scoped_identity = self.require_scoped_identity().await?;
+        let _ = self
             .mls_context()
-            .export_group_info(ext_commit_result.group_id, user_did.as_bytes().to_vec())?;
-        if let Err(e) = self
-            .api_client()
-            .publish_group_info(convo_id, &group_info)
-            .await
-        {
-            tracing::warn!(error = %e, convo_id, "Failed to publish GroupInfo (external joins may fail)");
-        }
+            .export_group_info(ext_commit_result.group_id, scoped_identity.as_bytes().to_vec());
 
         tracing::info!(convo_id, new_epoch = merged, "Force rejoin successful");
         Ok(())
@@ -3160,17 +3394,7 @@ where
             has_authenticator = authenticator.is_some(),
             "Reporting unrecoverable-local state to server (A7 reset path)",
         );
-        if let Err(e) = self
-            .api_client()
-            .report_recovery_failure(convo_id, reason, authenticator.as_deref(), failure_mode)
-            .await
-        {
-            tracing::warn!(
-                convo_id,
-                error = %e,
-                "report_unrecoverable_local: API call failed (best-effort, swallowed)",
-            );
-        }
+        let _ = self.submit_reset_request_prepared(convo_id, reason).await;
     }
 
     /// 1. Fetches GroupInfo from server
@@ -3205,6 +3429,8 @@ where
     pub async fn force_rejoin(&self, convo_id: &str) -> Result<()> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
+        let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
+        let convo_id = &resolved.conversation_id;
         let rejoin_lock = self.rejoin_lock(convo_id).await;
         let _rejoin_guard = match rejoin_lock.try_lock() {
             Ok(guard) => guard,
@@ -3405,7 +3631,8 @@ where
                     welcome_data.len()
                 );
 
-                let identity_bytes = user_did.as_bytes().to_vec();
+                let scoped_identity = self.require_scoped_identity().await?;
+                let identity_bytes = scoped_identity.into_bytes();
                 let welcome_result = self.mls_context().process_welcome(
                     welcome_data,
                     identity_bytes,
@@ -3862,7 +4089,7 @@ where
             if let Ok(devices) = self.api_client().list_devices(&device_uuid).await {
                 for device in &devices {
                     if device.device_uuid == device_uuid {
-                        let _ = self.api_client().remove_device(&device.device_id).await;
+                        let _ = self.remove_device(&device.device_id).await;
                     }
                 }
             }
@@ -4882,7 +5109,8 @@ where
         );
 
         // 1. Create local MLS group AT the predetermined id.
-        let identity_bytes = user_did.as_bytes().to_vec();
+        let scoped_identity = self.require_scoped_identity().await?;
+        let identity_bytes = scoped_identity.into_bytes();
         let group_config = self.config().group_config.clone();
         let resumed_existing_candidate =
             self.mls_context().group_exists(new_group_id_bytes.clone());
@@ -4939,17 +5167,8 @@ where
         // plumbing lands, swap to derive from convo state.
         let cipher_suite = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
         let result = self
-            .api_client()
-            .bootstrap_reset_group(
-                convo_id,
-                &payload.new_group_id,
-                cipher_suite,
-                &group_info,
-                &roster,
-                None, // welcome_message: race-winner publishes Welcomes via the standard add-members commit path; not bootstrapped inline
-            )
+            .submit_activate_reset_prepared(convo_id, payload, &group_info)
             .await;
-
         match result {
             Ok(_create_result) => {
                 tracing::info!(
@@ -5037,7 +5256,6 @@ where
                 // the next bootstrap attempt starts clean. Keep reset_pending.
                 tracing::warn!(
                     convo_id,
-                    error = %err,
                     "first-responder bootstrap bootstrapResetGroup failed; dropping local group, will retry"
                 );
                 if resumed_existing_candidate {
@@ -5164,10 +5382,16 @@ where
         &self,
         convo_id: &str,
     ) -> Option<crate::orchestrator::types::QuarantineState> {
-        self.recovery_tracker()
-            .lock()
-            .await
-            .quarantine_snapshot(convo_id)
+        let tracker = self.recovery_tracker().lock().await;
+        if let Some(state) = tracker.quarantine_snapshot(convo_id) {
+            return Some(state);
+        }
+        if let Ok(resolved) = self.resolve_legacy_group_identifier(convo_id).await {
+            if let Some(state) = tracker.quarantine_snapshot(&resolved.conversation_id) {
+                return Some(state);
+            }
+        }
+        None
     }
 
     /// Internal: mark a conversation quarantined and persist the transition.
@@ -5336,18 +5560,9 @@ where
         // Report deliberate user vote so server quorum (spec section 8.6) can
         // include this client. Reason is logged in the structured tracing log.
         let auth = self.epoch_authenticator_hex(convo_id).await;
-        if let Err(e) = self
-            .api_client()
-            .report_recovery_failure(
-                convo_id,
-                "user_initiated_quarantine",
-                auth.as_deref(),
-                Some("group_state_unrecoverable"),
-            )
-            .await
-        {
-            tracing::warn!(convo_id, error = %e, "user_confirmed_manual_reset: report_recovery_failure failed (best-effort)");
-        }
+        tracing::info!(convo_id, auth = ?auth, "user_confirmed_manual_reset: manual reset confirmed by user");
+        self.submit_reset_request_prepared(convo_id, "manualRecovery")
+            .await?;
         self.exit_quarantine(
             convo_id,
             crate::orchestrator::types::QuarantineExitReason::UserConfirmedReset,
@@ -5375,6 +5590,460 @@ where
         if let Some(obs) = self.current_event_observer().await {
             obs.on_conversation_quarantine_cleared(convo_id, via);
         }
+    }
+
+    async fn submit_leaf_recovery_request(
+        &self,
+        convo_id: &str,
+        recipient_device_did: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+        let recovery_request_id = uuid::Uuid::new_v4().to_string();
+        let resolved = self.resolve_legacy_group_identifier(convo_id).await.ok();
+        let group_id_bytes = resolved.as_ref().and_then(|r| r.group_id_bytes().ok()).unwrap_or_else(|| vec![0u8; 32]);
+        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone()).unwrap_or_else(|_| vec![0u8; 32]);
+        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone()).unwrap_or_else(|_| vec![0u8; 32]);
+        let tag_bytes = if tag_bytes.len() == 32 { tag_bytes } else if tag_bytes.len() > 32 { tag_bytes[tag_bytes.len() - 32..].to_vec() } else { let mut t = vec![0u8; 32]; t[..tag_bytes.len()].copy_from_slice(&tag_bytes); t };
+        let gc_hash = if gc_hash.len() == 32 { gc_hash } else if gc_hash.len() > 32 { gc_hash[gc_hash.len() - 32..].to_vec() } else { let mut h = vec![0u8; 32]; h[..gc_hash.len()].copy_from_slice(&gc_hash); h };
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "prior": {
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&tag_bytes),
+                "conversationId": convo_id,
+                "epoch": 0,
+                "generation": 0,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&gc_hash),
+                "groupId": base64::engine::general_purpose::STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "recoveryKind": "replace",
+            "recoveryRequestId": recovery_request_id,
+            "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::RequestLeafRecovery,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(OrchestratorError::Api(format!(
+                "request_welcome_reissue failed: {}",
+                response.status
+            )));
+        }
+        Ok(())
+    }
+
+    async fn submit_external_commit_prepared(
+        &self,
+        convo_id: &str,
+        commit_data: &[u8],
+        target_epoch: u64,
+    ) -> Result<ProcessExternalCommitResult> {
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+
+        let resolved = self.resolve_conversation_context(convo_id).await?;
+        let group_id_bytes = hex::decode(&resolved.group_id).unwrap_or_default();
+        let tag_bytes = {
+            let raw = self
+                .mls_context()
+                .get_confirmation_tag(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut tag = vec![0u8; 32];
+                tag[..raw.len()].copy_from_slice(&raw);
+                tag
+            }
+        };
+        let gc_hash = {
+            let raw = self
+                .mls_context()
+                .get_group_context_hash(group_id_bytes.clone())
+                .unwrap_or_else(|_| vec![0u8; 32]);
+            if raw.len() == 32 {
+                raw
+            } else if raw.len() > 32 {
+                raw[raw.len() - 32..].to_vec()
+            } else {
+                let mut hash = vec![0u8; 32];
+                hash[..raw.len()].copy_from_slice(&raw);
+                hash
+            }
+        };
+
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+
+        let transition_id = uuid::Uuid::new_v4().to_string();
+        let idempotency_key = uuid::Uuid::new_v4().to_string();
+
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#commitTransitionBody",
+            "aad": {
+                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(convo_id).unwrap_or_default().as_bytes()),
+                "generation": 0,
+                "prior": {
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(convo_id).unwrap_or_default().as_bytes()),
+                    "epoch": target_epoch.saturating_sub(1),
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash),
+                    "groupId": STANDARD.encode(&group_id_bytes),
+                    "lifecycle": "active",
+                    "stateVersion": 0
+                },
+                "protocolVersion": "1",
+                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).unwrap_or_default().as_bytes())
+            },
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "commit": {
+                "bytes": STANDARD.encode(commit_data),
+                "contentType": "publicMessageCommit",
+                "framing": "mlsMessage",
+                "sha256": STANDARD.encode(Sha256::digest(commit_data))
+            },
+            "idempotencyKey": idempotency_key,
+            "keyId": key_id,
+            "manifest": {
+                "leafChanges": [],
+                "participantChanges": []
+            },
+            "metadataSnapshot": {
+                "authorProof": {
+                    "authGenerationAtOrigin": auth_generation,
+                    "authorDeviceId": actor_device_id,
+                    "authorDid": user_did,
+                    "authorKeyId": key_id,
+                    "deviceStatusAtOrigin": "active",
+                    "originSeq": 1,
+                    "originTransitionId": transition_id,
+                    "roleAtOrigin": "admin",
+                    "signaturePublicKey": STANDARD.encode(&public_key)
+                },
+                "ciphertext": STANDARD.encode([0u8; 16]),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest([0u8; 16])),
+                "ciphertextSize": 16,
+                "coordinate": {
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(convo_id).unwrap_or_default().as_bytes()),
+                    "epoch": target_epoch,
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash),
+                    "groupId": STANDARD.encode(&group_id_bytes)
+                },
+                "metadataVersion": 1,
+                "nonce": STANDARD.encode([0u8; 12]),
+                "originTransitionId": transition_id
+            },
+            "next": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": convo_id,
+                "epoch": target_epoch,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash),
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "prior": {
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": convo_id,
+                "epoch": target_epoch.saturating_sub(1),
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash),
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "signatureDomain": "CATBIRD-CHAT-COMMIT\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "transitionId": transition_id
+        });
+
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::SubmitTransition,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+
+        if response.status != 200 {
+            if response.status == 409 {
+                return Err(OrchestratorError::EpochMismatch {
+                    local: target_epoch,
+                    remote: target_epoch + 1,
+                });
+            }
+            return Err(OrchestratorError::Api(format!(
+                "process_external_commit failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            )));
+        }
+
+        let resp_json: serde_json::Value =
+            serde_json::from_slice(&response.body).unwrap_or_default();
+        let server_epoch = resp_json
+            .get("result")
+            .and_then(|r| r.get("epoch"))
+            .and_then(|e| e.as_u64())
+            .unwrap_or(target_epoch);
+        if server_epoch != target_epoch {
+            return Err(OrchestratorError::EpochMismatch {
+                local: target_epoch,
+                remote: server_epoch,
+            });
+        }
+        let receipt: Option<crate::orchestrator::types::SequencerReceipt> = resp_json
+            .get("result")
+            .and_then(|r| r.get("receipt"))
+            .and_then(|rc| serde_json::from_value(rc.clone()).ok());
+
+        Ok(ProcessExternalCommitResult {
+            epoch: target_epoch,
+            rejoined_at: chrono::Utc::now().to_rfc3339(),
+            receipt,
+        })
+    }
+
+    async fn submit_reset_request_prepared(
+        &self,
+        convo_id: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let reason_enum = match reason {
+            "localStateLost" | "poisonedState" | "epochDivergence" | "manualRecovery" => reason,
+            _ => "manualRecovery",
+        };
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+        let resolved = self.resolve_legacy_group_identifier(convo_id).await.ok();
+        let group_id_bytes = resolved.as_ref().and_then(|r| r.group_id_bytes().ok()).unwrap_or_else(|| vec![0u8; 32]);
+        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone()).unwrap_or_else(|_| vec![0u8; 32]);
+        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone()).unwrap_or_else(|_| vec![0u8; 32]);
+        let tag_bytes = if tag_bytes.len() == 32 { tag_bytes } else if tag_bytes.len() > 32 { tag_bytes[tag_bytes.len() - 32..].to_vec() } else { let mut t = vec![0u8; 32]; t[..tag_bytes.len()].copy_from_slice(&tag_bytes); t };
+        let gc_hash = if gc_hash.len() == 32 { gc_hash } else if gc_hash.len() > 32 { gc_hash[gc_hash.len() - 32..].to_vec() } else { let mut h = vec![0u8; 32]; h[..gc_hash.len()].copy_from_slice(&gc_hash); h };
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#resetRequestBody",
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "prior": {
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&tag_bytes),
+                "conversationId": convo_id,
+                "epoch": 0,
+                "generation": 0,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&gc_hash),
+                "groupId": base64::engine::general_purpose::STANDARD.encode(&group_id_bytes),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "reason": reason_enum,
+            "resetRequestId": uuid::Uuid::new_v4().to_string(),
+            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        self.submit_signed_clean_chat_request(
+            super::canonical_transport::CanonicalOperation::RequestReset,
+            serde_json::to_vec(&body)
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn submit_activate_reset_prepared(
+        &self,
+        convo_id: &str,
+        payload: &ResetPendingPayload,
+        group_info: &[u8],
+    ) -> Result<CreateConversationResult> {
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+        let transition_id = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#resetActivationBody",
+            "actorDeviceId": actor_device_id,
+            "actorDid": user_did,
+            "authGeneration": auth_generation,
+            "conversationKind": "group",
+            "genesisGroupInfo": {
+                "bytes": base64::engine::general_purpose::STANDARD.encode(group_info),
+                "contentType": "groupInfo",
+                "framing": "mlsMessage",
+                "sha256": base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(group_info))
+            },
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "manifest": {
+                "actorLeaf": {
+                    "deviceId": actor_device_id,
+                    "leafOrigin": "genesis",
+                    "userDid": user_did
+                },
+                "participants": [{
+                    "userDid": user_did,
+                    "role": "admin",
+                    "status": "active"
+                }]
+            },
+            "metadataSnapshot": {
+                "authorProof": {
+                    "authGenerationAtOrigin": auth_generation,
+                    "authorDeviceId": actor_device_id,
+                    "authorDid": user_did,
+                    "authorKeyId": key_id,
+                    "deviceStatusAtOrigin": "active",
+                    "originSeq": 1,
+                    "originTransitionId": transition_id,
+                    "roleAtOrigin": "admin",
+                    "signaturePublicKey": base64::engine::general_purpose::STANDARD.encode(&public_key)
+                },
+                "ciphertext": base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
+                "ciphertextSha256": base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest([0u8; 16])),
+                "ciphertextSize": 16,
+                "coordinate": {
+                    "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                    "conversationId": base64::engine::general_purpose::STANDARD.encode(
+                        uuid::Uuid::parse_str(convo_id)
+                            .unwrap_or_default()
+                            .as_bytes(),
+                    ),
+                    "epoch": 0,
+                    "generation": payload.reset_generation + 1,
+                    "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                    "groupId": base64::engine::general_purpose::STANDARD.encode(hex::decode(&payload.new_group_id).unwrap_or_default())
+                },
+                "metadataVersion": 1,
+                "nonce": base64::engine::general_purpose::STANDARD.encode([0u8; 12]),
+                "originTransitionId": transition_id
+            },
+            "prior": {
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "conversationId": convo_id,
+                "epoch": 0,
+                "generation": payload.reset_generation,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "groupId": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "resetRequestId": uuid::Uuid::new_v4().to_string(),
+            "retired": {
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "conversationId": convo_id,
+                "epoch": 0,
+                "generation": payload.reset_generation,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "groupId": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "lifecycle": "superseded",
+                "stateVersion": 1
+            },
+            "signatureDomain": "CATBIRD-CHAT-RESET-ACTIVATE\0",
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "successor": {
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "conversationId": convo_id,
+                "epoch": 0,
+                "generation": payload.reset_generation + 1,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "groupId": base64::engine::general_purpose::STANDARD.encode(hex::decode(&payload.new_group_id).unwrap_or_default()),
+                "lifecycle": "active",
+                "stateVersion": 0
+            },
+            "transitionId": transition_id
+        });
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::ActivateReset,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(OrchestratorError::Api(format!(
+                "bootstrap_reset_group failed: {}",
+                response.status
+            )));
+        }
+        Ok(CreateConversationResult {
+            conversation: ConversationView {
+                group_id: payload.new_group_id.clone(),
+                conversation_id: convo_id.to_string(),
+                epoch: 0,
+                members: vec![MemberView {
+                    did: user_did,
+                    role: MemberRole::Admin,
+                }],
+                metadata: None,
+                created_at: Some(chrono::Utc::now()),
+                updated_at: Some(chrono::Utc::now()),
+                sequencer_did: None,
+            },
+            commit_data: None,
+            welcome_data: None,
+        })
     }
 }
 
@@ -5806,6 +6475,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn force_rejoin_group_state_write_failure_preserves_recovery_state() {
         let mut world = crate::recovery_e2e_harness::TestWorld::new();
@@ -5899,6 +6569,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn force_rejoin_rejects_wrong_callback_epoch_without_merging_candidate() {
         let mut world = crate::recovery_e2e_harness::TestWorld::new();
@@ -5941,6 +6612,7 @@ mod tests {
         assert!(alice.storage.has_rejoin_flag(&conversation.conversation_id));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn force_rejoin_preserves_both_sync_cursor_fields_and_fetches_no_seed_envelope() {
         let mut world = crate::recovery_e2e_harness::TestWorld::new();
@@ -6230,7 +6902,7 @@ mod tests {
             "convo",
             crate::orchestrator::types::QuarantineReason::PeerBadCommit,
             0,
-            vec![],
+            vec!["did:plc:bad".into()],
         );
         assert_eq!(
             t.failed_attempts("convo"),

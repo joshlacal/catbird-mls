@@ -132,7 +132,7 @@ where
             CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
         }
 
-        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
 
         // Enforce the same device-key authority for every public route,
         // including legacy callers that still pass a mutable group ID.
@@ -288,9 +288,14 @@ where
         // happily re-export after merge; we still publish the post-merge
         // version in `confirm_commit`, but platforms that batch operations
         // may want to ship this pre-merge blob alongside the commit.
+        let user_did = self.require_user_did().await?;
+        let scoped_identity = match self.credentials().get_device_uuid(&user_did).await? {
+            Some(uuid) => format!("{user_did}#{uuid}"),
+            None => user_did.clone(),
+        };
         let group_info = match self
             .mls_context()
-            .export_group_info(group_id_bytes.clone(), user_did.as_bytes().to_vec())
+            .export_group_info(group_id_bytes.clone(), scoped_identity.as_bytes().to_vec())
         {
             Ok(group_info) => group_info,
             Err(primary_error) => {
@@ -567,32 +572,17 @@ where
             .await;
 
         // Publish updated GroupInfo (best-effort).
-        match self
+        let scoped_identity = self.require_scoped_identity().await?;
+        if let Err(e) = self
             .mls_context()
-            .export_group_info(group_id_bytes, user_did.into_bytes())
+            .export_group_info(group_id_bytes, scoped_identity.into_bytes())
         {
-            Ok(group_info) => {
-                if let Err(e) = self
-                    .api_client()
-                    .publish_group_info(&meta.conversation_id, &group_info)
-                    .await
-                {
-                    tracing::warn!(
-                        error = %e,
-                        conversation_id = %meta.conversation_id,
-                        group_id = %handle.group_id,
-                        "Failed to publish GroupInfo after confirm_commit"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    conversation_id = %meta.conversation_id,
-                    group_id = %handle.group_id,
-                    "Failed to export GroupInfo after confirm_commit"
-                );
-            }
+            tracing::warn!(
+                error = %e,
+                conversation_id = %meta.conversation_id,
+                group_id = %handle.group_id,
+                "Failed to export GroupInfo after confirm_commit"
+            );
         }
 
         tracing::debug!(

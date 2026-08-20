@@ -409,21 +409,33 @@ impl MockDeliveryService {
 
         let mut guard = self.state.lock().unwrap();
 
+        let matched_cid = if guard.conversations.contains_key(old_convo_id) {
+            old_convo_id.to_string()
+        } else {
+            guard
+                .conversations
+                .iter()
+                .find(|(_, c)| c.view.group_id == old_convo_id)
+                .map(|(cid, _)| cid.clone())
+                .unwrap_or_else(|| old_convo_id.to_string())
+        };
         let mut stored = guard
             .conversations
-            .remove(old_convo_id)
+            .remove(&matched_cid)
             .unwrap_or_else(|| panic!("conversation {old_convo_id} not found"));
         stored.view.conversation_id = new_convo_id.to_string();
         guard.conversations.insert(new_convo_id.to_string(), stored);
 
-        if let Some(mut messages) = guard.messages.remove(old_convo_id) {
+        let msgs = guard.messages.remove(old_convo_id).or_else(|| guard.messages.remove(&matched_cid));
+        if let Some(mut messages) = msgs {
             for message in &mut messages {
                 message.conversation_id = new_convo_id.to_string();
             }
             guard.messages.insert(new_convo_id.to_string(), messages);
         }
 
-        if let Some(group_info) = guard.group_infos.remove(old_convo_id) {
+        let gi = guard.group_infos.remove(old_convo_id).or_else(|| guard.group_infos.remove(&matched_cid));
+        if let Some(group_info) = gi {
             guard
                 .group_infos
                 .insert(new_convo_id.to_string(), group_info);
@@ -517,22 +529,35 @@ impl MockDeliveryService {
 
     /// Members of a conversation.
     pub fn members_of(&self, convo_id: &str) -> Vec<String> {
-        self.state
-            .lock()
-            .unwrap()
+        let guard = self.state.lock().unwrap();
+        guard
             .conversations
             .get(convo_id)
-            .map_or_else(Vec::new, |c| c.members.clone())
+            .map(|c| c.members.clone())
+            .or_else(|| {
+                guard
+                    .conversations
+                    .values()
+                    .find(|c| c.view.group_id == convo_id)
+                    .map(|c| c.members.clone())
+            })
+            .unwrap_or_default()
     }
 
     /// Server-side epoch of a conversation, if it exists.
     pub fn conversation_epoch(&self, convo_id: &str) -> Option<u64> {
-        self.state
-            .lock()
-            .unwrap()
+        let guard = self.state.lock().unwrap();
+        guard
             .conversations
             .get(convo_id)
             .map(|c| c.view.epoch)
+            .or_else(|| {
+                guard
+                    .conversations
+                    .values()
+                    .find(|c| c.view.group_id == convo_id)
+                    .map(|c| c.view.epoch)
+            })
     }
 
     /// Force the server-side epoch of a conversation (stale-needs_rejoin
@@ -541,6 +566,8 @@ impl MockDeliveryService {
     pub fn set_conversation_epoch_for_test(&self, convo_id: &str, epoch: u64) {
         let mut guard = self.state.lock().unwrap();
         if let Some(c) = guard.conversations.get_mut(convo_id) {
+            c.view.epoch = epoch;
+        } else if let Some(c) = guard.conversations.values_mut().find(|c| c.view.group_id == convo_id) {
             c.view.epoch = epoch;
         }
     }
@@ -710,81 +737,8 @@ fn check_fail(flag: &mut bool, msg: &str) -> Result<()> {
 // MLSAPIClient implementation
 // ---------------------------------------------------------------------------
 
-#[async_trait]
-impl MLSAPIClient for MockDeliveryService {
-    // -- Authentication ------------------------------------------------------
-
-    async fn is_authenticated_as(&self, did: &str) -> bool {
-        let guard = self.state.lock().unwrap();
-        self.effective_did_from_guard(&guard).as_deref() == Some(did)
-    }
-
-    async fn current_did(&self) -> Option<String> {
-        let guard = self.state.lock().unwrap();
-        self.effective_did_from_guard(&guard)
-    }
-
-    // -- Conversations -------------------------------------------------------
-
-    async fn get_conversations(
-        &self,
-        limit: u32,
-        cursor: Option<&str>,
-    ) -> Result<ConversationListPage> {
-        let result = {
-            let mut guard = self.state.lock().unwrap();
-            check_fail(
-                &mut guard.failures.fail_next_get_conversations,
-                "injected get_conversations failure",
-            )?;
-            if guard.failures.fail_get_conversations_count > 0 {
-                guard.failures.fail_get_conversations_count -= 1;
-                return Err(OrchestratorError::Api(
-                    "injected get_conversations failure (counted)".to_string(),
-                ));
-            }
-            let did = self
-                .effective_did_from_guard(&guard)
-                .ok_or(OrchestratorError::NotAuthenticated)?;
-
-            // Return conversations where the authenticated DID is a member.
-            let mut all: Vec<ConversationView> = guard
-                .conversations
-                .values()
-                .filter(|c| {
-                    c.members.contains(&did)
-                        && !guard
-                            .hidden_conversation_ids
-                            .contains(&c.view.conversation_id)
-                })
-                .map(|c| c.view.clone())
-                .collect();
-            all.sort_by_key(|c| c.created_at);
-
-            // Cursor-based pagination: cursor is the index (stringified).
-            let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
-            let end = (start + limit as usize).min(all.len());
-            let page = all[start..end].to_vec();
-            let next_cursor = if end < all.len() {
-                Some(end.to_string())
-            } else {
-                None
-            };
-
-            ConversationListPage {
-                conversations: page,
-                cursor: next_cursor,
-            }
-        };
-        let gate = self.get_conversations_gate.lock().unwrap().take();
-        if let Some(gate) = gate {
-            gate.reached.notify_one();
-            gate.release.notified().await;
-        }
-        Ok(result)
-    }
-
-    async fn create_conversation(
+impl MockDeliveryService {
+    pub async fn create_conversation(
         &self,
         group_id: &str,
         initial_members: Option<&[String]>,
@@ -884,7 +838,7 @@ impl MLSAPIClient for MockDeliveryService {
         })
     }
 
-    async fn bootstrap_reset_group(
+    pub async fn bootstrap_reset_group(
         &self,
         original_convo_id: &str,
         new_group_id: &str,
@@ -934,22 +888,21 @@ impl MLSAPIClient for MockDeliveryService {
         }
     }
 
-    async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
+    pub async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
         let did = self
             .effective_did_from_guard(&guard)
             .ok_or(OrchestratorError::NotAuthenticated)?;
-
         let convo = guard
             .conversations
             .get_mut(convo_id)
             .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))?;
-        convo.members.retain(|m| m != &did);
-        convo.view.members.retain(|m| m.did != did);
+        convo.members.retain(|m| m != &did && !m.starts_with(&format!("{did}#")));
+        convo.view.members.retain(|m| m.did != did && !m.did.starts_with(&format!("{did}#")));
         Ok(())
     }
 
-    async fn commit_group_change(
+    pub async fn commit_group_change(
         &self,
         convo_id: &str,
         _commit_data: &[u8],
@@ -968,7 +921,7 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(())
     }
 
-    async fn put_group_metadata_blob(
+    pub async fn put_group_metadata_blob(
         &self,
         _convo_id: &str,
         _group_id_hex: &str,
@@ -981,7 +934,7 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(())
     }
 
-    async fn add_members(
+    pub async fn add_members(
         &self,
         convo_id: &str,
         member_dids: &[String],
@@ -1079,7 +1032,7 @@ impl MLSAPIClient for MockDeliveryService {
         })
     }
 
-    async fn add_members_with_idempotency(
+    pub async fn add_members_with_idempotency(
         &self,
         convo_id: &str,
         member_dids: &[String],
@@ -1114,7 +1067,7 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(result)
     }
 
-    async fn remove_members(
+    pub async fn remove_members(
         &self,
         convo_id: &str,
         member_dids: &[String],
@@ -1141,7 +1094,7 @@ impl MLSAPIClient for MockDeliveryService {
 
     // -- Messages ------------------------------------------------------------
 
-    async fn send_message(
+    pub async fn send_message(
         &self,
         convo_id: &str,
         ciphertext: &[u8],
@@ -1182,7 +1135,7 @@ impl MLSAPIClient for MockDeliveryService {
         })
     }
 
-    async fn send_message_with_id(
+    pub async fn send_message_with_id(
         &self,
         convo_id: &str,
         ciphertext: &[u8],
@@ -1223,62 +1176,10 @@ impl MLSAPIClient for MockDeliveryService {
         })
     }
 
-    async fn get_messages(
-        &self,
-        convo_id: &str,
-        cursor: Option<&str>,
-        limit: u32,
-        _message_type: Option<&str>,
-        _from_epoch: Option<u32>,
-        _to_epoch: Option<u32>,
-    ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
-        let gate = self.get_messages_gate.lock().unwrap().take();
-        if let Some(gate) = gate {
-            gate.reached.notify_one();
-            gate.release.notified().await;
-        }
-
-        let mut guard = self.state.lock().unwrap();
-        check_fail(
-            &mut guard.failures.fail_next_get_messages,
-            "injected get_messages failure",
-        )?;
-
-        let messages = guard.messages.get(convo_id).cloned().unwrap_or_default();
-
-        // Cursor is a 0-based index encoded as string.
-        let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
-        let end = (start + limit as usize).min(messages.len());
-        let page: Vec<IncomingEnvelope> = messages[start..end]
-            .iter()
-            .map(|m| IncomingEnvelope {
-                conversation_id: m.conversation_id.clone(),
-                // WS-3 stage-2 tests: a relabel entry spoofs the envelope's
-                // claimed sender (routing hint only — ciphertext untouched).
-                sender_did: guard
-                    .envelope_sender_relabels
-                    .get(&m.sender_did)
-                    .cloned()
-                    .unwrap_or_else(|| m.sender_did.clone()),
-                ciphertext: m.ciphertext.clone(),
-                timestamp: m.timestamp,
-                server_epoch: None,
-                server_message_id: Some(m.id.clone()),
-            })
-            .collect();
-
-        let next_cursor = if end < messages.len() {
-            Some(end.to_string())
-        } else {
-            None
-        };
-
-        Ok((page, next_cursor))
-    }
 
     // -- Key Packages --------------------------------------------------------
 
-    async fn publish_key_package(
+    pub async fn publish_key_package(
         &self,
         key_package: &[u8],
         cipher_suite: &str,
@@ -1309,71 +1210,23 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(())
     }
 
-    async fn get_key_packages(
+    pub async fn publish_key_packages(
         &self,
-        _actor_device_id: &str,
-        dids: &[String],
-    ) -> Result<Vec<KeyPackageRef>> {
-        let mut guard = self.state.lock().unwrap();
-        check_fail(
-            &mut guard.failures.fail_next_get_key_packages,
-            "injected get_key_packages failure",
-        )?;
-
-        let mut result = Vec::new();
-        for did in dids {
-            // WS-3 tests: a redirect serves another DID's package while still
-            // labeling it with the requested DID (malicious-DS simulation).
-            let source_did = guard
-                .key_package_redirects
-                .get(did)
-                .cloned()
-                .unwrap_or_else(|| did.clone());
-            if let Some(packages) = guard.key_packages.get_mut(&source_did) {
-                if let Some(pkg) = packages.first().cloned() {
-                    // Consume FIFO — remove the first element.
-                    packages.remove(0);
-                    result.push(KeyPackageRef {
-                        did: did.clone(),
-                        key_package_data: pkg.data,
-                        hash: None,
-                        cipher_suite: pkg.cipher_suite,
-                    });
-                }
-            }
+        key_packages: &[Vec<u8>],
+        cipher_suite: &str,
+        expires_at: &str,
+        device_id: Option<&str>,
+    ) -> Result<()> {
+        for kp in key_packages {
+            self.publish_key_package(kp, cipher_suite, expires_at, device_id).await?;
         }
-        Ok(result)
+        Ok(())
     }
 
-    async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
-        let guard = self.state.lock().unwrap();
-        let did = self
-            .effective_did_from_guard(&guard)
-            .ok_or(OrchestratorError::NotAuthenticated)?;
-
-        let available = guard.key_packages.get(&did).map_or(0, |v| v.len() as u32);
-
-        Ok(KeyPackageStats {
-            available,
-            total: available,
-        })
-    }
-
-    async fn sync_key_packages(
-        &self,
-        local_hashes: &[String],
-        _device_id: &str,
-    ) -> Result<KeyPackageSyncResult> {
-        // Simplified: just report zero orphans.
-        Ok(KeyPackageSyncResult {
-            orphaned_count: 0,
-            deleted_count: local_hashes.len() as u32,
-        })
-    }
 
     // -- Devices -------------------------------------------------------------
 
-    async fn register_device(
+    pub async fn register_device(
         &self,
         device_uuid: &str,
         _device_name: &str,
@@ -1393,7 +1246,6 @@ impl MLSAPIClient for MockDeliveryService {
             .ok_or(OrchestratorError::NotAuthenticated)?;
 
         let info = DeviceInfo {
-            // v2 preserves the canonical client UUID as the authoritative id.
             device_id: device_uuid.to_string(),
             mls_did: mls_did.to_string(),
             device_uuid: device_uuid.to_string(),
@@ -1415,23 +1267,12 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(info)
     }
 
-    async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
-        let guard = self.state.lock().unwrap();
-        let did = self
-            .effective_did_from_guard(&guard)
-            .ok_or(OrchestratorError::NotAuthenticated)?;
 
-        Ok(guard.devices.get(&did).map_or_else(Vec::new, |devs| {
-            devs.iter().map(|d| d.info.clone()).collect()
-        }))
-    }
-
-    async fn remove_device(&self, device_id: &str) -> Result<()> {
+    pub async fn remove_device(&self, device_id: &str) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
         let did = self
             .effective_did_from_guard(&guard)
             .ok_or(OrchestratorError::NotAuthenticated)?;
-
         if let Some(devs) = guard.devices.get_mut(&did) {
             devs.retain(|d| d.info.device_id != device_id);
         }
@@ -1440,7 +1281,7 @@ impl MLSAPIClient for MockDeliveryService {
 
     // -- Group Info ----------------------------------------------------------
 
-    async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
+    pub async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
         {
             let mut guard = self.state.lock().unwrap();
             guard
@@ -1455,53 +1296,35 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(())
     }
 
-    async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let mut guard = self.state.lock().unwrap();
-        *guard
-            .get_group_info_calls
-            .entry(convo_id.to_string())
-            .or_default() += 1;
-        check_fail(
-            &mut guard.failures.fail_next_get_group_info,
-            "injected get_group_info failure",
-        )?;
-        guard
-            .group_infos
-            .get(convo_id)
-            .cloned()
-            .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))
+
+    pub async fn request_welcome_reissue(
+        &self,
+        convo_id: &str,
+        recipient_device_did: &str,
+        reason: &str,
+    ) -> Result<catbird_mls::orchestrator::welcome_recovery::WelcomeReissueRequestResult> {
+        let _ = (convo_id, recipient_device_did, reason);
+        Err(OrchestratorError::Api("not implemented".into()))
     }
 
-    async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let mut guard = self.state.lock().unwrap();
-        *guard
-            .get_welcome_calls
-            .entry(convo_id.to_string())
-            .or_default() += 1;
-        check_fail(
-            &mut guard.failures.fail_next_get_welcome,
-            "injected get_welcome failure",
-        )?;
-        let did = self
-            .effective_did_from_guard(&guard)
-            .ok_or(OrchestratorError::NotAuthenticated)?;
-
-        let key = (convo_id.to_string(), did.clone());
-        let welcome = guard.welcomes.get_mut(&key).and_then(|q| {
-            if q.is_empty() {
-                None
-            } else {
-                Some(q.remove(0))
-            }
-        });
-
-        welcome.ok_or(OrchestratorError::ServerError {
-            status: 404,
-            body: "welcome not available".to_string(),
-        })
+    pub async fn request_failover(&self, convo_id: &str) -> Result<RequestFailoverResponse> {
+        let _ = convo_id;
+        Err(OrchestratorError::Api("not implemented".into()))
     }
 
-    async fn process_external_commit(
+    pub async fn report_recovery_failure(
+        &self,
+        convo_id: &str,
+        failure_type: &str,
+        epoch_authenticator: Option<&str>,
+        failure_mode: Option<&str>,
+    ) -> Result<()> {
+        let _ = (convo_id, failure_type, epoch_authenticator, failure_mode);
+        Ok(())
+    }
+
+
+    pub async fn process_external_commit(
         &self,
         convo_id: &str,
         commit_data: &[u8],
@@ -1566,6 +1389,920 @@ impl MLSAPIClient for MockDeliveryService {
             rejoined_at: Utc::now().to_rfc3339(),
             receipt,
         })
+    }
+}
+
+#[async_trait]
+impl MLSAPIClient for MockDeliveryService {
+    async fn is_authenticated_as(&self, did: &str) -> bool {
+        let guard = self.state.lock().unwrap();
+        self.effective_did_from_guard(&guard).as_deref() == Some(did)
+    }
+
+    async fn current_did(&self) -> Option<String> {
+        let guard = self.state.lock().unwrap();
+        self.effective_did_from_guard(&guard)
+    }
+
+    async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
+        {
+            let mut guard = self.state.lock().unwrap();
+            guard
+                .group_infos
+                .insert(convo_id.to_string(), group_info.to_vec());
+        }
+        let gate = self.publish_group_info_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(())
+    }
+
+    async fn publish_welcome(&self, convo_id: &str, welcome_data: &[u8]) -> Result<()> {
+        let did = self.current_did().await.unwrap_or_default();
+        let mut guard = self.state.lock().unwrap();
+        let group_id_opt = guard.conversations.get(convo_id).map(|c| c.view.group_id.clone());
+        for (k, _) in guard.key_packages.clone() {
+            if k != did {
+                guard
+                    .welcomes
+                    .entry((convo_id.to_string(), k.clone()))
+                    .or_default()
+                    .push(welcome_data.to_vec());
+                if let Some(ref gid) = group_id_opt {
+                    guard
+                        .welcomes
+                        .entry((gid.clone(), k.clone()))
+                        .or_default()
+                        .push(welcome_data.to_vec());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn submit_prepared_request(
+        &self,
+        request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
+    ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        let body_bytes = request.body.as_deref().unwrap_or(&[]);
+        let body_val: serde_json::Value = if !body_bytes.is_empty() {
+            serde_json::from_slice(body_bytes)
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?
+        } else {
+            serde_json::Value::Null
+        };
+        let inner_body = body_val
+            .get("signedRequest")
+            .and_then(|s| s.get("body"))
+            .unwrap_or(&body_val);
+
+        match request.operation {
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation => {
+                let group_id = inner_body
+                    .get("next")
+                    .and_then(|n| n.get("groupId"))
+                    .and_then(|g| g.as_str())
+                    .or_else(|| inner_body.get("groupId").and_then(|g| g.as_str()))
+                    .unwrap_or_default();
+                let group_id_str = if let Ok(bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(group_id)
+                {
+                    hex::encode(bytes)
+                } else {
+                    group_id.to_string()
+                };
+                let has_next_id = self.state.lock().unwrap().next_create_conversation_id.is_some();
+                if !has_next_id {
+                    if let Some(cid) = inner_body.get("conversationId").and_then(|c| c.as_str()) {
+                        self.set_next_create_conversation_id(cid);
+                    }
+                }
+                let initial_members: Vec<String> = inner_body
+                    .get("manifest")
+                    .and_then(|m| m.get("participants"))
+                    .and_then(|p| p.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|p| {
+                                p.get("userDid")
+                                    .and_then(|u| u.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let res = self
+                    .create_conversation(
+                        &group_id_str,
+                        Some(&initial_members),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await?;
+
+                if let Some(gi_b64) = inner_body
+                    .get("genesisGroupInfo")
+                    .and_then(|g| g.get("bytes"))
+                    .and_then(|b| b.as_str())
+                {
+                    if let Ok(gi_bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(gi_b64)
+                    {
+                        self.state
+                            .lock()
+                            .unwrap()
+                            .group_infos
+                            .insert(res.conversation.conversation_id.clone(), gi_bytes);
+                    }
+                }
+                let participants: Vec<serde_json::Value> = res
+                    .conversation
+                    .members
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "userDid": m.did,
+                            "role": match m.role { MemberRole::Admin => "admin", _ => "member" },
+                            "status": "active"
+                        })
+                    })
+                    .collect();
+                let group_id_bytes = hex::decode(&res.conversation.group_id)
+                    .unwrap_or_else(|_| vec![0u8; 32]);
+                let output = serde_json::json!({
+                    "result": {
+                        "$type": "blue.catbird.chat.defs#conversationCreatedResult",
+                        "coordinates": {
+                            "conversationId": res.conversation.conversation_id,
+                            "groupId": {
+                                "$bytes": base64::engine::general_purpose::STANDARD.encode(&group_id_bytes)
+                            },
+                            "epoch": res.conversation.epoch as i64,
+                            "generation": 0,
+                            "stateVersion": 0,
+                            "lifecycle": "active",
+                            "groupContextHash": {
+                                "$bytes": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+                            },
+                            "confirmationTag": {
+                                "$bytes": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+                            }
+                        },
+                        "entry": {
+                            "conversationId": res.conversation.conversation_id,
+                            "entryId": uuid::Uuid::new_v4().to_string(),
+                            "receivedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            "seq": 1,
+                            "signedRequest": {
+                                "body": inner_body,
+                                "signature": body_val
+                                    .get("signature")
+                                    .and_then(|s| s.as_str())
+                                    .or_else(|| body_val.get("signedRequest").and_then(|s| s.get("signature")).and_then(|s| s.as_str()))
+                                    .unwrap_or(&base64::engine::general_purpose::STANDARD.encode([0u8; 64]))
+                            }
+                        }
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage => {
+                let convo_id = inner_body
+                    .get("prior")
+                    .and_then(|p| p.get("conversationId"))
+                    .or_else(|| inner_body.get("conversationId"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+                let ciphertext_b64 = inner_body
+                    .get("applicationMessage")
+                    .and_then(|a| a.get("bytes"))
+                    .and_then(|b| b.as_str())
+                    .unwrap_or_default();
+                let ciphertext = base64::engine::general_purpose::STANDARD
+                    .decode(ciphertext_b64)
+                    .unwrap_or_default();
+                let epoch = inner_body
+                    .get("prior")
+                    .and_then(|p| p.get("epoch"))
+                    .and_then(|e| e.as_u64())
+                    .unwrap_or(0);
+                let message_id = inner_body
+                    .get("messageId")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_default();
+
+                let mut guard = self.state.lock().unwrap();
+                check_fail(&mut guard.failures.fail_next_send, "injected send failure")?;
+                let did = self
+                    .effective_did_from_guard(&guard)
+                    .unwrap_or_else(|| "did:plc:mock".to_string());
+
+                let msg = StoredMessage {
+                    id: message_id.to_string(),
+                    conversation_id: convo_id.to_string(),
+                    sender_did: did,
+                    ciphertext,
+                    timestamp: Utc::now(),
+                };
+                guard
+                    .messages
+                    .entry(convo_id.to_string())
+                    .or_default()
+                    .push(msg);
+
+                let default_sig = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+                let sig_b64 = body_val
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .or_else(|| body_val.get("signedRequest").and_then(|s| s.get("signature")).and_then(|s| s.as_str()))
+                    .unwrap_or(&default_sig);
+                let output = serde_json::json!({
+                    "entry": {
+                        "conversationId": convo_id,
+                        "entryId": message_id,
+                        "receivedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        "seq": 1,
+                        "signedRequest": {
+                            "body": inner_body,
+                            "signature": sig_b64
+                        }
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages => {
+                let packages = inner_body
+                    .get("keyPackages")
+                    .and_then(|p| p.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let device_uuid = inner_body
+                    .get("actorDeviceId")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default();
+                let actor_did = inner_body
+                    .get("actorDid")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default();
+                let mut pkgs = Vec::new();
+                for p in &packages {
+                    if let Some(bytes_b64) = p.get("bytes").and_then(|b| b.as_str()) {
+                        if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(bytes_b64) {
+                            pkgs.push(b);
+                        }
+                    }
+                }
+                let did = if !actor_did.is_empty() {
+                    actor_did.to_string()
+                } else {
+                    self.effective_did_from_guard(&self.state.lock().unwrap())
+                        .unwrap_or_default()
+                };
+                {
+                    let mut guard = self.state.lock().unwrap();
+                    for pkg in &pkgs {
+                        guard.key_packages.entry(did.clone()).or_default().push(StoredKeyPackage {
+                            data: pkg.clone(),
+                            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
+                            expires_at: "".to_string(),
+                            device_id: Some(device_uuid.to_string()),
+                        });
+                    }
+                }
+                let output = serde_json::json!({
+                    "result": {
+                        "available": pkgs.len() as i64
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::EnrollDevice => {
+                let device_uuid = inner_body
+                    .get("deviceId")
+                    .or_else(|| inner_body.get("actorDeviceId"))
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default();
+                let actor_did = inner_body
+                    .get("actorDid")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default();
+                let mls_did = format!("{actor_did}#{device_uuid}");
+                let sig_pk_b64 = inner_body
+                    .get("signaturePublicKey")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default();
+                let sig_pk = if let Ok(bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(sig_pk_b64)
+                {
+                    if bytes.len() == 32 {
+                        bytes
+                    } else {
+                        vec![0u8; 32]
+                    }
+                } else {
+                    vec![0u8; 32]
+                };
+                let key_id = inner_body
+                    .get("keyId")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+
+                let mut pkgs = Vec::new();
+                if let Some(packages) = inner_body.get("keyPackages").and_then(|p| p.as_array()) {
+                    for p in packages {
+                        if let Some(bytes_b64) = p.get("bytes").and_then(|b| b.as_str()) {
+                            if let Ok(b) = base64::engine::general_purpose::STANDARD.decode(bytes_b64) {
+                                pkgs.push(b);
+                            }
+                        }
+                    }
+                }
+                let info = self
+                    .register_device(
+                        device_uuid,
+                        "Mock Device",
+                        &mls_did,
+                        &sig_pk,
+                        &pkgs,
+                        body_bytes,
+                    )
+                    .await?;
+                {
+                    let mut guard = self.state.lock().unwrap();
+                    for pkg in &pkgs {
+                        guard.key_packages.entry(actor_did.to_string()).or_default().push(StoredKeyPackage {
+                            data: pkg.clone(),
+                            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
+                            expires_at: "".to_string(),
+                            device_id: Some(device_uuid.to_string()),
+                        });
+                        guard.key_packages.entry(mls_did.clone()).or_default().push(StoredKeyPackage {
+                            data: pkg.clone(),
+                            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
+                            expires_at: "".to_string(),
+                            device_id: Some(device_uuid.to_string()),
+                        });
+                    }
+                }
+                let output = serde_json::json!({
+                    "device": {
+                        "deviceId": info.device_id,
+                        "keyId": key_id,
+                        "signaturePublicKey": {
+                            "$bytes": base64::engine::general_purpose::STANDARD.encode(&sig_pk)
+                        },
+                        "authGeneration": 1,
+                        "status": "active",
+                        "availablePackageCount": 50,
+                        "reservedPackageCount": 0,
+                        "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        "updatedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RevokeDevice => {
+                let target_device_id = inner_body
+                    .get("targetDeviceId")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default();
+                self.remove_device(target_device_id).await?;
+                let output = serde_json::json!({
+                    "result": {
+                        "revoked": true
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition => {
+                let convo_id = inner_body
+                    .get("prior")
+                    .and_then(|p| p.get("conversationId"))
+                    .or_else(|| inner_body.get("conversationId"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+                let mut guard = self.state.lock().unwrap();
+                check_fail(&mut guard.failures.fail_next_commit_group_change, "injected commit_group_change failure")?;
+                check_fail(&mut guard.failures.fail_next_add_members, "injected add_members failure")?;
+                check_fail(&mut guard.failures.fail_next_remove_members, "injected remove_members failure")?;
+                if guard.failures.reject_next_add_members {
+                    guard.failures.reject_next_add_members = false;
+                    let output = serde_json::json!({
+                        "result": {
+                            "applied": false,
+                            "epoch": guard.conversations.get(convo_id).map_or(0, |c| c.view.epoch)
+                        }
+                    });
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 200,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&output).unwrap(),
+                    });
+                }
+                if guard.failures.no_advance_next_add_members {
+                    guard.failures.no_advance_next_add_members = false;
+                    let output = serde_json::json!({
+                        "result": {
+                            "applied": true,
+                            "epoch": 0
+                        }
+                    });
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 200,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&output).unwrap(),
+                    });
+                }
+                let did = self
+                    .effective_did_from_guard(&guard)
+                    .unwrap_or_else(|| "did:plc:mock".to_string());
+
+                let key_pkg_dids: Vec<String> = guard.key_packages.keys().cloned().collect();
+                let mut new_epoch = 1;
+                if let Some(stored) = guard.conversations.get_mut(convo_id) {
+                    stored.view.epoch += 1;
+                    new_epoch = stored.view.epoch;
+                    let leaf_changes = inner_body.get("manifest").and_then(|m| m.get("leafChanges")).and_then(|l| l.as_array());
+                    if let Some(changes) = leaf_changes.filter(|c| !c.is_empty()) {
+                        for change in changes {
+                            if let Some(user_did) = change.get("userDid").and_then(|u| u.as_str()) {
+                                stored.members.retain(|m| m != user_did && !m.starts_with(&format!("{user_did}#")));
+                                stored.view.members.retain(|m| m.did != user_did && !m.did.starts_with(&format!("{user_did}#")));
+                            }
+                        }
+                    } else {
+                        for k in key_pkg_dids {
+                            if !stored.members.contains(&k) {
+                                stored.members.push(k.clone());
+                                stored.view.members.push(MemberView {
+                                    did: k,
+                                    role: MemberRole::Member,
+                                });
+                            }
+                        }
+                    }
+                }
+                let commit_bytes = inner_body
+                    .get("commit")
+                    .and_then(|c| c.get("bytes"))
+                    .and_then(|b| b.as_str())
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                    .unwrap_or_default();
+                if !commit_bytes.is_empty() {
+                    guard
+                        .messages
+                        .entry(convo_id.to_string())
+                        .or_default()
+                        .push(StoredMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            conversation_id: convo_id.to_string(),
+                            sender_did: did.clone(),
+                            ciphertext: commit_bytes.clone(),
+                            timestamp: Utc::now(),
+                        });
+                }
+
+                if let Some(w_b64) = inner_body.get("welcomeMessage").and_then(|w| w.as_str()) {
+                    if let Ok(w_bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(w_b64)
+                    {
+                        let group_id_opt = guard.conversations.get(convo_id).map(|c| c.view.group_id.clone());
+                        for (k, _) in guard.key_packages.clone() {
+                            if k != did {
+                                guard
+                                    .welcomes
+                                    .entry((convo_id.to_string(), k.clone()))
+                                    .or_default()
+                                    .push(w_bytes.clone());
+                                if let Some(ref gid) = group_id_opt {
+                                    guard
+                                        .welcomes
+                                        .entry((gid.clone(), k.clone()))
+                                        .or_default()
+                                        .push(w_bytes.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                let receipt = if guard.issue_external_commit_receipts {
+                    use sha2::{Digest, Sha256};
+                    Some(SequencerReceipt {
+                        convo_id: convo_id.to_string(),
+                        epoch: new_epoch as i32,
+                        sequencer_term: 0,
+                        commit_hash: Sha256::digest(&commit_bytes).to_vec(),
+                        sequencer_did: "did:web:sequencer.test".to_string(),
+                        issued_at: chrono::Utc::now().timestamp(),
+                        signature: vec![],
+                    })
+                } else {
+                    None
+                };
+                let output = serde_json::json!({
+                    "result": {
+                        "applied": true,
+                        "epoch": new_epoch,
+                        "receipt": receipt
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeave => {
+                let convo_id = inner_body
+                    .get("prior")
+                    .and_then(|p| p.get("conversationId"))
+                    .or_else(|| inner_body.get("conversationId"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+                self.leave_conversation(convo_id).await?;
+                let output = serde_json::json!({
+                    "result": {
+                        "left": true
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::PrepareBlobUpload => {
+                let output = serde_json::json!({
+                    "result": {
+                        "uploadUrl": "/upload"
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::UploadBlob => {
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&serde_json::json!({"result": {}})).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::AcceptConversation => {
+                let convo_id = inner_body
+                    .get("prior")
+                    .and_then(|p| p.get("conversationId"))
+                    .or_else(|| inner_body.get("conversationId"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+                let mut guard = self.state.lock().unwrap();
+                let mut new_epoch = 1;
+                if let Some(stored) = guard.conversations.get_mut(convo_id) {
+                    stored.view.epoch += 1;
+                    new_epoch = stored.view.epoch;
+                }
+                let output = serde_json::json!({
+                    "result": {
+                        "accepted": true,
+                        "epoch": new_epoch
+                    }
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestReset => {
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&serde_json::json!({"result": {"recorded": true}})).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ActivateReset => {
+                let convo_id = inner_body
+                    .get("prior")
+                    .and_then(|p| p.get("conversationId"))
+                    .or_else(|| inner_body.get("conversationId"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or_default();
+                let mut guard = self.state.lock().unwrap();
+                *guard.bootstrap_reset_group_calls.entry(convo_id.to_string()).or_default() += 1;
+                let matched_gid = guard.conversations.values().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id).map(|c| (c.view.conversation_id.clone(), c.view.group_id.clone()));
+                if let Some((cid, gid)) = matched_gid {
+                    if cid != convo_id {
+                        *guard.bootstrap_reset_group_calls.entry(cid).or_default() += 1;
+                    }
+                    if gid != convo_id {
+                        *guard.bootstrap_reset_group_calls.entry(gid).or_default() += 1;
+                    }
+                }
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&serde_json::json!({"result": {"activated": true}})).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeafRecovery => {
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&serde_json::json!({"result": {"requested": true}})).unwrap(),
+                })
+            }
+            _ => Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&serde_json::json!({"result": {}})).unwrap(),
+            }),
+        }
+    }
+
+    async fn get_conversations(
+        &self,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<ConversationListPage> {
+        let result = {
+            let mut guard = self.state.lock().unwrap();
+            check_fail(
+                &mut guard.failures.fail_next_get_conversations,
+                "injected get_conversations failure",
+            )?;
+            if guard.failures.fail_get_conversations_count > 0 {
+                guard.failures.fail_get_conversations_count -= 1;
+                return Err(OrchestratorError::Api(
+                    "injected get_conversations failure (counted)".to_string(),
+                ));
+            }
+            let did = self
+                .effective_did_from_guard(&guard)
+                .ok_or(OrchestratorError::NotAuthenticated)?;
+
+            let mut all: Vec<ConversationView> = guard
+                .conversations
+                .values()
+                .filter(|c| {
+                    c.members.contains(&did)
+                        && !guard
+                            .hidden_conversation_ids
+                            .contains(&c.view.conversation_id)
+                })
+                .map(|c| c.view.clone())
+                .collect();
+            all.sort_by_key(|c| c.created_at);
+
+            let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+            let end = (start + limit as usize).min(all.len());
+            let page = all[start..end].to_vec();
+            let next_cursor = if end < all.len() {
+                Some(end.to_string())
+            } else {
+                None
+            };
+
+            ConversationListPage {
+                conversations: page,
+                cursor: next_cursor,
+            }
+        };
+        let gate = self.get_conversations_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        Ok(result)
+    }
+
+    async fn get_messages(
+        &self,
+        convo_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+        message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
+    ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
+        let gate = self.get_messages_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+
+        let mut guard = self.state.lock().unwrap();
+        check_fail(
+            &mut guard.failures.fail_next_get_messages,
+            "injected get_messages failure",
+        )?;
+
+        let messages = guard.messages.get(convo_id).cloned().or_else(|| {
+            let matched_cid = guard.conversations.iter().find(|(_, c)| c.view.group_id == convo_id).map(|(cid, _)| cid.clone());
+            matched_cid.and_then(|cid| guard.messages.get(&cid).cloned())
+        }).unwrap_or_default();
+
+        // Cursor is a 0-based index encoded as string.
+        let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+        let end = (start + limit as usize).min(messages.len());
+        let page: Vec<IncomingEnvelope> = messages[start..end]
+            .iter()
+            .map(|m| IncomingEnvelope {
+                conversation_id: m.conversation_id.clone(),
+                sender_did: guard
+                    .envelope_sender_relabels
+                    .get(&m.sender_did)
+                    .cloned()
+                    .unwrap_or_else(|| m.sender_did.clone()),
+                ciphertext: m.ciphertext.clone(),
+                timestamp: m.timestamp,
+                server_epoch: None,
+                server_message_id: Some(m.id.clone()),
+            })
+            .collect();
+
+        let next_cursor = if end < messages.len() {
+            Some(end.to_string())
+        } else {
+            None
+        };
+
+        Ok((page, next_cursor))
+    }
+
+    async fn get_key_packages(
+        &self,
+        _actor_device_id: &str,
+        dids: &[String],
+    ) -> Result<Vec<KeyPackageRef>> {
+        let mut guard = self.state.lock().unwrap();
+        check_fail(
+            &mut guard.failures.fail_next_get_key_packages,
+            "injected get_key_packages failure",
+        )?;
+
+        let mut result = Vec::new();
+        for did in dids {
+            let source_did = guard
+                .key_package_redirects
+                .get(did)
+                .cloned()
+                .unwrap_or_else(|| did.clone());
+            let root_did = if let Some((root, _)) = source_did.split_once('#') {
+                root.to_string()
+            } else {
+                source_did.clone()
+            };
+            let packages_opt = if guard.key_packages.contains_key(&source_did) {
+                guard.key_packages.get_mut(&source_did)
+            } else {
+                guard.key_packages.get_mut(&root_did)
+            };
+            if let Some(packages) = packages_opt {
+                if let Some(pkg) = packages.first().cloned() {
+                    packages.remove(0);
+                    result.push(KeyPackageRef {
+                        did: did.clone(),
+                        key_package_data: pkg.data,
+                        hash: None,
+                        cipher_suite: pkg.cipher_suite,
+                    });
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
+        let guard = self.state.lock().unwrap();
+        let did = self
+            .effective_did_from_guard(&guard)
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+
+        let available = guard.key_packages.get(&did).map_or(0, |v| v.len() as u32);
+
+        Ok(KeyPackageStats {
+            available,
+            total: available,
+        })
+    }
+
+    async fn sync_key_packages(
+        &self,
+        local_hashes: &[String],
+        _device_id: &str,
+    ) -> Result<KeyPackageSyncResult> {
+        Ok(KeyPackageSyncResult {
+            orphaned_count: 0,
+            deleted_count: local_hashes.len() as u32,
+        })
+    }
+
+    async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
+        let guard = self.state.lock().unwrap();
+        let did = self
+            .effective_did_from_guard(&guard)
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+
+        let devices = guard
+            .devices
+            .get(&did)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|d| d.info)
+            .collect();
+
+        Ok(devices)
+    }
+
+    async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
+        let mut guard = self.state.lock().unwrap();
+        *guard
+            .get_group_info_calls
+            .entry(convo_id.to_string())
+            .or_default() += 1;
+        check_fail(
+            &mut guard.failures.fail_next_get_group_info,
+            "injected get_group_info failure",
+        )?;
+        guard
+            .group_infos
+            .get(convo_id)
+            .cloned()
+            .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))
+    }
+
+    async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
+        let mut guard = self.state.lock().unwrap();
+        *guard
+            .get_welcome_calls
+            .entry(convo_id.to_string())
+            .or_default() += 1;
+        check_fail(
+            &mut guard.failures.fail_next_get_welcome,
+            "injected get_welcome failure",
+        )?;
+        let did = self
+            .effective_did_from_guard(&guard)
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+
+        let welcome = guard.welcomes.get_mut(&(convo_id.to_string(), did.clone())).and_then(|q| {
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
+        }).or_else(|| {
+            let matched_cid = guard.conversations.iter().find(|(_, c)| c.view.group_id == convo_id).map(|(cid, _)| cid.clone());
+            if let Some(cid) = matched_cid {
+                guard.welcomes.get_mut(&(cid, did.clone())).and_then(|q| {
+                    if q.is_empty() {
+                        None
+                    } else {
+                        Some(q.remove(0))
+                    }
+                })
+            } else {
+                None
+            }
+        });
+        welcome.ok_or(OrchestratorError::ServerError {
+            status: 404,
+            body: "welcome not available".to_string(),
+        })
+    }
+
+    async fn get_delivery_status(
+        &self,
+        _convo_id: &str,
+        _message_ids: &[String],
+    ) -> Result<Vec<(String, DeliveryStatus)>> {
+        Ok(vec![])
     }
 }
 

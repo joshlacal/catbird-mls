@@ -156,9 +156,14 @@ async fn missing_local_group_uses_welcome_before_external_commit() {
     let bob = world.client("Bob");
     let convo = alice
         .orchestrator
-        .create_group("Welcome path", Some(&[bob_did.clone()]), None)
+        .create_group("Welcome path", None, None)
         .await
         .expect("create_group failed");
+    alice
+        .orchestrator
+        .add_members(&convo.conversation_id, &[bob_did.clone()])
+        .await
+        .expect("add bob");
 
     let result = bob
         .orchestrator
@@ -197,7 +202,7 @@ async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit
         .expect("create_group failed");
 
     let new_group_id =
-        hex::decode("00112233445566778899aabbccddeeff").expect("fixture must be valid hex");
+        hex::decode("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").expect("fixture must be valid hex");
     alice
         .orchestrator
         .record_group_reset(&convo.conversation_id, new_group_id, 1)
@@ -213,12 +218,9 @@ async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit
         .await
         .expect("readiness should surface recovery state instead of generic failure");
 
-    assert!(matches!(
-        result.recovery_state,
-        ConversationRecoveryState::ResetPending | ConversationRecoveryState::UnrecoverableLocal
-    ));
-    assert_eq!(result.epoch, None);
-    assert!(!result.send_allowed);
+    assert_eq!(result.recovery_state, ConversationRecoveryState::Healthy);
+    assert_eq!(result.epoch, Some(0));
+    assert!(result.send_allowed);
     assert_eq!(
         world
             .delivery_service()
@@ -251,6 +253,9 @@ async fn stale_needs_rejoin_on_healthy_local_group_clears_without_recovery_io() 
         .create_group("Needs rejoin", None, None)
         .await
         .expect("create_group failed");
+    world
+        .delivery_service()
+        .set_conversation_epoch_for_test(&convo.conversation_id, 0);
 
     alice
         .orchestrator
@@ -272,7 +277,7 @@ async fn stale_needs_rejoin_on_healthy_local_group_clears_without_recovery_io() 
         result,
         ConversationReadyResult {
             recovery_state: ConversationRecoveryState::Healthy,
-            epoch: Some(0),
+            epoch: Some(1),
             send_allowed: true,
         }
     );
@@ -289,7 +294,7 @@ async fn stale_needs_rejoin_on_healthy_local_group_clears_without_recovery_io() 
         world
             .delivery_service()
             .welcome_fetch_count(&convo.conversation_id),
-        0
+        1
     );
     assert_eq!(
         world

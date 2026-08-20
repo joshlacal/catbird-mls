@@ -99,3 +99,58 @@ fn upgrade_and_binding_failures_are_typed() {
         assert_eq!(error.recovery_outcome(), Some(expected));
     }
 }
+
+#[test]
+fn all_canonical_operations_map_to_valid_unique_xrpc_paths() {
+    use std::collections::HashSet;
+    let mut seen_paths = HashSet::new();
+    let mut seen_nsids = HashSet::new();
+
+    for op in CanonicalOperation::ALL {
+        let route = op.route();
+        assert!(route.path.starts_with("/xrpc/blue.catbird.chat."));
+        assert!(seen_paths.insert(route.path), "duplicate path for {:?}", op);
+        assert!(seen_nsids.insert(route.nsid), "duplicate nsid for {:?}", op);
+    }
+    assert_eq!(seen_paths.len(), 31);
+}
+
+#[test]
+fn read_query_encoding_escapes_special_characters_cleanly() {
+    let auth = CleanChatAuthContext::new(DEVICE_ID.to_owned());
+
+    let conversations = prepare_get_conversations(&auth, 50, Some("cursor with spaces & special=chars"))
+        .expect("query encoding");
+    assert!(conversations.path.contains("pageCursor=cursor%20with%20spaces%20%26%20special%3Dchars"));
+
+    let entries = prepare_get_entries(&auth, "123e4567-e89b-42d3-a456-426614174001", 0, 100)
+        .expect("entries encoding");
+    assert!(entries.path.contains("afterSeq=0"));
+    assert!(entries.path.contains("limit=100"));
+}
+
+#[test]
+fn invalid_auth_generation_is_rejected_on_context_construction() {
+    let auth = CleanChatAuthContext::new(DEVICE_ID.to_owned()).with_auth_generation(42);
+    assert_eq!(auth.auth_generation, Some(42));
+    assert_eq!(auth.device_id, DEVICE_ID);
+}
+
+#[test]
+fn endpoint_error_status_and_recovery_mapping_is_deterministic() {
+    let rate_limited = EndpointError::new(
+        "blue.catbird.chat.sendMessage",
+        ChatErrorCode::RateLimited,
+        Some("Slow down".into()),
+    );
+    assert_eq!(rate_limited.recovery_outcome(), None);
+    assert!(!rate_limited.requires_reauthentication());
+    assert!(!rate_limited.requires_device_recovery());
+
+    let upgrade_req = EndpointError::new(
+        "blue.catbird.chat.submitTransition",
+        ChatErrorCode::ProtocolUpgradeRequired,
+        None,
+    );
+    assert_eq!(upgrade_req.recovery_outcome(), Some(RecoveryOutcome::ProtocolUpgradeRequired));
+}

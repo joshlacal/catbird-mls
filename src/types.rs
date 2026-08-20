@@ -121,6 +121,7 @@ pub struct ExternalCommitResult {
     pub group_info: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Debug)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct KeyPackageResult {
     pub key_package_data: Vec<u8>,

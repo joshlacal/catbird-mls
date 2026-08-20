@@ -35,25 +35,9 @@ where
         let identity_bytes = format!("{user_did}#{device_uuid}").into_bytes();
         let kp_result = self.mls_context().create_key_package(identity_bytes)?;
 
-        // Calculate expiry (30 days from now)
-        let expires_at = chrono::Utc::now() + chrono::Duration::days(30);
-        let expires_at_str = expires_at.to_rfc3339();
-
-        // Scope the publish to this device. The UUID is generated and stored
-        // during `ensure_device_registered`, so it is always present by the
-        // time we replenish; without it the server cannot bind the package to
-        // the device signature key and rejects an unscoped fresh device (403).
-        // Upload to server
-        self.api_client()
-            .publish_key_package(
-                &kp_result.key_package_data,
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                &expires_at_str,
-                Some(&device_uuid),
-            )
+        // Publish key package using signed canonical request
+        self.publish_key_packages_batch(&[kp_result])
             .await?;
-
-        tracing::debug!("Key package published");
         Ok(())
     }
 
@@ -150,13 +134,13 @@ where
         let identity_bytes = format!("{user_did}#{device_uuid}").into_bytes();
         let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
 
-        let mut batch: Vec<Vec<u8>> = Vec::with_capacity(needed as usize);
+        let mut batch: Vec<crate::types::KeyPackageResult> = Vec::with_capacity(needed as usize);
         for i in 0..needed {
             match self
                 .mls_context()
                 .create_key_package(identity_bytes.clone())
             {
-                Ok(kp) => batch.push(kp.key_package_data),
+                Ok(kp) => batch.push(kp),
                 Err(e) => {
                     tracing::error!(
                         error = %e,
@@ -168,20 +152,8 @@ where
             }
         }
 
-        // Respect the delivery service's MAX_BATCH_SIZE (100). `needed` is
-        // bounded by the target (50 today), so this is a single chunk, but
-        // chunk defensively in case the target ever grows.
         for chunk in batch.chunks(100) {
-            if let Err(e) = self
-                .api_client()
-                .publish_key_packages(
-                    chunk,
-                    "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                    &expires_at,
-                    Some(device_uuid.as_str()),
-                )
-                .await
-            {
+            if let Err(e) = self.publish_key_packages_batch(chunk).await {
                 tracing::error!(
                     error = %e,
                     batch = chunk.len(),
@@ -190,10 +162,8 @@ where
                 break;
             }
         }
-
         Ok(())
     }
-
     /// Get current key package stats from the server.
     pub async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
         self.api_client().get_key_package_stats().await
@@ -213,5 +183,60 @@ where
         self.api_client()
             .sync_key_packages(local_hashes, &device_uuid)
             .await
+    }
+
+    async fn publish_key_packages_batch(&self, key_packages: &[crate::types::KeyPackageResult]) -> Result<()> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
+        let user_did = self.require_user_did().await?;
+        let device_uuid = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .unwrap_or(1);
+        let identity_bytes = format!("{user_did}#{device_uuid}").into_bytes();
+        let public_key = self.mls_context().identity_public_key(identity_bytes)?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
+
+        let mut sorted_packages = key_packages.to_vec();
+        sorted_packages.sort_by(|a, b| a.hash_ref.cmp(&b.hash_ref));
+
+        let mut packages_json = Vec::with_capacity(sorted_packages.len());
+        for kp in &sorted_packages {
+            packages_json.push(serde_json::json!({
+                "framing": "mlsMessage",
+                "contentType": "keyPackage",
+                "bytes": STANDARD.encode(&kp.key_package_data),
+                "sha256": STANDARD.encode(Sha256::digest(&kp.key_package_data)),
+                "keyPackageRef": STANDARD.encode(&kp.hash_ref)
+            }));
+        }
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#keyPackageReplenishmentBody",
+            "actorDeviceId": device_uuid,
+            "authGeneration": auth_generation,
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "keyId": key_id,
+            "keyPackages": packages_json,
+            "signatureDomain": "CATBIRD-CHAT-DEVICE-REPLENISH\0",
+            "signaturePublicKey": STANDARD.encode(&public_key),
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::ReplenishKeyPackages,
+                serde_json::to_vec(&body)
+                    .map_err(|e| super::error::OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+        if response.status != 200 {
+            return Err(super::error::OrchestratorError::Api(format!(
+                "replenish_key_packages failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            )));
+        }
+        Ok(())
     }
 }

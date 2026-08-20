@@ -203,6 +203,7 @@ where
         }
 
         crate::async_runtime::block_on(self.orchestrator.initialize(user_did))?;
+        let _ = crate::async_runtime::block_on(self.orchestrator.ensure_device_registered())?;
         *self.lock_state()? = EngineState {
             phase: EnginePhase::Initialized,
             initialized_user_did: Some(user_did.to_string()),

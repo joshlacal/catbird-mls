@@ -95,7 +95,7 @@ fn metadata_proposal_capabilities() -> [ProposalType; 1] {
     [ProposalType::AppDataUpdate]
 }
 
-fn metadata_leaf_capabilities() -> Capabilities {
+pub(crate) fn metadata_leaf_capabilities() -> Capabilities {
     Capabilities::new(
         None,
         None,
@@ -2315,28 +2315,36 @@ impl MLSContext {
             credential,
             signature_key: signature_keys.public().into(),
         };
-        let mut group = match predetermined_group_id {
+        let effective_id_bytes = match predetermined_group_id {
             Some(ref id_bytes) => {
-                crate::debug_log!(
-                    "[MLS-CONTEXT] Using predetermined group_id ({} bytes) via MlsGroup::new_with_group_id",
-                    id_bytes.len()
-                );
-                let openmls_group_id = openmls::prelude::GroupId::from_slice(id_bytes);
-                MlsGroup::new_with_group_id(
-                    &self.provider,
-                    &signature_keys,
-                    &group_config,
-                    openmls_group_id,
-                    credential_with_key,
-                )
+                if id_bytes.len() == 32 {
+                    id_bytes.clone()
+                } else if id_bytes.len() > 32 {
+                    id_bytes[id_bytes.len() - 32..].to_vec()
+                } else {
+                    let mut padded = vec![0u8; 32];
+                    padded[..id_bytes.len()].copy_from_slice(id_bytes);
+                    padded
+                }
             }
-            None => MlsGroup::new(
-                &self.provider,
-                &signature_keys,
-                &group_config,
-                credential_with_key,
-            ),
-        }
+            None => {
+                use openmls_traits::random::OpenMlsRand;
+                self.provider.rand().random_vec(32).unwrap_or_else(|_| {
+                    use rand::RngCore;
+                    let mut b = [0u8; 32];
+                    rand::thread_rng().fill_bytes(&mut b);
+                    b.to_vec()
+                })
+            }
+        };
+        let openmls_group_id = openmls::prelude::GroupId::from_slice(&effective_id_bytes);
+        let mut group = MlsGroup::new_with_group_id(
+            &self.provider,
+            &signature_keys,
+            &group_config,
+            openmls_group_id,
+            credential_with_key,
+        )
         .map_err(|e| {
             crate::debug_log!("[MLS-CONTEXT] ERROR: Failed to create MLS group: {:?}", e);
             MLSError::OpenMLSError
@@ -3501,11 +3509,24 @@ impl MLSContext {
 
         self.with_group(&gid, |group, provider, signer| {
             // Deserialize and validate key package
-            let (kp_in, _) =
-                KeyPackageIn::tls_deserialize_bytes(key_package_data).map_err(|e| {
+            let kp_in = if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(key_package_data) {
+                match mls_msg.extract() {
+                    MlsMessageBodyIn::KeyPackage(kp_in) => kp_in,
+                    _ => {
+                        let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data).map_err(|e| {
+                            crate::error_log!("[MLS-CONTEXT] Failed to deserialize key package: {:?}", e);
+                            MLSError::SerializationError
+                        })?;
+                        kp_in
+                    }
+                }
+            } else {
+                let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data).map_err(|e| {
                     crate::error_log!("[MLS-CONTEXT] Failed to deserialize key package: {:?}", e);
                     MLSError::SerializationError
                 })?;
+                kp_in
+            };
 
             let key_package = kp_in
                 .validate(provider.crypto(), ProtocolVersion::default())

@@ -4,6 +4,7 @@ mod e2e_harness;
 
 use std::sync::{Arc, Mutex};
 
+use base64::Engine as _;
 use async_trait::async_trait;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result as OrchestratorResult};
 use catbird_mls::orchestrator::{
@@ -75,59 +76,41 @@ impl MLSAPIClient for RecordingCommitApi {
         self.inner.get_conversations(limit, cursor).await
     }
 
-    async fn create_conversation(
+    async fn submit_prepared_request(
         &self,
-        group_id: &str,
-        initial_members: Option<&[String]>,
-        metadata: Option<&catbird_mls::orchestrator::ConversationMetadata>,
-        commit_data: Option<&[u8]>,
-        welcome_data: Option<&[u8]>,
-    ) -> OrchestratorResult<catbird_mls::orchestrator::CreateConversationResult> {
-        self.inner
-            .create_conversation(
-                group_id,
-                initial_members,
-                metadata,
-                commit_data,
-                welcome_data,
-            )
-            .await
-    }
-
-    async fn leave_conversation(&self, convo_id: &str) -> OrchestratorResult<()> {
-        self.inner.leave_conversation(convo_id).await
-    }
-
-    async fn add_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-    ) -> OrchestratorResult<catbird_mls::orchestrator::AddMembersServerResult> {
-        self.inner
-            .add_members(convo_id, member_dids, commit_data, welcome_data)
-            .await
-    }
-
-    async fn remove_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-    ) -> OrchestratorResult<()> {
-        self.inner
-            .remove_members(convo_id, member_dids, commit_data)
-            .await
-    }
-
-    async fn send_message(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-    ) -> OrchestratorResult<catbird_mls::orchestrator::SendMessageResponse> {
-        self.inner.send_message(convo_id, ciphertext, epoch).await
+        request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
+    ) -> OrchestratorResult<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        if self.fail_commits
+            && request.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
+        {
+            return Err(OrchestratorError::Api(
+                "injected commit failure".to_string(),
+            ));
+        }
+        if request.operation
+            == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestReset
+        {
+            if let Some(ref b) = request.body {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) {
+                    let body_obj = v.get("signedRequest").and_then(|s| s.get("body")).or_else(|| v.get("body")).unwrap_or(&v);
+                    let prior = body_obj.get("prior");
+                    let convo_id = prior
+                        .and_then(|p| p.get("conversationId"))
+                        .or_else(|| body_obj.get("conversationId"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let auth = prior
+                        .and_then(|p| p.get("groupContextHash"))
+                        .and_then(|g| g.as_str().or_else(|| g.get("$bytes").and_then(|b| b.as_str())))
+                        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+                        .map(|bytes| hex::encode(bytes));
+                    self.recovery_reports.lock().unwrap().push((convo_id, auth));
+                }
+            }
+        }
+        self.inner.submit_prepared_request(request).await
     }
 
     async fn get_messages(
@@ -138,21 +121,12 @@ impl MLSAPIClient for RecordingCommitApi {
         message_type: Option<&str>,
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
-    ) -> OrchestratorResult<(Vec<IncomingEnvelope>, Option<String>)> {
+    ) -> OrchestratorResult<(
+        Vec<catbird_mls::orchestrator::IncomingEnvelope>,
+        Option<String>,
+    )> {
         self.inner
             .get_messages(convo_id, cursor, limit, message_type, from_epoch, to_epoch)
-            .await
-    }
-
-    async fn publish_key_package(
-        &self,
-        key_package: &[u8],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> OrchestratorResult<()> {
-        self.inner
-            .publish_key_package(key_package, cipher_suite, expires_at, device_id)
             .await
     }
 
@@ -178,44 +152,11 @@ impl MLSAPIClient for RecordingCommitApi {
         self.inner.sync_key_packages(local_hashes, device_id).await
     }
 
-    async fn register_device(
-        &self,
-        device_uuid: &str,
-        device_name: &str,
-        mls_did: &str,
-        signature_key: &[u8],
-        key_packages: &[Vec<u8>],
-        prepared_request_body: &[u8],
-    ) -> OrchestratorResult<catbird_mls::orchestrator::DeviceInfo> {
-        self.inner
-            .register_device(
-                device_uuid,
-                device_name,
-                mls_did,
-                signature_key,
-                key_packages,
-                prepared_request_body,
-            )
-            .await
-    }
-
     async fn list_devices(
         &self,
-        _actor_device_id: &str,
+        actor_device_id: &str,
     ) -> OrchestratorResult<Vec<catbird_mls::orchestrator::DeviceInfo>> {
-        self.inner.list_devices(_actor_device_id).await
-    }
-
-    async fn remove_device(&self, device_id: &str) -> OrchestratorResult<()> {
-        self.inner.remove_device(device_id).await
-    }
-
-    async fn publish_group_info(
-        &self,
-        convo_id: &str,
-        group_info: &[u8],
-    ) -> OrchestratorResult<()> {
-        self.inner.publish_group_info(convo_id, group_info).await
+        self.inner.list_devices(actor_device_id).await
     }
 
     async fn get_group_info(&self, convo_id: &str) -> OrchestratorResult<Vec<u8>> {
@@ -224,42 +165,6 @@ impl MLSAPIClient for RecordingCommitApi {
 
     async fn get_welcome(&self, convo_id: &str) -> OrchestratorResult<Vec<u8>> {
         self.inner.get_welcome(convo_id).await
-    }
-
-    async fn commit_group_change(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        action: &str,
-        confirmation_tag: Option<&str>,
-    ) -> OrchestratorResult<()> {
-        self.submissions.lock().unwrap().push(CommitSubmission {
-            convo_id: convo_id.to_string(),
-            commit_data: commit_data.to_vec(),
-            action: action.to_string(),
-            confirmation_tag: confirmation_tag.map(str::to_string),
-        });
-
-        if self.fail_commits {
-            return Err(OrchestratorError::Api(
-                "injected commit_group_change failure".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn report_recovery_failure(
-        &self,
-        convo_id: &str,
-        _failure_type: &str,
-        epoch_authenticator: Option<&str>,
-        _failure_mode: Option<&str>,
-    ) -> OrchestratorResult<()> {
-        self.recovery_reports.lock().unwrap().push((
-            convo_id.to_string(),
-            epoch_authenticator.map(str::to_string),
-        ));
-        Ok(())
     }
 }
 
@@ -686,7 +591,7 @@ async fn recovery_vote_authenticator_ignores_stale_legacy_group_state() {
         .create_group("recovery-vote-unrelated", None, None)
         .await
         .expect("create unrelated group");
-    let stable_conversation_id = format!("convo-{group_id}");
+    let stable_conversation_id = uuid::Uuid::new_v4().to_string();
     world
         .delivery_service()
         .rekey_conversation_for_test(&group_id, &stable_conversation_id);
@@ -733,7 +638,7 @@ async fn recovery_vote_authenticator_ignores_stale_legacy_group_state() {
     let expected_authenticator = hex::encode(
         orchestrator
             .mls_context()
-            .epoch_authenticator(hex::decode(&group_id).expect("active group id"))
+            .get_group_context_hash(hex::decode(&group_id).expect("active group id"))
             .expect("active epoch authenticator"),
     );
 

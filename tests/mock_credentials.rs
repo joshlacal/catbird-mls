@@ -154,13 +154,14 @@ impl CredentialStore for MockCredentials {
         transcript: &[u8],
         _key_id: &str,
     ) -> Result<Option<CleanChatSigningAuthority>> {
-        let (key_data, binding, explicit) = {
+        let (key_data, binding, explicit, device_uuid) = {
             let map = self.state.lock().unwrap();
             (
                 map.get(user_did).and_then(|c| c.signing_key.clone()),
                 map.get(user_did).and_then(|c| c.clean_chat_binding.clone()),
                 map.get("__test_authority__")
                     .and_then(|c| c.clean_chat_authority.clone()),
+                map.get(user_did).and_then(|c| c.device_uuid.clone()),
             )
         };
         if let Some(authority) = explicit {
@@ -169,12 +170,12 @@ impl CredentialStore for MockCredentials {
         let Some(key_data) = key_data else {
             return Ok(None);
         };
-        let Some(binding) = binding else {
-            return Err(
-                catbird_mls::orchestrator::error::OrchestratorError::Storage(
-                    "test signing binding is missing".into(),
-                ),
-            );
+        let (device_id, auth_generation) = if let Some(binding) = binding {
+            (binding.device_id, binding.auth_generation)
+        } else if let Some(uuid) = device_uuid {
+            (uuid, Some(1))
+        } else {
+            return Ok(None);
         };
         let signer: SignatureKeyPair = serde_json::from_slice(&key_data).map_err(|_| {
             catbird_mls::orchestrator::error::OrchestratorError::Storage(
@@ -189,8 +190,8 @@ impl CredentialStore for MockCredentials {
         Ok(Some(CleanChatSigningAuthority {
             public_key: signer.public().to_vec(),
             signature,
-            device_id: binding.device_id,
-            auth_generation: binding.auth_generation,
+            device_id,
+            auth_generation,
         }))
     }
 

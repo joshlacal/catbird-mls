@@ -311,9 +311,14 @@ async fn process_incoming_message_catches_up_missing_commits_before_decrypting()
     let bob = world.client("Bob");
     let convo = alice
         .orchestrator
-        .create_group("Epoch catch-up", Some(&[bob_did.clone()]), None)
+        .create_group("Epoch catch-up", None, None)
         .await
         .expect("create_group failed");
+    alice
+        .orchestrator
+        .add_members(&convo.conversation_id, &[bob_did.clone()])
+        .await
+        .expect("add bob");
 
     bob.orchestrator
         .ensure_conversation_ready(&convo.conversation_id)

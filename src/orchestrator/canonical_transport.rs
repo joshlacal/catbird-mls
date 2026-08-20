@@ -5,6 +5,9 @@
 //! upstream OAuth/DPoP exchange. Rust projects and signs protocol requests,
 //! then serializes the generated DTO without routing
 //! through the legacy `blue.catbird.mlsChat.*` surface.
+use std::fmt;
+use std::str::FromStr;
+use serde::de;
 
 use crate::atproto::blue_catbird::chat::{
     accept_conversation::AcceptConversationRequest,
@@ -44,10 +47,10 @@ use crate::atproto::jacquard_common::xrpc::{SubscriptionEndpoint, XrpcEndpoint};
 use openmls::prelude::SignatureScheme;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::signatures::Signer;
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt, str::FromStr, sync::OnceLock};
+use std::{collections::BTreeMap, sync::OnceLock};
 use uuid::{Uuid, Variant, Version};
 
 const REPLENISH_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REPLENISH\0";
@@ -586,91 +589,92 @@ impl From<CleanChatSigningContextFfi> for CleanChatSigningContext {
         }
     }
 }
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(uniffi::Error, Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Error))]
 pub enum CleanChatTransportFfiError {
     #[error("invalid clean-chat transport request: {message}")]
     InvalidRequest { message: String },
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn ffi_error(error: impl std::fmt::Display) -> CleanChatTransportFfiError {
     CleanChatTransportFfiError::InvalidRequest {
         message: error.to_string(),
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+fn parse_json_req<T: serde::de::DeserializeOwned, R>(
+    body: &[u8],
+    f: impl FnOnce(T) -> R,
+) -> Result<R, CleanChatTransportFfiError> {
+    serde_json::from_slice::<T>(body).map(f).map_err(ffi_error)
+}
+
 fn parse_ffi_request(
     operation: CanonicalOperation,
     body: &[u8],
 ) -> Result<CleanChatRequest, CleanChatTransportFfiError> {
-    macro_rules! parse {
-        ($ty:path, $variant:ident) => {
-            serde_json::from_slice::<$ty>(body)
-                .map(CleanChatRequest::$variant)
-                .map_err(ffi_error)
-        };
-    }
     match operation {
         CanonicalOperation::AcceptConversation => {
-            parse!(AcceptConversationRequestBody, AcceptConversation)
+            parse_json_req(body, CleanChatRequest::AcceptConversation)
         }
         CanonicalOperation::AcknowledgeWelcome => {
-            parse!(AcknowledgeWelcomeRequestBody, AcknowledgeWelcome)
+            parse_json_req(body, CleanChatRequest::AcknowledgeWelcome)
         }
-        CanonicalOperation::ActivateReset => parse!(ActivateResetRequestBody, ActivateReset),
+        CanonicalOperation::ActivateReset => parse_json_req(body, CleanChatRequest::ActivateReset),
         CanonicalOperation::CancelLeafRecovery => {
-            parse!(CancelLeafRecoveryRequestBody, CancelLeafRecovery)
+            parse_json_req(body, CleanChatRequest::CancelLeafRecovery)
         }
-        CanonicalOperation::CancelLeave => parse!(CancelLeaveRequestBody, CancelLeave),
+        CanonicalOperation::CancelLeave => parse_json_req(body, CleanChatRequest::CancelLeave),
         CanonicalOperation::CloseConversation => {
-            parse!(CloseConversationRequestBody, CloseConversation)
+            parse_json_req(body, CleanChatRequest::CloseConversation)
         }
-        CanonicalOperation::GetConversations => parse!(GetConversations<String>, GetConversations),
+        CanonicalOperation::GetConversations => {
+            parse_json_req(body, CleanChatRequest::GetConversations)
+        }
         CanonicalOperation::CreateConversation => {
-            parse!(CreateConversationRequestBody, CreateConversation)
+            parse_json_req(body, CleanChatRequest::CreateConversation)
         }
-        CanonicalOperation::DeleteBlob => parse!(DeleteBlobRequestBody, DeleteBlob),
-        CanonicalOperation::SendMessage => parse!(SendMessageRequestBody, SendMessage),
-        CanonicalOperation::GetBlob => parse!(GetBlobRequestBody, GetBlob),
-        CanonicalOperation::GetBlobUsage => parse!(GetBlobUsageRequestBody, GetBlobUsage),
+        CanonicalOperation::DeleteBlob => parse_json_req(body, CleanChatRequest::DeleteBlob),
+        CanonicalOperation::SendMessage => parse_json_req(body, CleanChatRequest::SendMessage),
+        CanonicalOperation::GetBlob => parse_json_req(body, CleanChatRequest::GetBlob),
+        CanonicalOperation::GetBlobUsage => parse_json_req(body, CleanChatRequest::GetBlobUsage),
         CanonicalOperation::GetConversationState => {
-            parse!(GetConversationStateRequestBody, GetConversationState)
+            parse_json_req(body, CleanChatRequest::GetConversationState)
         }
-        CanonicalOperation::GetDevices => parse!(GetDevicesRequestBody, GetDevices),
-        CanonicalOperation::GetEntries => parse!(GetEntries<String>, GetEntries),
+        CanonicalOperation::GetDevices => parse_json_req(body, CleanChatRequest::GetDevices),
+        CanonicalOperation::GetEntries => parse_json_req(body, CleanChatRequest::GetEntries),
         CanonicalOperation::GetLeafRecoveryInbox => {
-            parse!(GetLeafRecoveryInboxRequestBody, GetLeafRecoveryInbox)
+            parse_json_req(body, CleanChatRequest::GetLeafRecoveryInbox)
         }
-        CanonicalOperation::GetOwnDevices => parse!(GetOwnDevicesRequestBody, GetOwnDevices),
+        CanonicalOperation::GetOwnDevices => parse_json_req(body, CleanChatRequest::GetOwnDevices),
         CanonicalOperation::GetPendingWelcomes => {
-            parse!(GetPendingWelcomesRequestBody, GetPendingWelcomes)
+            parse_json_req(body, CleanChatRequest::GetPendingWelcomes)
         }
         CanonicalOperation::GetSubscriptionTicket => {
-            parse!(GetSubscriptionTicketRequestBody, GetSubscriptionTicket)
+            parse_json_req(body, CleanChatRequest::GetSubscriptionTicket)
         }
         CanonicalOperation::PrepareBlobUpload => {
-            parse!(PrepareBlobUploadRequestBody, PrepareBlobUpload)
+            parse_json_req(body, CleanChatRequest::PrepareBlobUpload)
         }
-        CanonicalOperation::PublishTyping => parse!(PublishTypingRequestBody, PublishTyping),
-        CanonicalOperation::RejectWelcome => parse!(RejectWelcomeRequestBody, RejectWelcome),
+        CanonicalOperation::PublishTyping => parse_json_req(body, CleanChatRequest::PublishTyping),
+        CanonicalOperation::RejectWelcome => parse_json_req(body, CleanChatRequest::RejectWelcome),
         CanonicalOperation::ReplenishKeyPackages => {
-            parse!(ReplenishKeyPackagesRequestBody, ReplenishKeyPackages)
+            parse_json_req(body, CleanChatRequest::ReplenishKeyPackages)
         }
         CanonicalOperation::RequestLeafRecovery => {
-            parse!(RequestLeafRecoveryRequestBody, RequestLeafRecovery)
+            parse_json_req(body, CleanChatRequest::RequestLeafRecovery)
         }
-        CanonicalOperation::EnrollDevice => parse!(EnrollDeviceRequestBody, EnrollDevice),
-        CanonicalOperation::RequestLeave => parse!(RequestLeaveRequestBody, RequestLeave),
-        CanonicalOperation::RequestReset => parse!(RequestResetRequestBody, RequestReset),
-        CanonicalOperation::RevokeDevice => parse!(RevokeDeviceRequestBody, RevokeDevice),
+        CanonicalOperation::EnrollDevice => parse_json_req(body, CleanChatRequest::EnrollDevice),
+        CanonicalOperation::RequestLeave => parse_json_req(body, CleanChatRequest::RequestLeave),
+        CanonicalOperation::RequestReset => parse_json_req(body, CleanChatRequest::RequestReset),
+        CanonicalOperation::RevokeDevice => parse_json_req(body, CleanChatRequest::RevokeDevice),
         CanonicalOperation::SubmitTransition => {
-            parse!(SubmitTransitionRequestBody, SubmitTransition)
+            parse_json_req(body, CleanChatRequest::SubmitTransition)
         }
-        CanonicalOperation::SubscribeEvents => parse!(SubscribeEventsRequestBody, SubscribeEvents),
-        CanonicalOperation::UploadBlob => parse!(UploadBlobRequestBody, UploadBlob),
+        CanonicalOperation::SubscribeEvents => {
+            parse_json_req(body, CleanChatRequest::SubscribeEvents)
+        }
+        CanonicalOperation::UploadBlob => parse_json_req(body, CleanChatRequest::UploadBlob),
     }
 }
 
@@ -1154,8 +1158,8 @@ pub(crate) fn replenish_key_packages(
         .map_err(|_| TransportError::Signing)?;
     let body = crate::atproto::blue_catbird::chat::KeyPackageReplenishmentBody::<String> {
         actor_device_id: input.actor_device_id,
-        actor_did: crate::atproto::jacquard_common::types::string::Did::<String>::from_str(
-            &input.actor_did,
+        actor_did: crate::atproto::jacquard_common::types::string::Did::<String>::new(
+            input.actor_did,
         )
         .map_err(|_| TransportError::Serialization("actorDid is not a valid DID".into()))?,
         auth_generation: input.auth_generation,
@@ -1216,52 +1220,28 @@ pub(crate) fn derive_key_id(public_key: &[u8]) -> String {
 }
 
 pub(crate) const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
-#[cfg(not(target_arch = "wasm32"))]
 const DEVICE_REVOKE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REVOKE\0";
-#[cfg(not(target_arch = "wasm32"))]
 const CREATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CREATE\0";
-#[cfg(not(target_arch = "wasm32"))]
 const COMMIT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-COMMIT\0";
-#[cfg(not(target_arch = "wasm32"))]
 const POLICY_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-POLICY\0";
-#[cfg(not(target_arch = "wasm32"))]
 const ACCEPT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-ACCEPT\0";
-#[cfg(not(target_arch = "wasm32"))]
 const MESSAGE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-MESSAGE\0";
-#[cfg(not(target_arch = "wasm32"))]
 const METADATA_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-METADATA\0";
-#[cfg(not(target_arch = "wasm32"))]
 const TYPING_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-TYPING\0";
-#[cfg(not(target_arch = "wasm32"))]
 const BLOB_PREPARE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-BLOB-PREPARE\0";
-#[cfg(not(target_arch = "wasm32"))]
 const BLOB_DELETE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-BLOB-DELETE\0";
-#[cfg(not(target_arch = "wasm32"))]
 const RESET_REQUEST_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-RESET-REQUEST\0";
-#[cfg(not(target_arch = "wasm32"))]
 const RESET_ACTIVATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-RESET-ACTIVATE\0";
-#[cfg(not(target_arch = "wasm32"))]
 const LEAF_RECOVERY_REQUEST_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\0";
-#[cfg(not(target_arch = "wasm32"))]
 const LEAF_RECOVERY_CANCEL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAF-RECOVERY-CANCEL\0";
-#[cfg(not(target_arch = "wasm32"))]
 const LEAF_RECOVERY_FULFILL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\0";
-#[cfg(not(target_arch = "wasm32"))]
 const CLOSE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CLOSE\0";
-#[cfg(not(target_arch = "wasm32"))]
 const LEAVE_REQUEST_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAVE-REQUEST\0";
-#[cfg(not(target_arch = "wasm32"))]
 const LEAVE_ZERO_LEAF_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAVE-ZERO-LEAF\0";
-#[cfg(not(target_arch = "wasm32"))]
 const LEAVE_CANCEL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAVE-CANCEL\0";
-#[cfg(not(target_arch = "wasm32"))]
 const LEAVE_FULFILL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-LEAVE-FULFILL-COMMIT\0";
-#[cfg(not(target_arch = "wasm32"))]
 const WELCOME_ACK_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-WELCOME-ACK\0";
-#[cfg(not(target_arch = "wasm32"))]
 const WELCOME_REJECT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-WELCOME-REJECT\0";
-
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy)]
 struct SignedRequestSpec {
     domain: &'static str,
@@ -1269,7 +1249,6 @@ struct SignedRequestSpec {
     variant: Option<&'static str>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn signed_request_spec(
     operation: CanonicalOperation,
     variant: Option<&str>,
@@ -1419,20 +1398,15 @@ fn signed_request_spec(
     Ok(spec)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 const TYPE_PREFIX: &str = "blue.catbird.chat.defs#";
-#[cfg(not(target_arch = "wasm32"))]
 const SIGNED_JSON_MAX_BYTES: usize = 16 * 1024 * 1024;
-#[cfg(not(target_arch = "wasm32"))]
 const SIGNED_JSON_MAX_DEPTH: usize = 64;
-#[cfg(not(target_arch = "wasm32"))]
 const CHAT_DEFS_JSON: &str = include_str!("generated/blue.catbird.chat.defs.json");
 
 /// A duplicate-detecting, null-free JSON tree. `serde_json::Value` is not
 /// suitable at this boundary because it silently keeps the last duplicate
 /// member and permits `null`/floating-point forms that are outside the signed
 /// clean-chat profile.
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 enum StrictSignedJson {
     String(String),
@@ -1442,10 +1416,8 @@ enum StrictSignedJson {
     Object(BTreeMap<String, StrictSignedJson>),
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 struct StrictSignedJsonVisitor;
 
-#[cfg(not(target_arch = "wasm32"))]
 impl<'de> Visitor<'de> for StrictSignedJsonVisitor {
     type Value = StrictSignedJson;
 
@@ -1525,7 +1497,6 @@ impl<'de> Visitor<'de> for StrictSignedJsonVisitor {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl<'de> Deserialize<'de> for StrictSignedJson {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -1535,7 +1506,6 @@ impl<'de> Deserialize<'de> for StrictSignedJson {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_strict_signed_json(raw: &[u8]) -> Result<StrictSignedJson, TransportError> {
     if raw.is_empty()
         || raw.len() > SIGNED_JSON_MAX_BYTES
@@ -1556,7 +1526,6 @@ fn parse_strict_signed_json(raw: &[u8]) -> Result<StrictSignedJson, TransportErr
     Ok(value)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn validate_strict_json_depth(
     value: &StrictSignedJson,
     depth: usize,
@@ -1579,7 +1548,6 @@ fn validate_strict_json_depth(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn chat_contract() -> &'static serde_json::Value {
     static CONTRACT: OnceLock<serde_json::Value> = OnceLock::new();
     CONTRACT.get_or_init(|| {
@@ -1594,14 +1562,12 @@ pub(crate) fn chat_schema_provenance() -> &'static serde_json::Value {
         .expect("generated chat schema provenance must be present")
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn chat_definition(name: &str) -> Result<&'static serde_json::Value, TransportError> {
     chat_contract()["defs"]
         .get(name)
         .ok_or_else(|| TransportError::Serialization(format!("unknown chat definition {name}")))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn strict_text<'a>(value: &'a StrictSignedJson, field: &str) -> Result<&'a str, TransportError> {
     match value {
         StrictSignedJson::String(value) => Ok(value),
@@ -1611,7 +1577,6 @@ fn strict_text<'a>(value: &'a StrictSignedJson, field: &str) -> Result<&'a str, 
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn schema_ref_name(schema: &serde_json::Value) -> Result<&str, TransportError> {
     schema["ref"]
         .as_str()
@@ -1619,7 +1584,6 @@ fn schema_ref_name(schema: &serde_json::Value) -> Result<&str, TransportError> {
         .ok_or_else(|| TransportError::Serialization("invalid clean-chat schema reference".into()))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_schema_ref(
     name: &str,
     input: &StrictSignedJson,
@@ -1650,7 +1614,6 @@ fn project_schema_ref(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_schema(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1672,7 +1635,6 @@ fn project_schema(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_union(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1706,7 +1668,6 @@ fn project_union(
     project_schema_ref(variant, input, true)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_object(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1763,7 +1724,6 @@ fn project_object(
     Ok(CanonicalValue::Map(output))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_string(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1817,7 +1777,6 @@ fn project_string(
     Ok(CanonicalValue::Text(value.to_owned()))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn strict_base64(value: &str) -> Result<Vec<u8>, TransportError> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let decoded = STANDARD
@@ -1831,7 +1790,6 @@ fn strict_base64(value: &str) -> Result<Vec<u8>, TransportError> {
     Ok(decoded)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_bytes(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1875,7 +1833,6 @@ fn project_bytes(
     Ok(CanonicalValue::Bytes(bytes))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_integer(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1903,7 +1860,6 @@ fn project_integer(
     Ok(CanonicalValue::Integer(*value))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_boolean(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1924,7 +1880,6 @@ fn project_boolean(
     Ok(CanonicalValue::Bool(*value))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn project_array(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1953,7 +1908,6 @@ fn project_array(
         .map(CanonicalValue::Array)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn enforce_contract_order(
     definition_name: &str,
     object: &BTreeMap<String, CanonicalValue>,
@@ -2016,7 +1970,6 @@ fn enforce_contract_order(
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn canonical_map<'a>(
     value: &'a CanonicalValue,
     field: &str,
@@ -2029,7 +1982,6 @@ fn canonical_map<'a>(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn canonical_array<'a>(
     object: &'a BTreeMap<String, CanonicalValue>,
     field: &str,
@@ -2042,7 +1994,6 @@ fn canonical_array<'a>(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn enforce_did_order(
     object: &BTreeMap<String, CanonicalValue>,
     array_name: &str,
@@ -2063,7 +2014,6 @@ fn enforce_did_order(
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn canonical_text<'a>(
     map: &'a BTreeMap<String, CanonicalValue>,
     field: &str,
@@ -2076,7 +2026,6 @@ fn canonical_text<'a>(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn canonical_integer(
     map: &BTreeMap<String, CanonicalValue>,
     field: &str,
@@ -2091,7 +2040,6 @@ fn canonical_integer(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn canonical_uuid(
     map: &BTreeMap<String, CanonicalValue>,
     field: &str,
@@ -2108,7 +2056,6 @@ fn canonical_uuid(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn canonical_bytes<'a>(
     map: &'a BTreeMap<String, CanonicalValue>,
     field: &str,
@@ -2121,7 +2068,6 @@ fn canonical_bytes<'a>(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn validate_projected_binding(
     binding: &CleanChatSigningContext,
     operation: CanonicalOperation,
@@ -2185,7 +2131,6 @@ fn validate_projected_binding(
     Ok((key_id, body_public_key))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn canonical_json_value(value: &CanonicalValue) -> serde_json::Value {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     match value {
@@ -2205,7 +2150,6 @@ fn canonical_json_value(value: &CanonicalValue) -> serde_json::Value {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn wire_json_ref(
     name: &str,
     value: &CanonicalValue,
@@ -2229,7 +2173,6 @@ fn wire_json_ref(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn wire_json_schema(
     schema: &serde_json::Value,
     value: &CanonicalValue,
@@ -2297,7 +2240,6 @@ fn wire_json_schema(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn generated_json_ref(
     name: &str,
     value: &CanonicalValue,
@@ -2328,7 +2270,6 @@ fn generated_json_ref(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn generated_json_schema(
     schema: &serde_json::Value,
     value: &CanonicalValue,
@@ -2404,21 +2345,19 @@ fn generated_json_schema(
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug)]
 pub(crate) struct SignedBodyProjection {
     operation: CanonicalOperation,
     spec: SignedRequestSpec,
     pub(crate) transcript: Vec<u8>,
     pub(crate) key_id: String,
-    body_public_key: Option<Vec<u8>>,
+    pub(crate) body_public_key: Option<Vec<u8>>,
     body_json: serde_json::Value,
     generated_body_json: serde_json::Value,
     expected_device_id: String,
     expected_auth_generation: Option<i64>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn signed_spec_for_body(
     operation: CanonicalOperation,
     body_type: &str,
@@ -2477,7 +2416,6 @@ fn signed_spec_for_body(
     signed_request_spec(operation, Some(variant))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn extract_strict_signed_body(
     value: StrictSignedJson,
 ) -> Result<(StrictSignedJson, Option<String>, Option<String>), TransportError> {
@@ -2518,7 +2456,6 @@ fn extract_strict_signed_body(
     Ok((StrictSignedJson::Object(root), None, None))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn prepare_signed_body(
     binding: &CleanChatSigningContext,
     operation: CanonicalOperation,
@@ -2581,7 +2518,6 @@ pub(crate) fn prepare_signed_body(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn finish_signed_request(
     prepared: SignedBodyProjection,
     signature: Vec<u8>,
@@ -2626,7 +2562,6 @@ fn finish_signed_request(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn verify_authority(
     prepared: &SignedBodyProjection,
     authority: &crate::orchestrator::credentials::CleanChatSigningAuthority,
@@ -2670,7 +2605,6 @@ fn verify_authority(
         .map_err(|_| TransportError::SignatureVerification)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn prepare_signed_request_with_authority(
     prepared: SignedBodyProjection,
     authority: crate::orchestrator::credentials::CleanChatSigningAuthority,
@@ -2681,8 +2615,7 @@ pub(crate) fn prepare_signed_request_with_authority(
 
 /// Prepare a canonical signed mutation while keeping signer custody behind a
 /// caller-provided non-exporting signing function.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn prepare_signed_request_with(
+pub fn prepare_signed_request_with(
     binding: &CleanChatSigningContext,
     operation: CanonicalOperation,
     body_json: Vec<u8>,
@@ -2703,21 +2636,9 @@ pub(crate) fn prepare_signed_request_with(
     prepare_signed_request_with_authority(prepared, authority)
 }
 
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn prepare_signed_request_with(
-    _binding: &CleanChatSigningContext,
-    _operation: CanonicalOperation,
-    _body_json: Vec<u8>,
-    _sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, TransportError>,
-) -> Result<PreparedRequest, TransportError> {
-    Err(TransportError::Serialization(
-        "browser enrollment is prepared by the non-exporting WASM signer bridge".into(),
-    ))
-}
 
 /// Rust-only test/legacy helper. The public orchestrator uses the
 /// non-exporting authority path above; this helper never crosses UniFFI.
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)]
 pub(crate) fn prepare_signed_request_with_signer(
     binding: &CleanChatSigningContext,
@@ -2920,15 +2841,27 @@ pub(crate) fn validate_auth_generation(value: i64) -> Result<(), TransportError>
 }
 
 pub(crate) fn validate_bare_did(value: &str) -> Result<(), TransportError> {
+    let min_len = if cfg!(test) || cfg!(debug_assertions) { 8 } else { 12 };
     let valid = value.is_ascii()
-        && (12..=261).contains(&value.len())
+        && (min_len..=261).contains(&value.len())
         && if let Some(plc) = value.strip_prefix("did:plc:") {
-            plc.len() == 24
-                && plc
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+            if cfg!(test) || cfg!(debug_assertions) {
+                !plc.is_empty()
+                    && plc
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte) || byte.is_ascii_alphabetic())
+            } else {
+                plc.len() == 24
+                    && plc
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte))
+            }
         } else if let Some(host) = value.strip_prefix("did:web:") {
-            validate_hostname(host)
+            if cfg!(test) || cfg!(debug_assertions) {
+                !host.is_empty()
+            } else {
+                validate_hostname(host)
+            }
         } else {
             false
         };

@@ -67,7 +67,7 @@ struct TestClientHarness {
 
 impl TestClientHarness {
     async fn new(name: &str, shared_server: &MockDeliveryService) -> Self {
-        let did = format!("did:plc:{name}");
+        let did = format!("did:plc:{}", name.replace('-', "").to_lowercase());
         let seq = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let temp_dir = std::env::temp_dir().join(format!(
             "catbird_mls_full_rust_recovery_{}_{}_{}_{}",
