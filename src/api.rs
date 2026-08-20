@@ -6064,12 +6064,11 @@ impl MLSContext {
             now.saturating_sub(60),
             now + 29 * 24 * 60 * 60,
         );
-        let leaf_caps = crate::mls_context::metadata_leaf_capabilities();
         let capabilities = Capabilities::new(
             Some(&[openmls::prelude::ProtocolVersion::Mls10]),
             Some(&[ciphersuite]),
-            Some(leaf_caps.extensions()),
-            Some(leaf_caps.proposals()),
+            Some(&[]),
+            Some(&[]),
             Some(&[CredentialType::Basic]),
         );
         let mut builder = KeyPackage::builder()

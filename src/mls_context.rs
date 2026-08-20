@@ -70,49 +70,25 @@ use sha2::{Digest, Sha256};
 // — which was blocking Android's External Commit recovery into legacy
 // groups (see Android logs from Phase G).
 //
-// Resolution: the leaf advertises 0xff00 (so we can join legacy groups)
-// but new groups' RequiredCapabilities omit it. We never write into the
-// 0xff00 extension on outbound commits — Phase A removed those writes.
+// Resolution: new enrollment leaves advertise the server's clean profile:
+// no extension or proposal capabilities. New groups likewise carry an empty
+// RequiredCapabilities extension so these leaves can join successfully.
 
-fn metadata_leaf_extension_capabilities() -> [ExtensionType; 4] {
-    [
-        ExtensionType::RatchetTree,
-        ExtensionType::AppDataDictionary,
-        ExtensionType::LastResort,
-        // Advertise legacy 0xff00 support so we can join groups created
-        // before the cutover. Reading the extension is harmless — the
-        // GroupMetadata struct that consumed it was deleted in Phase F,
-        // but mere "I support this type" doesn't require us to do anything
-        // with the bytes.
-        ExtensionType::Unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE),
-    ]
-}
 
-fn metadata_required_extension_capabilities() -> [ExtensionType; 2] {
-    [ExtensionType::RatchetTree, ExtensionType::AppDataDictionary]
-}
-
-fn metadata_proposal_capabilities() -> [ProposalType; 1] {
-    [ProposalType::AppDataUpdate]
+fn metadata_required_capabilities_extension() -> RequiredCapabilitiesExtension {
+    RequiredCapabilitiesExtension::new(&[], &[], &[])
 }
 
 pub(crate) fn metadata_leaf_capabilities() -> Capabilities {
     Capabilities::new(
         None,
         None,
-        Some(&metadata_leaf_extension_capabilities()),
-        Some(&metadata_proposal_capabilities()),
+        Some(&[]),
+        Some(&[]),
         None,
     )
 }
 
-fn metadata_required_capabilities_extension() -> RequiredCapabilitiesExtension {
-    RequiredCapabilitiesExtension::new(
-        &metadata_required_extension_capabilities(),
-        &metadata_proposal_capabilities(),
-        &[],
-    )
-}
 
 fn map_sqlite_error(context: &str, error: &rusqlite::Error) -> MLSError {
     match error {
