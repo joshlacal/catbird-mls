@@ -1,6 +1,6 @@
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
-use super::error::Result;
+use super::error::{OrchestratorError, Result};
 use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
@@ -194,7 +194,7 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         let identity_bytes = format!("{user_did}#{device_uuid}").into_bytes();
         let public_key = self.mls_context().identity_public_key(identity_bytes)?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);

@@ -32,7 +32,7 @@ fn credential_root_matches_exact(identity: &str, expected_root: &str) -> bool {
     super::credential_binding::credential_root_did(identity) == expected_root
 }
 
-fn advertised_group_id_from_group_info(group_info: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn advertised_group_id_from_group_info(group_info: &[u8]) -> Result<Vec<u8>> {
     crate::message_limits::validate_inbound_mls_message_len(group_info.len(), "group_info")?;
     let (message, remaining) = MlsMessageIn::tls_deserialize_bytes(group_info).map_err(|_| {
         OrchestratorError::InvalidInput("recovery GroupInfo is malformed".to_string())
@@ -43,7 +43,7 @@ fn advertised_group_id_from_group_info(group_info: &[u8]) -> Result<Vec<u8>> {
         ));
     }
     match message.extract() {
-        MlsMessageBodyIn::GroupInfo(group_info) => Ok(group_info.group_id().as_slice().to_vec()),
+        MlsMessageBodyIn::GroupInfo(info) => Ok(info.group_id().as_slice().to_vec()),
         _ => Err(OrchestratorError::InvalidInput(
             "recovery payload is not GroupInfo".to_string(),
         )),
@@ -5636,7 +5636,7 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
             .mls_context()
@@ -6001,35 +6001,36 @@ where
         let transition_id = uuid::Uuid::new_v4().to_string();
         let new_group_id_bytes = hex::decode(&payload.new_group_id)
             .map_err(|_| OrchestratorError::InvalidInput("invalid new_group_id hex".into()))?;
-        let group_id_32 = if new_group_id_bytes.len() == 32 {
-            new_group_id_bytes.clone()
-        } else if new_group_id_bytes.len() > 32 {
-            new_group_id_bytes[new_group_id_bytes.len() - 32..].to_vec()
-        } else {
-            let mut g = vec![0u8; 32];
-            g[..new_group_id_bytes.len()].copy_from_slice(&new_group_id_bytes);
-            g
+        let (group_info_group_id, successor_epoch) = {
+            let (gid, epoch) = {
+                crate::message_limits::validate_inbound_mls_message_len(group_info.len(), "group_info")?;
+                let (message, remaining) = MlsMessageIn::tls_deserialize_bytes(group_info)
+                    .map_err(|_| OrchestratorError::InvalidInput("malformed GroupInfo".into()))?;
+                if !remaining.is_empty() { return Err(OrchestratorError::InvalidInput("GroupInfo trailing bytes".into())); }
+                match message.extract() {
+                    MlsMessageBodyIn::GroupInfo(info) => (info.group_id().as_slice().to_vec(), info.epoch().as_u64()),
+                    _ => return Err(OrchestratorError::InvalidInput("not GroupInfo".into())),
+                }
+            };
+            (gid, epoch)
         };
+        if group_info_group_id != new_group_id_bytes || successor_epoch != 0 {
+            return Err(OrchestratorError::InvalidInput("exported reset GroupInfo coordinate mismatch".into()));
+        }
+        let prior_context = self.resolve_conversation_context(convo_id).await?;
+        let prior_group_id = prior_context.group_id_bytes()?;
+        let prior_epoch = self.mls_context().get_epoch(prior_group_id.clone())?;
+        let prior_tag: [u8; 32] = self.mls_context().get_confirmation_tag(prior_group_id.clone())?.try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("prior confirmation tag length mismatch".into())))?;
+        let prior_gc_hash: [u8; 32] = self.mls_context().get_group_context_hash(prior_group_id.clone())?.try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("prior group context hash length mismatch".into())))?;
+        let successor_tag: [u8; 32] = self.mls_context().get_confirmation_tag(new_group_id_bytes.clone())?.try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("successor confirmation tag length mismatch".into())))?;
+        let successor_gc_hash: [u8; 32] = self.mls_context().get_group_context_hash(new_group_id_bytes.clone())?.try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("successor group context hash length mismatch".into())))?;
         let convo_uuid = uuid::Uuid::parse_str(convo_id)
             .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(new_group_id_bytes.clone())
-            .unwrap_or_else(|_| vec![0u8; 32]);
-        let tag_bytes = if tag_bytes.len() == 32 {
-            tag_bytes
-        } else {
-            vec![0u8; 32]
-        };
-        let gc_hash = self
-            .mls_context()
-            .get_group_context_hash(new_group_id_bytes.clone())
-            .unwrap_or_else(|_| vec![0u8; 32]);
-        let gc_hash = if gc_hash.len() == 32 {
-            gc_hash
-        } else {
-            vec![0u8; 32]
-        };
+        let prior_generation = payload.reset_generation;
 
         use rand::RngCore;
         let mut nonce = [0u8; 12];
@@ -6041,12 +6042,7 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self.mls_context().safe_export_secret(new_group_id_bytes.clone(), 0x8001)
-            .unwrap_or_else(|_| {
-                let mut k = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut k);
-                k.to_vec()
-            });
+        let metadata_key = self.mls_context().safe_export_secret(new_group_id_bytes.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -6101,11 +6097,11 @@ where
                 "ciphertextSha256": base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&tag_bytes),
+                    "confirmationTag": base64::engine::general_purpose::STANDARD.encode(successor_tag),
                     "conversationId": base64::engine::general_purpose::STANDARD.encode(convo_uuid.as_bytes()),
-                    "epoch": 0,
-                    "generation": payload.reset_generation + 1,
-                    "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&gc_hash),
+                    "epoch": successor_epoch,
+                    "generation": prior_generation + 1,
+                    "groupContextHash": base64::engine::general_purpose::STANDARD.encode(successor_gc_hash),
                     "groupId": base64::engine::general_purpose::STANDARD.encode(&new_group_id_bytes)
                 },
                 "metadataVersion": 1,
@@ -6113,34 +6109,33 @@ where
                 "originTransitionId": transition_id
             },
             "prior": {
-                "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(prior_tag),
                 "conversationId": convo_id,
-                "epoch": 0,
-                "generation": payload.reset_generation,
-                "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
-                "groupId": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "epoch": prior_epoch,
+                "generation": prior_generation,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(prior_gc_hash),
+                "groupId": base64::engine::general_purpose::STANDARD.encode(&prior_group_id),
                 "lifecycle": "active",
                 "stateVersion": 0
             },
             "resetRequestId": uuid::Uuid::new_v4().to_string(),
             "retired": {
-                "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(prior_tag),
                 "conversationId": convo_id,
-                "epoch": 0,
-                "generation": payload.reset_generation,
-                "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
-                "groupId": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "epoch": prior_epoch,
+                "generation": prior_generation,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(prior_gc_hash),
+                "groupId": base64::engine::general_purpose::STANDARD.encode(&prior_group_id),
                 "lifecycle": "superseded",
                 "stateVersion": 1
             },
             "signatureDomain": "CATBIRD-CHAT-RESET-ACTIVATE\0",
-            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "successor": {
-                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&tag_bytes),
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(successor_tag),
                 "conversationId": convo_id,
-                "epoch": 0,
-                "generation": payload.reset_generation + 1,
-                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&gc_hash),
+                "epoch": successor_epoch,
+                "generation": prior_generation + 1,
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(successor_gc_hash),
                 "groupId": base64::engine::general_purpose::STANDARD.encode(&new_group_id_bytes),
                 "lifecycle": "active",
                 "stateVersion": 0

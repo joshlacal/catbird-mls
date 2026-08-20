@@ -696,7 +696,7 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         let binding = CleanChatSigningContext {
             actor_did: user_did,
             device_id,

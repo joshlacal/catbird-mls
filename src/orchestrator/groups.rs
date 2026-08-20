@@ -1006,24 +1006,20 @@ where
             .mls_context()
             .export_group_info(group_id_bytes.clone(), scoped_identity.as_bytes().to_vec())?;
 
-        let confirmation_tag = self
-            .mls_context()
-            .get_confirmation_tag(group_id_bytes.clone())
-            .unwrap_or_else(|_| vec![0u8; 32]);
-        let confirmation_tag = if confirmation_tag.len() == 32 {
-            confirmation_tag
-        } else {
-            vec![0u8; 32]
-        };
-        let group_context_hash = self
-            .mls_context()
-            .get_group_context_hash(group_id_bytes.clone())
-            .unwrap_or_else(|_| vec![0u8; 32]);
-        let group_context_hash = if group_context_hash.len() == 32 {
-            group_context_hash
-        } else {
-            vec![0u8; 32]
-        };
+        let advertised_id = super::recovery::advertised_group_id_from_group_info(&group_info_bytes)?;
+        if advertised_id != group_id_bytes {
+            return Err(OrchestratorError::InvalidInput("exported GroupInfo group ID mismatch".into()));
+        }
+        let epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+        if epoch != 0 {
+            return Err(OrchestratorError::InvalidInput("genesis GroupInfo epoch must be zero".into()));
+        }
+        let confirmation_tag: [u8; 32] = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?
+            .try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("confirmation tag length mismatch".into())))?;
+        let group_context_hash: [u8; 32] = self.mls_context().get_group_context_hash(group_id_bytes.clone())?
+            .try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("group context hash length mismatch".into())))?;
 
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use rand::RngCore;
@@ -1055,12 +1051,7 @@ where
         };
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let metadata_key = self.mls_context().safe_export_secret(group_id_bytes.clone(), 0x8001)
-            .unwrap_or_else(|_| {
-                let mut k = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut k);
-                k.to_vec()
-            });
+        let metadata_key = self.mls_context().safe_export_secret(group_id_bytes.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -2085,31 +2076,15 @@ where
             .mls_context()
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
-        let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
-        let convo_id = &resolved.conversation_id;
-        let group_id_bytes = resolved.group_id_bytes().unwrap_or_else(|_| vec![0u8; 32]);
-        let epoch = self
-            .mls_context()
-            .get_epoch(group_id_bytes.clone())
-            .unwrap_or(0);
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(group_id_bytes.clone())
-            .unwrap_or_else(|_| vec![0u8; 32]);
-        let tag_bytes = if tag_bytes.len() == 32 {
-            tag_bytes
-        } else {
-            vec![0u8; 32]
-        };
-        let gc_hash = self
-            .mls_context()
-            .get_group_context_hash(group_id_bytes.clone())
-            .unwrap_or_else(|_| vec![0u8; 32]);
-        let gc_hash = if gc_hash.len() == 32 {
-            gc_hash
-        } else {
-            vec![0u8; 32]
-        };
+        let resolved = self.resolve_conversation_context(convo_id).await?;
+        let group_id_bytes = resolved.group_id_bytes()?;
+        let tag_bytes: [u8; 32] = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?
+            .try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("confirmation tag length mismatch".into())))?;
+        let gc_hash: [u8; 32] = self.mls_context().get_group_context_hash(group_id_bytes.clone())?
+            .try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("group context hash length mismatch".into())))?;
+        let epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#leaveRequestBody",
             "actorDeviceId": actor_device_id,
@@ -3222,12 +3197,7 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self.mls_context().safe_export_secret(group_id.to_vec(), 0x8001)
-            .unwrap_or_else(|_| {
-                let mut k = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut k);
-                k.to_vec()
-            });
+        let metadata_key = self.mls_context().safe_export_secret(group_id.to_vec(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -3347,22 +3317,10 @@ where
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "transitionId": transition_id
         });
-        if let Some(wb) = welcome_bytes {
-            body["manifest"]["welcomeBundle"] = serde_json::json!({
-                "contentType": "welcome",
-                "deliveries": [{
-                    "provenance": {
-                        "keyPackageRef": STANDARD.encode([0u8; 32]),
-                        "recoveryRequestId": uuid::Uuid::new_v4().to_string()
-                    },
-                    "recipientDeviceId": "00000000-0000-4000-8000-000000000001",
-                    "recipientDid": member_dids.first().cloned().unwrap_or_default()
-                }],
-                "framing": "mlsMessage",
-                "opaqueWelcome": STANDARD.encode(wb),
-                "sha256": STANDARD.encode(Sha256::digest(wb)),
-                "welcomeId": uuid::Uuid::new_v4().to_string()
-            });
+        if welcome_bytes.is_some() {
+            return Err(OrchestratorError::InvalidInput(
+                "welcome provenance is unavailable; refusing fabricated key package coordinates".into(),
+            ));
         }
         let response = self
             .submit_signed_clean_chat_request(

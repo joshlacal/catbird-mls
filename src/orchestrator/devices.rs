@@ -337,20 +337,20 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         let key_id = {
             let identity_bytes = format!("{user_did}#{actor_device_id}").into_bytes();
             let pk = self.mls_context().identity_public_key(identity_bytes)?;
             super::canonical_transport::derive_key_id(&pk)
         };
-        let target_auth_generation = match self.api_client().list_devices(&actor_device_id).await {
-            Ok(devices) => devices
-                .into_iter()
-                .find(|d| d.device_id == target_device_id || d.device_uuid == target_device_id)
-                .and_then(|d| d.auth_generation)
-                .unwrap_or(1),
-            Err(_) => 1,
-        };
+        let target_auth_generation = self
+            .api_client()
+            .list_devices(&actor_device_id)
+            .await?
+            .into_iter()
+            .find(|d| d.device_id == target_device_id || d.device_uuid == target_device_id)
+            .and_then(|d| d.auth_generation)
+            .ok_or_else(|| OrchestratorError::InvalidInput("target device auth generation unavailable".into()))?;
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#deviceRevocationBody",
             "actorDid": user_did,
