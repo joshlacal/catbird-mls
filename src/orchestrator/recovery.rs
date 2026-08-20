@@ -2,10 +2,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 use web_time::Instant;
 
-use base64::Engine;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use sha2::{Digest, Sha256};
 use tls_codec::DeserializeBytes;
+use crate::error::MLSError;
 
 use super::api_client::MLSAPIClient;
 use super::constants;
@@ -1182,43 +1183,60 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        if auth_generation < 1 {
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+        }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
             .mls_context()
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
-        let target_epoch = self.mls_context().get_epoch(gid.clone()).unwrap_or(0) + 1;
-        let tag_bytes = {
-            let raw = self
-                .mls_context()
-                .get_confirmation_tag(gid.clone())
-                .unwrap_or_else(|_| vec![0u8; 32]);
-            if raw.len() == 32 {
-                raw
-            } else if raw.len() > 32 {
-                raw[raw.len() - 32..].to_vec()
-            } else {
-                let mut tag = vec![0u8; 32];
-                tag[..raw.len()].copy_from_slice(&raw);
-                tag
-            }
+        let target_epoch = self.mls_context().get_epoch(gid.clone())? + 1;
+        let tag_bytes = self.mls_context().get_confirmation_tag(gid.clone())?;
+        if tag_bytes.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "confirmation tag must be exactly 32 bytes, got {}",
+                tag_bytes.len()
+            ))));
+        }
+        let gc_hash = self.mls_context().get_group_context_hash(gid.clone())?;
+        if gc_hash.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "group context hash must be exactly 32 bytes, got {}",
+                gc_hash.len()
+            ))));
+        }
+        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+
+        use rand::RngCore;
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
+            version: 1,
+            title: "".to_string(),
+            description: "".to_string(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
         };
-        let gc_hash = {
-            let raw = self
-                .mls_context()
-                .get_group_context_hash(gid.clone())
-                .unwrap_or_else(|_| vec![0u8; 32]);
-            if raw.len() == 32 {
-                raw
-            } else if raw.len() > 32 {
-                raw[raw.len() - 32..].to_vec()
-            } else {
-                let mut hash = vec![0u8; 32];
-                hash[..raw.len()].copy_from_slice(&raw);
-                hash
-            }
-        };
+        let metadata_key = self.mls_context().safe_export_secret(gid.clone(), 0x8001)
+            .unwrap_or_else(|_| {
+                let mut k = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut k);
+                k.to_vec()
+            });
+        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
+            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+        })?;
+        let ciphertext = crate::metadata::encrypt_metadata_blob(
+            &metadata_key_arr,
+            &gid,
+            target_epoch,
+            1,
+            &metadata_plaintext,
+        )
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -1226,11 +1244,11 @@ where
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#commitTransitionBody",
             "aad": {
-                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "generation": 0,
                 "prior": {
                     "confirmationTag": STANDARD.encode(&tag_bytes),
-                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch.saturating_sub(1),
                     "generation": 0,
                     "groupContextHash": STANDARD.encode(&gc_hash),
@@ -1239,7 +1257,7 @@ where
                     "stateVersion": 0
                 },
                 "protocolVersion": "1",
-                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).unwrap_or_default().as_bytes())
+                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?.as_bytes())
             },
             "actorDeviceId": actor_device_id,
             "actorDid": user_did,
@@ -1268,19 +1286,19 @@ where
                     "roleAtOrigin": "admin",
                     "signaturePublicKey": STANDARD.encode(&public_key)
                 },
-                "ciphertext": STANDARD.encode([0u8; 16]),
-                "ciphertextSha256": STANDARD.encode(Sha256::digest([0u8; 16])),
-                "ciphertextSize": 16,
+                "ciphertext": STANDARD.encode(&ciphertext),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
+                "ciphertextSize": ciphertext.len(),
                 "coordinate": {
                     "confirmationTag": STANDARD.encode(&tag_bytes),
-                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch,
                     "generation": 0,
                     "groupContextHash": STANDARD.encode(&gc_hash),
                     "groupId": STANDARD.encode(&gid)
                 },
                 "metadataVersion": 1,
-                "nonce": STANDARD.encode([0u8; 12]),
+                "nonce": STANDARD.encode(&nonce),
                 "originTransitionId": transition_id
             },
             "next": {
@@ -2802,44 +2820,64 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        if auth_generation < 1 {
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+        }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
             .mls_context()
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
-        let group_id_bytes = hex::decode(&resolved.group_id).unwrap_or_default();
-        let tag_bytes = {
-            let raw = self
-                .mls_context()
-                .get_confirmation_tag(group_id_bytes.clone())
-                .unwrap_or_else(|_| vec![0u8; 32]);
-            if raw.len() == 32 {
-                raw
-            } else if raw.len() > 32 {
-                raw[raw.len() - 32..].to_vec()
-            } else {
-                let mut tag = vec![0u8; 32];
-                tag[..raw.len()].copy_from_slice(&raw);
-                tag
-            }
-        };
-        let gc_hash = {
-            let raw = self
-                .mls_context()
-                .get_group_context_hash(group_id_bytes.clone())
-                .unwrap_or_else(|_| vec![0u8; 32]);
-            if raw.len() == 32 {
-                raw
-            } else if raw.len() > 32 {
-                raw[raw.len() - 32..].to_vec()
-            } else {
-                let mut hash = vec![0u8; 32];
-                hash[..raw.len()].copy_from_slice(&raw);
-                hash
-            }
-        };
+        let group_id_bytes = resolved.group_id_bytes()?;
+        let tag_bytes = self
+            .mls_context()
+            .get_confirmation_tag(group_id_bytes.clone())?;
+        if tag_bytes.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "confirmation tag must be exactly 32 bytes, got {}",
+                tag_bytes.len()
+            ))));
+        }
+        let gc_hash = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())?;
+        if gc_hash.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "group context hash must be exactly 32 bytes, got {}",
+                gc_hash.len()
+            ))));
+        }
+        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
 
+        use rand::RngCore;
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
+            version: 1,
+            title: "".to_string(),
+            description: "".to_string(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
+        };
+        let metadata_key = self.mls_context().safe_export_secret(group_id_bytes.clone(), 0x8001)
+            .unwrap_or_else(|_| {
+                let mut k = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut k);
+                k.to_vec()
+            });
+        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
+            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+        })?;
+        let ciphertext = crate::metadata::encrypt_metadata_blob(
+            &metadata_key_arr,
+            &group_id_bytes,
+            plan.target_epoch,
+            1,
+            &metadata_plaintext,
+        )
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -2847,11 +2885,11 @@ where
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#leafRecoveryFulfillmentBody",
             "aad": {
-                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "generation": 0,
                 "prior": {
                     "confirmationTag": STANDARD.encode(&tag_bytes),
-                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": plan.target_epoch.saturating_sub(1),
                     "generation": 0,
                     "groupContextHash": STANDARD.encode(&gc_hash),
@@ -2860,7 +2898,7 @@ where
                     "stateVersion": 0
                 },
                 "protocolVersion": "1",
-                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).unwrap_or_default().as_bytes())
+                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?.as_bytes())
             },
             "actorDeviceId": actor_device_id,
             "actorDid": user_did,
@@ -2889,19 +2927,19 @@ where
                     "roleAtOrigin": "admin",
                     "signaturePublicKey": STANDARD.encode(&public_key)
                 },
-                "ciphertext": STANDARD.encode([0u8; 16]),
-                "ciphertextSha256": STANDARD.encode(Sha256::digest([0u8; 16])),
-                "ciphertextSize": 16,
+                "ciphertext": STANDARD.encode(&ciphertext),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
+                "ciphertextSize": ciphertext.len(),
                 "coordinate": {
                     "confirmationTag": STANDARD.encode(&tag_bytes),
-                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(&resolved.conversation_id).unwrap_or_default().as_bytes()),
+                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": plan.target_epoch,
                     "generation": 0,
                     "groupContextHash": STANDARD.encode(&gc_hash),
                     "groupId": STANDARD.encode(&group_id_bytes)
                 },
                 "metadataVersion": 1,
-                "nonce": STANDARD.encode([0u8; 12]),
+                "nonce": STANDARD.encode(&nonce),
                 "originTransitionId": transition_id
             },
             "next": {
@@ -5611,12 +5649,23 @@ where
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
         let recovery_request_id = uuid::Uuid::new_v4().to_string();
-        let resolved = self.resolve_legacy_group_identifier(convo_id).await.ok();
-        let group_id_bytes = resolved.as_ref().and_then(|r| r.group_id_bytes().ok()).unwrap_or_else(|| vec![0u8; 32]);
-        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone()).unwrap_or_else(|_| vec![0u8; 32]);
-        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone()).unwrap_or_else(|_| vec![0u8; 32]);
-        let tag_bytes = if tag_bytes.len() == 32 { tag_bytes } else if tag_bytes.len() > 32 { tag_bytes[tag_bytes.len() - 32..].to_vec() } else { let mut t = vec![0u8; 32]; t[..tag_bytes.len()].copy_from_slice(&tag_bytes); t };
-        let gc_hash = if gc_hash.len() == 32 { gc_hash } else if gc_hash.len() > 32 { gc_hash[gc_hash.len() - 32..].to_vec() } else { let mut h = vec![0u8; 32]; h[..gc_hash.len()].copy_from_slice(&gc_hash); h };
+        let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
+        let convo_id = &resolved.conversation_id;
+        let group_id_bytes = resolved.group_id_bytes()?;
+        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone())?;
+        if gc_hash.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "group context hash must be exactly 32 bytes, got {}",
+                gc_hash.len()
+            ))));
+        }
+        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?;
+        if tag_bytes.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "confirmation tag must be exactly 32 bytes, got {}",
+                tag_bytes.len()
+            ))));
+        }
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
             "actorDeviceId": actor_device_id,
@@ -5667,7 +5716,10 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        if auth_generation < 1 {
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+        }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
             .mls_context()
@@ -5675,37 +5727,55 @@ where
         let key_id = super::canonical_transport::derive_key_id(&public_key);
 
         let resolved = self.resolve_conversation_context(convo_id).await?;
-        let group_id_bytes = hex::decode(&resolved.group_id).unwrap_or_default();
-        let tag_bytes = {
-            let raw = self
-                .mls_context()
-                .get_confirmation_tag(group_id_bytes.clone())
-                .unwrap_or_else(|_| vec![0u8; 32]);
-            if raw.len() == 32 {
-                raw
-            } else if raw.len() > 32 {
-                raw[raw.len() - 32..].to_vec()
-            } else {
-                let mut tag = vec![0u8; 32];
-                tag[..raw.len()].copy_from_slice(&raw);
-                tag
-            }
+        let group_id_bytes = resolved.group_id_bytes()?;
+        let tag_bytes = self
+            .mls_context()
+            .get_confirmation_tag(group_id_bytes.clone())?;
+        if tag_bytes.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "confirmation tag must be exactly 32 bytes, got {}",
+                tag_bytes.len()
+            ))));
+        }
+        let gc_hash = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())?;
+        if gc_hash.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "group context hash must be exactly 32 bytes, got {}",
+                gc_hash.len()
+            ))));
+        }
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+
+        use rand::RngCore;
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
+            version: 1,
+            title: "".to_string(),
+            description: "".to_string(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
         };
-        let gc_hash = {
-            let raw = self
-                .mls_context()
-                .get_group_context_hash(group_id_bytes.clone())
-                .unwrap_or_else(|_| vec![0u8; 32]);
-            if raw.len() == 32 {
-                raw
-            } else if raw.len() > 32 {
-                raw[raw.len() - 32..].to_vec()
-            } else {
-                let mut hash = vec![0u8; 32];
-                hash[..raw.len()].copy_from_slice(&raw);
-                hash
-            }
-        };
+        let metadata_key = self.mls_context().safe_export_secret(group_id_bytes.clone(), 0x8001)
+            .unwrap_or_else(|_| {
+                let mut k = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut k);
+                k.to_vec()
+            });
+        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
+            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+        })?;
+        let ciphertext = crate::metadata::encrypt_metadata_blob(
+            &metadata_key_arr,
+            &group_id_bytes,
+            target_epoch,
+            1,
+            &metadata_plaintext,
+        )
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
 
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
@@ -5716,11 +5786,11 @@ where
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#commitTransitionBody",
             "aad": {
-                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(convo_id).unwrap_or_default().as_bytes()),
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "generation": 0,
                 "prior": {
                     "confirmationTag": STANDARD.encode(&tag_bytes),
-                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(convo_id).unwrap_or_default().as_bytes()),
+                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch.saturating_sub(1),
                     "generation": 0,
                     "groupContextHash": STANDARD.encode(&gc_hash),
@@ -5729,7 +5799,7 @@ where
                     "stateVersion": 0
                 },
                 "protocolVersion": "1",
-                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).unwrap_or_default().as_bytes())
+                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?.as_bytes())
             },
             "actorDeviceId": actor_device_id,
             "actorDid": user_did,
@@ -5758,19 +5828,19 @@ where
                     "roleAtOrigin": "admin",
                     "signaturePublicKey": STANDARD.encode(&public_key)
                 },
-                "ciphertext": STANDARD.encode([0u8; 16]),
-                "ciphertextSha256": STANDARD.encode(Sha256::digest([0u8; 16])),
-                "ciphertextSize": 16,
+                "ciphertext": STANDARD.encode(&ciphertext),
+                "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
+                "ciphertextSize": ciphertext.len(),
                 "coordinate": {
                     "confirmationTag": STANDARD.encode(&tag_bytes),
-                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(convo_id).unwrap_or_default().as_bytes()),
+                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch,
                     "generation": 0,
                     "groupContextHash": STANDARD.encode(&gc_hash),
                     "groupId": STANDARD.encode(&group_id_bytes)
                 },
                 "metadataVersion": 1,
-                "nonce": STANDARD.encode([0u8; 12]),
+                "nonce": STANDARD.encode(&nonce),
                 "originTransitionId": transition_id
             },
             "next": {
@@ -5860,18 +5930,31 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        if auth_generation < 1 {
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+        }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
             .mls_context()
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
-        let resolved = self.resolve_legacy_group_identifier(convo_id).await.ok();
-        let group_id_bytes = resolved.as_ref().and_then(|r| r.group_id_bytes().ok()).unwrap_or_else(|| vec![0u8; 32]);
-        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone()).unwrap_or_else(|_| vec![0u8; 32]);
-        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone()).unwrap_or_else(|_| vec![0u8; 32]);
-        let tag_bytes = if tag_bytes.len() == 32 { tag_bytes } else if tag_bytes.len() > 32 { tag_bytes[tag_bytes.len() - 32..].to_vec() } else { let mut t = vec![0u8; 32]; t[..tag_bytes.len()].copy_from_slice(&tag_bytes); t };
-        let gc_hash = if gc_hash.len() == 32 { gc_hash } else if gc_hash.len() > 32 { gc_hash[gc_hash.len() - 32..].to_vec() } else { let mut h = vec![0u8; 32]; h[..gc_hash.len()].copy_from_slice(&gc_hash); h };
+        let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
+        let group_id_bytes = resolved.group_id_bytes()?;
+        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone())?;
+        if gc_hash.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "group context hash must be exactly 32 bytes, got {}",
+                gc_hash.len()
+            ))));
+        }
+        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?;
+        if tag_bytes.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "confirmation tag must be exactly 32 bytes, got {}",
+                tag_bytes.len()
+            ))));
+        }
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#resetRequestBody",
             "actorDeviceId": actor_device_id,
@@ -5915,13 +5998,76 @@ where
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        if auth_generation < 1 {
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+        }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
             .mls_context()
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
         let transition_id = uuid::Uuid::new_v4().to_string();
+        let new_group_id_bytes = hex::decode(&payload.new_group_id)
+            .map_err(|_| OrchestratorError::InvalidInput("invalid new_group_id hex".into()))?;
+        let group_id_32 = if new_group_id_bytes.len() == 32 {
+            new_group_id_bytes.clone()
+        } else if new_group_id_bytes.len() > 32 {
+            new_group_id_bytes[new_group_id_bytes.len() - 32..].to_vec()
+        } else {
+            let mut g = vec![0u8; 32];
+            g[..new_group_id_bytes.len()].copy_from_slice(&new_group_id_bytes);
+            g
+        };
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let tag_bytes = self
+            .mls_context()
+            .get_confirmation_tag(new_group_id_bytes.clone())
+            .unwrap_or_else(|_| vec![0u8; 32]);
+        let tag_bytes = if tag_bytes.len() == 32 {
+            tag_bytes
+        } else {
+            vec![0u8; 32]
+        };
+        let gc_hash = self
+            .mls_context()
+            .get_group_context_hash(new_group_id_bytes.clone())
+            .unwrap_or_else(|_| vec![0u8; 32]);
+        let gc_hash = if gc_hash.len() == 32 {
+            gc_hash
+        } else {
+            vec![0u8; 32]
+        };
+
+        use rand::RngCore;
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
+            version: 1,
+            title: "".to_string(),
+            description: "".to_string(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
+        };
+        let metadata_key = self.mls_context().safe_export_secret(new_group_id_bytes.clone(), 0x8001)
+            .unwrap_or_else(|_| {
+                let mut k = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut k);
+                k.to_vec()
+            });
+        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
+            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+        })?;
+        let ciphertext = crate::metadata::encrypt_metadata_blob(
+            &metadata_key_arr,
+            &new_group_id_bytes,
+            0,
+            1,
+            &metadata_plaintext,
+        )
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#resetActivationBody",
             "actorDeviceId": actor_device_id,
@@ -5960,23 +6106,19 @@ where
                     "roleAtOrigin": "admin",
                     "signaturePublicKey": base64::engine::general_purpose::STANDARD.encode(&public_key)
                 },
-                "ciphertext": base64::engine::general_purpose::STANDARD.encode([0u8; 16]),
-                "ciphertextSha256": base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest([0u8; 16])),
-                "ciphertextSize": 16,
+                "ciphertext": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+                "ciphertextSha256": base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&ciphertext)),
+                "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
-                    "conversationId": base64::engine::general_purpose::STANDARD.encode(
-                        uuid::Uuid::parse_str(convo_id)
-                            .unwrap_or_default()
-                            .as_bytes(),
-                    ),
+                    "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&tag_bytes),
+                    "conversationId": base64::engine::general_purpose::STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": 0,
                     "generation": payload.reset_generation + 1,
-                    "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
-                    "groupId": base64::engine::general_purpose::STANDARD.encode(hex::decode(&payload.new_group_id).unwrap_or_default())
+                    "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&gc_hash),
+                    "groupId": base64::engine::general_purpose::STANDARD.encode(&new_group_id_bytes)
                 },
                 "metadataVersion": 1,
-                "nonce": base64::engine::general_purpose::STANDARD.encode([0u8; 12]),
+                "nonce": base64::engine::general_purpose::STANDARD.encode(&nonce),
                 "originTransitionId": transition_id
             },
             "prior": {
@@ -6003,12 +6145,12 @@ where
             "signatureDomain": "CATBIRD-CHAT-RESET-ACTIVATE\0",
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "successor": {
-                "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&tag_bytes),
                 "conversationId": convo_id,
                 "epoch": 0,
                 "generation": payload.reset_generation + 1,
-                "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
-                "groupId": base64::engine::general_purpose::STANDARD.encode(hex::decode(&payload.new_group_id).unwrap_or_default()),
+                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&gc_hash),
+                "groupId": base64::engine::general_purpose::STANDARD.encode(&new_group_id_bytes),
                 "lifecycle": "active",
                 "stateVersion": 0
             },
@@ -6022,10 +6164,10 @@ where
             )
             .await?;
         if response.status != 200 {
-            return Err(OrchestratorError::Api(format!(
-                "bootstrap_reset_group failed: {}",
-                response.status
-            )));
+            return Err(OrchestratorError::ServerError {
+                status: response.status as u16,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+            });
         }
         Ok(CreateConversationResult {
             conversation: ConversationView {

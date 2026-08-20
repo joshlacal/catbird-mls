@@ -210,6 +210,9 @@ async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit
         .expect("record_group_reset failed");
     world
         .delivery_service()
+        .set_bootstrap_reset_group_success(true);
+    world
+        .delivery_service()
         .clear_group_info_for_test(&convo.conversation_id);
 
     let result = alice
@@ -217,7 +220,6 @@ async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit
         .ensure_conversation_ready(&convo.conversation_id)
         .await
         .expect("readiness should surface recovery state instead of generic failure");
-
     assert_eq!(result.recovery_state, ConversationRecoveryState::Healthy);
     assert_eq!(result.epoch, Some(0));
     assert!(result.send_allowed);

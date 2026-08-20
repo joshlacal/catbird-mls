@@ -200,10 +200,15 @@ impl TestWorld {
                 .create_key_package(scoped_did.as_bytes().to_vec())?;
             pkgs.push(kp.key_package_data);
         }
+        let device_id = scoped_did
+            .split('#')
+            .nth(1)
+            .unwrap_or(&scoped_did)
+            .to_string();
         client
             .orchestrator
             .api_client()
-            .publish_key_packages(&pkgs, "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519", "", Some(&scoped_did))
+            .publish_key_packages(&pkgs, "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519", "", Some(&device_id))
             .await?;
 
         self.authorized_device_keys

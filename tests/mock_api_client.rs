@@ -1804,6 +1804,10 @@ impl MLSAPIClient for MockDeliveryService {
                     .or_else(|| inner_body.get("conversationId"))
                     .and_then(|c| c.as_str())
                     .unwrap_or_default();
+                let delay_ms = self.state.lock().unwrap().process_external_commit_delay_ms;
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
                 let mut guard = self.state.lock().unwrap();
                 check_fail(&mut guard.failures.fail_next_commit_group_change, "injected commit_group_change failure")?;
                 check_fail(&mut guard.failures.fail_next_add_members, "injected add_members failure")?;
@@ -1885,25 +1889,34 @@ impl MLSAPIClient for MockDeliveryService {
                         });
                 }
 
-                if let Some(w_b64) = inner_body.get("welcomeMessage").and_then(|w| w.as_str()) {
-                    if let Ok(w_bytes) =
-                        base64::engine::general_purpose::STANDARD.decode(w_b64)
-                    {
-                        let group_id_opt = guard.conversations.get(convo_id).map(|c| c.view.group_id.clone());
-                        for (k, _) in guard.key_packages.clone() {
-                            if k != did {
+                let welcome_bytes_opt = inner_body
+                    .get("manifest")
+                    .and_then(|m| m.get("welcomeBundle"))
+                    .or_else(|| inner_body.get("welcomeBundle"))
+                    .and_then(|w| w.get("opaqueWelcome").or_else(|| w.get("bytes")))
+                    .and_then(|b| b.as_str())
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                    .or_else(|| {
+                        inner_body
+                            .get("welcomeMessage")
+                            .and_then(|w| w.as_str())
+                            .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                    });
+                if let Some(w_bytes) = welcome_bytes_opt {
+                    let group_id_opt = guard.conversations.get(convo_id).map(|c| c.view.group_id.clone());
+                    for (k, _) in guard.key_packages.clone() {
+                        if k != did {
+                            guard
+                                .welcomes
+                                 .entry((convo_id.to_string(), k.clone()))
+                                .or_default()
+                                .push(w_bytes.clone());
+                            if let Some(ref gid) = group_id_opt {
                                 guard
                                     .welcomes
-                                    .entry((convo_id.to_string(), k.clone()))
+                                    .entry((gid.clone(), k.clone()))
                                     .or_default()
                                     .push(w_bytes.clone());
-                                if let Some(ref gid) = group_id_opt {
-                                    guard
-                                        .welcomes
-                                        .entry((gid.clone(), k.clone()))
-                                        .or_default()
-                                        .push(w_bytes.clone());
-                                }
                             }
                         }
                     }
@@ -1970,7 +1983,7 @@ impl MLSAPIClient for MockDeliveryService {
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
-                    body: serde_json::to_vec(&serde_json::json!({"result": {}})).unwrap(),
+                    body: serde_json::to_vec(&serde_json::json!({"result": {"uploaded": true}})).unwrap(),
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::AcceptConversation => {
@@ -2006,22 +2019,56 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ActivateReset => {
+                let delay_ms = self.state.lock().unwrap().bootstrap_reset_group_delay_ms;
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
                 let convo_id = inner_body
                     .get("prior")
                     .and_then(|p| p.get("conversationId"))
                     .or_else(|| inner_body.get("conversationId"))
                     .and_then(|c| c.as_str())
                     .unwrap_or_default();
+                let new_group_id_b64 = inner_body
+                    .get("successor")
+                    .and_then(|s| s.get("groupId"))
+                    .and_then(|g| g.as_str())
+                    .unwrap_or_default();
+                let new_group_id_hex = base64::engine::general_purpose::STANDARD
+                    .decode(new_group_id_b64)
+                    .map(|b| hex::encode(&b))
+                    .unwrap_or_default();
+                let group_info_bytes = inner_body
+                    .get("genesisGroupInfo")
+                    .and_then(|g| g.get("bytes"))
+                    .and_then(|b| b.as_str())
+                    .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                    .unwrap_or_default();
+
                 let mut guard = self.state.lock().unwrap();
-                *guard.bootstrap_reset_group_calls.entry(convo_id.to_string()).or_default() += 1;
-                let matched_gid = guard.conversations.values().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id).map(|c| (c.view.conversation_id.clone(), c.view.group_id.clone()));
-                if let Some((cid, gid)) = matched_gid {
-                    if cid != convo_id {
-                        *guard.bootstrap_reset_group_calls.entry(cid).or_default() += 1;
+                let calls = guard.bootstrap_reset_group_calls.entry(convo_id.to_string()).or_default();
+                *calls += 1;
+                let call_number = *calls;
+                if guard.bootstrap_already_bootstrapped_after_success && call_number > 1 {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 409,
+                        content_type: Some("application/json".into()),
+                        body: br#"{"error":"AlreadyBootstrapped"}"#.to_vec(),
+                    });
+                }
+                if guard.bootstrap_reset_group_succeeds {
+                    if let Some(stored) = guard.conversations.get_mut(convo_id) {
+                        if !new_group_id_hex.is_empty() {
+                            stored.view.group_id = new_group_id_hex;
+                        }
                     }
-                    if gid != convo_id {
-                        *guard.bootstrap_reset_group_calls.entry(gid).or_default() += 1;
-                    }
+                    guard.group_infos.insert(convo_id.to_string(), group_info_bytes);
+                } else {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 500,
+                        content_type: Some("application/json".into()),
+                        body: br#"{"error":"bootstrap_reset_group failed"}"#.to_vec(),
+                    });
                 }
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,

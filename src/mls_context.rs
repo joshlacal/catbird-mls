@@ -74,10 +74,11 @@ use sha2::{Digest, Sha256};
 // but new groups' RequiredCapabilities omit it. We never write into the
 // 0xff00 extension on outbound commits — Phase A removed those writes.
 
-fn metadata_leaf_extension_capabilities() -> [ExtensionType; 3] {
+fn metadata_leaf_extension_capabilities() -> [ExtensionType; 4] {
     [
         ExtensionType::RatchetTree,
         ExtensionType::AppDataDictionary,
+        ExtensionType::LastResort,
         // Advertise legacy 0xff00 support so we can join groups created
         // before the cutover. Reading the extension is harmless — the
         // GroupMetadata struct that consumed it was deleted in Phase F,
@@ -2316,17 +2317,7 @@ impl MLSContext {
             signature_key: signature_keys.public().into(),
         };
         let effective_id_bytes = match predetermined_group_id {
-            Some(ref id_bytes) => {
-                if id_bytes.len() == 32 {
-                    id_bytes.clone()
-                } else if id_bytes.len() > 32 {
-                    id_bytes[id_bytes.len() - 32..].to_vec()
-                } else {
-                    let mut padded = vec![0u8; 32];
-                    padded[..id_bytes.len()].copy_from_slice(id_bytes);
-                    padded
-                }
-            }
+            Some(ref id_bytes) => id_bytes.clone(),
             None => {
                 use openmls_traits::random::OpenMlsRand;
                 self.provider.rand().random_vec(32).unwrap_or_else(|_| {

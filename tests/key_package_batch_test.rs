@@ -274,7 +274,8 @@ fn last_resort_create_marks_package_and_persists_bundle() {
         "KeyPackage serialization should not leave trailing bytes"
     );
 
-    let provider = openmls_libcrux_crypto::Provider::new().expect("libcrux provider");
+    use openmls_traits::OpenMlsProvider;
+    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
         .expect("generated key package should validate");

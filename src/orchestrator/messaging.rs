@@ -1,5 +1,7 @@
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
-use sha2::Digest;
+use sha2::{Digest, Sha256};
+use crate::error::MLSError;
 use std::collections::{HashMap, HashSet};
 
 use super::api_client::MLSAPIClient;
@@ -970,8 +972,7 @@ where
                 .get(&commit_hash)
                 .cloned();
             if let Some(expectation) = expectation {
-                let identity_matches = expectation.conversation_id == resolved.conversation_id
-                    && expectation.group_id == resolved.group_id;
+                let identity_matches = expectation.group_id == resolved.group_id;
                 let proof = if identity_matches {
                     self.mls_context()
                         .ensure_storage_durable()
@@ -1885,60 +1886,56 @@ where
         message_id: &str,
     ) -> Result<SendMessageResponse> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        use sha2::{Digest, Sha256};
+        use sha2::Sha256;
         let user_did = self.require_user_did().await?;
         let actor_device_id = self.require_actor_device_id().await?;
         let auth_generation = self
             .credentials()
             .get_auth_generation(&user_did)
             .await?
-            .unwrap_or(1);
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        if auth_generation < 1 {
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+        }
         let key_id = {
             let identity_bytes = format!("{user_did}#{actor_device_id}").into_bytes();
             let pk = self.mls_context().identity_public_key(identity_bytes)?;
             super::canonical_transport::derive_key_id(&pk)
         };
         let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let convo_id = &resolved.conversation_id;
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let msg_uuid = uuid::Uuid::parse_str(message_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid message UUID: {e}")))?;
         let group_id_bytes = resolved.group_id_bytes()?;
-        let confirmation_tag = {
-            let raw = self
-                .mls_context()
-                .get_confirmation_tag(group_id_bytes.clone())
-                .unwrap_or_else(|_| vec![0u8; 32]);
-            if raw.len() == 32 {
-                raw
-            } else if raw.len() > 32 {
-                raw[raw.len() - 32..].to_vec()
-            } else {
-                let mut tag = vec![0u8; 32];
-                tag[..raw.len()].copy_from_slice(&raw);
-                tag
-            }
-        };
-        let group_context_hash = {
-            let raw = self
-                .mls_context()
-                .get_group_context_hash(group_id_bytes.clone())
-                .unwrap_or_else(|_| vec![0u8; 32]);
-            if raw.len() == 32 {
-                raw
-            } else if raw.len() > 32 {
-                raw[raw.len() - 32..].to_vec()
-            } else {
-                let mut hash = vec![0u8; 32];
-                hash[..raw.len()].copy_from_slice(&raw);
-                hash
-            }
-        };
+        let confirmation_tag = self
+            .mls_context()
+            .get_confirmation_tag(group_id_bytes.clone())?;
+        if confirmation_tag.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "confirmation tag must be exactly 32 bytes, got {}",
+                confirmation_tag.len()
+            ))));
+        }
+        let group_context_hash = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())?;
+        if group_context_hash.len() != 32 {
+            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
+                "group context hash must be exactly 32 bytes, got {}",
+                group_context_hash.len()
+            ))));
+        }
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#applicationSendBody",
             "aad": {
-                "conversationId": STANDARD.encode(uuid::Uuid::parse_str(conversation_id).unwrap_or_default().as_bytes()),
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "generation": 0,
-                "messageId": STANDARD.encode(uuid::Uuid::parse_str(message_id).unwrap_or_default().as_bytes()),
+                "messageId": STANDARD.encode(msg_uuid.as_bytes()),
                 "prior": {
                     "confirmationTag": STANDARD.encode(&confirmation_tag),
-                    "conversationId": STANDARD.encode(uuid::Uuid::parse_str(conversation_id).unwrap_or_default().as_bytes()),
+                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": epoch,
                     "generation": 0,
                     "groupContextHash": STANDARD.encode(&group_context_hash),

@@ -4003,7 +4003,11 @@ impl MLSContext {
                     let bytes = t
                         .tls_serialize_detached()
                         .map_err(|e| MLSError::Internal(format!("TLS serialize: {}", e)))?;
-                    Ok(bytes)
+                    if bytes.len() == 33 && bytes[0] == 32 {
+                        Ok(bytes[1..].to_vec())
+                    } else {
+                        Ok(bytes)
+                    }
                 }
                 None => Err(MLSError::Internal("No confirmation tag found".to_string())),
             }

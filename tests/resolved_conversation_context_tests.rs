@@ -16,7 +16,7 @@ use chrono::Utc;
 use e2e_harness::TestWorld;
 use sha2::{Digest, Sha256};
 
-const STABLE_CONVERSATION_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const STABLE_CONVERSATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_projection_failure_does_not_publish_an_undurable_cache_entry() {
@@ -186,7 +186,7 @@ async fn failed_post_create_projection_rolls_back_stable_row_cache_and_raw_mls_g
         .await
         .expect("register alice");
     let alice = world.client("Alice");
-    let stable_id = "stable-create-projection-failure";
+    let stable_id = "11111111-1111-4111-8111-111111111111";
     let local_groups_before = alice
         .orchestrator
         .mls_context()
@@ -270,7 +270,7 @@ async fn failed_group_info_export_removes_stable_projection_and_raw_aliases() {
         .await
         .expect("register alice");
     let alice = world.client("Alice");
-    let stable_id = "stable-create-export-failure";
+    let stable_id = "22222222-2222-4222-8222-222222222222";
     let local_groups_before = alice
         .orchestrator
         .mls_context()
@@ -357,7 +357,7 @@ async fn sync_during_create_protects_distinct_stable_and_group_ids() {
         .await
         .expect("register alice");
     let alice = world.client("Alice");
-    let stable_id = "stable-create-visibility-gap";
+    let stable_id = "33333333-3333-4333-8333-333333333333";
     world
         .delivery_service()
         .set_next_create_conversation_id(stable_id);
@@ -429,7 +429,7 @@ async fn cancelled_create_releases_creation_protection() {
         .await
         .expect("register alice");
     let alice = world.client("Alice");
-    let stable_id = "stable-create-cancelled";
+    let stable_id = "44444444-4444-4444-8444-444444444444";
     world
         .delivery_service()
         .set_next_create_conversation_id(stable_id);
@@ -466,7 +466,7 @@ async fn distinct_stable_create_publishes_group_info_for_stable_recovery_route()
         .await
         .expect("register alice");
     let alice = world.client("Alice");
-    let stable_id = "stable-create-group-info-route";
+    let stable_id = "55555555-5555-4555-8555-555555555555";
     world
         .delivery_service()
         .set_next_create_conversation_id(stable_id);
@@ -552,6 +552,17 @@ async fn migrate_stable_conversation_id_for_test(
         .ensure_conversation_exists(&client.did, new_conversation_id, &old_view.group_id)
         .await
         .expect("persist replacement conversation projection");
+    let latest_epoch = client
+        .storage
+        .get_group_state(&old_view.group_id)
+        .await
+        .ok()
+        .flatten()
+        .map_or(old_view.epoch, |s| s.epoch);
+    let _ = client
+        .storage
+        .update_join_info(new_conversation_id, &client.did, catbird_mls::orchestrator::JoinMethod::Creator, latest_epoch)
+        .await;
     client
         .storage
         .set_conversation_state(new_conversation_id, old_state)
@@ -2080,6 +2091,11 @@ async fn commit_self_remove_proposals_uses_active_group_for_rotated_stable_conve
         .await
         .expect("create group");
     let group_id = conversation.group_id.clone();
+    alice
+        .orchestrator
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("add bob");
     let bob_api = world.delivery_service().clone_as(&bob.did);
     let welcome = bob_api
         .get_welcome(&conversation.conversation_id)
@@ -2174,6 +2190,11 @@ async fn pending_proposal_commit_merges_only_after_server_acceptance() {
         .await
         .expect("create group");
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
+    alice
+        .orchestrator
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
+        .await
+        .expect("add bob");
     let welcome = world
         .delivery_service()
         .clone_as(&bob.did)
@@ -2280,6 +2301,11 @@ async fn empty_application_message_is_not_treated_as_an_epoch_commit() {
         .await
         .expect("create group");
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
+    alice
+        .orchestrator
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
+        .await
+        .expect("add bob");
     let welcome = world
         .delivery_service()
         .clone_as(&bob.did)
@@ -2346,6 +2372,11 @@ async fn sender_binding_rejection_discards_staged_proposal_before_commit() {
         .await
         .expect("create group");
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
+    alice
+        .orchestrator
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
+        .await
+        .expect("add bob");
     let welcome = world
         .delivery_service()
         .clone_as(&bob.did)
@@ -2423,7 +2454,7 @@ async fn unknown_hex_identifier_cannot_be_treated_as_an_authoritative_group_mapp
         .remove(&hex_identifier);
     alice
         .storage
-        .delete_conversations(&alice.did, &[&hex_identifier])
+        .delete_conversations(&alice.did, &[&hex_identifier, &conversation.conversation_id])
         .await
         .expect("remove authoritative mapping");
 
@@ -2560,11 +2591,15 @@ async fn receive_uses_resolved_group_id_but_stores_under_stable_conversation_id(
 
     let conversation = alice
         .orchestrator
-        .create_group("rotated receive", Some(&[bob_did]), None)
+        .create_group("rotated receive", Some(&[bob_did.clone()]), None)
         .await
         .expect("create group with bob");
     let group_id = conversation.group_id.clone();
-
+    alice
+        .orchestrator
+        .add_members(&conversation.conversation_id, &[bob_did.clone()])
+        .await
+        .expect("add bob");
     let bob_api = world.delivery_service().clone_as(&bob.did);
     let welcome = bob_api
         .get_welcome(&conversation.conversation_id)
@@ -2647,14 +2682,18 @@ async fn welcome_join_persists_history_under_stable_conversation_id() {
 
     let conversation = alice
         .orchestrator
-        .create_group("rotated welcome", Some(&[bob_did]), None)
+        .create_group("rotated welcome", Some(&[bob_did.clone()]), None)
         .await
         .expect("create group with bob");
     let group_id = conversation.group_id.clone();
+    alice
+        .orchestrator
+        .add_members(&conversation.conversation_id, &[bob_did.clone()])
+        .await
+        .expect("add bob");
     world
         .delivery_service()
         .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
-
     let bob_api = world.delivery_service().clone_as(&bob.did);
     let welcome = bob_api
         .get_welcome(STABLE_CONVERSATION_ID)
@@ -2823,7 +2862,11 @@ async fn swap_members_uses_resolved_group_after_server_accepts_stable_conversati
         .sync_with_server(false)
         .await
         .expect("refresh stable conversation mapping");
-
+    alice
+        .orchestrator
+        .add_members(STABLE_CONVERSATION_ID, std::slice::from_ref(&bob_did))
+        .await
+        .expect("add bob before swap");
     alice
         .orchestrator
         .swap_members(

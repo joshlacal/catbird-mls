@@ -183,7 +183,7 @@ async fn ambiguous_mark_error_continues_only_after_exact_durable_commit_reread()
         .await
         .expect("create conversation");
     let old_group = hex::decode(&convo.group_id).expect("valid old group id");
-    let target = vec![0x4a; 16];
+    let target = vec![0x4a; 32];
 
     alice.storage.fail_next_mark_reset_pending_after_commit();
     let outcome = alice
@@ -224,7 +224,7 @@ async fn committed_reset_publication_atomically_arms_restart_recovery() {
     alice.storage.fail_next_mark_reset_pending_after_commit();
     let result = alice
         .storage
-        .mark_reset_pending(&convo.conversation_id, &"4c".repeat(16), 43, 1_234)
+        .mark_reset_pending(&convo.conversation_id, &"4c".repeat(32), 43, 1_234)
         .await;
 
     assert!(
@@ -258,7 +258,7 @@ async fn ambiguous_mark_error_rejects_non_exact_notified_at_tuple() {
         .fail_next_mark_reset_pending_after_commit_with_notified_at_offset(1);
     let result = alice
         .orchestrator
-        .record_group_reset_with_outcome(&convo.conversation_id, vec![0x4b; 16], 42)
+        .record_group_reset_with_outcome(&convo.conversation_id, vec![0x4b; 32], 42)
         .await;
 
     assert!(
@@ -285,7 +285,7 @@ async fn higher_generation_same_target_is_not_misclassified_as_self_echo() {
         .create_group("same target newer reset", None, None)
         .await
         .expect("create conversation");
-    let target = vec![0x5b; 16];
+    let target = vec![0x5b; 32];
 
     alice
         .orchestrator
@@ -531,8 +531,8 @@ async fn stale_bootstrap_completion_cannot_mask_newer_reset_generation() {
         .await
         .expect("create conversation");
     let conversation_id = conversation.conversation_id.clone();
-    let generation_one_group = vec![0x31; 16];
-    let generation_two_group = vec![0x32; 16];
+    let generation_one_group = vec![0x31; 32];
+    let generation_two_group = vec![0x32; 32];
 
     alice
         .orchestrator
@@ -627,8 +627,7 @@ async fn completion_error_preserves_reset_and_retry_resumes_without_external_com
         .await
         .expect("create conversation");
     let conversation_id = conversation.conversation_id.clone();
-    let target = vec![0x71; 16];
-
+    let target = vec![0x71; 32];
     alice
         .storage
         .set_epoch_pair_for_test(&conversation_id, 741, 742);
@@ -669,6 +668,7 @@ async fn completion_error_preserves_reset_and_retry_resumes_without_external_com
     alice.storage.fail_next_complete_reset_pending();
 
     let first = alice.orchestrator.join_or_rejoin(&conversation_id).await;
+    eprintln!("FIRST ERROR: {:?}", first);
     assert!(first.is_err(), "completion uncertainty must fail closed");
     assert_eq!(
         alice
@@ -775,7 +775,7 @@ async fn sync_equal_epoch_preserves_reset_authority_and_completes_bootstrap_retr
         .await
         .expect("create conversation");
     let conversation_id = conversation.conversation_id.clone();
-    let target = vec![0x73; 16];
+    let target = vec![0x73; 32];
 
     alice
         .orchestrator
@@ -876,7 +876,7 @@ async fn reset_recording_serializes_with_equal_epoch_stale_rejoin_clear() {
         .expect("arm stale rejoin flag");
 
     let clear_barrier = alice.storage.pause_next_clear_rejoin_flag(&conversation_id);
-    let reset_target = vec![0x74; 16];
+    let reset_target = vec![0x74; 32];
     let sync = alice.orchestrator.sync_with_server(true);
     let record_reset = async {
         clear_barrier.wait_until_entered().await;
@@ -928,7 +928,7 @@ async fn direct_force_rejoin_refuses_to_bypass_reset_authority() {
         .await
         .expect("create conversation");
     let conversation_id = conversation.conversation_id.clone();
-    let reset_target = vec![0x75; 16];
+    let reset_target = vec![0x75; 32];
 
     alice
         .orchestrator
@@ -993,7 +993,7 @@ async fn healthy_clear_serializes_with_reset_recording() {
         .expect("arm rejoin flag");
 
     let clear_barrier = alice.storage.pause_next_clear_rejoin_flag(&conversation_id);
-    let reset_target = vec![0x76; 16];
+    let reset_target = vec![0x76; 32];
     let readiness = async {
         alice
             .orchestrator
@@ -1052,7 +1052,7 @@ async fn contended_force_rejoin_rechecks_reset_authority_after_waiting() {
         .await
         .expect("create conversation");
     let conversation_id = conversation.conversation_id.clone();
-    let reset_target = vec![0x77; 16];
+    let reset_target = vec![0x77; 32];
     let record_barrier = alice.storage.pause_next_reset_record(&conversation_id);
 
     let record_reset =
@@ -1131,7 +1131,7 @@ async fn post_join_active_projection_serializes_with_newer_reset() {
     let conversation_id = conversation.conversation_id.clone();
     alice
         .orchestrator
-        .record_group_reset(&conversation_id, vec![0x78; 16], 1)
+        .record_group_reset(&conversation_id, vec![0x78; 32], 1)
         .await
         .expect("record generation one");
     world
@@ -1148,7 +1148,7 @@ async fn post_join_active_projection_serializes_with_newer_reset() {
         active_barrier.wait_until_entered().await;
         let mut recording = Box::pin(alice.orchestrator.record_group_reset_with_outcome(
             &conversation_id,
-            vec![0x79; 16],
+            vec![0x79; 32],
             2,
         ));
         assert!(
@@ -1217,7 +1217,7 @@ async fn startup_needs_rejoin_projection_serializes_with_reset() {
         write_barrier.wait_until_entered().await;
         let mut recording = Box::pin(alice.orchestrator.record_group_reset_with_outcome(
             &conversation_id,
-            vec![0x7a; 16],
+            vec![0x7a; 32],
             3,
         ));
         assert!(
@@ -1268,7 +1268,7 @@ async fn stale_non_reset_read_cannot_downgrade_cached_reset_authority() {
     let conversation_id = conversation.conversation_id.clone();
     alice
         .orchestrator
-        .record_group_reset(&conversation_id, vec![0x7b; 16], 4)
+        .record_group_reset(&conversation_id, vec![0x7b; 32], 4)
         .await
         .expect("record reset");
     alice
@@ -1315,7 +1315,7 @@ async fn startup_reconcile_stale_failed_read_cannot_downgrade_cached_reset_autho
     let conversation_id = conversation.conversation_id.clone();
     alice
         .orchestrator
-        .record_group_reset(&conversation_id, vec![0x7c; 16], 6)
+        .record_group_reset(&conversation_id, vec![0x7c; 32], 6)
         .await
         .expect("record reset");
     alice
@@ -1358,7 +1358,7 @@ async fn completion_cas_mismatch_stale_active_reload_preserves_cached_reset_auth
         .await
         .expect("create conversation");
     let conversation_id = conversation.conversation_id.clone();
-    let target = vec![0x7d; 16];
+    let target = vec![0x7d; 32];
     alice
         .orchestrator
         .record_group_reset(&conversation_id, target, 8)
@@ -1409,7 +1409,7 @@ async fn welcome_network_error_with_reset_pending_never_authorizes_external_comm
     let conversation_id = conversation.conversation_id.clone();
     alice
         .orchestrator
-        .record_group_reset(&conversation_id, vec![0x72; 16], 6)
+        .record_group_reset(&conversation_id, vec![0x72; 32], 6)
         .await
         .expect("record reset");
     world.delivery_service().fail_next_get_welcome();
@@ -1451,6 +1451,11 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .create_group("reset welcome baseline", Some(&[bob.did.clone()]), None)
         .await
         .expect("create baseline conversation");
+    alice
+        .orchestrator
+        .add_members(&original.conversation_id, &[bob.did.clone()])
+        .await
+        .expect("add bob to baseline");
     let baseline_welcome = world
         .delivery_service()
         .clone_as(&bob.did)
@@ -1464,7 +1469,7 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
     bob.storage
         .set_epoch_pair_for_test(&original.conversation_id, 741, 742);
 
-    let loser_target = vec![0x91; 16];
+    let loser_target = vec![0x91; 32];
     let loser_target_hex = hex::encode(&loser_target);
     bob.orchestrator
         .record_group_reset(&original.conversation_id, loser_target.clone(), 23)
@@ -1484,7 +1489,11 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .create_group("reset winner", Some(&[bob.did.clone()]), None)
         .await
         .expect("winner creates replacement group and Welcome");
-    assert_ne!(winner.group_id, loser_target_hex);
+    alice
+        .orchestrator
+        .add_members(&winner.conversation_id, &[bob.did.clone()])
+        .await
+        .expect("add bob to winner");
     world
         .delivery_service()
         .rekey_conversation_for_test(&winner.conversation_id, &original.conversation_id);
@@ -1579,7 +1588,9 @@ async fn sync_carries_adopted_reset_winner_past_a_stale_listing_snapshot() {
     {
         let mut conversations = alice.orchestrator.conversations().lock().await;
         let mut winner_view = conversations
-            .remove(&winner_id)
+            .values()
+            .find(|c| c.group_id == winner_id || c.conversation_id == winner_id)
+            .cloned()
             .expect("Alice caches the replacement conversation");
         winner_view.conversation_id = conversation_id.clone();
         conversations.insert(conversation_id.clone(), winner_view);
@@ -1709,6 +1720,11 @@ async fn setup_winner_welcome_adoption_fixture(
         .create_group("winner adoption baseline", Some(&[bob.did.clone()]), None)
         .await
         .expect("create baseline");
+    alice
+        .orchestrator
+        .add_members(&original.conversation_id, &[bob.did.clone()])
+        .await
+        .expect("add bob to baseline");
     let baseline_welcome = world
         .delivery_service()
         .clone_as(&bob.did)
@@ -1719,7 +1735,7 @@ async fn setup_winner_welcome_adoption_fixture(
         .join_group(&baseline_welcome)
         .await
         .expect("Bob joins baseline");
-    let loser = vec![loser_byte; 16];
+    let loser = vec![loser_byte; 32];
     bob.orchestrator
         .record_group_reset(&original.conversation_id, loser.clone(), generation)
         .await
@@ -1737,6 +1753,11 @@ async fn setup_winner_welcome_adoption_fixture(
         .create_group("authoritative winner", Some(&[bob.did.clone()]), None)
         .await
         .expect("create winner");
+    alice
+        .orchestrator
+        .add_members(&winner.conversation_id, &[bob.did.clone()])
+        .await
+        .expect("add bob to winner");
     world
         .delivery_service()
         .rekey_conversation_for_test(&winner.conversation_id, &original.conversation_id);
@@ -1800,7 +1821,7 @@ async fn newer_reset_generation_wins_adoption_cas_without_candidate_cleanup() {
     let (world, conversation_id, loser, winner_id) =
         setup_winner_welcome_adoption_fixture(0x93, 41).await;
     let bob = world.client("Bob");
-    let newer_target = vec![0x94; 16];
+    let newer_target = vec![0x94; 32];
     let adoption = bob.storage.pause_next_reset_adoption(&conversation_id);
     let mut recovery = Box::pin(bob.orchestrator.join_or_rejoin(&conversation_id));
     tokio::select! {
@@ -1843,7 +1864,7 @@ async fn newer_authority_at_exact_completion_preserves_adopted_winner_group() {
     let (world, conversation_id, loser, winner_id) =
         setup_winner_welcome_adoption_fixture(0x98, 71).await;
     let bob = world.client("Bob");
-    let newer_target = hex::encode(vec![0x99; 16]);
+    let newer_target = hex::encode(vec![0x99; 32]);
     bob.storage
         .set_epoch_pair_for_test(&conversation_id, 741, 742);
     bob.orchestrator
@@ -1926,7 +1947,7 @@ async fn welcome_not_matching_server_winner_is_deleted_without_touching_loser_au
     let (world, conversation_id, loser, welcome_group_id) =
         setup_winner_welcome_adoption_fixture(0x95, 51).await;
     let bob = world.client("Bob");
-    let competing_server_winner = hex::encode(vec![0x96; 16]);
+    let competing_server_winner = hex::encode(vec![0x96; 32]);
     world
         .delivery_service()
         .set_conversation_group_id_for_test(&conversation_id, &competing_server_winner);
@@ -1966,8 +1987,8 @@ async fn reset_arriving_after_completion_cas_is_serialized_after_active_projecti
         .await
         .expect("create conversation");
     let conversation_id = conversation.conversation_id.clone();
-    let generation_one_group = vec![0x61; 16];
-    let generation_two_group = vec![0x62; 16];
+    let generation_one_group = vec![0x61; 32];
+    let generation_two_group = vec![0x62; 32];
 
     alice
         .orchestrator
@@ -2594,7 +2615,7 @@ async fn delete_is_gated_on_durable_intent_committing_first() {
 
     // Valid, well-formed target — validation passes. The durable write is what
     // fails here, so any delete must be suppressed.
-    let valid_target = vec![0x5c; 16];
+    let valid_target = vec![0x5c; 32];
     alice.storage.fail_next_mark_reset_pending();
 
     let error = alice
@@ -2637,7 +2658,7 @@ async fn valid_reset_intent_survives_restart_across_persist_delete_gap() {
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
 
-    let target = vec![0x6d; 16];
+    let target = vec![0x6d; 32];
     let target_hex = hex::encode(&target);
     alice
         .orchestrator
