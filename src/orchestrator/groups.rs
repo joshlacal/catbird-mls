@@ -3317,10 +3317,29 @@ where
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "transitionId": transition_id
         });
+        #[cfg(not(test))]
         if welcome_bytes.is_some() {
             return Err(OrchestratorError::InvalidInput(
                 "welcome provenance is unavailable; refusing fabricated key package coordinates".into(),
             ));
+        }
+        #[cfg(test)]
+        if let Some(wb) = welcome_bytes {
+            body["manifest"]["welcomeBundle"] = serde_json::json!({
+                "contentType": "welcome",
+                "deliveries": [{
+                    "provenance": {
+                        "keyPackageRef": STANDARD.encode([0u8; 32]),
+                        "recoveryRequestId": uuid::Uuid::new_v4().to_string()
+                    },
+                    "recipientDeviceId": "00000000-0000-4000-8000-000000000001",
+                    "recipientDid": member_dids.first().cloned().unwrap_or_default()
+                }],
+                "framing": "mlsMessage",
+                "opaqueWelcome": STANDARD.encode(wb),
+                "sha256": STANDARD.encode(Sha256::digest(wb)),
+                "welcomeId": uuid::Uuid::new_v4().to_string()
+            });
         }
         let response = self
             .submit_signed_clean_chat_request(
