@@ -1220,12 +1220,9 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self.mls_context().safe_export_secret(gid.clone(), 0x8001)
-            .unwrap_or_else(|_| {
-                let mut k = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut k);
-                k.to_vec()
-            });
+        let metadata_key = self
+            .mls_context()
+            .safe_export_secret(gid.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -2861,12 +2858,9 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self.mls_context().safe_export_secret(group_id_bytes.clone(), 0x8001)
-            .unwrap_or_else(|_| {
-                let mut k = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut k);
-                k.to_vec()
-            });
+        let metadata_key = self
+            .mls_context()
+            .safe_export_secret(group_id_bytes.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -5759,12 +5753,9 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self.mls_context().safe_export_secret(group_id_bytes.clone(), 0x8001)
-            .unwrap_or_else(|_| {
-                let mut k = [0u8; 32];
-                rand::thread_rng().fill_bytes(&mut k);
-                k.to_vec()
-            });
+        let metadata_key = self
+            .mls_context()
+            .safe_export_secret(group_id_bytes.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
