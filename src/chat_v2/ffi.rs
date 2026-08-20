@@ -85,9 +85,10 @@ use super::recovery::{RecoveryLadder, RecoveryRung};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
 pub enum ChatV2ErrorClass {
-    /// The device credential, DPoP binding, or authentication generation is no
-    /// longer valid.
-    Authentication,
+    /// The PDS account session expired and login is required.
+    AccountSession,
+    /// The MLS device requires enrollment or binding recovery.
+    DeviceLifecycle,
     /// Authenticated but not permitted in this state.
     Authorization,
     /// A relationship or declaration policy denied the operation.
@@ -119,7 +120,8 @@ pub enum ChatV2ErrorClass {
 impl From<ChatErrorClass> for ChatV2ErrorClass {
     fn from(class: ChatErrorClass) -> Self {
         match class {
-            ChatErrorClass::Authentication => Self::Authentication,
+            ChatErrorClass::AccountSession => Self::AccountSession,
+            ChatErrorClass::DeviceLifecycle => Self::DeviceLifecycle,
             ChatErrorClass::Authorization => Self::Authorization,
             ChatErrorClass::RelationshipPolicy => Self::RelationshipPolicy,
             ChatErrorClass::Readiness => Self::Readiness,
@@ -163,8 +165,10 @@ pub struct ChatV2EndpointError {
     pub is_retryable_after_backoff: bool,
     /// Whether local state must be refetched and the request rebuilt.
     pub requires_state_resync: bool,
-    /// Whether the device's authentication must be repaired first.
+    /// Whether the PDS account session requires login.
     pub requires_reauthentication: bool,
+    /// Whether automatic MLS device enrollment or binding repair is required.
+    pub requires_device_recovery: bool,
     /// Whether no automatic action can advance this attempt.
     pub is_terminal_for_request: bool,
 }
@@ -181,6 +185,7 @@ impl From<EndpointError> for ChatV2EndpointError {
             is_retryable_after_backoff: class.is_retryable_after_backoff(),
             requires_state_resync: class.requires_state_resync(),
             requires_reauthentication: class.requires_reauthentication(),
+            requires_device_recovery: class.requires_device_recovery(),
             is_terminal_for_request: class.is_terminal_for_request(),
         }
     }
@@ -300,6 +305,7 @@ pub fn chat_v2_classify_endpoint_error(
         is_retryable_after_backoff: class.is_retryable_after_backoff(),
         requires_state_resync: class.requires_state_resync(),
         requires_reauthentication: class.requires_reauthentication(),
+        requires_device_recovery: class.requires_device_recovery(),
         is_terminal_for_request: class.is_terminal_for_request(),
     }
 }
@@ -659,7 +665,8 @@ mod tests {
         );
         let ffi: ChatV2EndpointError = domain.into();
         assert_eq!(ffi.code, "DeviceRevoked");
-        assert!(ffi.requires_reauthentication);
+        assert!(!ffi.requires_reauthentication);
+        assert!(ffi.requires_device_recovery);
     }
 
     #[test]

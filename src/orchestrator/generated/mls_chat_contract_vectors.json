@@ -1,14 +1,14 @@
 {
   "_catbird_mls_provenance": {
     "generator": "scripts/generate_chat_schema.py",
-    "generatorVersion": 7,
+    "generatorVersion": 9,
     "sourcePath": "mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json",
-    "sourceRevision": "38126b069d11992310043752bc84bf5f6817212b",
-    "sourceSha256": "96044be0c06e3dd43cbe77b7ac29c1ecfcee1922782b1c5e74258768b1aa3c6d",
-    "sourceTree": "2515b2234a4f86cf08c929d540ada696bf747c04",
+    "sourceRevision": "ec5028ce4f424af3819aa3e993c86fca1a85bbde",
+    "sourceSha256": "4bfaf0966facdf574fa0411fa245f06288de2badac5ffeb8ec2b076ba7b58d4e",
+    "sourceTree": "e29416025c27ac91c74930514b2bc85385f93a0c",
     "vectorCaseCount": 14,
     "vectorSet": "signed-mutation",
-    "vectorSetCount": 25
+    "vectorSetCount": 24
   },
   "applicationEntryFingerprint": {
     "base64BytePaths": [
@@ -611,145 +611,6 @@
       "😀",
       "a"
     ]
-  },
-  "cleanAuth": {
-    "ambiguousResponseLossAfterDsCommitRemainsPinnedPendingUntilNestDurablyRecordsSuccess": true,
-    "authCapabilityExpiresAt": "authTimePlus300Seconds",
-    "authCapabilityFirstBodyPinFields": [
-      "canonicalRequestDigest",
-      "signature",
-      "sub",
-      "device_id",
-      "dpopJkt",
-      "key_id",
-      "signing_key_sha256",
-      "enrollment_transcript_sha256"
-    ],
-    "authCapabilityStates": [
-      "unpinned",
-      "pinnedPending",
-      "terminalSuccess"
-    ],
-    "authEvidencePurpose": "blue.catbird.chat.enrollDevice",
-    "authTimeSource": "nestCallbackCompletionNotUpstreamAuthTime",
-    "authTxnConsumedOnce": true,
-    "authTxnGrammar": "canonicalLowercaseUuidV4",
-    "authTxnSource": "nestServerGeneratedPerGrantAttemptDistinctFromProviderStateAndClientInput",
-    "changedBodyCanReuseAuthCapability": false,
-    "chatInstanceGrammar": "canonicalLowercaseUuidV4",
-    "deliveryServiceAuthTimeAgeCheckIndependent": true,
-    "deliveryServiceExactReplayReturnsStoredResultWithoutReexecution": true,
-    "enrollmentGrantBindings": [
-      "sub",
-      "lxm",
-      "device_id",
-      "key_id",
-      "signing_key_sha256",
-      "dpopJkt",
-      "enrollment_transcript_sha256",
-      "auth_time",
-      "auth_txn"
-    ],
-    "enrollmentGrantExpArithmetic": "checkedNumericDate",
-    "enrollmentGrantExpFormula": "min(iatPlus120,authTimePlus300)",
-    "enrollmentGrantExpirationCases": [
-      {
-        "authTime": 1699999900,
-        "expectedExp": 1700000120,
-        "iat": 1700000000,
-        "limitingBound": "iatPlus120"
-      },
-      {
-        "authTime": 1700000000,
-        "expectedExp": 1700000300,
-        "iat": 1700000290,
-        "limitingBound": "authTimePlus300"
-      },
-      {
-        "authTime": 1700000000,
-        "expectedExp": 1700000300,
-        "iat": 1700000180,
-        "limitingBound": "equal"
-      }
-    ],
-    "ephemeralBrowserPreferredBestEffort": true,
-    "expiredCapabilityRequiresNewAuthorizationCodeFlow": true,
-    "freshAuthorizationAttestsCredentialEntryOrUserPresence": false,
-    "htuHtmWidenReplayKey": false,
-    "invalidEnrollmentGrantNumericDates": [
-      {
-        "authTime": 1700000000,
-        "iat": -1
-      },
-      {
-        "authTime": -1,
-        "iat": 1700000000
-      },
-      {
-        "authTime": 1700000000,
-        "iat": 9007199254740900
-      },
-      {
-        "authTime": 9007199254740800,
-        "iat": 1700000000
-      }
-    ],
-    "invalidPrePinAttemptBurnsOrPinsCapability": false,
-    "maxAuthTimeAgeSeconds": 300,
-    "maxEvidenceLifetimeSeconds": 300,
-    "maxTokenLifetimeSeconds": 120,
-    "nestDurableSuccessClosesAuthCapability": true,
-    "nestDurableSuccessStoresTerminalResultBinding": true,
-    "nestOwnsSessionDpopPrivateKey": true,
-    "ordinaryTokenExpirationCases": [
-      {
-        "exp": 1700000120,
-        "iat": 1700000000,
-        "valid": true
-      },
-      {
-        "exp": 1700000121,
-        "iat": 1700000000,
-        "valid": false
-      }
-    ],
-    "pinnedPendingRetryGetsFreshAuthTxnAndTokenProofJtis": true,
-    "pinnedPendingRetryRetainsOriginalAuthTime": true,
-    "prePinChecks": [
-      "strictCanonicalDecode",
-      "bounds",
-      "capabilityBodyBindings",
-      "bodyEd25519SignatureUnderSuppliedImmutableSigningKey"
-    ],
-    "promptLoginRequestedBestEffort": true,
-    "promptOrUpstreamAuthTimeIsSecurityPredicate": false,
-    "proofJtiGrammar": "canonicalBase64urlNoPadDecoded12To32Bytes",
-    "proofReplayKey": [
-      "jkt",
-      "decodedJtiBytes"
-    ],
-    "proofReplayNamespace": "dpopProofJti",
-    "purposeBoundAuthorizationCodeOnly": true,
-    "rebindCompletedReplayProofJkt": "recordedNewDpopJkt",
-    "rebindFirstExecutionProofJkt": "newDpopJkt",
-    "refreshRestoreCookieEvidenceAllowed": false,
-    "requiredTokenClaims": [
-      "iss",
-      "sub",
-      "aud",
-      "lxm",
-      "iat",
-      "exp",
-      "jti",
-      "cnf.jkt",
-      "device_id",
-      "chat_instance"
-    ],
-    "terminalExactClientRetrySource": "nestStoredTerminalResultBindingNoDownstreamGrant",
-    "terminalSuccessCanMintDownstreamGrant": false,
-    "tokenJtiGrammar": "canonicalLowercaseUuidV4",
-    "tokenReplayNamespace": "cleanAccessTokenJti",
-    "userReauthenticationClaimed": false
   },
   "controlEntryFingerprintGeneration": {
     "checkCommand": "python3 mls-ds/server/tests/generate_mls_chat_contract_vectors.py --check",
@@ -1482,6 +1343,43 @@
       "blobId",
       "idempotencyKey"
     ]
+  },
+  "standardServiceAuth": {
+    "accountAuthorityFields": [
+      "iss",
+      "aud",
+      "lxm",
+      "iat",
+      "exp",
+      "jti"
+    ],
+    "basicCredentialIdentity": "actorDid#deviceId",
+    "clientDeviceIdAuthoritative": true,
+    "customCleanChatDpopAccepted": false,
+    "delegatedNestTokensAccepted": false,
+    "deviceAuthorityFields": [
+      "actorDid",
+      "actorDeviceId",
+      "keyId",
+      "authGeneration",
+      "signature"
+    ],
+    "enrollmentGeneration": 0,
+    "exactAudienceRequired": true,
+    "exactMethodLxmRequired": true,
+    "exactReplayReturnsStoredResult": true,
+    "issuerVerificationMethod": "#atproto",
+    "jtiConsumedOnce": true,
+    "maxTokenLifetimeSeconds": 60,
+    "requiredTokenClaims": [
+      "iss",
+      "aud",
+      "lxm",
+      "iat",
+      "exp",
+      "jti"
+    ],
+    "serviceRef": "did:web:chat.catbird.blue#atproto_mls"
   },
   "strictJson": {
     "invalid": [

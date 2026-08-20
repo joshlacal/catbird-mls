@@ -16,10 +16,10 @@ use super::code::ChatErrorCode;
 /// What a chat error code means for synchronization and recovery policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChatErrorClass {
-    /// The device's credential, DPoP binding, or authentication generation is
-    /// no longer valid. Requires rebind, re-enrollment, or a new device — never
-    /// a blind retry.
-    Authentication,
+    /// The PDS account session is expired and login is genuinely required.
+    AccountSession,
+    /// The MLS device must enroll, re-enroll, or reconcile its binding.
+    DeviceLifecycle,
     /// The principal is authenticated but not permitted to perform this
     /// operation in this state.
     Authorization,
@@ -74,7 +74,11 @@ impl ChatErrorClass {
 
     /// Whether the device's authentication must be repaired before retrying.
     pub fn requires_reauthentication(&self) -> bool {
-        matches!(self, Self::Authentication)
+        matches!(self, Self::AccountSession)
+    }
+
+    pub fn requires_device_recovery(&self) -> bool {
+        matches!(self, Self::DeviceLifecycle)
     }
 
     /// Whether this attempt is over and no automatic action can advance it.
@@ -82,6 +86,7 @@ impl ChatErrorClass {
         !self.is_retryable_after_backoff()
             && !self.requires_state_resync()
             && !self.requires_reauthentication()
+            && !self.requires_device_recovery()
     }
 }
 
@@ -91,12 +96,13 @@ impl ChatErrorCode {
         use ChatErrorClass as C;
         match self {
             // Authentication: the device credential itself is the problem.
-            Self::InvalidDPoP
-            | Self::DeviceNotRegistered
+            Self::AccountSessionExpired => C::AccountSession,
+
+            Self::DeviceNotRegistered
             | Self::DeviceRevoked
             | Self::DeviceTombstoned
-            | Self::DeviceNotFound
-            | Self::AuthenticationGenerationConflict => C::Authentication,
+            | Self::DeviceBindingMismatch
+            | Self::AuthenticationGenerationConflict => C::DeviceLifecycle,
 
             // Authorization: authenticated, but not permitted here and now.
             Self::NotAuthorized
@@ -163,6 +169,7 @@ impl ChatErrorCode {
             | Self::LeafRecoveryNotFound
             | Self::LeaveRequestNotFound
             | Self::ResetRequestNotFound
+            | Self::DeviceNotFound
             | Self::UploadTicketNotFound => C::NotFound,
 
             Self::WelcomeExpired
@@ -209,7 +216,7 @@ impl ChatErrorCode {
             // incomplete, or stale evidence rather than a denial.
             Self::RelationshipPolicyUnavailable | Self::RateLimited => C::Transient,
 
-            Self::CutoverRequired => C::CutoverRequired,
+            Self::CutoverRequired | Self::ProtocolUpgradeRequired => C::CutoverRequired,
 
             Self::Unknown(_) => C::Unknown,
         }
@@ -316,13 +323,22 @@ mod tests {
     }
 
     #[test]
-    fn credential_failures_demand_reauthentication() {
-        for spelling in ["InvalidDPoP", "DeviceRevoked", "DeviceNotRegistered"] {
+    fn device_failures_demand_device_recovery_not_login() {
+        for spelling in [
+            "DeviceBindingMismatch",
+            "DeviceRevoked",
+            "DeviceNotRegistered",
+        ] {
             let class = ChatErrorCode::parse(spelling).classify();
-            assert!(class.requires_reauthentication(), "{spelling}");
+            assert!(!class.requires_reauthentication(), "{spelling}");
+            assert!(class.requires_device_recovery(), "{spelling}");
             assert!(!class.is_retryable_after_backoff());
             assert!(!class.is_terminal_for_request());
         }
+
+        let expired = ChatErrorCode::AccountSessionExpired.classify();
+        assert!(expired.requires_reauthentication());
+        assert!(!expired.requires_device_recovery());
     }
 
     #[test]
@@ -335,6 +351,7 @@ mod tests {
                 class.is_retryable_after_backoff(),
                 class.requires_state_resync(),
                 class.requires_reauthentication(),
+                class.requires_device_recovery(),
             ];
             assert!(
                 set.iter().filter(|answered| **answered).count() <= 1,

@@ -125,11 +125,6 @@ signed_mutation_kinds!(
         "CATBIRD-CHAT-DEVICE-REPLENISH\0"
     ),
     (
-        DeviceAuthenticationRebind,
-        "deviceAuthenticationRebindBody",
-        "CATBIRD-CHAT-DEVICE-REBIND\0"
-    ),
-    (
         DeviceRevocation,
         "deviceRevocationBody",
         "CATBIRD-CHAT-DEVICE-REVOKE\0"

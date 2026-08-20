@@ -299,7 +299,7 @@ fn every_domain_is_nul_terminated_and_unique() {
         );
         seen.push(domain);
     }
-    assert_eq!(seen.len(), 25, "the closed set is twenty-five kinds");
+    assert_eq!(seen.len(), 24, "the closed set is twenty-four kinds");
 }
 
 #[test]

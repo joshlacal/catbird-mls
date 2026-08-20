@@ -95,10 +95,11 @@ impl CatbirdMls {
         config: FFIOrchestratorConfig,
     ) -> Result<Arc<Self>, OrchestratorBridgeError> {
         // Create the low-level MLS context
-        let mls_context = MLSContext::new(storage_path, encryption_key, keychain)
-            .map_err(|e| OrchestratorBridgeError::Mls {
+        let mls_context = MLSContext::new(storage_path, encryption_key, keychain).map_err(|e| {
+            OrchestratorBridgeError::Mls {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
 
         let orch_config = OrchestratorConfig {
             max_devices: config.max_devices,
@@ -467,6 +468,12 @@ impl CatbirdMls {
                 mls_did: d.mls_did,
                 device_uuid: d.device_uuid,
                 created_at: d.created_at.map(|t| t.to_rfc3339()),
+                key_id: d.key_id,
+                signature_public_key: d.signature_public_key,
+                auth_generation: d.auth_generation,
+                status: d.status,
+                available_package_count: d.available_package_count,
+                reserved_package_count: d.reserved_package_count,
             })
             .collect())
     }
@@ -501,9 +508,7 @@ impl CatbirdMls {
         reason: String,
     ) -> Result<(), OrchestratorBridgeError> {
         let orchestrator = self.client.orchestrator();
-        crate::async_runtime::block_on(
-            orchestrator.report_unrecoverable_local(&convo_id, &reason),
-        );
+        crate::async_runtime::block_on(orchestrator.report_unrecoverable_local(&convo_id, &reason));
         Ok(())
     }
 
@@ -541,7 +546,10 @@ impl CatbirdMls {
     }
 
     /// Get the confirmation tag for a group.
-    pub fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, OrchestratorBridgeError> {
+    pub fn get_confirmation_tag(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Vec<u8>, OrchestratorBridgeError> {
         self.mls_context
             .get_confirmation_tag(group_id)
             .map_err(|e| OrchestratorBridgeError::Mls {
@@ -620,10 +628,7 @@ impl CatbirdMls {
     }
 
     /// Merge a pending commit after server acknowledgment.
-    pub fn merge_pending_commit(
-        &self,
-        group_id: Vec<u8>,
-    ) -> Result<u64, OrchestratorBridgeError> {
+    pub fn merge_pending_commit(&self, group_id: Vec<u8>) -> Result<u64, OrchestratorBridgeError> {
         self.mls_context
             .merge_pending_commit(group_id)
             .map(|r| r.new_epoch)
@@ -633,10 +638,7 @@ impl CatbirdMls {
     }
 
     /// Clear a pending commit (e.g., after server rejection).
-    pub fn clear_pending_commit(
-        &self,
-        group_id: Vec<u8>,
-    ) -> Result<(), OrchestratorBridgeError> {
+    pub fn clear_pending_commit(&self, group_id: Vec<u8>) -> Result<(), OrchestratorBridgeError> {
         self.mls_context
             .clear_pending_commit(group_id)
             .map_err(|e| OrchestratorBridgeError::Mls {
@@ -784,10 +786,7 @@ impl CatbirdMls {
     }
 
     /// Export epoch secret for the current epoch.
-    pub fn export_epoch_secret(
-        &self,
-        group_id: Vec<u8>,
-    ) -> Result<(), OrchestratorBridgeError> {
+    pub fn export_epoch_secret(&self, group_id: Vec<u8>) -> Result<(), OrchestratorBridgeError> {
         self.mls_context
             .export_epoch_secret(group_id)
             .map_err(|e| OrchestratorBridgeError::Mls {

@@ -560,6 +560,18 @@ where
         }
     }
 
+    /// Resolve the durable client-generated device ID used to scope every
+    /// authenticated AppView read. A caller may never substitute a header or
+    /// synthetic identifier when local device custody is absent.
+    pub(crate) async fn require_actor_device_id(&self) -> Result<String> {
+        let user_did = self.require_user_did().await?;
+        self.credentials()
+            .get_device_uuid(&user_did)
+            .await?
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| OrchestratorError::Credential("device not registered".into()))
+    }
+
     /// Read the lifecycle-bound user for destructive cleanup that may resume
     /// during `initialize` before the public authenticated state becomes
     /// Ready. Callers must already hold the lifecycle/transition ownership

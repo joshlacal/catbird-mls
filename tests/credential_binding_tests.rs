@@ -45,7 +45,7 @@ async fn replace_available_packages_with_one_wrapped(
         let fetched = requester
             .orchestrator
             .api_client()
-            .get_key_packages(&[did.to_string()])
+            .get_key_packages("00000000-0000-4000-8000-000000000001", &[did.to_string()])
             .await
             .expect("drain raw key packages");
         let Some(package) = fetched.into_iter().next() else {
@@ -389,69 +389,53 @@ async fn successful_no_advance_add_rejects_without_local_roster_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn create_group_rejects_substituted_initial_package_before_create_or_persist() {
+async fn create_group_keeps_invitees_pending_without_fetching_key_packages() {
     let mut world = TestWorld::new();
-    for name in ["Alice", "Bob", "Mallory"] {
+    const ALICE: &str = "aaaaaaaaaaaaaaaaaaaaaaaa";
+    const BOB: &str = "bbbbbbbbbbbbbbbbbbbbbbbb";
+    const MALLORY: &str = "cccccccccccccccccccccccc";
+    for name in [ALICE, BOB, MALLORY] {
         world.add_client(name).await;
         world.register_device(name).await.unwrap();
     }
 
-    let alice = world.client("Alice");
-    let bob_did = world.client("Bob").did.clone();
-    let mallory_did = world.client("Mallory").did.clone();
+    let alice = world.client(ALICE);
+    let bob_did = world.client(BOB).did.clone();
+    let mallory_did = world.client(MALLORY).did.clone();
     world
         .delivery_service()
         .redirect_key_packages_for_test(&bob_did, &mallory_did);
 
-    let groups_before = alice
-        .orchestrator
-        .mls_context()
-        .list_local_group_ids()
-        .expect("list local groups");
-    let conversations_before = alice.storage.conversation_count();
-    let pending_deletes_before = alice.storage.pending_local_delete_count();
-
-    // This sentinel must remain unconsumed: credential validation is required
-    // to finish before group creation reaches its first persistence mutation.
-    alice.storage.fail_next_mark_pending_local_delete();
-    let error = alice
+    let bob_packages_before = world.delivery_service().key_package_count(&bob_did);
+    let conversation = alice
         .orchestrator
         .create_group(
-            "preflight initial binding",
+            "actor-only genesis",
             Some(std::slice::from_ref(&bob_did)),
             None,
         )
         .await
-        .expect_err("substituted initial KeyPackage must fail preflight");
-    assert!(matches!(error, OrchestratorError::InvalidInput(_)));
-    assert!(error.to_string().contains("credential") || error.to_string().contains("DID"));
+        .expect("pending invitee must not require a KeyPackage");
+
+    assert_eq!(
+        world.delivery_service().key_package_count(&bob_did),
+        bob_packages_before,
+        "createConversation must not fetch or consume an invitee KeyPackage"
+    );
+    assert_eq!(conversation.epoch, 0);
+    assert!(conversation
+        .members
+        .iter()
+        .any(|member| member.did == bob_did));
     assert_eq!(
         alice
             .orchestrator
             .mls_context()
-            .list_local_group_ids()
-            .expect("list groups after rejection"),
-        groups_before,
-        "preflight rejection must not invoke local MLS group creation"
+            .get_epoch(hex::decode(&conversation.group_id).expect("group id is hex"))
+            .expect("read actor-only group epoch"),
+        0,
+        "the local MLS group must contain only the creator at epoch zero"
     );
-    assert_eq!(alice.storage.conversation_count(), conversations_before);
-    assert_eq!(
-        alice.storage.pending_local_delete_count(),
-        pending_deletes_before
-    );
-    assert!(alice
-        .orchestrator
-        .groups_being_created()
-        .lock()
-        .await
-        .is_empty());
-
-    let persistence_error = alice
-        .orchestrator
-        .create_group("consume untouched sentinel", None, None)
-        .await
-        .expect_err("the untouched persistence sentinel must fail this valid create");
-    assert!(matches!(persistence_error, OrchestratorError::Storage(_)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1351,7 +1335,10 @@ async fn device_key_mismatch_rejects_add_without_epoch_change() {
     let refs = alice
         .orchestrator
         .api_client()
-        .get_key_packages(std::slice::from_ref(&bob_did))
+        .get_key_packages(
+            "00000000-0000-4000-8000-000000000001",
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("read Bob fixture package");
     let bob_key = extract_key_package_binding(&refs[0].key_package_data)
@@ -1482,7 +1469,10 @@ async fn legacy_atomic_swap_rejects_device_mismatch_and_resolver_failure() {
     let mallory_refs = alice
         .orchestrator
         .api_client()
-        .get_key_packages(std::slice::from_ref(&mallory_did))
+        .get_key_packages(
+            "00000000-0000-4000-8000-000000000001",
+            std::slice::from_ref(&mallory_did),
+        )
         .await
         .expect("read Mallory fixture package");
     let mallory_key = extract_key_package_binding(&mallory_refs[0].key_package_data)
@@ -1607,7 +1597,7 @@ async fn device_key_match_is_silent_and_cached_within_ttl() {
     let refs = alice
         .orchestrator
         .api_client()
-        .get_key_packages(&[bob_did.clone()])
+        .get_key_packages("00000000-0000-4000-8000-000000000001", &[bob_did.clone()])
         .await
         .expect("get_key_packages failed");
     assert!(!refs.is_empty(), "Bob should have published key packages");

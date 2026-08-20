@@ -63,7 +63,7 @@ impl AliceOrchestratorAccess for &e2e_harness::TestClient {
         let kps = self
             .orchestrator
             .api_client()
-            .get_key_packages(dids)
+            .get_key_packages("00000000-0000-4000-8000-000000000001", dids)
             .await
             .expect("mock get_key_packages should succeed");
         kps.into_iter().map(|k| k.key_package_data).collect()
@@ -682,7 +682,7 @@ async fn raw_key_package(
     let mut packages = client
         .orchestrator
         .api_client()
-        .get_key_packages(&[did.to_string()])
+        .get_key_packages("00000000-0000-4000-8000-000000000001", &[did.to_string()])
         .await
         .expect("fetch key package");
     assert_eq!(

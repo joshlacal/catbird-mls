@@ -17,6 +17,19 @@ pub mod code;
 pub use class::ChatErrorClass;
 pub use code::ChatErrorCode;
 
+/// Actionable v2 outcomes exposed to every first-party client. These are
+/// intentionally narrower than the full endpoint error catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryOutcome {
+    NeedsEnrollment,
+    RecipientNotEnrolled,
+    ChatPermissionRequired,
+    AccountSessionExpired,
+    DeviceRevoked,
+    DeviceBindingMismatch,
+    ProtocolUpgradeRequired,
+}
+
 use core::fmt;
 
 /// The JSON member carrying the error code, per the generated `#[serde(tag)]`.
@@ -102,9 +115,43 @@ impl EndpointError {
         self.class().requires_state_resync()
     }
 
-    /// Whether the device's authentication must be repaired first.
+    /// Whether the PDS account session genuinely requires login.
     pub fn requires_reauthentication(&self) -> bool {
         self.class().requires_reauthentication()
+    }
+
+    /// Whether the MLS device should be enrolled or reconciled automatically.
+    pub fn requires_device_recovery(&self) -> bool {
+        self.class().requires_device_recovery()
+    }
+
+    /// Map only errors with a defined cross-platform recovery action. Login is
+    /// reserved for a genuine account-session failure; a missing device row
+    /// always starts automatic enrollment.
+    pub fn recovery_outcome(&self) -> Option<RecoveryOutcome> {
+        match &self.code {
+            ChatErrorCode::DeviceNotRegistered => {
+                Some(RecoveryOutcome::NeedsEnrollment)
+            }
+            ChatErrorCode::KeyPackageUnavailable | ChatErrorCode::RecipientNotReady => {
+                Some(RecoveryOutcome::RecipientNotEnrolled)
+            }
+            ChatErrorCode::Unknown(code) if code == "InsufficientScope" => {
+                Some(RecoveryOutcome::ChatPermissionRequired)
+            }
+            ChatErrorCode::AccountSessionExpired => Some(RecoveryOutcome::AccountSessionExpired),
+            ChatErrorCode::DeviceRevoked | ChatErrorCode::DeviceTombstoned => {
+                Some(RecoveryOutcome::DeviceRevoked)
+            }
+            ChatErrorCode::DeviceBindingMismatch
+            | ChatErrorCode::AuthenticationGenerationConflict => {
+                Some(RecoveryOutcome::DeviceBindingMismatch)
+            }
+            ChatErrorCode::CutoverRequired | ChatErrorCode::ProtocolUpgradeRequired => {
+                Some(RecoveryOutcome::ProtocolUpgradeRequired)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -172,14 +219,22 @@ mod tests {
     }
 
     #[test]
-    fn preserves_the_invalid_dpop_spelling_exactly() {
-        // `InvalidDPoP` keeps its irregular casing on the wire. A mapping that
-        // normalized case would silently fail to match it.
-        let generated = chat::get_entries::GetEntriesError::InvalidDPoP(None);
+    fn account_expiry_is_the_only_login_outcome() {
+        let generated = chat::get_entries::GetEntriesError::AccountSessionExpired(None);
         let typed = EndpointError::from_generated("blue.catbird.chat.getEntries", &generated);
-        assert_eq!(typed.code, ChatErrorCode::InvalidDPoP);
-        assert_eq!(typed.code.as_str(), "InvalidDPoP");
+        assert_eq!(typed.code, ChatErrorCode::AccountSessionExpired);
         assert!(typed.requires_reauthentication());
+
+        let missing = EndpointError::from_generated(
+            "blue.catbird.chat.getEntries",
+            &chat::get_entries::GetEntriesError::DeviceNotRegistered(None),
+        );
+        assert!(!missing.requires_reauthentication());
+        assert!(missing.requires_device_recovery());
+        assert_eq!(
+            missing.recovery_outcome(),
+            Some(RecoveryOutcome::NeedsEnrollment)
+        );
     }
 
     #[test]
@@ -212,9 +267,11 @@ mod tests {
             chat::get_entries::GetEntriesError::CutoverRequired(None),
             chat::get_entries::GetEntriesError::DeviceNotRegistered(None),
             chat::get_entries::GetEntriesError::DeviceRevoked(None),
-            chat::get_entries::GetEntriesError::InvalidDPoP(None),
+            chat::get_entries::GetEntriesError::AccountSessionExpired(None),
+            chat::get_entries::GetEntriesError::DeviceBindingMismatch(None),
             chat::get_entries::GetEntriesError::InvalidRequest(None),
             chat::get_entries::GetEntriesError::NotEntitled(None),
+            chat::get_entries::GetEntriesError::ProtocolUpgradeRequired(None),
         ];
         for generated in &all {
             let typed = EndpointError::from_generated("blue.catbird.chat.getEntries", generated);

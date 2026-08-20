@@ -9,7 +9,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use catbird_mls::orchestrator::{
@@ -1307,7 +1309,11 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(())
     }
 
-    async fn get_key_packages(&self, dids: &[String]) -> Result<Vec<KeyPackageRef>> {
+    async fn get_key_packages(
+        &self,
+        _actor_device_id: &str,
+        dids: &[String],
+    ) -> Result<Vec<KeyPackageRef>> {
         let mut guard = self.state.lock().unwrap();
         check_fail(
             &mut guard.failures.fail_next_get_key_packages,
@@ -1372,8 +1378,9 @@ impl MLSAPIClient for MockDeliveryService {
         device_uuid: &str,
         _device_name: &str,
         mls_did: &str,
-        _signature_key: &[u8],
-        _key_packages: &[Vec<u8>],
+        signature_key: &[u8],
+        key_packages: &[Vec<u8>],
+        _prepared_request_body: &[u8],
     ) -> Result<DeviceInfo> {
         let mut guard = self.state.lock().unwrap();
         check_fail(
@@ -1386,10 +1393,17 @@ impl MLSAPIClient for MockDeliveryService {
             .ok_or(OrchestratorError::NotAuthenticated)?;
 
         let info = DeviceInfo {
-            device_id: Uuid::new_v4().to_string(),
+            // v2 preserves the canonical client UUID as the authoritative id.
+            device_id: device_uuid.to_string(),
             mls_did: mls_did.to_string(),
             device_uuid: device_uuid.to_string(),
             created_at: Some(Utc::now()),
+            key_id: Some(URL_SAFE_NO_PAD.encode(Sha256::digest(signature_key))),
+            signature_public_key: Some(signature_key.to_vec()),
+            auth_generation: Some(1),
+            status: Some("active".into()),
+            available_package_count: Some(key_packages.len() as u32),
+            reserved_package_count: Some(0),
         };
 
         guard
@@ -1401,7 +1415,7 @@ impl MLSAPIClient for MockDeliveryService {
         Ok(info)
     }
 
-    async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
+    async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
         let guard = self.state.lock().unwrap();
         let did = self
             .effective_did_from_guard(&guard)
@@ -1658,7 +1672,10 @@ mod tests {
         assert_eq!(svc.key_package_count("did:plc:alice"), 2);
 
         let refs = svc
-            .get_key_packages(&["did:plc:alice".to_string()])
+            .get_key_packages(
+                "00000000-0000-4000-8000-000000000001",
+                &["did:plc:alice".to_string()],
+            )
             .await
             .unwrap();
         assert_eq!(refs.len(), 1);
@@ -1666,7 +1683,10 @@ mod tests {
 
         // Second fetch consumes next package
         let refs2 = svc
-            .get_key_packages(&["did:plc:alice".to_string()])
+            .get_key_packages(
+                "00000000-0000-4000-8000-000000000001",
+                &["did:plc:alice".to_string()],
+            )
             .await
             .unwrap();
         assert_eq!(refs2[0].key_package_data, b"kp-2");
@@ -1684,16 +1704,23 @@ mod tests {
                 "did:plc:alice",
                 b"sig-key",
                 &[vec![1, 2, 3]],
+                b"{}",
             )
             .await
             .unwrap();
         assert_eq!(info.mls_did, "did:plc:alice");
 
-        let devices = svc.list_devices().await.unwrap();
+        let devices = svc
+            .list_devices("00000000-0000-4000-8000-000000000001")
+            .await
+            .unwrap();
         assert_eq!(devices.len(), 1);
 
         svc.remove_device(&info.device_id).await.unwrap();
-        let devices = svc.list_devices().await.unwrap();
+        let devices = svc
+            .list_devices("00000000-0000-4000-8000-000000000001")
+            .await
+            .unwrap();
         assert_eq!(devices.len(), 0);
     }
 

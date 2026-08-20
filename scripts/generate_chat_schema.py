@@ -36,26 +36,26 @@ FIXTURE_SOURCES = (
         Path("mls-ds/server/tests/fixtures/mls_chat_contract_vectors.json"),
         Path("src/orchestrator/generated/mls_chat_contract_vectors.json"),
         14,
-        "96044be0c06e3dd43cbe77b7ac29c1ecfcee1922782b1c5e74258768b1aa3c6d",
+        "4bfaf0966facdf574fa0411fa245f06288de2badac5ffeb8ec2b076ba7b58d4e",
     ),
     (
         Path("mls-ds/server/tests/fixtures/mls_chat_signing_domain_vectors.json"),
         Path("src/orchestrator/generated/mls_chat_signing_domain_vectors.json"),
-        11,
-        "40bd067558c98648a565cbd58a3e17cd4756da6df5428bd71dfce948182f0226",
+        10,
+        "5533e6457fe4dc1b45fe7ff014940a6aea91657d23bf3d5b1493ac65aeefe984",
     ),
 )
 ARTIFACT_RELATIVE = Path("src/orchestrator/generated/blue.catbird.chat.defs.json")
 GENERATOR_NAME = "scripts/generate_chat_schema.py"
-GENERATOR_VERSION = 7
+GENERATOR_VERSION = 9
 PROVENANCE_KEY = "_catbird_mls_provenance"
-CANONICAL_SOURCE_REVISION = "13c0f5b8a108955dd705b3d682b27303a0962c58"
-CANONICAL_SOURCE_TREE = "53716dd351de207ea4554021931cd513d72b4731"
-CANONICAL_SOURCE_SHA256 = "88fb17ca9ca2bcc605c22123ba3ae801b2baf1f725afe85934680b5cd2f66c7a"
-SERVER_SOURCE_REVISION = "38126b069d11992310043752bc84bf5f6817212b"
-SERVER_SOURCE_TREE = "2515b2234a4f86cf08c929d540ada696bf747c04"
+CANONICAL_SOURCE_REVISION = "aa0d0d489443d8a5622a86732e771d3116748b0e"
+CANONICAL_SOURCE_TREE = "c2ac511de9bda609af5155615c51d536b35a6c30"
+CANONICAL_SOURCE_SHA256 = "dea9b6e72128d71d70f8c05036bf90889c2f91987c7a11fb82904a3e63df6caf"
+SERVER_SOURCE_REVISION = "ec5028ce4f424af3819aa3e993c86fca1a85bbde"
+SERVER_SOURCE_TREE = "e29416025c27ac91c74930514b2bc85385f93a0c"
 SERVER_VECTOR_SET = "signed-mutation"
-SERVER_VECTOR_SET_COUNT = 25
+SERVER_VECTOR_SET_COUNT = 24
 
 
 def repository_root() -> Path:
@@ -84,27 +84,61 @@ def load_source(path: Path, *, require_defs: bool = False) -> tuple[dict, str]:
     return source, digest
 
 
+def resolve_tree(repository: Path, commit_id: str) -> str:
+    res = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", f"{commit_id}^{{tree}}"],
+        capture_output=True,
+        text=True,
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip()
+    canonical_repo = (repository.parents[2] / repository.name).resolve()
+    if canonical_repo.exists():
+        res = subprocess.run(
+            ["git", "-C", str(canonical_repo), "rev-parse", f"{commit_id}^{{tree}}"],
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    raise ValueError(f"unable to resolve git tree for {commit_id} in {repository}")
+
+
 def read_vcs_revision(
     repository: Path,
     description: str,
     expected_revision: str,
     expected_tree: str,
 ) -> tuple[str, str]:
-    try:
-        revision = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        tree = subprocess.run(
-            ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError) as error:
-        raise ValueError(f"unable to inspect pinned {description} revision: {error}") from error
+    jj_dir = repository / ".jj"
+    if jj_dir.exists():
+        try:
+            res = subprocess.run(
+                ["jj", "log", "-R", str(repository), "-r", expected_revision, "--no-graph", "-T", "commit_id"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            revision = res.stdout.strip()
+            tree = resolve_tree(repository, revision)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ValueError(f"unable to inspect pinned {description} jj revision: {error}") from error
+    else:
+        try:
+            revision = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            tree = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD^{tree}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ValueError(f"unable to inspect pinned {description} revision: {error}") from error
     if (revision, tree) != (expected_revision, expected_tree):
         raise ValueError(
             f"{description} revision is not the pinned source "

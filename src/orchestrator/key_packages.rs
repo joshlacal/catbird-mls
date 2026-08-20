@@ -23,7 +23,16 @@ where
         tracing::debug!("Publishing key package");
 
         // Create key package via FFI
-        let identity_bytes = user_did.as_bytes().to_vec();
+        let device_uuid = self
+            .credentials()
+            .get_device_uuid(&user_did)
+            .await?
+            .ok_or_else(|| {
+                super::error::OrchestratorError::Credential(
+                    "cannot create a key package before verified device enrollment".into(),
+                )
+            })?;
+        let identity_bytes = format!("{user_did}#{device_uuid}").into_bytes();
         let kp_result = self.mls_context().create_key_package(identity_bytes)?;
 
         // Calculate expiry (30 days from now)
@@ -34,64 +43,17 @@ where
         // during `ensure_device_registered`, so it is always present by the
         // time we replenish; without it the server cannot bind the package to
         // the device signature key and rejects an unscoped fresh device (403).
-        let device_uuid = self.credentials().get_device_uuid(&user_did).await?;
-
         // Upload to server
         self.api_client()
             .publish_key_package(
                 &kp_result.key_package_data,
                 "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                 &expires_at_str,
-                device_uuid.as_deref(),
+                Some(&device_uuid),
             )
             .await?;
 
         tracing::debug!("Key package published");
-        Ok(())
-    }
-
-    /// Create and publish a reusable last-resort key package.
-    ///
-    /// A last-resort KP carries the MLS `last_resort` extension. The delivery
-    /// service serves it only as a fallback — when a member has no regular
-    /// single-use KP available — so it is the join floor: a recipient can
-    /// always be invited even after its pool is drained by the orphan-reconcile
-    /// or exhausted by failed joins. The bytes built here carry the extension,
-    /// so the server detects it and marks the row `is_last_resort` (replacing
-    /// the device's previous active last-resort); no wire flag is needed and
-    /// the ordinary `publish_key_package` path is reused.
-    ///
-    /// `create_last_resort_key_package` is only available on crypto backends
-    /// that support it (native `MLSContext`); the trait default returns
-    /// `OperationNotSupported`, so callers should treat failures as best-effort.
-    pub async fn publish_last_resort_key_package(&self) -> Result<()> {
-        self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
-
-        tracing::debug!("Publishing last-resort key package");
-
-        let identity_bytes = user_did.as_bytes().to_vec();
-        let kp_result = self
-            .mls_context()
-            .create_last_resort_key_package(identity_bytes)?;
-
-        // Last-resort packages are long-lived by design; reuse the standard
-        // 30-day expiry so the cleanup worker treats them like any other KP.
-        let expires_at = chrono::Utc::now() + chrono::Duration::days(30);
-        let expires_at_str = expires_at.to_rfc3339();
-
-        let device_uuid = self.credentials().get_device_uuid(&user_did).await?;
-
-        self.api_client()
-            .publish_key_package(
-                &kp_result.key_package_data,
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                &expires_at_str,
-                device_uuid.as_deref(),
-            )
-            .await?;
-
-        tracing::debug!("Last-resort key package published");
         Ok(())
     }
 
@@ -176,9 +138,17 @@ where
         // publish ran on the startup/account-switch critical path and blocked
         // message loading.
         let user_did = self.require_user_did().await?;
-        let identity_bytes = user_did.as_bytes().to_vec();
+        let device_uuid = self
+            .credentials()
+            .get_device_uuid(&user_did)
+            .await?
+            .ok_or_else(|| {
+                super::error::OrchestratorError::Credential(
+                    "cannot replenish key packages before verified device enrollment".into(),
+                )
+            })?;
+        let identity_bytes = format!("{user_did}#{device_uuid}").into_bytes();
         let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
-        let device_uuid = self.credentials().get_device_uuid(&user_did).await?;
 
         let mut batch: Vec<Vec<u8>> = Vec::with_capacity(needed as usize);
         for i in 0..needed {
@@ -208,7 +178,7 @@ where
                     chunk,
                     "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                     &expires_at,
-                    device_uuid.as_deref(),
+                    Some(device_uuid.as_str()),
                 )
                 .await
             {

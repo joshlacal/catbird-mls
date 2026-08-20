@@ -1057,8 +1057,13 @@ impl MLSAPIClient for HttpDSClient {
         Ok(())
     }
 
-    async fn get_key_packages(&self, dids: &[String]) -> OrcResult<Vec<KeyPackageRef>> {
-        let params: Vec<(&str, &str)> = dids.iter().map(|d| ("dids", d.as_str())).collect();
+    async fn get_key_packages(
+        &self,
+        actor_device_id: &str,
+        dids: &[String],
+    ) -> OrcResult<Vec<KeyPackageRef>> {
+        let mut params: Vec<(&str, &str)> = vec![("actorDeviceId", actor_device_id)];
+        params.extend(dids.iter().map(|d| ("dids", d.as_str())));
         let resp = self
             .client
             .get(self.xrpc_url("blue.catbird.chat.getKeyPackages"))
@@ -1147,31 +1152,16 @@ impl MLSAPIClient for HttpDSClient {
         mls_did: &str,
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
+        prepared_request_body: &[u8],
     ) -> OrcResult<DeviceInfo> {
-        let kps: Vec<serde_json::Value> = key_packages
-            .iter()
-            .map(|kp| {
-                serde_json::json!({
-                    "data": base64::engine::general_purpose::STANDARD.encode(kp),
-                    "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                    "expiresAt": (Utc::now() + chrono::Duration::days(30)).to_rfc3339(),
-                })
-            })
-            .collect();
-
-        let body = serde_json::json!({
-            "deviceUuid": device_uuid,
-            "deviceName": device_name,
-            "mlsDid": mls_did,
-            "signatureKey": base64::engine::general_purpose::STANDARD.encode(signature_key),
-            "keyPackages": kps,
-        });
+        let _ = (device_name, signature_key, key_packages);
 
         let resp = self
             .client
             .post(self.xrpc_url("blue.catbird.chat.enrollDevice"))
             .bearer_auth(&self.auth_token)
-            .json(&body)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(prepared_request_body.to_vec())
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(format!("registerDevice: {e}")))?;
@@ -1192,10 +1182,16 @@ impl MLSAPIClient for HttpDSClient {
             mls_did: mls_did.to_string(),
             device_uuid: device_uuid.to_string(),
             created_at: Some(Utc::now()),
+            key_id: None,
+            signature_public_key: None,
+            auth_generation: None,
+            status: None,
+            available_package_count: None,
+            reserved_package_count: None,
         })
     }
 
-    async fn list_devices(&self) -> OrcResult<Vec<DeviceInfo>> {
+    async fn list_devices(&self, _actor_device_id: &str) -> OrcResult<Vec<DeviceInfo>> {
         Ok(vec![])
     }
 

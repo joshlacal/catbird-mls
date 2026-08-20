@@ -806,7 +806,6 @@ struct GroupCreationGuard<'a> {
 
 struct CreateGroupInitialMembers<'a> {
     dids: Option<&'a [String]>,
-    key_packages: Option<&'a [KeyPackageRef]>,
 }
 
 impl<'a> GroupCreationGuard<'a> {
@@ -844,9 +843,9 @@ where
     /// Create a new MLS group/conversation.
     ///
     /// 1. Creates MLS group locally via FFI
-    /// 2. Creates conversation on server (with optional initial members)
-    /// 3. Merges pending commit if members were added
-    /// 4. Publishes GroupInfo for external joins
+    /// 2. Creates the server conversation with non-creators pending/zero-leaf
+    /// 3. Persists the actor-only epoch-zero projection
+    /// 4. Publishes GroupInfo for later consent/recovery joins
     pub async fn create_group(
         &self,
         name: &str,
@@ -883,42 +882,8 @@ where
         });
         let filtered_members_ref = filtered_members.as_deref();
 
-        // Fetch and structurally validate initial-member KeyPackages before
-        // creating any local MLS state or writing rollback authority. The
-        // delivery service's DID labels are not authority; only the embedded
-        // credential roots may authorize this bootstrap Add.
-        let initial_key_packages = if let Some(members) = filtered_members_ref {
-            if members.is_empty() {
-                None
-            } else {
-                let member_dids = members.to_vec();
-                let key_packages = self.api_client().get_key_packages(&member_dids).await?;
-
-                // Enforce response cardinality/size plus DID/device binding
-                // before cloning DS-controlled bytes or creating local MLS
-                // state. OpenMLS performs protocol authentication later; this
-                // is the application authorization gate required by ADR-009.
-                self.verify_fetched_key_packages(&member_dids, &key_packages, "create_group", None)
-                    .await?;
-
-                let kp_data: Vec<crate::KeyPackageData> = key_packages
-                    .iter()
-                    .map(|kp| crate::KeyPackageData {
-                        data: kp.key_package_data.clone(),
-                    })
-                    .collect();
-                super::credential_binding::enforce_outbound_key_package_did_bindings(
-                    &member_dids,
-                    &kp_data,
-                )?;
-                Some(key_packages)
-            }
-        } else {
-            None
-        };
         let initial_members = CreateGroupInitialMembers {
             dids: filtered_members_ref,
-            key_packages: initial_key_packages.as_deref(),
         };
 
         // Create MLS group locally — with encrypted metadata in group context
@@ -1020,94 +985,21 @@ where
         &self,
         user_did: &str,
         group_id_hex: &str,
-        name: &str,
-        description: Option<&str>,
+        _name: &str,
+        _description: Option<&str>,
         initial_members: CreateGroupInitialMembers<'_>,
         rollback: &mut CreateGroupRollbackContext,
     ) -> Result<ConversationView> {
         let group_id_bytes = hex::decode(group_id_hex)
             .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
 
-        // If initial members were provided, stage the MLS add before calling
-        // createConvo. The server's createConvo path stores the Welcome and
-        // treats that bootstrap add as the initial epoch-1 group material; if
-        // we create first and then call commitGroupChange/addMembers, the DS
-        // has already seeded the row at epoch 1 and rejects our epoch-0 commit.
-        let mut initial_add_result: Option<crate::AddMembersResult> = None;
-        if let Some(members) = initial_members.dids {
-            if !members.is_empty() {
-                tracing::info!(
-                    count = members.len(),
-                    "Staging initial members for createConvo Welcome path"
-                );
-
-                let key_packages = initial_members.key_packages.ok_or_else(|| {
-                    OrchestratorError::InvalidInput(
-                        "initial-member KeyPackages were not prevalidated".to_string(),
-                    )
-                })?;
-
-                for kp in key_packages {
-                    tracing::info!(
-                        did = %kp.did,
-                        cipher_suite = %kp.cipher_suite,
-                        bytes = kp.key_package_data.len(),
-                        "Fetched key package for member"
-                    );
-                }
-
-                let kp_data: Vec<crate::KeyPackageData> = key_packages
-                    .iter()
-                    .map(|kp| crate::KeyPackageData {
-                        data: kp.key_package_data.clone(),
-                    })
-                    .collect();
-
-                // If the group has a name/description, add the members AND
-                // re-seal the metadata at the post-add epoch in the SAME commit,
-                // so the Welcome carries a MetadataReference the joiners can use
-                // and the matching blob is sealed at the epoch they land on.
-                // Plain `add_members` embeds no reference, leaving joiners at
-                // "Secure Chat".
-                let add_result = if !name.is_empty() || description.is_some() {
-                    self.mls_context()
-                        .add_members_with_metadata(
-                            group_id_bytes.clone(),
-                            kp_data,
-                            if name.is_empty() { None } else { Some(name.to_string()) },
-                            description.map(|d| d.to_string()),
-                        )
-                        .map_err(|e| {
-                            tracing::error!(error = %e, "MLS add_members_with_metadata failed — key package validation or crypto error");
-                            e
-                        })?
-                } else {
-                    self.mls_context()
-                        .add_members(group_id_bytes.clone(), kp_data)
-                        .map_err(|e| {
-                            tracing::error!(error = %e, "MLS add_members failed — key package validation or crypto error");
-                            e
-                        })?
-                };
-
-                initial_add_result = Some(add_result);
-            }
-        }
-
-        // Create conversation on server (metadata is encrypted in MLS extensions, not sent as plaintext).
+        // Creation is actor-only at epoch zero. Non-creators are pending,
+        // zero-leaf participants. Their KeyPackages are neither fetched nor
+        // consumed here, and createConversation carries no bootstrap Commit or
+        // Welcome.
         let result = self
             .api_client()
-            .create_conversation(
-                group_id_hex,
-                initial_members.dids,
-                None,
-                initial_add_result
-                    .as_ref()
-                    .map(|add| add.commit_data.as_slice()),
-                initial_add_result
-                    .as_ref()
-                    .map(|add| add.welcome_data.as_slice()),
-            )
+            .create_conversation(group_id_hex, initial_members.dids, None, None, None)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Server creation failed");
@@ -1116,42 +1008,7 @@ where
 
         let mut convo = result.conversation.clone();
         let conversation_id = &convo.conversation_id;
-        let bootstrap_target_epoch = if initial_add_result.is_some() {
-            Some(
-                self.mls_context()
-                    .get_epoch(group_id_bytes.clone())?
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        OrchestratorError::InvalidInput(
-                            "bootstrap Add target epoch overflow".to_string(),
-                        )
-                    })?,
-            )
-        } else {
-            None
-        };
-        rollback.bind_stable_conversation(&convo, bootstrap_target_epoch)?;
-
-        // The stable conversation id is not known until createConvo returns.
-        // Publish the self-echo hash only after its complete durability
-        // expectation exists. An earlier echo therefore fails closed in the
-        // normal decrypt path and can be retried after local confirmation.
-        if let Some(add_result) = initial_add_result.as_ref() {
-            // Reuse the already-computed, overflow-checked bootstrap target epoch
-            // instead of re-reading the epoch from the MLS context.
-            let target_epoch = bootstrap_target_epoch
-                .expect("bootstrap_target_epoch is Some whenever initial_add_result is Some");
-            let hash = Sha256::digest(&add_result.commit_data).to_vec();
-            self.track_epoch_changing_own_commit(
-                hash,
-                OwnCommitExpectation {
-                    conversation_id: conversation_id.to_string(),
-                    group_id: group_id_hex.to_string(),
-                    target_epoch,
-                },
-            )
-            .await;
-        }
+        rollback.bind_stable_conversation(&convo, None)?;
 
         // Handoff cleanup authority before materializing any stable-keyed
         // local row/cache. Keep the raw intent until the stable write commits.
@@ -1178,19 +1035,6 @@ where
             .update_join_info(conversation_id, user_did, JoinMethod::Creator, 0)
             .await?;
 
-        if initial_add_result.is_some() {
-            let merged_epoch = self
-                .mls_context()
-                .merge_pending_commit(group_id_bytes.clone())?;
-
-            convo.epoch = merged_epoch;
-
-            tracing::info!(
-                epoch = merged_epoch,
-                "Initial members committed via createConvo Welcome path"
-            );
-        }
-
         // Crypto merge is not the application commit point. Persist the
         // stable projection before publishing any cache entry, pruning epoch
         // secrets, uploading metadata, or reporting success.
@@ -1204,15 +1048,6 @@ where
             members,
         };
         self.storage().set_group_state(&state).await?;
-        // Once both the MLS provider and stable application projection are
-        // durable, the bootstrap hash itself is sufficient as a replay token.
-        // Drop the transient expectation so a later, already-confirmed echo is
-        // not coupled to stale compatibility aliases in the in-memory cache.
-        if let Some(add_result) = initial_add_result.as_ref() {
-            self.mls_context().ensure_storage_durable()?;
-            let hash = Sha256::digest(&add_result.commit_data).to_vec();
-            self.mark_own_commit_durably_confirmed(&hash).await;
-        }
         self.group_states()
             .lock()
             .await
@@ -1227,48 +1062,6 @@ where
             .insert(conversation_id.to_string(), ConversationState::Active);
         self.cleanup_epoch_secrets_if_needed(conversation_id, group_id_hex, ffi_epoch)
             .await;
-
-        // Upload the encrypted group metadata blob so OTHER members can decrypt
-        // the group name/description. The initial `add_members_with_metadata`
-        // commit above (1) embedded a fresh `MetadataReference` (locator +
-        // version) into the group context — which the Welcome carries to every
-        // joiner — and (2) re-sealed the `GroupMetadataV1` blob at the post-add
-        // epoch under that same locator. Joiners land at exactly that epoch, so
-        // they can derive the metadata key, fetch this blob, and decrypt it.
-        //
-        // No extra commit / epoch advance happens here (the reseal rode the add
-        // commit), so sends keep working. `put_group_metadata_blob` requires the
-        // conversation row to exist on the DS, hence we upload AFTER createConvo.
-        // Non-fatal: on any failure the name stays hidden until a later update.
-        if let (Some(locator), Some(ciphertext), Some(version)) = (
-            initial_add_result
-                .as_ref()
-                .and_then(|r| r.metadata_blob_locator.clone()),
-            initial_add_result
-                .as_ref()
-                .and_then(|r| r.metadata_blob_ciphertext.clone()),
-            initial_add_result.as_ref().and_then(|r| r.metadata_version),
-        ) {
-            if let Err(e) = self
-                .api_client()
-                .put_group_metadata_blob(
-                    &convo.conversation_id,
-                    group_id_hex,
-                    &locator,
-                    &ciphertext,
-                    "metadata",
-                    version,
-                    None,
-                )
-                .await
-            {
-                tracing::warn!(
-                    error = %e,
-                    group_id = %group_id_hex,
-                    "Failed to upload initial group metadata blob; members won't see the group name until the next metadata update"
-                );
-            }
-        }
 
         // Publish GroupInfo for external joins
         let group_info = self
@@ -1759,7 +1552,11 @@ where
         );
 
         // Fetch key packages for the new members.
-        let key_packages = self.api_client().get_key_packages(member_dids).await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let key_packages = self
+            .api_client()
+            .get_key_packages(&actor_device_id, member_dids)
+            .await?;
 
         // ADR-009 D3: enforce credential binding before cloning/staging.
         self.verify_fetched_key_packages(
@@ -1951,7 +1748,11 @@ where
             "swap_members"
         );
 
-        let key_packages = self.api_client().get_key_packages(add_dids).await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let key_packages = self
+            .api_client()
+            .get_key_packages(&actor_device_id, add_dids)
+            .await?;
 
         // ADR-009 D3: enforce credential binding before cloning/staging.
         self.verify_fetched_key_packages(add_dids, &key_packages, "swap_members", Some(group_id))

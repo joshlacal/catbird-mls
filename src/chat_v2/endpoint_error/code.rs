@@ -60,6 +60,7 @@ macro_rules! chat_error_codes {
 }
 
 chat_error_codes! {
+    AccountSessionExpired,
     /// The requested scan position lies outside the caller's membership interval.
     AccessOutsideMembershipInterval,
     AcknowledgementConflict,
@@ -87,6 +88,7 @@ chat_error_codes! {
     /// The caller is speaking the superseded protocol and must upgrade.
     CutoverRequired,
     DeviceAlreadyExists,
+    DeviceBindingMismatch,
     DeviceLimitReached,
     DeviceNotFound,
     DeviceNotLeaf,
@@ -100,7 +102,6 @@ chat_error_codes! {
     IdempotencyConflict,
     InvalidApplicationMessage,
     InvalidCommit,
-    InvalidDPoP,
     InvalidGenesisGroupInfo,
     InvalidKeyPackage,
     InvalidLeaveManifest,
@@ -141,6 +142,7 @@ chat_error_codes! {
     NotParticipant,
     ParticipantLeafLimitReached,
     ParticipantLimitReached,
+    ProtocolUpgradeRequired,
     RateLimited,
     /// A direct peer is active but currently has no MLS leaf, i.e. an
     /// acceptance, recovery, or reset gap.
@@ -195,7 +197,7 @@ mod tests {
         // classification match below stops compiling until it is triaged.
         assert_eq!(
             ChatErrorCode::KNOWN.len(),
-            91,
+            93,
             "the union of typed codes across all 32 endpoints"
         );
     }

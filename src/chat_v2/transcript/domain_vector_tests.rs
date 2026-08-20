@@ -1,8 +1,8 @@
-//! The eleven signing domains that the fingerprint corpus never covered.
+//! The ten signing domains that the fingerprint corpus never covered.
 //!
-//! Until these vectors existed, fourteen of the twenty-five domains were pinned
+//! Until these vectors existed, fourteen of the twenty-four domains were pinned
 //! against server bytes — the thirteen control entries plus
-//! `CATBIRD-CHAT-BLOB-DELETE` — and the other eleven rested entirely on the
+//! `CATBIRD-CHAT-BLOB-DELETE` — and the other ten rested entirely on the
 //! constant table in [`super`] being transcribed correctly. That included
 //! `CATBIRD-CHAT-MESSAGE`, the domain every application send signs under. A
 //! single wrong byte in a domain produces signatures that verify locally and
@@ -90,7 +90,7 @@ fn previously_pinned_domains() -> Vec<String> {
 #[test]
 fn every_signing_domain_is_now_pinned_by_a_server_vector() {
     // The accounting this file exists to change. Thirteen control domains and
-    // blob deletion came from the fingerprint corpus; these eleven are the rest,
+    // blob deletion came from the fingerprint corpus; these ten are the rest,
     // and together they are the whole enum. Nothing is left resting on the
     // transcribed table alone.
     let mut pinned = previously_pinned_domains();
@@ -100,7 +100,7 @@ fn every_signing_domain_is_now_pinned_by_a_server_vector() {
     pinned.sort();
     pinned.dedup();
 
-    assert_eq!(pinned.len(), 25, "one vector per kind, none counted twice");
+    assert_eq!(pinned.len(), 24, "one vector per kind, none counted twice");
     let unpinned: Vec<&str> = SignedMutationKind::ALL
         .iter()
         .filter(|kind| {
@@ -118,7 +118,7 @@ fn every_signing_domain_is_now_pinned_by_a_server_vector() {
 }
 
 #[test]
-fn the_eleven_cases_are_exactly_the_kinds_no_other_fixture_covers() {
+fn the_ten_cases_are_exactly_the_kinds_no_other_fixture_covers() {
     let already = previously_pinned_domains();
     let expected: Vec<&str> = SignedMutationKind::ALL
         .iter()
@@ -134,7 +134,7 @@ fn the_eleven_cases_are_exactly_the_kinds_no_other_fixture_covers() {
         .map(|case| case["bodyName"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 11);
+    assert_eq!(actual.len(), 10);
 }
 
 #[test]
@@ -270,6 +270,6 @@ fn the_vendored_signing_domain_vectors_are_actually_loaded() {
     let vectors = vectors();
     assert_eq!(vectors["schemaVersion"], 1);
     assert_eq!(vectors["signatureAlgorithm"], "Ed25519");
-    assert_eq!(cases().len(), 11);
+    assert_eq!(cases().len(), 10);
     assert!(VECTORS.len() > 10_000, "the fixture is not a stub");
 }

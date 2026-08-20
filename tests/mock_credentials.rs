@@ -190,7 +190,6 @@ impl CredentialStore for MockCredentials {
             public_key: signer.public().to_vec(),
             signature,
             device_id: binding.device_id,
-            dpop_jkt: binding.dpop_jkt,
             auth_generation: binding.auth_generation,
         }))
     }

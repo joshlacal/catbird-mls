@@ -356,6 +356,7 @@ pub trait OrchestratorAPICallback: Send + Sync {
 
     fn get_key_packages(
         &self,
+        actor_device_id: String,
         dids: Vec<String>,
     ) -> Result<Vec<FFIKeyPackageRef>, OrchestratorBridgeError>;
 
@@ -374,9 +375,13 @@ pub trait OrchestratorAPICallback: Send + Sync {
         mls_did: String,
         signature_key: Vec<u8>,
         key_packages: Vec<Vec<u8>>,
+        prepared_request_body: Vec<u8>,
     ) -> Result<FFIDeviceInfo, OrchestratorBridgeError>;
 
-    fn list_devices(&self) -> Result<Vec<FFIDeviceInfo>, OrchestratorBridgeError>;
+    fn list_devices(
+        &self,
+        actor_device_id: String,
+    ) -> Result<Vec<FFIDeviceInfo>, OrchestratorBridgeError>;
     fn remove_device(&self, device_id: String) -> Result<(), OrchestratorBridgeError>;
 
     fn publish_group_info(
@@ -567,7 +572,6 @@ pub struct CleanChatSigningAuthorityFfi {
     pub public_key: Vec<u8>,
     pub signature: Vec<u8>,
     pub device_id: String,
-    pub dpop_jkt: String,
     pub auth_generation: Option<i64>,
 }
 
@@ -740,6 +744,12 @@ pub struct FFIDeviceInfo {
     pub mls_did: String,
     pub device_uuid: String,
     pub created_at: Option<String>,
+    pub key_id: Option<String>,
+    pub signature_public_key: Option<Vec<u8>>,
+    pub auth_generation: Option<i64>,
+    pub status: Option<String>,
+    pub available_package_count: Option<u32>,
+    pub reserved_package_count: Option<u32>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -2298,10 +2308,11 @@ impl MLSAPIClient for APIAdapter {
 
     async fn get_key_packages(
         &self,
+        actor_device_id: &str,
         dids: &[String],
     ) -> crate::orchestrator::Result<Vec<KeyPackageRef>> {
         self.0
-            .get_key_packages(dids.to_vec())
+            .get_key_packages(actor_device_id.to_string(), dids.to_vec())
             .map(|v| {
                 v.into_iter()
                     .map(|ffi| KeyPackageRef {
@@ -2346,6 +2357,7 @@ impl MLSAPIClient for APIAdapter {
         mls_did: &str,
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
+        prepared_request_body: &[u8],
     ) -> crate::orchestrator::Result<DeviceInfo> {
         self.0
             .register_device(
@@ -2354,6 +2366,7 @@ impl MLSAPIClient for APIAdapter {
                 mls_did.to_string(),
                 signature_key.to_vec(),
                 key_packages.to_vec(),
+                prepared_request_body.to_vec(),
             )
             .map(|ffi| DeviceInfo {
                 device_id: ffi.device_id,
@@ -2363,13 +2376,22 @@ impl MLSAPIClient for APIAdapter {
                     .created_at
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&chrono::Utc)),
+                key_id: ffi.key_id,
+                signature_public_key: ffi.signature_public_key,
+                auth_generation: ffi.auth_generation,
+                status: ffi.status,
+                available_package_count: ffi.available_package_count,
+                reserved_package_count: ffi.reserved_package_count,
             })
             .map_err(bridge_err)
     }
 
-    async fn list_devices(&self) -> crate::orchestrator::Result<Vec<DeviceInfo>> {
+    async fn list_devices(
+        &self,
+        actor_device_id: &str,
+    ) -> crate::orchestrator::Result<Vec<DeviceInfo>> {
         self.0
-            .list_devices()
+            .list_devices(actor_device_id.to_owned())
             .map(|v| {
                 v.into_iter()
                     .map(|ffi| DeviceInfo {
@@ -2380,6 +2402,12 @@ impl MLSAPIClient for APIAdapter {
                             .created_at
                             .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                             .map(|dt| dt.with_timezone(&chrono::Utc)),
+                        key_id: ffi.key_id,
+                        signature_public_key: ffi.signature_public_key,
+                        auth_generation: ffi.auth_generation,
+                        status: ffi.status,
+                        available_package_count: ffi.available_package_count,
+                        reserved_package_count: ffi.reserved_package_count,
                     })
                     .collect()
             })
@@ -2577,7 +2605,6 @@ impl CredentialStore for CredentialAdapter {
                 public_key: authority.public_key,
                 signature: authority.signature,
                 device_id: authority.device_id,
-                dpop_jkt: authority.dpop_jkt,
                 auth_generation: authority.auth_generation,
             });
         Ok(authority)
@@ -2903,8 +2930,6 @@ impl OrchestratorBridge {
             operation: prepared.operation.into(),
             method: prepared.method,
             path: prepared.path,
-            authorization: None,
-            dpop: None,
             body: prepared.body,
         })
     }
@@ -3449,6 +3474,12 @@ impl OrchestratorBridge {
                 mls_did: d.mls_did,
                 device_uuid: d.device_uuid,
                 created_at: d.created_at.map(|t| t.to_rfc3339()),
+                key_id: d.key_id,
+                signature_public_key: d.signature_public_key,
+                auth_generation: d.auth_generation,
+                status: d.status,
+                available_package_count: d.available_package_count,
+                reserved_package_count: d.reserved_package_count,
             })
             .collect())
     }
@@ -4683,6 +4714,7 @@ mod tests {
 
         fn get_key_packages(
             &self,
+            _actor_device_id: String,
             _dids: Vec<String>,
         ) -> Result<Vec<FFIKeyPackageRef>, OrchestratorBridgeError> {
             Ok(vec![])
@@ -4713,13 +4745,17 @@ mod tests {
             _mls_did: String,
             _signature_key: Vec<u8>,
             _key_packages: Vec<Vec<u8>>,
+            _prepared_request_body: Vec<u8>,
         ) -> Result<FFIDeviceInfo, OrchestratorBridgeError> {
             Err(OrchestratorBridgeError::Api {
                 message: "not used by bridge joinOrRejoin test".to_string(),
             })
         }
 
-        fn list_devices(&self) -> Result<Vec<FFIDeviceInfo>, OrchestratorBridgeError> {
+        fn list_devices(
+            &self,
+            _actor_device_id: String,
+        ) -> Result<Vec<FFIDeviceInfo>, OrchestratorBridgeError> {
             Ok(vec![])
         }
 

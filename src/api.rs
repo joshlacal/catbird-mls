@@ -2171,6 +2171,18 @@ impl MLSContext {
         serde_json::to_vec(&signer).map_err(|_| MLSError::SerializationError)
     }
 
+    pub fn identity_public_key(&self, identity: String) -> Result<Vec<u8>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner
+            .get_signer_for_identity(&identity)
+            .map(|signer| signer.public().to_vec())
+            .ok_or_else(|| MLSError::invalid_input("Identity not found"))
+    }
+
     /// Import an identity key pair from backup/recovery
     /// This restores the identity key into the current storage provider
     pub fn import_identity_key(&self, identity: String, key_data: Vec<u8>) -> Result<(), MLSError> {
@@ -7186,6 +7198,22 @@ impl MlsCryptoContext for MLSContext {
         let id = String::from_utf8(identity)
             .map_err(|_| MLSError::invalid_input("Invalid UTF-8 identity"))?;
         self.import_identity_key(id, key_data)
+    }
+
+    fn identity_public_key(&self, identity: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        let id = String::from_utf8(identity)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8 identity"))?;
+        self.identity_public_key(id)
+    }
+
+    fn sign_with_identity_key(
+        &self,
+        identity: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        let id = String::from_utf8(identity)
+            .map_err(|_| MLSError::invalid_input("Invalid UTF-8 identity"))?;
+        MLSContext::sign_with_identity_key(self, id, payload)
     }
 
     fn get_current_metadata(

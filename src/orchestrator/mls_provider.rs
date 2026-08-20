@@ -60,6 +60,25 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
 
+    /// Return the active Ed25519 public key for an enrolled MLS identity.
+    fn identity_public_key(&self, _identity: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "identity_public_key not available on this platform".to_string(),
+        })
+    }
+
+    /// Sign a Rust-canonical mutation transcript with this identity's
+    /// non-exporting Ed25519 signer.
+    fn sign_with_identity_key(
+        &self,
+        _identity: Vec<u8>,
+        _payload: Vec<u8>,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "identity signing not available on this platform".to_string(),
+        })
+    }
+
     /// Return the hex-encoded key-package refs the client currently holds a
     /// private key for (i.e. the live local bundle set). Used to drain
     /// server-side orphans via `syncKeyPackages`: any KP the server still lists

@@ -877,9 +877,10 @@ mod tests {
         match err {
             AppendLogError::Endpoint(endpoint) => {
                 assert_eq!(endpoint.code, ChatErrorCode::DeviceRevoked);
+                assert!(endpoint.requires_device_recovery());
                 assert!(
-                    endpoint.requires_reauthentication(),
-                    "the ladder must see the typed classification, not a string"
+                    !endpoint.requires_reauthentication(),
+                    "device revocation must not be presented as account logout"
                 );
             }
             other => panic!("expected a typed endpoint error, got {other}"),

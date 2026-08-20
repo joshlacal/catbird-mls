@@ -211,7 +211,11 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     }
 
     /// Get key packages for a set of DIDs.
-    async fn get_key_packages(&self, dids: &[String]) -> Result<Vec<KeyPackageRef>>;
+    async fn get_key_packages(
+        &self,
+        actor_device_id: &str,
+        dids: &[String],
+    ) -> Result<Vec<KeyPackageRef>>;
 
     /// Get key package stats for the current user.
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats>;
@@ -233,10 +237,11 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         mls_did: &str,
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
+        prepared_request_body: &[u8],
     ) -> Result<DeviceInfo>;
 
-    /// List registered devices.
-    async fn list_devices(&self) -> Result<Vec<DeviceInfo>>;
+    /// List registered devices through the device-scoped v2 query.
+    async fn list_devices(&self, actor_device_id: &str) -> Result<Vec<DeviceInfo>>;
 
     /// Remove a device by ID.
     async fn remove_device(&self, device_id: &str) -> Result<()>;

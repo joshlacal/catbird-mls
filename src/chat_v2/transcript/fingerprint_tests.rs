@@ -279,10 +279,10 @@ fn every_control_case_pins_a_signing_domain_this_crate_spells_identically() {
 }
 
 #[test]
-fn this_fixture_pins_fourteen_of_the_twenty_five_domains_and_names_the_rest() {
+fn this_fixture_pins_fourteen_of_the_twenty_four_domains_and_names_the_rest() {
     // What *this* fixture covers, kept exact so its scope is never overstated:
     // the thirteen control entries plus BLOB-DELETE from the signed-mutator
-    // vector. The other eleven were once pinned only by the transcribed
+    // vector. The other ten were once pinned only by the transcribed
     // constant table; they now have their own server vectors in
     // `mls_ds_signing_domain_vectors.json`, and
     // [`super::domain_vector_tests::every_signing_domain_is_now_pinned_by_a_server_vector`]
@@ -315,7 +315,6 @@ fn this_fixture_pins_fourteen_of_the_twenty_five_domains_and_names_the_rest() {
         vec![
             "deviceEnrollmentBody",
             "keyPackageReplenishmentBody",
-            "deviceAuthenticationRebindBody",
             "deviceRevocationBody",
             "blobUploadPreparationBody",
             "applicationSendBody",
@@ -325,7 +324,7 @@ fn this_fixture_pins_fourteen_of_the_twenty_five_domains_and_names_the_rest() {
             "welcomeAcknowledgementBody",
             "welcomeRejectionBody",
         ],
-        "these eleven are pinned by the signing-domain vectors, not this fixture"
+        "these ten are pinned by the signing-domain vectors, not this fixture"
     );
     assert_eq!(
         pinned.len() + elsewhere.len(),

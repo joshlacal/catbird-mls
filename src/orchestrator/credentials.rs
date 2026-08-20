@@ -14,7 +14,6 @@ pub struct CleanChatSigningAuthority {
     pub public_key: Vec<u8>,
     pub signature: Vec<u8>,
     pub device_id: String,
-    pub dpop_jkt: String,
     pub auth_generation: Option<i64>,
 }
 
@@ -48,7 +47,7 @@ pub trait CredentialStore: CredentialStoreBounds {
     /// Sign one canonical clean-chat transcript without exporting the private
     /// key. Implementations must resolve the key and binding tuple from one
     /// atomic authority snapshot and return only the public key, signature,
-    /// and snapshot metadata. The caller's claimed device/JKT/generation are
+    /// and snapshot metadata. The caller's claimed device/generation are
     /// deliberately not callback arguments, so an implementation cannot
     /// accidentally turn caller-controlled binding fields into authority.
     ///

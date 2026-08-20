@@ -791,10 +791,11 @@ impl MLSAPIClient for ClientAPIAdapter {
 
     async fn get_key_packages(
         &self,
+        actor_device_id: &str,
         dids: &[String],
     ) -> crate::orchestrator::Result<Vec<KeyPackageRef>> {
         self.0
-            .get_key_packages(dids.to_vec())
+            .get_key_packages(actor_device_id.to_string(), dids.to_vec())
             .map(|v| {
                 v.into_iter()
                     .map(|ffi| KeyPackageRef {
@@ -839,6 +840,7 @@ impl MLSAPIClient for ClientAPIAdapter {
         mls_did: &str,
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
+        prepared_request_body: &[u8],
     ) -> crate::orchestrator::Result<DeviceInfo> {
         self.0
             .register_device(
@@ -847,6 +849,7 @@ impl MLSAPIClient for ClientAPIAdapter {
                 mls_did.to_string(),
                 signature_key.to_vec(),
                 key_packages.to_vec(),
+                prepared_request_body.to_vec(),
             )
             .map(|ffi| DeviceInfo {
                 device_id: ffi.device_id,
@@ -856,13 +859,22 @@ impl MLSAPIClient for ClientAPIAdapter {
                     .created_at
                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&chrono::Utc)),
+                key_id: ffi.key_id,
+                signature_public_key: ffi.signature_public_key,
+                auth_generation: ffi.auth_generation,
+                status: ffi.status,
+                available_package_count: ffi.available_package_count,
+                reserved_package_count: ffi.reserved_package_count,
             })
             .map_err(bridge_err)
     }
 
-    async fn list_devices(&self) -> crate::orchestrator::Result<Vec<DeviceInfo>> {
+    async fn list_devices(
+        &self,
+        actor_device_id: &str,
+    ) -> crate::orchestrator::Result<Vec<DeviceInfo>> {
         self.0
-            .list_devices()
+            .list_devices(actor_device_id.to_owned())
             .map(|v| {
                 v.into_iter()
                     .map(|ffi| DeviceInfo {
@@ -873,6 +885,12 @@ impl MLSAPIClient for ClientAPIAdapter {
                             .created_at
                             .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                             .map(|dt| dt.with_timezone(&chrono::Utc)),
+                        key_id: ffi.key_id,
+                        signature_public_key: ffi.signature_public_key,
+                        auth_generation: ffi.auth_generation,
+                        status: ffi.status,
+                        available_package_count: ffi.available_package_count,
+                        reserved_package_count: ffi.reserved_package_count,
                     })
                     .collect()
             })

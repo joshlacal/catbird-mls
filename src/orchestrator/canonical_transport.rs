@@ -1,9 +1,9 @@
 //! Transport for the generated clean-chat XRPC surface.
 //!
 //! This is intentionally a transport seam, not a second protocol
-//! implementation. The platform owns OAuth/DPoP proof construction and the
-//! clean-chat transcript projector. We consume those exact values, bind them
-//! to the generated request, and serialize the generated DTO without routing
+//! implementation. The platform gateway owns the opaque Nest session and
+//! upstream OAuth/DPoP exchange. Rust projects and signs protocol requests,
+//! then serializes the generated DTO without routing
 //! through the legacy `blue.catbird.mlsChat.*` surface.
 
 use crate::atproto::blue_catbird::chat::{
@@ -28,7 +28,6 @@ use crate::atproto::blue_catbird::chat::{
     get_subscription_ticket::GetSubscriptionTicketRequest,
     prepare_blob_upload::PrepareBlobUploadRequest,
     publish_typing::PublishTypingRequest,
-    rebind_device_authentication::RebindDeviceAuthenticationRequest,
     reject_welcome::RejectWelcomeRequest,
     replenish_key_packages::{ReplenishKeyPackages, ReplenishKeyPackagesRequest},
     request_leaf_recovery::RequestLeafRecoveryRequest,
@@ -53,48 +52,28 @@ use uuid::{Uuid, Variant, Version};
 
 const REPLENISH_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REPLENISH\0";
 
-/// The already-authenticated transport material supplied by the platform.
-///
-/// `authorization` and `dpop_proof` are opaque on purpose: Nest/DPoP owns
-/// their construction and refresh/nonce policy. The Rust orchestrator only
-/// ensures that both are present and that the signed mutation's JKT/device
-/// agree with the same authenticated device.
+/// The device binding used to prepare a request. Account authentication is
+/// intentionally absent: the platform gateway attaches its opaque Nest
+/// session after Rust returns the prepared request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TransportAuth {
-    pub(crate) authorization: String,
-    pub(crate) dpop_proof: String,
-    pub(crate) dpop_jkt: String,
     pub(crate) device_id: String,
 }
 
 /// Authenticated transport context supplied by a platform adapter.
 ///
-/// The access token and DPoP proof remain opaque: Nest owns their issuance,
-/// refresh, nonce, and proof policy. Rust binds the generated signed request
-/// to the same authenticated device/JKT and refuses to prepare a request with
-/// missing authentication material. This is deliberately a small transport
-/// context rather than a second token or credential schema.
+/// This contains no token, proof, JKT, or other account authorization. The
+/// gateway owns those values and Rust cannot inspect, log, or export them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanChatAuthContext {
-    pub authorization: String,
-    pub dpop_proof: String,
-    pub dpop_jkt: String,
     pub device_id: String,
     /// Optional generation binding for signed mutation requests.
     pub auth_generation: Option<i64>,
 }
 
 impl CleanChatAuthContext {
-    pub fn new(
-        authorization: String,
-        dpop_proof: String,
-        dpop_jkt: String,
-        device_id: String,
-    ) -> Self {
+    pub fn new(device_id: String) -> Self {
         Self {
-            authorization,
-            dpop_proof,
-            dpop_jkt,
             device_id,
             auth_generation: None,
         }
@@ -107,9 +86,6 @@ impl CleanChatAuthContext {
 
     fn as_internal(&self) -> TransportAuth {
         TransportAuth {
-            authorization: self.authorization.clone(),
-            dpop_proof: self.dpop_proof.clone(),
-            dpop_jkt: self.dpop_jkt.clone(),
             device_id: self.device_id.clone(),
         }
     }
@@ -124,20 +100,15 @@ impl CleanChatAuthContext {
 pub struct CleanChatSigningContext {
     pub actor_did: String,
     pub device_id: String,
-    pub dpop_jkt: String,
     pub auth_generation: Option<i64>,
 }
 
 impl TransportAuth {
     fn validate(&self) -> Result<(), TransportError> {
-        if self.authorization.trim().is_empty() || self.dpop_proof.trim().is_empty() {
-            return Err(TransportError::MissingAuthentication);
-        }
-        if self.dpop_jkt.trim().is_empty() || self.device_id.trim().is_empty() {
+        if self.device_id.trim().is_empty() {
             return Err(TransportError::MissingDeviceBinding);
         }
         validate_uuid(&self.device_id, "deviceId")?;
-        validate_jkt(&self.dpop_jkt)?;
         Ok(())
     }
 }
@@ -148,21 +119,33 @@ pub struct PreparedRequest {
     pub operation: CanonicalOperation,
     pub method: String,
     pub path: String,
-    pub authorization: String,
-    pub dpop: String,
     pub body: Option<Vec<u8>>,
+}
+
+/// Bytes returned by a platform gateway after it authenticates a prepared
+/// XRPC with its opaque Nest session. Header filtering and token refresh stay
+/// entirely inside the implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// One cross-platform gateway seam for prepared XRPC requests. Implementers
+/// own their session storage and must not expose access tokens to this API.
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait GatewayTransport {
+    async fn submit(&self, request: PreparedRequest) -> Result<GatewayResponse, TransportError>;
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TransportError {
-    #[error("clean-chat transport authentication is missing")]
-    MissingAuthentication,
     #[error("clean-chat transport device binding is missing")]
     MissingDeviceBinding,
     #[error("signed body device {body} does not match authenticated device {authenticated}")]
     DeviceBindingMismatch { body: String, authenticated: String },
-    #[error("signed body DPoP JKT does not match authenticated DPoP JKT")]
-    DpopBindingMismatch,
     #[error("signed clean-chat mutations require an authenticated authGeneration")]
     MissingAuthGeneration,
     #[error(
@@ -235,7 +218,6 @@ pub enum CleanChatRequest {
     GetSubscriptionTicket(GetSubscriptionTicketRequestBody),
     PrepareBlobUpload(PrepareBlobUploadRequestBody),
     PublishTyping(PublishTypingRequestBody),
-    RebindDeviceAuthentication(RebindDeviceAuthenticationRequestBody),
     RejectWelcome(RejectWelcomeRequestBody),
     ReplenishKeyPackages(ReplenishKeyPackagesRequestBody),
     RequestLeafRecovery(RequestLeafRecoveryRequestBody),
@@ -284,10 +266,6 @@ pub type PrepareBlobUploadRequestBody =
     crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUpload<String>;
 pub type PublishTypingRequestBody =
     crate::atproto::blue_catbird::chat::publish_typing::PublishTyping<String>;
-pub type RebindDeviceAuthenticationRequestBody =
-    crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthentication<
-        String,
-    >;
 pub type RejectWelcomeRequestBody =
     crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcome<String>;
 pub type ReplenishKeyPackagesRequestBody =
@@ -312,12 +290,20 @@ pub type UploadBlobRequestBody = crate::atproto::blue_catbird::chat::upload_blob
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum CleanChatResponse {
-    AcceptConversation(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>),
-    AcknowledgeWelcome(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeOutput<String>),
+    AcceptConversation(
+        crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>,
+    ),
+    AcknowledgeWelcome(
+        crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeOutput<String>,
+    ),
     ActivateReset(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetOutput<String>),
-    CancelLeafRecovery(crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryOutput<String>),
+    CancelLeafRecovery(
+        crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryOutput<String>,
+    ),
     CancelLeave(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveOutput<String>),
-    CloseConversation(crate::atproto::blue_catbird::chat::close_conversation::CloseConversationOutput<String>),
+    CloseConversation(
+        crate::atproto::blue_catbird::chat::close_conversation::CloseConversationOutput<String>,
+    ),
     GetConversations(
         crate::atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<String>,
     ),
@@ -328,23 +314,42 @@ pub enum CleanChatResponse {
     SendMessage(crate::atproto::blue_catbird::chat::send_message::SendMessageOutput<String>),
     GetBlob(crate::atproto::blue_catbird::chat::get_blob::GetBlobOutput),
     GetBlobUsage(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageOutput<String>),
-    GetConversationState(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>),
+    GetConversationState(
+        crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<
+            String,
+        >,
+    ),
     GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>),
     GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>),
-    GetLeafRecoveryInbox(crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxOutput<String>),
+    GetLeafRecoveryInbox(
+        crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxOutput<
+            String,
+        >,
+    ),
     GetOwnDevices(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>),
-    GetPendingWelcomes(crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutput<String>),
-    GetSubscriptionTicket(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketOutput<String>),
-    PrepareBlobUpload(crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadOutput<String>),
+    GetPendingWelcomes(
+        crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutput<String>,
+    ),
+    GetSubscriptionTicket(
+        crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketOutput<
+            String,
+        >,
+    ),
+    PrepareBlobUpload(
+        crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadOutput<String>,
+    ),
     PublishTyping(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingOutput<String>),
-    RebindDeviceAuthentication(crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthenticationOutput<String>),
     RejectWelcome(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeOutput<String>),
     ReplenishKeyPackages(
         crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesOutput<
             String,
         >,
     ),
-    RequestLeafRecovery(crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryOutput<String>),
+    RequestLeafRecovery(
+        crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryOutput<
+            String,
+        >,
+    ),
     EnrollDevice(crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceOutput<String>),
     RequestLeave(crate::atproto::blue_catbird::chat::request_leave::RequestLeaveOutput<String>),
     RequestReset(crate::atproto::blue_catbird::chat::request_reset::RequestResetOutput<String>),
@@ -352,19 +357,29 @@ pub enum CleanChatResponse {
     SubmitTransition(
         crate::atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput<String>,
     ),
-    SubscribeEvents(crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage<String>),
+    SubscribeEvents(
+        crate::atproto::blue_catbird::chat::subscribe_events::SubscribeEventsMessage<String>,
+    ),
     UploadBlob(crate::atproto::blue_catbird::chat::upload_blob::UploadBlobOutput<String>),
 }
 
 /// A generated clean-chat error body, selected by the canonical operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanChatError {
-    AcceptConversation(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError),
-    AcknowledgeWelcome(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeError),
+    AcceptConversation(
+        crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError,
+    ),
+    AcknowledgeWelcome(
+        crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeError,
+    ),
     ActivateReset(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetError),
-    CancelLeafRecovery(crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryError),
+    CancelLeafRecovery(
+        crate::atproto::blue_catbird::chat::cancel_leaf_recovery::CancelLeafRecoveryError,
+    ),
     CancelLeave(crate::atproto::blue_catbird::chat::cancel_leave::CancelLeaveError),
-    CloseConversation(crate::atproto::blue_catbird::chat::close_conversation::CloseConversationError),
+    CloseConversation(
+        crate::atproto::blue_catbird::chat::close_conversation::CloseConversationError,
+    ),
     GetConversations(crate::atproto::blue_catbird::chat::get_conversations::GetConversationsError),
     CreateConversation(
         crate::atproto::blue_catbird::chat::create_conversation::CreateConversationError,
@@ -373,21 +388,32 @@ pub enum CleanChatError {
     SendMessage(crate::atproto::blue_catbird::chat::send_message::SendMessageError),
     GetBlob(crate::atproto::blue_catbird::chat::get_blob::GetBlobError),
     GetBlobUsage(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageError),
-    GetConversationState(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError),
+    GetConversationState(
+        crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError,
+    ),
     GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError),
     GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesError),
-    GetLeafRecoveryInbox(crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxError),
+    GetLeafRecoveryInbox(
+        crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxError,
+    ),
     GetOwnDevices(crate::atproto::blue_catbird::chat::get_own_devices::GetOwnDevicesError),
-    GetPendingWelcomes(crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesError),
-    GetSubscriptionTicket(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketError),
-    PrepareBlobUpload(crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadError),
+    GetPendingWelcomes(
+        crate::atproto::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesError,
+    ),
+    GetSubscriptionTicket(
+        crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketError,
+    ),
+    PrepareBlobUpload(
+        crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadError,
+    ),
     PublishTyping(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingError),
-    RebindDeviceAuthentication(crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthenticationError),
     RejectWelcome(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeError),
     ReplenishKeyPackages(
         crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesError,
     ),
-    RequestLeafRecovery(crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryError),
+    RequestLeafRecovery(
+        crate::atproto::blue_catbird::chat::request_leaf_recovery::RequestLeafRecoveryError,
+    ),
     EnrollDevice(crate::atproto::blue_catbird::chat::enroll_device::EnrollDeviceError),
     RequestLeave(crate::atproto::blue_catbird::chat::request_leave::RequestLeaveError),
     RequestReset(crate::atproto::blue_catbird::chat::request_reset::RequestResetError),
@@ -421,7 +447,6 @@ pub enum CleanChatOperationFfi {
     GetSubscriptionTicket,
     PrepareBlobUpload,
     PublishTyping,
-    RebindDeviceAuthentication,
     RejectWelcome,
     ReplenishKeyPackages,
     RequestLeafRecovery,
@@ -459,7 +484,6 @@ impl From<CleanChatOperationFfi> for CanonicalOperation {
             CleanChatOperationFfi::GetSubscriptionTicket => Self::GetSubscriptionTicket,
             CleanChatOperationFfi::PrepareBlobUpload => Self::PrepareBlobUpload,
             CleanChatOperationFfi::PublishTyping => Self::PublishTyping,
-            CleanChatOperationFfi::RebindDeviceAuthentication => Self::RebindDeviceAuthentication,
             CleanChatOperationFfi::RejectWelcome => Self::RejectWelcome,
             CleanChatOperationFfi::ReplenishKeyPackages => Self::ReplenishKeyPackages,
             CleanChatOperationFfi::RequestLeafRecovery => Self::RequestLeafRecovery,
@@ -499,7 +523,6 @@ impl From<CanonicalOperation> for CleanChatOperationFfi {
             CanonicalOperation::GetSubscriptionTicket => Self::GetSubscriptionTicket,
             CanonicalOperation::PrepareBlobUpload => Self::PrepareBlobUpload,
             CanonicalOperation::PublishTyping => Self::PublishTyping,
-            CanonicalOperation::RebindDeviceAuthentication => Self::RebindDeviceAuthentication,
             CanonicalOperation::RejectWelcome => Self::RejectWelcome,
             CanonicalOperation::ReplenishKeyPackages => Self::ReplenishKeyPackages,
             CanonicalOperation::RequestLeafRecovery => Self::RequestLeafRecovery,
@@ -514,14 +537,11 @@ impl From<CanonicalOperation> for CleanChatOperationFfi {
     }
 }
 
-/// UniFFI-safe authenticated transport context. Token/proof contents remain
-/// opaque to Rust; the device/JKT/generation are checked against signed bodies.
+/// UniFFI-safe device context. The platform gateway retains the opaque Nest
+/// session and attaches account authentication only while submitting.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
 pub struct CleanChatAuthContextFfi {
-    pub authorization: String,
-    pub dpop_proof: String,
-    pub dpop_jkt: String,
     pub device_id: String,
     pub auth_generation: Option<i64>,
 }
@@ -530,9 +550,6 @@ pub struct CleanChatAuthContextFfi {
 impl From<CleanChatAuthContextFfi> for CleanChatAuthContext {
     fn from(context: CleanChatAuthContextFfi) -> Self {
         Self {
-            authorization: context.authorization,
-            dpop_proof: context.dpop_proof,
-            dpop_jkt: context.dpop_jkt,
             device_id: context.device_id,
             auth_generation: context.auth_generation,
         }
@@ -540,18 +557,14 @@ impl From<CleanChatAuthContextFfi> for CleanChatAuthContext {
 }
 
 /// UniFFI-safe prepared request. The request body is the generated DTO's JSON
-/// bytes; platform clients own the actual HTTP execution. Unsigned requests
-/// carry their already-authenticated transport headers as `Some`; signed
-/// requests deliberately return `None` so the selected direct-DS or Nest
-/// adapter can attach its own transport credentials.
+/// bytes; platform clients own authenticated HTTP execution through the
+/// gateway. Prepared requests never contain access tokens or DPoP material.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
 pub struct CleanChatPreparedRequestFfi {
     pub operation: CleanChatOperationFfi,
     pub method: String,
     pub path: String,
-    pub authorization: Option<String>,
-    pub dpop: Option<String>,
     pub body: Option<Vec<u8>>,
 }
 
@@ -560,7 +573,6 @@ pub struct CleanChatPreparedRequestFfi {
 pub struct CleanChatSigningContextFfi {
     pub actor_did: String,
     pub device_id: String,
-    pub dpop_jkt: String,
     pub auth_generation: Option<i64>,
 }
 
@@ -570,7 +582,6 @@ impl From<CleanChatSigningContextFfi> for CleanChatSigningContext {
         Self {
             actor_did: context.actor_did,
             device_id: context.device_id,
-            dpop_jkt: context.dpop_jkt,
             auth_generation: context.auth_generation,
         }
     }
@@ -644,10 +655,6 @@ fn parse_ffi_request(
             parse!(PrepareBlobUploadRequestBody, PrepareBlobUpload)
         }
         CanonicalOperation::PublishTyping => parse!(PublishTypingRequestBody, PublishTyping),
-        CanonicalOperation::RebindDeviceAuthentication => parse!(
-            RebindDeviceAuthenticationRequestBody,
-            RebindDeviceAuthentication
-        ),
         CanonicalOperation::RejectWelcome => parse!(RejectWelcomeRequestBody, RejectWelcome),
         CanonicalOperation::ReplenishKeyPackages => {
             parse!(ReplenishKeyPackagesRequestBody, ReplenishKeyPackages)
@@ -683,8 +690,6 @@ pub fn prepare_clean_chat_request(
         operation: prepared.operation.into(),
         method: prepared.method,
         path: prepared.path,
-        authorization: Some(prepared.authorization),
-        dpop: Some(prepared.dpop),
         body: prepared.body,
     })
 }
@@ -765,9 +770,6 @@ pub fn decode_clean_chat_response(
             serde_json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::PublishTyping(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::RebindDeviceAuthentication(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
-        }
         CleanChatResponse::RejectWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::ReplenishKeyPackages(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
@@ -822,9 +824,6 @@ pub fn decode_clean_chat_error(
         }
         CleanChatError::PrepareBlobUpload(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::PublishTyping(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::RebindDeviceAuthentication(value) => {
-            serde_json::to_vec(&value).map_err(ffi_error)
-        }
         CleanChatError::RejectWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::ReplenishKeyPackages(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
@@ -864,7 +863,6 @@ impl CleanChatRequest {
             Self::GetSubscriptionTicket(_) => CanonicalOperation::GetSubscriptionTicket,
             Self::PrepareBlobUpload(_) => CanonicalOperation::PrepareBlobUpload,
             Self::PublishTyping(_) => CanonicalOperation::PublishTyping,
-            Self::RebindDeviceAuthentication(_) => CanonicalOperation::RebindDeviceAuthentication,
             Self::RejectWelcome(_) => CanonicalOperation::RejectWelcome,
             Self::ReplenishKeyPackages(_) => CanonicalOperation::ReplenishKeyPackages,
             Self::RequestLeafRecovery(_) => CanonicalOperation::RequestLeafRecovery,
@@ -916,7 +914,6 @@ impl CleanChatRequest {
             Self::PrepareBlobUpload(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::PublishTyping(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::GetSubscriptionTicket(request) => prepare_unsigned_json_request(&internal, self.operation(), request),
-            Self::RebindDeviceAuthentication(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::RejectWelcome(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::ReplenishKeyPackages(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::RequestLeafRecovery(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
@@ -980,7 +977,6 @@ impl CleanChatResponse {
             CanonicalOperation::GetSubscriptionTicket => decode!(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketOutput<String>, GetSubscriptionTicket),
             CanonicalOperation::PrepareBlobUpload => decode!(crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadOutput<String>, PrepareBlobUpload),
             CanonicalOperation::PublishTyping => decode!(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingOutput<String>, PublishTyping),
-            CanonicalOperation::RebindDeviceAuthentication => decode!(crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthenticationOutput<String>, RebindDeviceAuthentication),
             CanonicalOperation::RejectWelcome => decode!(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeOutput<String>, RejectWelcome),
             CanonicalOperation::ReplenishKeyPackages => decode!(
                 crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesOutput<
@@ -1055,7 +1051,6 @@ impl CleanChatError {
             CanonicalOperation::GetSubscriptionTicket => decode!(crate::atproto::blue_catbird::chat::get_subscription_ticket::GetSubscriptionTicketError, GetSubscriptionTicket),
             CanonicalOperation::PrepareBlobUpload => decode!(crate::atproto::blue_catbird::chat::prepare_blob_upload::PrepareBlobUploadError, PrepareBlobUpload),
             CanonicalOperation::PublishTyping => decode!(crate::atproto::blue_catbird::chat::publish_typing::PublishTypingError, PublishTyping),
-            CanonicalOperation::RebindDeviceAuthentication => decode!(crate::atproto::blue_catbird::chat::rebind_device_authentication::RebindDeviceAuthenticationError, RebindDeviceAuthentication),
             CanonicalOperation::RejectWelcome => decode!(crate::atproto::blue_catbird::chat::reject_welcome::RejectWelcomeError, RejectWelcome),
             CanonicalOperation::ReplenishKeyPackages => decode!(
                 crate::atproto::blue_catbird::chat::replenish_key_packages::ReplenishKeyPackagesError,
@@ -1109,7 +1104,6 @@ pub struct ReplenishKeyPackagesInput {
     pub auth_generation: i64,
     pub idempotency_key: String,
     pub key_id: String,
-    pub dpop_jkt: String,
     pub signature_domain: String,
     pub key_packages: Vec<crate::atproto::blue_catbird::chat::KeyPackageArtifact<String>>,
     pub signed_at: String,
@@ -1120,8 +1114,7 @@ pub struct ReplenishKeyPackagesInput {
 /// The returned wrapper uses the generated `SignedKeyPackageReplenishment` and
 /// `ReplenishKeyPackages` types, so the wire shape cannot silently drift from
 /// the lexicon. No public FFI is introduced; a platform can call this from an
-/// existing internal adapter once its transcript and DPoP facilities are
-/// available.
+/// existing internal adapter once its non-exporting signer is available.
 pub(crate) fn replenish_key_packages(
     auth: &TransportAuth,
     signer: &SignatureKeyPair,
@@ -1132,16 +1125,12 @@ pub(crate) fn replenish_key_packages(
     validate_uuid(&input.actor_device_id, "actorDeviceId")?;
     validate_uuid(&input.idempotency_key, "idempotencyKey")?;
     validate_auth_generation(input.auth_generation)?;
-    validate_jkt(&input.dpop_jkt)?;
     validate_key_packages(&input.key_packages)?;
     if input.actor_device_id != auth.device_id {
         return Err(TransportError::DeviceBindingMismatch {
             body: input.actor_device_id,
             authenticated: auth.device_id.clone(),
         });
-    }
-    if input.dpop_jkt != auth.dpop_jkt {
-        return Err(TransportError::DpopBindingMismatch);
     }
     if input.signature_domain != REPLENISH_SIGNATURE_DOMAIN {
         return Err(TransportError::InvalidSignatureDomain);
@@ -1170,7 +1159,6 @@ pub(crate) fn replenish_key_packages(
         )
         .map_err(|_| TransportError::Serialization("actorDid is not a valid DID".into()))?,
         auth_generation: input.auth_generation,
-        dpop_jkt: input.dpop_jkt,
         idempotency_key: input.idempotency_key,
         key_id: input.key_id,
         key_packages: input.key_packages,
@@ -1192,8 +1180,6 @@ pub(crate) fn replenish_key_packages(
         operation: CanonicalOperation::ReplenishKeyPackages,
         method: "POST".into(),
         path: ReplenishKeyPackagesRequest::PATH.to_owned(),
-        authorization: auth.authorization.clone(),
-        dpop: auth.dpop_proof.clone(),
         body: Some(serialize_json(&request)?),
     })
 }
@@ -1214,14 +1200,10 @@ pub fn prepare_replenishment(
             actual: input.auth_generation,
         });
     }
-    if input.dpop_jkt != auth.dpop_jkt || input.actor_device_id != auth.device_id {
-        return Err(if input.dpop_jkt != auth.dpop_jkt {
-            TransportError::DpopBindingMismatch
-        } else {
-            TransportError::DeviceBindingMismatch {
-                body: input.actor_device_id,
-                authenticated: auth.device_id.clone(),
-            }
+    if input.actor_device_id != auth.device_id {
+        return Err(TransportError::DeviceBindingMismatch {
+            body: input.actor_device_id,
+            authenticated: auth.device_id.clone(),
         });
     }
     replenish_key_packages(&auth.as_internal(), signer, input)
@@ -1233,10 +1215,7 @@ pub(crate) fn derive_key_id(public_key: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(public_key))
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
-#[cfg(not(target_arch = "wasm32"))]
-const DEVICE_REBIND_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REBIND\0";
+pub(crate) const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
 #[cfg(not(target_arch = "wasm32"))]
 const DEVICE_REVOKE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REVOKE\0";
 #[cfg(not(target_arch = "wasm32"))]
@@ -1349,11 +1328,6 @@ fn signed_request_spec(
         CanonicalOperation::PublishTyping => SignedRequestSpec {
             domain: TYPING_SIGNATURE_DOMAIN,
             body_type: "blue.catbird.chat.defs#typingBody",
-            variant: None,
-        },
-        CanonicalOperation::RebindDeviceAuthentication => SignedRequestSpec {
-            domain: DEVICE_REBIND_SIGNATURE_DOMAIN,
-            body_type: "blue.catbird.chat.defs#deviceAuthenticationRebindBody",
             variant: None,
         },
         CanonicalOperation::RejectWelcome => SignedRequestSpec {
@@ -2173,40 +2147,14 @@ fn validate_projected_binding(
             authenticated: binding.device_id.clone(),
         });
     }
-    validate_jkt(&binding.dpop_jkt)?;
-
     match operation {
         CanonicalOperation::EnrollDevice => {
-            let body_jkt = canonical_text(body, "dpopJkt")?;
-            if body_jkt != binding.dpop_jkt {
-                return Err(TransportError::DpopBindingMismatch);
-            }
             let expected = canonical_integer(body, "expectedAuthGeneration")?;
             if expected != 0 {
                 return Err(TransportError::InvalidEnrollmentGeneration { actual: expected });
             }
         }
-        CanonicalOperation::RebindDeviceAuthentication => {
-            validate_jkt(canonical_text(body, "currentDpopJkt")?)?;
-            if canonical_text(body, "newDpopJkt")? != binding.dpop_jkt {
-                return Err(TransportError::DpopBindingMismatch);
-            }
-            let actual = canonical_integer(body, "expectedAuthGeneration")?;
-            validate_auth_generation(actual)?;
-            let expected = binding
-                .auth_generation
-                .ok_or(TransportError::MissingAuthGeneration)?;
-            if actual != expected {
-                return Err(TransportError::AuthGenerationMismatch { expected, actual });
-            }
-        }
         _ => {
-            if let Some(CanonicalValue::Text(jkt)) = body.get("dpopJkt") {
-                validate_jkt(jkt)?;
-                if *jkt != binding.dpop_jkt {
-                    return Err(TransportError::DpopBindingMismatch);
-                }
-            }
             let actual = canonical_integer(body, "authGeneration")?;
             validate_auth_generation(actual)?;
             let expected = binding
@@ -2467,7 +2415,6 @@ pub(crate) struct SignedBodyProjection {
     body_json: serde_json::Value,
     generated_body_json: serde_json::Value,
     expected_device_id: String,
-    expected_dpop_jkt: String,
     expected_auth_generation: Option<i64>,
 }
 
@@ -2630,7 +2577,6 @@ pub(crate) fn prepare_signed_body(
         body_json: wire_json_ref(definition_name, &projected, true)?,
         generated_body_json,
         expected_device_id: binding.device_id.clone(),
-        expected_dpop_jkt: binding.dpop_jkt.clone(),
         expected_auth_generation: binding.auth_generation,
     })
 }
@@ -2673,8 +2619,6 @@ fn finish_signed_request(
         operation: prepared.operation,
         method: "POST".into(),
         path: canonical_route(prepared.operation).path.to_owned(),
-        authorization: String::new(),
-        dpop: String::new(),
         body: Some(
             serde_json::to_vec(&wire)
                 .map_err(|error| TransportError::Serialization(error.to_string()))?,
@@ -2692,9 +2636,6 @@ fn verify_authority(
     }
     if authority.device_id != prepared.expected_device_id {
         return Err(TransportError::SigningAuthorityMismatch { field: "deviceId" });
-    }
-    if authority.dpop_jkt != prepared.expected_dpop_jkt {
-        return Err(TransportError::SigningAuthorityMismatch { field: "dpopJkt" });
     }
     if authority.auth_generation != prepared.expected_auth_generation {
         return Err(TransportError::SigningAuthorityMismatch {
@@ -2738,6 +2679,42 @@ pub(crate) fn prepare_signed_request_with_authority(
     finish_signed_request(prepared, authority.signature)
 }
 
+/// Prepare a canonical signed mutation while keeping signer custody behind a
+/// caller-provided non-exporting signing function.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn prepare_signed_request_with(
+    binding: &CleanChatSigningContext,
+    operation: CanonicalOperation,
+    body_json: Vec<u8>,
+    sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, TransportError>,
+) -> Result<PreparedRequest, TransportError> {
+    let prepared = prepare_signed_body(binding, operation, &body_json)?;
+    let signature = sign(&prepared.transcript)?;
+    let public_key = prepared
+        .body_public_key
+        .clone()
+        .ok_or(TransportError::InvalidSigningAuthority)?;
+    let authority = crate::orchestrator::credentials::CleanChatSigningAuthority {
+        public_key,
+        signature,
+        device_id: binding.device_id.clone(),
+        auth_generation: binding.auth_generation,
+    };
+    prepare_signed_request_with_authority(prepared, authority)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn prepare_signed_request_with(
+    _binding: &CleanChatSigningContext,
+    _operation: CanonicalOperation,
+    _body_json: Vec<u8>,
+    _sign: impl FnOnce(&[u8]) -> Result<Vec<u8>, TransportError>,
+) -> Result<PreparedRequest, TransportError> {
+    Err(TransportError::Serialization(
+        "browser enrollment is prepared by the non-exporting WASM signer bridge".into(),
+    ))
+}
+
 /// Rust-only test/legacy helper. The public orchestrator uses the
 /// non-exporting authority path above; this helper never crosses UniFFI.
 #[cfg(not(target_arch = "wasm32"))]
@@ -2762,7 +2739,6 @@ pub(crate) fn prepare_signed_request_with_signer(
         public_key: signer.public().to_vec(),
         signature,
         device_id: binding.device_id.clone(),
-        dpop_jkt: binding.dpop_jkt.clone(),
         auth_generation: binding.auth_generation,
     };
     prepare_signed_request_with_authority(prepared, authority)
@@ -2829,10 +2805,6 @@ pub(crate) fn canonical_replenishment_transcript(
     body.insert(
         "authGeneration".into(),
         CanonicalValue::Integer(auth_generation),
-    );
-    body.insert(
-        "dpopJkt".into(),
-        CanonicalValue::Text(input.dpop_jkt.clone()),
     );
     body.insert(
         "idempotencyKey".into(),
@@ -3081,8 +3053,6 @@ fn prepare_json_request<T: Serialize>(
         operation,
         method: "POST".into(),
         path: canonical_route(operation).path.to_owned(),
-        authorization: auth.authorization.clone(),
-        dpop: auth.dpop_proof.clone(),
         body: Some(body),
     })
 }
@@ -3093,12 +3063,23 @@ fn prepare_unsigned_json_request<T: Serialize>(
     request: &T,
 ) -> Result<PreparedRequest, TransportError> {
     auth.validate()?;
+    let value = serde_json::to_value(request)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    if let Some(actor_device_id) = value
+        .get("actorDeviceId")
+        .and_then(serde_json::Value::as_str)
+    {
+        if actor_device_id != auth.device_id {
+            return Err(TransportError::DeviceBindingMismatch {
+                body: actor_device_id.to_owned(),
+                authenticated: auth.device_id.clone(),
+            });
+        }
+    }
     Ok(PreparedRequest {
         operation,
         method: "POST".into(),
         path: canonical_route(operation).path.to_owned(),
-        authorization: auth.authorization.clone(),
-        dpop: auth.dpop_proof.clone(),
         body: Some(serialize_json(request)?),
     })
 }
@@ -3130,15 +3111,6 @@ pub(crate) fn validate_signed_request_context(
                 authenticated: auth.device_id.clone(),
             });
         }
-        let jkt = body
-            .get("dpopJkt")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                TransportError::Serialization("enrollment body is missing dpopJkt".into())
-            })?;
-        if jkt != auth.dpop_jkt {
-            return Err(TransportError::DpopBindingMismatch);
-        }
         let expected = body
             .get("expectedAuthGeneration")
             .and_then(serde_json::Value::as_i64)
@@ -3152,50 +3124,6 @@ pub(crate) fn validate_signed_request_context(
         }
         return Ok(());
     }
-    if operation == CanonicalOperation::RebindDeviceAuthentication {
-        let device = body
-            .get("actorDeviceId")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                TransportError::Serialization("rebind body is missing actorDeviceId".into())
-            })?;
-        if device != auth.device_id {
-            return Err(TransportError::DeviceBindingMismatch {
-                body: device.to_owned(),
-                authenticated: auth.device_id.clone(),
-            });
-        }
-        let current_jkt = body
-            .get("currentDpopJkt")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                TransportError::Serialization("rebind body is missing currentDpopJkt".into())
-            })?;
-        validate_jkt(current_jkt)?;
-        let new_jkt = body
-            .get("newDpopJkt")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                TransportError::Serialization("rebind body is missing newDpopJkt".into())
-            })?;
-        validate_jkt(new_jkt)?;
-        if new_jkt != auth.dpop_jkt {
-            return Err(TransportError::DpopBindingMismatch);
-        }
-        let actual = body
-            .get("expectedAuthGeneration")
-            .and_then(serde_json::Value::as_i64)
-            .ok_or_else(|| {
-                TransportError::Serialization(
-                    "rebind body is missing expectedAuthGeneration".into(),
-                )
-            })?;
-        let expected = auth_generation.ok_or(TransportError::MissingAuthGeneration)?;
-        if expected != actual {
-            return Err(TransportError::AuthGenerationMismatch { expected, actual });
-        }
-        return Ok(());
-    }
     if let Some(device) = body
         .get("actorDeviceId")
         .or_else(|| body.get("deviceId"))
@@ -3206,11 +3134,6 @@ pub(crate) fn validate_signed_request_context(
                 body: device.to_owned(),
                 authenticated: auth.device_id.clone(),
             });
-        }
-    }
-    if let Some(jkt) = body.get("dpopJkt").and_then(serde_json::Value::as_str) {
-        if jkt != auth.dpop_jkt {
-            return Err(TransportError::DpopBindingMismatch);
         }
     }
     let actual = body
@@ -3251,6 +3174,17 @@ fn query_request<T: Serialize>(
             "generated query request is not an object".into(),
         ));
     };
+    if let Some(actor_device_id) = object
+        .get("actorDeviceId")
+        .and_then(serde_json::Value::as_str)
+    {
+        if actor_device_id != auth.device_id {
+            return Err(TransportError::DeviceBindingMismatch {
+                body: actor_device_id.to_owned(),
+                authenticated: auth.device_id.clone(),
+            });
+        }
+    }
     let mut fields = Vec::new();
     for (key, value) in object {
         if key == "$type" {
@@ -3293,8 +3227,6 @@ fn read_request(
         operation,
         method: "GET".into(),
         path,
-        authorization: auth.authorization.clone(),
-        dpop: auth.dpop_proof.clone(),
         body: None,
     })
 }
@@ -3307,12 +3239,17 @@ pub(crate) fn get_conversations(
     page_cursor: Option<&str>,
 ) -> Result<PreparedRequest, TransportError> {
     let request = GetConversations {
+        actor_device_id: auth.device_id.clone(),
         limit,
         page_cursor: page_cursor.map(ToOwned::to_owned),
     };
     let value = serde_json::to_value(request)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
-    let mut query = format!("limit={}", value["limit"]);
+    let mut query = format!(
+        "actorDeviceId={}&limit={}",
+        encode_query(value["actorDeviceId"].as_str().unwrap_or_default()),
+        value["limit"]
+    );
     if let Some(cursor) = value["pageCursor"].as_str() {
         query.push_str("&pageCursor=");
         query.push_str(&encode_query(cursor));
@@ -3338,6 +3275,7 @@ pub(crate) fn get_entries(
     limit: i64,
 ) -> Result<PreparedRequest, TransportError> {
     let request = GetEntries {
+        actor_device_id: auth.device_id.clone(),
         after_seq,
         conversation_id: conversation_id.to_owned(),
         limit,
@@ -3345,7 +3283,8 @@ pub(crate) fn get_entries(
     let value = serde_json::to_value(request)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
     let query = format!(
-        "afterSeq={}&conversationId={}&limit={}",
+        "actorDeviceId={}&afterSeq={}&conversationId={}&limit={}",
+        encode_query(value["actorDeviceId"].as_str().unwrap_or_default()),
         value["afterSeq"],
         encode_query(value["conversationId"].as_str().unwrap_or_default()),
         value["limit"]
@@ -3395,7 +3334,6 @@ pub enum CanonicalOperation {
     GetSubscriptionTicket,
     PrepareBlobUpload,
     PublishTyping,
-    RebindDeviceAuthentication,
     RejectWelcome,
     ReplenishKeyPackages,
     RequestLeafRecovery,
@@ -3432,7 +3370,6 @@ impl CanonicalOperation {
         Self::GetSubscriptionTicket,
         Self::PrepareBlobUpload,
         Self::PublishTyping,
-        Self::RebindDeviceAuthentication,
         Self::RejectWelcome,
         Self::ReplenishKeyPackages,
         Self::RequestLeafRecovery,
@@ -3496,9 +3433,6 @@ pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
         CanonicalOperation::GetSubscriptionTicket => route(GetSubscriptionTicketRequest::PATH),
         CanonicalOperation::PrepareBlobUpload => route(PrepareBlobUploadRequest::PATH),
         CanonicalOperation::PublishTyping => route(PublishTypingRequest::PATH),
-        CanonicalOperation::RebindDeviceAuthentication => {
-            route(RebindDeviceAuthenticationRequest::PATH)
-        }
         CanonicalOperation::RejectWelcome => route(RejectWelcomeRequest::PATH),
         CanonicalOperation::ReplenishKeyPackages => route(ReplenishKeyPackagesRequest::PATH),
         CanonicalOperation::RequestLeafRecovery => route(RequestLeafRecoveryRequest::PATH),

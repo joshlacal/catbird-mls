@@ -158,9 +158,10 @@ impl MLSAPIClient for RecordingCommitApi {
 
     async fn get_key_packages(
         &self,
+        actor_device_id: &str,
         dids: &[String],
     ) -> OrchestratorResult<Vec<catbird_mls::orchestrator::KeyPackageRef>> {
-        self.inner.get_key_packages(dids).await
+        self.inner.get_key_packages(actor_device_id, dids).await
     }
 
     async fn get_key_package_stats(
@@ -184,6 +185,7 @@ impl MLSAPIClient for RecordingCommitApi {
         mls_did: &str,
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
+        prepared_request_body: &[u8],
     ) -> OrchestratorResult<catbird_mls::orchestrator::DeviceInfo> {
         self.inner
             .register_device(
@@ -192,12 +194,16 @@ impl MLSAPIClient for RecordingCommitApi {
                 mls_did,
                 signature_key,
                 key_packages,
+                prepared_request_body,
             )
             .await
     }
 
-    async fn list_devices(&self) -> OrchestratorResult<Vec<catbird_mls::orchestrator::DeviceInfo>> {
-        self.inner.list_devices().await
+    async fn list_devices(
+        &self,
+        _actor_device_id: &str,
+    ) -> OrchestratorResult<Vec<catbird_mls::orchestrator::DeviceInfo>> {
+        self.inner.list_devices(_actor_device_id).await
     }
 
     async fn remove_device(&self, device_id: &str) -> OrchestratorResult<()> {
@@ -502,7 +508,7 @@ async fn fork_readd_stages_server_submit_ready_commit_without_merging_first() {
     let key_packages = alice
         .orchestrator
         .api_client()
-        .get_key_packages(&[alice.did.clone(), bob_did])
+        .get_key_packages("00000000-0000-4000-8000-000000000001", &[alice.did.clone(), bob_did])
         .await
         .expect("key packages should be available");
     assert!(

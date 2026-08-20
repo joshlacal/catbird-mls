@@ -328,6 +328,12 @@ pub struct DeviceInfo {
     pub mls_did: DID,
     pub device_uuid: String,
     pub created_at: Option<DateTime<Utc>>,
+    pub key_id: Option<String>,
+    pub signature_public_key: Option<Vec<u8>>,
+    pub auth_generation: Option<i64>,
+    pub status: Option<String>,
+    pub available_package_count: Option<u32>,
+    pub reserved_package_count: Option<u32>,
 }
 
 /// State of a conversation from the orchestrator's perspective.

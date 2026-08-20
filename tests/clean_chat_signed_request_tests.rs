@@ -25,7 +25,6 @@ fn replenishment_body(signer: &SignatureKeyPair) -> Vec<u8> {
         "actorDid": format!("did:plc:{ACTOR_NAME}"),
         "actorDeviceId": DEVICE_ID,
         "authGeneration": 1,
-        "dpopJkt": DPOP_JKT,
         "idempotencyKey": "22222222-2222-4222-8222-222222222222",
         "keyId": key_id,
         "keyPackages": [{
@@ -46,7 +45,6 @@ fn binding() -> CleanChatSigningContext {
     CleanChatSigningContext {
         actor_did: format!("did:plc:{ACTOR_NAME}"),
         device_id: DEVICE_ID.into(),
-        dpop_jkt: DPOP_JKT.into(),
         auth_generation: Some(1),
     }
 }
@@ -79,8 +77,8 @@ async fn configured_credential_store_signs_without_transport_headers() {
         .await
         .expect("configured credential store signer");
 
-    assert!(prepared.authorization.is_empty());
-    assert!(prepared.dpop.is_empty());
+    assert_eq!(prepared.method, "POST");
+    assert!(prepared.path.starts_with("/xrpc/blue.catbird.chat."));
     let wire: Value = serde_json::from_slice(prepared.body.as_deref().unwrap()).unwrap();
     assert_eq!(wire["signedRequest"].as_object().unwrap().len(), 2);
     assert!(wire["signedRequest"]["signature"].is_string());
@@ -106,8 +104,7 @@ async fn signed_orchestrator_requires_atomic_authority_snapshot() {
         .set_clean_chat_authority(CleanChatSigningAuthority {
             public_key: signer.public().to_vec(),
             signature: vec![0; 64],
-            device_id: DEVICE_ID.into(),
-            dpop_jkt: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".into(),
+            device_id: "33333333-3333-4333-8333-333333333333".into(),
             auth_generation: Some(1),
         });
 
@@ -121,7 +118,7 @@ async fn signed_orchestrator_requires_atomic_authority_snapshot() {
         .await;
     assert!(matches!(
         result,
-        Err(TransportError::SigningAuthorityMismatch { field: "dpopJkt" })
+        Err(TransportError::SigningAuthorityMismatch { field: "deviceId" })
     ));
 }
 
@@ -138,7 +135,6 @@ async fn signed_orchestrator_rejects_authority_signature_for_another_transcript(
             public_key: signer.public().to_vec(),
             signature: vec![0; 64],
             device_id: DEVICE_ID.into(),
-            dpop_jkt: DPOP_JKT.into(),
             auth_generation: Some(1),
         });
 

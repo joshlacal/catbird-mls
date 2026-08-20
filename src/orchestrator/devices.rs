@@ -5,6 +5,8 @@ use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use sha2::{Digest, Sha256};
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
@@ -49,7 +51,6 @@ where
     /// and stores credentials.
     pub async fn ensure_device_registered(&self) -> Result<String> {
         let user_did = self.require_user_did().await?;
-        let identity_bytes = user_did.as_bytes().to_vec();
 
         // Durable signer reuse (prevents signing-key churn / orphaned key
         // packages): if a previously-exported full keypair survives in the
@@ -77,18 +78,40 @@ where
             .await?
             .unwrap_or(false);
 
-        // Check if already registered via credential store
+        // Local custody is never sufficient readiness evidence. Always ask the
+        // server for this account's devices before taking the fast path.
         if self.credentials().has_credentials(&user_did).await? {
             if let Some(mls_did) = self.credentials().get_mls_did(&user_did).await? {
-                tracing::debug!(mls_did = %mls_did, "Device already registered");
-
-                // Only short-circuit when the server has key packages AND the
-                // local signer is in sync with the last-registered key. A signer
-                // mismatch falls through to re-registration, which updates the
-                // server device's signature key + publishes fresh matching key
-                // packages, self-healing the divergence.
-                let stats = self.api_client().get_key_package_stats().await?;
-                if stats.available > 0 && durable_signer_in_sync {
+                let local_device_id = self.credentials().get_device_uuid(&user_did).await?;
+                let local_public_key = self
+                    .mls_context()
+                    .identity_public_key(mls_did.as_bytes().to_vec())
+                    .ok();
+                let server_device = match local_device_id.as_deref() {
+                    Some(device_id) => self
+                        .api_client()
+                        .list_devices(device_id)
+                        .await?
+                        .into_iter()
+                        .find(|device| device.device_id == device_id),
+                    None => None,
+                };
+                let server_matches_custody = server_device.as_ref().is_some_and(|device| {
+                    device.status.as_deref() == Some("active")
+                        && device
+                            .auth_generation
+                            .is_some_and(|generation| generation >= 1)
+                        && device
+                            .available_package_count
+                            .is_some_and(|count| count > 0)
+                        && device.signature_public_key.as_ref() == local_public_key.as_ref()
+                        && device.key_id.as_deref().is_some_and(|key_id| {
+                            local_public_key.as_ref().is_some_and(|public_key| {
+                                super::canonical_transport::derive_key_id(public_key) == key_id
+                            })
+                        })
+                });
+                if server_matches_custody && durable_signer_in_sync {
                     return Ok(mls_did);
                 }
 
@@ -96,30 +119,11 @@ where
                     tracing::warn!(
                         "Local signer diverged from the registered device key - re-registering to reconcile"
                     );
-                    // The stale server device is keyed to a signer we no longer
-                    // use, and re-registration below mints a FRESH device_uuid
-                    // (so the server can't match + update the old row in place).
-                    // Remove the stale device first so its now-unusable key
-                    // packages can't be served to adders — otherwise a member is
-                    // handed a key package whose private key this device doesn't
-                    // hold and can never open the Welcome. `removeDevice` deletes
-                    // the device row + its key packages + welcome messages; group
-                    // memberships are untouched.
-                    if let Some(stale_device_id) =
-                        self.credentials().get_device_uuid(&user_did).await?
-                    {
-                        if let Err(e) = self.api_client().remove_device(&stale_device_id).await {
-                            tracing::warn!(error = %e, "Failed to remove stale device before re-registration (continuing)");
-                        } else {
-                            tracing::info!(
-                                stale_device_id = %stale_device_id,
-                                "Removed stale divergent device before re-registration"
-                            );
-                        }
-                    }
+                    // Never overwrite or delete the mismatched server identity
+                    // silently. Enrollment below uses a new UUID and signer.
                 } else {
                     tracing::warn!(
-                        "Device registered locally but 0 key packages on server - re-registering"
+                        "Server device projection does not match local custody - enrolling a fresh device"
                     );
                 }
                 // Fall through to re-register
@@ -131,6 +135,8 @@ where
 
         // Generate device UUID
         let device_uuid = uuid::Uuid::new_v4().to_string();
+        let mls_did = format!("{user_did}#{device_uuid}");
+        let identity_bytes = mls_did.as_bytes().to_vec();
 
         // Create MLS identity via FFI. If the durable key was imported above,
         // this reuses it; otherwise it mints (and we persist the full keypair
@@ -139,9 +145,66 @@ where
             .mls_context()
             .create_key_package(identity_bytes.clone())?;
 
-        // The MLS credential identity uses the bare DID (matches iOS behavior).
-        // The device UUID is tracked server-side via register_device, not in the credential.
-        let mls_did = user_did.clone();
+        let key_id = super::canonical_transport::derive_key_id(&kp_result.signature_public_key);
+        let signed_at = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#deviceEnrollmentBody",
+            "signatureDomain": super::canonical_transport::DEVICE_ENROLL_SIGNATURE_DOMAIN,
+            "actorDid": user_did,
+            "deviceId": device_uuid,
+            "deviceName": get_device_name(),
+            "keyId": key_id,
+            "signaturePublicKey": B64.encode(&kp_result.signature_public_key),
+            "expectedAuthGeneration": 0,
+            "capability": {
+                "protocolVersion": "1",
+                "mlsVersion": "1.0",
+                "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "credentialType": "basic",
+                "addByValue": "supported",
+                "updatePath": "supported",
+                "removeByValue": "supported",
+                "ratchetTreeGroupInfo": "supported",
+                "externalPubGroupInfo": "presentButExternalCommitsForbidden",
+                "applicationFrameProfile": "dagCborApplication1",
+                "controlProfile": "publicGroup1",
+                "attachmentProfile": "aes256GcmBlob1",
+                "metadataProfile": "exporterAes256Gcm1",
+                "typingProfile": "signedClearEphemeral1"
+            },
+            "keyPackages": [{
+                "framing": "mlsMessage",
+                "contentType": "keyPackage",
+                "bytes": B64.encode(&kp_result.key_package_data),
+                "sha256": B64.encode(Sha256::digest(&kp_result.key_package_data)),
+                "keyPackageRef": B64.encode(&kp_result.hash_ref)
+            }],
+            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
+            "signedAt": signed_at
+        });
+        let binding = super::canonical_transport::CleanChatSigningContext {
+            actor_did: user_did.clone(),
+            device_id: device_uuid.clone(),
+            auth_generation: None,
+        };
+        let prepared = super::canonical_transport::prepare_signed_request_with(
+            &binding,
+            super::canonical_transport::CanonicalOperation::EnrollDevice,
+            serde_json::to_vec(&body).map_err(|error| {
+                OrchestratorError::Credential(format!("serialize enrollment: {error}"))
+            })?,
+            |transcript| {
+                self.mls_context()
+                    .sign_with_identity_key(identity_bytes.clone(), transcript.to_vec())
+                    .map_err(|_| super::canonical_transport::TransportError::Signing)
+            },
+        )
+        .map_err(|error| OrchestratorError::Credential(error.to_string()))?;
+        let prepared_request_body = prepared.body.ok_or_else(|| {
+            OrchestratorError::Credential("prepared enrollment has no body".into())
+        })?;
 
         // Register with server (include initial key package)
         let device_info = self
@@ -152,6 +215,7 @@ where
                 &mls_did,
                 &kp_result.signature_public_key,
                 std::slice::from_ref(&kp_result.key_package_data),
+                &prepared_request_body,
             )
             .await
             .map_err(|e| {
@@ -167,20 +231,20 @@ where
                 e
             })?;
 
-        // Store credentials.
-        //
-        // The delivery service MINTS its own `device_id` and ignores the
-        // client-supplied `device_uuid`, returning the minted id in
-        // `device_info.device_id`. Every device-scoped call (publish, sync)
-        // must reference that minted id, so persist it — not the throwaway
-        // `device_uuid` we sent as the registration input. Storing the client
-        // UUID here is what stranded fresh devices: publishes carried an id the
-        // server never created and were rejected (403).
+        if device_info.device_id != device_uuid {
+            return Err(OrchestratorError::Credential(format!(
+                "server substituted device ID {} for client ID {}",
+                device_info.device_id, device_uuid
+            )));
+        }
+
+        // Persist the signer receipt and authoritative client UUID only after
+        // successful (or exact-idempotent) enrollment.
         self.credentials()
             .store_mls_did(&user_did, &mls_did)
             .await?;
         self.credentials()
-            .store_device_uuid(&user_did, &device_info.device_id)
+            .store_device_uuid(&user_did, &device_uuid)
             .await?;
         // Persist the FULL signing keypair (not just the public key) so it can
         // be reimported after an app reinstall / local-storage wipe and reused
@@ -210,19 +274,6 @@ where
             }
         }
 
-        // Publish a reusable last-resort key package so this device always has a
-        // join floor: even if its regular single-use pool is drained (orphan
-        // reconcile) or exhausted (failed joins), the DS can still seal a
-        // Welcome to the last-resort KP. Best-effort — not all platforms'
-        // crypto backends support last-resort generation, and a failure here
-        // must not block device registration.
-        match self.publish_last_resort_key_package().await {
-            Ok(()) => tracing::info!("Published last-resort key package"),
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to publish last-resort key package (continuing)")
-            }
-        }
-
         tracing::info!(
             device_id = %device_info.device_id,
             mls_did = %mls_did,
@@ -233,7 +284,17 @@ where
 
     /// List all registered devices for the current user.
     pub async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
-        self.api_client().list_devices().await
+        let user_did = self.require_user_did().await?;
+        let device_id = self
+            .credentials()
+            .get_device_uuid(&user_did)
+            .await?
+            .ok_or_else(|| {
+                OrchestratorError::Credential(
+                    "cannot read devices before verified device enrollment".into(),
+                )
+            })?;
+        self.api_client().list_devices(&device_id).await
     }
 
     /// Remove a device by ID.

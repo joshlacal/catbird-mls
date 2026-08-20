@@ -30,7 +30,8 @@ pub use canonical_transport::{
     canonical_route, decode_clean_chat_blob_response, map_wire_error, prepare_get_conversations,
     prepare_get_entries, prepare_replenishment, route_for_nsid, CanonicalOperation,
     CleanChatAuthContext, CleanChatError, CleanChatRequest, CleanChatResponse,
-    CleanChatSigningContext, PreparedRequest, ReplenishKeyPackagesInput, TransportError,
+    CleanChatSigningContext, GatewayResponse, GatewayTransport, PreparedRequest,
+    ReplenishKeyPackagesInput, TransportError,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use canonical_transport::{

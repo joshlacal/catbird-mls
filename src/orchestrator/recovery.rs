@@ -1127,7 +1127,12 @@ where
             self.escalate_fork_to_rejoin(convo_id).await;
             return Err(OrchestratorError::RecoveryFailed("no members".into()));
         }
-        let kp_refs = match self.api_client().get_key_packages(&mems).await {
+        let actor_device_id = self.require_actor_device_id().await?;
+        let kp_refs = match self
+            .api_client()
+            .get_key_packages(&actor_device_id, &mems)
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 self.escalate_fork_to_rejoin(convo_id).await;
@@ -2648,7 +2653,10 @@ where
         // `add_members_with_idempotency` so the DS answers the reissue request.
         let key_packages = self
             .api_client()
-            .get_key_packages(&[recipient_user_did.clone()])
+            .get_key_packages(
+                &self.require_actor_device_id().await?,
+                &[recipient_user_did.clone()],
+            )
             .await?;
         self.verify_fetched_key_packages(
             &[recipient_user_did.clone()],
@@ -3845,16 +3853,17 @@ where
         );
 
         // 1. Delete current device from server
-        if let Ok(devices) = self.api_client().list_devices().await {
-            let device_uuid = self
-                .credentials()
-                .get_device_uuid(&user_did)
-                .await?
-                .unwrap_or_default();
-
-            for device in &devices {
-                if device.device_uuid == device_uuid {
-                    let _ = self.api_client().remove_device(&device.device_id).await;
+        let device_uuid = self
+            .credentials()
+            .get_device_uuid(&user_did)
+            .await?
+            .unwrap_or_default();
+        if !device_uuid.is_empty() {
+            if let Ok(devices) = self.api_client().list_devices(&device_uuid).await {
+                for device in &devices {
+                    if device.device_uuid == device_uuid {
+                        let _ = self.api_client().remove_device(&device.device_id).await;
+                    }
                 }
             }
         }
