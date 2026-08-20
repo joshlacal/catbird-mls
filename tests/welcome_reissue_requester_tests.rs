@@ -46,13 +46,14 @@ async fn failed_reissue_request_records_attempt_and_backs_off() {
     let alice = world.client("Alice");
     let convo = alice
         .orchestrator
-        .create_group(
-            "reissue-requester",
-            Some(std::slice::from_ref(&carol_did)),
-            None,
-        )
+        .create_group("reissue-requester", None, None)
         .await
         .expect("create_group failed");
+    alice
+        .orchestrator
+        .add_members(&convo.conversation_id, std::slice::from_ref(&carol_did))
+        .await
+        .expect("add Carol");
     let convo_id = convo.conversation_id.clone();
     let group_id = convo.group_id.clone();
 

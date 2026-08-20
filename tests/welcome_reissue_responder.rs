@@ -44,14 +44,14 @@ async fn responds_with_swap_and_idempotency_key() {
     let admin = world.client("Admin");
     let convo = admin
         .orchestrator
-        .create_group(
-            "reissue-responder",
-            Some(std::slice::from_ref(&recipient_did)),
-            None,
-        )
+        .create_group("reissue-responder", None, None)
         .await
         .expect("create_group failed");
-
+    admin
+        .orchestrator
+        .add_members(&convo.conversation_id, std::slice::from_ref(&recipient_did))
+        .await
+        .expect("add recipient");
     let convo_id = convo.conversation_id.clone();
     let group_id = convo.group_id.clone();
 
@@ -64,7 +64,8 @@ async fn responds_with_swap_and_idempotency_key() {
     // bare user DID before matching. The harness mints bare leaf identities, so
     // a device-qualified request DID still has to match a bare leaf.
     let recipient_device_did = format!("{recipient_did}#device-stale");
-    let request_id = "reissue-req-123";
+    let request_id_uuid = uuid::Uuid::new_v4().to_string();
+    let request_id = &request_id_uuid;
 
     admin
         .orchestrator
@@ -124,15 +125,16 @@ async fn rotated_reissue_keeps_cleanup_bound_to_stable_conversation() {
     let admin = world.client("Admin");
     let convo = admin
         .orchestrator
-        .create_group(
-            "rotated-reissue-responder",
-            Some(std::slice::from_ref(&recipient_did)),
-            None,
-        )
+        .create_group("rotated-reissue-responder", None, None)
         .await
         .expect("create group");
+    admin
+        .orchestrator
+        .add_members(&convo.conversation_id, std::slice::from_ref(&recipient_did))
+        .await
+        .expect("add recipient");
     let group_id = convo.group_id.clone();
-    let stable_conversation_id = format!("convo-{group_id}");
+    let stable_conversation_id = uuid::Uuid::new_v4().to_string();
     world
         .delivery_service()
         .rekey_conversation_for_test(&convo.conversation_id, &stable_conversation_id);
@@ -191,7 +193,7 @@ async fn rotated_reissue_keeps_cleanup_bound_to_stable_conversation() {
             .respond_to_welcome_reissue(
                 &stable_conversation_id,
                 &format!("{recipient_did}#stale-device"),
-                &format!("rotated-reissue-request-{attempt}"),
+                &uuid::Uuid::new_v4().to_string(),
             )
             .await
             .expect("rotated reissue response");

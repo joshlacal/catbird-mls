@@ -3389,3 +3389,64 @@ pub fn route_for_nsid(nsid: &str) -> Option<CanonicalRoute> {
         .map(canonical_route)
         .find(|route| route.nsid == nsid)
 }
+pub(crate) fn canonical_cbor_for_schema(
+    definition_name: &str,
+    json_value: &serde_json::Value,
+    tagged: bool,
+) -> Result<Vec<u8>, TransportError> {
+    let raw = serde_json::to_vec(json_value)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let strict = parse_strict_signed_json(&raw)?;
+    let projected = project_schema_ref(definition_name, &strict, tagged)?;
+    serde_ipld_dagcbor::to_vec(&projected)
+        .map_err(|e| TransportError::Serialization(e.to_string()))
+}
+
+#[test]
+fn participant_acceptance_transcript_matches_server_exactly() {
+    let body = serde_json::json!({
+        "$type": "blue.catbird.chat.defs#participantAcceptanceBody",
+        "actorDeviceId": "1ad34b5a-3c93-4201-a5c9-b0951b7bc92a",
+        "actorDid": "did:plc:z3rwldqwosuekdwpn45d6uly",
+        "authGeneration": 1,
+        "idempotencyKey": "52f04e1a-015f-40f9-a199-302a69150a93",
+        "invitationProvenance": {
+            "invitationTransitionId": "6bd96af3-72b2-4e5a-be1d-2109ab171196",
+            "invitedByDeviceId": "f67f7cf1-564b-4072-a6f9-95120eb43d69",
+            "invitedByDid": "did:plc:w6a3dnclcts3moxutwbo3hf6"
+        },
+        "keyId": "KQLZhgER2qO_IONmgFTzed9UBVZAelmChZDKQ-_gagQ",
+        "next": {
+            "confirmationTag": "ixtwb78YjjWEJ/Y98+/2pCKNi4qpXyo6FVExKruDDRo=",
+            "conversationId": "009ffa92-4bf9-4307-bf26-e7428d53d800",
+            "epoch": 0,
+            "generation": 0,
+            "groupContextHash": "dNZwPlqizJADC1l9N2VV1Yna6sSzNnXdvkCiguL6B6k=",
+            "groupId": "GTu3NbweIIBe3sJv720BZEA6YzwPxYTXjYBVB+7EB2M=",
+            "lifecycle": "active",
+            "stateVersion": 1
+        },
+        "prior": {
+            "confirmationTag": "ixtwb78YjjWEJ/Y98+/2pCKNi4qpXyo6FVExKruDDRo=",
+            "conversationId": "009ffa92-4bf9-4307-bf26-e7428d53d800",
+            "epoch": 0,
+            "generation": 0,
+            "groupContextHash": "dNZwPlqizJADC1l9N2VV1Yna6sSzNnXdvkCiguL6B6k=",
+            "groupId": "GTu3NbweIIBe3sJv720BZEA6YzwPxYTXjYBVB+7EB2M=",
+            "lifecycle": "active",
+            "stateVersion": 0
+        },
+        "recoveryRequestId": "52f04e1a-015f-40f9-a199-302a69150a93",
+        "signatureDomain": "CATBIRD-CHAT-ACCEPT\0",
+        "signedAt": "2026-08-21T08:21:23.543Z",
+        "transitionId": "52f04e1a-015f-40f9-a199-302a69150a93"
+    });
+    let binding = CleanChatSigningContext {
+        actor_did: "did:plc:z3rwldqwosuekdwpn45d6uly".into(),
+        device_id: "1ad34b5a-3c93-4201-a5c9-b0951b7bc92a".into(),
+        auth_generation: Some(1),
+    };
+    let prepared = prepare_signed_body(&binding, CanonicalOperation::AcceptConversation, &serde_json::to_vec(&body).unwrap()).expect("must prepare signed body");
+    let server_hex = "434154424952442d434841542d41434345505400ad646e657874a86565706f6368006767726f757049645820193bb735bc1e20805edec26fef6d0164403a633c0fc584d78d805507eec40763696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e016e636f6e766572736174696f6e496450009ffa924bf94307bf26e7428d53d8006f636f6e6669726d6174696f6e54616758208b1b706fbf188e358427f63df3eff6a4228d8b8aa95f2a3a1551312abb830d1a7067726f7570436f6e7465787448617368582074d6703e5aa2cc90030b597d376555d589daeac4b33675ddbe40a282e2fa07a96524747970657830626c75652e636174626972642e636861742e64656673237061727469636970616e74416363657074616e6365426f6479656b65794964782b4b514c5a6867455232714f5f494f4e6d6746547a6564395542565a41656c6d43685a444b512d5f67616751657072696f72a86565706f6368006767726f757049645820193bb735bc1e20805edec26fef6d0164403a633c0fc584d78d805507eec40763696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450009ffa924bf94307bf26e7428d53d8006f636f6e6669726d6174696f6e54616758208b1b706fbf188e358427f63df3eff6a4228d8b8aa95f2a3a1551312abb830d1a7067726f7570436f6e7465787448617368582074d6703e5aa2cc90030b597d376555d589daeac4b33675ddbe40a282e2fa07a9686163746f7244696478206469643a706c633a7a3372776c6471776f7375656b6477706e34356436756c79687369676e656441747818323032362d30382d32315430383a32313a32332e3534335a6c7472616e736974696f6e49645052f04e1a015f40f9a199302a69150a936d6163746f724465766963654964501ad34b5a3c934201a5c9b0951b7bc92a6e6175746847656e65726174696f6e016e6964656d706f74656e63794b65795052f04e1a015f40f9a199302a69150a936f7369676e6174757265446f6d61696e74434154424952442d434841542d41434345505400717265636f766572795265717565737449645052f04e1a015f40f9a199302a69150a9374696e7669746174696f6e50726f76656e616e6365a36c696e7669746564427944696478206469643a706c633a77366133646e636c637473336d6f78757477626f3368663671696e76697465644279446576696365496450f67f7cf1564b4072a6f995120eb43d6976696e7669746174696f6e5472616e736974696f6e4964506bd96af372b24e5abe1d2109ab171196";
+    assert_eq!(hex::encode(prepared.transcript), server_hex);
+}

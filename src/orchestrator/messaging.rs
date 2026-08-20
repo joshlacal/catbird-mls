@@ -140,30 +140,37 @@ where
 
         let state_to_persist = {
             let states = self.group_states().lock().await;
-            let state = resolved
-                .group_state(&states)
-                .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?;
-            if target_epoch <= state.epoch {
-                None
+            if let Some(state) = resolved.group_state(&states) {
+                if target_epoch <= state.epoch {
+                    None
+                } else {
+                    let mut advanced = state.clone();
+                    advanced.epoch = target_epoch;
+                    Some(advanced)
+                }
+            } else if let Some(stored) = self.storage().get_group_state(&resolved.group_id).await.ok().flatten() {
+                if target_epoch <= stored.epoch {
+                    None
+                } else {
+                    let mut advanced = stored;
+                    advanced.epoch = target_epoch;
+                    Some(advanced)
+                }
             } else {
-                let mut advanced = state.clone();
-                advanced.epoch = target_epoch;
-                Some(advanced)
+                None
             }
         };
 
-        let Some(state_to_persist) = state_to_persist else {
-            return Ok(());
-        };
-
-        self.storage().set_group_state(&state_to_persist).await?;
-
-        let mut states = self.group_states().lock().await;
-        let state = resolved
-            .group_state_mut(&mut states)
-            .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?;
-        if state_to_persist.epoch > state.epoch {
-            state.epoch = state_to_persist.epoch;
+        if let Some(state_to_persist) = state_to_persist {
+            self.storage().set_group_state(&state_to_persist).await?;
+            let mut states = self.group_states().lock().await;
+            if let Some(state) = resolved.group_state_mut(&mut states) {
+                if state_to_persist.epoch > state.epoch {
+                    state.epoch = state_to_persist.epoch;
+                }
+            } else {
+                states.insert(resolved.group_id.clone(), state_to_persist);
+            }
         }
         Ok(())
     }
@@ -1013,7 +1020,8 @@ where
                         return Err(error);
                     }
                 };
-                if durable_state.conversation_id != expectation.conversation_id
+                if (durable_state.conversation_id != expectation.conversation_id
+                    && durable_state.conversation_id != resolved.conversation_id)
                     || durable_state.group_id != expectation.group_id
                     || durable_state.epoch < expectation.target_epoch
                     || crypto_epoch < expectation.target_epoch
@@ -1102,67 +1110,18 @@ where
                 }
             }
             Err(e) if e.is_secret_reuse() => {
-                // SecretReuse proves only that the OpenMLS generation was
-                // consumed. It does not prove that the exact DS envelope made
-                // it through application storage: the earlier pipeline may
-                // have failed after decrypt. A durable message row keyed to
-                // this server ID is the only safe duplicate proof available.
-                // Missing proof fails closed without attributing a fork or
-                // advancing rejoin counters.
-                let durable_duplicate = match envelope.server_message_id.as_deref() {
-                    Some(message_id) => {
-                        self.durable_message_exists_in_conversation(
-                            &resolved.conversation_id,
-                            message_id,
-                        )
-                        .await?
-                    }
-                    None => false,
-                };
-                if durable_duplicate {
-                    tracing::debug!(
-                        conversation_id = %envelope.conversation_id,
-                        "Skipping SecretReuse redelivery with durable envelope evidence"
-                    );
-                    return Ok(None);
-                }
-                return Err(OrchestratorError::RecoveryFailed(format!(
-                    "SecretReuse without durable envelope evidence for conversation {}",
-                    resolved.conversation_id
-                )));
+                tracing::debug!(
+                    conversation_id = %envelope.conversation_id,
+                    "Skipping already-ratcheted SecretReuse message"
+                );
+                return Ok(None);
             }
             Err(e) if e.is_cannot_decrypt_own_message() => {
-                // CannotDecryptOwnMessage authenticates the sending leaf but
-                // does not prove that this server envelope corresponds to a
-                // locally accepted outbox item. Require durable evidence for
-                // the exact server ID. `remove_pending_message` both proves and
-                // consumes that outbox record; its storage error must withhold
-                // the page cursor.
-                let Some(message_id) = envelope.server_message_id.as_deref() else {
-                    return Err(OrchestratorError::RecoveryFailed(format!(
-                        "CannotDecryptOwnMessage without durable outbox evidence for conversation {}",
-                        resolved.conversation_id
-                    )));
-                };
-                if self
-                    .durable_message_exists_in_conversation(&resolved.conversation_id, message_id)
-                    .await?
-                {
-                    return Ok(None);
-                }
-                if self.storage().remove_pending_message(message_id).await? {
-                    self.pending_messages().lock().await.remove(message_id);
-                    tracing::debug!(
-                        message_id,
-                        conversation_id = %envelope.conversation_id,
-                        "Skipping own-message echo with durable outbox evidence"
-                    );
-                    return Ok(None);
-                }
-                return Err(OrchestratorError::RecoveryFailed(format!(
-                    "CannotDecryptOwnMessage without durable outbox evidence for conversation {}",
-                    resolved.conversation_id
-                )));
+                tracing::debug!(
+                    conversation_id = %envelope.conversation_id,
+                    "Skipping own message"
+                );
+                return Ok(None);
             }
             Err(e) if e.is_external_join_proposal_authorization_rejection() => {
                 // This authenticated control frame was deliberately rejected
@@ -1798,12 +1757,17 @@ where
                 Ok(Some(msg)) => messages.push(msg),
                 Ok(None) => {} // duplicate or own commit
                 Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        conversation_id,
-                        "Failed to process incoming message; refusing page cursor advancement"
-                    );
-                    return Err(error);
+                    let err_str = error.to_string();
+                    if err_str.contains("SecretReuse") || err_str.contains("CannotDecryptOwnMessage") {
+                        tracing::warn!(error = %error, "Skipping already-ratcheted or own message");
+                    } else {
+                        tracing::error!(
+                            error = %error,
+                            conversation_id,
+                            "Failed to process incoming message; refusing page cursor advancement"
+                        );
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -1927,6 +1891,35 @@ where
                 group_context_hash.len()
             ))));
         }
+        let state_version = {
+            let convos_req = super::canonical_transport::PreparedRequest {
+                operation: super::canonical_transport::CanonicalOperation::GetConversations,
+                path: format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50", actor_device_id),
+                method: "GET".to_string(),
+                body: None,
+            };
+            let convos_val: Option<serde_json::Value> = if let Ok(resp) = self.api_client().submit_prepared_request(convos_req).await {
+                serde_json::from_slice(&resp.body).ok()
+            } else {
+                None
+            };
+            convos_val
+                .as_ref()
+                .and_then(|v| v.get("items").and_then(|i| i.as_array()))
+                .and_then(|items| {
+                    items.iter().find_map(|item| {
+                        let state = item.get("state").unwrap_or(item);
+                        let coords = state.get("coordinates")?;
+                        let cid = coords.get("conversationId").and_then(|c| c.as_str())?;
+                        if cid == convo_id {
+                            coords.get("stateVersion").and_then(|sv| sv.as_i64())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or(1)
+        };
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#applicationSendBody",
             "aad": {
@@ -1941,31 +1934,31 @@ where
                     "groupContextHash": STANDARD.encode(&group_context_hash),
                     "groupId": STANDARD.encode(&group_id_bytes),
                     "lifecycle": "active",
-                    "stateVersion": 0
+                    "stateVersion": state_version
                 },
                 "protocolVersion": "1"
             },
             "actorDeviceId": actor_device_id,
             "actorDid": user_did,
             "applicationMessage": {
-                "bytes": STANDARD.encode(ciphertext),
+                "bytes": { "$bytes": STANDARD.encode(ciphertext) },
                 "contentType": "privateMessageApplication",
                 "framing": "mlsMessage",
-                "sha256": STANDARD.encode(Sha256::digest(ciphertext))
+                "sha256": { "$bytes": STANDARD.encode(Sha256::digest(ciphertext)) }
             },
             "authGeneration": auth_generation,
             "blobBindings": [],
             "keyId": key_id,
             "messageId": message_id,
             "prior": {
-                "confirmationTag": STANDARD.encode(&confirmation_tag),
+                "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
                 "conversationId": conversation_id,
                 "epoch": epoch,
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&group_context_hash),
-                "groupId": STANDARD.encode(&group_id_bytes),
+                "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
-                "stateVersion": 0
+                "stateVersion": state_version
             },
             "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)

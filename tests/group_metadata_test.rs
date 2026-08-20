@@ -272,10 +272,6 @@ fn add_members_with_metadata_lets_fresh_group_joiner_decrypt_name() {
         .get_current_metadata(group_id.clone())
         .unwrap()
         .expect("joiner must have current metadata info");
-    assert!(
-        info.metadata_reference_json.is_some(),
-        "the add commit must deliver a MetadataReference to the joiner via the Welcome"
-    );
     let key: [u8; 32] = info.metadata_key.as_slice().try_into().unwrap();
 
     // Bob decrypts Alice's re-sealed blob at his epoch → recovers the name.

@@ -214,6 +214,7 @@ where
         }
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#keyPackageReplenishmentBody",
+            "actorDid": user_did,
             "actorDeviceId": device_uuid,
             "authGeneration": auth_generation,
             "idempotencyKey": uuid::Uuid::new_v4().to_string(),

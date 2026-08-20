@@ -1447,9 +1447,11 @@ impl MLSAPIClient for MockDeliveryService {
         request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
     ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
         let body_bytes = request.body.as_deref().unwrap_or(&[]);
-        let body_val: serde_json::Value = if !body_bytes.is_empty() {
-            serde_json::from_slice(body_bytes)
-                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?
+        let body_val: serde_json::Value = if !body_bytes.is_empty()
+            && request.operation
+                != catbird_mls::orchestrator::canonical_transport::CanonicalOperation::UploadBlob
+        {
+            serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null)
         } else {
             serde_json::Value::Null
         };
@@ -1809,6 +1811,43 @@ impl MLSAPIClient for MockDeliveryService {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
                 let mut guard = self.state.lock().unwrap();
+                *guard.external_commit_counts.entry(convo_id.to_string()).or_default() += 1;
+                let idempotency_key = inner_body
+                    .get("idempotencyKey")
+                    .and_then(|i| i.as_str())
+                    .map(|s| s.to_string());
+                let recovery_request_id = inner_body
+                    .get("recoveryRequestId")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string());
+                if let Some(idem) = &idempotency_key {
+                    guard.add_members_idempotency_keys.push(idem.clone());
+                }
+                if let Some(req_id) = &recovery_request_id {
+                    guard.add_members_idempotency_keys.push(req_id.clone());
+                }
+                let cached = idempotency_key
+                    .as_ref()
+                    .and_then(|k| guard.idempotent_add_results.get(k))
+                    .or_else(|| {
+                        recovery_request_id
+                            .as_ref()
+                            .and_then(|k| guard.idempotent_add_results.get(k))
+                    });
+                if let Some(cached) = cached {
+                    let output = serde_json::json!({
+                        "result": {
+                            "applied": true,
+                            "epoch": cached.new_epoch,
+                            "receipt": cached.receipt
+                        }
+                    });
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 200,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&output).unwrap(),
+                    });
+                }
                 check_fail(&mut guard.failures.fail_next_commit_group_change, "injected commit_group_change failure")?;
                 check_fail(&mut guard.failures.fail_next_add_members, "injected add_members failure")?;
                 check_fail(&mut guard.failures.fail_next_remove_members, "injected remove_members failure")?;
@@ -1942,6 +1981,20 @@ impl MLSAPIClient for MockDeliveryService {
                         "receipt": receipt
                     }
                 });
+                if let Some(idem) = &idempotency_key {
+                    guard.idempotent_add_results.insert(idem.clone(), AddMembersServerResult {
+                        success: true,
+                        new_epoch,
+                        receipt: receipt.clone(),
+                    });
+                }
+                if let Some(req_id) = &recovery_request_id {
+                    guard.idempotent_add_results.insert(req_id.clone(), AddMembersServerResult {
+                        success: true,
+                        new_epoch,
+                        receipt: receipt.clone(),
+                    });
+                }
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),

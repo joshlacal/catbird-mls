@@ -25,10 +25,6 @@ where
     /// no durable signer exists, `Some(true)` means it was adopted, and
     /// `Some(false)` means durable material existed but could not be adopted.
     pub(crate) async fn reconcile_durable_signer(&self, user_did: &str) -> Result<Option<bool>> {
-        let Some(stored_key) = self.credentials().get_signing_key(user_did).await? else {
-            return Ok(None);
-        };
-
         let identity = if let Some(mls_did) = self.credentials().get_mls_did(user_did).await? {
             mls_did
         } else if let Some(device_uuid) = self.credentials().get_device_uuid(user_did).await? {
@@ -37,6 +33,16 @@ where
             user_did.to_string()
         };
 
+        let stored_key = match self.credentials().get_signing_key(user_did).await? {
+            Some(key) => key,
+            None => match self.mls_context().export_identity_key(identity.as_bytes().to_vec()) {
+                Ok(key) => {
+                    let _ = self.credentials().store_signing_key(user_did, &key).await;
+                    key
+                }
+                Err(_) => return Ok(None),
+            },
+        };
         match self
             .mls_context()
             .import_identity_key(identity.into_bytes(), stored_key.clone())
@@ -112,9 +118,6 @@ where
                         && device
                             .auth_generation
                             .is_some_and(|generation| generation >= 1)
-                        && device
-                            .available_package_count
-                            .is_some_and(|count| count > 0)
                         && device.signature_public_key.as_ref() == local_public_key.as_ref()
                         && device.key_id.as_deref().is_some_and(|key_id| {
                             local_public_key.as_ref().is_some_and(|public_key| {

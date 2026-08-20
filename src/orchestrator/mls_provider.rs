@@ -155,6 +155,16 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         group_id: Vec<u8>,
         key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError>;
+    fn add_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<AddMembersResult, MLSError> {
+        let _ = &aad;
+        self.add_members(group_id, key_packages)
+    }
+
 
     /// Add members AND re-seal the group metadata at the post-add epoch so the
     /// newly-added members can decrypt the group name/description. The returned
@@ -480,6 +490,16 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
     ) -> Result<Vec<u8>, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "safe_export_secret_from_pending not available on this platform".to_string(),
+        })
+    }
+    /// Export the canonical metadata encryption key (MEK) for an epoch.
+    fn export_metadata_key(
+        &self,
+        _group_id: Vec<u8>,
+        _epoch: u64,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "export_metadata_key not available on this platform".to_string(),
         })
     }
 

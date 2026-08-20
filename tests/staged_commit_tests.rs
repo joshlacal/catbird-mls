@@ -147,7 +147,7 @@ async fn test_stage_then_confirm_advances_epoch() {
         .orchestrator
         .api_client()
         .add_members(
-            &group_id,
+            &convo.conversation_id,
             &[bob.did.clone()],
             &plan.commit_bytes,
             plan.welcome_bytes.as_deref(),
@@ -252,7 +252,7 @@ async fn test_confirm_projection_failure_withholds_success_and_cache_advance() {
         .orchestrator
         .api_client()
         .add_members(
-            &group_id,
+            &convo.conversation_id,
             &[bob.did.clone()],
             &plan.commit_bytes,
             plan.welcome_bytes.as_deref(),
@@ -384,7 +384,7 @@ async fn test_double_confirm_errors() {
         .orchestrator
         .api_client()
         .add_members(
-            &group_id,
+            &convo.conversation_id,
             &[bob.did.clone()],
             &plan.commit_bytes,
             plan.welcome_bytes.as_deref(),
@@ -507,7 +507,7 @@ async fn test_discard_after_confirm_errors() {
         .orchestrator
         .api_client()
         .add_members(
-            &group_id,
+            &convo.conversation_id,
             &[bob.did.clone()],
             &plan.commit_bytes,
             plan.welcome_bytes.as_deref(),
@@ -604,14 +604,14 @@ async fn staged_add_rejects_empty_authority_but_pure_remove_swap_remains_valid()
     let alice = world.client("Alice");
     let convo = alice
         .orchestrator
-        .create_group(
-            "empty-add-authority",
-            Some(std::slice::from_ref(&bob_did)),
-            None,
-        )
+        .create_group("empty-add-authority", None, None)
         .await
-        .expect("create group with Bob");
-
+        .expect("create group");
+    alice
+        .orchestrator
+        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
     let error = alice
         .orchestrator
         .stage_commit(
@@ -866,13 +866,14 @@ async fn staged_swap_mismatch_does_neither_removal_nor_addition() {
     for (case, add_dids, add_key_packages) in cases {
         let convo = alice
             .orchestrator
-            .create_group(
-                &format!("binding-swap-{case}"),
-                Some(std::slice::from_ref(&bob_did)),
-                None,
-            )
+            .create_group(&format!("binding-swap-{case}"), None, None)
             .await
-            .expect("create group with Bob");
+            .expect("create group");
+        alice
+            .orchestrator
+            .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+            .await
+            .expect("add Bob");
         let group_bytes = hex::decode(&convo.group_id).unwrap();
         let members_before = alice
             .orchestrator
@@ -1100,18 +1101,16 @@ async fn staged_swap_fails_closed_when_authorized_device_resolution_errors() {
     let alice = world.client("Alice");
     let bob_did = world.client("Bob").did.clone();
     let mallory_did = world.client("Mallory").did.clone();
-    world
-        .delivery_service()
-        .set_next_create_conversation_id("staged-swap-resolver-error");
     let convo = alice
         .orchestrator
-        .create_group(
-            "binding-swap-resolver-error",
-            Some(std::slice::from_ref(&bob_did)),
-            None,
-        )
+        .create_group("binding-swap-resolver-error", None, None)
         .await
-        .expect("create group with Bob");
+        .expect("create group");
+    alice
+        .orchestrator
+        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
     let group_bytes = hex::decode(&convo.group_id).unwrap();
     let members_before = alice
         .orchestrator
@@ -1201,9 +1200,6 @@ async fn staged_swap_rejects_exact_did_batch_before_device_resolution() {
     let alice = world.client("Alice");
     let bob_did = world.client("Bob").did.clone();
     let mallory_did = world.client("Mallory").did.clone();
-    world
-        .delivery_service()
-        .set_next_create_conversation_id("staged-swap-binding-first");
     let convo = alice
         .orchestrator
         .create_group("binding-before-resolution", None, None)

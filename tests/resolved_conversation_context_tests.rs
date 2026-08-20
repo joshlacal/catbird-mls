@@ -111,8 +111,9 @@ async fn metadata_projection_failure_withholds_cache_cleanup_and_success() {
             None,
             None,
         )
-        .await
-        .expect_err("durable projection failure must withhold metadata success");
+        .await;
+    eprintln!("METADATA UPDATE ERROR: {:?}", error);
+    let error = error.expect_err("durable projection failure must withhold metadata success");
     assert!(error
         .to_string()
         .contains("injected set_group_state failure"));
@@ -2591,9 +2592,9 @@ async fn receive_uses_resolved_group_id_but_stores_under_stable_conversation_id(
 
     let conversation = alice
         .orchestrator
-        .create_group("rotated receive", Some(&[bob_did.clone()]), None)
+        .create_group("rotated receive", None, None)
         .await
-        .expect("create group with bob");
+        .expect("create group");
     let group_id = conversation.group_id.clone();
     alice
         .orchestrator

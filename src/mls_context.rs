@@ -81,11 +81,11 @@ fn metadata_required_capabilities_extension() -> RequiredCapabilitiesExtension {
 
 pub(crate) fn metadata_leaf_capabilities() -> Capabilities {
     Capabilities::new(
-        None,
-        None,
+        Some(&[openmls::prelude::ProtocolVersion::Mls10]),
+        Some(&[Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519]),
         Some(&[]),
         Some(&[]),
-        None,
+        Some(&[openmls::prelude::CredentialType::Basic]),
     )
 }
 
@@ -1323,10 +1323,14 @@ impl MLSContext {
                         crate::debug_log!("[MLS-CONTEXT] 🔍 Loading group: {}", hex_id);
 
                         match openmls::prelude::MlsGroup::load(provider.storage(), &group_id) {
-                            Ok(Some(group)) => {
+                            Ok(Some(mut group)) => {
+                                let join_config = openmls::group::MlsGroupJoinConfig::builder()
+                                    .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                                    .use_ratchet_tree_extension(true)
+                                    .build();
+                                let _ = group.set_configuration(provider.storage(), &join_config);
                                 let loaded_epoch = group.epoch().as_u64();
                                 let loaded_members = group.members().count();
-
                                 crate::info_log!("[MLS-CONTEXT] ✅ Group loaded from storage:");
                                 crate::info_log!("[MLS-CONTEXT]   Group ID: {}", hex_id);
                                 crate::info_log!("[MLS-CONTEXT]   Epoch: {}", loaded_epoch);
@@ -1909,7 +1913,7 @@ impl MLSContext {
         };
 
         let join_config = MlsGroupJoinConfig::builder()
-            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true)
             .build();
 
@@ -2237,50 +2241,30 @@ impl MLSContext {
         // This ensures Welcome messages include the ratchet tree for new members
         let capabilities = metadata_leaf_capabilities();
 
-        let mut group_config_builder = MlsGroupCreateConfig::builder()
+        // The creator's leaf lifetime must satisfy the delivery service's
+        // MAX_KEY_PACKAGE_LIFETIME_SECONDS (30 days + 1 hour); OpenMLS would
+        // otherwise default to 3 months and the genesis GroupInfo is rejected
+        // with LifetimeTooLong. Keep this in lockstep with the KeyPackage
+        // lifetime used when building key packages.
+        let leaf_lifetime = {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            openmls::prelude::Lifetime::init(now.saturating_sub(60), now + 29 * 24 * 60 * 60)
+        };
+        let group_config_builder = MlsGroupCreateConfig::builder()
             .ciphersuite(Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519)
             .max_past_epochs(config.max_past_epochs as usize)
             .sender_ratchet_configuration(SenderRatchetConfiguration::new(
                 config.out_of_order_tolerance,
                 config.maximum_forward_distance,
             ))
-            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .capabilities(capabilities) // Set required capabilities
+            .lifetime(leaf_lifetime)
             .use_ratchet_tree_extension(true); // CRITICAL: Include ratchet tree in Welcome messages
-
-        let mut group_context_extensions = Extensions::<GroupContext>::empty();
-        group_context_extensions
-            .add(Extension::RequiredCapabilities(
-                metadata_required_capabilities_extension(),
-            ))
-            .map_err(|e| {
-                MLSError::Internal(format!(
-                    "Failed to add required capabilities extension: {:?}",
-                    e
-                ))
-            })?;
-        group_context_extensions
-            .add(Extension::AppDataDictionary(
-                AppDataDictionaryExtension::default(),
-            ))
-            .map_err(|e| {
-                MLSError::Internal(format!(
-                    "Failed to add app data dictionary extension: {:?}",
-                    e
-                ))
-            })?;
-
-        // Plaintext 0xff00 extension is retired (MLS metadata cutover).
-        // Group title / description / avatar are set after creation by
-        // encrypting `GroupMetadataV1` with a key derived from the new
-        // group's epoch exporter and uploading the blob via
-        // `putGroupMetadataBlob`. The MLS group itself only carries the
-        // encrypted-blob `MetadataReference` at AppDataDictionary
-        // component 0x8001 (see `metadata.rs`).
         let _ = (&config.group_name, &config.group_description);
-
-        group_config_builder =
-            group_config_builder.with_group_context_extensions(group_context_extensions);
 
         let group_config = group_config_builder.build();
         crate::debug_log!(
@@ -2661,15 +2645,51 @@ impl MLSContext {
     /// Get persistent signature keypair for an identity if it exists
     /// Returns None if no signer has been registered for this identity yet
     pub fn get_signer_for_identity(&self, identity: &str) -> Option<SignatureKeyPair> {
-        // Look up public key bytes for this identity
-        let public_key_bytes = self.signers_by_identity.get(identity.as_bytes())?;
+        tracing::info!(
+            lookup_identity = %identity,
+            available_signers = ?self.signers_by_identity.iter().map(|(k, v)| (String::from_utf8_lossy(k).to_string(), hex::encode(v))).collect::<Vec<_>>(),
+            "get_signer_for_identity lookup"
+        );
+        // Look up public key bytes for this identity (exact match)
+        if let Some(public_key_bytes) = self.signers_by_identity.get(identity.as_bytes()) {
+            if let Some(keypair) = SignatureKeyPair::read(
+                self.provider.storage(),
+                public_key_bytes,
+                SignatureScheme::ED25519,
+            ) {
+                return Some(keypair);
+            }
+        }
 
-        // Load the full keypair from storage using the public key
-        SignatureKeyPair::read(
-            self.provider.storage(),
-            public_key_bytes,
-            SignatureScheme::ED25519,
-        )
+        // If identity is device-qualified (e.g. did:plc:...#uuid), try root DID
+        if let Some((root, _)) = identity.split_once('#') {
+            if let Some(public_key_bytes) = self.signers_by_identity.get(root.as_bytes()) {
+                if let Some(keypair) = SignatureKeyPair::read(
+                    self.provider.storage(),
+                    public_key_bytes,
+                    SignatureScheme::ED25519,
+                ) {
+                    return Some(keypair);
+                }
+            }
+        }
+
+        // Also check if any registered identity starts with identity#
+        for (reg_id, pk_bytes) in &self.signers_by_identity {
+            if let Ok(reg_str) = std::str::from_utf8(reg_id) {
+                if reg_str.starts_with(identity) && (reg_str.len() == identity.len() || reg_str.as_bytes()[identity.len()] == b'#') {
+                    if let Some(keypair) = SignatureKeyPair::read(
+                        self.provider.storage(),
+                        pk_bytes,
+                        SignatureScheme::ED25519,
+                    ) {
+                        return Some(keypair);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     pub fn with_group<T, F>(&mut self, group_id: &GroupId, f: F) -> Result<T, MLSError>
@@ -2892,122 +2912,13 @@ impl MLSContext {
         let _ = metadata_json;
 
         self.with_group(&gid, |group, provider, signer| {
-            // Clone existing extensions; we must preserve any not-our-business
-            // extensions (e.g. RequiredCapabilities for AppData/RatchetTree).
-            let mut extensions = group.extensions().clone();
-
-            // Rebuild RequiredCapabilities WITHOUT the retired 0xff00. Groups
-            // created by older builds may still list it; this commit drops it.
-            let existing_rc = extensions.required_capabilities().cloned();
-            let mut ext_types: Vec<ExtensionType> = existing_rc
-                .as_ref()
-                .map(|rc| {
-                    rc.extension_types()
-                        .iter()
-                        .copied()
-                        .filter(|t| {
-                            !matches!(
-                                t,
-                                ExtensionType::Unknown(
-                                    metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE
-                                )
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !ext_types.contains(&ExtensionType::AppDataDictionary) {
-                ext_types.push(ExtensionType::AppDataDictionary);
-            }
-            if !ext_types.contains(&ExtensionType::RatchetTree) {
-                ext_types.push(ExtensionType::RatchetTree);
-            }
-
-            let mut proposal_types = existing_rc
-                .as_ref()
-                .map(|rc| rc.proposal_types().to_vec())
-                .unwrap_or_default();
-            if !proposal_types.contains(&ProposalType::AppDataUpdate) {
-                proposal_types.push(ProposalType::AppDataUpdate);
-            }
-            let credential_types = existing_rc
-                .as_ref()
-                .map(|rc| rc.credential_types().to_vec())
-                .unwrap_or_default();
-
-            extensions
-                .add_or_replace(Extension::RequiredCapabilities(
-                    RequiredCapabilitiesExtension::new(
-                        &ext_types,
-                        &proposal_types,
-                        &credential_types,
-                    ),
-                ))
-                .map_err(|e| {
-                    MLSError::Internal(format!(
-                        "Failed to add required capabilities extension: {:?}",
-                        e
-                    ))
-                })?;
-
-            // Drop any pre-existing plaintext 0xff00 extension from a legacy
-            // group. New groups never carry it. We can't ALTER the existing
-            // extension, but we can replace it with an empty payload — the
-            // group then advertises no plaintext metadata. Even this is only
-            // load-bearing during the migration window; once all members are
-            // on builds that ignore 0xff00, the leftover empty extension is
-            // harmless dead weight.
-            if extensions
-                .unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE)
-                .is_some()
-            {
-                let _ = extensions.add_or_replace(Extension::Unknown(
-                    metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE,
-                    UnknownExtension(Vec::new()),
-                ));
-            }
-
-            // Always advance the encrypted MetadataReference for this commit.
-            let planned_reference_json = metadata::planned_metadata_reference_json(
-                metadata::current_metadata_reference(group).as_ref(),
-                metadata::current_metadata_reference(group).is_some(),
-                true,
-            )
-            .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
-
-            let mut commit_builder = group
+            let commit_stage = group
                 .commit_builder()
-                .propose_group_context_extensions(extensions)
+                .load_psks(provider.storage())
                 .map_err(|e| {
-                    crate::error_log!(
-                        "[MLS-CONTEXT] Failed to propose group context extensions: {:?}",
-                        e
-                    );
-                    MLSError::OpenMLS(format!("propose_group_context_extensions: {:?}", e))
+                    crate::error_log!("[MLS-CONTEXT] Failed to load PSKs: {:?}", e);
+                    MLSError::OpenMLS(format!("load_psks: {:?}", e))
                 })?;
-
-            if let Some(ref_json) = planned_reference_json.clone() {
-                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
-                    AppDataUpdateProposal::update(
-                        metadata::METADATA_REFERENCE_COMPONENT_ID,
-                        ref_json,
-                    ),
-                )));
-            }
-
-            let mut commit_stage = commit_builder.load_psks(provider.storage()).map_err(|e| {
-                crate::error_log!("[MLS-CONTEXT] Failed to load PSKs: {:?}", e);
-                MLSError::OpenMLS(format!("load_psks: {:?}", e))
-            })?;
-
-            if let Some(ref_json) = planned_reference_json {
-                let mut updater = commit_stage.app_data_dictionary_updater();
-                updater.set(ComponentData::from_parts(
-                    metadata::METADATA_REFERENCE_COMPONENT_ID,
-                    ref_json.into(),
-                ));
-                commit_stage.with_app_data_dictionary_updates(updater.changes());
-            }
 
             let commit_bundle = commit_stage
                 .build(provider.rand(), provider.crypto(), signer, |_| true)
@@ -3092,85 +3003,10 @@ impl MLSContext {
                 MLSError::Internal(format!("serialize placeholder reference: {:?}", e))
             })?;
 
-            // 3. Build the GroupContextExtensions update (drop legacy 0xff00 from
-            //    RequiredCapabilities, ensure AppData/RatchetTree are listed).
-            let mut extensions = group.extensions().clone();
-            let existing_rc = extensions.required_capabilities().cloned();
-            let mut ext_types: Vec<ExtensionType> = existing_rc
-                .as_ref()
-                .map(|rc| {
-                    rc.extension_types()
-                        .iter()
-                        .copied()
-                        .filter(|t| {
-                            !matches!(t, ExtensionType::Unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !ext_types.contains(&ExtensionType::AppDataDictionary) {
-                ext_types.push(ExtensionType::AppDataDictionary);
-            }
-            if !ext_types.contains(&ExtensionType::RatchetTree) {
-                ext_types.push(ExtensionType::RatchetTree);
-            }
-            let mut proposal_types = existing_rc
-                .as_ref()
-                .map(|rc| rc.proposal_types().to_vec())
-                .unwrap_or_default();
-            if !proposal_types.contains(&ProposalType::AppDataUpdate) {
-                proposal_types.push(ProposalType::AppDataUpdate);
-            }
-            let credential_types = existing_rc
-                .as_ref()
-                .map(|rc| rc.credential_types().to_vec())
-                .unwrap_or_default();
-            extensions
-                .add_or_replace(Extension::RequiredCapabilities(
-                    RequiredCapabilitiesExtension::new(
-                        &ext_types,
-                        &proposal_types,
-                        &credential_types,
-                    ),
-                ))
-                .map_err(|e| {
-                    MLSError::Internal(format!(
-                        "Failed to add required capabilities: {:?}",
-                        e
-                    ))
-                })?;
-            if extensions.unknown(metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE).is_some() {
-                let _ = extensions.add_or_replace(Extension::Unknown(
-                    metadata::RETIRED_PLAINTEXT_METADATA_EXTENSION_TYPE,
-                    UnknownExtension(Vec::new()),
-                ));
-            }
-
-            // 4. Stage the commit with the placeholder reference.
-            let commit_builder = group
+            let commit_stage = group
                 .commit_builder()
-                .propose_group_context_extensions(extensions)
-                .map_err(|e| {
-                    MLSError::OpenMLS(format!("propose_group_context_extensions: {:?}", e))
-                })?
-                .add_proposal(Proposal::AppDataUpdate(Box::new(
-                    AppDataUpdateProposal::update(
-                        metadata::METADATA_REFERENCE_COMPONENT_ID,
-                        placeholder_ref_json.clone(),
-                    ),
-                )));
-
-            let mut commit_stage = commit_builder
                 .load_psks(provider.storage())
                 .map_err(|e| MLSError::OpenMLS(format!("load_psks: {:?}", e)))?;
-
-            let mut updater = commit_stage.app_data_dictionary_updater();
-            updater.set(ComponentData::from_parts(
-                metadata::METADATA_REFERENCE_COMPONENT_ID,
-                placeholder_ref_json.into(),
-            ));
-            commit_stage.with_app_data_dictionary_updates(updater.changes());
-
             let commit_bundle = commit_stage
                 .build(provider.rand(), provider.crypto(), signer, |_| true)
                 .map_err(|e| MLSError::OpenMLS(format!("build commit: {:?}", e)))?

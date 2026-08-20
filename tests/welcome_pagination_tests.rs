@@ -35,13 +35,15 @@ async fn assert_failed_join_is_fully_rolled_back(failure: JoinWriteFailure) {
     let target = world
         .client("Alice")
         .orchestrator
-        .create_group(
-            "welcome-write-rollback",
-            Some(std::slice::from_ref(&bob_did)),
-            None,
-        )
+        .create_group("welcome-write-rollback", None, None)
         .await
         .expect("create target conversation");
+    world
+        .client("Alice")
+        .orchestrator
+        .add_members(&target.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
     let bob = world.client("Bob");
     let welcome = bob
         .orchestrator
@@ -145,13 +147,15 @@ async fn join_group_finds_welcome_target_beyond_first_conversation_page() {
     let target = world
         .client("Alice")
         .orchestrator
-        .create_group(
-            "welcome-page-two",
-            Some(std::slice::from_ref(&bob_did)),
-            None,
-        )
+        .create_group("welcome-page-two", None, None)
         .await
         .expect("create target conversation");
+    world
+        .client("Alice")
+        .orchestrator
+        .add_members(&target.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
     world
         .delivery_service()
         .set_conversation_created_at_for_test(
@@ -190,13 +194,15 @@ async fn join_group_rolls_back_crypto_state_when_conversation_lookup_fails() {
     let target = world
         .client("Alice")
         .orchestrator
-        .create_group(
-            "welcome-lookup-rollback",
-            Some(std::slice::from_ref(&bob_did)),
-            None,
-        )
+        .create_group("welcome-lookup-rollback", None, None)
         .await
         .expect("create target conversation");
+    world
+        .client("Alice")
+        .orchestrator
+        .add_members(&target.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
     let bob = world.client("Bob");
     let welcome = bob
         .orchestrator
@@ -248,13 +254,15 @@ async fn join_or_rejoin_projection_failure_withholds_cache_and_active_success() 
     let target = world
         .client("Alice")
         .orchestrator
-        .create_group(
-            "welcome-recovery-persist-first",
-            Some(std::slice::from_ref(&bob_did)),
-            None,
-        )
+        .create_group("welcome-recovery-persist-first", None, None)
         .await
         .expect("create target conversation");
+    world
+        .client("Alice")
+        .orchestrator
+        .add_members(&target.conversation_id, std::slice::from_ref(&bob_did))
+        .await
+        .expect("add Bob");
     let bob = world.client("Bob");
     bob.storage.fail_next_set_group_state();
 

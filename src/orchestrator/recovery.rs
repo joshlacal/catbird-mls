@@ -2972,11 +2972,20 @@ where
 
         let server_result: std::result::Result<AddMembersServerResult, OrchestratorError> =
             match server_resp {
-                Ok(resp) if resp.status == 200 => Ok(AddMembersServerResult {
-                    success: true,
-                    new_epoch: plan.target_epoch,
-                    receipt: None,
-                }),
+                Ok(resp) if resp.status == 200 => {
+                    let resp_json: serde_json::Value = serde_json::from_slice(&resp.body)
+                        .map_err(|e| OrchestratorError::Serialization(format!("SubmitTransition response: {e}")))?;
+                    let epoch = resp_json
+                        .get("result")
+                        .and_then(|r| r.get("epoch"))
+                        .and_then(|e| e.as_u64())
+                        .unwrap_or(plan.target_epoch);
+                    Ok(AddMembersServerResult {
+                        success: true,
+                        new_epoch: epoch,
+                        receipt: None,
+                    })
+                }
                 Ok(resp) => Err(OrchestratorError::Api(format!(
                     "respond_to_welcome_reissue failed with status {}",
                     resp.status
@@ -6140,6 +6149,7 @@ where
                 "lifecycle": "active",
                 "stateVersion": 0
             },
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "transitionId": transition_id
         });
         let response = self

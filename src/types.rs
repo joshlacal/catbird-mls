@@ -42,18 +42,11 @@ pub struct GroupCreationResult {
 pub struct AddMembersResult {
     pub commit_data: Vec<u8>,
     pub welcome_data: Vec<u8>,
-    /// Re-sealed group metadata for the post-add epoch. Present only when the
-    /// caller supplied current metadata content (via `add_members_with_metadata`).
-    /// The caller MUST upload this blob via `putGroupMetadataBlob(locator, version)`
-    /// when (or before) submitting the commit, so newly-added members can decrypt
-    /// metadata at their join epoch.
     pub metadata_blob_locator: Option<String>,
-    /// See `metadata_blob_locator`. The encrypted `GroupMetadataV1` blob
-    /// (`nonce || ciphertext || tag`) sealed at the post-add epoch.
     pub metadata_blob_ciphertext: Option<Vec<u8>>,
-    /// See `metadata_blob_locator`. The metadata version embedded in the
-    /// committed `MetadataReference`; pass it to `putGroupMetadataBlob`.
     pub metadata_version: Option<u64>,
+    pub next_confirmation_tag: Option<Vec<u8>>,
+    pub next_group_context_hash: Option<Vec<u8>>,
 }
 
 /// FFI surface for `MLSContext::update_group_metadata_encrypted` (Phase A.2).

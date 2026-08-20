@@ -562,7 +562,7 @@ where
     /// Resolve the durable client-generated device ID used to scope every
     /// authenticated AppView read. A caller may never substitute a header or
     /// synthetic identifier when local device custody is absent.
-    pub(crate) async fn require_actor_device_id(&self) -> Result<String> {
+    pub async fn require_actor_device_id(&self) -> Result<String> {
         let user_did = self.require_user_did().await?;
         self.credentials()
             .get_device_uuid(&user_did)
@@ -574,11 +574,6 @@ where
     /// local MLSContext crypto operation.
     pub(crate) async fn require_scoped_identity(&self) -> Result<String> {
         let user_did = self.require_user_did().await?;
-        if let Some(mls_did) = self.credentials().get_mls_did(&user_did).await? {
-            if !mls_did.is_empty() {
-                return Ok(mls_did);
-            }
-        }
         let device_id = self.require_actor_device_id().await?;
         Ok(format!("{user_did}#{device_id}"))
     }
@@ -657,24 +652,19 @@ where
         {
             auth
         } else {
-            let identity = if let Some(mls_did) = self
-                .credentials()
-                .get_mls_did(&user_did)
-                .await
-                .map_err(|e| TransportError::Credential(e.to_string()))?
-            {
-                mls_did
-            } else {
-                format!("{user_did}#{}", binding.device_id)
-            };
+            let identity = format!("{user_did}#{}", binding.device_id);
+            let identity_bytes = identity.into_bytes();
             let signature = self
                 .mls_context()
-                .sign_with_identity_key(identity.into_bytes(), prepared.transcript.clone())
+                .sign_with_identity_key(identity_bytes.clone(), prepared.transcript.clone())
                 .map_err(|_| TransportError::MissingSigningKey)?;
-            let public_key = prepared
-                .body_public_key
-                .clone()
-                .ok_or(TransportError::InvalidSigningAuthority)?;
+            let public_key = match prepared.body_public_key.clone() {
+                Some(pk) => pk,
+                None => self
+                    .mls_context()
+                    .identity_public_key(identity_bytes)
+                    .map_err(|_| TransportError::InvalidSigningAuthority)?,
+            };
             crate::orchestrator::credentials::CleanChatSigningAuthority {
                 public_key,
                 signature,

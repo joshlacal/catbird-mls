@@ -21,18 +21,18 @@ use std::sync::Arc;
 
 use catbird_mls::orchestrator::recovery::RecoveryTracker;
 use catbird_mls::orchestrator::{
-    constants, ConversationState, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
+    constants, ConversationState, CredentialStore, FailingCrypto, IncomingEnvelope,
+    MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, OrchestratorError,
     PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState, ResetRecordOutcome,
 };
 use e2e_harness::TestWorld;
 
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
-
-/// Encode the current owner- and lifecycle-bound local-delete authority used
-/// by production. Integration tests cannot access the crate-private encoder,
-/// so keep this fixture deliberately explicit and versioned.
 fn encode_local_delete_authority_v2(owner_user_did: &str, group_id: &str, epoch: u64) -> String {
     let payload = serde_json::json!({
         "owner_user_did": owner_user_did,
@@ -1188,12 +1188,13 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
+    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
+    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
+    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
     storage
         .ensure_conversation_exists(did, &convo_id, &convo_id)
         .await
         .expect("seed explicit conversation-to-group mapping");
-
-    let max = OrchestratorConfig::default().max_rejoin_attempts;
     // Maxed-out persisted row, as accumulated rejoin failures would write it.
     storage.seed_recovery_backoff(PersistedRecoveryBackoff {
         conversation_id: convo_id.clone(),
@@ -1348,6 +1349,9 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
+    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
+    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
+    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
     storage
         .ensure_conversation_exists(did, &convo_id, &convo_id)
         .await
@@ -1355,7 +1359,6 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
     for i in 0..3 {
         let _ = orchestrator
             .process_incoming(&IncomingEnvelope {
-                conversation_id: convo_id.clone(),
                 sender_did: "did:plc:mallory".to_string(),
                 ciphertext: format!("exit-race-{i}").into_bytes(),
                 timestamp: chrono::Utc::now(),
@@ -1370,14 +1373,13 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
     let reset = async {
         state_barrier.wait_until_entered().await;
         let mut recording =
-            Box::pin(orchestrator.record_group_reset_with_outcome(&convo_id, vec![0x7d; 16], 21));
+            Box::pin(orchestrator.record_group_reset_with_outcome(&convo_id, vec![0x7d; 32], 21));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording)
                 .await
                 .is_err(),
             "reset must wait while quarantine exit owns the transition gate"
         );
-        state_barrier.release();
         recording.await
     };
     let (exit_result, reset_result) =
@@ -1474,11 +1476,13 @@ async fn failing_quarantine_persists_escalate() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
+    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
+    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
+    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
     storage
         .ensure_conversation_exists(did, &convo_id, &convo_id)
         .await
         .expect("seed explicit conversation-to-group mapping");
-
     let observer = Arc::new(RecordingObserver::default());
     orchestrator
         .set_event_observer(Some(observer.clone()))
@@ -1726,16 +1730,14 @@ async fn reset_authority_read_failure_keeps_delete_intent_and_committed_reset() 
         .await
         .expect("create_group failed");
     let convo_id = convo.conversation_id.clone();
-
     alice
         .storage
-        .mark_reset_pending(&convo_id, &"ab".repeat(16), 2, now_ms())
+        .mark_reset_pending(&convo_id, &"ab".repeat(32), 2, now_ms())
         .await
         .expect("seed committed reset authority");
     alice
         .storage
-        .fail_get_conversation_state_after_successful_reads(&convo_id, 1);
-
+        .fail_get_conversation_state_after_successful_reads(&convo_id, 2);
     let deletion_error = alice
         .orchestrator
         .leave_group(&convo_id)
@@ -1777,13 +1779,12 @@ async fn reset_delete_generation_mismatch_keeps_intent_then_retry_clears_without
 
     alice
         .orchestrator
-        .record_group_reset(&convo_id, vec![0xcd; 16], 7)
+        .record_group_reset(&convo_id, vec![0xcd; 32], 7)
         .await
         .expect("commit reset authority");
     alice
         .storage
         .force_next_clear_reset_pending_for_delete_false();
-
     let deletion_error = alice
         .orchestrator
         .leave_group(&convo_id)

@@ -1204,7 +1204,16 @@ impl MLSContext {
         group_id: Vec<u8>,
         key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError> {
-        self.add_members_impl(group_id, key_packages, None)
+        self.add_members_impl(group_id, key_packages, None, None)
+    }
+
+    pub fn add_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<AddMembersResult, MLSError> {
+        self.add_members_impl(group_id, key_packages, None, aad)
     }
 
     /// Add members to a group AND re-seal the group metadata at the post-add
@@ -1240,6 +1249,7 @@ impl MLSContext {
                 avatar_blob_locator,
                 avatar_content_type,
             }),
+            None,
         )
     }
 }
@@ -1253,6 +1263,7 @@ impl MLSContext {
         group_id: Vec<u8>,
         key_packages: Vec<KeyPackageData>,
         metadata_reseal: Option<MetadataReseal>,
+        aad: Option<Vec<u8>>,
     ) -> Result<AddMembersResult, MLSError> {
         self.check_suspended()?;
         validate_outbound_key_package_data_batch(&key_packages)?;
@@ -1379,7 +1390,7 @@ impl MLSContext {
             );
         }
 
-        let (commit_data, welcome_data, metadata_reseal_out) =
+        let (commit_data, welcome_data, metadata_reseal_out, next_confirmation_tag, next_group_context_hash) =
             inner.with_group(&gid, |group, provider, signer| {
             // Log only structural metadata. Credentials can contain user
             // identifiers and must not be copied into diagnostics.
@@ -1480,34 +1491,25 @@ impl MLSContext {
             // the metadata blob at the post-add epoch under the SAME locator
             // that gets embedded in the commit below.
             let planned_reference_json_for_reseal = planned_reference_json.clone();
-
-            let mut commit_builder = group.commit_builder().propose_adds(kps.iter().cloned());
-            if let Some(ref_json) = planned_reference_json.clone() {
-                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
-                    AppDataUpdateProposal::update(
-                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                        ref_json,
-                    ),
-                )));
+            let join_config = openmls::group::MlsGroupJoinConfig::builder()
+                .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                .use_ratchet_tree_extension(true)
+                .build();
+            let _ = group.set_configuration(provider.storage(), &join_config);
+            if let Some(aad_bytes) = &aad {
+                group.set_aad(aad_bytes.clone());
             }
-
-            let mut commit_stage = commit_builder
+            let commit_builder = group
+                .commit_builder()
+                .propose_adds(kps.iter().cloned())
+                .force_self_update(true);
+            let commit_stage = commit_builder
                 .load_psks(provider.storage())
                 .map_err(|e| {
                     let msg = format!("add_members load_psks failed: {:?}", e);
                     crate::error_log!("[MLS-FFI] ❌ {}", msg);
                     MLSError::AddMembersFailed { message: msg }
                 })?;
-
-            if let Some(ref_json) = planned_reference_json {
-                let mut updater = commit_stage.app_data_dictionary_updater();
-                updater.set(ComponentData::from_parts(
-                    crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                    ref_json.into(),
-                ));
-                commit_stage.with_app_data_dictionary_updates(updater.changes());
-            }
-
             let commit_bundle = commit_stage
                 .build(provider.rand(), provider.crypto(), signer, |_| true)
                 .map_err(|e| {
@@ -1521,8 +1523,15 @@ impl MLSContext {
                     crate::error_log!("[MLS-FFI] ❌ {}", msg);
                     MLSError::AddMembersFailed { message: msg }
                 })?;
-
-            let (commit, welcome, _group_info) = commit_bundle.into_contents();
+            if aad.is_some() {
+                group.set_aad(vec![]);
+            }
+            let (commit, welcome, group_info) = commit_bundle.into_contents();
+            let next_gch = group_info.as_ref().and_then(|gi| {
+                gi.group_context().tls_serialize_detached().ok().map(|gc_bytes| {
+                    sha2::Sha256::digest(&gc_bytes).to_vec()
+                })
+            });
             let welcome = welcome.ok_or_else(|| {
                 crate::error_log!("[MLS-FFI] ❌ add_members staged commit produced no Welcome");
                 MLSError::AddMembersFailed {
@@ -1556,6 +1565,15 @@ impl MLSContext {
                 .tls_serialize_detached()
                 .map_err(|_| MLSError::SerializationError)?;
 
+            use openmls::prelude::tls_codec::DeserializeBytes as _;
+            let next_tag = MlsMessageIn::tls_deserialize_exact_bytes(&commit_bytes)
+                .ok()
+                .and_then(|msg_in| match msg_in.extract() {
+                    MlsMessageBodyIn::PublicMessage(pm) => pm.confirmation_tag().cloned(),
+                    _ => None,
+                })
+                .and_then(|t| t.tls_serialize_detached().ok())
+                .map(|tag_bytes| if tag_bytes.len() > 32 { tag_bytes[tag_bytes.len() - 32..].to_vec() } else { tag_bytes });
             // ✅ CRITICAL FIX: Serialize Welcome WITH MlsMessage wrapper
             // The receiver expects MlsMessageIn format, not bare Welcome
             // Both commit and welcome should be serialized as MlsMessageOut
@@ -1666,7 +1684,7 @@ impl MLSContext {
                 _ => None,
             };
 
-            Ok((commit_bytes, welcome_bytes, metadata_reseal_out))
+            Ok((commit_bytes, welcome_bytes, metadata_reseal_out, next_tag, next_gch))
         })?;
 
         let (metadata_blob_locator, metadata_blob_ciphertext, metadata_version) =
@@ -1683,6 +1701,8 @@ impl MLSContext {
             metadata_blob_locator,
             metadata_blob_ciphertext,
             metadata_version,
+            next_confirmation_tag,
+            next_group_context_hash,
         })
     }
 }
@@ -1889,6 +1909,8 @@ impl MLSContext {
             metadata_blob_locator: None,
             metadata_blob_ciphertext: None,
             metadata_version: None,
+            next_confirmation_tag: None,
+            next_group_context_hash: None,
         })
     }
 
@@ -2144,6 +2166,8 @@ impl MLSContext {
                 metadata_blob_locator: None,
                 metadata_blob_ciphertext: None,
                 metadata_version: None,
+                next_confirmation_tag: None,
+                next_group_context_hash: None,
             })
         })
         .await
@@ -2331,6 +2355,8 @@ impl MLSContext {
             metadata_blob_locator: None,
             metadata_blob_ciphertext: None,
             metadata_version: None,
+            next_confirmation_tag: None,
+            next_group_context_hash: None,
         })
     }
 
@@ -3641,7 +3667,7 @@ impl MLSContext {
                 group_config.out_of_order_tolerance,
                 group_config.maximum_forward_distance,
             ))
-            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
             .use_ratchet_tree_extension(true) // CRITICAL: Must match group creation config
             .build();
         crate::debug_log!(
@@ -3923,6 +3949,30 @@ impl MLSContext {
         })
     }
 
+    /// Export the canonical metadata encryption key (MEK) for a specific epoch.
+    pub fn export_metadata_key(
+        &self,
+        group_id: Vec<u8>,
+        epoch: u64,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        inner.with_group(&gid, |group, provider, _signer| {
+            let key = crate::metadata::derive_metadata_key_from_group(
+                group,
+                provider.crypto(),
+                provider.storage(),
+                &group_id,
+                epoch,
+            )
+            .map_err(|e| MLSError::Internal(format!("derive metadata key: {e:?}")))?;
+            Ok(key.to_vec())
+        })
+    }
     /// Export a secret from the pending commit's Puncturable PRF tree.
     ///
     /// Falls back to `export_secret` from the pending commit when the group
@@ -6064,10 +6114,15 @@ impl MLSContext {
             now.saturating_sub(60),
             now + 29 * 24 * 60 * 60,
         );
+        let extension_caps = if last_resort {
+            vec![openmls::prelude::ExtensionType::LastResort]
+        } else {
+            vec![]
+        };
         let capabilities = Capabilities::new(
             Some(&[openmls::prelude::ProtocolVersion::Mls10]),
             Some(&[ciphersuite]),
-            Some(&[]),
+            Some(&extension_caps),
             Some(&[]),
             Some(&[CredentialType::Basic]),
         );
@@ -7243,6 +7298,21 @@ impl MlsCryptoContext for MLSContext {
         let id = String::from_utf8(identity)
             .map_err(|_| MLSError::invalid_input("Invalid UTF-8 identity"))?;
         MLSContext::sign_with_identity_key(self, id, payload)
+    }
+    fn add_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        key_packages: Vec<KeyPackageData>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<AddMembersResult, MLSError> {
+        self.add_members_with_aad(group_id, key_packages, aad)
+    }
+    fn export_metadata_key(
+        &self,
+        group_id: Vec<u8>,
+        epoch: u64,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.export_metadata_key(group_id, epoch)
     }
 
     fn get_current_metadata(
