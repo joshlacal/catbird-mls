@@ -55,6 +55,8 @@ pub struct UpdateGroupMetadataResult {
     pub metadata_version: u64,
     /// UUIDv4 locator the caller uses with `putGroupMetadataBlob`.
     pub metadata_blob_locator: String,
+    pub next_confirmation_tag: Option<Vec<u8>>,
+    pub next_group_context_hash: Option<Vec<u8>>,
 }
 use sha2::{Digest, Sha256};
 
@@ -2976,6 +2978,7 @@ impl MLSContext {
         description: Option<String>,
         avatar_blob_locator: Option<String>,
         avatar_content_type: Option<String>,
+        aad: Option<Vec<u8>>,
     ) -> Result<UpdateGroupMetadataResult, MLSError> {
         let gid = GroupId::from_slice(group_id);
 
@@ -3003,8 +3006,12 @@ impl MLSContext {
                 MLSError::Internal(format!("serialize placeholder reference: {:?}", e))
             })?;
 
+            if let Some(ref aad_bytes) = aad {
+                group.set_aad(aad_bytes.clone());
+            }
             let commit_stage = group
                 .commit_builder()
+                .force_self_update(true)
                 .load_psks(provider.storage())
                 .map_err(|e| MLSError::OpenMLS(format!("load_psks: {:?}", e)))?;
             let commit_bundle = commit_stage
@@ -3012,7 +3019,9 @@ impl MLSContext {
                 .map_err(|e| MLSError::OpenMLS(format!("build commit: {:?}", e)))?
                 .stage_commit(provider)
                 .map_err(|e| MLSError::OpenMLS(format!("stage commit: {:?}", e)))?;
-
+            if aad.is_some() {
+                group.set_aad(vec![]);
+            }
             let (commit_msg, _welcome, _group_info) = commit_bundle.into_contents();
             let commit_bytes = TlsSerialize::tls_serialize_detached(&commit_msg)
                 .map_err(|_| MLSError::SerializationError)?;
@@ -3070,12 +3079,29 @@ impl MLSContext {
                 new_locator
             );
 
+            use openmls::prelude::tls_codec::DeserializeBytes as _;
+            let next_tag = MlsMessageIn::tls_deserialize_exact_bytes(&commit_bytes)
+                .ok()
+                .and_then(|msg_in| match msg_in.extract() {
+                    MlsMessageBodyIn::PublicMessage(pm) => pm.confirmation_tag().cloned(),
+                    _ => None,
+                })
+                .and_then(|t| t.tls_serialize_detached().ok())
+                .map(|tag_bytes| if tag_bytes.len() > 32 { tag_bytes[tag_bytes.len() - 32..].to_vec() } else { tag_bytes });
+            let next_gch = pending
+                .group_context()
+                .tls_serialize_detached()
+                .ok()
+                .map(|gc_bytes| sha2::Sha256::digest(&gc_bytes).to_vec());
+
             Ok(UpdateGroupMetadataResult {
                 commit_bytes,
                 metadata_blob_ciphertext: ciphertext,
                 metadata_reference_json: final_ref_json,
                 metadata_version: next_version,
                 metadata_blob_locator: new_locator,
+                next_confirmation_tag: next_tag,
+                next_group_context_hash: next_gch,
             })
         })
     }

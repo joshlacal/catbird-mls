@@ -72,6 +72,8 @@ pub struct UpdateGroupMetadataResultFfi {
     pub metadata_version: u64,
     /// UUIDv4 locator the caller uses with `putGroupMetadataBlob`.
     pub metadata_blob_locator: String,
+    pub next_confirmation_tag: Option<Vec<u8>>,
+    pub next_group_context_hash: Option<Vec<u8>>,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]

@@ -341,6 +341,58 @@ pub fn decrypt_metadata_blob(
     Ok(serde_json::from_slice(&plaintext)?)
 }
 
+/// Encrypt a `GroupMetadataV1` with an explicit 12-byte nonce for clean-chat `metadataSnapshot`,
+/// returning ONLY `ciphertext || tag` (without the 12-byte nonce prepended).
+pub fn encrypt_metadata_snapshot_with_nonce(
+    key: &[u8; 32],
+    group_id: &[u8],
+    epoch: u64,
+    metadata_version: u64,
+    nonce: &[u8; 12],
+    metadata: &GroupMetadataV1,
+) -> Result<Vec<u8>, MetadataError> {
+    let plaintext = serde_json::to_vec(metadata)?;
+    let aad = build_metadata_aad(group_id, epoch, metadata_version);
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| MetadataError::Encryption(format!("{e}")))?;
+    let nonce_arr = chacha20poly1305::Nonce::from_slice(nonce);
+    cipher
+        .encrypt(
+            nonce_arr,
+            chacha20poly1305::aead::Payload {
+                msg: &plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| MetadataError::Encryption(format!("{e}")))
+}
+
+/// Decrypt a clean-chat `metadataSnapshot`'s `ciphertext` (which does not include the nonce)
+/// given the explicit 12-byte nonce.
+pub fn decrypt_metadata_snapshot(
+    key: &[u8; 32],
+    group_id: &[u8],
+    epoch: u64,
+    metadata_version: u64,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+) -> Result<GroupMetadataV1, MetadataError> {
+    let aad = build_metadata_aad(group_id, epoch, metadata_version);
+    let cipher = ChaCha20Poly1305::new_from_slice(key)
+        .map_err(|e| MetadataError::Decryption(format!("{e}")))?;
+    let nonce_arr = chacha20poly1305::Nonce::from_slice(nonce);
+    let plaintext = cipher
+        .decrypt(
+            nonce_arr,
+            chacha20poly1305::aead::Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(|e| MetadataError::Decryption(format!("{e}")))?;
+    Ok(serde_json::from_slice(&plaintext)?)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Public encrypt / decrypt — avatar
 // ═══════════════════════════════════════════════════════════════════════════

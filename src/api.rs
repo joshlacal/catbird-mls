@@ -3973,6 +3973,32 @@ impl MLSContext {
             Ok(key.to_vec())
         })
     }
+    /// Export the canonical metadata encryption key (MEK) from a pending staged commit.
+    pub fn export_metadata_key_from_pending(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        inner.with_group(&gid, |group, provider, _signer| {
+            let staged_commit = group
+                .pending_commit()
+                .ok_or_else(|| MLSError::Internal("no pending commit".into()))?;
+            let key = crate::metadata::derive_metadata_key(
+                staged_commit,
+                provider.crypto(),
+                &group_id,
+                target_epoch,
+            )
+            .map_err(|e| MLSError::Internal(format!("derive metadata key from pending: {e:?}")))?;
+            Ok(key.to_vec())
+        })
+    }
     /// Export a secret from the pending commit's Puncturable PRF tree.
     ///
     /// Falls back to `export_secret` from the pending commit when the group
@@ -4178,6 +4204,25 @@ impl MLSContext {
         avatar_blob_locator: Option<String>,
         avatar_content_type: Option<String>,
     ) -> Result<UpdateGroupMetadataResultFfi, MLSError> {
+        self.update_group_metadata_encrypted_with_aad(
+            group_id,
+            title,
+            description,
+            avatar_blob_locator,
+            avatar_content_type,
+            None,
+        )
+    }
+
+    pub fn update_group_metadata_encrypted_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        title: Option<String>,
+        description: Option<String>,
+        avatar_blob_locator: Option<String>,
+        avatar_content_type: Option<String>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<UpdateGroupMetadataResultFfi, MLSError> {
         self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] update_group_metadata_encrypted: {}",
@@ -4197,8 +4242,8 @@ impl MLSContext {
             description,
             avatar_blob_locator,
             avatar_content_type,
+            aad,
         )?;
-
         self.check_suspended()?;
         inner.flush_database().map_err(|e| {
             crate::error_log!(
@@ -4215,6 +4260,8 @@ impl MLSContext {
             metadata_reference_json: result.metadata_reference_json,
             metadata_version: result.metadata_version,
             metadata_blob_locator: result.metadata_blob_locator,
+            next_confirmation_tag: result.next_confirmation_tag,
+            next_group_context_hash: result.next_group_context_hash,
         })
     }
 
@@ -7314,6 +7361,13 @@ impl MlsCryptoContext for MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         self.export_metadata_key(group_id, epoch)
     }
+    fn export_metadata_key_from_pending(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<Vec<u8>, MLSError> {
+        MLSContext::export_metadata_key_from_pending(self, group_id, target_epoch)
+    }
 
     fn get_current_metadata(
         &self,
@@ -7550,13 +7604,15 @@ impl MlsCryptoContext for MLSContext {
         description: Option<String>,
         avatar_blob_locator: Option<String>,
         avatar_content_type: Option<String>,
+        aad: Option<Vec<u8>>,
     ) -> Result<UpdateGroupMetadataResultFfi, MLSError> {
-        self.update_group_metadata_encrypted(
+        self.update_group_metadata_encrypted_with_aad(
             group_id,
             title,
             description,
             avatar_blob_locator,
             avatar_content_type,
+            aad,
         )
     }
 

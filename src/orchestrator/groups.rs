@@ -1051,15 +1051,16 @@ where
         };
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let metadata_key = self.mls_context().safe_export_secret(group_id_bytes.clone(), 0x8001)?;
+        let metadata_key = self.mls_context().export_metadata_key(group_id_bytes.clone(), 0)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
-        let ciphertext = crate::metadata::encrypt_metadata_blob(
+        let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
             &metadata_key_arr,
             &group_id_bytes,
             0,
             1,
+            &nonce,
             &metadata_plaintext,
         )
         .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
@@ -1795,9 +1796,17 @@ where
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
         let entries_arr = entries_val.get("entries").and_then(|v| v.as_array())
             .ok_or_else(|| OrchestratorError::Api("getEntries response missing entries array".into()))?;
+        println!("DEBUG FULFILL: entries count = {}", entries_arr.len());
+        for (idx, e) in entries_arr.iter().enumerate() {
+            println!("DEBUG FULFILL entry[{}]: type={} has_recovery={}", idx, e.get("$type").and_then(|v| v.as_str()).unwrap_or(""), e.get("recovery").is_some());
+            if let Some(rec) = e.get("recovery") {
+                println!("  recovery={}", serde_json::to_string(rec).unwrap_or_default());
+            }
+        }
         let mut open_recovery: Option<serde_json::Value> = None;
         let mut prior_coord: Option<serde_json::Value> = None;
 
+        let mut fulfilled_recovery_ids = std::collections::HashSet::new();
         for entry in entries_arr.iter() {
             let entry_type = entry.get("$type").and_then(|v| v.as_str()).unwrap_or("");
             if entry_type.contains("participantAcceptanceEntry") || entry_type.contains("leafRecoveryFulfillmentEntry") || entry_type.contains("creationEntry") {
@@ -1805,9 +1814,23 @@ where
                     if let Some(next_c) = sr.get("next") {
                         prior_coord = Some(next_c.clone());
                     }
+                    if entry_type.contains("leafRecoveryFulfillmentEntry") {
+                        if let Some(r_id) = sr.get("recoveryRequestId").and_then(|v| v.as_str()) {
+                            fulfilled_recovery_ids.insert(r_id.to_string());
+                        }
+                    }
                 }
             }
         }
+
+        let identities = self.mls_context().group_member_identities(group_id_bytes.clone())?;
+        let existing_dids: std::collections::HashSet<String> = identities
+            .iter()
+            .filter_map(|raw| String::from_utf8(raw.clone()).ok())
+            .map(|id| super::credential_binding::credential_root_did(&id).to_string())
+            .collect();
+        println!("DEBUG FULFILL: existing_dids = {:?}", existing_dids);
+        println!("DEBUG FULFILL: fulfilled_recovery_ids = {:?}", fulfilled_recovery_ids);
 
         let convos_req = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
@@ -1852,10 +1875,41 @@ where
                                 let rec = item.get("recovery").unwrap_or(item);
                                 let cid = rec.get("conversationId").and_then(|v| v.as_str())
                                     .or_else(|| rec.get("boundCoordinate").and_then(|c| c.get("conversationId")).and_then(|v| v.as_str()));
-                                if cid == Some(&convo_uuid_str) {
-                                    open_recovery = Some(rec.clone());
-                                    break;
+                                if cid != Some(&convo_uuid_str) {
+                                    continue;
                                 }
+                                let r_id = rec.get("recoveryRequestId").and_then(|v| v.as_str()).unwrap_or("");
+                                let r_did = rec.get("requesterDid").and_then(|v| v.as_str()).unwrap_or("");
+                                let r_kind = rec.get("recoveryKind").and_then(|v| v.as_str()).unwrap_or("add");
+                                let status = rec.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                if !status.is_empty() && status != "open" {
+                                    continue;
+                                }
+                                if let Some(expires_at_str) = rec.get("expiresAt").and_then(|v| v.as_str()) {
+                                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at_str) {
+                                        if exp < chrono::Utc::now() {
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if let Some(explicit_id) = explicit_recovery_request_id {
+                                    if r_id != explicit_id {
+                                        continue;
+                                    }
+                                }
+                                if let Some(explicit_did) = explicit_requester_did {
+                                    if r_did != explicit_did {
+                                        continue;
+                                    }
+                                }
+                                if fulfilled_recovery_ids.contains(r_id) {
+                                    continue;
+                                }
+                                if r_kind == "add" && existing_dids.contains(r_did) {
+                                    continue;
+                                }
+                                open_recovery = Some(rec.clone());
+                                break;
                             }
                         }
                     }
@@ -1865,11 +1919,38 @@ where
         if open_recovery.is_none() {
             for entry in entries_arr.iter() {
                 if let Some(rec) = entry.get("recovery") {
+                    let r_id = rec.get("recoveryRequestId").and_then(|v| v.as_str()).unwrap_or("");
+                    let r_did = rec.get("requesterDid").and_then(|v| v.as_str()).unwrap_or("");
+                    let r_kind = rec.get("recoveryKind").and_then(|v| v.as_str()).unwrap_or("add");
                     let status = rec.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                    if status == "open" {
-                        open_recovery = Some(rec.clone());
-                        break;
+                    if !status.is_empty() && status != "open" {
+                        continue;
                     }
+                    if let Some(expires_at_str) = rec.get("expiresAt").and_then(|v| v.as_str()) {
+                        if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at_str) {
+                            if exp < chrono::Utc::now() {
+                                continue;
+                            }
+                        }
+                    }
+                    if let Some(explicit_id) = explicit_recovery_request_id {
+                        if r_id != explicit_id {
+                            continue;
+                        }
+                    }
+                    if let Some(explicit_did) = explicit_requester_did {
+                        if r_did != explicit_did {
+                            continue;
+                        }
+                    }
+                    if fulfilled_recovery_ids.contains(r_id) {
+                        continue;
+                    }
+                    if r_kind == "add" && existing_dids.contains(r_did) {
+                        continue;
+                    }
+                    open_recovery = Some(rec.clone());
+                    break;
                 }
             }
         }
@@ -1879,18 +1960,30 @@ where
             explicit_requester_did,
             explicit_requester_device_id,
         ) {
-            let kp_bytes = if let Some(kp_b64) = explicit_key_package_b64 {
-                STANDARD.decode(kp_b64).map_err(|e| OrchestratorError::Serialization(e.to_string()))?
+            let (kp_bytes, ref_b64) = if let (Some(kp_b64), Some(r_b64)) = (explicit_key_package_b64, explicit_key_package_ref_b64) {
+                let bytes = STANDARD.decode(kp_b64).map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+                (bytes, r_b64.to_string())
+            } else if let Some(rec) = &open_recovery {
+                let reservation = rec.get("reservation")
+                    .ok_or_else(|| OrchestratorError::Api("recovery missing reservation".into()))?;
+                let ref_b64 = reservation.get("keyPackageRef").and_then(|v| v.as_str())
+                    .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackageRef".into()))?.to_string();
+                let kp_bytes = if let Some(kp_obj) = reservation.get("keyPackage") {
+                    if let Some(b_str) = kp_obj.get("bytes").and_then(|v| v.as_str()) {
+                        STANDARD.decode(b_str).map_err(|e| OrchestratorError::Serialization(e.to_string()))?
+                    } else {
+                        return Err(OrchestratorError::Api("keyPackage missing bytes".into()));
+                    }
+                } else {
+                    return Err(OrchestratorError::Api("reservation missing keyPackage".into()));
+                };
+                (kp_bytes, ref_b64)
+            } else if let Some(kp_b64) = explicit_key_package_b64 {
+                let bytes = STANDARD.decode(kp_b64).map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+                let ref_b64 = STANDARD.encode(Sha256::digest(&bytes));
+                (bytes, ref_b64)
             } else {
-                let kps = self.api_client().get_key_packages(&actor_device_id, &[r_did.to_string()]).await?;
-                let kp = kps.into_iter().find(|k| k.did == r_did)
-                    .ok_or_else(|| OrchestratorError::Api(format!("no key package for {r_did}")))?;
-                kp.key_package_data
-            };
-            let ref_b64 = if let Some(r_b64) = explicit_key_package_ref_b64 {
-                r_b64.to_string()
-            } else {
-                STANDARD.encode(Sha256::digest(&kp_bytes))
+                return Err(OrchestratorError::Api("explicit recovery fulfillment requires key package bytes and ref".into()));
             };
             (r_id.to_string(), r_did.to_string(), r_dev.to_string(), ref_b64, kp_bytes)
         } else {
@@ -1918,10 +2011,7 @@ where
                     return Err(OrchestratorError::Api("keyPackage missing bytes".into()));
                 }
             } else {
-                let kps = self.api_client().get_key_packages(&actor_device_id, &[requester_did.clone()]).await?;
-                let kp = kps.into_iter().find(|k| k.did == requester_did)
-                    .ok_or_else(|| OrchestratorError::Api(format!("no key package for {requester_did}")))?;
-                kp.key_package_data
+                return Err(OrchestratorError::Api("reservation missing keyPackage".into()));
             };
             (recovery_request_id, requester_did, requester_device_id, key_package_ref_b64, kp_bytes)
         };
@@ -1969,34 +2059,27 @@ where
         let epoch_0_key = self.mls_context().export_metadata_key(group_id_bytes.clone(), prior_epoch)?;
         let epoch_0_key_arr: [u8; 32] = epoch_0_key.as_slice().try_into().unwrap_or([0u8; 32]);
 
+        println!("DEBUG FULFILL META: prior_epoch={} metadata_version={} prior_ct_len={} prior_nonce_len={}", prior_epoch, metadata_version, prior_ct.len(), prior_nonce.len());
+        println!("DEBUG FULFILL META: pm={}", serde_json::to_string(&pm).unwrap_or_default());
+        println!("DEBUG FULFILL META: epoch_key={:?}", &epoch_0_key_arr[..8]);
         let metadata_plaintext = if !prior_ct.is_empty() && prior_nonce.len() == 12 {
-            let mut full_blob = prior_nonce;
-            full_blob.extend_from_slice(&prior_ct);
-            crate::metadata::decrypt_metadata_blob(
+            let prior_nonce_arr: [u8; 12] = prior_nonce.as_slice().try_into().unwrap();
+            crate::metadata::decrypt_metadata_snapshot(
                 &epoch_0_key_arr,
                 &group_id_bytes,
                 prior_epoch,
                 metadata_version as u64,
-                &full_blob,
+                &prior_nonce_arr,
+                &prior_ct,
             ).unwrap_or_else(|e| {
                 println!("DECRYPT METADATA FAILED: {e:?}");
-                let mut meta = crate::metadata::GroupMetadataV1 {
+                crate::metadata::GroupMetadataV1 {
                     version: metadata_version as u32,
                     title: requester_did.clone(),
                     description: "".to_string(),
                     avatar_blob_locator: None,
                     avatar_content_type: None,
-                };
-                if prior_ct.len() > 16 {
-                    let target_payload_len = prior_ct.len() - 16;
-                    if let Ok(base_json) = serde_json::to_vec(&meta) {
-                        if base_json.len() < target_payload_len {
-                            let pad_len = target_payload_len - base_json.len();
-                            meta.description = "a".repeat(pad_len);
-                        }
-                    }
                 }
-                meta
             })
         } else {
             crate::metadata::GroupMetadataV1 {
@@ -2054,24 +2137,22 @@ where
 
         let metadata_key = self
             .mls_context()
-            .export_metadata_key(group_id_bytes.clone(), target_epoch)?;
+            .export_metadata_key_from_pending(group_id_bytes.clone(), target_epoch)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
-        let encrypted_blob = crate::metadata::encrypt_metadata_blob(
+        use rand::RngCore;
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
             &metadata_key_arr,
             &group_id_bytes,
             target_epoch,
             metadata_version as u64,
+            &nonce,
             &metadata_plaintext,
         )
         .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
-
-        let (nonce, ciphertext) = if encrypted_blob.len() >= 12 {
-            (&encrypted_blob[..12], &encrypted_blob[12..])
-        } else {
-            (&[][..], &encrypted_blob[..])
-        };
         println!("RE-ENCRYPTED METADATA CT: len={}", ciphertext.len());
 
         let mut leaf_changes = Vec::new();
@@ -2101,9 +2182,9 @@ where
             },
             "originTransitionId": origin_transition_id,
             "metadataVersion": metadata_version,
-            "nonce": STANDARD.encode(nonce),
-            "ciphertext": STANDARD.encode(ciphertext),
-            "ciphertextSha256": STANDARD.encode(Sha256::digest(ciphertext)),
+            "nonce": STANDARD.encode(&nonce),
+            "ciphertext": STANDARD.encode(&ciphertext),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
             "ciphertextSize": ciphertext.len(),
             "authorProof": author_proof
         });
@@ -2220,7 +2301,8 @@ where
         let entries_arr = entries_val.get("entries").and_then(|v| v.as_array())
             .ok_or_else(|| OrchestratorError::Api("getEntries response missing entries array".into()))?;
 
-        for entry in entries_arr.iter() {
+        let mut last_err = None;
+        for entry in entries_arr.iter().rev() {
             if let Some(sr) = entry.get("signedRequest").and_then(|sr| sr.get("body")) {
                 if let Some(manifest) = sr.get("manifest") {
                     if let Some(wb) = manifest.get("welcomeBundle") {
@@ -2229,7 +2311,12 @@ where
                             .and_then(|v| v.as_str());
                         if let Some(b64) = welcome_b64 {
                             if let Ok(welcome_bytes) = STANDARD.decode(b64) {
-                                return self.join_group(&welcome_bytes).await;
+                                match self.join_group(&welcome_bytes).await {
+                                    Ok(view) => return Ok(view),
+                                    Err(e) => {
+                                        last_err = Some(e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -2237,6 +2324,9 @@ where
             }
         }
 
+        if let Some(e) = last_err {
+            return Err(e);
+        }
         Err(OrchestratorError::Api("No Welcome message found in conversation entries".into()))
     }
 
@@ -3098,178 +3188,214 @@ where
     ) -> Result<()> {
         self.check_shutdown().await?;
 
-        let resolved = self.resolve_conversation_context(conversation_id).await?;
+        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
         let group_id_hex = resolved.group_id.clone();
+        let conversation_id = &resolved.conversation_id;
         let group_id_bytes = hex::decode(&group_id_hex).map_err(|_| {
             OrchestratorError::InvalidInput("Invalid hex group ID for metadata update".into())
         })?;
 
-        // 1. Stage commit + encrypt + assemble artifacts in one FFI call.
-        let result = self.mls_context().update_group_metadata_encrypted(
-            group_id_bytes.clone(),
-            title.map(|s| s.to_string()),
-            description.map(|s| s.to_string()),
-            avatar_blob_locator.map(|s| s.to_string()),
-            avatar_content_type.map(|s| s.to_string()),
-        )?;
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use sha2::{Digest, Sha256};
 
-        // 2. Upload the encrypted blob first; if this fails we must discard the
-        //    pending commit so the local epoch doesn't advance into a state
-        //    other clients can't reach (no blob → can't decrypt metadata).
-        if let Err(e) = self
-            .put_group_metadata_blob(
-                conversation_id,
-                &group_id_hex,
-                &result.metadata_blob_locator,
-                &result.metadata_blob_ciphertext,
-                "metadata",
-                result.metadata_version,
-                None,
-            )
-            .await
-        {
-            if let Err(cleanup_error) = self
-                .mls_context()
-                .clear_pending_commit(group_id_bytes.clone())
-            {
-                self.mark_needs_rejoin_critical(conversation_id).await;
-                return Err(OrchestratorError::RecoveryFailed(format!(
-                    "metadata blob upload failed ({e}); pending commit cleanup also failed: {cleanup_error}"
-                )));
-            }
-            return Err(e);
+        let user_did = self.require_user_did().await?;
+        let actor_device_id = self.require_actor_device_id().await?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&user_did)
+            .await?
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        if auth_generation < 1 {
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
         }
-
-        // 3. Submit the commit. Same discard logic on failure.
-        if let Err(e) = self
-            .submit_commit_transition_helper(
-                conversation_id,
-                &group_id_bytes,
-                self.mls_context().get_epoch(group_id_bytes.clone()).unwrap_or(0) + 1,
-                &result.commit_bytes,
-                None,
-                &[],
-                None,
-            )
-            .await
-        {
-            if let Err(cleanup_error) = self
-                .mls_context()
-                .clear_pending_commit(group_id_bytes.clone())
-            {
-                self.mark_needs_rejoin_critical(conversation_id).await;
-                return Err(OrchestratorError::RecoveryFailed(format!(
-                    "metadata commit submission failed ({e}); pending commit cleanup also failed: {cleanup_error}"
-                )));
-            }
-            return Err(e);
-        }
-
-        // 4. Merge locally (advances epoch and applies the new
-        //    MetadataReference in AppDataDictionary).
-        let merge_epoch = match self
+        let scoped_identity = self.require_scoped_identity().await?;
+        let public_key = self
             .mls_context()
-            .merge_pending_commit(group_id_bytes.clone())
-        {
-            Ok(epoch) => epoch,
-            Err(error) => {
-                self.mark_needs_rejoin_critical(conversation_id).await;
-                return Err(error.into());
-            }
-        };
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let key_id = super::canonical_transport::derive_key_id(&public_key);
 
-        // The crypto merge is only the first half of the commit point. Make
-        // the stable conversation -> mutable group/epoch projection durable
-        // before publishing it to the cache, pruning epoch secrets, or
-        // returning success. A storage failure after server acceptance is a
-        // recovery event, never a successful metadata update.
-        let cached_state = {
-            let states = self.group_states().lock().await;
-            resolved.group_state(&states).cloned()
-        };
-        let existing_state = match cached_state {
-            Some(state) => Some(state),
-            None => self.storage().get_group_state(&group_id_hex).await?,
-        };
-        let Some(mut projected_state) = existing_state else {
-            self.mark_needs_rejoin_critical(conversation_id).await;
-            return Err(OrchestratorError::Storage(format!(
-                "Missing GroupState after metadata commit for conversation {conversation_id} (group {group_id_hex})"
-            )));
-        };
-        if projected_state.group_id != group_id_hex {
-            self.mark_needs_rejoin_critical(conversation_id).await;
-            return Err(OrchestratorError::Storage(format!(
-                "Mismatched GroupState after metadata commit for conversation {conversation_id} (group {group_id_hex})"
-            )));
-        }
-        projected_state.conversation_id = conversation_id.to_string();
-        projected_state.epoch = merge_epoch;
-        if let Err(error) = self.storage().set_group_state(&projected_state).await {
-            self.mark_needs_rejoin_critical(conversation_id).await;
-            return Err(error);
-        }
-        {
-            let mut states = self.group_states().lock().await;
-            normalize_group_state(&mut states, projected_state);
-        }
-        self.cleanup_epoch_secrets_if_needed(conversation_id, &group_id_hex, merge_epoch)
-            .await;
+        let convo_uuid = uuid::Uuid::parse_str(conversation_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let transition_uuid = uuid::Uuid::new_v4();
+        let transition_id = transition_uuid.to_string();
 
-        // 5. Encrypt + upload the avatar blob at the SAME post-commit
-        //    (epoch, metadata_version) the metadata blob was bound to, so
-        //    joiners — who fetch the avatar via `avatar_blob_locator` from the
-        //    decrypted metadata and decrypt it with their current-epoch key —
-        //    get a matching AAD (`group_id || epoch || metadata_version`). The
-        //    metadata blob references the locator; without this upload the
-        //    locator points at nothing and joiners see no avatar. Best-effort:
-        //    the metadata commit already merged, so a failed avatar upload
-        //    leaves the group named-but-avatarless rather than breaking it.
-        if let (Some(bytes), Some(locator)) = (avatar_bytes, avatar_blob_locator) {
-            match self
-                .mls_context()
-                .get_current_metadata(group_id_bytes.clone())
-            {
-                Ok(Some(info)) => match <[u8; 32]>::try_from(info.metadata_key.as_slice()) {
-                    Ok(key) => {
-                        match crate::metadata::encrypt_avatar_blob(
-                            &key,
-                            &group_id_bytes,
-                            info.epoch,
-                            result.metadata_version,
-                            bytes,
-                        ) {
-                            Ok(encrypted_avatar) => {
-                                tracing::info!(conversation_id, "Avatar encrypted successfully");
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, conversation_id, "Avatar encryption failed")
-                            }
-                        }
-                    }
-                    Err(_) => tracing::warn!(
-                        conversation_id,
-                        "Avatar upload skipped: metadata key wrong length"
-                    ),
-                },
-                Ok(None) => tracing::warn!(
-                    conversation_id,
-                    "Avatar upload skipped: no current metadata after merge"
-                ),
-                Err(e) => {
-                    tracing::warn!(error = %e, conversation_id, "Avatar upload skipped: get_current_metadata failed")
+        let tag_bytes = self
+            .mls_context()
+            .get_confirmation_tag(group_id_bytes.clone())
+            .unwrap_or_default();
+        let gc_hash_bytes = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())
+            .unwrap_or_default();
+
+        let (prior_coord, prior_mv, next_entry_seq) = match self.fetch_current_conversation_coordinates(conversation_id).await {
+            Ok((c, mv, s)) => (c, mv, s),
+            Err(_) => (serde_json::json!({}), 0, 1),
+        };
+        let target_metadata_version = (prior_mv + 1) as u64;
+
+        fn extract_bytes_32(value: Option<&serde_json::Value>) -> Option<[u8; 32]> {
+            match value {
+                Some(serde_json::Value::String(s)) => {
+                    let decoded = STANDARD.decode(s).ok()?;
+                    decoded.try_into().ok()
                 }
+                Some(serde_json::Value::Object(map)) => {
+                    if let Some(serde_json::Value::String(s)) = map.get("$bytes") {
+                        let decoded = STANDARD.decode(s).ok()?;
+                        decoded.try_into().ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             }
         }
 
-        tracing::info!(
-            conversation_id,
-            new_epoch = merge_epoch,
-            metadata_version = result.metadata_version,
-            blob_locator = %result.metadata_blob_locator,
-            has_avatar = avatar_bytes.is_some(),
-            "Group metadata updated (encrypted)"
-        );
+        let prior_sv = prior_coord.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(0);
+        let prior_epoch = prior_coord.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+        let prior_tag_bytes = extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
+            arr
+        });
+        let prior_gch_bytes = extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
+            arr
+        });
+        let prior_group_id_32 = extract_bytes_32(prior_coord.get("groupId")).unwrap_or_else(|| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&group_id_bytes[..32.min(group_id_bytes.len())]);
+            arr
+        });
+
+        // 1. Encrypt new metadata blob under the current epoch's exporter key
+        let metadata_key = self.mls_context().export_metadata_key(group_id_bytes.clone(), prior_epoch)?;
+        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
+            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+        })?;
+
+        let payload = crate::metadata::GroupMetadataV1 {
+            version: 1,
+            title: title.unwrap_or_default().to_string(),
+            description: description.unwrap_or_default().to_string(),
+            avatar_blob_locator: avatar_blob_locator.map(|s| s.to_string()),
+            avatar_content_type: avatar_content_type.map(|s| s.to_string()),
+        };
+
+        use rand::RngCore;
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+
+        let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
+            &metadata_key_arr,
+            &group_id_bytes,
+            prior_epoch,
+            target_metadata_version,
+            &nonce,
+            &payload,
+        )
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+
+        let metadata_snapshot = serde_json::json!({
+            "coordinate": {
+                "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+                "epoch": prior_epoch,
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&prior_gch_bytes),
+                "groupId": STANDARD.encode(&prior_group_id_32)
+            },
+            "originTransitionId": transition_id,
+            "metadataVersion": target_metadata_version,
+            "nonce": STANDARD.encode(&nonce),
+            "ciphertext": STANDARD.encode(&ciphertext),
+            "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
+            "ciphertextSize": ciphertext.len(),
+            "authorProof": {
+                "authorDid": user_did,
+                "authorDeviceId": actor_device_id,
+                "authorKeyId": key_id,
+                "signaturePublicKey": STANDARD.encode(&public_key),
+                "authGenerationAtOrigin": auth_generation,
+                "originTransitionId": transition_id,
+                "originSeq": next_entry_seq,
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active"
+            }
+        });
+
+        let prior_clean = serde_json::json!({
+            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "conversationId": conversation_id,
+            "epoch": prior_epoch,
+            "generation": 0,
+            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
+            "groupId": STANDARD.encode(&prior_group_id_32),
+            "lifecycle": "active",
+            "stateVersion": prior_sv
+        });
+
+        let next_coord = serde_json::json!({
+            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "conversationId": conversation_id,
+            "epoch": prior_epoch,
+            "generation": 0,
+            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
+            "groupId": STANDARD.encode(&prior_group_id_32),
+            "lifecycle": "active",
+            "stateVersion": prior_sv + 1
+        });
+
+        let body = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#metadataTransitionBody",
+            "signatureDomain": "CATBIRD-CHAT-METADATA\0",
+            "transitionId": transition_id,
+            "idempotencyKey": transition_id,
+            "actorDid": user_did,
+            "actorDeviceId": actor_device_id,
+            "keyId": key_id,
+            "authGeneration": auth_generation,
+            "prior": prior_clean,
+            "next": next_coord,
+            "metadataSnapshot": metadata_snapshot,
+            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        });
+
+        // 2. Submit the metadata transition request
+        let response = self
+            .submit_signed_clean_chat_request(
+                super::canonical_transport::CanonicalOperation::SubmitTransition,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+            )
+            .await?;
+
+        if response.status != 200 {
+            return Err(OrchestratorError::Api(format!(
+                "submit_transition (metadata) failed with status {}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            )));
+        }
+
+        let mut convos = self.conversations().lock().await;
+        if let Some(convo) = convos.get_mut(conversation_id) {
+            if let Some(ref mut meta) = convo.metadata {
+                meta.name = title.map(|s| s.to_string());
+                if let Some(desc) = description {
+                    meta.description = Some(desc.to_string());
+                }
+            } else {
+                convo.metadata = Some(crate::orchestrator::types::ConversationMetadata {
+                    name: title.map(|s| s.to_string()),
+                    description: description.map(|s| s.to_string()),
+                    avatar_url: avatar_blob_locator.map(|s| s.to_string()),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -3927,6 +4053,39 @@ where
         member_dids: &[String],
         key_packages_for_provenance: Option<&[crate::KeyPackageData]>,
     ) -> Result<AddMembersServerResult> {
+        self.submit_commit_transition_helper_inner(
+            conversation_id,
+            group_id,
+            target_epoch,
+            commit_bytes,
+            welcome_bytes,
+            member_dids,
+            key_packages_for_provenance,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_commit_transition_helper_inner(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+        target_epoch: u64,
+        commit_bytes: &[u8],
+        welcome_bytes: Option<&[u8]>,
+        member_dids: &[String],
+        key_packages_for_provenance: Option<&[crate::KeyPackageData]>,
+        custom_transition_id: Option<String>,
+        custom_metadata_ciphertext: Option<Vec<u8>>,
+        custom_metadata_version: Option<u64>,
+        custom_next_confirmation_tag: Option<Vec<u8>>,
+        custom_next_group_context_hash: Option<Vec<u8>>,
+    ) -> Result<AddMembersServerResult> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
         let user_did = self.require_user_did().await?;
@@ -3944,8 +4103,10 @@ where
             .mls_context()
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
-        let transition_id = uuid::Uuid::new_v4().to_string();
-        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        let transition_id = custom_transition_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let transition_uuid = uuid::Uuid::parse_str(&transition_id)
+            .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?;
+        let idempotency_key = transition_id.clone();
         let convo_uuid = uuid::Uuid::parse_str(conversation_id)
             .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
         let tag_bytes = self
@@ -3970,36 +4131,31 @@ where
         use rand::RngCore;
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let metadata_info = self.mls_context().get_current_metadata(group_id.to_vec()).ok().flatten();
-        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
-            version: 1,
-            title: "".to_string(),
-            description: "".to_string(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
+        let (ciphertext, target_metadata_version) = if let (Some(ct), Some(mv)) = (custom_metadata_ciphertext, custom_metadata_version) {
+            (ct, mv)
+        } else {
+            let metadata_plaintext = crate::metadata::GroupMetadataV1 {
+                version: 1,
+                title: "".to_string(),
+                description: "".to_string(),
+                avatar_blob_locator: None,
+                avatar_content_type: None,
+            };
+            let metadata_key = self.mls_context().export_metadata_key(group_id.to_vec(), target_epoch)?;
+            let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+            })?;
+            let ct = crate::metadata::encrypt_metadata_blob(
+                &metadata_key_arr,
+                group_id,
+                target_epoch,
+                1,
+                &metadata_plaintext,
+            )
+            .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+            (ct, 1)
         };
-        let metadata_key = self.mls_context().safe_export_secret(group_id.to_vec(), 0x8001)?;
-        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
-            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
-        })?;
-        let ciphertext = crate::metadata::encrypt_metadata_blob(
-            &metadata_key_arr,
-            group_id,
-            target_epoch,
-            1,
-            &metadata_plaintext,
-        )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
-        let participants: Vec<serde_json::Value> = member_dids
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "userDid": d,
-                    "role": "member",
-                    "status": "active"
-                })
-            })
-            .collect();
+
         let leaf_changes: Vec<serde_json::Value> = if welcome_bytes.is_none() && !member_dids.is_empty() {
             member_dids
                 .iter()
@@ -4014,24 +4170,103 @@ where
         } else {
             vec![]
         };
+
+        fn extract_bytes_32(value: Option<&serde_json::Value>) -> Option<[u8; 32]> {
+            match value {
+                Some(serde_json::Value::String(s)) => {
+                    let decoded = STANDARD.decode(s).ok()?;
+                    decoded.try_into().ok()
+                }
+                Some(serde_json::Value::Object(map)) => {
+                    if let Some(serde_json::Value::String(s)) = map.get("$bytes") {
+                        let decoded = STANDARD.decode(s).ok()?;
+                        decoded.try_into().ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        let (prior_coord, prior_mv, next_entry_seq) = match self.fetch_current_conversation_coordinates(conversation_id).await {
+            Ok((c, mv, s)) => (c, mv, s),
+            Err(_) => (serde_json::json!({
+                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "conversationId": conversation_id,
+                "epoch": target_epoch.saturating_sub(1),
+                "generation": 0,
+                "groupContextHash": STANDARD.encode(&gc_hash_bytes),
+                "groupId": STANDARD.encode(group_id),
+                "lifecycle": "active",
+                "stateVersion": 0
+            }), 0, 1),
+        };
+        let prior_sv = prior_coord.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(0);
+        let prior_epoch = prior_coord.get("epoch").and_then(|v| v.as_u64()).unwrap_or(target_epoch.saturating_sub(1));
+        let prior_tag_bytes = extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
+            arr
+        });
+        let prior_gch_bytes = extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
+            arr
+        });
+        let prior_group_id_32 = extract_bytes_32(prior_coord.get("groupId")).unwrap_or_else(|| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&group_id[..32.min(group_id.len())]);
+            arr
+        });
+
+        let aad_prior = serde_json::json!({
+            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+            "epoch": prior_epoch,
+            "generation": 0,
+            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
+            "groupId": STANDARD.encode(&prior_group_id_32),
+            "lifecycle": "active",
+            "stateVersion": prior_sv
+        });
+
+        let aad_json = serde_json::json!({
+            "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+            "generation": 0,
+            "prior": aad_prior,
+            "protocolVersion": "1",
+            "transitionId": STANDARD.encode(transition_uuid.as_bytes())
+        });
+
+        let prior_clean = serde_json::json!({
+            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "conversationId": conversation_id,
+            "epoch": prior_epoch,
+            "generation": 0,
+            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
+            "groupId": STANDARD.encode(&prior_group_id_32),
+            "lifecycle": "active",
+            "stateVersion": prior_sv
+        });
+
+        let next_tag_bytes = custom_next_confirmation_tag.unwrap_or(tag_bytes.clone());
+        let next_gch_bytes = custom_next_group_context_hash.unwrap_or(gc_hash_bytes.clone());
+
+        let next_clean = serde_json::json!({
+            "confirmationTag": STANDARD.encode(&next_tag_bytes),
+            "conversationId": conversation_id,
+            "epoch": target_epoch,
+            "generation": 0,
+            "groupContextHash": STANDARD.encode(&next_gch_bytes),
+            "groupId": STANDARD.encode(group_id),
+            "lifecycle": "active",
+            "stateVersion": prior_sv + 1
+        });
+
         let mut body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#commitTransitionBody",
-            "aad": {
-                "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                "generation": 0,
-                "prior": {
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
-                    "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                    "epoch": target_epoch.saturating_sub(1),
-                    "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash_bytes),
-                    "groupId": STANDARD.encode(group_id),
-                    "lifecycle": "active",
-                    "stateVersion": 0
-                },
-                "protocolVersion": "1",
-                "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?.as_bytes())
-            },
+            "aad": aad_json,
             "actorDeviceId": actor_device_id,
             "actorDid": user_did,
             "authGeneration": auth_generation,
@@ -4054,7 +4289,7 @@ where
                     "authorDid": user_did,
                     "authorKeyId": key_id,
                     "deviceStatusAtOrigin": "active",
-                    "originSeq": 1,
+                    "originSeq": next_entry_seq,
                     "originTransitionId": transition_id,
                     "roleAtOrigin": "admin",
                     "signaturePublicKey": STANDARD.encode(&public_key)
@@ -4063,37 +4298,19 @@ where
                 "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "confirmationTag": STANDARD.encode(&next_tag_bytes),
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch,
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash_bytes),
+                    "groupContextHash": STANDARD.encode(&next_gch_bytes),
                     "groupId": STANDARD.encode(group_id)
                 },
-                "metadataVersion": 1,
+                "metadataVersion": target_metadata_version,
                 "nonce": STANDARD.encode(&nonce),
                 "originTransitionId": transition_id
             },
-            "next": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
-                "conversationId": conversation_id,
-                "epoch": target_epoch,
-                "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash_bytes),
-                "groupId": STANDARD.encode(group_id),
-                "lifecycle": "active",
-                "stateVersion": 0
-            },
-            "prior": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
-                "conversationId": conversation_id,
-                "epoch": target_epoch.saturating_sub(1),
-                "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash_bytes),
-                "groupId": STANDARD.encode(group_id),
-                "lifecycle": "active",
-                "stateVersion": 0
-            },
+            "next": next_clean,
+            "prior": prior_clean,
             "signatureDomain": "CATBIRD-CHAT-COMMIT\0",
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             "transitionId": transition_id
@@ -4300,15 +4517,18 @@ where
             "keyId": key_id,
             "mediaType": "application/octet-stream",
             "plaintextSize": plain_size,
-            "prior": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
-                "conversationId": conversation_id,
-                "epoch": epoch,
-                "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash),
-                "groupId": STANDARD.encode(&group_id_bytes),
-                "lifecycle": "active",
-                "stateVersion": 0
+            "prior": match self.fetch_current_conversation_coordinates(conversation_id).await {
+                Ok((c, _, _)) => c,
+                Err(_) => serde_json::json!({
+                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "conversationId": conversation_id,
+                    "epoch": epoch,
+                    "generation": 0,
+                    "groupContextHash": STANDARD.encode(&gc_hash),
+                    "groupId": STANDARD.encode(&group_id_bytes),
+                    "lifecycle": "active",
+                    "stateVersion": 0
+                }),
             },
             "purpose": "metadata",
             "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\0",
@@ -4344,5 +4564,52 @@ where
             )));
         }
         Ok(())
+    }
+    pub(crate) async fn fetch_current_conversation_coordinates(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(serde_json::Value, i64, u64)> {
+        let actor_device_id = self.require_actor_device_id().await?;
+        let convos_req = super::canonical_transport::PreparedRequest {
+            operation: super::canonical_transport::CanonicalOperation::GetConversations,
+            path: format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50", actor_device_id),
+            method: "GET".to_string(),
+            body: None,
+        };
+        let resp = self.api_client().submit_prepared_request(convos_req).await?;
+        if resp.status == 200 {
+            if let Ok(convos_val) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
+                if let Some(items) = convos_val.get("items").and_then(|v| v.as_array()) {
+                    for item in items {
+                        let st = item.get("state").unwrap_or(item);
+                        let cid = st.get("coordinates").and_then(|c| c.get("conversationId")).and_then(|v| v.as_str());
+                        if cid == Some(conversation_id) {
+                            let coord = st.get("coordinates").cloned().unwrap_or(serde_json::json!({}));
+                            let mv = st.get("metadataSnapshot").and_then(|m| m.get("metadataVersion")).and_then(|v| v.as_i64()).unwrap_or(0);
+                            let mut next_entry_seq = st.get("snapshotSeq").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                            let entries_req = super::canonical_transport::PreparedRequest {
+                                operation: super::canonical_transport::CanonicalOperation::GetEntries,
+                                path: format!("/xrpc/blue.catbird.chat.getEntries?conversationId={}&actorDeviceId={}&afterSeq=0&limit=100", conversation_id, actor_device_id),
+                                method: "GET".to_string(),
+                                body: None,
+                            };
+                            if let Ok(entries_resp) = self.api_client().submit_prepared_request(entries_req).await {
+                                if entries_resp.status == 200 {
+                                    if let Ok(entries_val) = serde_json::from_slice::<serde_json::Value>(&entries_resp.body) {
+                                        if let Some(entries_arr) = entries_val.get("entries").and_then(|v| v.as_array()) {
+                                            if let Some(max_s) = entries_arr.iter().filter_map(|e| e.get("seq").and_then(|v| v.as_u64())).max() {
+                                                next_entry_seq = max_s + 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok((coord, mv, next_entry_seq));
+                        }
+                    }
+                }
+            }
+        }
+        Err(OrchestratorError::Api(format!("Could not fetch coordinates for conversation {conversation_id}")))
     }
 }

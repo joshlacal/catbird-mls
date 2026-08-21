@@ -399,6 +399,7 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         description: Option<String>,
         avatar_blob_locator: Option<String>,
         avatar_content_type: Option<String>,
+        aad: Option<Vec<u8>>,
     ) -> Result<crate::types::UpdateGroupMetadataResultFfi, MLSError> {
         let _ = (
             group_id,
@@ -406,6 +407,7 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
             description,
             avatar_blob_locator,
             avatar_content_type,
+            aad,
         );
         Err(MLSError::Internal(
             "MlsCryptoContext::update_group_metadata_encrypted is not implemented for this backend"
@@ -500,6 +502,16 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
     ) -> Result<Vec<u8>, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "export_metadata_key not available on this platform".to_string(),
+        })
+    }
+    /// Export the canonical metadata encryption key (MEK) from a pending staged commit.
+    fn export_metadata_key_from_pending(
+        &self,
+        _group_id: Vec<u8>,
+        _target_epoch: u64,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "export_metadata_key_from_pending not available on this platform".to_string(),
         })
     }
 

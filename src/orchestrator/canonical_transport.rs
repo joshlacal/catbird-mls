@@ -2456,6 +2456,20 @@ fn extract_strict_signed_body(
     Ok((StrictSignedJson::Object(root), None, None))
 }
 
+pub(crate) fn canonical_commit_aad_bytes(
+    aad_json: &serde_json::Value,
+) -> Result<Vec<u8>, TransportError> {
+    let raw = serde_json::to_vec(aad_json)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let strict = parse_strict_signed_json(&raw)?;
+    let projected = project_schema_ref("commitAad", &strict, false)?;
+    let cbor = serde_ipld_dagcbor::to_vec(&projected)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let mut aad = Vec::with_capacity(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0".len() + cbor.len());
+    aad.extend_from_slice(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0");
+    aad.extend_from_slice(&cbor);
+    Ok(aad)
+}
 pub(crate) fn prepare_signed_body(
     binding: &CleanChatSigningContext,
     operation: CanonicalOperation,
