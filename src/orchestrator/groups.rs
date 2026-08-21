@@ -604,6 +604,11 @@ mod tests {
         let bob_did = world.register_device("Bob").await.expect("register bob");
         let alice = world.client("Alice");
         let bob = world.client("Bob");
+        let bob_scoped_did = bob
+            .orchestrator
+            .ensure_device_registered()
+            .await
+            .expect("bob scoped identity");
         let conversation = alice
             .orchestrator
             .create_group("remove epoch fence", None, None)
@@ -615,7 +620,7 @@ mod tests {
         let bob_kp = bob
             .orchestrator
             .mls_context()
-            .create_key_package(bob_did.as_bytes().to_vec())
+            .create_key_package(bob_scoped_did.as_bytes().to_vec())
             .expect("bob kp");
         let _ = alice
             .orchestrator
@@ -716,6 +721,11 @@ mod tests {
             .expect("register carol");
         let alice = world.client("Alice");
         let bob = world.client("Bob");
+        let bob_scoped_did = bob
+            .orchestrator
+            .ensure_device_registered()
+            .await
+            .expect("bob scoped identity");
         let conversation = alice
             .orchestrator
             .create_group("swap epoch fence", None, None)
@@ -727,7 +737,7 @@ mod tests {
         let bob_kp = bob
             .orchestrator
             .mls_context()
-            .create_key_package(bob_did.as_bytes().to_vec())
+            .create_key_package(bob_scoped_did.as_bytes().to_vec())
             .expect("bob kp");
         let _ = alice
             .orchestrator
