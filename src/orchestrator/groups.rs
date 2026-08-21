@@ -3041,13 +3041,58 @@ where
                     return Err(OrchestratorError::MemberSyncFailed);
                 }
                 if result.new_epoch != target_epoch {
-                    let _ = self.mls_context().clear_pending_commit(group_id_bytes.clone());
+                    let _ = self
+                        .mls_context()
+                        .clear_pending_commit(group_id_bytes.clone());
                     return Err(OrchestratorError::EpochMismatch {
                         local: target_epoch,
                         remote: result.new_epoch,
                     });
                 }
-                let merged_epoch = self.mls_context().merge_pending_commit(group_id_bytes.clone())?;
+                let merged_epoch = self
+                    .mls_context()
+                    .merge_pending_commit(group_id_bytes.clone())?;
+                if merged_epoch != target_epoch {
+                    self.mark_needs_rejoin_critical(conversation_id).await;
+                    return Err(OrchestratorError::EpochMismatch {
+                        local: merged_epoch,
+                        remote: target_epoch,
+                    });
+                }
+                let resolved_context = super::types::ResolvedConversationContext {
+                    conversation_id: conversation_id.clone(),
+                    group_id: group_id.clone(),
+                };
+                let cached_state = {
+                    let states = self.group_states().lock().await;
+                    resolved_context.group_state(&states).cloned()
+                };
+                let mut state = match cached_state {
+                    Some(state) => state,
+                    None => self
+                        .storage()
+                        .get_group_state(group_id)
+                        .await?
+                        .ok_or_else(|| {
+                            OrchestratorError::Storage(format!(
+                                "Missing GroupState projection after member removal for conversation {conversation_id}"
+                            ))
+                        })?,
+                };
+                state.conversation_id = conversation_id.clone();
+                state.group_id = group_id.clone();
+                state.epoch = merged_epoch;
+                state.members.retain(|did| !member_dids.contains(did));
+                if let Err(error) = self.storage().set_group_state(&state).await {
+                    self.mark_needs_rejoin_critical(conversation_id).await;
+                    return Err(error);
+                }
+                {
+                    let mut states = self.group_states().lock().await;
+                    super::types::normalize_group_state(&mut states, state);
+                }
+                self.cleanup_epoch_secrets_if_needed(conversation_id, group_id, merged_epoch)
+                    .await;
                 tracing::info!(conversation_id, group_id = %group_id, epoch = merged_epoch, "Member removed successfully and local epoch advanced");
                 Ok(())
             }
@@ -4511,20 +4556,54 @@ where
             (ct, 1)
         };
 
-        let leaf_changes: Vec<serde_json::Value> = if welcome_bytes.is_none() && !member_dids.is_empty() {
-            member_dids
-                .iter()
-                .map(|d| {
-                    serde_json::json!({
-                        "$type": "blue.catbird.chat.defs#removeLeaf",
-                        "deviceId": "00000000-0000-4000-8000-000000000001",
-                        "userDid": d
+        let leaf_changes: Vec<serde_json::Value> =
+            if welcome_bytes.is_none() && !member_dids.is_empty() {
+                let identities = self
+                    .mls_context()
+                    .group_member_identities(group_id.to_vec())?;
+                let mut removals = Vec::new();
+                for did in member_dids {
+                    let mut matched = false;
+                    for identity in &identities {
+                        let identity = std::str::from_utf8(identity).map_err(|_| {
+                            OrchestratorError::InvalidInput(
+                                "MLS member credential is not UTF-8".into(),
+                            )
+                        })?;
+                        let Some(device_id) = identity
+                            .strip_prefix(did)
+                            .and_then(|suffix| suffix.strip_prefix('#'))
+                        else {
+                            continue;
+                        };
+                        uuid::Uuid::parse_str(device_id).map_err(|_| {
+                            OrchestratorError::InvalidInput(
+                                "MLS member credential has an invalid device id".into(),
+                            )
+                        })?;
+                        removals.push((did.clone(), device_id.to_owned()));
+                        matched = true;
+                    }
+                    if !matched {
+                        return Err(OrchestratorError::InvalidInput(format!(
+                            "No MLS leaf found for removal target {did}"
+                        )));
+                    }
+                }
+                removals.sort();
+                removals
+                    .into_iter()
+                    .map(|(user_did, device_id)| {
+                        serde_json::json!({
+                            "$type": "blue.catbird.chat.defs#removeLeaf",
+                            "deviceId": device_id,
+                            "userDid": user_did
+                        })
                     })
-                })
-                .collect()
-        } else {
-            vec![]
-        };
+                    .collect()
+            } else {
+                vec![]
+            };
 
         fn extract_bytes_32(value: Option<&serde_json::Value>) -> Option<[u8; 32]> {
             match value {

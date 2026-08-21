@@ -230,19 +230,18 @@ where
             ))
         })?;
 
-        let cached_state = {
-            let states = self.group_states().lock().await;
-            resolved
-                .group_state(&states)
-                .cloned()
-                .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?
-        };
-
         let persisted_state = self
             .storage()
             .get_group_state(&resolved.group_id)
             .await?
             .ok_or_else(|| OrchestratorError::GroupNotFound(resolved.group_id.clone()))?;
+        let cached_state = {
+            let states = self.group_states().lock().await;
+            resolved
+                .group_state(&states)
+                .cloned()
+                .unwrap_or_else(|| persisted_state.clone())
+        };
 
         if persisted_state.group_id != resolved.group_id
             || persisted_state.conversation_id != resolved.conversation_id
