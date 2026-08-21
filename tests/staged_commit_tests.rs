@@ -607,11 +607,10 @@ async fn staged_add_rejects_empty_authority_but_pure_remove_swap_remains_valid()
         .create_group("empty-add-authority", None, None)
         .await
         .expect("create group");
-    alice
-        .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
-        .await
-        .expect("add Bob");
+    let bob_kp = world.client("Bob").orchestrator.mls_context().create_key_package(bob_did.as_bytes().to_vec()).expect("bob kp");
+    let group_id_bytes = hex::decode(&convo.group_id).unwrap();
+    let _ = alice.orchestrator.mls_context().add_members(group_id_bytes.clone(), vec![catbird_mls::KeyPackageData { data: bob_kp.key_package_data }]).expect("add bob");
+    alice.orchestrator.mls_context().merge_pending_commit(group_id_bytes).expect("merge bob");
     let error = alice
         .orchestrator
         .stage_commit(
@@ -869,11 +868,10 @@ async fn staged_swap_mismatch_does_neither_removal_nor_addition() {
             .create_group(&format!("binding-swap-{case}"), None, None)
             .await
             .expect("create group");
-        alice
-            .orchestrator
-            .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
-            .await
-            .expect("add Bob");
+        let bob_kp = world.client("Bob").orchestrator.mls_context().create_key_package(bob_did.as_bytes().to_vec()).expect("bob kp");
+        let group_bytes = hex::decode(&convo.group_id).unwrap();
+        let _ = alice.orchestrator.mls_context().add_members(group_bytes.clone(), vec![catbird_mls::KeyPackageData { data: bob_kp.key_package_data }]).expect("add bob");
+        alice.orchestrator.mls_context().merge_pending_commit(group_bytes.clone()).expect("merge bob");
         let group_bytes = hex::decode(&convo.group_id).unwrap();
         let members_before = alice
             .orchestrator
@@ -1106,11 +1104,10 @@ async fn staged_swap_fails_closed_when_authorized_device_resolution_errors() {
         .create_group("binding-swap-resolver-error", None, None)
         .await
         .expect("create group");
-    alice
-        .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
-        .await
-        .expect("add Bob");
+    let bob_kp = world.client("Bob").orchestrator.mls_context().create_key_package(bob_did.as_bytes().to_vec()).expect("bob kp");
+    let group_bytes = hex::decode(&convo.group_id).unwrap();
+    let _ = alice.orchestrator.mls_context().add_members(group_bytes.clone(), vec![catbird_mls::KeyPackageData { data: bob_kp.key_package_data }]).expect("add bob");
+    alice.orchestrator.mls_context().merge_pending_commit(group_bytes.clone()).expect("merge bob");
     let group_bytes = hex::decode(&convo.group_id).unwrap();
     let members_before = alice
         .orchestrator

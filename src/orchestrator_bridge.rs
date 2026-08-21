@@ -4994,6 +4994,11 @@ mod tests {
                 quarantined_since_ms: None,
             },
         );
+        let credentials = RecordingCredentialCallback::default();
+        credentials.device_uuids.lock().unwrap().insert(
+            "did:plc:alice".into(),
+            "00000000-0000-4000-8000-000000000001".into(),
+        );
         let bridge = OrchestratorBridge::new(
             mls_context,
             Box::new(storage),
@@ -5001,7 +5006,7 @@ mod tests {
                 "did:plc:alice",
                 Arc::new(AtomicUsize::new(0)),
             )),
-            Box::new(RecordingCredentialCallback::default()),
+            Box::new(credentials),
             full_security_capabilities(),
             FFIOrchestratorConfig {
                 max_devices: 5,
@@ -5043,11 +5048,13 @@ mod tests {
             );
         });
 
+        assert!(
+            bridge
+                .add_members(reset_target_group_id.clone(), vec![])
+                .is_ok(),
+            "add_members translates post-reset group_id and completes policy invitation"
+        );
         let results = [
-            (
-                "add_members",
-                bridge.add_members(reset_target_group_id.clone(), vec![]),
-            ),
             (
                 "remove_members",
                 bridge.remove_members(reset_target_group_id.clone(), vec![]),

@@ -192,6 +192,21 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         member_identities: Vec<Vec<u8>>,
     ) -> Result<Vec<u8>, MLSError>;
 
+    fn remove_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        member_identities: Vec<Vec<u8>>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<RemoveMembersResult, MLSError> {
+        let _ = &aad;
+        let commit_data = self.remove_members(group_id, member_identities)?;
+        Ok(RemoveMembersResult {
+            commit_data,
+            next_confirmation_tag: None,
+            next_group_context_hash: None,
+        })
+    }
+
     /// Atomically swap members in a single commit: remove old and add new.
     fn swap_members(
         &self,

@@ -274,6 +274,12 @@ targets = [
         'public object FfiConverterTypeMLSCommitError',
         '\npublic object ',
     ),
+    (
+        'sealed class CleanChatTransportFfiException: kotlin.Exception() {',
+        '\n\n    companion object ErrorHandler',
+        'public object FfiConverterTypeCleanChatTransportFfiError',
+        '\npublic object ',
+    ),
 ]
 
 for class_head, class_tail, conv_head, conv_tail in targets:

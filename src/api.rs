@@ -1734,6 +1734,16 @@ impl MLSContext {
         group_id: Vec<u8>,
         member_identities: Vec<Vec<u8>>,
     ) -> Result<Vec<u8>, MLSError> {
+        self.remove_members_with_aad(group_id, member_identities, None)
+            .map(|r| r.commit_data)
+    }
+
+    pub fn remove_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        member_identities: Vec<Vec<u8>>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<RemoveMembersResult, MLSError> {
         self.check_suspended()?;
         crate::info_log!(
             "[MLS-FFI] remove_members: Removing {} members from group {}",
@@ -1756,14 +1766,14 @@ impl MLSContext {
             );
         }
 
-        let commit_data = inner.remove_members_internal(&group_id, &member_identities)?;
+        let res = inner.remove_members_internal(&group_id, &member_identities, aad)?;
 
         crate::info_log!(
             "[MLS-FFI] remove_members: Complete, commit size: {} bytes",
-            commit_data.len()
+            res.commit_data.len()
         );
 
-        Ok(commit_data)
+        Ok(res)
     }
 
     /// Atomically swap members: remove old + add new in a single commit.
@@ -1856,30 +1866,25 @@ impl MLSContext {
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata ref: {:?}", e)))?;
 
-            let mut cb = group
+            let has_app_data_dict = group.extensions().app_data_dictionary().is_some();
+            let cb = group
                 .commit_builder()
                 .propose_removals(indices)
                 .propose_adds(kps.iter().cloned());
-            if let Some(ref_json) = planned_ref.clone() {
-                cb = cb.add_proposal(Proposal::AppDataUpdate(Box::new(
-                    AppDataUpdateProposal::update(
-                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                        ref_json,
-                    ),
-                )));
-            }
             let mut cs =
                 cb.load_psks(provider.storage())
                     .map_err(|e| MLSError::AddMembersFailed {
                         message: format!("swap load_psks: {:?}", e),
                     })?;
-            if let Some(ref_json) = planned_ref {
-                let mut u = cs.app_data_dictionary_updater();
-                u.set(ComponentData::from_parts(
-                    crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                    ref_json.into(),
-                ));
-                cs.with_app_data_dictionary_updates(u.changes());
+            if has_app_data_dict {
+                if let Some(ref_json) = planned_ref {
+                    let mut u = cs.app_data_dictionary_updater();
+                    u.set(ComponentData::from_parts(
+                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json.into(),
+                    ));
+                    cs.with_app_data_dictionary_updates(u.changes());
+                }
             }
             let bundle = cs
                 .build(provider.rand(), provider.crypto(), signer, |_| true)
@@ -2095,16 +2100,10 @@ impl MLSContext {
                     )
                     .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
 
-                    let mut commit_builder =
+                    let has_app_data_dict =
+                        group.extensions().app_data_dictionary().is_some();
+                    let commit_builder =
                         group.commit_builder().propose_adds(kps.iter().cloned());
-                    if let Some(ref_json) = planned_reference_json.clone() {
-                        commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(
-                            Box::new(AppDataUpdateProposal::update(
-                                crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                                ref_json,
-                            )),
-                        ));
-                    }
 
                     let mut commit_stage =
                         commit_builder.load_psks(provider.storage()).map_err(|e| {
@@ -2115,15 +2114,16 @@ impl MLSContext {
                             MLSError::OpenMLSError
                         })?;
 
-                    if let Some(ref_json) = planned_reference_json {
-                        let mut updater = commit_stage.app_data_dictionary_updater();
-                        updater.set(ComponentData::from_parts(
-                            crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                            ref_json.into(),
-                        ));
-                        commit_stage.with_app_data_dictionary_updates(updater.changes());
+                    if has_app_data_dict {
+                        if let Some(ref_json) = planned_reference_json {
+                            let mut updater = commit_stage.app_data_dictionary_updater();
+                            updater.set(ComponentData::from_parts(
+                                crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                                ref_json.into(),
+                            ));
+                            commit_stage.with_app_data_dictionary_updates(updater.changes());
+                        }
                     }
-
                     let commit_bundle = commit_stage
                         .build(provider.rand(), provider.crypto(), signer, |_| true)
                         .map_err(|e| {
@@ -2282,18 +2282,10 @@ impl MLSContext {
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
 
-            let mut commit_builder = group
+            let has_app_data_dict = group.extensions().app_data_dictionary().is_some();
+            let commit_builder = group
                 .commit_builder()
                 .force_self_update(true);
-
-            if let Some(ref_json) = planned_reference_json.clone() {
-                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
-                    AppDataUpdateProposal::update(
-                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                        ref_json,
-                    ),
-                )));
-            }
 
             let mut commit_stage = commit_builder
                 .load_psks(provider.storage())
@@ -2302,15 +2294,16 @@ impl MLSContext {
                     MLSError::OpenMLSError
                 })?;
 
-            if let Some(ref_json) = planned_reference_json {
-                let mut updater = commit_stage.app_data_dictionary_updater();
-                updater.set(ComponentData::from_parts(
-                    crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                    ref_json.into(),
-                ));
-                commit_stage.with_app_data_dictionary_updates(updater.changes());
+            if has_app_data_dict {
+                if let Some(ref_json) = planned_reference_json {
+                    let mut updater = commit_stage.app_data_dictionary_updater();
+                    updater.set(ComponentData::from_parts(
+                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json.into(),
+                    ));
+                    commit_stage.with_app_data_dictionary_updates(updater.changes());
+                }
             }
-
             let commit_bundle = commit_stage
                 .build(provider.rand(), provider.crypto(), signer, |_| true)
                 .map_err(|e| {
@@ -2322,7 +2315,6 @@ impl MLSContext {
                     crate::error_log!("[MLS-FFI] ❌ self_update stage failed: {:?}", e);
                     MLSError::OpenMLSError
                 })?;
-
             let (commit, welcome_option, _group_info) = commit_bundle.into_contents();
 
             // ✅ RATCHET DESYNC FIX: DO NOT merge commit here - use send-then-merge pattern
@@ -4295,6 +4287,7 @@ impl MLSContext {
         })
     }
 
+    /// Get the SHA-256 hash of the TLS-serialized GroupContext.
     /// Manually export epoch secret for a group
     /// Call this after creating the conversation record in SQLCipher to ensure
     /// the foreign key constraint is satisfied when storing the epoch secret
@@ -4782,39 +4775,31 @@ impl MLSContext {
             )
             .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
 
-            let mut commit_builder = group.commit_builder().consume_proposal_store(true);
-            if let Some(ref_json) = planned_reference_json.clone() {
-                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
-                    AppDataUpdateProposal::update(
-                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                        ref_json,
-                    ),
-                )));
-            }
+            let has_app_data_dict = group.extensions().app_data_dictionary().is_some();
+            let commit_builder = group.commit_builder().consume_proposal_store(true);
 
             let mut commit_stage = commit_builder
                 .load_psks(provider.storage())
                 .map_err(|_| MLSError::OpenMLSError)?;
 
-            if let Some(ref_json) = planned_reference_json {
-                let mut updater = commit_stage.app_data_dictionary_updater();
-                updater.set(ComponentData::from_parts(
-                    crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                    ref_json.into(),
-                ));
-                commit_stage.with_app_data_dictionary_updates(updater.changes());
+            if has_app_data_dict {
+                if let Some(ref_json) = planned_reference_json {
+                    let mut updater = commit_stage.app_data_dictionary_updater();
+                    updater.set(ComponentData::from_parts(
+                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                        ref_json.into(),
+                    ));
+                    commit_stage.with_app_data_dictionary_updates(updater.changes());
+                }
             }
-
             let commit_bundle = commit_stage
                 .build(provider.rand(), provider.crypto(), signer, |_| true)
                 .map_err(|_| MLSError::OpenMLSError)?
                 .stage_commit(provider)
                 .map_err(|_| MLSError::OpenMLSError)?;
 
-            let (commit_msg, _welcome, _group_info) = commit_bundle.into_contents();
-
-            // Serialize the commit
-            let commit_data = commit_msg
+            let (commit, _, _) = commit_bundle.into_contents();
+            let commit_data = commit
                 .tls_serialize_detached()
                 .map_err(|_| MLSError::SerializationError)?;
 
@@ -7457,6 +7442,15 @@ impl MlsCryptoContext for MLSContext {
         member_identities: Vec<Vec<u8>>,
     ) -> Result<Vec<u8>, MLSError> {
         self.remove_members(group_id, member_identities)
+    }
+
+    fn remove_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        member_identities: Vec<Vec<u8>>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<RemoveMembersResult, MLSError> {
+        self.remove_members_with_aad(group_id, member_identities, aad)
     }
 
     fn swap_members(

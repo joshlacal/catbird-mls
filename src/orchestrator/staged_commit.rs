@@ -228,11 +228,16 @@ where
                     .iter()
                     .map(|did| did.as_bytes().to_vec())
                     .collect();
-                let commit_bytes = self
+                let aad_bytes = self
+                    .prepare_commit_aad_context(conversation_id, &group_id_bytes, source_epoch + 1)
+                    .await
+                    .ok()
+                    .map(|ctx| ctx.aad_bytes);
+                let remove_res = self
                     .mls_context()
-                    .remove_members(group_id_bytes.clone(), member_identities)?;
+                    .remove_members_with_aad(group_id_bytes.clone(), member_identities, aad_bytes)?;
                 (
-                    commit_bytes,
+                    remove_res.commit_data,
                     None,
                     StagedCommitKindSummary::RemoveMembers { member_dids },
                 )
@@ -249,14 +254,15 @@ where
                 let remove_ids: Vec<Vec<u8>> =
                     remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
                 let (commit_bytes, welcome_bytes) = if add_dids.is_empty() {
-                    // OpenMLS rejects swap_members with an empty add batch.
-                    // Preserve the public pure-removal Swap operation by
-                    // staging the equivalent removal commit instead.
-                    (
-                        self.mls_context()
-                            .remove_members(group_id_bytes.clone(), remove_ids)?,
-                        None,
-                    )
+                    let aad_bytes = self
+                        .prepare_commit_aad_context(conversation_id, &group_id_bytes, source_epoch + 1)
+                        .await
+                        .ok()
+                        .map(|ctx| ctx.aad_bytes);
+                    let remove_res = self
+                        .mls_context()
+                        .remove_members_with_aad(group_id_bytes.clone(), remove_ids, aad_bytes)?;
+                    (remove_res.commit_data, None)
                 } else {
                     let swap_result = self.mls_context().swap_members(
                         group_id_bytes.clone(),

@@ -37,6 +37,8 @@ struct StoredMessage {
 struct StoredConversation {
     view: ConversationView,
     members: Vec<String>,
+    conversation_kind: String,
+    metadata_snapshot: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +165,11 @@ struct MockState {
     /// recipients (the newly added members); we fan it out by storing one copy
     /// per recipient DID.
     welcomes: HashMap<(String, String), Vec<Vec<u8>>>,
+
+    /// Submitted prepared requests
+    submitted_prepared_requests: Vec<catbird_mls::orchestrator::canonical_transport::PreparedRequest>,
+    /// Call count for get_key_packages
+    get_key_packages_call_count: usize,
 
     /// Failure injection flags.
     failures: FailureFlags,
@@ -341,8 +348,6 @@ impl MockDeliveryService {
             .failures
             .fail_next_commit_group_change = true;
     }
-
-    /// Make the next `n` get_conversations calls fail.
     pub fn fail_get_conversations_n_times(&self, n: u32) {
         self.state
             .lock()
@@ -563,14 +568,25 @@ impl MockDeliveryService {
     /// Force the server-side epoch of a conversation (stale-needs_rejoin
     /// tests where the local group must be >= the server listing epoch).
     #[allow(dead_code)]
+    #[allow(dead_code)]
     pub fn set_conversation_epoch_for_test(&self, convo_id: &str, epoch: u64) {
         let mut guard = self.state.lock().unwrap();
         if let Some(c) = guard.conversations.get_mut(convo_id) {
             c.view.epoch = epoch;
-        } else if let Some(c) = guard.conversations.values_mut().find(|c| c.view.group_id == convo_id) {
+        } else if let Some(c) = guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id) {
             c.view.epoch = epoch;
         }
     }
+    #[allow(dead_code)]
+    pub fn update_conversation_metadata_snapshot_for_test(&self, convo_id: &str, snapshot: serde_json::Value) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(c) = guard.conversations.get_mut(convo_id) {
+            c.metadata_snapshot = Some(snapshot);
+        } else if let Some(c) = guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id) {
+            c.metadata_snapshot = Some(snapshot);
+        }
+    }
+
 
     /// Force the server-side `sequencerDid` of a conversation (WS-4 rung 2
     /// exposure tests; ADR-010 D4).
@@ -718,6 +734,14 @@ impl MockDeliveryService {
             spoofed_sender_did.to_string(),
         );
     }
+    pub fn submitted_prepared_requests(&self) -> Vec<catbird_mls::orchestrator::canonical_transport::PreparedRequest> {
+        self.state.lock().unwrap().submitted_prepared_requests.clone()
+    }
+
+    pub fn get_key_packages_call_count(&self) -> usize {
+        self.state.lock().unwrap().get_key_packages_call_count
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -797,14 +821,16 @@ impl MockDeliveryService {
             sequencer_did: None,
         };
 
+        let conversation_kind = "group".to_string();
         let stored = StoredConversation {
             view: view.clone(),
             members: members.clone(),
+            conversation_kind,
+            metadata_snapshot: None,
         };
 
         guard.conversations.insert(conversation_id.clone(), stored);
         guard.messages.entry(conversation_id.clone()).or_default();
-
         // Fan out the Welcome (if provided) to each initial member so they can
         // later pull it via `get_welcome`. Also store the commit as a message
         // so existing members (not relevant at creation time, but kept for
@@ -978,10 +1004,12 @@ impl MockDeliveryService {
             .effective_did_from_guard(&guard)
             .ok_or(OrchestratorError::NotAuthenticated)?;
 
-        let convo = guard
-            .conversations
-            .get_mut(convo_id)
-            .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))?;
+        let convo = if guard.conversations.contains_key(convo_id) {
+            guard.conversations.get_mut(convo_id)
+        } else {
+            guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
+        }
+        .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))?;
 
         for did in member_dids {
             if !convo.members.contains(did) {
@@ -1446,6 +1474,7 @@ impl MLSAPIClient for MockDeliveryService {
         &self,
         request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
     ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        self.state.lock().unwrap().submitted_prepared_requests.push(request.clone());
         let body_bytes = request.body.as_deref().unwrap_or(&[]);
         let body_val: serde_json::Value = if !body_bytes.is_empty()
             && request.operation
@@ -1519,6 +1548,20 @@ impl MLSAPIClient for MockDeliveryService {
                             .group_infos
                             .insert(res.conversation.conversation_id.clone(), gi_bytes);
                     }
+                }
+                let kind = inner_body
+                    .get("conversationKind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("group");
+                if let Some(stored) = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .conversations
+                    .get_mut(&res.conversation.conversation_id)
+                {
+                    stored.conversation_kind = kind.to_string();
+                    stored.metadata_snapshot = inner_body.get("metadataSnapshot").cloned();
                 }
                 let participants: Vec<serde_json::Value> = res
                     .conversation
@@ -1884,26 +1927,41 @@ impl MLSAPIClient for MockDeliveryService {
                     .unwrap_or_else(|| "did:plc:mock".to_string());
 
                 let key_pkg_dids: Vec<String> = guard.key_packages.keys().cloned().collect();
-                let mut new_epoch = 1;
-                if let Some(stored) = guard.conversations.get_mut(convo_id) {
-                    stored.view.epoch += 1;
-                    new_epoch = stored.view.epoch;
-                    let leaf_changes = inner_body.get("manifest").and_then(|m| m.get("leafChanges")).and_then(|l| l.as_array());
-                    if let Some(changes) = leaf_changes.filter(|c| !c.is_empty()) {
-                        for change in changes {
-                            if let Some(user_did) = change.get("userDid").and_then(|u| u.as_str()) {
-                                stored.members.retain(|m| m != user_did && !m.starts_with(&format!("{user_did}#")));
-                                stored.view.members.retain(|m| m.did != user_did && !m.did.starts_with(&format!("{user_did}#")));
-                            }
-                        }
+                let is_policy_transition = inner_body.get("participantChanges").is_some();
+                let mut new_epoch = if let Some(stored) = if guard.conversations.contains_key(convo_id) {
+                    guard.conversations.get(convo_id)
+                } else {
+                    guard.conversations.values().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
+                } {
+                    stored.view.epoch
+                } else {
+                    0
+                };
+                if !is_policy_transition {
+                    if let Some(stored) = if guard.conversations.contains_key(convo_id) {
+                        guard.conversations.get_mut(convo_id)
                     } else {
-                        for k in key_pkg_dids {
-                            if !stored.members.contains(&k) {
-                                stored.members.push(k.clone());
-                                stored.view.members.push(MemberView {
-                                    did: k,
-                                    role: MemberRole::Member,
-                                });
+                        guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
+                    } {
+                        stored.view.epoch += 1;
+                        new_epoch = stored.view.epoch;
+                        let leaf_changes = inner_body.get("manifest").and_then(|m| m.get("leafChanges")).and_then(|l| l.as_array());
+                        if let Some(changes) = leaf_changes.filter(|c| !c.is_empty()) {
+                            for change in changes {
+                                if let Some(user_did) = change.get("userDid").and_then(|u| u.as_str()) {
+                                    stored.members.retain(|m| m != user_did && !m.starts_with(&format!("{user_did}#")));
+                                    stored.view.members.retain(|m| m.did != user_did && !m.did.starts_with(&format!("{user_did}#")));
+                                }
+                            }
+                        } else {
+                            for k in key_pkg_dids {
+                                if !stored.members.contains(&k) {
+                                    stored.members.push(k.clone());
+                                    stored.view.members.push(MemberView {
+                                        did: k,
+                                        role: MemberRole::Member,
+                                    });
+                                }
                             }
                         }
                     }
@@ -2136,6 +2194,60 @@ impl MLSAPIClient for MockDeliveryService {
                     body: serde_json::to_vec(&serde_json::json!({"result": {"requested": true}})).unwrap(),
                 })
             }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversations => {
+                let guard = self.state.lock().unwrap();
+                let items: Vec<serde_json::Value> = guard.conversations.values().map(|c| {
+                    let participants: Vec<serde_json::Value> = c.members.iter().map(|did| {
+                        serde_json::json!({
+                            "userDid": did,
+                            "role": "admin",
+                            "status": "active"
+                        })
+                    }).collect();
+                    let group_id_bytes = hex::decode(&c.view.group_id).unwrap_or_else(|_| vec![0u8; 32]);
+                    let meta = c.metadata_snapshot.clone().unwrap_or_else(|| serde_json::json!({
+                        "metadataVersion": 1,
+                        "nonce": base64::engine::general_purpose::STANDARD.encode([0u8; 12]),
+                        "ciphertext": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                    }));
+                    serde_json::json!({
+                        "state": {
+                            "conversationKind": c.conversation_kind.clone(),
+                            "coordinates": {
+                                "conversationId": c.view.conversation_id,
+                                "groupId": base64::engine::general_purpose::STANDARD.encode(&group_id_bytes),
+                                "epoch": c.view.epoch,
+                                "generation": 0,
+                                "stateVersion": 0,
+                                "lifecycle": "active",
+                                "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                                "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+                            },
+                            "participants": participants,
+                            "metadataSnapshot": meta,
+                            "snapshotSeq": 1
+                        }
+                    })
+                }).collect();
+                let output = serde_json::json!({
+                    "items": items
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetEntries => {
+                let output = serde_json::json!({
+                    "entries": []
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
             _ => Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                 status: 200,
                 content_type: Some("application/json".into()),
@@ -2260,6 +2372,7 @@ impl MLSAPIClient for MockDeliveryService {
         dids: &[String],
     ) -> Result<Vec<KeyPackageRef>> {
         let mut guard = self.state.lock().unwrap();
+        guard.get_key_packages_call_count += 1;
         check_fail(
             &mut guard.failures.fail_next_get_key_packages,
             "injected get_key_packages failure",

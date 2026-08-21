@@ -947,3 +947,147 @@ fn test_remove_nonexistent_member_graceful() {
     // when no valid members are found to remove
     println!("\n🎉 SUCCESS: Nonexistent member handling test PASSED");
 }
+
+// ============================================================================
+// Regression Tests for AAD-Aware Member Removal & Coordinates
+// ============================================================================
+
+fn parse_public_commit_wire(bytes: &[u8]) -> (Vec<u8>, Vec<Proposal>) {
+    use openmls::messages::proposals_in::ProposalOrRefIn;
+    use openmls::prelude::tls_codec::Deserialize;
+    use openmls_rust_crypto::OpenMlsRustCrypto;
+    let crypto = OpenMlsRustCrypto::default();
+    let mut inner = &bytes[4..]; // skip 2 bytes wire format + 2 bytes version
+    let _group_id = VLBytes::tls_deserialize(&mut inner).unwrap();
+    let _epoch = u64::tls_deserialize(&mut inner).unwrap();
+    let _sender = Sender::tls_deserialize(&mut inner).unwrap();
+    let aad = VLBytes::tls_deserialize(&mut inner).unwrap();
+    let content_type = u8::tls_deserialize(&mut inner).unwrap();
+    assert_eq!(content_type, 3); // Commit
+    let proposal_vector = VLBytes::tls_deserialize(&mut inner).unwrap();
+    let mut proposals = proposal_vector.as_slice();
+    let mut parsed_proposals = Vec::new();
+    while !proposals.is_empty() {
+        let p_or_ref_in = ProposalOrRefIn::tls_deserialize(&mut proposals).unwrap();
+        let validated = p_or_ref_in.validate(crypto.crypto(), Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519, ProtocolVersion::default()).unwrap();
+        match validated {
+            ProposalOrRef::Proposal(p) => parsed_proposals.push(*p),
+            _ => panic!("Expected inline proposal in commit"),
+        }
+    }
+    (aad.as_slice().to_vec(), parsed_proposals)
+}
+
+#[test]
+fn test_removal_commit_aad_and_coordinates_regression() {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    let (context, _dir) = new_context();
+    let alice_id = b"did:plc:alice#11111111-1111-4111-8111-111111111111";
+    let bob_id = b"did:plc:bob#22222222-2222-4222-8222-222222222222";
+
+    let created = context
+        .create_group(alice_id.to_vec(), None)
+        .unwrap();
+    let group_id = created.group_id;
+
+    let bob_kp = key_package_for(&context, bob_id);
+    let _add_res = context
+        .add_members(group_id.clone(), vec![bob_kp])
+        .unwrap();
+    context.merge_pending_commit(group_id.clone()).unwrap();
+
+    // Prepare test AAD
+    let convo_uuid = uuid::Uuid::new_v4();
+    let transition_uuid = uuid::Uuid::new_v4();
+    let prior_tag = [0x11u8; 32];
+    let prior_gch = [0x22u8; 32];
+    let prior_gid = [0x33u8; 32];
+
+    let aad_prior = serde_json::json!({
+        "confirmationTag": STANDARD.encode(&prior_tag),
+        "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+        "epoch": 1,
+        "generation": 0,
+        "groupContextHash": STANDARD.encode(&prior_gch),
+        "groupId": STANDARD.encode(&prior_gid),
+        "lifecycle": "active",
+        "stateVersion": 1
+    });
+
+    let aad_json = serde_json::json!({
+        "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
+        "generation": 0,
+        "prior": aad_prior,
+        "protocolVersion": "1",
+        "transitionId": STANDARD.encode(transition_uuid.as_bytes())
+    });
+
+    let aad_bytes = catbird_mls::orchestrator::canonical_commit_aad_bytes(&aad_json)
+        .expect("canonical AAD encoding must succeed");
+
+    // Verify prefix
+    assert!(aad_bytes.starts_with(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0"));
+
+    // Stage removal with AAD
+    let remove_res = context
+        .remove_members_with_aad(
+            group_id.clone(),
+            vec![bob_id.to_vec()],
+            Some(aad_bytes.clone()),
+        )
+        .expect("remove_members_with_aad must succeed");
+
+    // 1. Verify next coordinates are extracted and non-empty
+    assert!(remove_res.next_confirmation_tag.is_some());
+    let next_tag = remove_res.next_confirmation_tag.unwrap();
+    assert_eq!(next_tag.len(), 32);
+
+    assert!(remove_res.next_group_context_hash.is_some());
+    let next_gch = remove_res.next_group_context_hash.unwrap();
+    assert_eq!(next_gch.len(), 32);
+
+    // 2. Deserialize commit and verify authenticated_data matches EXACTLY
+    let (extracted_aad, proposals) = parse_public_commit_wire(&remove_res.commit_data);
+    assert_eq!(
+        extracted_aad,
+        aad_bytes,
+        "Commit authenticated_data must match server-required prefixed canonical CBOR AAD"
+    );
+
+    // 3. Verify Remove proposal exists and no AppDataUpdate proposal exists
+    assert!(proposals.iter().any(|p| matches!(p, Proposal::Remove(_))), "Removal commit must contain Remove proposal");
+    assert!(!proposals.iter().any(|p| matches!(p, Proposal::AppDataUpdate(_))), "Removal commit must NOT contain AppDataUpdate proposal");
+
+    // Merge the removal commit
+    let new_epoch = context.merge_pending_commit(group_id.clone()).unwrap().new_epoch;
+    assert_eq!(new_epoch, 2);
+}
+
+#[test]
+fn test_staged_failure_clears_aad() {
+    let (context, _dir) = new_context();
+    let alice_id = b"did:plc:alice#11111111-1111-4111-8111-111111111111";
+
+    let created = context
+        .create_group(alice_id.to_vec(), None)
+        .unwrap();
+    let group_id = created.group_id;
+
+    // Try to remove a non-existent member with AAD set
+    let dummy_aad = b"CATBIRD-CHAT-MLS-AAD-COMMIT\0dummy-aad".to_vec();
+    let err = context.remove_members_with_aad(
+        group_id.clone(),
+        vec![b"did:plc:nonexistent".to_vec()],
+        Some(dummy_aad),
+    );
+    assert!(err.is_err());
+
+    // Next valid commit (self-update) without AAD must produce empty authenticated_data
+    let update_res = context.self_update(group_id.clone()).unwrap();
+    let (extracted_aad, _) = parse_public_commit_wire(&update_res.commit_data);
+    assert!(
+        extracted_aad.is_empty(),
+        "Failed staged commit must not leave group AAD dirty"
+    );
+}

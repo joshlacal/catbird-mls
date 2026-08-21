@@ -49,6 +49,14 @@ pub struct AddMembersResult {
     pub next_group_context_hash: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct RemoveMembersResult {
+    pub commit_data: Vec<u8>,
+    pub next_confirmation_tag: Option<Vec<u8>>,
+    pub next_group_context_hash: Option<Vec<u8>>,
+}
+
 /// FFI surface for `MLSContext::update_group_metadata_encrypted` (Phase A.2).
 ///
 /// All five fields are mandatory. The caller must:

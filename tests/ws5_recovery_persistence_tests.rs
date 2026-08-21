@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use catbird_mls::orchestrator::recovery::RecoveryTracker;
 use catbird_mls::orchestrator::{
-    constants, ConversationState, CredentialStore, FailingCrypto, IncomingEnvelope,
+    constants, ConversationState, CredentialStore, IncomingEnvelope,
     MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, OrchestratorError,
     PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState, ResetRecordOutcome,
 };
@@ -865,7 +865,6 @@ async fn failed_pending_delete_intent_write_refuses_destructive_cleanup() {
 // WS-5 review fixes (2026-06-10)
 // ───────────────────────────────────────────────────────────────────────────
 
-use catbird_mls::orchestrator::IncomingEnvelope;
 
 /// Event observer that records WS-5.2 recovery-storage escalations.
 #[derive(Default)]
@@ -1198,7 +1197,7 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
     // Maxed-out persisted row, as accumulated rejoin failures would write it.
     storage.seed_recovery_backoff(PersistedRecoveryBackoff {
         conversation_id: convo_id.clone(),
-        failed_rejoin_count: max,
+        failed_rejoin_count: 3,
         last_attempt_at_ms: now_ms(),
         quarantined_until_ms: Some(now_ms() + constants::RECOVERY_BACKOFF_TTL.as_millis() as i64),
     });
@@ -1345,7 +1344,7 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
         Arc::new(FailingCrypto::peer_bad()),
         Arc::new(storage.clone()),
         Arc::new(ds.clone_as(did)),
-        Arc::new(credentials),
+        Arc::new(credentials.clone()),
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
@@ -1359,6 +1358,7 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
     for i in 0..3 {
         let _ = orchestrator
             .process_incoming(&IncomingEnvelope {
+                conversation_id: convo_id.clone(),
                 sender_did: "did:plc:mallory".to_string(),
                 ciphertext: format!("exit-race-{i}").into_bytes(),
                 timestamp: chrono::Utc::now(),

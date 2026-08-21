@@ -201,6 +201,7 @@ async fn test_commit_messages_advance_epoch() {
     // commit + Welcome to the mock server, and merges Alice's pending commit
     // locally. Alice ends at epoch 1.
     let alice = world.client("Alice");
+    let bob_did = world.client("Bob").did.clone();
     let convo = alice
         .orchestrator
         .create_group("Epoch Test", None, None)
@@ -229,7 +230,7 @@ async fn test_commit_messages_advance_epoch() {
     let bob_welcome = bob
         .orchestrator
         .api_client()
-        .get_welcome(&group_id)
+        .get_welcome(&convo.conversation_id)
         .await
         .expect("bob get_welcome failed");
     let bob_convo = bob

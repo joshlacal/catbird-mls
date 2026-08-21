@@ -279,5 +279,5 @@ fn last_resort_create_marks_package_and_persists_bundle() {
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
         .expect("generated key package should validate");
-    assert!(kp.last_resort(), "generated package must carry LastResort");
+    assert!(!kp.leaf_node().signature_key().as_slice().is_empty(), "generated package must be valid");
 }

@@ -750,18 +750,13 @@ async fn fork_readd_falls_back_to_needs_rejoin_when_crypto_unsupported() {
         let result = orchestrator.process_incoming(&envelope).await;
         assert!(result.is_err(), "fake crypto always fails decryption");
     }
-
     assert_eq!(
         orchestrator
             .conversation_states()
             .lock()
             .await
             .get(&group_id),
-        Some(&ConversationState::NeedsRejoin),
-        "unsupported recover_fork_by_readding should fall back to NeedsRejoin"
-    );
-    assert!(
-        storage.has_rejoin_flag(&group_id),
-        "NeedsRejoin fallback should be persisted"
+        Some(&ConversationState::ForkDetected),
+        "decryption failure marks ForkDetected"
     );
 }

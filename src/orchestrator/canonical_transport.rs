@@ -2456,7 +2456,7 @@ fn extract_strict_signed_body(
     Ok((StrictSignedJson::Object(root), None, None))
 }
 
-pub(crate) fn canonical_commit_aad_bytes(
+pub fn canonical_commit_aad_bytes(
     aad_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
     let raw = serde_json::to_vec(aad_json)

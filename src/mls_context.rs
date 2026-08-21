@@ -1,4 +1,4 @@
-use openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY;
+use crate::types::RemoveMembersResult;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_libcrux_crypto::CryptoProvider as LibcruxCrypto;
@@ -3220,7 +3220,8 @@ impl MLSContext {
         &mut self,
         group_id: &[u8],
         member_identities: &[Vec<u8>],
-    ) -> Result<Vec<u8>, MLSError> {
+        aad: Option<Vec<u8>>,
+    ) -> Result<RemoveMembersResult, MLSError> {
         let gid = GroupId::from_slice(group_id);
 
         self.with_group(&gid, |group, provider, signer| {
@@ -3257,50 +3258,55 @@ impl MLSContext {
                 indices_to_remove.len()
             );
 
-            let planned_reference_json = metadata::planned_metadata_reference_json(
-                metadata::current_metadata_reference(group).as_ref(),
-                false, /* post-Phase-A: legacy 0xff00 path retired */
-                false,
-            )
-            .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
+            let join_config = openmls::group::MlsGroupJoinConfig::builder()
+                .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                .use_ratchet_tree_extension(true)
+                .build();
+            let _ = group.set_configuration(provider.storage(), &join_config);
 
-            let mut commit_builder = group.commit_builder().propose_removals(indices_to_remove);
-            if let Some(ref_json) = planned_reference_json.clone() {
-                commit_builder = commit_builder.add_proposal(Proposal::AppDataUpdate(Box::new(
-                    AppDataUpdateProposal::update(
-                        metadata::METADATA_REFERENCE_COMPONENT_ID,
-                        ref_json,
-                    ),
-                )));
+            if let Some(aad_bytes) = &aad {
+                group.set_aad(aad_bytes.clone());
             }
 
-            let mut commit_stage = commit_builder.load_psks(provider.storage()).map_err(|e| {
+            let commit_builder = group
+                .commit_builder()
+                .propose_removals(indices_to_remove)
+                .force_self_update(true);
+
+            let commit_stage_res = commit_builder.load_psks(provider.storage()).map_err(|e| {
                 crate::error_log!("[MLS-CONTEXT] remove_members load_psks failed: {:?}", e);
                 MLSError::OpenMLS(format!("remove_members load_psks failed: {:?}", e))
-            })?;
+            });
 
-            if let Some(ref_json) = planned_reference_json {
-                let mut updater = commit_stage.app_data_dictionary_updater();
-                updater.set(ComponentData::from_parts(
-                    metadata::METADATA_REFERENCE_COMPONENT_ID,
-                    ref_json.into(),
-                ));
-                commit_stage.with_app_data_dictionary_updates(updater.changes());
-            }
+            let commit_stage = match commit_stage_res {
+                Ok(cs) => cs,
+                Err(e) => {
+                    if aad.is_some() {
+                        group.set_aad(vec![]);
+                    }
+                    return Err(e);
+                }
+            };
 
-            let commit_bundle = commit_stage
+            let commit_bundle_res = commit_stage
                 .build(provider.rand(), provider.crypto(), signer, |_| true)
                 .map_err(|e| {
                     crate::error_log!("[MLS-CONTEXT] remove_members build failed: {:?}", e);
                     MLSError::OpenMLS(format!("remove_members build failed: {:?}", e))
-                })?
-                .stage_commit(provider)
-                .map_err(|e| {
-                    crate::error_log!("[MLS-CONTEXT] remove_members stage failed: {:?}", e);
-                    MLSError::OpenMLS(format!("remove_members stage failed: {:?}", e))
-                })?;
+                })
+                .and_then(|stage| {
+                    stage.stage_commit(provider).map_err(|e| {
+                        crate::error_log!("[MLS-CONTEXT] remove_members stage failed: {:?}", e);
+                        MLSError::OpenMLS(format!("remove_members stage failed: {:?}", e))
+                    })
+                });
 
-            let (commit, welcome_option, _group_info) = commit_bundle.into_contents();
+            if aad.is_some() {
+                group.set_aad(vec![]);
+            }
+
+            let commit_bundle = commit_bundle_res?;
+            let (commit, welcome_option, group_info) = commit_bundle.into_contents();
 
             // 3. DO NOT merge - send-then-merge pattern
             crate::debug_log!("[MLS-CONTEXT] Remove commit staged (NOT merged)");
@@ -3317,12 +3323,38 @@ impl MLSContext {
                 crate::error_log!("[MLS-CONTEXT] ⚠️ Unexpected Welcome from remove_members!");
             }
 
+            let next_gch = group.pending_commit().and_then(|pending| {
+                pending.group_context().tls_serialize_detached().ok().map(|gc_bytes| {
+                    sha2::Sha256::digest(&gc_bytes).to_vec()
+                })
+            }).or_else(|| {
+                group_info.as_ref().and_then(|gi| {
+                    gi.group_context().tls_serialize_detached().ok().map(|gc_bytes| {
+                        sha2::Sha256::digest(&gc_bytes).to_vec()
+                    })
+                })
+            });
+
+            use openmls::prelude::tls_codec::DeserializeBytes as _;
+            let next_tag = MlsMessageIn::tls_deserialize_exact_bytes(&commit_bytes)
+                .ok()
+                .and_then(|msg_in| match msg_in.extract() {
+                    MlsMessageBodyIn::PublicMessage(pm) => pm.confirmation_tag().cloned(),
+                    _ => None,
+                })
+                .and_then(|t| t.tls_serialize_detached().ok())
+                .map(|tag_bytes| if tag_bytes.len() > 32 { tag_bytes[tag_bytes.len() - 32..].to_vec() } else { tag_bytes });
+
             crate::info_log!(
                 "[MLS-CONTEXT] ✅ Remove commit created, size: {} bytes",
                 commit_bytes.len()
             );
 
-            Ok(commit_bytes)
+            Ok(RemoveMembersResult {
+                commit_data: commit_bytes,
+                next_confirmation_tag: next_tag,
+                next_group_context_hash: next_gch,
+            })
         })
     }
 
