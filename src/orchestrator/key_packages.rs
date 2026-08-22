@@ -207,9 +207,9 @@ where
             packages_json.push(serde_json::json!({
                 "framing": "mlsMessage",
                 "contentType": "keyPackage",
-                "bytes": STANDARD.encode(&kp.key_package_data),
+                "bytes": { "$bytes": STANDARD.encode(&kp.key_package_data) },
                 "sha256": STANDARD.encode(Sha256::digest(&kp.key_package_data)),
-                "keyPackageRef": STANDARD.encode(&kp.hash_ref)
+                "keyPackageRef": { "$bytes": STANDARD.encode(&kp.hash_ref) }
             }));
         }
         let body = serde_json::json!({
@@ -221,7 +221,7 @@ where
             "keyId": key_id,
             "keyPackages": packages_json,
             "signatureDomain": "CATBIRD-CHAT-DEVICE-REPLENISH\0",
-            "signaturePublicKey": STANDARD.encode(&public_key),
+            "signaturePublicKey": { "$bytes": STANDARD.encode(&public_key) },
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         });
         let response = self

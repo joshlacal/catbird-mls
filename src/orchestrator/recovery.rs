@@ -1244,12 +1244,12 @@ where
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "generation": 0,
                 "prior": {
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch.saturating_sub(1),
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash),
-                    "groupId": STANDARD.encode(&gid),
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&gid) },
                     "lifecycle": "active",
                     "stateVersion": 0
                 },
@@ -1260,7 +1260,7 @@ where
             "actorDid": user_did,
             "authGeneration": auth_generation,
             "commit": {
-                "bytes": STANDARD.encode(&commit),
+                "bytes": { "$bytes": STANDARD.encode(&commit) },
                 "contentType": "publicMessageCommit",
                 "framing": "mlsMessage",
                 "sha256": STANDARD.encode(Sha256::digest(&commit))
@@ -1281,40 +1281,40 @@ where
                     "originSeq": 1,
                     "originTransitionId": transition_id,
                     "roleAtOrigin": "admin",
-                    "signaturePublicKey": STANDARD.encode(&public_key)
+                    "signaturePublicKey": { "$bytes": STANDARD.encode(&public_key) }
                 },
-                "ciphertext": STANDARD.encode(&ciphertext),
+                "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
                 "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch,
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash),
-                    "groupId": STANDARD.encode(&gid)
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&gid) }
                 },
                 "metadataVersion": 1,
-                "nonce": STANDARD.encode(&nonce),
+                "nonce": { "$bytes": STANDARD.encode(&nonce) },
                 "originTransitionId": transition_id
             },
             "next": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": resolved.conversation_id.clone(),
                 "epoch": target_epoch,
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash),
-                "groupId": STANDARD.encode(&gid),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&gid) },
                 "lifecycle": "active",
                 "stateVersion": 0
             },
             "prior": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": resolved.conversation_id.clone(),
                 "epoch": target_epoch.saturating_sub(1),
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash),
-                "groupId": STANDARD.encode(&gid),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&gid) },
                 "lifecycle": "active",
                 "stateVersion": 0
             },
@@ -2882,12 +2882,12 @@ where
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "generation": 0,
                 "prior": {
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": plan.target_epoch.saturating_sub(1),
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash),
-                    "groupId": STANDARD.encode(&group_id_bytes),
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                     "lifecycle": "active",
                     "stateVersion": 0
                 },
@@ -2898,7 +2898,7 @@ where
             "actorDid": user_did,
             "authGeneration": auth_generation,
             "commit": {
-                "bytes": STANDARD.encode(&plan.commit_bytes),
+                "bytes": { "$bytes": STANDARD.encode(&plan.commit_bytes) },
                 "contentType": "publicMessageCommit",
                 "framing": "mlsMessage",
                 "sha256": STANDARD.encode(Sha256::digest(&plan.commit_bytes))
@@ -2919,40 +2919,40 @@ where
                     "originSeq": 1,
                     "originTransitionId": transition_id,
                     "roleAtOrigin": "admin",
-                    "signaturePublicKey": STANDARD.encode(&public_key)
+                    "signaturePublicKey": { "$bytes": STANDARD.encode(&public_key) }
                 },
-                "ciphertext": STANDARD.encode(&ciphertext),
+                "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
                 "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": plan.target_epoch,
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash),
-                    "groupId": STANDARD.encode(&group_id_bytes)
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
                 "metadataVersion": 1,
-                "nonce": STANDARD.encode(&nonce),
+                "nonce": { "$bytes": STANDARD.encode(&nonce) },
                 "originTransitionId": transition_id
             },
             "next": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": resolved.conversation_id.clone(),
                 "epoch": plan.target_epoch,
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash),
-                "groupId": STANDARD.encode(&group_id_bytes),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
                 "stateVersion": 0
             },
             "prior": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": resolved.conversation_id.clone(),
                 "epoch": plan.target_epoch.saturating_sub(1),
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash),
-                "groupId": STANDARD.encode(&group_id_bytes),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
                 "stateVersion": 0
             },
@@ -5789,12 +5789,12 @@ where
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "generation": 0,
                 "prior": {
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch.saturating_sub(1),
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash),
-                    "groupId": STANDARD.encode(&group_id_bytes),
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                     "lifecycle": "active",
                     "stateVersion": 0
                 },
@@ -5805,7 +5805,7 @@ where
             "actorDid": user_did,
             "authGeneration": auth_generation,
             "commit": {
-                "bytes": STANDARD.encode(commit_data),
+                "bytes": { "$bytes": STANDARD.encode(commit_data) },
                 "contentType": "publicMessageCommit",
                 "framing": "mlsMessage",
                 "sha256": STANDARD.encode(Sha256::digest(commit_data))
@@ -5826,40 +5826,40 @@ where
                     "originSeq": 1,
                     "originTransitionId": transition_id,
                     "roleAtOrigin": "admin",
-                    "signaturePublicKey": STANDARD.encode(&public_key)
+                    "signaturePublicKey": { "$bytes": STANDARD.encode(&public_key) }
                 },
-                "ciphertext": STANDARD.encode(&ciphertext),
+                "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
                 "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch,
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash),
-                    "groupId": STANDARD.encode(&group_id_bytes)
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
                 "metadataVersion": 1,
-                "nonce": STANDARD.encode(&nonce),
+                "nonce": { "$bytes": STANDARD.encode(&nonce) },
                 "originTransitionId": transition_id
             },
             "next": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": convo_id,
                 "epoch": target_epoch,
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash),
-                "groupId": STANDARD.encode(&group_id_bytes),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
                 "stateVersion": 0
             },
             "prior": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": convo_id,
                 "epoch": target_epoch.saturating_sub(1),
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash),
-                "groupId": STANDARD.encode(&group_id_bytes),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
                 "stateVersion": 0
             },

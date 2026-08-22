@@ -1926,12 +1926,12 @@ where
                 "generation": 0,
                 "messageId": STANDARD.encode(msg_uuid.as_bytes()),
                 "prior": {
-                    "confirmationTag": STANDARD.encode(&confirmation_tag),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": epoch,
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&group_context_hash),
-                    "groupId": STANDARD.encode(&group_id_bytes),
+                    "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                     "lifecycle": "active",
                     "stateVersion": state_version
                 },

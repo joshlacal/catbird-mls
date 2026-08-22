@@ -1223,7 +1223,7 @@ where
             "conversationId": conversation_id,
             "conversationKind": conversation_kind,
             "genesisGroupInfo": {
-                "bytes": STANDARD.encode(&group_info_bytes),
+                "bytes": { "$bytes": STANDARD.encode(&group_info_bytes) },
                 "contentType": "groupInfo",
                 "framing": "mlsMessage",
                 "sha256": STANDARD.encode(Sha256::digest(&group_info_bytes))
@@ -1248,30 +1248,30 @@ where
                     "originSeq": 1,
                     "originTransitionId": transition_id,
                     "roleAtOrigin": "admin",
-                    "signaturePublicKey": STANDARD.encode(&public_key)
+                    "signaturePublicKey": { "$bytes": STANDARD.encode(&public_key) }
                 },
-                "ciphertext": STANDARD.encode(&ciphertext),
+                "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
                 "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": STANDARD.encode(&confirmation_tag),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": 0,
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&group_context_hash),
-                    "groupId": STANDARD.encode(&group_id_bytes)
+                    "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
                 "metadataVersion": 1,
-                "nonce": STANDARD.encode(&nonce),
+                "nonce": { "$bytes": STANDARD.encode(&nonce) },
                 "originTransitionId": transition_id
             },
             "next": {
-                "confirmationTag": STANDARD.encode(&confirmation_tag),
+                "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
                 "conversationId": conversation_id,
                 "epoch": 0,
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&group_context_hash),
-                "groupId": STANDARD.encode(&group_id_bytes),
+                "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
                 "stateVersion": 0
             },
@@ -2245,12 +2245,12 @@ where
         })?;
         let next_coord = serde_json::json!({
             "conversationId": resolved.conversation_id,
-            "groupId": STANDARD.encode(&group_id_bytes),
+            "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
             "epoch": target_epoch,
             "generation": 0,
             "stateVersion": prior_sv + 1,
-            "groupContextHash": STANDARD.encode(&next_gch),
-            "confirmationTag": STANDARD.encode(&next_tag),
+            "groupContextHash": { "$bytes": STANDARD.encode(&next_gch) },
+            "confirmationTag": { "$bytes": STANDARD.encode(&next_tag) },
             "lifecycle": "active"
         });
 
@@ -2292,15 +2292,15 @@ where
             "coordinate": {
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "generation": 0,
-                "groupId": STANDARD.encode(&group_id_bytes),
+                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "epoch": target_epoch,
-                "groupContextHash": STANDARD.encode(&next_gch),
-                "confirmationTag": STANDARD.encode(&next_tag)
+                "groupContextHash": { "$bytes": STANDARD.encode(&next_gch) },
+                "confirmationTag": { "$bytes": STANDARD.encode(&next_tag) }
             },
             "originTransitionId": origin_transition_id,
             "metadataVersion": metadata_version,
-            "nonce": STANDARD.encode(&nonce),
-            "ciphertext": STANDARD.encode(&ciphertext),
+            "nonce": { "$bytes": STANDARD.encode(&nonce) },
+            "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
             "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
             "ciphertextSize": ciphertext.len(),
             "authorProof": author_proof
@@ -2335,7 +2335,7 @@ where
                     "welcomeId": welcome_id,
                     "framing": "mlsMessage",
                     "contentType": "welcome",
-                    "opaqueWelcome": STANDARD.encode(&welcome_bytes),
+                    "opaqueWelcome": { "$bytes": STANDARD.encode(&welcome_bytes) },
                     "sha256": STANDARD.encode(Sha256::digest(&welcome_bytes)),
                     "deliveries": [
                         {
@@ -2352,7 +2352,7 @@ where
             "commit": {
                 "framing": "mlsMessage",
                 "contentType": "publicMessageCommit",
-                "bytes": STANDARD.encode(&commit_bytes),
+                "bytes": { "$bytes": STANDARD.encode(&commit_bytes) },
                 "sha256": STANDARD.encode(Sha256::digest(&commit_bytes))
             },
             "metadataSnapshot": metadata_snapshot_json,
@@ -2853,23 +2853,23 @@ where
         });
 
         let prior_clean = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": prior_gen,
-            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-            "groupId": STANDARD.encode(&prior_group_id_32),
+            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
 
         let next_coord = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": prior_gen,
-            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-            "groupId": STANDARD.encode(&prior_group_id_32),
+            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv + 1
         });
@@ -3273,12 +3273,12 @@ where
             "keyId": key_id,
             "leaveRequestId": uuid::Uuid::new_v4().to_string(),
             "prior": {
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": convo_id,
                 "epoch": epoch,
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash),
-                "groupId": STANDARD.encode(&group_id_bytes),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
                 "stateVersion": 0
             },
@@ -3593,24 +3593,24 @@ where
 
         let metadata_snapshot = serde_json::json!({
             "coordinate": {
-                "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                 "epoch": prior_epoch,
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-                "groupId": STANDARD.encode(&prior_group_id_32)
+                "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+                "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) }
             },
             "originTransitionId": transition_id,
             "metadataVersion": target_metadata_version,
-            "nonce": STANDARD.encode(&nonce),
-            "ciphertext": STANDARD.encode(&ciphertext),
+            "nonce": { "$bytes": STANDARD.encode(&nonce) },
+            "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
             "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
             "ciphertextSize": ciphertext.len(),
             "authorProof": {
                 "authorDid": user_did,
                 "authorDeviceId": actor_device_id,
                 "authorKeyId": key_id,
-                "signaturePublicKey": STANDARD.encode(&public_key),
+                "signaturePublicKey": { "$bytes": STANDARD.encode(&public_key) },
                 "authGenerationAtOrigin": auth_generation,
                 "originTransitionId": transition_id,
                 "originSeq": next_entry_seq,
@@ -3620,23 +3620,23 @@ where
         });
 
         let prior_clean = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-            "groupId": STANDARD.encode(&prior_group_id_32),
+            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
 
         let next_coord = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-            "groupId": STANDARD.encode(&prior_group_id_32),
+            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv + 1
         });
@@ -4404,12 +4404,12 @@ where
         let (prior_coord, prior_mv, _next_seq) = match self.fetch_current_conversation_coordinates(conversation_id).await {
             Ok((c, mv, s)) => (c, mv, s),
             Err(_) => (serde_json::json!({
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": conversation_id,
                 "epoch": target_epoch.saturating_sub(1),
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash_bytes),
-                "groupId": STANDARD.encode(group_id),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash_bytes) },
+                "groupId": { "$bytes": STANDARD.encode(group_id) },
                 "lifecycle": "active",
                 "stateVersion": 0
             }), 0, 1),
@@ -4434,12 +4434,12 @@ where
         });
 
         let aad_prior = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
             "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-            "groupId": STANDARD.encode(&prior_group_id_32),
+            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
@@ -4456,12 +4456,12 @@ where
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
 
         let prior_clean = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-            "groupId": STANDARD.encode(&prior_group_id_32),
+            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
@@ -4636,12 +4636,12 @@ where
         let (prior_coord, prior_mv, next_entry_seq) = match self.fetch_current_conversation_coordinates(conversation_id).await {
             Ok((c, mv, s)) => (c, mv, s),
             Err(_) => (serde_json::json!({
-                "confirmationTag": STANDARD.encode(&tag_bytes),
+                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                 "conversationId": conversation_id,
                 "epoch": target_epoch.saturating_sub(1),
                 "generation": 0,
-                "groupContextHash": STANDARD.encode(&gc_hash_bytes),
-                "groupId": STANDARD.encode(group_id),
+                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash_bytes) },
+                "groupId": { "$bytes": STANDARD.encode(group_id) },
                 "lifecycle": "active",
                 "stateVersion": 0
             }), 0, 1),
@@ -4665,12 +4665,12 @@ where
         });
 
         let aad_prior = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
             "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-            "groupId": STANDARD.encode(&prior_group_id_32),
+            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
@@ -4684,12 +4684,12 @@ where
         });
 
         let prior_clean = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&prior_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&prior_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": prior_epoch,
             "generation": 0,
-            "groupContextHash": STANDARD.encode(&prior_gch_bytes),
-            "groupId": STANDARD.encode(&prior_group_id_32),
+            "groupContextHash": { "$bytes": STANDARD.encode(&prior_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(&prior_group_id_32) },
             "lifecycle": "active",
             "stateVersion": prior_sv
         });
@@ -4698,12 +4698,12 @@ where
         let next_gch_bytes = custom_next_group_context_hash.unwrap_or(gc_hash_bytes.clone());
 
         let next_clean = serde_json::json!({
-            "confirmationTag": STANDARD.encode(&next_tag_bytes),
+            "confirmationTag": { "$bytes": STANDARD.encode(&next_tag_bytes) },
             "conversationId": conversation_id,
             "epoch": target_epoch,
             "generation": 0,
-            "groupContextHash": STANDARD.encode(&next_gch_bytes),
-            "groupId": STANDARD.encode(group_id),
+            "groupContextHash": { "$bytes": STANDARD.encode(&next_gch_bytes) },
+            "groupId": { "$bytes": STANDARD.encode(group_id) },
             "lifecycle": "active",
             "stateVersion": prior_sv + 1
         });
@@ -4715,7 +4715,7 @@ where
             "actorDid": user_did,
             "authGeneration": auth_generation,
             "commit": {
-                "bytes": STANDARD.encode(commit_bytes),
+                "bytes": { "$bytes": STANDARD.encode(commit_bytes) },
                 "contentType": "publicMessageCommit",
                 "framing": "mlsMessage",
                 "sha256": STANDARD.encode(Sha256::digest(commit_bytes))
@@ -4736,21 +4736,21 @@ where
                     "originSeq": next_entry_seq,
                     "originTransitionId": transition_id,
                     "roleAtOrigin": "admin",
-                    "signaturePublicKey": STANDARD.encode(&public_key)
+                    "signaturePublicKey": { "$bytes": STANDARD.encode(&public_key) }
                 },
-                "ciphertext": STANDARD.encode(&ciphertext),
+                "ciphertext": { "$bytes": STANDARD.encode(&ciphertext) },
                 "ciphertextSha256": STANDARD.encode(Sha256::digest(&ciphertext)),
                 "ciphertextSize": ciphertext.len(),
                 "coordinate": {
-                    "confirmationTag": STANDARD.encode(&next_tag_bytes),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&next_tag_bytes) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": target_epoch,
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&next_gch_bytes),
-                    "groupId": STANDARD.encode(group_id)
+                    "groupContextHash": { "$bytes": STANDARD.encode(&next_gch_bytes) },
+                    "groupId": { "$bytes": STANDARD.encode(group_id) }
                 },
                 "metadataVersion": target_metadata_version,
-                "nonce": STANDARD.encode(&nonce),
+                "nonce": { "$bytes": STANDARD.encode(&nonce) },
                 "originTransitionId": transition_id
             },
             "next": next_clean,
@@ -4822,7 +4822,7 @@ where
                 "contentType": "welcome",
                 "deliveries": deliveries,
                 "framing": "mlsMessage",
-                "opaqueWelcome": STANDARD.encode(wb),
+                "opaqueWelcome": { "$bytes": STANDARD.encode(wb) },
                 "sha256": STANDARD.encode(Sha256::digest(wb)),
                 "welcomeId": transition_id,
             });
@@ -4967,12 +4967,12 @@ where
             "prior": match self.fetch_current_conversation_coordinates(conversation_id).await {
                 Ok((c, _, _)) => c,
                 Err(_) => serde_json::json!({
-                    "confirmationTag": STANDARD.encode(&tag_bytes),
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
                     "conversationId": conversation_id,
                     "epoch": epoch,
                     "generation": 0,
-                    "groupContextHash": STANDARD.encode(&gc_hash),
-                    "groupId": STANDARD.encode(&group_id_bytes),
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
+                    "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                     "lifecycle": "active",
                     "stateVersion": 0
                 }),

@@ -182,7 +182,7 @@ where
             "deviceId": device_uuid,
             "deviceName": get_device_name(),
             "keyId": key_id,
-            "signaturePublicKey": B64.encode(&kp_result.signature_public_key),
+            "signaturePublicKey": { "$bytes": B64.encode(&kp_result.signature_public_key) },
             "expectedAuthGeneration": 0,
             "capability": {
                 "protocolVersion": "1",
@@ -203,9 +203,9 @@ where
             "keyPackages": [{
                 "framing": "mlsMessage",
                 "contentType": "keyPackage",
-                "bytes": B64.encode(&kp_result.key_package_data),
+                "bytes": { "$bytes": B64.encode(&kp_result.key_package_data) },
                 "sha256": B64.encode(Sha256::digest(&kp_result.key_package_data)),
-                "keyPackageRef": B64.encode(&kp_result.hash_ref)
+                "keyPackageRef": { "$bytes": B64.encode(&kp_result.hash_ref) }
             }],
             "idempotencyKey": uuid::Uuid::new_v4().to_string(),
             "signedAt": signed_at
