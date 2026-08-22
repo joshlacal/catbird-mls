@@ -113,6 +113,27 @@ impl OrchestratorError {
         matches!(self, OrchestratorError::ServerError { status: 429, .. })
     }
 
+    /// Whether the server reported that the acting device has no registered row.
+    ///
+    /// `blue.catbird.chat.*` answers `DeviceNotRegistered` with HTTP 401, and the
+    /// code is defined to start automatic enrollment rather than a login prompt
+    /// (see `RecoveryOutcome::NeedsEnrollment`). The device-readiness probe in
+    /// `ensure_device_registered` must therefore read it as "there is no server
+    /// device" and enroll, rather than aborting the way a real auth failure does.
+    ///
+    /// Deliberately keyed on the code and never on the bare status:
+    /// `DeviceRevoked` and `DeviceBindingMismatch` also answer 401, and those must
+    /// NOT silently mint a replacement device.
+    pub fn is_device_not_registered(&self) -> bool {
+        let body = match self {
+            OrchestratorError::ServerError { status: 401, body } => body.as_str(),
+            // The Swift/Kotlin FFI callbacks surface transport failures as `Api`.
+            OrchestratorError::Api(message) => message.as_str(),
+            _ => return false,
+        };
+        body.contains("DeviceNotRegistered")
+    }
+
     pub fn is_reset_completion_not_committed(&self) -> bool {
         matches!(self, OrchestratorError::ResetCompletionNotCommitted { .. })
     }
@@ -243,5 +264,37 @@ mod tests {
             err.is_create_convo_race_loss(),
             err.is_bootstrap_already_bootstrapped()
         );
+    }
+
+    #[test]
+    fn is_device_not_registered_matches_the_code_not_the_status() {
+        // The device-scoped probe answer that must start enrollment.
+        let err = OrchestratorError::ServerError {
+            status: 401,
+            body: r#"{"error":"DeviceNotRegistered"}"#.to_string(),
+        };
+        assert!(err.is_device_not_registered());
+
+        // The FFI callbacks surface transport failures as `Api`.
+        let err = OrchestratorError::Api(
+            r#"status 401: {"error":"DeviceNotRegistered"}"#.to_string(),
+        );
+        assert!(err.is_device_not_registered());
+
+        // Siblings that also answer 401 but must never mint a replacement device.
+        for code in ["DeviceRevoked", "DeviceBindingMismatch", "NotAuthorized"] {
+            let err = OrchestratorError::ServerError {
+                status: 401,
+                body: format!(r#"{{"error":"{code}"}}"#),
+            };
+            assert!(
+                !err.is_device_not_registered(),
+                "{code} must not classify as an unregistered device"
+            );
+        }
+
+        // Unrelated failures must not classify.
+        assert!(!OrchestratorError::Api("connection refused".into()).is_device_not_registered());
+        assert!(!OrchestratorError::NotAuthenticated.is_device_not_registered());
     }
 }

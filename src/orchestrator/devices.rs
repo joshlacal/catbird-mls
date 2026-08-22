@@ -105,12 +105,24 @@ where
                     .identity_public_key(mls_did.as_bytes().to_vec())
                     .ok();
                 let server_device = match local_device_id.as_deref() {
-                    Some(device_id) => self
-                        .api_client()
-                        .list_devices(device_id)
-                        .await?
-                        .into_iter()
-                        .find(|device| device.device_id == device_id),
+                    Some(device_id) => match self.api_client().list_devices(device_id).await {
+                        Ok(devices) => {
+                            devices.into_iter().find(|device| device.device_id == device_id)
+                        }
+                        // This probe is device-scoped, so an unregistered device cannot
+                        // read it — the server answers `DeviceNotRegistered`. That is the
+                        // probe's answer, not a failure to obtain one: there is no server
+                        // device, so fall through and enroll. Every other error still
+                        // aborts, so a revoked device, a binding mismatch, or a genuine
+                        // session failure never mints a replacement device.
+                        Err(error) if error.is_device_not_registered() => {
+                            tracing::info!(
+                                "Device-readiness probe reports no registered device - enrolling"
+                            );
+                            None
+                        }
+                        Err(error) => return Err(error),
+                    },
                     None => None,
                 };
                 let server_matches_custody = server_device.as_ref().is_some_and(|device| {
