@@ -1411,6 +1411,216 @@ mod tests {
         let cached = alice.orchestrator.conversations().lock().await;
         assert_eq!(cached.get(&convo_id).unwrap().group_id, bob_group_id);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_direct_result_evicts_stale_storage_and_persists_authoritative_group() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world.add_client("Bob").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        world.register_device("Bob").await.expect("register bob");
+        let alice = world.client("Alice");
+        let bob = world.client("Bob");
+
+        // Bob creates the authoritative direct conversation on server
+        let bob_convo = bob
+            .orchestrator
+            .create_group("direct convo", Some(&[alice.did.clone()]), None)
+            .await
+            .expect("bob creates convo");
+        let convo_id = bob_convo.conversation_id.clone();
+        let auth_group_id = bob_convo.group_id.clone();
+        let auth_group_bytes = hex::decode(&auth_group_id).unwrap();
+
+        // Seed Alice's persistent storage with a STALE group mapping for this conversation ID
+        let stale_group_bytes = [0x77u8; 32];
+        let stale_group_hex = hex::encode(stale_group_bytes);
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &convo_id, &stale_group_hex)
+            .await
+            .expect("seed stale storage");
+        assert_eq!(
+            alice
+                .storage
+                .get_conversation(&alice.did, &convo_id)
+                .await
+                .expect("read stored conversation")
+                .expect("stored conversation present")
+                .group_id,
+            stale_group_hex
+        );
+
+        // Ensure Alice's in-memory cache is empty
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .remove(&convo_id);
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .remove(&convo_id);
+
+        // Alice attempts to create the same direct pair, server returns existingDirectConversationResult
+        world.delivery_service().set_next_create_custom_response(
+            200,
+            serde_json::json!({
+                "result": {
+                    "$type": "blue.catbird.chat.defs#existingDirectConversationResult",
+                    "conversationId": convo_id,
+                    "coordinates": {
+                        "conversationId": convo_id,
+                        "groupId": { "$bytes": STANDARD.encode(&auth_group_bytes) },
+                        "epoch": 0,
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "lifecycle": "active",
+                        "groupContextHash": { "$bytes": STANDARD.encode([0u8; 32]) },
+                        "confirmationTag": { "$bytes": STANDARD.encode([0u8; 32]) }
+                    }
+                }
+            }),
+        );
+
+        let adopted = alice
+            .orchestrator
+            .create_group("alice duplicate direct", Some(&[bob.did.clone()]), None)
+            .await
+            .expect("must adopt authoritative existing conversation");
+
+        assert_eq!(adopted.conversation_id, convo_id);
+        assert_eq!(adopted.group_id, auth_group_id);
+
+        // Alice's persistent storage MUST now hold the authoritative group, not the stale one
+        let stored = alice
+            .storage
+            .get_conversation(&alice.did, &convo_id)
+            .await
+            .expect("read stored conversation")
+            .expect("stored conversation present");
+        assert_eq!(stored.group_id, auth_group_id);
+
+        let state = alice
+            .storage
+            .get_conversation_state(&convo_id)
+            .await
+            .expect("read conversation state")
+            .expect("state present");
+        assert_eq!(state, ConversationState::Active);
+
+        // Alice's in-memory cache also holds the authoritative group
+        let cached = alice.orchestrator.conversations().lock().await;
+        assert_eq!(cached.get(&convo_id).unwrap().group_id, auth_group_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_direct_result_storage_hit_persists_active_state_to_storage() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world.add_client("Bob").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        world.register_device("Bob").await.expect("register bob");
+        let alice = world.client("Alice");
+        let bob = world.client("Bob");
+
+        // Bob creates the authoritative direct conversation on server
+        let bob_convo = bob
+            .orchestrator
+            .create_group("direct convo", Some(&[alice.did.clone()]), None)
+            .await
+            .expect("bob creates convo");
+        let convo_id = bob_convo.conversation_id.clone();
+        let auth_group_id = bob_convo.group_id.clone();
+        let auth_group_bytes = hex::decode(&auth_group_id).unwrap();
+
+        // Seed Alice's persistent storage with matching group ID, seeded as Initializing by ensure_conversation_exists
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &convo_id, &auth_group_id)
+            .await
+            .expect("seed storage");
+        assert_eq!(
+            alice
+                .storage
+                .get_conversation_state(&convo_id)
+                .await
+                .expect("read state")
+                .expect("state present"),
+            ConversationState::Initializing
+        );
+
+        // Ensure Alice's in-memory cache is empty so it hits storage
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .remove(&convo_id);
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .remove(&convo_id);
+
+        world.delivery_service().set_next_create_custom_response(
+            200,
+            serde_json::json!({
+                "result": {
+                    "$type": "blue.catbird.chat.defs#existingDirectConversationResult",
+                    "conversationId": convo_id,
+                    "coordinates": {
+                        "conversationId": convo_id,
+                        "groupId": { "$bytes": STANDARD.encode(&auth_group_bytes) },
+                        "epoch": 0,
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "lifecycle": "active",
+                        "groupContextHash": { "$bytes": STANDARD.encode([0u8; 32]) },
+                        "confirmationTag": { "$bytes": STANDARD.encode([0u8; 32]) }
+                    }
+                }
+            }),
+        );
+
+        let res = alice
+            .orchestrator
+            .create_group("alice duplicate direct", Some(&[bob.did.clone()]), None)
+            .await
+            .expect("must resolve from storage");
+
+        assert_eq!(res.conversation_id, convo_id);
+        assert_eq!(res.group_id, auth_group_id);
+
+        // Storage MUST have been updated to Active (not left as Initializing)
+        let state = alice
+            .storage
+            .get_conversation_state(&convo_id)
+            .await
+            .expect("read state")
+            .expect("state present");
+        assert_eq!(state, ConversationState::Active);
+
+        // Memory cache also has Active
+        let mem_state = alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .get(&convo_id)
+            .cloned();
+        assert_eq!(mem_state, Some(ConversationState::Active));
+    }
 }
 
 /// Internal rollback identity for a group creation attempt. Before createConvo
@@ -2096,6 +2306,13 @@ where
                     .await?;
                 if let Some(view) = stored_view {
                     if view.group_id == expected_group_id_hex {
+                        if let Err(e) = self
+                            .storage()
+                            .set_conversation_state(&resp_convo_id_str, ConversationState::Active)
+                            .await
+                        {
+                            tracing::warn!(error = %e, convo_id = %resp_convo_id_str, "Failed to persist Active state for adopted existing conversation");
+                        }
                         self.cache_created_conversation(
                             parsed_conversation_id,
                             view.clone(),
@@ -2104,6 +2321,11 @@ where
                         .await;
                         return Ok(view);
                     }
+                    // Mismatched stored row is stale; evict it so ensure_conversation_exists recreates it with the authoritative group.
+                    let _ = self
+                        .storage()
+                        .delete_conversations(user_did, &[&resp_convo_id_str])
+                        .await;
                 }
 
                 let server_view = self.fetch_conversation_for_convo(&resp_convo_id_str).await?;
@@ -2118,7 +2340,7 @@ where
                 // so subsequent operations resolve it immediately.
                 let _ = self
                     .storage()
-                    .delete_conversations(user_did, &[group_id_hex])
+                    .delete_conversations(user_did, &[&resp_convo_id_str, group_id_hex])
                     .await;
                 self.storage()
                     .ensure_conversation_exists(
