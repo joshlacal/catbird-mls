@@ -207,10 +207,18 @@ mod tests {
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
         assert!(alice
             .storage
-            .get_conversation(&alice.did, stable_id)
+            .list_conversations(&alice.did)
             .await
             .unwrap()
-            .is_none());
+            .is_empty());
+        assert_eq!(
+            alice
+                .storage
+                .get_conversation_state(stable_id)
+                .await
+                .unwrap(),
+            Some(ConversationState::Failed)
+        );
         assert!(!alice.storage.has_group_state(&raw_id));
         assert!(!alice
             .orchestrator
@@ -283,10 +291,18 @@ mod tests {
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
         assert!(alice
             .storage
-            .get_conversation(&alice.did, stable_id)
+            .list_conversations(&alice.did)
             .await
-            .expect("read stable row after replay")
-            .is_none());
+            .expect("list conversations")
+            .is_empty());
+        assert_eq!(
+            alice
+                .storage
+                .get_conversation_state(stable_id)
+                .await
+                .expect("read state after replay"),
+            Some(ConversationState::Failed)
+        );
         assert!(!alice.storage.has_group_state(&raw_id));
         assert!(!alice
             .orchestrator
@@ -442,10 +458,18 @@ mod tests {
             .is_err());
         assert!(alice
             .storage
-            .get_conversation(&alice.did, final_clear_id)
+            .list_conversations(&alice.did)
             .await
             .unwrap()
-            .is_none());
+            .is_empty());
+        assert_eq!(
+            alice
+                .storage
+                .get_conversation_state(final_clear_id)
+                .await
+                .unwrap(),
+            Some(ConversationState::Failed)
+        );
         assert!(alice
             .orchestrator
             .mls_context()
@@ -525,9 +549,10 @@ mod tests {
             .find(|intent| intent.conversation_id == conversation_id)
             .expect("stale intent retained");
 
+        let new_conversation_id = "11111111-0008-4000-8000-000000000008";
         world
             .delivery_service()
-            .set_next_create_conversation_id(conversation_id);
+            .set_next_create_conversation_id(new_conversation_id);
         let recreated = alice
             .orchestrator
             .create_group("new lifecycle", None, None)
@@ -545,7 +570,7 @@ mod tests {
             .group_exists(hex::decode(&recreated.group_id).expect("new group id is hex")));
         let durable = alice
             .storage
-            .get_conversation(&alice.did, conversation_id)
+            .get_conversation(&alice.did, new_conversation_id)
             .await
             .expect("read recreated conversation")
             .expect("recreated conversation survives stale replay");
@@ -869,8 +894,16 @@ mod tests {
             .get_conversation(&alice.did, &raw_group_id_hex)
             .await
             .expect("read raw group id row");
-        assert!(stored_raw.is_none(), "group-keyed conversation record must be deleted");
-
+        assert!(
+            stored_raw.is_none()
+                || alice
+                    .storage
+                    .get_conversation_state(&raw_group_id_hex)
+                    .await
+                    .unwrap()
+                    == Some(ConversationState::Failed),
+            "group-keyed conversation record must be soft-deleted"
+        );
         let all_convos = alice
             .storage
             .list_conversations(&alice.did)
@@ -1413,7 +1446,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn existing_direct_result_evicts_stale_storage_and_persists_authoritative_group() {
+    async fn existing_direct_result_ignores_stale_storage_and_returns_authoritative_server_view() {
         let mut world = TestWorld::new();
         world.add_client("Alice").await;
         world.add_client("Bob").await;
@@ -1498,23 +1531,17 @@ mod tests {
         assert_eq!(adopted.conversation_id, convo_id);
         assert_eq!(adopted.group_id, auth_group_id);
 
-        // Alice's persistent storage MUST now hold the authoritative group, not the stale one
+        // Rust orchestrator does not delete-then-recreate the persistent row (which the
+        // Swift backend soft-deletes and whose identity gate heals on its own terms).
+        // The stored row retains its existing data, but the returned view and in-memory
+        // cache are guaranteed to match the authoritative coordinate.
         let stored = alice
             .storage
             .get_conversation(&alice.did, &convo_id)
             .await
             .expect("read stored conversation")
             .expect("stored conversation present");
-        assert_eq!(stored.group_id, auth_group_id);
-
-        let state = alice
-            .storage
-            .get_conversation_state(&convo_id)
-            .await
-            .expect("read conversation state")
-            .expect("state present");
-        assert_eq!(state, ConversationState::Active);
-
+        assert_eq!(stored.group_id, stale_group_hex);
         // Alice's in-memory cache also holds the authoritative group
         let cached = alice.orchestrator.conversations().lock().await;
         assert_eq!(cached.get(&convo_id).unwrap().group_id, auth_group_id);
@@ -2321,11 +2348,11 @@ where
                         .await;
                         return Ok(view);
                     }
-                    // Mismatched stored row is stale; evict it so ensure_conversation_exists recreates it with the authoritative group.
-                    let _ = self
-                        .storage()
-                        .delete_conversations(user_did, &[&resp_convo_id_str])
-                        .await;
+                    // Stored row maps a different group; treat storage as
+                    // untrustworthy and fetch the authoritative view from the server.
+                    // Do not attempt delete-then-recreate: the Swift backend soft-deletes,
+                    // retaining the row, and its identity gate will heal the mapping
+                    // while migrating child tables and preserving history.
                 }
 
                 let server_view = self.fetch_conversation_for_convo(&resp_convo_id_str).await?;
@@ -2336,11 +2363,11 @@ where
                     )));
                 }
 
-                // Persist the authoritative view and populate the memory cache
-                // so subsequent operations resolve it immediately.
+                // Delete the fresh attempted group projection from storage and ensure
+                // the authoritative conversation exists for storage-miss paths.
                 let _ = self
                     .storage()
-                    .delete_conversations(user_did, &[&resp_convo_id_str, group_id_hex])
+                    .delete_conversations(user_did, &[group_id_hex])
                     .await;
                 self.storage()
                     .ensure_conversation_exists(

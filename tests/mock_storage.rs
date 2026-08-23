@@ -29,6 +29,7 @@ struct ConversationRecord {
     join_method: Option<JoinMethod>,
     join_epoch: Option<u64>,
     view: ConversationView,
+    is_active: bool,
 }
 
 /// Persisted RESET_PENDING payload as `mark_reset_pending` would write it.
@@ -848,6 +849,7 @@ impl MLSStorageBackend for MockStorage {
                 needs_rejoin: false,
                 join_method: None,
                 join_epoch: None,
+                is_active: true,
                 view: ConversationView {
                     group_id: group_id.to_string(),
                     conversation_id: conversation_id.to_string(),
@@ -911,7 +913,7 @@ impl MLSStorageBackend for MockStorage {
         let views = inner
             .conversations
             .values()
-            .filter(|c| c.user_did == user_did)
+            .filter(|c| c.user_did == user_did && c.is_active)
             .map(|c| c.view.clone())
             .collect();
         Ok(views)
@@ -926,13 +928,11 @@ impl MLSStorageBackend for MockStorage {
             ));
         }
         for id in ids {
-            let owned = inner
-                .conversations
-                .get(*id)
-                .is_some_and(|conversation| conversation.user_did == user_did);
-            if owned {
-                inner.conversations.remove(*id);
-                inner.messages.remove(*id);
+            if let Some(record) = inner.conversations.get_mut(*id) {
+                if record.user_did == user_did {
+                    record.is_active = false;
+                    record.state = ConversationState::Failed;
+                }
             }
         }
         Ok(())
@@ -981,9 +981,18 @@ impl MLSStorageBackend for MockStorage {
             .map(|c| c.state.clone());
 
         if let Some(record) = inner.conversations.get_mut(conversation_id) {
+            match &state {
+                ConversationState::Active => {
+                    record.is_active = true;
+                    record.needs_rejoin = false;
+                }
+                ConversationState::Failed => {
+                    record.is_active = false;
+                }
+                _ => {}
+            }
             record.state = state.clone();
         }
-
         inner
             .state_transitions
             .entry(conversation_id.to_string())
