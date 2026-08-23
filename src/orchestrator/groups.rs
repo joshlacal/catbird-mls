@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
 use crate::chat_v2::ids::uuid::ConversationId as ValidatedConversationId;
@@ -959,6 +959,7 @@ mod tests {
             .delivery_service()
             .set_next_create_custom_response(200, serde_json::json!({
                 "result": {
+                    "$type": "blue.catbird.chat.defs#conversationCreatedResult",
                     "coordinates": {
                         "epoch": 0
                     }
@@ -1178,85 +1179,237 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn reconcile_noncanonical_phantom_aliases_retires_alias_without_deleting_crypto_group() {
+    async fn create_conversation_rejects_missing_or_shorthand_result_type_discriminator() {
         let mut world = TestWorld::new();
         world.add_client("Alice").await;
+        world.add_client("Bob").await;
         world
             .register_device("Alice")
             .await
             .expect("register alice");
+        world.register_device("Bob").await.expect("register bob");
         let alice = world.client("Alice");
+        let bob = world.client("Bob");
 
-        let canonical_uuid = "99999999-9999-4999-8999-999999999999";
+        // Missing $type discriminator must fail closed as InvalidInput
+        world.delivery_service().set_next_create_custom_response(
+            200,
+            serde_json::json!({
+                "result": {
+                    "conversationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "coordinates": {
+                        "conversationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                    }
+                }
+            }),
+        );
+        let err_missing = alice
+            .orchestrator
+            .create_group("test missing type", Some(&[bob.did.clone()]), None)
+            .await
+            .expect_err("missing $type must fail");
+        assert!(
+            err_missing
+                .to_string()
+                .contains("missing result.$type discriminator"),
+            "unexpected error: {err_missing}"
+        );
+
+        // Shorthand unqualified type must also be rejected
+        world.delivery_service().set_next_create_custom_response(
+            200,
+            serde_json::json!({
+                "result": {
+                    "$type": "existingDirectConversationResult",
+                    "conversationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "coordinates": {
+                        "conversationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                    }
+                }
+            }),
+        );
+        let err_shorthand = alice
+            .orchestrator
+            .create_group("test shorthand type", Some(&[bob.did.clone()]), None)
+            .await
+            .expect_err("shorthand $type must fail");
+        assert!(
+            err_shorthand
+                .to_string()
+                .contains("unknown create_conversation result type: existingDirectConversationResult"),
+            "unexpected error: {err_shorthand}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_direct_result_evicts_stale_cache_and_adopts_authoritative_group() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world.add_client("Bob").await;
         world
-            .delivery_service()
-            .set_next_create_conversation_id(canonical_uuid);
-
-        let created = alice
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        world.register_device("Bob").await.expect("register bob");
+        let alice = world.client("Alice");
+        let bob = world.client("Bob");
+        // Server has the authoritative group
+        let auth_convo = bob
             .orchestrator
-            .create_group("phantom test convo", None, None)
+            .create_group("direct convo", Some(&[alice.did.clone()]), None)
             .await
-            .expect("create conversation");
+            .expect("bob creates convo");
+        let auth_group_hex = auth_convo.group_id.clone();
+        let auth_group_bytes = hex::decode(&auth_group_hex).unwrap();
+        let auth_convo_id = auth_convo.conversation_id.clone();
 
-        let group_id_hex = created.group_id.clone();
-        assert_eq!(created.conversation_id, canonical_uuid);
-
-        // Simulate a legacy app version having left behind a phantom conversation row keyed by group_id_hex
-        alice
-            .storage
-            .ensure_conversation_exists(&alice.did, &group_id_hex, &group_id_hex)
-            .await
-            .expect("seed legacy phantom conversation row");
-        alice
-            .orchestrator
-            .conversations()
-            .lock()
-            .await
-            .insert(group_id_hex.clone(), ConversationView {
-                group_id: group_id_hex.clone(),
-                conversation_id: group_id_hex.clone(),
+        // Seed Alice's in-memory cache with a stale group mapping for this conversation ID
+        let stale_group_bytes = [0x99u8; 32];
+        let stale_group_hex = hex::encode(stale_group_bytes);
+        alice.orchestrator.conversations().lock().await.insert(
+            auth_convo_id.clone(),
+            ConversationView {
+                group_id: stale_group_hex.clone(),
+                conversation_id: auth_convo_id.clone(),
                 epoch: 0,
                 members: vec![],
                 metadata: None,
                 created_at: Some(chrono::Utc::now()),
                 updated_at: Some(chrono::Utc::now()),
                 sequencer_did: None,
-            });
-
-        assert_eq!(
-            alice.storage.list_conversations(&alice.did).await.unwrap().len(),
-            2,
-            "both canonical and phantom rows exist before reconcile"
+            },
         );
 
-        // Run startup reconcile
-        alice
+        world.delivery_service().set_next_create_custom_response(
+            200,
+            serde_json::json!({
+                "result": {
+                    "$type": "blue.catbird.chat.defs#existingDirectConversationResult",
+                    "conversationId": auth_convo_id,
+                    "coordinates": {
+                        "conversationId": auth_convo_id,
+                        "groupId": { "$bytes": STANDARD.encode(&auth_group_bytes) },
+                        "epoch": 0,
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "lifecycle": "active",
+                        "groupContextHash": { "$bytes": STANDARD.encode([0u8; 32]) },
+                        "confirmationTag": { "$bytes": STANDARD.encode([0u8; 32]) }
+                    }
+                }
+            }),
+        );
+
+        let adopted = alice
             .orchestrator
-            .reconcile_noncanonical_phantom_aliases(&alice.did)
-            .await;
-
-        let after_reconcile = alice
-            .storage
-            .list_conversations(&alice.did)
+            .create_group("duplicate direct", Some(&[bob.did.clone()]), None)
             .await
-            .expect("list conversations after reconcile");
+            .expect("must adopt authoritative existing conversation");
 
-        assert_eq!(after_reconcile.len(), 1, "phantom alias must be deleted");
-        assert_eq!(after_reconcile[0].conversation_id, canonical_uuid);
-        assert_eq!(after_reconcile[0].group_id, group_id_hex);
+        assert_eq!(adopted.conversation_id, auth_convo_id);
+        assert_eq!(adopted.group_id, auth_group_hex);
 
-        // Cryptographic MLS group state must be fully preserved
-        assert!(
-            alice
-                .orchestrator
-                .mls_context()
-                .group_exists(hex::decode(&group_id_hex).unwrap()),
-            "shared cryptographic group state must NOT be deleted"
+        // The stale cache entry was evicted and replaced with the authoritative group
+        let cached = alice.orchestrator.conversations().lock().await;
+        assert_eq!(cached.get(&auth_convo_id).unwrap().group_id, auth_group_hex);
+        drop(cached);
+
+        let stored = alice
+            .storage
+            .get_conversation(&alice.did, &auth_convo_id)
+            .await
+            .expect("read stored conversation")
+            .expect("stored conversation present");
+        assert_eq!(stored.group_id, auth_group_hex);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_direct_result_fetches_and_persists_server_view_when_not_in_local_storage() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world.add_client("Bob").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        world.register_device("Bob").await.expect("register bob");
+        let alice = world.client("Alice");
+        let bob = world.client("Bob");
+
+        // Bob creates the initial direct conversation
+        let bob_convo = bob
+            .orchestrator
+            .create_group("direct convo", Some(&[alice.did.clone()]), None)
+            .await
+            .expect("bob creates convo");
+        let convo_id = bob_convo.conversation_id.clone();
+        let bob_group_id = bob_convo.group_id.clone();
+        let bob_group_bytes = hex::decode(&bob_group_id).unwrap();
+
+        // Alice's storage and cache have NO conversation record yet
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, &convo_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .contains_key(&convo_id));
+
+        // Alice attempts to create the same direct pair, server returns existingDirectConversationResult
+        world.delivery_service().set_next_create_custom_response(
+            200,
+            serde_json::json!({
+                "result": {
+                    "$type": "blue.catbird.chat.defs#existingDirectConversationResult",
+                    "conversationId": convo_id,
+                    "coordinates": {
+                        "conversationId": convo_id,
+                        "groupId": { "$bytes": STANDARD.encode(&bob_group_bytes) },
+                        "epoch": 0,
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "lifecycle": "active",
+                        "groupContextHash": { "$bytes": STANDARD.encode([0u8; 32]) },
+                        "confirmationTag": { "$bytes": STANDARD.encode([0u8; 32]) }
+                    }
+                }
+            }),
         );
 
-        let convos = alice.orchestrator.conversations().lock().await;
-        assert!(!convos.contains_key(&group_id_hex), "phantom key must be purged from cache");
-        assert!(convos.contains_key(canonical_uuid), "canonical UUID must remain in cache");
+        let res = alice
+            .orchestrator
+            .create_group("alice create direct", Some(&[bob.did.clone()]), None)
+            .await
+            .expect("resolves from server and persists locally");
+
+        assert_eq!(res.conversation_id, convo_id);
+        assert_eq!(res.group_id, bob_group_id);
+
+        // Alice's storage now holds the conversation
+        let stored = alice
+            .storage
+            .get_conversation(&alice.did, &convo_id)
+            .await
+            .expect("read stored conversation")
+            .expect("conversation persisted to storage");
+        assert_eq!(stored.group_id, bob_group_id);
+
+        let state = alice
+            .storage
+            .get_conversation_state(&convo_id)
+            .await
+            .expect("read conversation state")
+            .expect("state present");
+        assert_eq!(state, ConversationState::Active);
+
+        // Alice's in-memory cache also holds the conversation
+        let cached = alice.orchestrator.conversations().lock().await;
+        assert_eq!(cached.get(&convo_id).unwrap().group_id, bob_group_id);
     }
 }
 
@@ -1838,22 +1991,27 @@ where
         let result_type = result_obj
             .get("$type")
             .and_then(|t| t.as_str())
-            .unwrap_or("blue.catbird.chat.defs#conversationCreatedResult");
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput(
+                    "create_conversation response missing result.$type discriminator".into(),
+                )
+            })?;
 
         match result_type {
-            "blue.catbird.chat.defs#conversationCreatedResult"
-            | "conversationCreatedResult"
-            | "#conversationCreatedResult" => {}
-            "blue.catbird.chat.defs#existingDirectConversationResult"
-            | "existingDirectConversationResult"
-            | "#existingDirectConversationResult" => {
+            "blue.catbird.chat.defs#conversationCreatedResult" => {}
+            "blue.catbird.chat.defs#existingDirectConversationResult" => {
                 let resp_cid_str = result_obj
                     .get("conversationId")
-                    .or_else(|| result_obj.get("coordinates").and_then(|c| c.get("conversationId")))
+                    .or_else(|| {
+                        result_obj
+                            .get("coordinates")
+                            .and_then(|c| c.get("conversationId"))
+                    })
                     .and_then(|cid| cid.as_str())
                     .ok_or_else(|| {
                         OrchestratorError::InvalidInput(
-                            "existingDirectConversationResult response missing conversationId".into(),
+                            "existingDirectConversationResult response missing conversationId"
+                                .into(),
                         )
                     })?;
 
@@ -1864,28 +2022,125 @@ where
                         ))
                     })?;
 
+                let expected_group_id_bytes = extract_bytes_32(
+                    result_obj
+                        .get("coordinates")
+                        .and_then(|c| c.get("groupId")),
+                )
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput(
+                        "existingDirectConversationResult response missing or invalid result.coordinates.groupId".into(),
+                    )
+                })?;
+                let expected_group_id_hex = hex::encode(expected_group_id_bytes);
+
                 let resp_convo_id_str = parsed_conversation_id.to_string();
                 tracing::info!(
                     convo_id = %resp_convo_id_str,
                     attempted_group_id = %group_id_hex,
+                    expected_group_id = %expected_group_id_hex,
                     "Server returned existingDirectConversationResult; discarding fresh group and loading existing conversation"
                 );
 
-                // Discard the fresh locally-created group state from OpenMLS memory/storage
-                let _ = self.mls_context().delete_group(group_id_bytes.clone());
-                let _ = self.storage().delete_group_state(group_id_hex).await;
-                let _ = self.storage().delete_conversations(user_did, &[group_id_hex]).await;
-                self.conversations().lock().await.remove(group_id_hex);
-                self.conversation_states().lock().await.remove(group_id_hex);
+                // Discard the fresh locally-created group state from OpenMLS
+                // memory/storage. Every cleanup step is part of the duplicate
+                // result's commit: if one fails, keep the raw pending-delete
+                // authority armed so the outer rollback/startup replay can
+                // finish it, and never report the existing conversation as a
+                // successful duplicate while the fresh group remains local.
+                let mut cleanup_errors = Vec::new();
+                match self.mls_context().delete_group(group_id_bytes.clone()) {
+                    Ok(()) | Err(MLSError::GroupNotFound { .. }) => {}
+                    Err(error) => cleanup_errors.push(format!("MLS group cleanup failed: {error}")),
+                }
+                if let Err(error) = self.storage().delete_group_state(group_id_hex).await {
+                    cleanup_errors.push(format!("GroupState cleanup failed: {error}"));
+                }
+                if let Err(error) = self
+                    .storage()
+                    .delete_conversations(user_did, &[group_id_hex])
+                    .await
+                {
+                    cleanup_errors.push(format!("conversation cleanup failed: {error}"));
+                }
+                if cleanup_errors.is_empty() {
+                    self.conversations().lock().await.remove(group_id_hex);
+                    self.conversation_states().lock().await.remove(group_id_hex);
+                } else {
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "existing direct conversation cleanup incomplete: {}",
+                        cleanup_errors.join("; ")
+                    )));
+                }
 
-                // Load existing conversation from cache, storage, or server
-                if let Some(view) = self.conversations().lock().await.get(&resp_convo_id_str).cloned() {
-                    return Ok(view);
+                // Load existing conversation from cache, storage, or server,
+                // validating against the authoritative coordinate's groupId.
+                let cached_view = self
+                    .conversations()
+                    .lock()
+                    .await
+                    .get(&resp_convo_id_str)
+                    .cloned();
+                if let Some(view) = cached_view {
+                    if view.group_id == expected_group_id_hex {
+                        return Ok(view);
+                    }
+                    // Mismatched cached row is stale; evict it.
+                    self.conversations().lock().await.remove(&resp_convo_id_str);
+                    self.conversation_states().lock().await.remove(&resp_convo_id_str);
                 }
-                if let Some(view) = self.storage().get_conversation(user_did, &resp_convo_id_str).await? {
-                    return Ok(view);
+
+                let stored_view = self
+                    .storage()
+                    .get_conversation(user_did, &resp_convo_id_str)
+                    .await?;
+                if let Some(view) = stored_view {
+                    if view.group_id == expected_group_id_hex {
+                        self.cache_created_conversation(
+                            parsed_conversation_id,
+                            view.clone(),
+                            ConversationState::Active,
+                        )
+                        .await;
+                        return Ok(view);
+                    }
                 }
-                return self.fetch_conversation_for_convo(&resp_convo_id_str).await;
+
+                let server_view = self.fetch_conversation_for_convo(&resp_convo_id_str).await?;
+                if server_view.group_id != expected_group_id_hex {
+                    return Err(OrchestratorError::InvalidInput(format!(
+                        "existingDirectConversationResult groupId mismatch: coordinate specifies '{expected_group_id_hex}', but server conversation view returned '{}'",
+                        server_view.group_id
+                    )));
+                }
+
+                // Persist the authoritative view and populate the memory cache
+                // so subsequent operations resolve it immediately.
+                let _ = self
+                    .storage()
+                    .delete_conversations(user_did, &[group_id_hex])
+                    .await;
+                self.storage()
+                    .ensure_conversation_exists(
+                        user_did,
+                        &server_view.conversation_id,
+                        &server_view.group_id,
+                    )
+                    .await?;
+                if let Err(e) = self
+                    .storage()
+                    .set_conversation_state(&resp_convo_id_str, ConversationState::Active)
+                    .await
+                {
+                    tracing::warn!(error = %e, convo_id = %resp_convo_id_str, "Failed to persist Active state for adopted existing conversation");
+                }
+                self.cache_created_conversation(
+                    parsed_conversation_id,
+                    server_view.clone(),
+                    ConversationState::Active,
+                )
+                .await;
+                return Ok(server_view);
             }
             other => {
                 return Err(OrchestratorError::InvalidInput(format!(
@@ -4941,56 +5196,7 @@ where
         }
     }
 
-    /// One-time / startup reconciliation to retire noncanonical group-key conversation aliases.
-    /// If an older app version persisted a local conversation record keyed by its 64-hex MLS group ID
-    /// while a canonical UUID record maps the same MLS group, deactivate/delete the phantom alias row
-    /// without deleting the shared cryptographic group state.
-    pub(crate) async fn reconcile_noncanonical_phantom_aliases(&self, user_did: &str) {
-        let convos = match self.storage().list_conversations(user_did).await {
-            Ok(list) => list,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to list conversations during phantom alias reconciliation");
-                return;
-            }
-        };
 
-        // Find all group_ids mapped by canonical UUID conversations
-        let mut canonical_group_ids = HashSet::new();
-        for convo in &convos {
-            if ValidatedConversationId::parse(&convo.conversation_id).is_ok() {
-                canonical_group_ids.insert(convo.group_id.clone());
-            }
-        }
-
-        // Identify noncanonical conversation records whose id is NOT a UUID
-        // but whose group_id is already mapped by a canonical UUID record.
-        let mut phantom_ids_to_delete = Vec::new();
-        for convo in &convos {
-            if ValidatedConversationId::parse(&convo.conversation_id).is_err() {
-                if canonical_group_ids.contains(&convo.group_id) {
-                    phantom_ids_to_delete.push(convo.conversation_id.clone());
-                }
-            }
-        }
-
-        if !phantom_ids_to_delete.is_empty() {
-            tracing::info!(
-                phantom_count = phantom_ids_to_delete.len(),
-                phantom_ids = ?phantom_ids_to_delete,
-                "Retiring noncanonical phantom conversation aliases"
-            );
-            let str_refs: Vec<&str> = phantom_ids_to_delete.iter().map(|s| s.as_str()).collect();
-            if let Err(e) = self.storage().delete_conversations(user_did, &str_refs).await {
-                tracing::warn!(error = %e, "Failed to delete phantom conversation aliases from storage");
-            }
-            let mut conversations_lock = self.conversations().lock().await;
-            let mut states_lock = self.conversation_states().lock().await;
-            for id in &phantom_ids_to_delete {
-                conversations_lock.remove(id);
-                states_lock.remove(id);
-            }
-        }
-    }
     async fn submit_commit_transition_helper(
         &self,
         conversation_id: &str,

@@ -383,10 +383,6 @@ where
         // WS-5.3: finish any force_delete_local a crash interrupted between
         // the persisted intent and completion.
         self.reconcile_pending_local_deletes().await;
-        // Reconcile and retire historical noncanonical phantom aliases (keyed by 64-hex group ID)
-        // when a canonical UUID conversation record maps the same MLS group.
-        self.reconcile_noncanonical_phantom_aliases(user_did).await;
-
 
         // Rehydrate persisted conversation state (spec §8.2 / §8.5 Phase 1).
         // Conversations themselves are populated from server data on first
