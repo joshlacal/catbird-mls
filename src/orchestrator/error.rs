@@ -167,13 +167,35 @@ impl OrchestratorError {
     /// Whether this error represents an active direct conversation existing between
     /// the caller and recipient pair where the caller/acting device is not an active member.
     pub fn is_direct_conversation_not_member(&self) -> bool {
-        let body = match self {
+        let raw = match self {
             OrchestratorError::ServerError { body, .. } => body.as_str(),
             OrchestratorError::Api(message) => message.as_str(),
             _ => return false,
         };
-        body.contains("ConversationAlreadyExists")
+        error_code_equals(raw, "ConversationAlreadyExists")
     }
+}
+
+fn error_code_equals(raw: &str, expected: &str) -> bool {
+    let trimmed = raw.trim();
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        if let Some(code) = val.get("error").and_then(|v| v.as_str()) {
+            return code == expected;
+        }
+    }
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]) {
+                if let Some(code) = val.get("error").and_then(|v| v.as_str()) {
+                    return code == expected;
+                }
+            }
+        }
+    }
+    if !trimmed.is_empty() && !trimmed.contains('{') && !trimmed.contains(' ') {
+        return trimmed == expected;
+    }
+    false
 }
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -322,6 +344,45 @@ mod tests {
         );
         assert!(api_err.is_direct_conversation_not_member(), "ConversationAlreadyExists via Api must classify");
 
+        // Bare error code must classify
+        let bare_err = OrchestratorError::ServerError {
+            status: 400,
+            body: "ConversationAlreadyExists".to_string(),
+        };
+        assert!(bare_err.is_direct_conversation_not_member(), "Bare ConversationAlreadyExists must classify");
+
+        // Removed speculative aliases MUST NOT classify (exact match, not substring).
+        for alias in [
+            "DirectConversationAlreadyExists",
+            "DirectConversationExistsNotMember",
+            "NotMember",
+            "NotEntitled",
+        ] {
+            let server_err = OrchestratorError::ServerError {
+                status: 400,
+                body: format!(r#"{{"error":"{alias}","message":"{alias}"}}"#),
+            };
+            assert!(
+                !server_err.is_direct_conversation_not_member(),
+                "{alias} must NOT classify as direct conversation not member"
+            );
+
+            let api_err = OrchestratorError::Api(format!(r#"status 400: {{"error":"{alias}"}}"#));
+            assert!(
+                !api_err.is_direct_conversation_not_member(),
+                "{alias} via Api must NOT classify"
+            );
+
+            let bare_alias = OrchestratorError::ServerError {
+                status: 400,
+                body: alias.to_string(),
+            };
+            assert!(
+                !bare_alias.is_direct_conversation_not_member(),
+                "{alias} bare must NOT classify"
+            );
+        }
+
         // Unrelated errors must not classify.
         let unrelated = OrchestratorError::ServerError {
             status: 400,
@@ -329,5 +390,6 @@ mod tests {
         };
         assert!(!unrelated.is_direct_conversation_not_member());
         assert!(!OrchestratorError::NotAuthenticated.is_direct_conversation_not_member());
+        assert!(!OrchestratorError::Api("connection refused".into()).is_direct_conversation_not_member());
     }
 }

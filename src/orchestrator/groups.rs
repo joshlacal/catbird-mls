@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
+use crate::chat_v2::ids::uuid::ConversationId as ValidatedConversationId;
 use crate::error::MLSError;
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
@@ -8,7 +9,6 @@ use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::{MLSOrchestrator, OwnCommitExpectation};
 use super::storage::MLSStorageBackend;
 use super::types::*;
-
 struct WelcomeJoinRollback<'a> {
     user_did: &'a str,
     conversation_id: Option<&'a str>,
@@ -1009,6 +1009,83 @@ mod tests {
             .unwrap()
             .is_empty(), "local MLS group must be cleaned up on failure");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conversation_id_newtype_type_separation() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+
+        let valid_uuid_str = "12345678-1234-4234-8234-123456789abc";
+        let valid_cid = ValidatedConversationId::parse(valid_uuid_str).expect("parse valid uuid");
+        assert_eq!(valid_cid.to_string(), valid_uuid_str);
+
+        // 1. Invalid strings (e.g. 64-hex MLS group id) fail parse and cannot become ValidatedConversationId
+        let group_hex = "205b476d54ee0ffb205b476d54ee0ffb205b476d54ee0ffb205b476d54ee0ffb";
+        assert!(ValidatedConversationId::parse(group_hex).is_err());
+        assert!(ValidatedConversationId::parse("not-a-uuid").is_err());
+
+        // 2. Typed rollback context requires ValidatedConversationId for stable binding
+        let mut rollback = CreateGroupRollbackContext::new(
+            group_hex.to_string(),
+            vec![0u8; 16],
+            &alice.did,
+        )
+        .expect("create rollback context");
+        assert_eq!(rollback.stable_conversation_id, None);
+        assert_eq!(rollback.cleanup_conversation_id(), group_hex);
+
+        rollback
+            .bind_stable_conversation(valid_cid, group_hex, Some(0))
+            .expect("bind stable conversation");
+        assert_eq!(rollback.stable_conversation_id, Some(valid_cid));
+        assert_eq!(rollback.cleanup_conversation_id(), valid_uuid_str);
+
+        // 3. Typed orchestrator persistence and cache methods enforce ValidatedConversationId
+        alice
+            .orchestrator
+            .persist_created_conversation_projection(&alice.did, valid_cid, group_hex)
+            .await
+            .expect("persist created projection");
+
+        alice
+            .orchestrator
+            .arm_stable_local_delete_intent(valid_cid, &rollback.encoded_delete_authority)
+            .await
+            .expect("arm stable delete intent");
+
+        let view = ConversationView {
+            group_id: group_hex.to_string(),
+            conversation_id: valid_cid.to_string(), // DTO boundary
+            epoch: 0,
+            members: vec![],
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+        };
+
+        alice
+            .orchestrator
+            .cache_created_conversation(valid_cid, view.clone(), ConversationState::Active)
+            .await;
+
+        let convos = alice.orchestrator.conversations().lock().await;
+        assert!(convos.contains_key(valid_uuid_str));
+        let states = alice.orchestrator.conversation_states().lock().await;
+        assert!(states.contains_key(valid_uuid_str));
+
+        let stored = alice
+            .storage
+            .get_conversation(&alice.did, valid_uuid_str)
+            .await
+            .expect("read persisted conversation");
+        assert!(stored.is_some());
+    }
 }
 
 /// Internal rollback identity for a group creation attempt. Before createConvo
@@ -1017,7 +1094,7 @@ mod tests {
 /// key while still carrying the raw group id as crypto-delete authority.
 struct CreateGroupRollbackContext {
     raw_group_id: String,
-    stable_conversation_id: Option<crate::chat_v2::ids::uuid::ConversationId>,
+    stable_conversation_id: Option<ValidatedConversationId>,
     encoded_delete_authority: String,
     owner_user_did: String,
     durable_intent_id: String,
@@ -1050,7 +1127,7 @@ impl CreateGroupRollbackContext {
 
     fn bind_stable_conversation(
         &mut self,
-        stable_id: crate::chat_v2::ids::uuid::ConversationId,
+        stable_id: ValidatedConversationId,
         group_id: &str,
         bootstrap_target_epoch: Option<u64>,
     ) -> Result<()> {
@@ -1197,6 +1274,43 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    pub(crate) async fn persist_created_conversation_projection(
+        &self,
+        user_did: &str,
+        conversation_id: ValidatedConversationId,
+        group_id_hex: &str,
+    ) -> Result<()> {
+        let convo_id_str = conversation_id.to_string();
+        self.storage()
+            .ensure_conversation_exists(user_did, &convo_id_str, group_id_hex)
+            .await?;
+        self.storage()
+            .update_join_info(&convo_id_str, user_did, JoinMethod::Creator, 0)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn arm_stable_local_delete_intent(
+        &self,
+        conversation_id: ValidatedConversationId,
+        encoded_authority: &str,
+    ) -> Result<()> {
+        self.storage()
+            .mark_pending_local_delete(&conversation_id.to_string(), Some(encoded_authority))
+            .await
+    }
+
+    pub(crate) async fn cache_created_conversation(
+        &self,
+        conversation_id: ValidatedConversationId,
+        convo: ConversationView,
+        state: ConversationState,
+    ) {
+        let key = conversation_id.to_string();
+        self.conversations().lock().await.insert(key.clone(), convo);
+        self.conversation_states().lock().await.insert(key, state);
+    }
+
     /// Create a new MLS group/conversation.
     ///
     /// 1. Creates MLS group locally via FFI
@@ -1554,13 +1668,12 @@ where
                 )
             })?;
 
-        let parsed_conversation_id = crate::chat_v2::ids::uuid::ConversationId::parse(resp_cid_str)
+        let parsed_conversation_id = ValidatedConversationId::parse(resp_cid_str)
             .map_err(|e| {
                 OrchestratorError::InvalidInput(format!(
                     "create_conversation returned non-canonical conversation UUID '{resp_cid_str}': {e}"
                 ))
             })?;
-        let resp_convo_id = parsed_conversation_id.to_string();
 
         let mut member_views = vec![MemberView {
             did: user_did.to_string(),
@@ -1582,10 +1695,62 @@ where
             }
         }
 
-        let mut convo = ConversationView {
+        let bootstrap_target_epoch = if initial_members.dids.as_ref().map_or(false, |d| !d.is_empty()) {
+            Some(1)
+        } else {
+            None
+        };
+
+        // When the server's stable conversation ID differs from the mutable
+        // group ID, delete the group-keyed projection and cache entries BEFORE
+        // transferring delete authority to the stable ID. This guarantees that
+        // the raw row is purged while raw cleanup authority remains armed in storage.
+        let resp_convo_id_str = parsed_conversation_id.to_string();
+        if resp_convo_id_str != group_id_hex {
+            self.storage()
+                .delete_conversations(user_did, &[group_id_hex])
+                .await?;
+            self.conversations().lock().await.remove(group_id_hex);
+            self.conversation_states().lock().await.remove(group_id_hex);
+
+            rollback.bind_stable_conversation(parsed_conversation_id, group_id_hex, bootstrap_target_epoch)?;
+            self.arm_stable_local_delete_intent(
+                parsed_conversation_id,
+                &rollback.encoded_delete_authority,
+            )
+            .await?;
+            rollback.durable_intent_id = resp_convo_id_str;
+            self.storage()
+                .clear_pending_local_delete(group_id_hex)
+                .await?;
+        } else {
+            rollback.bind_stable_conversation(parsed_conversation_id, group_id_hex, bootstrap_target_epoch)?;
+        }
+
+        self.persist_created_conversation_projection(user_did, parsed_conversation_id, group_id_hex)
+            .await?;
+
+        // Crypto merge is not the application commit point. Persist the
+        // stable projection before publishing any cache entry, pruning epoch
+        // secrets, uploading metadata, or reporting success.
+        let ffi_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+        let members: Vec<String> = member_views.iter().map(|m| m.did.clone()).collect();
+        let state = GroupState {
             group_id: group_id_hex.to_string(),
-            conversation_id: resp_convo_id,
-            epoch: 0,
+            conversation_id: parsed_conversation_id.to_string(),
+            epoch: ffi_epoch,
+            members,
+        };
+        self.storage().set_group_state(&state).await?;
+        self.group_states()
+            .lock()
+            .await
+            .insert(group_id_hex.to_string(), state);
+
+        let convo_view = ConversationView {
+            group_id: group_id_hex.to_string(),
+            conversation_id: parsed_conversation_id.to_string(), // DTO boundary
+            epoch: ffi_epoch,
             members: member_views,
             metadata: Some(ConversationMetadata {
                 name: if _name.is_empty() { None } else { Some(_name.to_string()) },
@@ -1596,78 +1761,22 @@ where
             updated_at: Some(chrono::Utc::now()),
             sequencer_did: None,
         };
-        let bootstrap_target_epoch = if initial_members.dids.as_ref().map_or(false, |d| !d.is_empty()) {
-            Some(1)
-        } else {
-            None
-        };
-        let resp_convo_id_str = parsed_conversation_id.to_string();
-        // When the server's stable conversation ID differs from the mutable
-        // group ID, delete the group-keyed projection and cache entries BEFORE
-        // transferring delete authority to the stable ID. This guarantees that
-        // the raw row is purged while raw cleanup authority remains armed in storage.
-        if resp_convo_id_str != group_id_hex {
-            self.storage()
-                .delete_conversations(user_did, &[group_id_hex])
-                .await?;
-            self.conversations().lock().await.remove(group_id_hex);
-            self.conversation_states().lock().await.remove(group_id_hex);
 
-            rollback.bind_stable_conversation(parsed_conversation_id, group_id_hex, bootstrap_target_epoch)?;
-            self.storage()
-                .mark_pending_local_delete(
-                    &resp_convo_id_str,
-                    Some(&rollback.encoded_delete_authority),
-                )
-                .await?;
-            rollback.durable_intent_id = resp_convo_id_str.clone();
-            self.storage()
-                .clear_pending_local_delete(group_id_hex)
-                .await?;
-        } else {
-            rollback.bind_stable_conversation(parsed_conversation_id, group_id_hex, bootstrap_target_epoch)?;
-        }
+        self.cache_created_conversation(
+            parsed_conversation_id,
+            convo_view.clone(),
+            ConversationState::Active,
+        )
+        .await;
 
-        self.storage()
-            .ensure_conversation_exists(user_did, &resp_convo_id_str, group_id_hex)
-            .await?;
-
-        self.storage()
-            .update_join_info(&resp_convo_id_str, user_did, JoinMethod::Creator, 0)
-            .await?;
-
-        // Crypto merge is not the application commit point. Persist the
-        // stable projection before publishing any cache entry, pruning epoch
-        // secrets, uploading metadata, or reporting success.
-        let ffi_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
-        convo.epoch = ffi_epoch;
-        let members: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
-        let state = GroupState {
-            group_id: group_id_hex.to_string(),
-            conversation_id: convo.conversation_id.clone(),
-            epoch: ffi_epoch,
-            members,
-        };
-        self.storage().set_group_state(&state).await?;
-        self.group_states()
-            .lock()
-            .await
-            .insert(group_id_hex.to_string(), state);
-        self.conversations()
-            .lock()
-            .await
-            .insert(convo.conversation_id.clone(), convo.clone());
-        self.conversation_states()
-            .lock()
-            .await
-            .insert(convo.conversation_id.clone(), ConversationState::Active);
-        self.cleanup_epoch_secrets_if_needed(&convo.conversation_id, group_id_hex, ffi_epoch)
+        self.cleanup_epoch_secrets_if_needed(&convo_view.conversation_id, group_id_hex, ffi_epoch)
             .await;
-        let _ = self.api_client().publish_group_info(&convo.conversation_id, &group_info_bytes).await;
+        let _ = self.api_client().publish_group_info(&convo_view.conversation_id, &group_info_bytes).await;
         let ffi_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
-        convo.epoch = ffi_epoch;
-        tracing::info!(group_id = %group_id_hex, epoch = convo.epoch, "Group creation complete");
-        Ok(convo)
+        let mut final_convo = convo_view;
+        final_convo.epoch = ffi_epoch;
+        tracing::info!(group_id = %group_id_hex, epoch = final_convo.epoch, "Group creation complete");
+        Ok(final_convo)
     }
 
     /// Read back the delivery service's accepted epoch for a staged commit
