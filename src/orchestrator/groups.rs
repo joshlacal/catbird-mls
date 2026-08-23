@@ -789,16 +789,73 @@ mod tests {
             .delivery_service()
             .set_next_create_conversation_id(server_convo_id);
 
-        let created = alice
-            .orchestrator
-            .create_group("dedup test", None, None)
+        // Pause on the initial raw-intent pending_local_delete write to capture
+        // the generated group ID and seed a raw group-keyed conversation row and cache.
+        let barrier = alice.storage.pause_next_pending_local_delete_write(true);
+
+        let mut create = Box::pin(alice.orchestrator.create_group(
+            "dedup test",
+            None,
+            None,
+        ));
+
+        tokio::select! {
+            _ = barrier.wait_until_entered() => {}
+            result = &mut create => panic!("create completed before raw intent barrier: {result:?}"),
+        }
+
+        let pending_ids = alice.storage.pending_local_delete_ids();
+        assert_eq!(pending_ids.len(), 1, "raw group delete intent must be armed");
+        let raw_group_id_hex = pending_ids[0].clone();
+
+        // Seed a raw group-keyed projection in storage and in-memory caches.
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &raw_group_id_hex, &raw_group_id_hex)
             .await
-            .expect("create distinct stable conversation");
+            .expect("seed raw conversation row");
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(raw_group_id_hex.clone(), ConversationView {
+                group_id: raw_group_id_hex.clone(),
+                conversation_id: raw_group_id_hex.clone(),
+                epoch: 0,
+                members: vec![],
+                metadata: None,
+                created_at: Some(chrono::Utc::now()),
+                updated_at: Some(chrono::Utc::now()),
+                sequencer_did: None,
+            });
+        alice
+            .orchestrator
+            .conversation_states()
+            .lock()
+            .await
+            .insert(raw_group_id_hex.clone(), ConversationState::Active);
+
+        assert!(
+            alice
+                .storage
+                .get_conversation(&alice.did, &raw_group_id_hex)
+                .await
+                .expect("read seeded raw row")
+                .is_some(),
+            "seeded raw group-keyed row must exist before create completes"
+        );
+
+        // Release barrier and allow create to finish adopting the server conversation id.
+        barrier.release();
+        let created = create.await.expect("create distinct stable conversation");
 
         assert_eq!(created.conversation_id, server_convo_id);
         assert_ne!(created.conversation_id, created.group_id);
+        assert_eq!(created.group_id, raw_group_id_hex);
 
         // The local store must hold exactly one conversation record: keyed by server_convo_id.
+        // The raw group-keyed record must have been deleted.
         let stored_stable = alice
             .storage
             .get_conversation(&alice.did, server_convo_id)
@@ -808,10 +865,10 @@ mod tests {
 
         let stored_raw = alice
             .storage
-            .get_conversation(&alice.did, &created.group_id)
+            .get_conversation(&alice.did, &raw_group_id_hex)
             .await
             .expect("read raw group id row");
-        assert!(stored_raw.is_none(), "group-keyed conversation record must not exist");
+        assert!(stored_raw.is_none(), "group-keyed conversation record must be deleted");
 
         let all_convos = alice
             .storage
@@ -824,12 +881,12 @@ mod tests {
         // In-memory caches must also hold only the stable conversation id.
         let convos = alice.orchestrator.conversations().lock().await;
         assert!(convos.contains_key(server_convo_id));
-        assert!(!convos.contains_key(&created.group_id));
+        assert!(!convos.contains_key(&raw_group_id_hex));
         drop(convos);
 
         let states = alice.orchestrator.conversation_states().lock().await;
         assert!(states.contains_key(server_convo_id));
-        assert!(!states.contains_key(&created.group_id));
+        assert!(!states.contains_key(&raw_group_id_hex));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -928,10 +985,9 @@ mod tests {
 
         world
             .delivery_service()
-            .set_next_create_custom_response(409, serde_json::json!({
-                "error": "DirectConversationExistsNotMember",
-                "message": "active direct conversation exists for dids but caller device is not a member",
-                "existingConversationId": "f55a5ece-b653-43f3-950a-ab72b4a5c075"
+            .set_next_create_custom_response(400, serde_json::json!({
+                "error": "ConversationAlreadyExists",
+                "message": "ConversationAlreadyExists"
             }));
 
         let err = alice
@@ -961,7 +1017,7 @@ mod tests {
 /// key while still carrying the raw group id as crypto-delete authority.
 struct CreateGroupRollbackContext {
     raw_group_id: String,
-    stable_conversation_id: Option<String>,
+    stable_conversation_id: Option<crate::chat_v2::ids::uuid::ConversationId>,
     encoded_delete_authority: String,
     owner_user_did: String,
     durable_intent_id: String,
@@ -994,10 +1050,11 @@ impl CreateGroupRollbackContext {
 
     fn bind_stable_conversation(
         &mut self,
-        conversation: &ConversationView,
+        stable_id: crate::chat_v2::ids::uuid::ConversationId,
+        group_id: &str,
         bootstrap_target_epoch: Option<u64>,
     ) -> Result<()> {
-        self.stable_conversation_id = Some(conversation.conversation_id.clone());
+        self.stable_conversation_id = Some(stable_id);
         let mut groups = vec![super::recovery::LocalDeleteGroupFence {
             group_id_hex: self.raw_group_id.clone(),
             // The local create has not merged its optional bootstrap Add yet.
@@ -1018,7 +1075,7 @@ impl CreateGroupRollbackContext {
             groups,
             group_state_keys: vec![self.raw_group_id.clone()],
             conversation: Some(super::recovery::LocalDeleteConversationFence {
-                group_id: conversation.group_id.clone(),
+                group_id: group_id.to_string(),
                 epoch: bootstrap_target_epoch.unwrap_or(0),
             }),
             reset: None,
@@ -1027,10 +1084,10 @@ impl CreateGroupRollbackContext {
         Ok(())
     }
 
-    fn cleanup_conversation_id(&self) -> &str {
+    fn cleanup_conversation_id(&self) -> String {
         self.stable_conversation_id
-            .as_deref()
-            .unwrap_or(&self.raw_group_id)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| self.raw_group_id.clone())
     }
 }
 
@@ -1259,13 +1316,14 @@ where
         // is released on success, error, panic unwinding, or future cancellation.
         if create_result.is_err() {
             tracing::warn!(group_id = %group_id_hex, "Cleaning up local MLS group after create_group failure");
+            let cleanup_id = rollback.cleanup_conversation_id();
             let cleanup_complete = self
                 .force_delete_local_with_group(
-                    rollback.cleanup_conversation_id(),
+                    &cleanup_id,
                     Some(&rollback.raw_group_id),
                 )
                 .await;
-            if cleanup_complete && rollback.cleanup_conversation_id() != rollback.raw_group_id {
+            if cleanup_complete && cleanup_id != rollback.raw_group_id {
                 if let Err(error) = self
                     .storage()
                     .clear_pending_local_delete(&rollback.raw_group_id)
@@ -1543,36 +1601,39 @@ where
         } else {
             None
         };
-        let conversation_id = &convo.conversation_id;
-        rollback.bind_stable_conversation(&convo, bootstrap_target_epoch)?;
-        // Handoff cleanup authority before materializing any stable-keyed
-        // local row/cache. Keep the raw intent until the stable write commits.
-        // When both ids are equal this is already the same single intent and
-        // clearing it here would silently disarm cancellation cleanup.
-        if conversation_id != group_id_hex {
-            self.storage()
-                .mark_pending_local_delete(
-                    conversation_id,
-                    Some(&rollback.encoded_delete_authority),
-                )
-                .await?;
-            rollback.durable_intent_id = conversation_id.to_string();
-            self.storage()
-                .clear_pending_local_delete(group_id_hex)
-                .await?;
+        let resp_convo_id_str = parsed_conversation_id.to_string();
+        // When the server's stable conversation ID differs from the mutable
+        // group ID, delete the group-keyed projection and cache entries BEFORE
+        // transferring delete authority to the stable ID. This guarantees that
+        // the raw row is purged while raw cleanup authority remains armed in storage.
+        if resp_convo_id_str != group_id_hex {
             self.storage()
                 .delete_conversations(user_did, &[group_id_hex])
                 .await?;
             self.conversations().lock().await.remove(group_id_hex);
             self.conversation_states().lock().await.remove(group_id_hex);
+
+            rollback.bind_stable_conversation(parsed_conversation_id, group_id_hex, bootstrap_target_epoch)?;
+            self.storage()
+                .mark_pending_local_delete(
+                    &resp_convo_id_str,
+                    Some(&rollback.encoded_delete_authority),
+                )
+                .await?;
+            rollback.durable_intent_id = resp_convo_id_str.clone();
+            self.storage()
+                .clear_pending_local_delete(group_id_hex)
+                .await?;
+        } else {
+            rollback.bind_stable_conversation(parsed_conversation_id, group_id_hex, bootstrap_target_epoch)?;
         }
 
         self.storage()
-            .ensure_conversation_exists(user_did, conversation_id, group_id_hex)
+            .ensure_conversation_exists(user_did, &resp_convo_id_str, group_id_hex)
             .await?;
 
         self.storage()
-            .update_join_info(conversation_id, user_did, JoinMethod::Creator, 0)
+            .update_join_info(&resp_convo_id_str, user_did, JoinMethod::Creator, 0)
             .await?;
 
         // Crypto merge is not the application commit point. Persist the
@@ -1595,14 +1656,14 @@ where
         self.conversations()
             .lock()
             .await
-            .insert(conversation_id.to_string(), convo.clone());
+            .insert(convo.conversation_id.clone(), convo.clone());
         self.conversation_states()
             .lock()
             .await
-            .insert(conversation_id.to_string(), ConversationState::Active);
-        self.cleanup_epoch_secrets_if_needed(conversation_id, group_id_hex, ffi_epoch)
+            .insert(convo.conversation_id.clone(), ConversationState::Active);
+        self.cleanup_epoch_secrets_if_needed(&convo.conversation_id, group_id_hex, ffi_epoch)
             .await;
-        let _ = self.api_client().publish_group_info(conversation_id, &group_info_bytes).await;
+        let _ = self.api_client().publish_group_info(&convo.conversation_id, &group_info_bytes).await;
         let ffi_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         convo.epoch = ffi_epoch;
         tracing::info!(group_id = %group_id_hex, epoch = convo.epoch, "Group creation complete");
