@@ -1841,8 +1841,12 @@ where
             .unwrap_or("blue.catbird.chat.defs#conversationCreatedResult");
 
         match result_type {
-            "blue.catbird.chat.defs#conversationCreatedResult" => {}
-            "blue.catbird.chat.defs#existingDirectConversationResult" => {
+            "blue.catbird.chat.defs#conversationCreatedResult"
+            | "conversationCreatedResult"
+            | "#conversationCreatedResult" => {}
+            "blue.catbird.chat.defs#existingDirectConversationResult"
+            | "existingDirectConversationResult"
+            | "#existingDirectConversationResult" => {
                 let resp_cid_str = result_obj
                     .get("conversationId")
                     .or_else(|| result_obj.get("coordinates").and_then(|c| c.get("conversationId")))
@@ -1889,7 +1893,6 @@ where
                 )));
             }
         }
-
         let resp_cid_str = result_obj
             .get("coordinates")
             .and_then(|c| c.get("conversationId"))
@@ -4964,9 +4967,7 @@ where
         let mut phantom_ids_to_delete = Vec::new();
         for convo in &convos {
             if ValidatedConversationId::parse(&convo.conversation_id).is_err() {
-                if canonical_group_ids.contains(&convo.group_id)
-                    || convo.conversation_id == convo.group_id
-                {
+                if canonical_group_ids.contains(&convo.group_id) {
                     phantom_ids_to_delete.push(convo.conversation_id.clone());
                 }
             }
