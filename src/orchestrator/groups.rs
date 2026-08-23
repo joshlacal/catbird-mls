@@ -1045,46 +1045,44 @@ mod tests {
         assert_eq!(rollback.stable_conversation_id, Some(valid_cid));
         assert_eq!(rollback.cleanup_conversation_id(), valid_uuid_str);
 
-        // 3. Typed orchestrator persistence and cache methods enforce ValidatedConversationId
-        alice
+        // 3. Exercise real create_group call path adopting server's ValidatedConversationId
+        // through lines 1717-1769 (rollback binding, stable intent arming, projection persistence, cache insertion)
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(valid_uuid_str);
+
+        let created = alice
             .orchestrator
-            .persist_created_conversation_projection(&alice.did, valid_cid, group_hex)
+            .create_group("type separation convo", None, None)
             .await
-            .expect("persist created projection");
+            .expect("create group through real orchestrator entry point");
 
-        alice
-            .orchestrator
-            .arm_stable_local_delete_intent(valid_cid, &rollback.encoded_delete_authority)
-            .await
-            .expect("arm stable delete intent");
-
-        let view = ConversationView {
-            group_id: group_hex.to_string(),
-            conversation_id: valid_cid.to_string(), // DTO boundary
-            epoch: 0,
-            members: vec![],
-            metadata: None,
-            created_at: None,
-            updated_at: None,
-            sequencer_did: None,
-        };
-
-        alice
-            .orchestrator
-            .cache_created_conversation(valid_cid, view.clone(), ConversationState::Active)
-            .await;
+        assert_eq!(created.conversation_id, valid_uuid_str);
+        assert_ne!(created.group_id, valid_uuid_str);
 
         let convos = alice.orchestrator.conversations().lock().await;
-        assert!(convos.contains_key(valid_uuid_str));
+        assert!(convos.contains_key(valid_uuid_str), "cache must contain validated conversation id");
+        assert!(!convos.contains_key(&created.group_id), "cache must not contain raw group id");
+        drop(convos);
+
         let states = alice.orchestrator.conversation_states().lock().await;
-        assert!(states.contains_key(valid_uuid_str));
+        assert!(states.contains_key(valid_uuid_str), "states must contain validated conversation id");
+        assert!(!states.contains_key(&created.group_id), "states must not contain raw group id");
+        drop(states);
 
         let stored = alice
             .storage
             .get_conversation(&alice.did, valid_uuid_str)
             .await
             .expect("read persisted conversation");
-        assert!(stored.is_some());
+        assert!(stored.is_some(), "storage projection must be keyed by validated conversation id");
+
+        let stored_raw = alice
+            .storage
+            .get_conversation(&alice.did, &created.group_id)
+            .await
+            .expect("check raw group id in storage");
+        assert!(stored_raw.is_none(), "raw group id must not be in storage");
     }
 }
 
