@@ -958,7 +958,7 @@ async fn staged_add_fails_closed_when_authorized_device_resolution_errors() {
     let bob_did = world.client("Bob").did.clone();
     world
         .delivery_service()
-        .set_next_create_conversation_id("staged-add-resolver-error");
+        .set_next_create_conversation_id("aaaaaaaa-0001-4000-8000-000000000001");
     let convo = alice
         .orchestrator
         .create_group("binding-resolver-error", None, None)
@@ -1040,7 +1040,7 @@ async fn staged_add_enforces_authorized_device_keys_when_resolver_is_available()
     let bob_did = world.client("Bob").did.clone();
     world
         .delivery_service()
-        .set_next_create_conversation_id("staged-add-device-authority");
+        .set_next_create_conversation_id("aaaaaaaa-0002-4000-8000-000000000002");
     let convo = alice
         .orchestrator
         .create_group("binding-resolved-device-key", None, None)

@@ -163,6 +163,21 @@ impl OrchestratorError {
     pub fn is_create_convo_race_loss(&self) -> bool {
         self.is_bootstrap_already_bootstrapped()
     }
+
+    /// Whether this error represents an active direct conversation existing between
+    /// the caller and recipient pair where the caller/acting device is not an active member.
+    pub fn is_direct_conversation_not_member(&self) -> bool {
+        let body = match self {
+            OrchestratorError::ServerError { body, .. } => body.as_str(),
+            OrchestratorError::Api(message) => message.as_str(),
+            _ => return false,
+        };
+        body.contains("DirectConversationExistsNotMember")
+            || body.contains("DirectConversationAlreadyExists")
+            || (body.contains("ConversationAlreadyExists") && body.contains("not a member"))
+            || (body.contains("NotMember") && body.contains("direct"))
+            || (body.contains("NotEntitled") && body.contains("direct"))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -296,5 +311,33 @@ mod tests {
         // Unrelated failures must not classify.
         assert!(!OrchestratorError::Api("connection refused".into()).is_device_not_registered());
         assert!(!OrchestratorError::NotAuthenticated.is_device_not_registered());
+    }
+
+    #[test]
+    fn is_direct_conversation_not_member_matches_lexicon_codes() {
+        for code in [
+            r#"{"error":"DirectConversationExistsNotMember","message":"active direct conversation exists"}"#,
+            r#"{"error":"DirectConversationAlreadyExists","message":"direct conversation already exists"}"#,
+            r#"{"error":"ConversationAlreadyExists","message":"active conversation exists but caller is not a member"}"#,
+            r#"{"error":"NotMember","message":"caller is not a member of this direct conversation"}"#,
+            r#"{"error":"NotEntitled","message":"caller is not entitled to direct conversation"}"#,
+        ] {
+            let err = OrchestratorError::ServerError {
+                status: 409,
+                body: code.to_string(),
+            };
+            assert!(err.is_direct_conversation_not_member(), "{code} must classify");
+
+            let api_err = OrchestratorError::Api(format!("status 409: {code}"));
+            assert!(api_err.is_direct_conversation_not_member(), "{code} via Api must classify");
+        }
+
+        // Unrelated errors must not classify.
+        let unrelated = OrchestratorError::ServerError {
+            status: 409,
+            body: r#"{"error":"AlreadyBootstrapped"}"#.to_string(),
+        };
+        assert!(!unrelated.is_direct_conversation_not_member());
+        assert!(!OrchestratorError::NotAuthenticated.is_direct_conversation_not_member());
     }
 }

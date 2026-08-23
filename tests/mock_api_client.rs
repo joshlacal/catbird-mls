@@ -94,6 +94,9 @@ struct MockState {
     /// from mutable MLS group ids from the first response onward.
     next_create_conversation_id: Option<String>,
 
+    /// Custom raw GatewayResponse for the next createConversation call.
+    next_create_custom_response: Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+
     /// Conversations temporarily omitted from get_conversations, modeling the
     /// visibility gap between createConvo acceptance and list projection.
     hidden_conversation_ids: HashSet<String>,
@@ -240,6 +243,16 @@ impl MockDeliveryService {
     pub fn set_next_create_conversation_id(&self, conversation_id: &str) {
         self.state.lock().unwrap().next_create_conversation_id = Some(conversation_id.to_string());
     }
+    pub fn set_next_create_custom_response(&self, status: u16, body: serde_json::Value) {
+        self.state.lock().unwrap().next_create_custom_response = Some(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&body).unwrap(),
+            },
+        );
+    }
+
 
     pub fn set_conversation_hidden_from_list(&self, conversation_id: &str, hidden: bool) {
         let mut state = self.state.lock().unwrap();
@@ -1491,6 +1504,9 @@ impl MLSAPIClient for MockDeliveryService {
 
         match request.operation {
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation => {
+                if let Some(resp) = self.state.lock().unwrap().next_create_custom_response.take() {
+                    return Ok(resp);
+                }
                 let group_id = inner_body
                     .get("next")
                     .and_then(|n| n.get("groupId"))

@@ -34,7 +34,7 @@ mod tests {
             .await
             .expect("register alice");
         let alice = world.client("Alice");
-        let stable_id = "stable-cleanup-raw-state-alias";
+        let stable_id = "11111111-0001-4000-8000-000000000001";
         world
             .delivery_service()
             .set_next_create_conversation_id(stable_id);
@@ -120,7 +120,7 @@ mod tests {
             .await
             .expect("register alice");
         let alice = world.client("Alice");
-        let stable_id = "stable-intent-handoff-cancel";
+        let stable_id = "11111111-0002-4000-8000-000000000002";
         world
             .delivery_service()
             .set_next_create_conversation_id(stable_id);
@@ -174,7 +174,7 @@ mod tests {
             .await
             .expect("register alice");
         let alice = world.client("Alice");
-        let stable_id = "stable-post-create-cancel";
+        let stable_id = "11111111-0003-4000-8000-000000000003";
         world
             .delivery_service()
             .set_next_create_conversation_id(stable_id);
@@ -353,7 +353,7 @@ mod tests {
             .is_empty());
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
 
-        let stable_mark_id = "stable-mark-fails";
+        let stable_mark_id = "11111111-0004-4000-8000-000000000004";
         world
             .delivery_service()
             .set_next_create_conversation_id(stable_mark_id);
@@ -386,7 +386,7 @@ mod tests {
             .is_empty());
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
 
-        let raw_clear_id = "raw-clear-fails";
+        let raw_clear_id = "11111111-0005-4000-8000-000000000005";
         world
             .delivery_service()
             .set_next_create_conversation_id(raw_clear_id);
@@ -427,7 +427,7 @@ mod tests {
             .is_empty());
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
 
-        let final_clear_id = "final-clear-fails";
+        let final_clear_id = "11111111-0006-4000-8000-000000000006";
         world
             .delivery_service()
             .set_next_create_conversation_id(final_clear_id);
@@ -497,7 +497,7 @@ mod tests {
             .await
             .expect("register alice");
         let alice = world.client("Alice");
-        let conversation_id = "delete-recreate-fence";
+        let conversation_id = "11111111-0007-4000-8000-000000000007";
         world
             .delivery_service()
             .set_next_create_conversation_id(conversation_id);
@@ -773,6 +773,185 @@ mod tests {
                 .expect("local epoch after rejection"),
             local_epoch
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_group_adopts_server_conversation_id_and_leaves_exactly_one_record() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+        let server_convo_id = "77777777-7777-4777-8777-777777777777";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(server_convo_id);
+
+        let created = alice
+            .orchestrator
+            .create_group("dedup test", None, None)
+            .await
+            .expect("create distinct stable conversation");
+
+        assert_eq!(created.conversation_id, server_convo_id);
+        assert_ne!(created.conversation_id, created.group_id);
+
+        // The local store must hold exactly one conversation record: keyed by server_convo_id.
+        let stored_stable = alice
+            .storage
+            .get_conversation(&alice.did, server_convo_id)
+            .await
+            .expect("read stable row");
+        assert!(stored_stable.is_some(), "stable record must exist");
+
+        let stored_raw = alice
+            .storage
+            .get_conversation(&alice.did, &created.group_id)
+            .await
+            .expect("read raw group id row");
+        assert!(stored_raw.is_none(), "group-keyed conversation record must not exist");
+
+        let all_convos = alice
+            .storage
+            .list_conversations(&alice.did)
+            .await
+            .expect("list conversations");
+        assert_eq!(all_convos.len(), 1, "exactly one conversation record must exist");
+        assert_eq!(all_convos[0].conversation_id, server_convo_id);
+
+        // In-memory caches must also hold only the stable conversation id.
+        let convos = alice.orchestrator.conversations().lock().await;
+        assert!(convos.contains_key(server_convo_id));
+        assert!(!convos.contains_key(&created.group_id));
+        drop(convos);
+
+        let states = alice.orchestrator.conversation_states().lock().await;
+        assert!(states.contains_key(server_convo_id));
+        assert!(!states.contains_key(&created.group_id));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_group_fails_when_server_returns_non_canonical_uuid() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+
+        // 1. 64-hex MLS group id returned as conversationId
+        let group_hex_id = "205b476d54ee0ffb205b476d54ee0ffb205b476d54ee0ffb205b476d54ee0ffb";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(group_hex_id);
+        let err = alice
+            .orchestrator
+            .create_group("hex id", None, None)
+            .await
+            .expect_err("non-canonical hex id must fail create");
+        assert!(err.to_string().contains("non-canonical conversation UUID"));
+        assert_eq!(alice.storage.conversation_count(), 0);
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap()
+            .is_empty());
+
+        // 2. Uppercase UUID
+        let uppercase_uuid = "70707070-7070-4070-B070-707070707070";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(uppercase_uuid);
+        let err = alice
+            .orchestrator
+            .create_group("uppercase uuid", None, None)
+            .await
+            .expect_err("uppercase UUID must fail create");
+        assert!(err.to_string().contains("non-canonical conversation UUID"));
+        assert_eq!(alice.storage.conversation_count(), 0);
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap()
+            .is_empty());
+
+        // 3. Compact UUID (no hyphens)
+        let compact_uuid = "7070707070704070b070707070707070";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(compact_uuid);
+        let err = alice
+            .orchestrator
+            .create_group("compact uuid", None, None)
+            .await
+            .expect_err("compact UUID must fail create");
+        assert!(err.to_string().contains("non-canonical conversation UUID"));
+        assert_eq!(alice.storage.conversation_count(), 0);
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+
+        // 4. Missing conversationId in response
+        world
+            .delivery_service()
+            .set_next_create_custom_response(200, serde_json::json!({
+                "result": {
+                    "coordinates": {
+                        "epoch": 0
+                    }
+                }
+            }));
+        let err = alice
+            .orchestrator
+            .create_group("missing convo id", None, None)
+            .await
+            .expect_err("missing conversationId must fail create");
+        assert!(err.to_string().contains("missing result.coordinates.conversationId"));
+        assert_eq!(alice.storage.conversation_count(), 0);
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_group_fails_and_cleans_up_when_active_direct_conversation_exists_and_caller_not_member() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+
+        world
+            .delivery_service()
+            .set_next_create_custom_response(409, serde_json::json!({
+                "error": "DirectConversationExistsNotMember",
+                "message": "active direct conversation exists for dids but caller device is not a member",
+                "existingConversationId": "f55a5ece-b653-43f3-950a-ab72b4a5c075"
+            }));
+
+        let err = alice
+            .orchestrator
+            .create_group("existing direct convo", None, None)
+            .await
+            .expect_err("create must fail with descriptive message");
+
+        assert!(
+            err.to_string().contains("a conversation with that person exists but this device has not been added to it"),
+            "expected specific direct conversation message, found: {err}"
+        );
+        assert_eq!(alice.storage.conversation_count(), 0);
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap()
+            .is_empty(), "local MLS group must be cleaned up on failure");
     }
 }
 
@@ -1289,11 +1468,16 @@ where
             .await?;
 
         if response.status != 200 {
-            return Err(OrchestratorError::Api(format!(
-                "create_conversation failed with status {}: {}",
-                response.status,
-                String::from_utf8_lossy(&response.body)
-            )));
+            let error = OrchestratorError::ServerError {
+                status: response.status,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+            };
+            if error.is_direct_conversation_not_member() {
+                return Err(OrchestratorError::InvalidInput(
+                    "a conversation with that person exists but this device has not been added to it".to_string(),
+                ));
+            }
+            return Err(error);
         }
 
         let resp_json: serde_json::Value =
@@ -1301,13 +1485,24 @@ where
                 OrchestratorError::Serialization(format!("create_conversation response: {e}"))
             })?;
 
-        let resp_convo_id = resp_json
+        let resp_cid_str = resp_json
             .get("result")
             .and_then(|r| r.get("coordinates"))
             .and_then(|c| c.get("conversationId"))
             .and_then(|cid| cid.as_str())
-            .unwrap_or(&conversation_id)
-            .to_string();
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput(
+                    "create_conversation response missing result.coordinates.conversationId".into(),
+                )
+            })?;
+
+        let parsed_conversation_id = crate::chat_v2::ids::uuid::ConversationId::parse(resp_cid_str)
+            .map_err(|e| {
+                OrchestratorError::InvalidInput(format!(
+                    "create_conversation returned non-canonical conversation UUID '{resp_cid_str}': {e}"
+                ))
+            })?;
+        let resp_convo_id = parsed_conversation_id.to_string();
 
         let mut member_views = vec![MemberView {
             did: user_did.to_string(),
@@ -1365,6 +1560,11 @@ where
             self.storage()
                 .clear_pending_local_delete(group_id_hex)
                 .await?;
+            self.storage()
+                .delete_conversations(user_did, &[group_id_hex])
+                .await?;
+            self.conversations().lock().await.remove(group_id_hex);
+            self.conversation_states().lock().await.remove(group_id_hex);
         }
 
         self.storage()
