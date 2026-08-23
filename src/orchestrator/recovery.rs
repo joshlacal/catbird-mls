@@ -5326,7 +5326,7 @@ where
         Ok(conversation.members.iter().map(|m| m.did.clone()).collect())
     }
 
-    async fn fetch_conversation_for_convo(&self, convo_id: &str) -> Result<ConversationView> {
+    pub(crate) async fn fetch_conversation_for_convo(&self, convo_id: &str) -> Result<ConversationView> {
         let mut cursor: Option<String> = None;
         let mut pagination = PaginationGuard::for_conversations("reset conversation lookup");
         loop {

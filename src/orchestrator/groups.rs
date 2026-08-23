@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
 use crate::chat_v2::ids::uuid::ConversationId as ValidatedConversationId;
@@ -1084,6 +1085,179 @@ mod tests {
             .expect("check raw group id in storage");
         assert!(stored_raw.is_none(), "raw group id must not be in storage");
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_group_existing_direct_result_discards_fresh_group_and_returns_existing() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world.add_client("Bob").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        world
+            .register_device("Bob")
+            .await
+            .expect("register bob");
+        let alice = world.client("Alice");
+        let bob = world.client("Bob");
+
+        // First, create an initial direct conversation between Alice and Bob.
+        let initial_convo_id = "88888888-8888-4888-8888-888888888888";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(initial_convo_id);
+
+        let initial = alice
+            .orchestrator
+            .create_group("initial direct", Some(&[bob.did.clone()]), None)
+            .await
+            .expect("create initial direct conversation");
+
+        assert_eq!(initial.conversation_id, initial_convo_id);
+        let initial_group_id = initial.group_id.clone();
+        assert!(alice
+            .orchestrator
+            .mls_context()
+            .group_exists(hex::decode(&initial_group_id).unwrap()));
+
+        // Now simulate a duplicate create where the server returns an existingDirectConversationResult
+        // with the original conversation coordinates and conversationId.
+        let initial_group_bytes = hex::decode(&initial_group_id).unwrap();
+        world
+            .delivery_service()
+            .set_next_create_custom_response(200, serde_json::json!({
+                "result": {
+                    "$type": "blue.catbird.chat.defs#existingDirectConversationResult",
+                    "conversationKind": "direct",
+                    "conversationId": initial_convo_id,
+                    "coordinates": {
+                        "conversationId": initial_convo_id,
+                        "groupId": {
+                            "$bytes": base64::engine::general_purpose::STANDARD.encode(&initial_group_bytes)
+                        },
+                        "epoch": initial.epoch as i64,
+                        "generation": 0,
+                        "stateVersion": 0,
+                        "lifecycle": "active",
+                        "groupContextHash": {
+                            "$bytes": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+                        },
+                        "confirmationTag": {
+                            "$bytes": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+                        }
+                    }
+                }
+            }));
+
+        let duplicate = alice
+            .orchestrator
+            .create_group("duplicate direct", Some(&[bob.did.clone()]), None)
+            .await
+            .expect("duplicate create with existingDirectConversationResult must succeed by returning existing");
+
+        assert_eq!(duplicate.conversation_id, initial_convo_id);
+        assert_eq!(duplicate.group_id, initial_group_id);
+
+        // Exactly one conversation record exists for Alice (under the canonical UUID), and exactly one MLS group.
+        let convos = alice.orchestrator.conversations().lock().await;
+        assert_eq!(convos.len(), 1);
+        assert!(convos.contains_key(initial_convo_id));
+        drop(convos);
+
+        let stored = alice
+            .storage
+            .list_conversations(&alice.did)
+            .await
+            .expect("list conversations");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].conversation_id, initial_convo_id);
+        assert_eq!(stored[0].group_id, initial_group_id);
+
+        assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconcile_noncanonical_phantom_aliases_retires_alias_without_deleting_crypto_group() {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
+        let alice = world.client("Alice");
+
+        let canonical_uuid = "99999999-9999-4999-8999-999999999999";
+        world
+            .delivery_service()
+            .set_next_create_conversation_id(canonical_uuid);
+
+        let created = alice
+            .orchestrator
+            .create_group("phantom test convo", None, None)
+            .await
+            .expect("create conversation");
+
+        let group_id_hex = created.group_id.clone();
+        assert_eq!(created.conversation_id, canonical_uuid);
+
+        // Simulate a legacy app version having left behind a phantom conversation row keyed by group_id_hex
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &group_id_hex, &group_id_hex)
+            .await
+            .expect("seed legacy phantom conversation row");
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(group_id_hex.clone(), ConversationView {
+                group_id: group_id_hex.clone(),
+                conversation_id: group_id_hex.clone(),
+                epoch: 0,
+                members: vec![],
+                metadata: None,
+                created_at: Some(chrono::Utc::now()),
+                updated_at: Some(chrono::Utc::now()),
+                sequencer_did: None,
+            });
+
+        assert_eq!(
+            alice.storage.list_conversations(&alice.did).await.unwrap().len(),
+            2,
+            "both canonical and phantom rows exist before reconcile"
+        );
+
+        // Run startup reconcile
+        alice
+            .orchestrator
+            .reconcile_noncanonical_phantom_aliases(&alice.did)
+            .await;
+
+        let after_reconcile = alice
+            .storage
+            .list_conversations(&alice.did)
+            .await
+            .expect("list conversations after reconcile");
+
+        assert_eq!(after_reconcile.len(), 1, "phantom alias must be deleted");
+        assert_eq!(after_reconcile[0].conversation_id, canonical_uuid);
+        assert_eq!(after_reconcile[0].group_id, group_id_hex);
+
+        // Cryptographic MLS group state must be fully preserved
+        assert!(
+            alice
+                .orchestrator
+                .mls_context()
+                .group_exists(hex::decode(&group_id_hex).unwrap()),
+            "shared cryptographic group state must NOT be deleted"
+        );
+
+        let convos = alice.orchestrator.conversations().lock().await;
+        assert!(!convos.contains_key(&group_id_hex), "phantom key must be purged from cache");
+        assert!(convos.contains_key(canonical_uuid), "canonical UUID must remain in cache");
+    }
 }
 
 /// Internal rollback identity for a group creation attempt. Before createConvo
@@ -1655,9 +1829,69 @@ where
                 OrchestratorError::Serialization(format!("create_conversation response: {e}"))
             })?;
 
-        let resp_cid_str = resp_json
+        let result_obj = resp_json
             .get("result")
-            .and_then(|r| r.get("coordinates"))
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput("create_conversation response missing result".into())
+            })?;
+
+        let result_type = result_obj
+            .get("$type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("blue.catbird.chat.defs#conversationCreatedResult");
+
+        match result_type {
+            "blue.catbird.chat.defs#conversationCreatedResult" => {}
+            "blue.catbird.chat.defs#existingDirectConversationResult" => {
+                let resp_cid_str = result_obj
+                    .get("conversationId")
+                    .or_else(|| result_obj.get("coordinates").and_then(|c| c.get("conversationId")))
+                    .and_then(|cid| cid.as_str())
+                    .ok_or_else(|| {
+                        OrchestratorError::InvalidInput(
+                            "existingDirectConversationResult response missing conversationId".into(),
+                        )
+                    })?;
+
+                let parsed_conversation_id = ValidatedConversationId::parse(resp_cid_str)
+                    .map_err(|e| {
+                        OrchestratorError::InvalidInput(format!(
+                            "existingDirectConversationResult returned non-canonical conversation UUID '{resp_cid_str}': {e}"
+                        ))
+                    })?;
+
+                let resp_convo_id_str = parsed_conversation_id.to_string();
+                tracing::info!(
+                    convo_id = %resp_convo_id_str,
+                    attempted_group_id = %group_id_hex,
+                    "Server returned existingDirectConversationResult; discarding fresh group and loading existing conversation"
+                );
+
+                // Discard the fresh locally-created group state from OpenMLS memory/storage
+                let _ = self.mls_context().delete_group(group_id_bytes.clone());
+                let _ = self.storage().delete_group_state(group_id_hex).await;
+                let _ = self.storage().delete_conversations(user_did, &[group_id_hex]).await;
+                self.conversations().lock().await.remove(group_id_hex);
+                self.conversation_states().lock().await.remove(group_id_hex);
+
+                // Load existing conversation from cache, storage, or server
+                if let Some(view) = self.conversations().lock().await.get(&resp_convo_id_str).cloned() {
+                    return Ok(view);
+                }
+                if let Some(view) = self.storage().get_conversation(user_did, &resp_convo_id_str).await? {
+                    return Ok(view);
+                }
+                return self.fetch_conversation_for_convo(&resp_convo_id_str).await;
+            }
+            other => {
+                return Err(OrchestratorError::InvalidInput(format!(
+                    "unknown create_conversation result type: {other}"
+                )));
+            }
+        }
+
+        let resp_cid_str = result_obj
+            .get("coordinates")
             .and_then(|c| c.get("conversationId"))
             .and_then(|cid| cid.as_str())
             .ok_or_else(|| {
@@ -1672,7 +1906,6 @@ where
                     "create_conversation returned non-canonical conversation UUID '{resp_cid_str}': {e}"
                 ))
             })?;
-
         let mut member_views = vec![MemberView {
             did: user_did.to_string(),
             role: MemberRole::Admin,
@@ -4701,6 +4934,59 @@ where
                     convo_id = %intent.conversation_id,
                     "Reconcile sweep: delete steps failed — keeping intent for the next startup sweep"
                 );
+            }
+        }
+    }
+
+    /// One-time / startup reconciliation to retire noncanonical group-key conversation aliases.
+    /// If an older app version persisted a local conversation record keyed by its 64-hex MLS group ID
+    /// while a canonical UUID record maps the same MLS group, deactivate/delete the phantom alias row
+    /// without deleting the shared cryptographic group state.
+    pub(crate) async fn reconcile_noncanonical_phantom_aliases(&self, user_did: &str) {
+        let convos = match self.storage().list_conversations(user_did).await {
+            Ok(list) => list,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list conversations during phantom alias reconciliation");
+                return;
+            }
+        };
+
+        // Find all group_ids mapped by canonical UUID conversations
+        let mut canonical_group_ids = HashSet::new();
+        for convo in &convos {
+            if ValidatedConversationId::parse(&convo.conversation_id).is_ok() {
+                canonical_group_ids.insert(convo.group_id.clone());
+            }
+        }
+
+        // Identify noncanonical conversation records whose id is NOT a UUID
+        // but whose group_id is already mapped by a canonical UUID record.
+        let mut phantom_ids_to_delete = Vec::new();
+        for convo in &convos {
+            if ValidatedConversationId::parse(&convo.conversation_id).is_err() {
+                if canonical_group_ids.contains(&convo.group_id)
+                    || convo.conversation_id == convo.group_id
+                {
+                    phantom_ids_to_delete.push(convo.conversation_id.clone());
+                }
+            }
+        }
+
+        if !phantom_ids_to_delete.is_empty() {
+            tracing::info!(
+                phantom_count = phantom_ids_to_delete.len(),
+                phantom_ids = ?phantom_ids_to_delete,
+                "Retiring noncanonical phantom conversation aliases"
+            );
+            let str_refs: Vec<&str> = phantom_ids_to_delete.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = self.storage().delete_conversations(user_did, &str_refs).await {
+                tracing::warn!(error = %e, "Failed to delete phantom conversation aliases from storage");
+            }
+            let mut conversations_lock = self.conversations().lock().await;
+            let mut states_lock = self.conversation_states().lock().await;
+            for id in &phantom_ids_to_delete {
+                conversations_lock.remove(id);
+                states_lock.remove(id);
             }
         }
     }
