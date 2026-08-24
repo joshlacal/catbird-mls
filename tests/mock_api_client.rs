@@ -155,6 +155,8 @@ struct MockState {
     /// `request_id` is forwarded here as the addMembers idempotency key.
     add_members_idempotency_keys: Vec<String>,
 
+    /// Leaf recovery inbox items served to GetLeafRecoveryInbox.
+    leaf_recovery_inbox_items: Vec<serde_json::Value>,
     /// Cached `add_members_with_idempotency` results keyed by idempotency key.
     /// A repeat call with an already-seen key replays the cached result WITHOUT
     /// advancing the server epoch — mirroring the DS
@@ -252,6 +254,10 @@ impl MockDeliveryService {
             },
         );
     }
+    pub fn add_leaf_recovery_inbox_item(&self, item: serde_json::Value) {
+        self.state.lock().unwrap().leaf_recovery_inbox_items.push(item);
+    }
+
 
 
     pub fn set_conversation_hidden_from_list(&self, conversation_id: &str, hidden: bool) {
@@ -2246,7 +2252,26 @@ impl MLSAPIClient for MockDeliveryService {
                     })
                 }).collect();
                 let output = serde_json::json!({
-                    "items": items
+                    "items": items,
+                    "inventorySessionId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+                    "snapshotEventCursor": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+                    "hasMore": false,
+                    "snapshotExpiresAt": "2026-08-20T12:00:00.000Z"
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox => {
+                let guard = self.state.lock().unwrap();
+                let output = serde_json::json!({
+                    "items": guard.leaf_recovery_inbox_items.clone(),
+                    "inventorySessionId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+                    "snapshotEventCursor": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+                    "hasMore": false,
+                    "snapshotExpiresAt": "2026-08-20T12:00:00.000Z"
                 });
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,

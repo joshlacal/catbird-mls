@@ -294,6 +294,26 @@ impl CatbirdMls {
             .map_err(OrchestratorBridgeError::from)
     }
 
+    /// Accept an invitation to a conversation (direct or group).
+    pub fn accept_conversation(
+        &self,
+        conversation_id: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        let orchestrator = self.client.orchestrator();
+        crate::async_runtime::block_on(orchestrator.accept_conversation(&conversation_id))?;
+        Ok(())
+    }
+
+    /// Fulfill an open leaf recovery request for a conversation.
+    pub fn fulfill_leaf_recovery(
+        &self,
+        conversation_id: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        let orchestrator = self.client.orchestrator();
+        crate::async_runtime::block_on(orchestrator.fulfill_leaf_recovery(&conversation_id))?;
+        Ok(())
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Messaging (high-level)
     // ═══════════════════════════════════════════════════════════════════════

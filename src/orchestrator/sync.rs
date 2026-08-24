@@ -594,8 +594,16 @@ where
                                             conversation_id = %conversation_id,
                                             group_id = %group_id,
                                             error = %e,
-                                            "Failed to join group"
+                                            "Failed to join group via join_or_rejoin; falling back to requesting leaf recovery"
                                         );
+                                        if let Err(rec_err) = self.accept_conversation(conversation_id).await {
+                                            tracing::warn!(
+                                                conversation_id = %conversation_id,
+                                                group_id = %group_id,
+                                                error = %rec_err,
+                                                "Failed to request leaf recovery/accept after join_or_rejoin failure"
+                                            );
+                                        }
                                         convo.epoch
                                     }
                                 }
@@ -878,6 +886,11 @@ where
                     }
                 }
             }
+        }
+
+        // Fulfill any pending leaf recovery requests for conversations we are active in.
+        if let Err(e) = self.fulfill_pending_leaf_recoveries().await {
+            tracing::warn!(error = %e, "Failed to fulfill pending leaf recoveries during sync");
         }
 
         tracing::info!(

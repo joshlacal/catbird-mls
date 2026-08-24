@@ -2728,6 +2728,24 @@ impl OrchestratorBridge {
         })
     }
 
+    /// Accept an invitation to a conversation (direct or group).
+    pub fn accept_conversation(
+        &self,
+        conversation_id: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.accept_conversation(&conversation_id))?;
+        Ok(())
+    }
+
+    /// Fulfill an open leaf recovery request for a conversation.
+    pub fn fulfill_leaf_recovery(
+        &self,
+        conversation_id: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.fulfill_leaf_recovery(&conversation_id))?;
+        Ok(())
+    }
+
     // -- Messaging --
 
     /// Send a text message.
