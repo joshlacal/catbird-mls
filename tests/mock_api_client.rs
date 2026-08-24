@@ -39,6 +39,7 @@ struct StoredConversation {
     members: Vec<String>,
     conversation_kind: String,
     metadata_snapshot: Option<serde_json::Value>,
+    participants: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone)]
@@ -846,6 +847,7 @@ impl MockDeliveryService {
             members: members.clone(),
             conversation_kind,
             metadata_snapshot: None,
+            participants: None,
         };
 
         guard.conversations.insert(conversation_id.clone(), stored);
@@ -1575,6 +1577,11 @@ impl MLSAPIClient for MockDeliveryService {
                     .get("conversationKind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("group");
+                let manifest_participants = inner_body
+                    .get("manifest")
+                    .and_then(|m| m.get("participants"))
+                    .and_then(|p| p.as_array())
+                    .cloned();
                 if let Some(stored) = self
                     .state
                     .lock()
@@ -1584,6 +1591,7 @@ impl MLSAPIClient for MockDeliveryService {
                 {
                     stored.conversation_kind = kind.to_string();
                     stored.metadata_snapshot = inner_body.get("metadataSnapshot").cloned();
+                    stored.participants = manifest_participants;
                 }
                 let participants: Vec<serde_json::Value> = res
                     .conversation
@@ -2126,11 +2134,24 @@ impl MLSAPIClient for MockDeliveryService {
                     .or_else(|| inner_body.get("conversationId"))
                     .and_then(|c| c.as_str())
                     .unwrap_or_default();
+                let actor_did = inner_body
+                    .get("actorDid")
+                    .and_then(|d| d.as_str())
+                    .unwrap_or_default();
                 let mut guard = self.state.lock().unwrap();
                 let mut new_epoch = 1;
                 if let Some(stored) = guard.conversations.get_mut(convo_id) {
                     stored.view.epoch += 1;
                     new_epoch = stored.view.epoch;
+                    if let Some(ref mut parts) = stored.participants {
+                        for p in parts.iter_mut() {
+                            if p.get("userDid").and_then(|u| u.as_str()) == Some(actor_did) {
+                                if let Some(obj) = p.as_object_mut() {
+                                    obj.insert("status".to_string(), serde_json::json!("active"));
+                                }
+                            }
+                        }
+                    }
                 }
                 let output = serde_json::json!({
                     "result": {
@@ -2219,13 +2240,17 @@ impl MLSAPIClient for MockDeliveryService {
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversations => {
                 let guard = self.state.lock().unwrap();
                 let items: Vec<serde_json::Value> = guard.conversations.values().map(|c| {
-                    let participants: Vec<serde_json::Value> = c.members.iter().map(|did| {
-                        serde_json::json!({
-                            "userDid": did,
-                            "role": "admin",
-                            "status": "active"
-                        })
-                    }).collect();
+                    let participants: Vec<serde_json::Value> = if let Some(ref parts) = c.participants {
+                        parts.clone()
+                    } else {
+                        c.members.iter().map(|did| {
+                            serde_json::json!({
+                                "userDid": did,
+                                "role": "admin",
+                                "status": "active"
+                            })
+                        }).collect()
+                    };
                     let group_id_bytes = hex::decode(&c.view.group_id).unwrap_or_else(|_| vec![0u8; 32]);
                     let meta = c.metadata_snapshot.clone().unwrap_or_else(|| serde_json::json!({
                         "metadataVersion": 1,

@@ -1730,13 +1730,15 @@ mod tests {
             .expect("create conversation");
 
         // Fetch Bob's key package
+        let bob_device_id = bob.orchestrator.require_actor_device_id().await.expect("bob device id");
+        let scoped_did = format!("{}#{}", bob.did, bob_device_id);
         let kp_res = bob
             .orchestrator
             .mls_context()
-            .create_key_package(bob.did.as_bytes().to_vec())
+            .create_key_package(scoped_did.as_bytes().to_vec())
             .expect("create key package for bob");
-        let kp_b64 = STANDARD.encode(&kp_res.key_package);
-        let kp_ref_b64 = STANDARD.encode(sha2::Sha256::digest(&kp_res.key_package));
+        let kp_b64 = STANDARD.encode(&kp_res.key_package_data);
+        let kp_ref_b64 = STANDARD.encode(&kp_res.hash_ref);
 
         let recovery_req_id = uuid::Uuid::new_v4().to_string();
         let inbox_item = serde_json::json!({
@@ -1744,7 +1746,7 @@ mod tests {
                 "recoveryRequestId": recovery_req_id,
                 "conversationId": created.conversation_id,
                 "requesterDid": bob.did,
-                "requesterDeviceId": "bob-device-1",
+                "requesterDeviceId": bob_device_id,
                 "recoveryKind": "add",
                 "status": "open",
                 "reservation": {
@@ -1806,13 +1808,15 @@ mod tests {
             .create_group("alice group", None, None)
             .await
             .expect("create conversation");
+        let alice_did = alice.did.clone();
 
         // Alice Device 2
-        world.add_client("AliceDev2").await;
+        world.add_client_with_did("AliceDev2", &alice_did).await;
+        world.register_device("AliceDev2").await.expect("register alice device 2");
         let alice_dev2 = world.client("AliceDev2");
-        alice_dev2.credentials.store_mls_did(&alice.did, "did:plc:alice#dev2").await.unwrap();
-        alice_dev2.credentials.set_auth_generation(&alice.did, 1).await.unwrap();
-        alice_dev2.credentials.store_signing_key(&alice.did, b"fake-dev2-key").await.unwrap();
+
+        // Make get_group_info fail so join_or_rejoin cannot use External Commit and falls back to leaf recovery
+        world.delivery_service().fail_next_get_group_info();
 
         // Device 2 performs sync; having no local group in FFI and no Welcome,
         // join_or_rejoin fails and sync falls back to requesting leaf recovery.

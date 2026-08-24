@@ -115,6 +115,12 @@ impl TestWorld {
     /// Add a new client (creates orchestrator, storage, credentials, and MLS context).
     pub async fn add_client(&mut self, name: &str) -> &TestClient {
         let did = format!("did:plc:{}", name.to_lowercase());
+        self.add_client_with_did(name, &did).await
+    }
+
+    /// Add a new client with an explicit DID (e.g. secondary device for an existing user).
+    pub async fn add_client_with_did(&mut self, name: &str, did: &str) -> &TestClient {
+        let did = did.to_string();
         let seq = GLOBAL_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         // Per-client temp directory for SQLite storage
