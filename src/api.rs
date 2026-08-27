@@ -407,9 +407,8 @@ struct PendingOutgoingCommitMeta {
     merge_started: bool,
 }
 
-#[derive(Clone)]
 struct PendingIncomingCommit {
-    staged: Box<StagedCommit>,
+    staged: Option<Box<StagedCommit>>,
     /// SHA-256 of the normalized MLS wire message that produced `staged`.
     /// The epoch alone is not an authorization handle: two different valid
     /// commits can target the same next epoch. Preserve the first object and
@@ -463,7 +462,7 @@ fn stage_pending_incoming_commit(
     match pending.entry(key) {
         Entry::Vacant(entry) => {
             entry.insert(PendingIncomingCommit {
-                staged,
+                staged: Some(staged),
                 wire_fingerprint,
                 merge_started: false,
             });
@@ -4297,7 +4296,7 @@ impl MLSContext {
         inner.with_group_ref(&gid, |group, _provider| {
             let epoch = group.epoch().as_u64();
             // tree_hash() returns &[u8] directly - no crypto provider needed
-            let tree_hash = group.tree_hash().to_vec();
+            let tree_hash = group.public_group().group_context().tree_hash().to_vec();
 
             crate::debug_log!(
                 "[MLS-FFI] Tree hash at epoch {}: {} bytes",
@@ -5146,7 +5145,6 @@ impl MLSContext {
                 target_epoch
             ))
         })?;
-        let staged = pending_entry.staged.clone();
         let merge_started = pending_entry.merge_started;
         let gid = GroupId::from_slice(&group_id);
         let expected_source = target_epoch.checked_sub(1).ok_or_else(|| {
@@ -5183,6 +5181,16 @@ impl MLSContext {
                 remote: expected_source,
             });
         }
+        let staged = pending
+            .get_mut(&pending_key)
+            .and_then(|e| e.staged.take())
+            .ok_or_else(|| {
+                MLSError::Internal(format!(
+                    "incoming staged commit payload missing for group {} epoch {}",
+                    hex::encode(&group_id),
+                    target_epoch
+                ))
+            })?;
 
         let new_epoch = inner.with_group(&gid, |group, provider, _signer| {
             group.merge_staged_commit(provider, *staged).map_err(|e| {
