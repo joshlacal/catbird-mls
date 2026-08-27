@@ -1272,7 +1272,7 @@ async fn own_pending_commit_untracked_restarted_withholds_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn own_commit_untracked_with_bare_own_commits_skips_and_advances_cursor() {
+async fn bare_own_commits_hash_without_expectation_withholds_cursor_and_marks_rejoin() {
     let conversation_id = "6162636465666768696a6b6c6d6e6f78";
     let message_id = "bare-own-commit";
     let fixture = controlled_inbound_fixture(
@@ -1294,28 +1294,150 @@ async fn own_commit_untracked_with_bare_own_commits_skips_and_advances_cursor() 
         .send_message_with_id(conversation_id, b"commit-ciphertext", 1, message_id)
         .await
         .expect("seed server envelope");
-    fixture
-        .api
-        .send_message_with_id(conversation_id, b"continuation", 1, "continuation-frame")
-        .await
-        .expect("seed continuation envelope");
 
-    let (messages, cursor) = fixture
+    let error = fixture
         .orchestrator
         .fetch_messages(conversation_id, None, 1, None, None, None)
         .await
-        .expect("bare tracked commit may be skipped");
-    assert!(messages.is_empty());
-    assert_eq!(cursor.as_deref(), Some("1"));
-    assert!(
-        !fixture
-            .orchestrator
-            .own_commits()
-            .lock()
-            .await
-            .contains_key(&commit_hash),
-        "consumed commit hash must be removed from tracking"
+        .expect_err("bare tracked commit without expectation must fail closed");
+    assert!(error
+        .to_string()
+        .contains("unverified bare own commit hash without expectation"));
+    assert!(fixture.storage.has_rejoin_flag(conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn response_lost_or_unrecorded_proof_withholds_cursor() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("response-lost-cursor-withholding", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id = &convo.group_id;
+    let group_bytes = hex::decode(group_id).unwrap();
+
+    // Alice encrypts an application message directly (simulating send where response was lost before proof storage)
+    let enc = alice
+        .orchestrator
+        .mls_context()
+        .encrypt_message(group_bytes.clone(), b"lost response payload".to_vec())
+        .expect("encrypt application message");
+
+    // Seed server with the message envelope
+    world
+        .api_service
+        .send_message_with_id(
+            &convo.conversation_id,
+            &enc.ciphertext,
+            0,
+            "server-entry-lost-ack",
+        )
+        .await
+        .expect("seed server envelope");
+
+    // Because no durable proof was recorded, receiving this own private message echo must withhold cursor
+    let error = alice
+        .orchestrator
+        .fetch_messages(group_id, None, 10, None, None, None)
+        .await
+        .expect_err("lost response / missing proof must withhold cursor on own message echo");
+    assert!(error
+        .to_string()
+        .contains("unverified own-private message outcome"));
+    assert!(!alice.storage.has_rejoin_flag(group_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn proof_store_failure_withholds_cursor() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("proof-store-failure-test", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id = &convo.group_id;
+    let group_bytes = hex::decode(group_id).unwrap();
+
+    let enc = alice
+        .orchestrator
+        .mls_context()
+        .encrypt_message(group_bytes.clone(), b"unproven payload".to_vec())
+        .expect("encrypt application message");
+    world
+        .api_service
+        .send_message_with_id(
+            &convo.conversation_id,
+            &enc.ciphertext,
+            0,
+            "unproven-server-entry",
+        )
+        .await
+        .expect("seed server envelope");
+
+    let error = alice
+        .orchestrator
+        .fetch_messages(group_id, None, 10, None, None, None)
+        .await
+        .expect_err("missing proof must withhold cursor");
+    assert!(error
+        .to_string()
+        .contains("unverified own-private message outcome"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_set_aad_failure_restores_aad_and_echo_matches_exact_proof() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("aad-restore-test", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id = &convo.group_id;
+    let group_bytes = hex::decode(group_id).unwrap();
+    // Force a failure in add_members_with_aad with non-empty AAD (using an invalid key package)
+    let bad_kp = catbird_mls::KeyPackageData {
+        data: b"invalid key package bytes".to_vec(),
+    };
+    let add_res = alice.orchestrator.mls_context().add_members_with_aad(
+        group_bytes.clone(),
+        vec![bad_kp],
+        Some(b"custom-aad".to_vec()),
     );
+    assert!(
+        add_res.is_err(),
+        "add_members_with_aad with invalid key package must fail"
+    );
+    // Now Alice sends an application message. The group AAD must have been restored to empty,
+    // so the proof's empty AAD matches the encryption and the subsequent echo.
+    let sent = alice
+        .orchestrator
+        .send_message(group_id, "hello with restored AAD")
+        .await
+        .expect("send_message must succeed after restored AAD");
+
+    // Fetch messages: Alice's own message echoes back and must be skipped cleanly via exact proof
+    let (fetched, _cursor) = alice
+        .orchestrator
+        .fetch_messages(group_id, None, 10, None, None, None)
+        .await
+        .expect("fetch_messages must match proof and skip echo");
+    assert!(fetched.is_empty(), "own message echo must be skipped");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1334,11 +1456,15 @@ async fn own_private_message_survives_restart_and_redelivery() {
         .expect("create_group failed");
     let group_id = &convo.group_id;
 
-    let _sent = alice
+    let sent = alice
         .orchestrator
         .send_message(group_id, "restart message")
         .await
         .expect("send_message failed");
+    assert_ne!(sent.id, "restart message");
+    let parsed_server_uuid =
+        uuid::Uuid::parse_str(&sent.id).expect("server entryId must be UUIDv4");
+    assert_eq!(parsed_server_uuid.get_version_num(), 4);
 
     // Clear in-memory caches to simulate app restart
     alice.orchestrator.own_commits().lock().await.clear();
@@ -1965,4 +2091,213 @@ async fn missing_group_projection_fails_before_pruning_or_cursor_return() {
     assert!(error.to_string().contains("Group not found"));
     assert_eq!(crypto.cleanup_calls.load(Ordering::SeqCst), 0);
     assert!(storage.has_rejoin_flag(conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_message_response_validation_rejects_noncanonical_shapes_and_mutations() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("response-validation-group", None, None)
+        .await
+        .expect("create_group");
+    let group_id = &convo.group_id;
+
+    // Helper to get the submitted signedRequest from a baseline send
+    // Do a successful send first so we capture a real signedRequest shape
+    alice
+        .orchestrator
+        .send_message(group_id, "seed message")
+        .await
+        .expect("seed send");
+    let last_req = world
+        .api_service
+        .submitted_prepared_requests()
+        .last()
+        .cloned()
+        .expect("last request");
+    let wire: serde_json::Value =
+        serde_json::from_slice(last_req.body.as_deref().unwrap()).unwrap();
+    let valid_signed_request = wire.get("signedRequest").unwrap().clone();
+
+    // 1. Top-level response without "entry" wrapper
+    world.api_service.set_next_send_custom_response(
+        200,
+        serde_json::json!({
+            "conversationId": &convo.conversation_id,
+            "entryId": uuid::Uuid::new_v4().to_string(),
+            "receivedAt": "2026-08-27T00:00:00.000Z",
+            "seq": 1,
+            "signedRequest": valid_signed_request
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "msg1")
+        .await
+        .expect_err("top-level response without entry wrapper must be rejected");
+    assert!(err
+        .to_string()
+        .contains("send_message response must contain only 'entry'"));
+
+    // 2. Extra field in entry object
+    world.api_service.set_next_send_custom_response(
+        200,
+        serde_json::json!({
+            "entry": {
+                "conversationId": &convo.conversation_id,
+                "entryId": uuid::Uuid::new_v4().to_string(),
+                "receivedAt": "2026-08-27T00:00:00.000Z",
+                "seq": 1,
+                "signedRequest": valid_signed_request,
+                "unexpectedExtraField": "malicious"
+            }
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "msg2")
+        .await
+        .expect_err("entry with extra fields must be rejected");
+    assert!(err
+        .to_string()
+        .contains("send_message response entry must have exactly 5 fields"));
+
+    // 3. Mutated signature in returned signedRequest
+    // Capture the latest valid signedRequest for msg3
+    let mut bad_sig_request = valid_signed_request.clone();
+    bad_sig_request["signature"] =
+        serde_json::json!("bXV0YXRlZHNpZ25hdHVyZW11dGF0ZWRzaWduYXR1cmVtdXRhdGVkc2lnbmF0dXJlMQ==");
+    world.api_service.set_next_send_custom_response(
+        200,
+        serde_json::json!({
+            "entry": {
+                "conversationId": &convo.conversation_id,
+                "entryId": uuid::Uuid::new_v4().to_string(),
+                "receivedAt": "2026-08-27T00:00:00.000Z",
+                "seq": 1,
+                "signedRequest": bad_sig_request
+            }
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "msg3")
+        .await
+        .expect_err("mutated signature in signedRequest must be rejected");
+    assert!(err
+        .to_string()
+        .contains("signedRequest does not match submitted signedRequest"));
+
+    // 4. Mutated actorDid in returned signedRequest
+    let mut bad_actor_request = valid_signed_request.clone();
+    bad_actor_request["body"]["actorDid"] = serde_json::json!("did:plc:mallory");
+    world.api_service.set_next_send_custom_response(
+        200,
+        serde_json::json!({
+            "entry": {
+                "conversationId": &convo.conversation_id,
+                "entryId": uuid::Uuid::new_v4().to_string(),
+                "receivedAt": "2026-08-27T00:00:00.000Z",
+                "seq": 1,
+                "signedRequest": bad_actor_request
+            }
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "msg4")
+        .await
+        .expect_err("mutated actorDid in signedRequest must be rejected");
+    assert!(err
+        .to_string()
+        .contains("signedRequest does not match submitted signedRequest"));
+
+    // 5. Mismatched outer conversationId in entry
+    world.api_service.set_next_send_custom_response(
+        200,
+        serde_json::json!({
+            "entry": {
+                "conversationId": "00000000-0000-0000-0000-000000000000",
+                "entryId": uuid::Uuid::new_v4().to_string(),
+                "receivedAt": "2026-08-27T00:00:00.000Z",
+                "seq": 1,
+                "signedRequest": valid_signed_request
+            }
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "msg5")
+        .await
+        .expect_err("mismatched outer conversationId must be rejected");
+    assert!(err.to_string().contains("conversationId mismatch"));
+
+    // 6. Invalid receivedAt timestamp
+    world.api_service.set_next_send_custom_response(
+        200,
+        serde_json::json!({
+            "entry": {
+                "conversationId": &convo.conversation_id,
+                "entryId": uuid::Uuid::new_v4().to_string(),
+                "receivedAt": "not-a-timestamp",
+                "seq": 1,
+                "signedRequest": valid_signed_request
+            }
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "msg6")
+        .await
+        .expect_err("invalid receivedAt must be rejected");
+    assert!(err
+        .to_string()
+        .contains("receivedAt is not a valid RFC3339 timestamp"));
+
+    // 7. Sequence zero and exceeding MAX_SAFE_INTEGER
+    world.api_service.set_next_send_custom_response(
+        200,
+        serde_json::json!({
+            "entry": {
+                "conversationId": &convo.conversation_id,
+                "entryId": uuid::Uuid::new_v4().to_string(),
+                "receivedAt": "2026-08-27T00:00:00.000Z",
+                "seq": 0,
+                "signedRequest": valid_signed_request
+            }
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "msg7")
+        .await
+        .expect_err("seq zero must be rejected");
+    assert!(err
+        .to_string()
+        .contains("seq must be in range 1..=9007199254740991"));
+
+    world.api_service.set_next_send_custom_response(
+        200,
+        serde_json::json!({
+            "entry": {
+                "conversationId": &convo.conversation_id,
+                "entryId": uuid::Uuid::new_v4().to_string(),
+                "receivedAt": "2026-08-27T00:00:00.000Z",
+                "seq": 9_007_199_254_740_992u64,
+                "signedRequest": valid_signed_request
+            }
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "msg8")
+        .await
+        .expect_err("seq > MAX_SAFE_INTEGER must be rejected");
+    assert!(err
+        .to_string()
+        .contains("seq must be in range 1..=9007199254740991"));
 }

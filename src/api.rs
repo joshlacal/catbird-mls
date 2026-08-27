@@ -1460,33 +1460,37 @@ impl MLSContext {
             if let Some(aad_bytes) = &aad {
                 group.set_aad(aad_bytes.clone());
             }
-            let commit_builder = group
-                .commit_builder()
-                .propose_adds(kps.iter().cloned())
-                .force_self_update(true);
-            let commit_stage = commit_builder
-                .load_psks(provider.storage())
-                .map_err(|e| {
-                    let msg = format!("add_members load_psks failed: {:?}", e);
-                    crate::error_log!("[MLS-FFI] ❌ {}", msg);
-                    MLSError::AddMembersFailed { message: msg }
-                })?;
-            let commit_bundle = commit_stage
-                .build(provider.rand(), provider.crypto(), signer, |_| true)
-                .map_err(|e| {
-                    let msg = format!("add_members build failed: {:?}", e);
-                    crate::error_log!("[MLS-FFI] ❌ {}", msg);
-                    MLSError::AddMembersFailed { message: msg }
-                })?
-                .stage_commit(provider)
-                .map_err(|e| {
-                    let msg = format!("add_members stage failed: {:?}", e);
-                    crate::error_log!("[MLS-FFI] ❌ {}", msg);
-                    MLSError::AddMembersFailed { message: msg }
-                })?;
+            let commit_bundle_res = (|| -> Result<_, MLSError> {
+                let commit_builder = group
+                    .commit_builder()
+                    .propose_adds(kps.iter().cloned())
+                    .force_self_update(true);
+                let commit_stage = commit_builder
+                    .load_psks(provider.storage())
+                    .map_err(|e| {
+                        let msg = format!("add_members load_psks failed: {:?}", e);
+                        crate::error_log!("[MLS-FFI] ❌ {}", msg);
+                        MLSError::AddMembersFailed { message: msg }
+                    })?;
+                let commit_bundle = commit_stage
+                    .build(provider.rand(), provider.crypto(), signer, |_| true)
+                    .map_err(|e| {
+                        let msg = format!("add_members build failed: {:?}", e);
+                        crate::error_log!("[MLS-FFI] ❌ {}", msg);
+                        MLSError::AddMembersFailed { message: msg }
+                    })?
+                    .stage_commit(provider)
+                    .map_err(|e| {
+                        let msg = format!("add_members stage failed: {:?}", e);
+                        crate::error_log!("[MLS-FFI] ❌ {}", msg);
+                        MLSError::AddMembersFailed { message: msg }
+                    })?;
+                Ok(commit_bundle)
+            })();
             if aad.is_some() {
                 group.set_aad(vec![]);
             }
+            let commit_bundle = commit_bundle_res?;
             let (commit, welcome, group_info) = commit_bundle.into_contents();
             let next_gch = group_info.as_ref().and_then(|gi| {
                 gi.group_context().tls_serialize_detached().ok().map(|gc_bytes| {
@@ -2435,6 +2439,9 @@ impl MLSContext {
             crate::info_log!("   ⚠️  This is the ACTUAL key being used to SIGN the outgoing message");
             crate::info_log!("   ⚠️  Receiver will verify signature using this public key");
 
+            if !group.aad().is_empty() {
+                group.set_aad(vec![]);
+            }
             crate::debug_log!("[MLS-FFI] Creating encrypted message...");
             let msg = group
                 .create_message(provider, signer, &plaintext)
@@ -2508,14 +2515,15 @@ impl MLSContext {
                 let signer_public_key = signer.public().to_vec();
                 crate::info_log!("🔑 [SIGNATURE KEY FORENSICS - Message Signing (async)]");
                 crate::info_log!("   Public Signature Key (32 bytes): {}", hex::encode(&signer_public_key));
-
+                if !group.aad().is_empty() {
+                    group.set_aad(vec![]);
+                }
                 let msg = group
                     .create_message(provider, signer, &plaintext)
                     .map_err(|e| {
                         crate::error_log!("[MLS-FFI] ERROR: Failed to create message: {:?}", e);
                         MLSError::EncryptionFailed
                     })?;
-
                 let epoch_after = group.epoch().as_u64();
                 if epoch_after != epoch_before {
                     crate::warn_log!("[MLS-FFI] ⚠️ UNEXPECTED: Epoch changed during encryption! Before: {}, After: {}", epoch_before, epoch_after);

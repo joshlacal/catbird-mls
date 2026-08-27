@@ -658,14 +658,6 @@ where
             Err(e) => return Err(OrchestratorError::from(e)),
         };
 
-        // Track own commit for dedup
-        self.evict_stale_commits().await;
-        let commit_hash = sha2::Sha256::digest(&encrypt_result.ciphertext).to_vec();
-        self.own_commits()
-            .lock()
-            .await
-            .insert(commit_hash, web_time::Instant::now());
-
         // Get current epoch from MLS FFI (authoritative source).
         // The in-memory group_states cache can be stale or missing after
         // session restore, so always query the FFI layer.
@@ -786,13 +778,6 @@ where
                         return Err(OrchestratorError::from(e));
                     }
                 };
-
-                // Track the new commit for dedup
-                let retry_commit_hash = sha2::Sha256::digest(&retry_encrypt.ciphertext).to_vec();
-                self.own_commits()
-                    .lock()
-                    .await
-                    .insert(retry_commit_hash, web_time::Instant::now());
 
                 let retry_send_result = self
                     .send_message_prepared(
@@ -977,61 +962,68 @@ where
                 .await
                 .get(&commit_hash)
                 .cloned();
-            if let Some(expectation) = expectation {
-                let identity_matches = expectation.group_id == resolved.group_id;
-                let proof = if identity_matches {
-                    self.mls_context()
-                        .ensure_storage_durable()
-                        .map_err(OrchestratorError::from)
-                        .and_then(|_| {
-                            self.mls_context()
-                                .get_epoch(group_id_bytes.clone())
-                                .map_err(OrchestratorError::from)
-                        })
-                } else {
-                    Err(OrchestratorError::RecoveryFailed(format!(
-                        "self-commit expectation identity mismatch for conversation {}",
-                        resolved.conversation_id
-                    )))
-                };
+            let Some(expectation) = expectation else {
+                self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                    .await;
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "unverified bare own commit hash without expectation for conversation {}",
+                    resolved.conversation_id
+                )));
+            };
 
-                let crypto_epoch = match proof {
-                    Ok(epoch) => epoch,
-                    Err(error) => {
-                        self.mark_needs_rejoin_critical(&resolved.conversation_id)
-                            .await;
-                        return Err(error);
-                    }
-                };
-                let durable_state = match self.storage().get_group_state(&resolved.group_id).await {
-                    Ok(Some(state)) => state,
-                    Ok(None) => {
-                        self.mark_needs_rejoin_critical(&resolved.conversation_id)
-                            .await;
-                        return Err(OrchestratorError::RecoveryFailed(format!(
-                            "self-commit echo arrived before durable GroupState for conversation {}",
-                            resolved.conversation_id
-                        )));
-                    }
-                    Err(error) => {
-                        self.mark_needs_rejoin_critical(&resolved.conversation_id)
-                            .await;
-                        return Err(error);
-                    }
-                };
-                if (durable_state.conversation_id != expectation.conversation_id
-                    && durable_state.conversation_id != resolved.conversation_id)
-                    || durable_state.group_id != expectation.group_id
-                    || durable_state.epoch < expectation.target_epoch
-                    || crypto_epoch < expectation.target_epoch
-                {
+            let identity_matches = expectation.group_id == resolved.group_id;
+            let proof = if identity_matches {
+                self.mls_context()
+                    .ensure_storage_durable()
+                    .map_err(OrchestratorError::from)
+                    .and_then(|_| {
+                        self.mls_context()
+                            .get_epoch(group_id_bytes.clone())
+                            .map_err(OrchestratorError::from)
+                    })
+            } else {
+                Err(OrchestratorError::RecoveryFailed(format!(
+                    "self-commit expectation identity mismatch for conversation {}",
+                    resolved.conversation_id
+                )))
+            };
+
+            let crypto_epoch = match proof {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                        .await;
+                    return Err(error);
+                }
+            };
+            let durable_state = match self.storage().get_group_state(&resolved.group_id).await {
+                Ok(Some(state)) => state,
+                Ok(None) => {
                     self.mark_needs_rejoin_critical(&resolved.conversation_id)
                         .await;
                     return Err(OrchestratorError::RecoveryFailed(format!(
-                        "self-commit echo arrived before durable confirmation for conversation {} (target epoch {})",
-                        resolved.conversation_id, expectation.target_epoch
+                        "self-commit echo arrived before durable GroupState for conversation {}",
+                        resolved.conversation_id
                     )));
                 }
+                Err(error) => {
+                    self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                        .await;
+                    return Err(error);
+                }
+            };
+            if (durable_state.conversation_id != expectation.conversation_id
+                && durable_state.conversation_id != resolved.conversation_id)
+                || durable_state.group_id != expectation.group_id
+                || durable_state.epoch < expectation.target_epoch
+                || crypto_epoch < expectation.target_epoch
+            {
+                self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                    .await;
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "self-commit echo arrived before durable confirmation for conversation {} (target epoch {})",
+                    resolved.conversation_id, expectation.target_epoch
+                )));
             }
 
             // Consume the hash only after any epoch-changing expectation has
@@ -2042,16 +2034,6 @@ where
             serde_json::from_slice(submitted_bytes).map_err(|e| {
                 OrchestratorError::Serialization(format!("prepared_request serialization: {e}"))
             })?;
-        let submitted_body = submitted_val
-            .get("signedRequest")
-            .and_then(|s| s.get("body"))
-            .and_then(|b| b.as_object())
-            .ok_or_else(|| {
-                OrchestratorError::Serialization(
-                    "prepared_request missing signedRequest.body".into(),
-                )
-            })?;
-        let accepted_request_sha256: [u8; 32] = sha2::Sha256::digest(submitted_bytes).into();
 
         let response = self
             .api_client()
@@ -2074,19 +2056,30 @@ where
 
         let resp_json: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|e| OrchestratorError::Serialization(format!("send_message response: {e}")))?;
-        let entry = if let Some(e) = resp_json.get("entry") {
-            e.as_object().ok_or_else(|| {
+        let resp_obj = resp_json.as_object().ok_or_else(|| {
+            OrchestratorError::Serialization("send_message response must be an object".into())
+        })?;
+        if resp_obj.len() != 1 || !resp_obj.contains_key("entry") {
+            return Err(OrchestratorError::Serialization(
+                "send_message response must contain only 'entry'".into(),
+            ));
+        }
+        let entry = resp_obj
+            .get("entry")
+            .and_then(|e| e.as_object())
+            .ok_or_else(|| {
                 OrchestratorError::Serialization(
                     "send_message response entry must be an object".into(),
                 )
-            })?
-        } else if let Some(obj) = resp_json.as_object() {
-            obj
-        } else {
-            return Err(OrchestratorError::Serialization(
-                "send_message response must be an object".into(),
-            ));
-        };
+            })?;
+
+        // applicationEntry has exactly 5 required properties: entryId, conversationId, seq, signedRequest, receivedAt
+        if entry.len() != 5 {
+            return Err(OrchestratorError::Serialization(format!(
+                "send_message response entry must have exactly 5 fields, got {}",
+                entry.len()
+            )));
+        }
 
         let entry_id_str = entry
             .get("entryId")
@@ -2105,109 +2098,59 @@ where
             ));
         }
 
-        let seq = entry.get("seq").and_then(|v| v.as_u64()).ok_or_else(|| {
-            OrchestratorError::Serialization("send_message response missing seq".into())
-        })?;
-        if seq == 0 {
-            return Err(OrchestratorError::Serialization(
-                "send_message response seq must be positive".into(),
-            ));
-        }
-
-        let signed_request = entry
-            .get("signedRequest")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| {
-                OrchestratorError::Serialization(
-                    "send_message response missing signedRequest".into(),
-                )
-            })?;
-        let resp_body = signed_request
-            .get("body")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| {
-                OrchestratorError::Serialization(
-                    "send_message response signedRequest missing body".into(),
-                )
-            })?;
-
-        let resp_msg_id = resp_body
-            .get("messageId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                OrchestratorError::Serialization("signedRequest body missing messageId".into())
-            })?;
-        if resp_msg_id != message_id {
-            return Err(OrchestratorError::Serialization(format!(
-                "signedRequest body messageId mismatch: expected {message_id}, got {resp_msg_id}"
-            )));
-        }
-
-        let resp_prior = resp_body
-            .get("prior")
-            .and_then(|v| v.as_object())
-            .ok_or_else(|| {
-                OrchestratorError::Serialization("signedRequest body missing prior".into())
-            })?;
-        let resp_prior_convo = resp_prior
+        let resp_convo_id = entry
             .get("conversationId")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 OrchestratorError::Serialization(
-                    "signedRequest prior missing conversationId".into(),
+                    "send_message response missing conversationId".into(),
                 )
             })?;
-        if resp_prior_convo != conversation_id && resp_prior_convo != convo_id {
-            return Err(OrchestratorError::Serialization(
-                "signedRequest prior conversationId mismatch".into(),
-            ));
+        if resp_convo_id != conversation_id && resp_convo_id != convo_id {
+            return Err(OrchestratorError::Serialization(format!(
+                "send_message response conversationId mismatch: expected {convo_id}, got {resp_convo_id}"
+            )));
         }
-        let resp_prior_epoch = resp_prior
-            .get("epoch")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                OrchestratorError::Serialization("signedRequest prior missing epoch".into())
-            })?;
-        if resp_prior_epoch != epoch {
+
+        let seq = entry.get("seq").and_then(|v| v.as_u64()).ok_or_else(|| {
+            OrchestratorError::Serialization("send_message response missing seq".into())
+        })?;
+        if seq == 0 || seq > 9_007_199_254_740_991 {
             return Err(OrchestratorError::Serialization(
-                "signedRequest prior epoch mismatch".into(),
-            ));
-        }
-        let resp_prior_gen = resp_prior
-            .get("generation")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                OrchestratorError::Serialization("signedRequest prior missing generation".into())
-            })?;
-        if resp_prior_gen != 0 {
-            return Err(OrchestratorError::Serialization(
-                "signedRequest prior generation mismatch".into(),
+                "send_message response seq must be in range 1..=9007199254740991".into(),
             ));
         }
 
-        let submitted_aad = submitted_body
-            .get("aad")
-            .ok_or_else(|| OrchestratorError::Serialization("submitted body missing aad".into()))?;
-        let resp_aad = resp_body.get("aad").ok_or_else(|| {
-            OrchestratorError::Serialization("signedRequest body missing aad".into())
+        let received_at_str = entry
+            .get("receivedAt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization("send_message response missing receivedAt".into())
+            })?;
+        chrono::DateTime::parse_from_rfc3339(received_at_str).map_err(|e| {
+            OrchestratorError::Serialization(format!(
+                "send_message response receivedAt is not a valid RFC3339 timestamp: {e}"
+            ))
         })?;
-        if submitted_aad != resp_aad {
+
+        let submitted_signed_request = submitted_val.get("signedRequest").ok_or_else(|| {
+            OrchestratorError::Serialization("prepared_request missing signedRequest".into())
+        })?;
+        let resp_signed_request = entry.get("signedRequest").ok_or_else(|| {
+            OrchestratorError::Serialization("send_message response missing signedRequest".into())
+        })?;
+
+        if submitted_signed_request != resp_signed_request {
             return Err(OrchestratorError::Serialization(
-                "signedRequest body aad mismatch".into(),
+                "send_message response signedRequest does not match submitted signedRequest".into(),
             ));
         }
 
-        let submitted_app_msg = submitted_body.get("applicationMessage").ok_or_else(|| {
-            OrchestratorError::Serialization("submitted body missing applicationMessage".into())
+        let accepted_request_bytes = serde_json::to_vec(resp_signed_request).map_err(|e| {
+            OrchestratorError::Serialization(format!("serialize accepted signedRequest: {e}"))
         })?;
-        let resp_app_msg = resp_body.get("applicationMessage").ok_or_else(|| {
-            OrchestratorError::Serialization("signedRequest body missing applicationMessage".into())
-        })?;
-        if submitted_app_msg != resp_app_msg {
-            return Err(OrchestratorError::Serialization(
-                "signedRequest body applicationMessage mismatch".into(),
-            ));
-        }
+        let accepted_request_sha256: [u8; 32] =
+            sha2::Sha256::digest(&accepted_request_bytes).into();
 
         let aad_sha256: [u8; 32] = sha2::Sha256::digest(b"").into();
         let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(ciphertext).into();

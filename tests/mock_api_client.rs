@@ -31,8 +31,9 @@ struct StoredMessage {
     sender_did: String,
     ciphertext: Vec<u8>,
     timestamp: chrono::DateTime<Utc>,
+    is_commit: bool,
+    epoch: Option<u64>,
 }
-
 #[derive(Debug, Clone)]
 struct StoredConversation {
     view: ConversationView,
@@ -96,8 +97,11 @@ struct MockState {
     next_create_conversation_id: Option<String>,
 
     /// Custom raw GatewayResponse for the next createConversation call.
-    next_create_custom_response: Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
-
+    next_create_custom_response:
+        Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    /// Custom raw GatewayResponse for the next sendMessage call.
+    next_send_custom_response:
+        Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
     /// Conversations temporarily omitted from get_conversations, modeling the
     /// visibility gap between createConvo acceptance and list projection.
     hidden_conversation_ids: HashSet<String>,
@@ -173,7 +177,8 @@ struct MockState {
     welcomes: HashMap<(String, String), Vec<Vec<u8>>>,
 
     /// Submitted prepared requests
-    submitted_prepared_requests: Vec<catbird_mls::orchestrator::canonical_transport::PreparedRequest>,
+    submitted_prepared_requests:
+        Vec<catbird_mls::orchestrator::canonical_transport::PreparedRequest>,
     /// Call count for get_key_packages
     get_key_packages_call_count: usize,
 
@@ -255,11 +260,22 @@ impl MockDeliveryService {
             },
         );
     }
-    pub fn add_leaf_recovery_inbox_item(&self, item: serde_json::Value) {
-        self.state.lock().unwrap().leaf_recovery_inbox_items.push(item);
+    pub fn set_next_send_custom_response(&self, status: u16, body: serde_json::Value) {
+        self.state.lock().unwrap().next_send_custom_response = Some(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&body).unwrap(),
+            },
+        );
     }
-
-
+    pub fn add_leaf_recovery_inbox_item(&self, item: serde_json::Value) {
+        self.state
+            .lock()
+            .unwrap()
+            .leaf_recovery_inbox_items
+            .push(item);
+    }
 
     pub fn set_conversation_hidden_from_list(&self, conversation_id: &str, hidden: bool) {
         let mut state = self.state.lock().unwrap();
@@ -451,7 +467,10 @@ impl MockDeliveryService {
         stored.view.conversation_id = new_convo_id.to_string();
         guard.conversations.insert(new_convo_id.to_string(), stored);
 
-        let msgs = guard.messages.remove(old_convo_id).or_else(|| guard.messages.remove(&matched_cid));
+        let msgs = guard
+            .messages
+            .remove(old_convo_id)
+            .or_else(|| guard.messages.remove(&matched_cid));
         if let Some(mut messages) = msgs {
             for message in &mut messages {
                 message.conversation_id = new_convo_id.to_string();
@@ -459,7 +478,10 @@ impl MockDeliveryService {
             guard.messages.insert(new_convo_id.to_string(), messages);
         }
 
-        let gi = guard.group_infos.remove(old_convo_id).or_else(|| guard.group_infos.remove(&matched_cid));
+        let gi = guard
+            .group_infos
+            .remove(old_convo_id)
+            .or_else(|| guard.group_infos.remove(&matched_cid));
         if let Some(group_info) = gi {
             guard
                 .group_infos
@@ -593,20 +615,31 @@ impl MockDeliveryService {
         let mut guard = self.state.lock().unwrap();
         if let Some(c) = guard.conversations.get_mut(convo_id) {
             c.view.epoch = epoch;
-        } else if let Some(c) = guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id) {
+        } else if let Some(c) = guard
+            .conversations
+            .values_mut()
+            .find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
+        {
             c.view.epoch = epoch;
         }
     }
     #[allow(dead_code)]
-    pub fn update_conversation_metadata_snapshot_for_test(&self, convo_id: &str, snapshot: serde_json::Value) {
+    pub fn update_conversation_metadata_snapshot_for_test(
+        &self,
+        convo_id: &str,
+        snapshot: serde_json::Value,
+    ) {
         let mut guard = self.state.lock().unwrap();
         if let Some(c) = guard.conversations.get_mut(convo_id) {
             c.metadata_snapshot = Some(snapshot);
-        } else if let Some(c) = guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id) {
+        } else if let Some(c) = guard
+            .conversations
+            .values_mut()
+            .find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
+        {
             c.metadata_snapshot = Some(snapshot);
         }
     }
-
 
     /// Force the server-side `sequencerDid` of a conversation (WS-4 rung 2
     /// exposure tests; ADR-010 D4).
@@ -754,14 +787,19 @@ impl MockDeliveryService {
             spoofed_sender_did.to_string(),
         );
     }
-    pub fn submitted_prepared_requests(&self) -> Vec<catbird_mls::orchestrator::canonical_transport::PreparedRequest> {
-        self.state.lock().unwrap().submitted_prepared_requests.clone()
+    pub fn submitted_prepared_requests(
+        &self,
+    ) -> Vec<catbird_mls::orchestrator::canonical_transport::PreparedRequest> {
+        self.state
+            .lock()
+            .unwrap()
+            .submitted_prepared_requests
+            .clone()
     }
 
     pub fn get_key_packages_call_count(&self) -> usize {
         self.state.lock().unwrap().get_key_packages_call_count
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +912,8 @@ impl MockDeliveryService {
                 sender_did: did.clone(),
                 ciphertext: c.to_vec(),
                 timestamp: Utc::now(),
+                is_commit: true,
+                epoch: Some(0),
             };
             guard.messages.entry(conversation_id).or_default().push(msg);
         }
@@ -944,8 +984,13 @@ impl MockDeliveryService {
             .conversations
             .get_mut(convo_id)
             .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))?;
-        convo.members.retain(|m| m != &did && !m.starts_with(&format!("{did}#")));
-        convo.view.members.retain(|m| m.did != did && !m.did.starts_with(&format!("{did}#")));
+        convo
+            .members
+            .retain(|m| m != &did && !m.starts_with(&format!("{did}#")));
+        convo
+            .view
+            .members
+            .retain(|m| m.did != did && !m.did.starts_with(&format!("{did}#")));
         Ok(())
     }
 
@@ -1028,7 +1073,10 @@ impl MockDeliveryService {
         let convo = if guard.conversations.contains_key(convo_id) {
             guard.conversations.get_mut(convo_id)
         } else {
-            guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
+            guard
+                .conversations
+                .values_mut()
+                .find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
         }
         .ok_or_else(|| OrchestratorError::ConversationNotFound(convo_id.to_string()))?;
 
@@ -1054,6 +1102,8 @@ impl MockDeliveryService {
             sender_did: sender_did.clone(),
             ciphertext: commit_data.to_vec(),
             timestamp: Utc::now(),
+            is_commit: true,
+            epoch: Some(new_epoch),
         };
         guard
             .messages
@@ -1169,8 +1219,9 @@ impl MockDeliveryService {
             sender_did: did,
             ciphertext: ciphertext.to_vec(),
             timestamp: Utc::now(),
+            is_commit: false,
+            epoch: Some(_epoch),
         };
-
         guard
             .messages
             .entry(convo_id.to_string())
@@ -1204,14 +1255,16 @@ impl MockDeliveryService {
             ));
         }
 
+        let is_commit = msg_id.contains("commit") || _epoch > 0;
         let msg = StoredMessage {
             id: msg_id.to_string(),
             conversation_id: convo_id.to_string(),
             sender_did: did,
             ciphertext: ciphertext.to_vec(),
             timestamp: Utc::now(),
+            is_commit,
+            epoch: Some(_epoch),
         };
-
         guard
             .messages
             .entry(convo_id.to_string())
@@ -1224,7 +1277,6 @@ impl MockDeliveryService {
             epoch: _epoch,
         })
     }
-
 
     // -- Key Packages --------------------------------------------------------
 
@@ -1267,11 +1319,11 @@ impl MockDeliveryService {
         device_id: Option<&str>,
     ) -> Result<()> {
         for kp in key_packages {
-            self.publish_key_package(kp, cipher_suite, expires_at, device_id).await?;
+            self.publish_key_package(kp, cipher_suite, expires_at, device_id)
+                .await?;
         }
         Ok(())
     }
-
 
     // -- Devices -------------------------------------------------------------
 
@@ -1316,7 +1368,6 @@ impl MockDeliveryService {
         Ok(info)
     }
 
-
     pub async fn remove_device(&self, device_id: &str) -> Result<()> {
         let mut guard = self.state.lock().unwrap();
         let did = self
@@ -1345,7 +1396,6 @@ impl MockDeliveryService {
         Ok(())
     }
 
-
     pub async fn request_welcome_reissue(
         &self,
         convo_id: &str,
@@ -1371,7 +1421,6 @@ impl MockDeliveryService {
         let _ = (convo_id, failure_type, epoch_authenticator, failure_mode);
         Ok(())
     }
-
 
     pub async fn process_external_commit(
         &self,
@@ -1414,8 +1463,9 @@ impl MockDeliveryService {
                 sender_did: did,
                 ciphertext: commit_data.to_vec(),
                 timestamp: Utc::now(),
+                is_commit: true,
+                epoch: Some(new_epoch),
             });
-
         // WS-3 equivocation tests: optionally issue a receipt over the
         // commit, mirroring the real sequencer's receipt shape.
         let receipt = if guard.issue_external_commit_receipts {
@@ -1471,7 +1521,10 @@ impl MLSAPIClient for MockDeliveryService {
     async fn publish_welcome(&self, convo_id: &str, welcome_data: &[u8]) -> Result<()> {
         let did = self.current_did().await.unwrap_or_default();
         let mut guard = self.state.lock().unwrap();
-        let group_id_opt = guard.conversations.get(convo_id).map(|c| c.view.group_id.clone());
+        let group_id_opt = guard
+            .conversations
+            .get(convo_id)
+            .map(|c| c.view.group_id.clone());
         for (k, _) in guard.key_packages.clone() {
             if k != did {
                 guard
@@ -1495,7 +1548,11 @@ impl MLSAPIClient for MockDeliveryService {
         &self,
         request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
     ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
-        self.state.lock().unwrap().submitted_prepared_requests.push(request.clone());
+        self.state
+            .lock()
+            .unwrap()
+            .submitted_prepared_requests
+            .push(request.clone());
         let body_bytes = request.body.as_deref().unwrap_or(&[]);
         let body_val: serde_json::Value = if !body_bytes.is_empty()
             && request.operation
@@ -1649,11 +1706,14 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage => {
+                if let Some(resp) = self.state.lock().unwrap().next_send_custom_response.take() {
+                    return Ok(resp);
+                }
                 let convo_id = inner_body
                     .get("prior")
                     .and_then(|p| p.get("conversationId"))
-                    .or_else(|| inner_body.get("conversationId"))
                     .and_then(|c| c.as_str())
+                    .or_else(|| inner_body.get("conversationId").and_then(|c| c.as_str()))
                     .unwrap_or_default();
                 let ciphertext_b64 = inner_body
                     .get("applicationMessage")
@@ -1679,12 +1739,15 @@ impl MLSAPIClient for MockDeliveryService {
                     .effective_did_from_guard(&guard)
                     .unwrap_or_else(|| "did:plc:mock".to_string());
 
+                let server_entry_id = uuid::Uuid::new_v4().to_string();
                 let msg = StoredMessage {
-                    id: message_id.to_string(),
+                    id: server_entry_id.clone(),
                     conversation_id: convo_id.to_string(),
                     sender_did: did,
                     ciphertext,
                     timestamp: Utc::now(),
+                    is_commit: false,
+                    epoch: Some(epoch),
                 };
                 guard
                     .messages
@@ -1701,7 +1764,7 @@ impl MLSAPIClient for MockDeliveryService {
                 let output = serde_json::json!({
                     "entry": {
                         "conversationId": convo_id,
-                        "entryId": message_id,
+                        "entryId": server_entry_id,
                         "receivedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                         "seq": 1,
                         "signedRequest": {
@@ -2013,9 +2076,10 @@ impl MLSAPIClient for MockDeliveryService {
                             sender_did: did.clone(),
                             ciphertext: commit_bytes.clone(),
                             timestamp: Utc::now(),
+                            is_commit: true,
+                            epoch: None,
                         });
                 }
-
                 let welcome_bytes_opt = inner_body
                     .get("manifest")
                     .and_then(|m| m.get("welcomeBundle"))
@@ -2399,15 +2463,53 @@ impl MLSAPIClient for MockDeliveryService {
             "injected get_messages failure",
         )?;
 
-        let messages = guard.messages.get(convo_id).cloned().or_else(|| {
-            let matched_cid = guard.conversations.iter().find(|(_, c)| c.view.group_id == convo_id).map(|(cid, _)| cid.clone());
-            matched_cid.and_then(|cid| guard.messages.get(&cid).cloned())
-        }).unwrap_or_default();
+        let all_messages = guard
+            .messages
+            .get(convo_id)
+            .cloned()
+            .or_else(|| {
+                let matched_cid = guard
+                    .conversations
+                    .iter()
+                    .find(|(_, c)| c.view.group_id == convo_id)
+                    .map(|(cid, _)| cid.clone());
+                matched_cid.and_then(|cid| guard.messages.get(&cid).cloned())
+            })
+            .unwrap_or_default();
+
+        let filtered_messages: Vec<StoredMessage> = all_messages
+            .into_iter()
+            .filter(|m| {
+                if let Some(mt) = message_type {
+                    if mt == "commit" && !m.is_commit {
+                        return false;
+                    }
+                    if (mt == "message" || mt == "application") && m.is_commit {
+                        return false;
+                    }
+                }
+                if let Some(from) = from_epoch {
+                    if let Some(e) = m.epoch {
+                        if e < from as u64 {
+                            return false;
+                        }
+                    }
+                }
+                if let Some(to) = to_epoch {
+                    if let Some(e) = m.epoch {
+                        if e > to as u64 {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .collect();
 
         // Cursor is a 0-based index encoded as string.
         let start = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
-        let end = (start + limit as usize).min(messages.len());
-        let page: Vec<IncomingEnvelope> = messages[start..end]
+        let end = (start + limit as usize).min(filtered_messages.len());
+        let page: Vec<IncomingEnvelope> = filtered_messages[start..end]
             .iter()
             .map(|m| IncomingEnvelope {
                 conversation_id: m.conversation_id.clone(),
@@ -2418,12 +2520,12 @@ impl MLSAPIClient for MockDeliveryService {
                     .unwrap_or_else(|| m.sender_did.clone()),
                 ciphertext: m.ciphertext.clone(),
                 timestamp: m.timestamp,
-                server_epoch: None,
+                server_epoch: m.epoch,
                 server_message_id: Some(m.id.clone()),
             })
             .collect();
 
-        let next_cursor = if end < messages.len() {
+        let next_cursor = if end < filtered_messages.len() {
             Some(end.to_string())
         } else {
             None
@@ -2550,26 +2652,34 @@ impl MLSAPIClient for MockDeliveryService {
             .effective_did_from_guard(&guard)
             .ok_or(OrchestratorError::NotAuthenticated)?;
 
-        let welcome = guard.welcomes.get_mut(&(convo_id.to_string(), did.clone())).and_then(|q| {
-            if q.is_empty() {
-                None
-            } else {
-                Some(q.remove(0))
-            }
-        }).or_else(|| {
-            let matched_cid = guard.conversations.iter().find(|(_, c)| c.view.group_id == convo_id).map(|(cid, _)| cid.clone());
-            if let Some(cid) = matched_cid {
-                guard.welcomes.get_mut(&(cid, did.clone())).and_then(|q| {
-                    if q.is_empty() {
-                        None
-                    } else {
-                        Some(q.remove(0))
-                    }
-                })
-            } else {
-                None
-            }
-        });
+        let welcome = guard
+            .welcomes
+            .get_mut(&(convo_id.to_string(), did.clone()))
+            .and_then(|q| {
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            })
+            .or_else(|| {
+                let matched_cid = guard
+                    .conversations
+                    .iter()
+                    .find(|(_, c)| c.view.group_id == convo_id)
+                    .map(|(cid, _)| cid.clone());
+                if let Some(cid) = matched_cid {
+                    guard.welcomes.get_mut(&(cid, did.clone())).and_then(|q| {
+                        if q.is_empty() {
+                            None
+                        } else {
+                            Some(q.remove(0))
+                        }
+                    })
+                } else {
+                    None
+                }
+            });
         welcome.ok_or(OrchestratorError::ServerError {
             status: 404,
             body: "welcome not available".to_string(),

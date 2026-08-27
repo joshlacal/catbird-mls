@@ -1291,7 +1291,6 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     world.register_device("Bob").await.unwrap();
 
     let alice = world.client("Alice");
-    let bob = world.client("Bob");
     let convo = alice
         .orchestrator
         .create_group("unaccepted-appdata-fence", None, None)
@@ -1305,10 +1304,19 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         .get_epoch(group_bytes.clone())
         .unwrap();
 
-    // Alice stages a commit which resolves successfully
-    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+    // Alice stages an AppData Update metadata commit (component 0x8001)
+    let plan = alice
+        .orchestrator
+        .stage_commit(
+            &group_id,
+            CommitKind::UpdateMetadata {
+                group_info_extension: b"{}".to_vec(),
+            },
+        )
+        .await
+        .expect("stage update metadata");
 
-    // A commit envelope arrives BEFORE server acceptance / durable confirmation
+    // 1. A commit envelope arrives BEFORE server acceptance / durable confirmation
     let error = alice
         .orchestrator
         .process_incoming(&IncomingEnvelope {
@@ -1320,7 +1328,7 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
             server_epoch: Some(plan.target_epoch),
         })
         .await
-        .expect_err("unaccepted staged commit must withhold merge and cursor advance");
+        .expect_err("unaccepted staged AppData commit must withhold merge and cursor advance");
 
     assert!(error.to_string().contains("before durable confirmation"));
 
@@ -1332,15 +1340,38 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         .unwrap();
     assert_eq!(
         epoch_after, epoch_before,
-        "unaccepted commit must never merge into the local MLS group"
+        "unaccepted AppData commit must never merge into the local MLS group"
     );
 
-    // Clean up staged commit
-    alice
+    // 2. Durably confirm the staged commit (simulating server ACK)
+    let confirmed = alice
         .orchestrator
-        .discard_pending(plan.handle)
+        .confirm_commit(plan.handle, plan.target_epoch)
         .await
-        .expect("cleanup staged commit");
+        .expect("confirm staged commit");
+    assert_eq!(confirmed.new_epoch, plan.target_epoch);
+
+    // 3. Process the commit envelope again — now passes the accepted fence and advances cursor
+    let result = alice
+        .orchestrator
+        .process_incoming(&IncomingEnvelope {
+            conversation_id: convo.conversation_id.clone(),
+            sender_did: alice.did.clone(),
+            ciphertext: plan.commit_bytes.clone(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some("accepted-appdata-commit".to_string()),
+            server_epoch: Some(plan.target_epoch),
+        })
+        .await
+        .expect("durably confirmed AppData commit echo must be skipped cleanly");
+    assert!(result.is_none(), "echo must produce no decrypted message");
+
+    let final_epoch = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .unwrap();
+    assert_eq!(final_epoch, plan.target_epoch);
 }
 
 #[tokio::test(flavor = "multi_thread")]

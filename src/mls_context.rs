@@ -3146,19 +3146,23 @@ impl MLSContext {
             if let Some(ref aad_bytes) = aad {
                 group.set_aad(aad_bytes.clone());
             }
-            let commit_stage = group
-                .commit_builder()
-                .force_self_update(true)
-                .load_psks(provider.storage())
-                .map_err(|e| MLSError::OpenMLS(format!("load_psks: {:?}", e)))?;
-            let commit_bundle = commit_stage
-                .build(provider.rand(), provider.crypto(), signer, |_| true)
-                .map_err(|e| MLSError::OpenMLS(format!("build commit: {:?}", e)))?
-                .stage_commit(provider)
-                .map_err(|e| MLSError::OpenMLS(format!("stage commit: {:?}", e)))?;
+            let commit_bundle_res = (|| -> Result<_, MLSError> {
+                let commit_stage = group
+                    .commit_builder()
+                    .force_self_update(true)
+                    .load_psks(provider.storage())
+                    .map_err(|e| MLSError::OpenMLS(format!("load_psks: {:?}", e)))?;
+                let commit_bundle = commit_stage
+                    .build(provider.rand(), provider.crypto(), signer, |_| true)
+                    .map_err(|e| MLSError::OpenMLS(format!("build commit: {:?}", e)))?
+                    .stage_commit(provider)
+                    .map_err(|e| MLSError::OpenMLS(format!("stage commit: {:?}", e)))?;
+                Ok(commit_bundle)
+            })();
             if aad.is_some() {
                 group.set_aad(vec![]);
             }
+            let commit_bundle = commit_bundle_res?;
             let (commit_msg, _welcome, _group_info) = commit_bundle.into_contents();
             let commit_bytes = TlsSerialize::tls_serialize_detached(&commit_msg)
                 .map_err(|_| MLSError::SerializationError)?;
@@ -3404,44 +3408,33 @@ impl MLSContext {
             if let Some(aad_bytes) = &aad {
                 group.set_aad(aad_bytes.clone());
             }
+            let commit_bundle_res = (|| -> Result<_, MLSError> {
+                let commit_builder = group
+                    .commit_builder()
+                    .propose_removals(indices_to_remove)
+                    .force_self_update(true);
 
-            let commit_builder = group
-                .commit_builder()
-                .propose_removals(indices_to_remove)
-                .force_self_update(true);
+                let commit_stage = commit_builder.load_psks(provider.storage()).map_err(|e| {
+                    crate::error_log!("[MLS-CONTEXT] remove_members load_psks failed: {:?}", e);
+                    MLSError::OpenMLS(format!("remove_members load_psks failed: {:?}", e))
+                })?;
 
-            let commit_stage_res = commit_builder.load_psks(provider.storage()).map_err(|e| {
-                crate::error_log!("[MLS-CONTEXT] remove_members load_psks failed: {:?}", e);
-                MLSError::OpenMLS(format!("remove_members load_psks failed: {:?}", e))
-            });
-
-            let commit_stage = match commit_stage_res {
-                Ok(cs) => cs,
-                Err(e) => {
-                    if aad.is_some() {
-                        group.set_aad(vec![]);
-                    }
-                    return Err(e);
-                }
-            };
-
-            let commit_bundle_res = commit_stage
-                .build(provider.rand(), provider.crypto(), signer, |_| true)
-                .map_err(|e| {
-                    crate::error_log!("[MLS-CONTEXT] remove_members build failed: {:?}", e);
-                    MLSError::OpenMLS(format!("remove_members build failed: {:?}", e))
-                })
-                .and_then(|stage| {
-                    stage.stage_commit(provider).map_err(|e| {
+                let commit_bundle = commit_stage
+                    .build(provider.rand(), provider.crypto(), signer, |_| true)
+                    .map_err(|e| {
+                        crate::error_log!("[MLS-CONTEXT] remove_members build failed: {:?}", e);
+                        MLSError::OpenMLS(format!("remove_members build failed: {:?}", e))
+                    })?
+                    .stage_commit(provider)
+                    .map_err(|e| {
                         crate::error_log!("[MLS-CONTEXT] remove_members stage failed: {:?}", e);
                         MLSError::OpenMLS(format!("remove_members stage failed: {:?}", e))
-                    })
-                });
-
+                    })?;
+                Ok(commit_bundle)
+            })();
             if aad.is_some() {
                 group.set_aad(vec![]);
             }
-
             let commit_bundle = commit_bundle_res?;
             let (commit, welcome_option, group_info) = commit_bundle.into_contents();
 

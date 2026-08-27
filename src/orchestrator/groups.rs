@@ -4845,29 +4845,29 @@ where
         {
             Ok(epoch) => epoch,
             Err(error) => {
+                self.remove_own_commit_tracking(&hash).await;
                 self.mark_needs_rejoin_critical(convo_id).await;
                 return Err(error.into());
             }
         };
         if new_epoch != target_epoch {
+            self.remove_own_commit_tracking(&hash).await;
             self.mark_needs_rejoin_critical(convo_id).await;
             return Err(OrchestratorError::RecoveryFailed(format!(
                 "pending-proposal merge advanced to epoch {new_epoch}, expected exactly {target_epoch} for {convo_id}"
             )));
         }
         if let Err(error) = self.mls_context().ensure_storage_durable() {
+            self.remove_own_commit_tracking(&hash).await;
             self.mark_needs_rejoin_critical(convo_id).await;
             return Err(error.into());
         }
         projected_state.epoch = new_epoch;
         if let Err(error) = self.storage().set_group_state(&projected_state).await {
+            self.remove_own_commit_tracking(&hash).await;
             self.mark_needs_rejoin_critical(convo_id).await;
             return Err(error);
         }
-        // Local MLS and application storage now prove the target epoch. Keep
-        // the hash for replay suppression, but no longer require a transient
-        // expectation lookup when the DS fans the accepted commit back.
-        self.mark_own_commit_durably_confirmed(&hash).await;
         {
             let mut states = self.group_states().lock().await;
             normalize_group_state(&mut states, projected_state);
