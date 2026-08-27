@@ -4612,7 +4612,20 @@ impl MLSContext {
 
                         Ok((updates, adds, removes, metadata_derived, target_epoch, Some(staged)))
                     }
-                    _ => Err(MLSError::InvalidCommit),
+                    ProcessedMessageContent::ApplicationMessage(_)
+                    | ProcessedMessageContent::ProposalMessage(_)
+                    | ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
+                        Err(MLSError::InvalidCommit)
+                    }
+                    ProcessedMessageContent::OwnPrivateMessage
+                    | ProcessedMessageContent::OwnPendingCommit => {
+                        Err(MLSError::DecryptionFailed)
+                    }
+                    ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                        Err(MLSError::Internal(
+                            "unresolved AppData commit escaped process_protocol_message".to_string(),
+                        ))
+                    }
                 }
             })?;
 

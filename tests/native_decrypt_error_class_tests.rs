@@ -36,7 +36,7 @@ mod e2e_harness;
 use catbird_mls::orchestrator::{
     IncomingEnvelope, MLSStorageBackend, MlsCryptoContext, QuarantineReason,
 };
-use catbird_mls::MLSError;
+use catbird_mls::{KeyPackageData, MLSError};
 use e2e_harness::TestWorld;
 
 use openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
@@ -429,5 +429,150 @@ async fn test_own_message_becomes_rust_only_outcome_before_credential_extraction
     assert!(
         matches!(ffi_err, MLSError::DecryptionFailed),
         "FFI decrypt_message must map own message to MLSError::DecryptionFailed, got: {ffi_err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_own_pending_commit_becomes_rust_only_outcome_before_credential_extraction() {
+    use catbird_mls::orchestrator::MlsDecryptOutcome;
+
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Own Pending Commit Test", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id_bytes = hex::decode(&convo.group_id).expect("valid hex group_id");
+
+    // Alice creates and stages a self-update commit locally (staged as pending_commit).
+    let add_res = alice
+        .orchestrator
+        .mls_context()
+        .self_update(group_id_bytes.clone())
+        .expect("self_update failed");
+    let commit_bytes = add_res.commit_data;
+
+    // 1. Rust-internal outcome seam: decrypt_message_outcome returns OwnPendingCommit before credential extraction
+    let outcome = alice
+        .orchestrator
+        .mls_context()
+        .decrypt_message_outcome(group_id_bytes.clone(), commit_bytes.clone())
+        .expect("decrypt_message_outcome must succeed for own pending commit");
+
+    match outcome {
+        MlsDecryptOutcome::OwnPendingCommit => {}
+        other => panic!("expected OwnPendingCommit, got {other:?}"),
+    }
+
+    // 2. Exported FFI decrypt_message maps OwnPendingCommit to DecryptionFailed
+    let ffi_err = alice
+        .orchestrator
+        .mls_context()
+        .decrypt_message(group_id_bytes.clone(), commit_bytes.clone())
+        .expect_err("FFI decrypt_message must fail for own pending commit");
+    assert!(
+        matches!(ffi_err, MLSError::DecryptionFailed),
+        "FFI decrypt_message must map own pending commit to MLSError::DecryptionFailed, got: {ffi_err:?}"
+    );
+}
+
+/// Regression for the explicit `process_commit` receive arms. The wildcard this
+/// replaced mapped every non-`StagedCommitMessage` variant to `InvalidCommit`,
+/// hiding the own outcomes. Both halves assert exactly one error class, so
+/// collapsing the arms again fails this test.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_process_commit_explicit_error_mapping_on_own_and_non_commit_variants() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    world.add_client("Bob").await;
+    world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("Process Commit Error Mapping Test", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id_bytes = hex::decode(&convo.group_id).expect("valid hex group_id");
+
+    // 1. Own pending commit: the own arm must map to DecryptionFailed, never InvalidCommit.
+    let staged = alice
+        .orchestrator
+        .mls_context()
+        .self_update(group_id_bytes.clone())
+        .expect("self_update failed");
+    // `ProcessCommitResult` has no `Debug`, so unwrap the error by match.
+    let own_err = match alice
+        .orchestrator
+        .mls_context()
+        .process_commit(group_id_bytes.clone(), staged.commit_data)
+    {
+        Ok(_) => panic!("process_commit on own pending commit must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(own_err, MLSError::DecryptionFailed),
+        "process_commit on own pending commit must return exactly DecryptionFailed, got: {own_err:?}"
+    );
+    alice
+        .orchestrator
+        .mls_context()
+        .merge_pending_commit(group_id_bytes.clone())
+        .expect("merge_pending_commit failed");
+
+    // 2. Ordinary non-commit content: Bob joins Alice's MLS group, so his
+    //    application message really decrypts to `ApplicationMessage` on Alice's
+    //    side instead of failing earlier as a foreign frame.
+    let bob_key_package = bob
+        .orchestrator
+        .mls_context()
+        .create_key_package(b"did:plc:bob#phone".to_vec())
+        .expect("Bob create_key_package failed");
+    let add = alice
+        .orchestrator
+        .mls_context()
+        .add_members(
+            group_id_bytes.clone(),
+            vec![KeyPackageData {
+                data: bob_key_package.key_package_data,
+            }],
+        )
+        .expect("Alice add_members failed");
+    alice
+        .orchestrator
+        .mls_context()
+        .merge_pending_commit(group_id_bytes.clone())
+        .expect("merge add_members commit failed");
+    bob.orchestrator
+        .mls_context()
+        .process_welcome(add.welcome_data, b"did:plc:bob#phone".to_vec(), None)
+        .expect("Bob process_welcome failed");
+
+    let encrypted_by_bob = bob
+        .orchestrator
+        .mls_context()
+        .encrypt_message(group_id_bytes.clone(), b"peer application message".to_vec())
+        .expect("Bob encrypt_message failed");
+    // Strip the 4-byte big-endian length prefix added by `pad_ciphertext`.
+    let len = u32::from_be_bytes(encrypted_by_bob.ciphertext[0..4].try_into().unwrap()) as usize;
+    let peer_application_message = encrypted_by_bob.ciphertext[4..4 + len].to_vec();
+
+    let app_err = match alice
+        .orchestrator
+        .mls_context()
+        .process_commit(group_id_bytes.clone(), peer_application_message)
+    {
+        Ok(_) => panic!("process_commit on a peer application message must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(app_err, MLSError::InvalidCommit),
+        "process_commit on peer application content must return exactly InvalidCommit, got: {app_err:?}"
     );
 }

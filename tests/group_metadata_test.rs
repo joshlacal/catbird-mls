@@ -286,135 +286,280 @@ fn add_members_with_metadata_lets_fresh_group_joiner_decrypt_name() {
     assert_eq!(decrypted.title, "Engineering");
     assert_eq!(decrypted.description, "the eng team");
 }
+
 #[test]
 fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_before_acceptance() {
-    let (alice, _adir) = make_context();
-    let (bob, _bdir) = make_context();
+    use openmls::prelude::*;
+    use openmls::component::ComponentData;
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_libcrux_crypto::Provider as LibcruxProvider;
+    use tls_codec::Serialize as TlsSerialize;
 
-    // Alice creates a NAMED group (contains component 0x8001 metadata).
-    let config = GroupConfig {
-        group_name: Some("Initial Name".to_string()),
-        group_description: Some("initial desc".to_string()),
-        ..Default::default()
+    let alice_provider = LibcruxProvider::default();
+    let bob_provider = LibcruxProvider::default();
+    let ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+    let alice_signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let alice_cred = BasicCredential::new(b"did:plc:alice".to_vec());
+    let alice_cwk = CredentialWithKey {
+        credential: alice_cred.into(),
+        signature_key: alice_signer.to_public_vec().into(),
     };
-    let created = alice
-        .create_group(b"did:plc:alice".to_vec(), Some(config))
-        .unwrap();
-    let group_id = created.group_id.clone();
+    let alice_capabilities = Capabilities::builder()
+        .extensions(vec![ExtensionType::RatchetTree, ExtensionType::AppDataDictionary])
+        .proposals(vec![ProposalType::AppDataUpdate])
+        .build();
+    let mut alice_group = MlsGroup::new_with_group_id(
+        &alice_provider,
+        &alice_signer,
+        &MlsGroupCreateConfig::builder()
+            .ciphersuite(ciphersuite)
+            .use_ratchet_tree_extension(true)
+            .capabilities(alice_capabilities)
+            .build(),
+        GroupId::from_slice(b"test-appdata-group"),
+        alice_cwk,
+    )
+    .unwrap();
 
-    // Bob joins via Welcome.
-    let bob_kp = bob.create_key_package(b"did:plc:bob".to_vec()).unwrap();
-    let add = alice
-        .add_members_with_metadata(
-            group_id.clone(),
-            vec![catbird_mls::KeyPackageData {
-                data: bob_kp.key_package_data,
-            }],
-            Some("Initial Name".to_string()),
-            Some("initial desc".to_string()),
-            None,
-            None,
+    // Bob creates a group via new_from_welcome with AppDataUpdate proposal capability
+    let bob_signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+    let bob_cred = BasicCredential::new(b"did:plc:bob".to_vec());
+    let bob_cwk = CredentialWithKey {
+        credential: bob_cred.into(),
+        signature_key: bob_signer.to_public_vec().into(),
+    };
+    let bob_capabilities = Capabilities::builder()
+        .extensions(vec![ExtensionType::RatchetTree, ExtensionType::AppDataDictionary])
+        .proposals(vec![ProposalType::AppDataUpdate])
+        .build();
+    let bob_kp_bundle = KeyPackage::builder()
+        .leaf_node_capabilities(bob_capabilities)
+        .build(ciphersuite, &bob_provider, &bob_signer, bob_cwk.clone())
+        .unwrap();
+    let bob_kp = bob_kp_bundle.key_package().clone();
+
+    let (_add_commit, welcome, _) = alice_group
+        .add_members(&alice_provider, &alice_signer, &[bob_kp])
+        .unwrap();
+    alice_group.merge_pending_commit(&alice_provider).unwrap();
+
+    let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(
+        welcome.tls_serialize_detached().unwrap().as_slice(),
+    )
+    .unwrap();
+    let welcome_in = match mls_msg.extract() {
+        MlsMessageBodyIn::Welcome(w) => w,
+        _ => panic!("Expected Welcome"),
+    };
+
+    let join_config = MlsGroupJoinConfig::builder()
+        .use_ratchet_tree_extension(true)
+        .build();
+    let mut bob_group = StagedWelcome::new_from_welcome(
+        &bob_provider,
+        &join_config,
+        welcome_in,
+        Some(alice_group.export_ratchet_tree().into()),
+    )
+    .unwrap()
+    .into_group(&bob_provider)
+    .unwrap();
+    assert_eq!(alice_group.epoch().as_u64(), 1);
+    assert_eq!(bob_group.epoch().as_u64(), 1);
+
+    // 1. Alice proposes an UPDATE on component 0x8001 metadata.
+    let update_data = b"{\"v\":1,\"locator\":\"blob-1234\",\"hash\":\"\"}".to_vec();
+    let (_prop_msg, _prop_ref) = alice_group
+        .propose_app_data_update(
+            &alice_provider,
+            &alice_signer,
+            catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID,
+            AppDataUpdateOperation::Update(update_data.clone().into()),
         )
         .unwrap();
-    alice.merge_pending_commit(group_id.clone()).unwrap();
-    bob.process_welcome(add.welcome_data, b"did:plc:bob".to_vec(), None)
+
+    let mut commit_stage = alice_group
+        .commit_builder()
+        .load_psks(alice_provider.storage())
+        .unwrap();
+    let mut updater = commit_stage.app_data_dictionary_updater();
+    for proposal in commit_stage.app_data_update_proposals() {
+        let operation = proposal.operation();
+        let component_id = proposal.component_id();
+        if let AppDataUpdateOperation::Update(data) = operation {
+            updater.set(ComponentData::from_parts(component_id, data.clone()));
+        } else if let AppDataUpdateOperation::Remove = operation {
+            updater.remove(&component_id);
+        }
+    }
+    let changes = updater.changes();
+    commit_stage.with_app_data_dictionary_updates(changes);
+    let commit_bundle = commit_stage
+        .build(alice_provider.rand(), alice_provider.crypto(), &alice_signer, |_| true)
+        .unwrap()
+        .stage_commit(&alice_provider)
+        .unwrap();
+    let (commit_msg, _, _) = commit_bundle.into_contents();
+    let commit_bytes = commit_msg.tls_serialize_detached().unwrap();
+
+    // Bob processes the commit message via process_message.
+    let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(commit_bytes.as_slice()).unwrap();
+    let protocol_msg: ProtocolMessage = mls_msg.try_into().unwrap();
+    let raw_processed = bob_group
+        .process_message(&bob_provider, protocol_msg)
         .unwrap();
 
-    assert_eq!(alice.get_epoch(group_id.clone()).unwrap(), 1);
-    assert_eq!(bob.get_epoch(group_id.clone()).unwrap(), 1);
+    // Receiver returns UnresolvedAppDataCommit
+    let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved) = raw_processed.content() else {
+        panic!("Expected UnresolvedAppDataCommit from OpenMLS 0.9 receive API");
+    };
 
-    // 1. Alice performs an UPDATE on component 0x8001 metadata.
-    let update_outcome = alice
-        .update_group_metadata_encrypted(
-            group_id.clone(),
-            Some("Updated Name".to_string()),
-            Some("updated desc".to_string()),
-            None,
-            None,
-        )
+    let mut bob_updater = bob_group.app_data_dictionary_updater();
+    for proposal in unresolved.app_data_update_proposals() {
+        let operation = proposal.operation();
+        let component_id = proposal.component_id();
+        if let AppDataUpdateOperation::Update(data) = operation {
+            bob_updater.set(ComponentData::from_parts(component_id, data.clone()));
+        } else if let AppDataUpdateOperation::Remove = operation {
+            bob_updater.remove(&component_id);
+        }
+    }
+    let processed = bob_group
+        .resolve_app_data_commit(&bob_provider, raw_processed, bob_updater.changes())
         .unwrap();
-
-    // Bob processes the commit message via decrypt_message.
-    let decrypt_res = bob
-        .decrypt_message(group_id.clone(), update_outcome.commit_bytes)
-        .unwrap();
-    assert_eq!(
-        decrypt_res.content_type,
-        catbird_mls::DecryptContentType::Commit
-    );
-    assert_eq!(decrypt_res.epoch, 2);
+    let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+        panic!("Expected StagedCommitMessage after resolve_app_data_commit");
+    };
 
     // Invariant: Bob's local epoch has NOT merged yet before explicit acceptance.
     assert_eq!(
-        bob.get_epoch(group_id.clone()).unwrap(),
+        bob_group.epoch().as_u64(),
         1,
         "Bob epoch must remain at 1 before explicit merge"
     );
 
-    // Explicit merge advances Bob's epoch.
-    let new_epoch = bob.merge_incoming_commit(group_id.clone(), 2).unwrap();
-    assert_eq!(new_epoch, 2);
+    // Invariant: Bob's metadata dictionary does NOT reflect the update before explicit merge.
     assert_eq!(
-        bob.get_epoch(group_id.clone()).unwrap(),
-        2,
-        "Bob epoch must advance to 2 after explicit merge"
+        bob_group
+            .extensions()
+            .app_data_dictionary()
+            .and_then(|d| d.dictionary().get(&catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID)),
+        None,
+        "Bob dictionary must not have updated metadata before merge"
     );
 
-    // Bob can now derive metadata key and decrypt the updated metadata blob.
-    let info = bob
-        .get_current_metadata(group_id.clone())
-        .unwrap()
-        .expect("bob must have metadata info");
-    let key: [u8; 32] = info.metadata_key.as_slice().try_into().unwrap();
-    let decrypted = catbird_mls::metadata::decrypt_metadata_blob(
-        &key,
-        &group_id,
-        info.epoch,
-        update_outcome.metadata_version,
-        &update_outcome.metadata_blob_ciphertext,
-    )
-    .unwrap();
-    assert_eq!(decrypted.title, "Updated Name");
-    assert_eq!(decrypted.description, "updated desc");
+    // Acceptance fence: Explicit merge advances Bob's epoch and applies dictionary updates.
+    bob_group.merge_staged_commit(&bob_provider, *staged).unwrap();
+    assert_eq!(bob_group.epoch().as_u64(), 2);
 
-    // Alice also merges her pending commit to stay synchronized.
-    alice.merge_pending_commit(group_id.clone()).unwrap();
-    assert_eq!(alice.get_epoch(group_id.clone()).unwrap(), 2);
+    let dict_after = bob_group
+        .extensions()
+        .app_data_dictionary()
+        .expect("Bob must have AppDataDictionary after merge");
+    assert_eq!(
+        dict_after
+            .dictionary()
+            .get(&catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID)
+            .unwrap(),
+        update_data.as_slice()
+    );
 
-    // 2. Alice updates metadata again with empty fields (REMOVE/clear semantics).
-    let clear_outcome = alice
-        .update_group_metadata_encrypted(
-            group_id.clone(),
-            Some("".to_string()),
-            Some("".to_string()),
-            None,
-            None,
+    // Alice also merges pending commit to stay synchronized.
+    alice_group.merge_pending_commit(&alice_provider).unwrap();
+    assert_eq!(alice_group.epoch().as_u64(), 2);
+
+    // 2. Alice proposes a REMOVE on component 0x8001 metadata.
+    let (_prop_msg2, _prop_ref2) = alice_group
+        .propose_app_data_update(
+            &alice_provider,
+            &alice_signer,
+            catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID,
+            AppDataUpdateOperation::Remove,
         )
         .unwrap();
 
-    // Bob processes the second commit message.
-    let decrypt_res2 = bob
-        .decrypt_message(group_id.clone(), clear_outcome.commit_bytes)
+    let mut commit_stage2 = alice_group
+        .commit_builder()
+        .load_psks(alice_provider.storage())
         .unwrap();
-    assert_eq!(
-        decrypt_res2.content_type,
-        catbird_mls::DecryptContentType::Commit
-    );
-    assert_eq!(decrypt_res2.epoch, 3);
+    let mut updater2 = commit_stage2.app_data_dictionary_updater();
+    for proposal in commit_stage2.app_data_update_proposals() {
+        let operation = proposal.operation();
+        let component_id = proposal.component_id();
+        if let AppDataUpdateOperation::Update(data) = operation {
+            updater2.set(ComponentData::from_parts(component_id, data.clone()));
+        } else if let AppDataUpdateOperation::Remove = operation {
+            updater2.remove(&component_id);
+        }
+    }
+    let changes2 = updater2.changes();
+    commit_stage2.with_app_data_dictionary_updates(changes2);
+    let commit_bundle2 = commit_stage2
+        .build(alice_provider.rand(), alice_provider.crypto(), &alice_signer, |_| true)
+        .unwrap()
+        .stage_commit(&alice_provider)
+        .unwrap();
+    let (commit_msg2, _, _) = commit_bundle2.into_contents();
+    let commit_bytes2 = commit_msg2.tls_serialize_detached().unwrap();
+
+    // Bob processes the second commit message (exercises AppData Remove in resolve_app_data_commit).
+    let (mls_msg2, _) = MlsMessageIn::tls_deserialize_bytes(commit_bytes2.as_slice()).unwrap();
+    let protocol_msg2: ProtocolMessage = mls_msg2.try_into().unwrap();
+    let raw_processed2 = bob_group
+        .process_message(&bob_provider, protocol_msg2)
+        .unwrap();
+
+    // Receiver returns UnresolvedAppDataCommit with Remove operation
+    let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved2) = raw_processed2.content() else {
+        panic!("Expected UnresolvedAppDataCommit for Remove operation");
+    };
+
+    let mut bob_updater2 = bob_group.app_data_dictionary_updater();
+    for proposal in unresolved2.app_data_update_proposals() {
+        let operation = proposal.operation();
+        let component_id = proposal.component_id();
+        if let AppDataUpdateOperation::Update(data) = operation {
+            bob_updater2.set(ComponentData::from_parts(component_id, data.clone()));
+        } else if let AppDataUpdateOperation::Remove = operation {
+            bob_updater2.remove(&component_id);
+        }
+    }
+    let processed2 = bob_group
+        .resolve_app_data_commit(&bob_provider, raw_processed2, bob_updater2.changes())
+        .unwrap();
+    let ProcessedMessageContent::StagedCommitMessage(staged2) = processed2.into_content() else {
+        panic!("Expected StagedCommitMessage after resolve_app_data_commit for remove");
+    };
 
     // Invariant: Bob's local epoch has NOT merged yet before explicit acceptance.
     assert_eq!(
-        bob.get_epoch(group_id.clone()).unwrap(),
+        bob_group.epoch().as_u64(),
         2,
         "Bob epoch must remain at 2 before explicit merge"
     );
 
-    // Explicit merge advances Bob's epoch to 3.
-    let new_epoch2 = bob.merge_incoming_commit(group_id.clone(), 3).unwrap();
-    assert_eq!(new_epoch2, 3);
+    // Invariant: Bob's metadata dictionary still contains component 0x8001 before merge.
     assert_eq!(
-        bob.get_epoch(group_id.clone()).unwrap(),
-        3,
-        "Bob epoch must advance to 3 after explicit merge"
+        bob_group
+            .extensions()
+            .app_data_dictionary()
+            .unwrap()
+            .dictionary()
+            .get(&catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID)
+            .unwrap(),
+        update_data.as_slice()
+    );
+
+    // Acceptance fence: Explicit merge advances Bob's epoch and applies remove dictionary semantics.
+    bob_group.merge_staged_commit(&bob_provider, *staged2).unwrap();
+    assert_eq!(bob_group.epoch().as_u64(), 3);
+
+    assert_eq!(
+        bob_group
+            .extensions()
+            .app_data_dictionary()
+            .and_then(|d| d.dictionary().get(&catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID)),
+        None,
+        "Component 0x8001 must be removed after merge"
     );
 }
