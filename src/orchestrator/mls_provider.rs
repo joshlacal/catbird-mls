@@ -483,6 +483,17 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         metadata_json: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError>;
 
+    #[doc(hidden)]
+    fn stage_app_data_update_for_test(
+        &self,
+        group_id: Vec<u8>,
+        component_id: u16,
+        data: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, MLSError> {
+        let _ = (group_id, component_id, data);
+        Err(MLSError::Internal("not implemented".into()))
+    }
+
     /// Atomic encrypted metadata update (Phase A.2).
     ///
     /// Stages a GroupContextExtensions commit, derives the post-commit

@@ -6173,16 +6173,18 @@ impl MLSContext {
             .as_secs();
         let lifetime =
             openmls::prelude::Lifetime::init(now.saturating_sub(60), now + 29 * 24 * 60 * 60);
-        let extension_caps = if last_resort {
-            vec![openmls::prelude::ExtensionType::LastResort]
-        } else {
-            vec![]
-        };
+        let mut extension_caps = vec![
+            openmls::prelude::ExtensionType::RatchetTree,
+            openmls::prelude::ExtensionType::AppDataDictionary,
+        ];
+        if last_resort {
+            extension_caps.push(openmls::prelude::ExtensionType::LastResort);
+        }
         let capabilities = Capabilities::new(
             Some(&[openmls::prelude::ProtocolVersion::Mls10]),
             Some(&[ciphersuite]),
             Some(&extension_caps),
-            Some(&[]),
+            Some(&[openmls::prelude::ProposalType::AppDataUpdate]),
             Some(&[CredentialType::Basic]),
         );
         let mut builder = KeyPackage::builder()
@@ -6664,6 +6666,61 @@ impl MLSContext {
                 .into()),
             },
         }
+    }
+    #[doc(hidden)]
+    pub fn stage_app_data_update_for_test(
+        &self,
+        group_id: Vec<u8>,
+        component_id: u16,
+        data: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, MLSError> {
+        let _storage_operation = self.begin_storage_operation("stage_app_data_update_for_test");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        inner.with_group(&gid, |group, provider, signer| {
+            use openmls::messages::proposals::AppDataUpdateOperation;
+            let operation = match data {
+                Some(bytes) => AppDataUpdateOperation::Update(bytes.into()),
+                None => AppDataUpdateOperation::Remove,
+            };
+            let (_prop_msg, _prop_ref) = group
+                .propose_app_data_update(provider, signer, component_id, operation)
+                .map_err(|e| MLSError::OpenMLS(format!("propose_app_data_update: {:?}", e)))?;
+
+            let commit_builder = group.commit_builder().force_self_update(true);
+            let mut commit_stage = commit_builder
+                .load_psks(provider.storage())
+                .map_err(|e| MLSError::OpenMLS(format!("load_psks: {:?}", e)))?;
+            let mut updater = commit_stage.app_data_dictionary_updater();
+            for proposal in commit_stage.app_data_update_proposals() {
+                let op = proposal.operation();
+                let comp_id = proposal.component_id();
+                match op {
+                    AppDataUpdateOperation::Update(d) => {
+                        updater.set(ComponentData::from_parts(comp_id, d.clone()));
+                    }
+                    AppDataUpdateOperation::Remove => {
+                        updater.remove(&comp_id);
+                    }
+                }
+            }
+            let changes = updater.changes();
+            commit_stage.with_app_data_dictionary_updates(changes);
+            let commit_bundle = commit_stage
+                .build(provider.rand(), provider.crypto(), signer, |_| true)
+                .map_err(|e| MLSError::OpenMLS(format!("build: {:?}", e)))?
+                .stage_commit(provider)
+                .map_err(|e| MLSError::OpenMLS(format!("stage: {:?}", e)))?;
+            let (commit_msg, _, _) = commit_bundle.into_contents();
+            let commit_bytes = commit_msg
+                .tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+            Ok(commit_bytes)
+        })
     }
 }
 
@@ -7649,6 +7706,15 @@ impl MlsCryptoContext for MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         self.update_group_metadata(group_id, metadata_json)
     }
+    fn stage_app_data_update_for_test(
+        &self,
+        group_id: Vec<u8>,
+        component_id: u16,
+        data: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, MLSError> {
+        self.stage_app_data_update_for_test(group_id, component_id, data)
+    }
+
 
     fn update_group_metadata_encrypted(
         &self,

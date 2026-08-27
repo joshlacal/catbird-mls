@@ -368,6 +368,85 @@ where
             target_epoch,
         })
     }
+    /// Test-only helper to stage an AppData update commit directly and register
+    /// it in orchestrator pending state so volatile tracking, confirmation, and
+    /// restart echo fences can be exercised on genuine AppData commits.
+    #[doc(hidden)]
+    pub async fn stage_app_data_update_commit_for_test(
+        &self,
+        conversation_id: &str,
+        component_id: u16,
+        data: Option<Vec<u8>>,
+    ) -> Result<CommitPlan> {
+        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let group_id = &resolved.group_id;
+        let conversation_id = &resolved.conversation_id;
+        let group_id_bytes = hex::decode(group_id)
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid hex group ID".into()))?;
+
+        {
+            let pending = self.pending_staged_commits().lock().await;
+            if pending.contains_key(group_id) {
+                return Err(OrchestratorError::InvalidInput(format!(
+                    "A staged commit already exists for conversation {conversation_id}; confirm or discard it before staging another"
+                )));
+            }
+        }
+        let source_epoch = self
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())?;
+
+        let commit_bytes = self
+            .mls_context()
+            .stage_app_data_update_for_test(group_id_bytes.clone(), component_id, data)?;
+
+        let user_did = self.require_user_did().await?;
+        let scoped_identity = match self.credentials().get_device_uuid(&user_did).await? {
+            Some(uuid) => format!("{user_did}#{uuid}"),
+            None => user_did.clone(),
+        };
+        let group_info = self
+            .mls_context()
+            .export_group_info(group_id_bytes.clone(), scoped_identity.as_bytes().to_vec())?;
+
+        let nonce = self.next_staged_commit_nonce().await;
+        let target_epoch = source_epoch.saturating_add(1);
+
+        let hash = Sha256::digest(&commit_bytes).to_vec();
+        self.track_epoch_changing_own_commit(
+            hash,
+            OwnCommitExpectation {
+                conversation_id: conversation_id.clone(),
+                group_id: group_id.to_string(),
+                target_epoch,
+            },
+        )
+        .await;
+
+        self.pending_staged_commits().lock().await.insert(
+            group_id.to_string(),
+            PendingCommitMeta {
+                conversation_id: conversation_id.to_string(),
+                nonce,
+                source_epoch,
+                target_epoch,
+                kind: StagedCommitKindSummary::UpdateMetadata,
+            },
+        );
+
+        Ok(CommitPlan {
+            handle: StagedCommitHandle {
+                group_id: group_id.to_string(),
+                nonce,
+            },
+            commit_bytes,
+            welcome_bytes: None,
+            group_info,
+            source_epoch,
+            target_epoch,
+        })
+    }
+
 
     /// Confirm a previously staged commit: merge it locally, advance the
     /// epoch, durably project the resulting group state, update the in-memory

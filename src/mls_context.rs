@@ -85,8 +85,11 @@ pub(crate) fn metadata_leaf_capabilities() -> Capabilities {
     Capabilities::new(
         Some(&[openmls::prelude::ProtocolVersion::Mls10]),
         Some(&[Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519]),
-        Some(&[]),
-        Some(&[]),
+        Some(&[
+            openmls::prelude::ExtensionType::RatchetTree,
+            openmls::prelude::ExtensionType::AppDataDictionary,
+        ]),
+        Some(&[openmls::prelude::ProposalType::AppDataUpdate]),
         Some(&[openmls::prelude::CredentialType::Basic]),
     )
 }

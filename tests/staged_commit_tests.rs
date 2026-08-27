@@ -1347,15 +1347,14 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         .unwrap();
     assert_eq!(alice_epoch_baseline, bob_epoch_baseline);
     assert_eq!(alice_epoch_baseline, 1);
-
-    // Alice stages an AppData Update metadata commit (component 0x8001)
+    // Alice stages a genuine AppData Update commit (component 0x8001)
+    let expected_metadata_1 = b"{\"version\":1,\"locator\":\"metadata-loc-1\",\"hash\":\"\"}".to_vec();
     let plan = alice
         .orchestrator
-        .stage_commit(
+        .stage_app_data_update_commit_for_test(
             &group_id,
-            CommitKind::UpdateMetadata {
-                group_info_extension: b"{}".to_vec(),
-            },
+            0x8001,
+            Some(expected_metadata_1.clone()),
         )
         .await
         .expect("stage update metadata");
@@ -1382,7 +1381,18 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         other => panic!("expected DecryptContentType::Commit, got {:?}", other),
     }
 
-    // AppData commit resolution must NOT auto-merge into Bob's group before explicit confirmation/merge
+    // AppData component 0x8001 must remain UNMERGED on Bob before explicit merge
+    let bob_metadata_before_merge = bob
+        .orchestrator
+        .mls_context()
+        .get_current_metadata(group_bytes.clone())
+        .unwrap()
+        .and_then(|m| m.metadata_reference_json);
+    assert_eq!(
+        bob_metadata_before_merge, None,
+        "Bob's 0x8001 AppData dictionary component must remain unmerged before explicit merge"
+    );
+
     let bob_epoch_after_decrypt = bob
         .orchestrator
         .mls_context()
@@ -1406,6 +1416,18 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
             .get_epoch(group_bytes.clone())
             .unwrap(),
         plan.target_epoch
+    );
+
+    let bob_metadata_after_merge = bob
+        .orchestrator
+        .mls_context()
+        .get_current_metadata(group_bytes.clone())
+        .unwrap()
+        .and_then(|m| m.metadata_reference_json)
+        .expect("Bob must have 0x8001 metadata reference after merge");
+    assert_eq!(
+        bob_metadata_after_merge, expected_metadata_1,
+        "Bob's 0x8001 AppData component must reflect merged value"
     );
 
     // -----------------------------------------------------------------------
@@ -1464,13 +1486,13 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     // -----------------------------------------------------------------------
     // Phase 3: Exercise volatile tracking fence on a second AppData commit
     // -----------------------------------------------------------------------
+    let expected_metadata_2 = b"{\"version\":2,\"locator\":\"metadata-loc-2\",\"hash\":\"\"}".to_vec();
     let plan2 = alice
         .orchestrator
-        .stage_commit(
+        .stage_app_data_update_commit_for_test(
             &group_id,
-            CommitKind::UpdateMetadata {
-                group_info_extension: b"{\"version\":2}".to_vec(),
-            },
+            0x8001,
+            Some(expected_metadata_2.clone()),
         )
         .await
         .expect("stage second update metadata");
@@ -1539,7 +1561,53 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         .get_epoch(group_bytes.clone())
         .unwrap();
     assert_eq!(final_epoch, plan2.target_epoch);
+
+    // Bob processes and merges second AppData commit
+    let bob_decrypt2 = bob
+        .orchestrator
+        .mls_context()
+        .decrypt_message_outcome(group_bytes.clone(), plan2.commit_bytes.clone())
+        .expect("Bob decrypt second AppData commit");
+    match bob_decrypt2 {
+        MlsDecryptOutcome::Message(decrypted) => {
+            assert_eq!(decrypted.content_type, DecryptContentType::Commit);
+            assert_eq!(decrypted.epoch, plan2.target_epoch);
+        }
+        other => panic!("expected DecryptContentType::Commit, got {:?}", other),
+    }
+    assert_eq!(
+        bob.orchestrator
+            .mls_context()
+            .get_current_metadata(group_bytes.clone())
+            .unwrap()
+            .and_then(|m| m.metadata_reference_json)
+            .unwrap(),
+        expected_metadata_1,
+        "Bob's metadata before merging second commit must still be expected_metadata_1"
+    );
+    bob.orchestrator
+        .mls_context()
+        .merge_incoming_commit(group_bytes.clone(), plan2.target_epoch)
+        .expect("Bob merge second AppData commit");
+    assert_eq!(
+        bob.orchestrator
+            .mls_context()
+            .get_epoch(group_bytes.clone())
+            .unwrap(),
+        plan2.target_epoch
+    );
+    assert_eq!(
+        bob.orchestrator
+            .mls_context()
+            .get_current_metadata(group_bytes.clone())
+            .unwrap()
+            .and_then(|m| m.metadata_reference_json)
+            .unwrap(),
+        expected_metadata_2,
+        "Bob's metadata after merging second commit must be expected_metadata_2"
+    );
 }
+#[tokio::test(flavor = "multi_thread")]
 async fn test_stage_commit_mismatched_identity_withholds_cursor() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
