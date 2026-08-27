@@ -17,6 +17,7 @@ use crate::epoch_storage::EpochSecretManager;
 use crate::error::MLSError;
 use crate::message_limits::validate_inbound_mls_message_len;
 use crate::metadata;
+use crate::orchestrator::mls_provider::OwnEchoProof;
 use openmls::component::ComponentData;
 use uuid::Uuid;
 
@@ -76,7 +77,6 @@ use sha2::{Digest, Sha256};
 // no extension or proposal capabilities. New groups likewise carry an empty
 // RequiredCapabilities extension so these leaves can join successfully.
 
-
 fn metadata_required_capabilities_extension() -> RequiredCapabilitiesExtension {
     RequiredCapabilitiesExtension::new(&[], &[], &[])
 }
@@ -90,7 +90,6 @@ pub(crate) fn metadata_leaf_capabilities() -> Capabilities {
         Some(&[openmls::prelude::CredentialType::Basic]),
     )
 }
-
 
 fn map_sqlite_error(context: &str, error: &rusqlite::Error) -> MLSError {
     match error {
@@ -339,6 +338,28 @@ impl ManifestStorage {
             .map_err(|e| {
                 crate::error_log!("[MANIFEST-STORAGE] Failed to create bundle table: {:?}", e);
                 map_sqlite_error("create_table(mls_key_package_bundles)", &e)
+            })?;
+
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS mls_own_echo_proofs (
+                canonical_entry_sha256 BLOB PRIMARY KEY CHECK(length(canonical_entry_sha256) = 32),
+                accepted_request_sha256 BLOB NOT NULL CHECK(length(accepted_request_sha256) = 32),
+                conversation_id TEXT NOT NULL,
+                group_id BLOB NOT NULL,
+                server_entry_id TEXT NOT NULL,
+                mls_epoch INTEGER NOT NULL CHECK(mls_epoch >= 0),
+                aad_sha256 BLOB NOT NULL CHECK(length(aad_sha256) = 32),
+                ciphertext_sha256 BLOB NOT NULL CHECK(length(ciphertext_sha256) = 32)
+            )",
+                [],
+            )
+            .map_err(|e| {
+                crate::error_log!(
+                    "[MANIFEST-STORAGE] Failed to create mls_own_echo_proofs table: {:?}",
+                    e
+                );
+                map_sqlite_error("create_table(mls_own_echo_proofs)", &e)
             })?;
 
         self.migrate_key_package_bundles_blob()?;
@@ -837,6 +858,94 @@ impl ManifestStorage {
             }
         }
     }
+
+    pub(crate) fn store_own_echo_proof(&self, proof: &OwnEchoProof) -> Result<(), MLSError> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO mls_own_echo_proofs (
+                    canonical_entry_sha256,
+                    accepted_request_sha256,
+                    conversation_id,
+                    group_id,
+                    server_entry_id,
+                    mls_epoch,
+                    aad_sha256,
+                    ciphertext_sha256
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    &proof.canonical_entry_sha256[..],
+                    &proof.accepted_request_sha256[..],
+                    &proof.conversation_id,
+                    &proof.group_id[..],
+                    &proof.server_entry_id,
+                    proof.mls_epoch as i64,
+                    &proof.aad_sha256[..],
+                    &proof.ciphertext_sha256[..],
+                ],
+            )
+            .map_err(|e| {
+                crate::error_log!("[MANIFEST-STORAGE] Failed to store own echo proof: {:?}", e);
+                map_sqlite_error("store_own_echo_proof", &e)
+            })?;
+        self.maybe_truncate_checkpoint();
+        Ok(())
+    }
+
+    pub(crate) fn has_own_echo_proof(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+        server_entry_id: &str,
+        mls_epoch: u64,
+        aad_sha256: &[u8; 32],
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<bool, MLSError> {
+        let canonical_entry_sha256 = OwnEchoProof::compute_canonical_entry_sha256(
+            conversation_id,
+            group_id,
+            server_entry_id,
+            mls_epoch,
+            aad_sha256,
+            ciphertext_sha256,
+        );
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT 1 FROM mls_own_echo_proofs WHERE
+                    canonical_entry_sha256 = ?1 AND
+                    conversation_id = ?2 AND
+                    group_id = ?3 AND
+                    server_entry_id = ?4 AND
+                    mls_epoch = ?5 AND
+                    aad_sha256 = ?6 AND
+                    ciphertext_sha256 = ?7",
+            )
+            .map_err(|e| {
+                crate::error_log!(
+                    "[MANIFEST-STORAGE] Failed to prepare has_own_echo_proof: {:?}",
+                    e
+                );
+                map_sqlite_error("has_own_echo_proof.prepare", &e)
+            })?;
+        let exists = stmt
+            .exists(rusqlite::params![
+                &canonical_entry_sha256[..],
+                conversation_id,
+                group_id,
+                server_entry_id,
+                mls_epoch as i64,
+                &aad_sha256[..],
+                &ciphertext_sha256[..],
+            ])
+            .map_err(|e| {
+                crate::error_log!(
+                    "[MANIFEST-STORAGE] Failed to check has_own_echo_proof: {:?}",
+                    e
+                );
+                map_sqlite_error("has_own_echo_proof.exists", &e)
+            })?;
+        Ok(exists)
+    }
 }
 
 /// JSON codec for SqliteStorageProvider
@@ -1327,7 +1436,9 @@ impl MLSContext {
                         match openmls::prelude::MlsGroup::load(provider.storage(), &group_id) {
                             Ok(Some(mut group)) => {
                                 let join_config = openmls::group::MlsGroupJoinConfig::builder()
-                                    .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+                                    .wire_format_policy(
+                                        openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY,
+                                    )
                                     .use_ratchet_tree_extension(true)
                                     .build();
                                 let _ = group.set_configuration(provider.storage(), &join_config);
@@ -1533,6 +1644,31 @@ impl MLSContext {
     /// Get a reference to the provider's crypto
     pub fn provider_crypto(&self) -> &LibcruxCrypto {
         self.provider.crypto()
+    }
+
+    /// Store a proven own-message echo proof inside the encrypted MLS database.
+    pub fn store_own_echo_proof(&self, proof: &OwnEchoProof) -> Result<(), MLSError> {
+        self.manifest_storage.store_own_echo_proof(proof)
+    }
+
+    /// Query non-destructively for an exact own-message echo proof.
+    pub fn has_own_echo_proof(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+        server_entry_id: &str,
+        mls_epoch: u64,
+        aad_sha256: &[u8; 32],
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<bool, MLSError> {
+        self.manifest_storage.has_own_echo_proof(
+            conversation_id,
+            group_id,
+            server_entry_id,
+            mls_epoch,
+            aad_sha256,
+            ciphertext_sha256,
+        )
     }
 
     /// Get mutable access to key_package_bundles
@@ -2679,7 +2815,10 @@ impl MLSContext {
         // Also check if any registered identity starts with identity#
         for (reg_id, pk_bytes) in &self.signers_by_identity {
             if let Ok(reg_str) = std::str::from_utf8(reg_id) {
-                if reg_str.starts_with(identity) && (reg_str.len() == identity.len() || reg_str.as_bytes()[identity.len()] == b'#') {
+                if reg_str.starts_with(identity)
+                    && (reg_str.len() == identity.len()
+                        || reg_str.as_bytes()[identity.len()] == b'#')
+                {
                     if let Some(keypair) = SignatureKeyPair::read(
                         self.provider.storage(),
                         pk_bytes,
@@ -3323,17 +3462,23 @@ impl MLSContext {
                 crate::error_log!("[MLS-CONTEXT] ⚠️ Unexpected Welcome from remove_members!");
             }
 
-            let next_gch = group.pending_commit().and_then(|pending| {
-                pending.group_context().tls_serialize_detached().ok().map(|gc_bytes| {
-                    sha2::Sha256::digest(&gc_bytes).to_vec()
+            let next_gch = group
+                .pending_commit()
+                .and_then(|pending| {
+                    pending
+                        .group_context()
+                        .tls_serialize_detached()
+                        .ok()
+                        .map(|gc_bytes| sha2::Sha256::digest(&gc_bytes).to_vec())
                 })
-            }).or_else(|| {
-                group_info.as_ref().and_then(|gi| {
-                    gi.group_context().tls_serialize_detached().ok().map(|gc_bytes| {
-                        sha2::Sha256::digest(&gc_bytes).to_vec()
+                .or_else(|| {
+                    group_info.as_ref().and_then(|gi| {
+                        gi.group_context()
+                            .tls_serialize_detached()
+                            .ok()
+                            .map(|gc_bytes| sha2::Sha256::digest(&gc_bytes).to_vec())
                     })
-                })
-            });
+                });
 
             use openmls::prelude::tls_codec::DeserializeBytes as _;
             let next_tag = MlsMessageIn::tls_deserialize_exact_bytes(&commit_bytes)
@@ -3343,7 +3488,13 @@ impl MLSContext {
                     _ => None,
                 })
                 .and_then(|t| t.tls_serialize_detached().ok())
-                .map(|tag_bytes| if tag_bytes.len() > 32 { tag_bytes[tag_bytes.len() - 32..].to_vec() } else { tag_bytes });
+                .map(|tag_bytes| {
+                    if tag_bytes.len() > 32 {
+                        tag_bytes[tag_bytes.len() - 32..].to_vec()
+                    } else {
+                        tag_bytes
+                    }
+                });
 
             crate::info_log!(
                 "[MLS-CONTEXT] ✅ Remove commit created, size: {} bytes",
@@ -3370,24 +3521,33 @@ impl MLSContext {
 
         self.with_group(&gid, |group, provider, signer| {
             // Deserialize and validate key package
-            let kp_in = if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(key_package_data) {
-                match mls_msg.extract() {
-                    MlsMessageBodyIn::KeyPackage(kp_in) => kp_in,
-                    _ => {
-                        let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data).map_err(|e| {
-                            crate::error_log!("[MLS-CONTEXT] Failed to deserialize key package: {:?}", e);
+            let kp_in =
+                if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(key_package_data) {
+                    match mls_msg.extract() {
+                        MlsMessageBodyIn::KeyPackage(kp_in) => kp_in,
+                        _ => {
+                            let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
+                                .map_err(|e| {
+                                    crate::error_log!(
+                                        "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
+                                        e
+                                    );
+                                    MLSError::SerializationError
+                                })?;
+                            kp_in
+                        }
+                    }
+                } else {
+                    let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
+                        .map_err(|e| {
+                            crate::error_log!(
+                                "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
+                                e
+                            );
                             MLSError::SerializationError
                         })?;
-                        kp_in
-                    }
-                }
-            } else {
-                let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data).map_err(|e| {
-                    crate::error_log!("[MLS-CONTEXT] Failed to deserialize key package: {:?}", e);
-                    MLSError::SerializationError
-                })?;
-                kp_in
-            };
+                    kp_in
+                };
 
             let key_package = kp_in
                 .validate(provider.crypto(), ProtocolVersion::default())

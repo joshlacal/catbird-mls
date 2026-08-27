@@ -1,14 +1,15 @@
+use crate::error::MLSError;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use crate::error::MLSError;
 use std::collections::{HashMap, HashSet};
 
 use super::api_client::MLSAPIClient;
+use super::canonical_transport::CleanChatSigningContext;
 use super::constants;
-use super::credentials::CredentialStore;
+use super::credentials::{CleanChatSigningAuthority, CredentialStore};
 use super::error::{OrchestratorError, Result};
-use super::mls_provider::MlsCryptoContext;
+use super::mls_provider::{MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof};
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
@@ -148,7 +149,7 @@ where
                     advanced.epoch = target_epoch;
                     Some(advanced)
                 }
-            } else if let Some(stored) = self.storage().get_group_state(&resolved.group_id).await.ok().flatten() {
+            } else if let Some(stored) = self.storage().get_group_state(&resolved.group_id).await? {
                 if target_epoch <= stored.epoch {
                     None
                 } else {
@@ -157,7 +158,7 @@ where
                     Some(advanced)
                 }
             } else {
-                None
+                return Err(OrchestratorError::GroupNotFound(resolved.group_id.clone()));
             }
         };
 
@@ -302,8 +303,7 @@ where
     /// 2. Sends ciphertext to the delivery service
     /// 3. Stores the plaintext locally
     pub async fn send_message(&self, conversation_id: &str, text: &str) -> Result<Message> {
-        Box::pin(self.send_payload_message(conversation_id, MLSMessagePayload::text(text)))
-            .await
+        Box::pin(self.send_payload_message(conversation_id, MLSMessagePayload::text(text))).await
     }
 
     async fn reject_send_if_reset_pending(&self, conversation_id: &str) -> Result<()> {
@@ -1053,9 +1053,52 @@ where
         // Commit spiral without silently skipping ordered server frames.
         let decrypt_result = match self
             .mls_context()
-            .decrypt_message(group_id_bytes.clone(), envelope.ciphertext.clone())
+            .decrypt_message_outcome(group_id_bytes.clone(), envelope.ciphertext.clone())
         {
-            Ok(r) => r,
+            Ok(MlsDecryptOutcome::Message(r)) => r,
+            Ok(MlsDecryptOutcome::OwnPrivateMessage {
+                epoch,
+                aad_sha256,
+                ciphertext_sha256,
+            }) => {
+                let has_proof = match envelope.server_message_id.as_deref() {
+                    Some(server_entry_id) => self.mls_context().has_own_echo_proof(
+                        &resolved.conversation_id,
+                        &group_id_bytes,
+                        server_entry_id,
+                        epoch,
+                        &aad_sha256,
+                        &ciphertext_sha256,
+                    )?,
+                    None => false,
+                };
+                if has_proof {
+                    tracing::debug!(
+                        conversation_id = %envelope.conversation_id,
+                        "Skipping durably proven own private message"
+                    );
+                    return Ok(None);
+                } else {
+                    tracing::warn!(
+                        conversation_id = %envelope.conversation_id,
+                        "OwnPrivateMessage without durable echo proof; refusing cursor advancement"
+                    );
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "unverified own-private message outcome for conversation {}",
+                        resolved.conversation_id
+                    )));
+                }
+            }
+            Ok(MlsDecryptOutcome::OwnPendingCommit) => {
+                tracing::warn!(
+                    conversation_id = %envelope.conversation_id,
+                    "OwnPendingCommit reached decrypt outcome without prior durable confirmation; refusing cursor advancement"
+                );
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "unverified own pending commit outcome for conversation {}",
+                    resolved.conversation_id
+                )));
+            }
             Err(crate::MLSError::GroupNotFound { .. }) => {
                 tracing::warn!(
                     convo_id = %envelope.conversation_id,
@@ -1109,18 +1152,32 @@ where
                 }
             }
             Err(e) if e.is_secret_reuse() => {
-                tracing::debug!(
-                    conversation_id = %envelope.conversation_id,
-                    "Skipping already-ratcheted SecretReuse message"
-                );
-                return Ok(None);
-            }
-            Err(e) if e.is_cannot_decrypt_own_message() => {
-                tracing::debug!(
-                    conversation_id = %envelope.conversation_id,
-                    "Skipping own message"
-                );
-                return Ok(None);
+                let has_durable_evidence = match envelope.server_message_id.as_deref() {
+                    Some(server_id) => {
+                        self.durable_message_exists_in_conversation(
+                            &resolved.conversation_id,
+                            server_id,
+                        )
+                        .await?
+                    }
+                    None => false,
+                };
+                if has_durable_evidence {
+                    tracing::debug!(
+                        conversation_id = %envelope.conversation_id,
+                        "Skipping already-ratcheted SecretReuse message"
+                    );
+                    return Ok(None);
+                } else {
+                    tracing::warn!(
+                        conversation_id = %envelope.conversation_id,
+                        "SecretReuse without durable envelope evidence; refusing cursor advancement"
+                    );
+                    return Err(OrchestratorError::RecoveryFailed(format!(
+                        "SecretReuse without durable envelope evidence for conversation {}",
+                        resolved.conversation_id
+                    )));
+                }
             }
             Err(e) if e.is_external_join_proposal_authorization_rejection() => {
                 // This authenticated control frame was deliberately rejected
@@ -1756,17 +1813,12 @@ where
                 Ok(Some(msg)) => messages.push(msg),
                 Ok(None) => {} // duplicate or own commit
                 Err(error) => {
-                    let err_str = error.to_string();
-                    if err_str.contains("SecretReuse") || err_str.contains("CannotDecryptOwnMessage") {
-                        tracing::warn!(error = %error, "Skipping already-ratcheted or own message");
-                    } else {
-                        tracing::error!(
-                            error = %error,
-                            conversation_id,
-                            "Failed to process incoming message; refusing page cursor advancement"
-                        );
-                        return Err(error);
-                    }
+                    tracing::error!(
+                        error = %error,
+                        conversation_id,
+                        "Failed to process incoming message; refusing page cursor advancement"
+                    );
+                    return Err(error);
                 }
             }
         }
@@ -1858,17 +1910,22 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let key_id = {
             let identity_bytes = format!("{user_did}#{actor_device_id}").into_bytes();
             let pk = self.mls_context().identity_public_key(identity_bytes)?;
             super::canonical_transport::derive_key_id(&pk)
         };
-        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let resolved = self
+            .resolve_legacy_group_identifier(conversation_id)
+            .await?;
         let convo_id = &resolved.conversation_id;
-        let convo_uuid = uuid::Uuid::parse_str(convo_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
         let msg_uuid = uuid::Uuid::parse_str(message_id)
             .map_err(|e| OrchestratorError::InvalidInput(format!("invalid message UUID: {e}")))?;
         let group_id_bytes = resolved.group_id_bytes()?;
@@ -1893,15 +1950,19 @@ where
         let state_version = {
             let convos_req = super::canonical_transport::PreparedRequest {
                 operation: super::canonical_transport::CanonicalOperation::GetConversations,
-                path: format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50", actor_device_id),
+                path: format!(
+                    "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
+                    actor_device_id
+                ),
                 method: "GET".to_string(),
                 body: None,
             };
-            let convos_val: Option<serde_json::Value> = if let Ok(resp) = self.api_client().submit_prepared_request(convos_req).await {
-                serde_json::from_slice(&resp.body).ok()
-            } else {
-                None
-            };
+            let convos_val: Option<serde_json::Value> =
+                if let Ok(resp) = self.api_client().submit_prepared_request(convos_req).await {
+                    serde_json::from_slice(&resp.body).ok()
+                } else {
+                    None
+                };
             convos_val
                 .as_ref()
                 .and_then(|v| v.get("items").and_then(|i| i.as_array()))
@@ -1963,12 +2024,41 @@ where
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         });
 
-        let response = self
-            .submit_signed_clean_chat_request(
+        let binding = CleanChatSigningContext {
+            actor_did: user_did.clone(),
+            device_id: actor_device_id.clone(),
+            auth_generation: Some(auth_generation),
+        };
+        let prepared_request = self
+            .prepare_clean_chat_signed_request(
+                binding,
                 super::canonical_transport::CanonicalOperation::SendMessage,
                 serde_json::to_vec(&body)
                     .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
             )
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        let submitted_bytes = prepared_request.body.as_deref().unwrap_or_default();
+        let submitted_val: serde_json::Value =
+            serde_json::from_slice(submitted_bytes).map_err(|e| {
+                OrchestratorError::Serialization(format!("prepared_request serialization: {e}"))
+            })?;
+        let submitted_body = submitted_val
+            .get("signedRequest")
+            .and_then(|s| s.get("body"))
+            .and_then(|b| b.as_object())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization(
+                    "prepared_request missing signedRequest.body".into(),
+                )
+            })?
+            .clone();
+        let accepted_request_sha256: [u8; 32] = sha2::Sha256::digest(submitted_bytes).into();
+
+        let response = self
+            .api_client()
+            .submit_prepared_request(prepared_request)
             .await?;
 
         if response.status != 200 {
@@ -1985,24 +2075,160 @@ where
             )));
         }
 
-        let resp_json: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(|e| {
-                OrchestratorError::Serialization(format!("send_message response: {e}"))
-            })?;
-        let entry = resp_json.get("entry").unwrap_or(&resp_json);
-        let resp_msg_id = entry
+        let resp_json: serde_json::Value = serde_json::from_slice(&response.body)
+            .map_err(|e| OrchestratorError::Serialization(format!("send_message response: {e}")))?;
+        let entry = if let Some(e) = resp_json.get("entry") {
+            e.as_object().ok_or_else(|| {
+                OrchestratorError::Serialization(
+                    "send_message response entry must be an object".into(),
+                )
+            })?
+        } else if let Some(obj) = resp_json.as_object() {
+            obj
+        } else {
+            return Err(OrchestratorError::Serialization(
+                "send_message response must be an object".into(),
+            ));
+        };
+
+        let entry_id_str = entry
             .get("entryId")
-            .or_else(|| entry.get("messageId"))
-            .and_then(|m| m.as_str())
-            .unwrap_or(message_id)
-            .to_string();
-        let seq = entry.get("seq").and_then(|s| s.as_u64()).unwrap_or(1);
-        let resp_epoch = entry.get("epoch").and_then(|e| e.as_u64()).unwrap_or(epoch);
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization("send_message response missing entryId".into())
+            })?;
+        let parsed_entry_uuid = uuid::Uuid::parse_str(entry_id_str).map_err(|e| {
+            OrchestratorError::Serialization(format!(
+                "send_message entryId is not a valid UUID: {e}"
+            ))
+        })?;
+        if parsed_entry_uuid.get_version_num() != 4 {
+            return Err(OrchestratorError::Serialization(
+                "send_message entryId must be UUIDv4".into(),
+            ));
+        }
+
+        let seq = entry.get("seq").and_then(|v| v.as_u64()).ok_or_else(|| {
+            OrchestratorError::Serialization("send_message response missing seq".into())
+        })?;
+        if seq == 0 {
+            return Err(OrchestratorError::Serialization(
+                "send_message response seq must be positive".into(),
+            ));
+        }
+
+        let signed_request = entry
+            .get("signedRequest")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization(
+                    "send_message response missing signedRequest".into(),
+                )
+            })?;
+        let resp_body = signed_request
+            .get("body")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization(
+                    "send_message response signedRequest missing body".into(),
+                )
+            })?;
+
+        let resp_msg_id = resp_body
+            .get("messageId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization("signedRequest body missing messageId".into())
+            })?;
+        if resp_msg_id != message_id {
+            return Err(OrchestratorError::Serialization(format!(
+                "signedRequest body messageId mismatch: expected {message_id}, got {resp_msg_id}"
+            )));
+        }
+
+        let resp_prior = resp_body
+            .get("prior")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization("signedRequest body missing prior".into())
+            })?;
+        let resp_prior_convo = resp_prior
+            .get("conversationId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization(
+                    "signedRequest prior missing conversationId".into(),
+                )
+            })?;
+        if resp_prior_convo != conversation_id && resp_prior_convo != convo_id {
+            return Err(OrchestratorError::Serialization(
+                "signedRequest prior conversationId mismatch".into(),
+            ));
+        }
+        let resp_prior_epoch = resp_prior
+            .get("epoch")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization("signedRequest prior missing epoch".into())
+            })?;
+        if resp_prior_epoch != epoch {
+            return Err(OrchestratorError::Serialization(
+                "signedRequest prior epoch mismatch".into(),
+            ));
+        }
+        let resp_prior_gen = resp_prior
+            .get("generation")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                OrchestratorError::Serialization("signedRequest prior missing generation".into())
+            })?;
+        if resp_prior_gen != 0 {
+            return Err(OrchestratorError::Serialization(
+                "signedRequest prior generation mismatch".into(),
+            ));
+        }
+
+        let submitted_aad = submitted_body
+            .get("aad")
+            .ok_or_else(|| OrchestratorError::Serialization("submitted body missing aad".into()))?;
+        let resp_aad = resp_body.get("aad").ok_or_else(|| {
+            OrchestratorError::Serialization("signedRequest body missing aad".into())
+        })?;
+        if submitted_aad != resp_aad {
+            return Err(OrchestratorError::Serialization(
+                "signedRequest body aad mismatch".into(),
+            ));
+        }
+
+        let submitted_app_msg = submitted_body.get("applicationMessage").ok_or_else(|| {
+            OrchestratorError::Serialization("submitted body missing applicationMessage".into())
+        })?;
+        let resp_app_msg = resp_body.get("applicationMessage").ok_or_else(|| {
+            OrchestratorError::Serialization("signedRequest body missing applicationMessage".into())
+        })?;
+        if submitted_app_msg != resp_app_msg {
+            return Err(OrchestratorError::Serialization(
+                "signedRequest body applicationMessage mismatch".into(),
+            ));
+        }
+
+        let aad_sha256: [u8; 32] = sha2::Sha256::digest(b"").into();
+        let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(ciphertext).into();
+        let proof = OwnEchoProof::new(
+            accepted_request_sha256,
+            resolved.conversation_id.clone(),
+            group_id_bytes,
+            entry_id_str.to_string(),
+            epoch,
+            aad_sha256,
+            ciphertext_sha256,
+        );
+        self.mls_context().store_own_echo_proof(&proof)?;
 
         Ok(SendMessageResponse {
-            message_id: resp_msg_id,
+            message_id: entry_id_str.to_string(),
             seq,
-            epoch: resp_epoch,
+            epoch,
         })
     }
 }

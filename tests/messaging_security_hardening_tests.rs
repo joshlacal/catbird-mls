@@ -4,10 +4,12 @@
 
 mod e2e_harness;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use catbird_mls::orchestrator::mls_provider::{MlsDecryptOutcome, OwnEchoProof};
 use catbird_mls::orchestrator::{
     ConversationState, GroupState, MLSAPIClient, MLSMessagePayload, MLSOrchestrator,
     MLSStorageBackend, Message, MlsCryptoContext, OrchestratorConfig, ReactionAction,
@@ -15,7 +17,8 @@ use catbird_mls::orchestrator::{
 use e2e_harness::mock_api_client::MockDeliveryService;
 use e2e_harness::mock_credentials::MockCredentials;
 use e2e_harness::mock_storage::MockStorage;
-
+use e2e_harness::TestWorld;
+use sha2::{Digest, Sha256};
 struct ControlledCommitCrypto {
     decrypt_calls: AtomicUsize,
     discard_calls: AtomicUsize,
@@ -30,11 +33,18 @@ struct ControlledCommitCrypto {
     external_join_rejection_on_decrypt: bool,
     group_not_found_on_decrypt: bool,
     secret_reuse_on_decrypt: bool,
-    cannot_decrypt_own_message_on_decrypt: bool,
+    own_private_message_on_decrypt: bool,
+    own_pending_commit_on_decrypt: bool,
+    custom_own_private_epoch: Option<u64>,
+    custom_own_private_aad_sha256: Option<[u8; 32]>,
+    custom_own_private_ciphertext_sha256: Option<[u8; 32]>,
     application_plaintext: Option<Vec<u8>>,
     application_then_secret_reuse: bool,
     first_decrypt_delay: Option<Duration>,
     first_decrypt_entered: AtomicBool,
+    proof_storage: Mutex<HashMap<[u8; 32], OwnEchoProof>>,
+    fail_store_proof: AtomicBool,
+    fail_lookup_proof: AtomicBool,
 }
 
 impl ControlledCommitCrypto {
@@ -59,14 +69,20 @@ impl ControlledCommitCrypto {
             external_join_rejection_on_decrypt: false,
             group_not_found_on_decrypt: false,
             secret_reuse_on_decrypt: false,
-            cannot_decrypt_own_message_on_decrypt: false,
+            own_private_message_on_decrypt: false,
+            own_pending_commit_on_decrypt: false,
+            custom_own_private_epoch: None,
+            custom_own_private_aad_sha256: None,
+            custom_own_private_ciphertext_sha256: None,
             application_plaintext: None,
             application_then_secret_reuse: false,
             first_decrypt_delay: None,
             first_decrypt_entered: AtomicBool::new(false),
+            proof_storage: Mutex::new(HashMap::new()),
+            fail_store_proof: AtomicBool::new(false),
+            fail_lookup_proof: AtomicBool::new(false),
         }
     }
-
     fn merge_fails() -> Self {
         Self::configured(false, true, true, 1, false)
     }
@@ -101,9 +117,15 @@ impl ControlledCommitCrypto {
         crypto
     }
 
-    fn cannot_decrypt_own_message() -> Self {
+    fn own_private_message() -> Self {
         let mut crypto = Self::configured(false, true, true, 1, false);
-        crypto.cannot_decrypt_own_message_on_decrypt = true;
+        crypto.own_private_message_on_decrypt = true;
+        crypto
+    }
+
+    fn own_pending_commit() -> Self {
+        let mut crypto = Self::configured(false, true, true, 1, false);
+        crypto.own_pending_commit_on_decrypt = true;
         crypto
     }
 
@@ -221,11 +243,6 @@ impl MlsCryptoContext for ControlledCommitCrypto {
                 "ValidationError(UnableToDecrypt(SecretTreeError(SecretReuseError)))".to_string(),
             ));
         }
-        if self.cannot_decrypt_own_message_on_decrypt {
-            return Err(catbird_mls::MLSError::OpenMLS(
-                "ValidationError(CannotDecryptOwnMessage)".to_string(),
-            ));
-        }
         if let Some(plaintext) = self.application_plaintext.as_ref() {
             self.first_decrypt_entered.store(true, Ordering::SeqCst);
             if let Some(delay) = self.first_decrypt_delay {
@@ -255,6 +272,79 @@ impl MlsCryptoContext for ControlledCommitCrypto {
             content_type: catbird_mls::DecryptContentType::Commit,
             proposal_ref: None,
         })
+    }
+
+    fn decrypt_message_outcome(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<MlsDecryptOutcome, catbird_mls::MLSError> {
+        if self.own_private_message_on_decrypt {
+            let epoch = self
+                .custom_own_private_epoch
+                .unwrap_or_else(|| self.crypto_epoch.load(Ordering::SeqCst));
+            let aad_sha256 = self
+                .custom_own_private_aad_sha256
+                .unwrap_or_else(|| Sha256::digest(b"").into());
+            let ciphertext_sha256 = self
+                .custom_own_private_ciphertext_sha256
+                .unwrap_or_else(|| Sha256::digest(&ciphertext).into());
+            return Ok(MlsDecryptOutcome::OwnPrivateMessage {
+                epoch,
+                aad_sha256,
+                ciphertext_sha256,
+            });
+        }
+        if self.own_pending_commit_on_decrypt {
+            return Ok(MlsDecryptOutcome::OwnPendingCommit);
+        }
+        self.decrypt_message(group_id, ciphertext)
+            .map(MlsDecryptOutcome::Message)
+    }
+
+    fn store_own_echo_proof(&self, proof: &OwnEchoProof) -> Result<(), catbird_mls::MLSError> {
+        if self.fail_store_proof.load(Ordering::SeqCst) {
+            return Err(catbird_mls::MLSError::StorageFailed);
+        }
+        self.proof_storage
+            .lock()
+            .unwrap()
+            .insert(proof.canonical_entry_sha256, proof.clone());
+        Ok(())
+    }
+
+    fn has_own_echo_proof(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+        server_entry_id: &str,
+        mls_epoch: u64,
+        aad_sha256: &[u8; 32],
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<bool, catbird_mls::MLSError> {
+        if self.fail_lookup_proof.load(Ordering::SeqCst) {
+            return Err(catbird_mls::MLSError::StorageFailed);
+        }
+        let canonical_entry_sha256 = OwnEchoProof::compute_canonical_entry_sha256(
+            conversation_id,
+            group_id,
+            server_entry_id,
+            mls_epoch,
+            aad_sha256,
+            ciphertext_sha256,
+        );
+        let guard = self.proof_storage.lock().unwrap();
+        if let Some(proof) = guard.get(&canonical_entry_sha256) {
+            let matches = proof.conversation_id == conversation_id
+                && proof.group_id == group_id
+                && proof.server_entry_id == server_entry_id
+                && proof.mls_epoch == mls_epoch
+                && proof.aad_sha256 == *aad_sha256
+                && proof.ciphertext_sha256 == *ciphertext_sha256;
+            Ok(matches)
+        } else {
+            Ok(false)
+        }
     }
 
     fn merge_incoming_commit(
@@ -740,12 +830,12 @@ async fn secret_reuse_without_durable_envelope_evidence_fails_closed_without_rej
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn own_message_decrypt_error_requires_durable_server_id_evidence() {
+async fn own_private_message_missing_proof_withholds_cursor_without_rejoin() {
     let conversation_id = "7172737475767778797a7b7c7d7e7f80";
     let message_id = "unproven-own-echo";
     let fixture = controlled_inbound_fixture(
         conversation_id,
-        Arc::new(ControlledCommitCrypto::cannot_decrypt_own_message()),
+        Arc::new(ControlledCommitCrypto::own_private_message()),
     )
     .await;
     fixture
@@ -766,27 +856,39 @@ async fn own_message_decrypt_error_requires_durable_server_id_evidence() {
         .expect_err("own-message error without durable outbox proof must withhold cursor");
     assert!(error
         .to_string()
-        .contains("CannotDecryptOwnMessage without durable outbox evidence"));
+        .contains("unverified own-private message outcome"));
     assert!(!fixture.storage.has_rejoin_flag(conversation_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn durable_pending_server_id_authorizes_own_echo_skip() {
+async fn own_private_message_exact_durable_proof_advances_cursor_and_retains_proof() {
     let conversation_id = "6162636465666768696a6b6c6d6e6f70";
     let message_id = "durable-own-echo";
     let fixture = controlled_inbound_fixture(
         conversation_id,
-        Arc::new(ControlledCommitCrypto::cannot_decrypt_own_message()),
+        Arc::new(ControlledCommitCrypto::own_private_message()),
     )
     .await;
-    fixture
-        .storage
-        .store_pending_message(conversation_id, message_id)
-        .await
-        .expect("seed durable outbox evidence");
+    let group_bytes = hex::decode(conversation_id).unwrap_or_default();
+    let ciphertext = b"exact-ciphertext";
+    let req_hash: [u8; 32] = Sha256::digest(b"test-request").into();
+    let aad_hash: [u8; 32] = Sha256::digest(b"").into();
+    let ct_hash: [u8; 32] = Sha256::digest(ciphertext).into();
+
+    let proof = OwnEchoProof::new(
+        req_hash,
+        conversation_id.to_string(),
+        group_bytes.clone(),
+        message_id.to_string(),
+        1,
+        aad_hash,
+        ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+
     fixture
         .api
-        .send_message_with_id(conversation_id, b"own-echo", 1, message_id)
+        .send_message_with_id(conversation_id, ciphertext, 1, message_id)
         .await
         .expect("seed server envelope");
 
@@ -803,11 +905,471 @@ async fn durable_pending_server_id_authorizes_own_echo_skip() {
         .expect("durably proven own echo may advance the cursor");
     assert!(messages.is_empty());
     assert_eq!(cursor.as_deref(), Some("1"));
-    assert!(!fixture
-        .storage
-        .remove_pending_message(message_id)
+
+    // Proof must be retained after acceptance
+    assert!(fixture
+        .crypto
+        .has_own_echo_proof(
+            conversation_id,
+            &group_bytes,
+            message_id,
+            1,
+            &aad_hash,
+            &ct_hash,
+        )
+        .expect("proof must remain queryable"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_private_message_entry_id_collision_withholds_cursor() {
+    let conversation_id = "6162636465666768696a6b6c6d6e6f71";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::own_private_message()),
+    )
+    .await;
+    let group_bytes = hex::decode(conversation_id).unwrap_or_default();
+    let ciphertext = b"ciphertext-payload";
+    let req_hash: [u8; 32] = Sha256::digest(b"test-request").into();
+    let aad_hash: [u8; 32] = Sha256::digest(b"").into();
+    let ct_hash: [u8; 32] = Sha256::digest(ciphertext).into();
+
+    // Store proof for entry-1
+    let proof = OwnEchoProof::new(
+        req_hash,
+        conversation_id.to_string(),
+        group_bytes.clone(),
+        "entry-1".to_string(),
+        1,
+        aad_hash,
+        ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+
+    // Inbound envelope arrives with entry-2
+    fixture
+        .api
+        .send_message_with_id(conversation_id, ciphertext, 1, "entry-2")
         .await
-        .expect("inspect consumed pending proof"));
+        .expect("seed server envelope");
+
+    let error = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect_err("entry-id collision must withhold cursor");
+    assert!(error
+        .to_string()
+        .contains("unverified own-private message outcome"));
+    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+
+    // Proof for entry-1 is still intact
+    assert!(fixture
+        .crypto
+        .has_own_echo_proof(
+            conversation_id,
+            &group_bytes,
+            "entry-1",
+            1,
+            &aad_hash,
+            &ct_hash,
+        )
+        .unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_private_message_conversation_mismatch_withholds_cursor() {
+    let conversation_id = "6162636465666768696a6b6c6d6e6f72";
+    let message_id = "mismatch-convo-msg";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::own_private_message()),
+    )
+    .await;
+    let group_bytes = hex::decode(conversation_id).unwrap_or_default();
+    let ciphertext = b"ciphertext-payload";
+    let req_hash: [u8; 32] = Sha256::digest(b"test-request").into();
+    let aad_hash: [u8; 32] = Sha256::digest(b"").into();
+    let ct_hash: [u8; 32] = Sha256::digest(ciphertext).into();
+
+    // Store proof for a different conversation
+    let proof = OwnEchoProof::new(
+        req_hash,
+        "different-conversation-id".to_string(),
+        group_bytes,
+        message_id.to_string(),
+        1,
+        aad_hash,
+        ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+
+    fixture
+        .api
+        .send_message_with_id(conversation_id, ciphertext, 1, message_id)
+        .await
+        .expect("seed server envelope");
+
+    let error = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect_err("conversation mismatch must withhold cursor");
+    assert!(error
+        .to_string()
+        .contains("unverified own-private message outcome"));
+    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_private_message_group_or_epoch_mismatch_withholds_cursor() {
+    let conversation_id = "6162636465666768696a6b6c6d6e6f73";
+    let message_id = "mismatch-group-epoch-msg";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::own_private_message()),
+    )
+    .await;
+    let ciphertext = b"ciphertext-payload";
+    let req_hash: [u8; 32] = Sha256::digest(b"test-request").into();
+    let aad_hash: [u8; 32] = Sha256::digest(b"").into();
+    let ct_hash: [u8; 32] = Sha256::digest(ciphertext).into();
+
+    // Proof with wrong group ID
+    let proof = OwnEchoProof::new(
+        req_hash,
+        conversation_id.to_string(),
+        b"wrong-group-id".to_vec(),
+        message_id.to_string(),
+        1,
+        aad_hash,
+        ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+
+    fixture
+        .api
+        .send_message_with_id(conversation_id, ciphertext, 1, message_id)
+        .await
+        .expect("seed server envelope");
+
+    let error = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect_err("group mismatch must withhold cursor");
+    assert!(error
+        .to_string()
+        .contains("unverified own-private message outcome"));
+    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_private_message_ciphertext_mutation_withholds_cursor() {
+    let conversation_id = "6162636465666768696a6b6c6d6e6f74";
+    let message_id = "ciphertext-mutation-msg";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::own_private_message()),
+    )
+    .await;
+    let group_bytes = hex::decode(conversation_id).unwrap_or_default();
+    let req_hash: [u8; 32] = Sha256::digest(b"test-request").into();
+    let aad_hash: [u8; 32] = Sha256::digest(b"").into();
+    let original_ct_hash: [u8; 32] = Sha256::digest(b"original-ciphertext").into();
+
+    let proof = OwnEchoProof::new(
+        req_hash,
+        conversation_id.to_string(),
+        group_bytes,
+        message_id.to_string(),
+        1,
+        aad_hash,
+        original_ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+
+    // Send mutated ciphertext
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"mutated-ciphertext", 1, message_id)
+        .await
+        .expect("seed server envelope");
+
+    let error = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect_err("ciphertext mutation must withhold cursor");
+    assert!(error
+        .to_string()
+        .contains("unverified own-private message outcome"));
+    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_private_message_aad_mutation_withholds_cursor() {
+    let conversation_id = "6162636465666768696a6b6c6d6e6f75";
+    let message_id = "aad-mutation-msg";
+    let mut crypto = ControlledCommitCrypto::own_private_message();
+    crypto.custom_own_private_aad_sha256 = Some(Sha256::digest(b"mutated-aad").into());
+    let fixture = controlled_inbound_fixture(conversation_id, Arc::new(crypto)).await;
+    let group_bytes = hex::decode(conversation_id).unwrap_or_default();
+    let ciphertext = b"ciphertext-payload";
+    let req_hash: [u8; 32] = Sha256::digest(b"test-request").into();
+    let aad_hash: [u8; 32] = Sha256::digest(b"expected-aad").into();
+    let ct_hash: [u8; 32] = Sha256::digest(ciphertext).into();
+
+    let proof = OwnEchoProof::new(
+        req_hash,
+        conversation_id.to_string(),
+        group_bytes,
+        message_id.to_string(),
+        1,
+        aad_hash,
+        ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+
+    fixture
+        .api
+        .send_message_with_id(conversation_id, ciphertext, 1, message_id)
+        .await
+        .expect("seed server envelope");
+
+    let error = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect_err("aad mutation must withhold cursor");
+    assert!(error
+        .to_string()
+        .contains("unverified own-private message outcome"));
+    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+}
+
+#[test]
+fn canonical_entry_digest_vector_proof_every_field_changes_digest() {
+    let convo = "convo-1";
+    let group = b"group-1";
+    let entry = "entry-1";
+    let epoch = 10u64;
+    let aad = [1u8; 32];
+    let ct = [2u8; 32];
+
+    let base_digest =
+        OwnEchoProof::compute_canonical_entry_sha256(convo, group, entry, epoch, &aad, &ct);
+
+    // Mutate conversation
+    let d1 =
+        OwnEchoProof::compute_canonical_entry_sha256("convo-2", group, entry, epoch, &aad, &ct);
+    assert_ne!(base_digest, d1, "conversation change must alter digest");
+
+    // Mutate group
+    let d2 =
+        OwnEchoProof::compute_canonical_entry_sha256(convo, b"group-2", entry, epoch, &aad, &ct);
+    assert_ne!(base_digest, d2, "group change must alter digest");
+
+    // Mutate entry
+    let d3 =
+        OwnEchoProof::compute_canonical_entry_sha256(convo, group, "entry-2", epoch, &aad, &ct);
+    assert_ne!(base_digest, d3, "entry change must alter digest");
+
+    // Mutate epoch
+    let d4 = OwnEchoProof::compute_canonical_entry_sha256(convo, group, entry, 11u64, &aad, &ct);
+    assert_ne!(base_digest, d4, "epoch change must alter digest");
+
+    // Mutate aad
+    let mut mutated_aad = aad;
+    mutated_aad[0] ^= 0xff;
+    let d5 =
+        OwnEchoProof::compute_canonical_entry_sha256(convo, group, entry, epoch, &mutated_aad, &ct);
+    assert_ne!(base_digest, d5, "aad change must alter digest");
+
+    // Mutate ciphertext
+    let mut mutated_ct = ct;
+    mutated_ct[0] ^= 0xff;
+    let d6 =
+        OwnEchoProof::compute_canonical_entry_sha256(convo, group, entry, epoch, &aad, &mutated_ct);
+    assert_ne!(base_digest, d6, "ciphertext change must alter digest");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_private_message_storage_lookup_failure_withholds_cursor() {
+    let conversation_id = "6162636465666768696a6b6c6d6e6f76";
+    let message_id = "storage-failure-msg";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::own_private_message()),
+    )
+    .await;
+    let group_bytes = hex::decode(conversation_id).unwrap_or_default();
+    let ciphertext = b"ciphertext-payload";
+    let req_hash: [u8; 32] = Sha256::digest(b"test-request").into();
+    let aad_hash: [u8; 32] = Sha256::digest(b"").into();
+    let ct_hash: [u8; 32] = Sha256::digest(ciphertext).into();
+
+    let proof = OwnEchoProof::new(
+        req_hash,
+        conversation_id.to_string(),
+        group_bytes,
+        message_id.to_string(),
+        1,
+        aad_hash,
+        ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+    fixture
+        .crypto
+        .fail_lookup_proof
+        .store(true, Ordering::SeqCst);
+
+    fixture
+        .api
+        .send_message_with_id(conversation_id, ciphertext, 1, message_id)
+        .await
+        .expect("seed server envelope");
+
+    let error = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect_err("storage lookup failure must withhold cursor");
+    assert!(matches!(
+        error,
+        catbird_mls::orchestrator::error::OrchestratorError::Mls(
+            catbird_mls::MLSError::StorageFailed
+        )
+    ));
+    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_pending_commit_untracked_restarted_withholds_cursor() {
+    let conversation_id = "6162636465666768696a6b6c6d6e6f77";
+    let message_id = "untracked-commit-msg";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::own_pending_commit()),
+    )
+    .await;
+
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"commit-ciphertext", 1, message_id)
+        .await
+        .expect("seed server envelope");
+
+    let error = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect_err("untracked OwnPendingCommit outcome must withhold cursor");
+    assert!(error
+        .to_string()
+        .contains("unverified own pending commit outcome"));
+    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_commit_untracked_with_bare_own_commits_skips_and_advances_cursor() {
+    let conversation_id = "6162636465666768696a6b6c6d6e6f78";
+    let message_id = "bare-own-commit";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::own_pending_commit()),
+    )
+    .await;
+
+    let commit_hash = Sha256::digest(b"commit-ciphertext").to_vec();
+    fixture
+        .orchestrator
+        .own_commits()
+        .lock()
+        .await
+        .insert(commit_hash.clone(), web_time::Instant::now());
+
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"commit-ciphertext", 1, message_id)
+        .await
+        .expect("seed server envelope");
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"continuation", 1, "continuation-frame")
+        .await
+        .expect("seed continuation envelope");
+
+    let (messages, cursor) = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect("bare tracked commit may be skipped");
+    assert!(messages.is_empty());
+    assert_eq!(cursor.as_deref(), Some("1"));
+    assert!(
+        !fixture
+            .orchestrator
+            .own_commits()
+            .lock()
+            .await
+            .contains_key(&commit_hash),
+        "consumed commit hash must be removed from tracking"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn own_private_message_survives_restart_and_redelivery() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("restart-redelivery-test", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id = &convo.group_id;
+
+    let _sent = alice
+        .orchestrator
+        .send_message(group_id, "restart message")
+        .await
+        .expect("send_message failed");
+
+    // Clear in-memory caches to simulate app restart
+    alice.orchestrator.own_commits().lock().await.clear();
+    alice.orchestrator.pending_messages().lock().await.clear();
+
+    // First fetch: message echoes back, skipped via durable proof in SQLCipher
+    let (fetched1, _cursor1) = alice
+        .orchestrator
+        .fetch_messages(group_id, None, 100, None, None, None)
+        .await
+        .expect("fetch_messages failed on restart");
+    assert!(
+        fetched1.is_empty(),
+        "own message echo should be skipped after restart"
+    );
+
+    // Second fetch (redelivery): message echoes back again, skipped via retained proof
+    let (fetched2, _cursor2) = alice
+        .orchestrator
+        .fetch_messages(group_id, None, 100, None, None, None)
+        .await
+        .expect("fetch_messages failed on redelivery");
+    assert!(
+        fetched2.is_empty(),
+        "own message echo should be skipped on redelivery"
+    );
+
+    // Verify local storage still has the original sent message
+    let all_msgs = alice.storage.get_conversation_messages(group_id);
+    assert_eq!(all_msgs.len(), 1);
+    assert_eq!(all_msgs[0].text, "restart message");
 }
 
 #[tokio::test(flavor = "multi_thread")]

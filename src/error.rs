@@ -266,18 +266,6 @@ impl MLSError {
             _ => false,
         }
     }
-
-    /// Whether OpenMLS rejected an outbound ciphertext echoed back to its own
-    /// sending leaf. Callers may treat this as handled only after proving a
-    /// durable outbox or message record for the exact server message ID.
-    pub fn is_cannot_decrypt_own_message(&self) -> bool {
-        let matches = |msg: &str| msg.contains("CannotDecryptOwnMessage");
-        match self {
-            Self::OpenMLS(msg) => matches(msg),
-            Self::CommitProcessingFailed { message } => matches(message),
-            _ => false,
-        }
-    }
 }
 
 /// Dedicated error type for the sender-side three-phase commit surface on
@@ -336,27 +324,21 @@ mod decrypt_class_tests {
     // produces for OpenMLS `process_message` failures (see api.rs:297).
     const SECRET_REUSE: &str =
         "process_message failed: ValidationError(UnableToDecrypt(SecretTreeError(SecretReuseError)))";
-    const OWN_MESSAGE: &str = "process_message failed: ValidationError(CannotDecryptOwnMessage)";
     const WRONG_EPOCH: &str = "process_message failed: ValidationError(WrongEpoch)";
 
     #[test]
-    fn secret_reuse_and_own_message_have_distinct_classifiers() {
+    fn secret_reuse_classifier_matches_expected_forms() {
         assert!(MLSError::OpenMLS(SECRET_REUSE.into()).is_secret_reuse());
-        assert!(!MLSError::OpenMLS(SECRET_REUSE.into()).is_cannot_decrypt_own_message());
-        assert!(MLSError::OpenMLS(OWN_MESSAGE.into()).is_cannot_decrypt_own_message());
-        assert!(!MLSError::OpenMLS(OWN_MESSAGE.into()).is_secret_reuse());
         assert!(MLSError::CommitProcessingFailed {
             message: SECRET_REUSE.into(),
         }
         .is_secret_reuse());
     }
-
     #[test]
     fn wrong_epoch_and_real_failures_are_not_benign() {
         // WrongEpoch has its own silent-skip arm — it must NOT also be
         // claimed by the benign-redundant classifier (different semantics).
         assert!(!MLSError::OpenMLS(WRONG_EPOCH.into()).is_secret_reuse());
-        assert!(!MLSError::OpenMLS(WRONG_EPOCH.into()).is_cannot_decrypt_own_message());
         assert!(MLSError::OpenMLS(WRONG_EPOCH.into()).is_wrong_epoch());
         // A genuine decrypt failure must still count toward rejoin.
         assert!(!MLSError::OpenMLS(

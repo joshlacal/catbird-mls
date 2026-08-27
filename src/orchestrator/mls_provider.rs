@@ -1,6 +1,74 @@
 use crate::error::MLSError;
 use crate::types::*;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnEchoProof {
+    pub canonical_entry_sha256: [u8; 32],
+    pub accepted_request_sha256: [u8; 32],
+    pub conversation_id: String,
+    pub group_id: Vec<u8>,
+    pub server_entry_id: String,
+    pub mls_epoch: u64,
+    pub aad_sha256: [u8; 32],
+    pub ciphertext_sha256: [u8; 32],
+}
+
+impl OwnEchoProof {
+    pub const PROOF_DOMAIN: &'static [u8] = b"CATBIRD-CLEAN-OWN-ECHO-PROOF-V1\0";
+
+    pub fn compute_canonical_entry_sha256(
+        conversation_id: &str,
+        group_id: &[u8],
+        server_entry_id: &str,
+        mls_epoch: u64,
+        aad_sha256: &[u8; 32],
+        ciphertext_sha256: &[u8; 32],
+    ) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(Self::PROOF_DOMAIN);
+        hasher.update((conversation_id.len() as u32).to_be_bytes());
+        hasher.update(conversation_id.as_bytes());
+        hasher.update((group_id.len() as u32).to_be_bytes());
+        hasher.update(group_id);
+        hasher.update((server_entry_id.len() as u32).to_be_bytes());
+        hasher.update(server_entry_id.as_bytes());
+        hasher.update(mls_epoch.to_be_bytes());
+        hasher.update(aad_sha256);
+        hasher.update(ciphertext_sha256);
+        hasher.finalize().into()
+    }
+
+    pub fn new(
+        accepted_request_sha256: [u8; 32],
+        conversation_id: String,
+        group_id: Vec<u8>,
+        server_entry_id: String,
+        mls_epoch: u64,
+        aad_sha256: [u8; 32],
+        ciphertext_sha256: [u8; 32],
+    ) -> Self {
+        let canonical_entry_sha256 = Self::compute_canonical_entry_sha256(
+            &conversation_id,
+            &group_id,
+            &server_entry_id,
+            mls_epoch,
+            &aad_sha256,
+            &ciphertext_sha256,
+        );
+        Self {
+            canonical_entry_sha256,
+            accepted_request_sha256,
+            conversation_id,
+            group_id,
+            server_entry_id,
+            mls_epoch,
+            aad_sha256,
+            ciphertext_sha256,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum MlsDecryptOutcome {
     Message(DecryptResult),
@@ -175,7 +243,6 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         let _ = &aad;
         self.add_members(group_id, key_packages)
     }
-
 
     /// Add members AND re-seal the group metadata at the post-add epoch so the
     /// newly-added members can decrypt the group name/description. The returned
@@ -529,11 +596,7 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
     /// Export the canonical metadata encryption key (MEK) for an epoch.
-    fn export_metadata_key(
-        &self,
-        _group_id: Vec<u8>,
-        _epoch: u64,
-    ) -> Result<Vec<u8>, MLSError> {
+    fn export_metadata_key(&self, _group_id: Vec<u8>, _epoch: u64) -> Result<Vec<u8>, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "export_metadata_key not available on this platform".to_string(),
         })
@@ -554,4 +617,24 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     /// Commit all pending proposals for a group and return the commit bytes.
     fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;
+
+    /// Store a proven own-message echo proof inside the encrypted MLS database.
+    fn store_own_echo_proof(&self, _proof: &OwnEchoProof) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "store_own_echo_proof not available on this platform".to_string(),
+        })
+    }
+
+    /// Query non-destructively for an exact own-message echo proof.
+    fn has_own_echo_proof(
+        &self,
+        _conversation_id: &str,
+        _group_id: &[u8],
+        _server_entry_id: &str,
+        _mls_epoch: u64,
+        _aad_sha256: &[u8; 32],
+        _ciphertext_sha256: &[u8; 32],
+    ) -> Result<bool, MLSError> {
+        Ok(false)
+    }
 }

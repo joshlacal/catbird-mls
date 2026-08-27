@@ -22,6 +22,7 @@ use crate::message_limits::{
     validate_outbound_key_package_lengths,
 };
 use crate::mls_context::MLSContext as MLSContextInner;
+use crate::orchestrator::mls_provider::OwnEchoProof;
 use crate::orchestrator::mls_provider::{MlsCryptoContext, MlsDecryptOutcome};
 use crate::types::*;
 
@@ -2060,10 +2061,8 @@ impl MLSContext {
                     )
                     .map_err(|e| MLSError::Internal(format!("plan metadata reference: {:?}", e)))?;
 
-                    let has_app_data_dict =
-                        group.extensions().app_data_dictionary().is_some();
-                    let commit_builder =
-                        group.commit_builder().propose_adds(kps.iter().cloned());
+                    let has_app_data_dict = group.extensions().app_data_dictionary().is_some();
+                    let commit_builder = group.commit_builder().propose_adds(kps.iter().cloned());
 
                     let mut commit_stage =
                         commit_builder.load_psks(provider.storage()).map_err(|e| {
@@ -3955,11 +3954,7 @@ impl MLSContext {
     }
 
     /// Export the canonical metadata encryption key (MEK) for a specific epoch.
-    pub fn export_metadata_key(
-        &self,
-        group_id: Vec<u8>,
-        epoch: u64,
-    ) -> Result<Vec<u8>, MLSError> {
+    pub fn export_metadata_key(&self, group_id: Vec<u8>, epoch: u64) -> Result<Vec<u8>, MLSError> {
         let mut guard = self
             .inner
             .lock()
@@ -4113,9 +4108,9 @@ impl MLSContext {
                 .map_err(|_| MLSError::StorageError)?;
             match context {
                 Some(gc) => {
-                    let bytes = gc
-                        .tls_serialize_detached()
-                        .map_err(|e| MLSError::Internal(format!("TLS serialize group context: {}", e)))?;
+                    let bytes = gc.tls_serialize_detached().map_err(|e| {
+                        MLSError::Internal(format!("TLS serialize group context: {}", e))
+                    })?;
                     Ok(sha2::Sha256::digest(&bytes).to_vec())
                 }
                 None => Err(MLSError::Internal("No group context found".to_string())),
@@ -6168,10 +6163,8 @@ impl MLSContext {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let lifetime = openmls::prelude::Lifetime::init(
-            now.saturating_sub(60),
-            now + 29 * 24 * 60 * 60,
-        );
+        let lifetime =
+            openmls::prelude::Lifetime::init(now.saturating_sub(60), now + 29 * 24 * 60 * 60);
         let extension_caps = if last_resort {
             vec![openmls::prelude::ExtensionType::LastResort]
         } else {
@@ -6267,6 +6260,7 @@ impl MLSContext {
     ) -> Result<MlsDecryptOutcome, MLSError> {
         self.check_suspended()?;
         validate_inbound_mls_message_len(ciphertext.len(), "ciphertext")?;
+        let raw_ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
         let wire_fingerprint = incoming_commit_wire_fingerprint(&ciphertext);
         // 🔍 DIAGNOSTIC: Thread tracking
         let thread_id = std::thread::current().id();
@@ -6426,7 +6420,7 @@ impl MLSContext {
             match processed.content() {
                 ProcessedMessageContent::OwnPrivateMessage => {
                     let aad_sha256 = sha2::Sha256::digest(processed.aad()).into();
-                    let ciphertext_sha256 = sha2::Sha256::digest(&ciphertext).into();
+                    let ciphertext_sha256 = raw_ciphertext_sha256;
                     return Ok(ControlFlow::Break(MlsDecryptOutcome::OwnPrivateMessage {
                         epoch: message_epoch,
                         aad_sha256,
@@ -7390,11 +7384,7 @@ impl MlsCryptoContext for MLSContext {
     ) -> Result<AddMembersResult, MLSError> {
         self.add_members_with_aad(group_id, key_packages, aad)
     }
-    fn export_metadata_key(
-        &self,
-        group_id: Vec<u8>,
-        epoch: u64,
-    ) -> Result<Vec<u8>, MLSError> {
+    fn export_metadata_key(&self, group_id: Vec<u8>, epoch: u64) -> Result<Vec<u8>, MLSError> {
         self.export_metadata_key(group_id, epoch)
     }
     fn export_metadata_key_from_pending(
@@ -7831,6 +7821,39 @@ impl MlsCryptoContext for MLSContext {
 
     fn commit_pending_proposals(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
         MLSContext::commit_pending_proposals(self, group_id)
+    }
+
+    fn store_own_echo_proof(&self, proof: &OwnEchoProof) -> Result<(), MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.store_own_echo_proof(proof)
+    }
+
+    fn has_own_echo_proof(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+        server_entry_id: &str,
+        mls_epoch: u64,
+        aad_sha256: &[u8; 32],
+        ciphertext_sha256: &[u8; 32],
+    ) -> Result<bool, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.has_own_echo_proof(
+            conversation_id,
+            group_id,
+            server_entry_id,
+            mls_epoch,
+            aad_sha256,
+            ciphertext_sha256,
+        )
     }
 }
 

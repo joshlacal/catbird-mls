@@ -607,10 +607,28 @@ async fn staged_add_rejects_empty_authority_but_pure_remove_swap_remains_valid()
         .create_group("empty-add-authority", None, None)
         .await
         .expect("create group");
-    let bob_kp = world.client("Bob").orchestrator.mls_context().create_key_package(bob_did.as_bytes().to_vec()).expect("bob kp");
+    let bob_kp = world
+        .client("Bob")
+        .orchestrator
+        .mls_context()
+        .create_key_package(bob_did.as_bytes().to_vec())
+        .expect("bob kp");
     let group_id_bytes = hex::decode(&convo.group_id).unwrap();
-    let _ = alice.orchestrator.mls_context().add_members(group_id_bytes.clone(), vec![catbird_mls::KeyPackageData { data: bob_kp.key_package_data }]).expect("add bob");
-    alice.orchestrator.mls_context().merge_pending_commit(group_id_bytes).expect("merge bob");
+    let _ = alice
+        .orchestrator
+        .mls_context()
+        .add_members(
+            group_id_bytes.clone(),
+            vec![catbird_mls::KeyPackageData {
+                data: bob_kp.key_package_data,
+            }],
+        )
+        .expect("add bob");
+    alice
+        .orchestrator
+        .mls_context()
+        .merge_pending_commit(group_id_bytes)
+        .expect("merge bob");
     let error = alice
         .orchestrator
         .stage_commit(
@@ -868,10 +886,28 @@ async fn staged_swap_mismatch_does_neither_removal_nor_addition() {
             .create_group(&format!("binding-swap-{case}"), None, None)
             .await
             .expect("create group");
-        let bob_kp = world.client("Bob").orchestrator.mls_context().create_key_package(bob_did.as_bytes().to_vec()).expect("bob kp");
+        let bob_kp = world
+            .client("Bob")
+            .orchestrator
+            .mls_context()
+            .create_key_package(bob_did.as_bytes().to_vec())
+            .expect("bob kp");
         let group_bytes = hex::decode(&convo.group_id).unwrap();
-        let _ = alice.orchestrator.mls_context().add_members(group_bytes.clone(), vec![catbird_mls::KeyPackageData { data: bob_kp.key_package_data }]).expect("add bob");
-        alice.orchestrator.mls_context().merge_pending_commit(group_bytes.clone()).expect("merge bob");
+        let _ = alice
+            .orchestrator
+            .mls_context()
+            .add_members(
+                group_bytes.clone(),
+                vec![catbird_mls::KeyPackageData {
+                    data: bob_kp.key_package_data,
+                }],
+            )
+            .expect("add bob");
+        alice
+            .orchestrator
+            .mls_context()
+            .merge_pending_commit(group_bytes.clone())
+            .expect("merge bob");
         let group_bytes = hex::decode(&convo.group_id).unwrap();
         let members_before = alice
             .orchestrator
@@ -1104,10 +1140,28 @@ async fn staged_swap_fails_closed_when_authorized_device_resolution_errors() {
         .create_group("binding-swap-resolver-error", None, None)
         .await
         .expect("create group");
-    let bob_kp = world.client("Bob").orchestrator.mls_context().create_key_package(bob_did.as_bytes().to_vec()).expect("bob kp");
+    let bob_kp = world
+        .client("Bob")
+        .orchestrator
+        .mls_context()
+        .create_key_package(bob_did.as_bytes().to_vec())
+        .expect("bob kp");
     let group_bytes = hex::decode(&convo.group_id).unwrap();
-    let _ = alice.orchestrator.mls_context().add_members(group_bytes.clone(), vec![catbird_mls::KeyPackageData { data: bob_kp.key_package_data }]).expect("add bob");
-    alice.orchestrator.mls_context().merge_pending_commit(group_bytes.clone()).expect("merge bob");
+    let _ = alice
+        .orchestrator
+        .mls_context()
+        .add_members(
+            group_bytes.clone(),
+            vec![catbird_mls::KeyPackageData {
+                data: bob_kp.key_package_data,
+            }],
+        )
+        .expect("add bob");
+    alice
+        .orchestrator
+        .mls_context()
+        .merge_pending_commit(group_bytes.clone())
+        .expect("merge bob");
     let group_bytes = hex::decode(&convo.group_id).unwrap();
     let members_before = alice
         .orchestrator
@@ -1226,4 +1280,114 @@ async fn staged_swap_rejects_exact_did_batch_before_device_resolution() {
         0,
         "an attacker-controlled credential root must not be resolved or cached"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cursor_advance() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("unaccepted-appdata-fence", None, None)
+        .await
+        .expect("create group");
+    let group_id = convo.group_id.clone();
+    let group_bytes = hex::decode(&group_id).unwrap();
+    let epoch_before = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .unwrap();
+
+    // Alice stages a commit which resolves successfully
+    let plan = stage_add_members(&alice, &group_id, &[bob.did.clone()]).await;
+
+    // A commit envelope arrives BEFORE server acceptance / durable confirmation
+    let error = alice
+        .orchestrator
+        .process_incoming(&IncomingEnvelope {
+            conversation_id: convo.conversation_id.clone(),
+            sender_did: alice.did.clone(),
+            ciphertext: plan.commit_bytes.clone(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some("unaccepted-appdata-commit".to_string()),
+            server_epoch: Some(plan.target_epoch),
+        })
+        .await
+        .expect_err("unaccepted staged commit must withhold merge and cursor advance");
+
+    assert!(error.to_string().contains("before durable confirmation"));
+
+    // Group epoch must NOT have merged or advanced
+    let epoch_after = alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .unwrap();
+    assert_eq!(
+        epoch_after, epoch_before,
+        "unaccepted commit must never merge into the local MLS group"
+    );
+
+    // Clean up staged commit
+    alice
+        .orchestrator
+        .discard_pending(plan.handle)
+        .await
+        .expect("cleanup staged commit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_stage_commit_mismatched_identity_withholds_cursor() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo1 = alice
+        .orchestrator
+        .create_group("mismatched-identity-1", None, None)
+        .await
+        .expect("create group 1");
+    let convo2 = alice
+        .orchestrator
+        .create_group("mismatched-identity-2", None, None)
+        .await
+        .expect("create group 2");
+
+    // Alice stages a commit on group 1
+    let plan = stage_add_members(&alice, &convo1.group_id, &[bob.did.clone()]).await;
+
+    // An envelope arrives claiming to be for convo2 but containing convo1's commit
+    let error = alice
+        .orchestrator
+        .process_incoming(&IncomingEnvelope {
+            conversation_id: convo2.conversation_id.clone(),
+            sender_did: alice.did.clone(),
+            ciphertext: plan.commit_bytes.clone(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some("mismatched-convo-commit".to_string()),
+            server_epoch: Some(plan.target_epoch),
+        })
+        .await
+        .expect_err("mismatched identity expectation must withhold cursor");
+
+    assert!(error
+        .to_string()
+        .contains("self-commit expectation identity mismatch"));
+
+    alice
+        .orchestrator
+        .discard_pending(plan.handle)
+        .await
+        .expect("cleanup staged commit");
 }
