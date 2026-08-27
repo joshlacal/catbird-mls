@@ -6420,11 +6420,13 @@ impl MLSContext {
             match processed.content() {
                 ProcessedMessageContent::OwnPrivateMessage => {
                     let aad_sha256 = sha2::Sha256::digest(processed.aad()).into();
-                    let ciphertext_sha256 = raw_ciphertext_sha256;
                     return Ok(ControlFlow::Break(MlsDecryptOutcome::OwnPrivateMessage {
                         epoch: message_epoch,
                         aad_sha256,
-                        ciphertext_sha256,
+                        // Digest of the padded wire ciphertext, captured before
+                        // `strip_padding` shadowed `ciphertext`, so it matches the
+                        // send-side proof over the exact submitted bytes.
+                        ciphertext_sha256: raw_ciphertext_sha256,
                     }));
                 }
                 ProcessedMessageContent::OwnPendingCommit => {

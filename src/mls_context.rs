@@ -927,24 +927,22 @@ impl ManifestStorage {
                 );
                 map_sqlite_error("has_own_echo_proof.prepare", &e)
             })?;
-        let exists = stmt
-            .exists(rusqlite::params![
-                &canonical_entry_sha256[..],
-                conversation_id,
-                group_id,
-                server_entry_id,
-                mls_epoch as i64,
-                &aad_sha256[..],
-                &ciphertext_sha256[..],
-            ])
-            .map_err(|e| {
-                crate::error_log!(
-                    "[MANIFEST-STORAGE] Failed to check has_own_echo_proof: {:?}",
-                    e
-                );
-                map_sqlite_error("has_own_echo_proof.exists", &e)
-            })?;
-        Ok(exists)
+        stmt.exists(rusqlite::params![
+            &canonical_entry_sha256[..],
+            conversation_id,
+            group_id,
+            server_entry_id,
+            mls_epoch as i64,
+            &aad_sha256[..],
+            &ciphertext_sha256[..],
+        ])
+        .map_err(|e| {
+            crate::error_log!(
+                "[MANIFEST-STORAGE] Failed to check has_own_echo_proof: {:?}",
+                e
+            );
+            map_sqlite_error("has_own_echo_proof.exists", &e)
+        })
     }
 }
 

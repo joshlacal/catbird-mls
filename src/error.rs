@@ -334,6 +334,7 @@ mod decrypt_class_tests {
         }
         .is_secret_reuse());
     }
+
     #[test]
     fn wrong_epoch_and_real_failures_are_not_benign() {
         // WrongEpoch has its own silent-skip arm — it must NOT also be

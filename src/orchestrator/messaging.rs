@@ -1078,16 +1078,15 @@ where
                         "Skipping durably proven own private message"
                     );
                     return Ok(None);
-                } else {
-                    tracing::warn!(
-                        conversation_id = %envelope.conversation_id,
-                        "OwnPrivateMessage without durable echo proof; refusing cursor advancement"
-                    );
-                    return Err(OrchestratorError::RecoveryFailed(format!(
-                        "unverified own-private message outcome for conversation {}",
-                        resolved.conversation_id
-                    )));
                 }
+                tracing::warn!(
+                    conversation_id = %envelope.conversation_id,
+                    "OwnPrivateMessage without durable echo proof; refusing cursor advancement"
+                );
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "unverified own-private message outcome for conversation {}",
+                    resolved.conversation_id
+                )));
             }
             Ok(MlsDecryptOutcome::OwnPendingCommit) => {
                 tracing::warn!(
@@ -1168,16 +1167,15 @@ where
                         "Skipping already-ratcheted SecretReuse message"
                     );
                     return Ok(None);
-                } else {
-                    tracing::warn!(
-                        conversation_id = %envelope.conversation_id,
-                        "SecretReuse without durable envelope evidence; refusing cursor advancement"
-                    );
-                    return Err(OrchestratorError::RecoveryFailed(format!(
-                        "SecretReuse without durable envelope evidence for conversation {}",
-                        resolved.conversation_id
-                    )));
                 }
+                tracing::warn!(
+                    conversation_id = %envelope.conversation_id,
+                    "SecretReuse without durable envelope evidence; refusing cursor advancement"
+                );
+                return Err(OrchestratorError::RecoveryFailed(format!(
+                    "SecretReuse without durable envelope evidence for conversation {}",
+                    resolved.conversation_id
+                )));
             }
             Err(e) if e.is_external_join_proposal_authorization_rejection() => {
                 // This authenticated control frame was deliberately rejected
@@ -2052,8 +2050,7 @@ where
                 OrchestratorError::Serialization(
                     "prepared_request missing signedRequest.body".into(),
                 )
-            })?
-            .clone();
+            })?;
         let accepted_request_sha256: [u8; 32] = sha2::Sha256::digest(submitted_bytes).into();
 
         let response = self
