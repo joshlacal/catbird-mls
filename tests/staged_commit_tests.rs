@@ -21,7 +21,10 @@ use catbird_mls::orchestrator::credential_binding::{
 };
 use catbird_mls::orchestrator::error::OrchestratorError;
 use catbird_mls::orchestrator::types::{CommitKind, CommitPlan, IncomingEnvelope};
-use catbird_mls::orchestrator::{MLSStorageBackend, MlsCryptoContext};
+use catbird_mls::orchestrator::{
+    MLSAPIClient, MLSStorageBackend, MlsCryptoContext, MlsDecryptOutcome,
+};
+use catbird_mls::DecryptContentType;
 use e2e_harness::TestWorld;
 
 /// Drive `stage_commit` on Alice's side for a fresh add-members operation.
@@ -1288,9 +1291,10 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     world.add_client("Alice").await;
     world.add_client("Bob").await;
     world.register_device("Alice").await.unwrap();
-    world.register_device("Bob").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
 
     let alice = world.client("Alice");
+    let bob = world.client("Bob");
     let convo = alice
         .orchestrator
         .create_group("unaccepted-appdata-fence", None, None)
@@ -1298,11 +1302,51 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         .expect("create group");
     let group_id = convo.group_id.clone();
     let group_bytes = hex::decode(&group_id).unwrap();
-    let epoch_before = alice
+
+    // Alice adds Bob to the group using stage_add_members + confirm_commit
+    let add_plan = stage_add_members(&alice, &group_id, &[bob_did.clone()]).await;
+    let server_result = alice
+        .orchestrator
+        .api_client()
+        .add_members(
+            &convo.conversation_id,
+            &[bob_did.clone()],
+            &add_plan.commit_bytes,
+            add_plan.welcome_bytes.as_deref(),
+        )
+        .await
+        .expect("server add_members should succeed");
+    assert!(server_result.success);
+
+    let _confirmed_add = alice
+        .orchestrator
+        .confirm_commit(add_plan.handle, add_plan.target_epoch)
+        .await
+        .expect("confirm add_members commit");
+
+    let welcome = bob
+        .orchestrator
+        .api_client()
+        .get_welcome(&convo.conversation_id)
+        .await
+        .expect("bob get_welcome");
+    bob.orchestrator
+        .join_group(&welcome)
+        .await
+        .expect("bob join_group");
+
+    let alice_epoch_baseline = alice
         .orchestrator
         .mls_context()
         .get_epoch(group_bytes.clone())
         .unwrap();
+    let bob_epoch_baseline = bob
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .unwrap();
+    assert_eq!(alice_epoch_baseline, bob_epoch_baseline);
+    assert_eq!(alice_epoch_baseline, 1);
 
     // Alice stages an AppData Update metadata commit (component 0x8001)
     let plan = alice
@@ -1315,55 +1359,178 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         )
         .await
         .expect("stage update metadata");
+    assert_eq!(plan.source_epoch, 1);
+    assert_eq!(plan.target_epoch, 2);
 
-    // 1. A commit envelope arrives BEFORE server acceptance / durable confirmation
-    let error = alice
+    // -----------------------------------------------------------------------
+    // Phase 1: Real AppData resolver execution on a peer context (Bob)
+    // -----------------------------------------------------------------------
+    // Bob receives Alice's genuine 0x8001 AppData commit ciphertext.
+    // Decrypt runs real crypto: OpenMLS returns UnresolvedAppDataCommit, updater
+    // applies component 0x8001 update, and resolve_app_data_commit returns StagedCommit.
+    let bob_decrypt = bob
+        .orchestrator
+        .mls_context()
+        .decrypt_message_outcome(group_bytes.clone(), plan.commit_bytes.clone())
+        .expect("Bob decrypt_message_outcome should resolve AppData commit via real crypto");
+
+    match bob_decrypt {
+        MlsDecryptOutcome::Message(decrypted) => {
+            assert_eq!(decrypted.content_type, DecryptContentType::Commit);
+            assert_eq!(decrypted.epoch, plan.target_epoch);
+        }
+        other => panic!("expected DecryptContentType::Commit, got {:?}", other),
+    }
+
+    // AppData commit resolution must NOT auto-merge into Bob's group before explicit confirmation/merge
+    let bob_epoch_after_decrypt = bob
+        .orchestrator
+        .mls_context()
+        .get_epoch(group_bytes.clone())
+        .unwrap();
+    assert_eq!(
+        bob_epoch_after_decrypt, bob_epoch_baseline,
+        "AppData commit resolution must stage without auto-merging into local group"
+    );
+
+    // Explicit merge advances Bob's epoch to the target epoch
+    let bob_merged_epoch = bob
+        .orchestrator
+        .mls_context()
+        .merge_incoming_commit(group_bytes.clone(), plan.target_epoch)
+        .expect("explicit merge staged commit on Bob");
+    assert_eq!(bob_merged_epoch, plan.target_epoch);
+    assert_eq!(
+        bob.orchestrator
+            .mls_context()
+            .get_epoch(group_bytes.clone())
+            .unwrap(),
+        plan.target_epoch
+    );
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Own pending commit with volatile tracking cleared (model restart)
+    // -----------------------------------------------------------------------
+    // Clear Alice's volatile tracking map so `is_own_commit` is false and real crypto runs
+    alice.orchestrator.own_commits().lock().await.clear();
+    let restart_error = alice
         .orchestrator
         .process_incoming(&IncomingEnvelope {
             conversation_id: convo.conversation_id.clone(),
             sender_did: alice.did.clone(),
             ciphertext: plan.commit_bytes.clone(),
             timestamp: chrono::Utc::now(),
-            server_message_id: Some("unaccepted-appdata-commit".to_string()),
+            server_message_id: Some("restarted-unconfirmed-appdata-commit".to_string()),
             server_epoch: Some(plan.target_epoch),
         })
         .await
-        .expect_err("unaccepted staged AppData commit must withhold merge and cursor advance");
+        .expect_err("unconfirmed OwnPendingCommit after restart must withhold cursor advance");
 
-    assert!(error.to_string().contains("before durable confirmation"));
+    assert!(
+        restart_error
+            .to_string()
+            .contains("unverified own pending commit outcome"),
+        "error must be from real decrypt OwnPendingCommit outcome, got: {}",
+        restart_error
+    );
 
-    // Group epoch must NOT have merged or advanced
-    let epoch_after = alice
+    // Group epoch must NOT have merged or advanced in Alice's group
+    let alice_epoch_after_restart_echo = alice
         .orchestrator
         .mls_context()
         .get_epoch(group_bytes.clone())
         .unwrap();
     assert_eq!(
-        epoch_after, epoch_before,
-        "unaccepted AppData commit must never merge into the local MLS group"
+        alice_epoch_after_restart_echo, alice_epoch_baseline,
+        "unaccepted OwnPendingCommit must never merge into the local MLS group"
     );
 
-    // 2. Durably confirm the staged commit (simulating server ACK)
+    // Durably confirm the staged commit on Alice (simulating server ACK)
     let confirmed = alice
         .orchestrator
         .confirm_commit(plan.handle, plan.target_epoch)
         .await
         .expect("confirm staged commit");
     assert_eq!(confirmed.new_epoch, plan.target_epoch);
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes.clone())
+            .unwrap(),
+        plan.target_epoch
+    );
 
-    // 3. Process the commit envelope again — now passes the accepted fence and advances cursor
+    // -----------------------------------------------------------------------
+    // Phase 3: Exercise volatile tracking fence on a second AppData commit
+    // -----------------------------------------------------------------------
+    let plan2 = alice
+        .orchestrator
+        .stage_commit(
+            &group_id,
+            CommitKind::UpdateMetadata {
+                group_info_extension: b"{\"version\":2}".to_vec(),
+            },
+        )
+        .await
+        .expect("stage second update metadata");
+    assert_eq!(plan2.source_epoch, 2);
+    assert_eq!(plan2.target_epoch, 3);
+
+    // 3a. A commit envelope arrives BEFORE durable confirmation while volatile tracking is active:
+    let tracking_error = alice
+        .orchestrator
+        .process_incoming(&IncomingEnvelope {
+            conversation_id: convo.conversation_id.clone(),
+            sender_did: alice.did.clone(),
+            ciphertext: plan2.commit_bytes.clone(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some("tracked-unconfirmed-commit".to_string()),
+            server_epoch: Some(plan2.target_epoch),
+        })
+        .await
+        .expect_err("tracked unconfirmed commit must withhold cursor advance");
+
+    assert!(
+        tracking_error
+            .to_string()
+            .contains("before durable confirmation"),
+        "error must be from the volatile tracking fence, got: {}",
+        tracking_error
+    );
+
+    // Group epoch must NOT have merged or advanced
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_bytes.clone())
+            .unwrap(),
+        plan.target_epoch,
+        "unaccepted commit must not merge into local group"
+    );
+
+    // 3b. Durably confirm the second staged commit
+    let confirmed2 = alice
+        .orchestrator
+        .confirm_commit(plan2.handle, plan2.target_epoch)
+        .await
+        .expect("confirm second staged commit");
+    assert_eq!(confirmed2.new_epoch, plan2.target_epoch);
+
+    // 3c. Process the commit envelope again — now passes the accepted fence and advances cursor
     let result = alice
         .orchestrator
         .process_incoming(&IncomingEnvelope {
             conversation_id: convo.conversation_id.clone(),
             sender_did: alice.did.clone(),
-            ciphertext: plan.commit_bytes.clone(),
+            ciphertext: plan2.commit_bytes.clone(),
             timestamp: chrono::Utc::now(),
-            server_message_id: Some("accepted-appdata-commit".to_string()),
-            server_epoch: Some(plan.target_epoch),
+            server_message_id: Some("tracked-accepted-commit".to_string()),
+            server_epoch: Some(plan2.target_epoch),
         })
         .await
-        .expect("durably confirmed AppData commit echo must be skipped cleanly");
+        .expect("durably confirmed commit echo must be skipped cleanly");
     assert!(result.is_none(), "echo must produce no decrypted message");
 
     let final_epoch = alice
@@ -1371,10 +1538,8 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         .mls_context()
         .get_epoch(group_bytes.clone())
         .unwrap();
-    assert_eq!(final_epoch, plan.target_epoch);
+    assert_eq!(final_epoch, plan2.target_epoch);
 }
-
-#[tokio::test(flavor = "multi_thread")]
 async fn test_stage_commit_mismatched_identity_withholds_cursor() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
