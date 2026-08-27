@@ -1285,6 +1285,7 @@ async fn staged_swap_rejects_exact_did_batch_before_device_resolution() {
     );
 }
 
+#[cfg(feature = "test-utils")]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cursor_advance() {
     let mut world = TestWorld::new();

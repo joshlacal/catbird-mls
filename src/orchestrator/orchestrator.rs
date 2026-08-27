@@ -233,6 +233,10 @@ pub(crate) enum StagedCommitKindSummary {
         add_dids: Vec<String>,
     },
     UpdateMetadata,
+    #[cfg(feature = "test-utils")]
+    AppDataUpdate {
+        component_id: u16,
+    },
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>

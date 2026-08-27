@@ -82,14 +82,28 @@ fn metadata_required_capabilities_extension() -> RequiredCapabilitiesExtension {
 }
 
 pub(crate) fn metadata_leaf_capabilities() -> Capabilities {
+    #[cfg(feature = "test-utils")]
+    let (extensions, proposals): (
+        &[openmls::prelude::ExtensionType],
+        &[openmls::prelude::ProposalType],
+    ) = (
+        &[
+            openmls::prelude::ExtensionType::RatchetTree,
+            openmls::prelude::ExtensionType::AppDataDictionary,
+        ],
+        &[openmls::prelude::ProposalType::AppDataUpdate],
+    );
+    #[cfg(not(feature = "test-utils"))]
+    let (extensions, proposals): (
+        &[openmls::prelude::ExtensionType],
+        &[openmls::prelude::ProposalType],
+    ) = (&[], &[]);
+
     Capabilities::new(
         Some(&[openmls::prelude::ProtocolVersion::Mls10]),
         Some(&[Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519]),
-        Some(&[
-            openmls::prelude::ExtensionType::RatchetTree,
-            openmls::prelude::ExtensionType::AppDataDictionary,
-        ]),
-        Some(&[openmls::prelude::ProposalType::AppDataUpdate]),
+        Some(extensions),
+        Some(proposals),
         Some(&[openmls::prelude::CredentialType::Basic]),
     )
 }
@@ -3516,20 +3530,32 @@ impl MLSContext {
         self.with_group(&gid, |group, provider, signer| {
             // Deserialize and validate key package
             let kp_in =
-                if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(key_package_data) {
-                    match mls_msg.extract() {
-                        MlsMessageBodyIn::KeyPackage(kp_in) => kp_in,
-                        _ => {
-                            let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
-                                .map_err(|e| {
-                                    crate::error_log!(
-                                        "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
-                                        e
-                                    );
-                                    MLSError::SerializationError
-                                })?;
-                            kp_in
+                if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(key_package_data) {
+                    if remaining.is_empty() {
+                        match mls_msg.extract() {
+                            MlsMessageBodyIn::KeyPackage(kp_in) => kp_in,
+                            _ => {
+                                let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
+                                    .map_err(|e| {
+                                        crate::error_log!(
+                                            "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
+                                            e
+                                        );
+                                        MLSError::SerializationError
+                                    })?;
+                                kp_in
+                            }
                         }
+                    } else {
+                        let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
+                            .map_err(|e| {
+                                crate::error_log!(
+                                    "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
+                                    e
+                                );
+                                MLSError::SerializationError
+                            })?;
+                        kp_in
                     }
                 } else {
                     let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)

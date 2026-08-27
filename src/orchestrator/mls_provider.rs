@@ -483,6 +483,7 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         metadata_json: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError>;
 
+    #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     fn stage_app_data_update_for_test(
         &self,

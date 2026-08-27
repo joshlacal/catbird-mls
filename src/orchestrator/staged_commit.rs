@@ -371,6 +371,7 @@ where
     /// Test-only helper to stage an AppData update commit directly and register
     /// it in orchestrator pending state so volatile tracking, confirmation, and
     /// restart echo fences can be exercised on genuine AppData commits.
+    #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     pub async fn stage_app_data_update_commit_for_test(
         &self,
@@ -430,7 +431,7 @@ where
                 nonce,
                 source_epoch,
                 target_epoch,
-                kind: StagedCommitKindSummary::UpdateMetadata,
+                kind: StagedCommitKindSummary::AppDataUpdate { component_id },
             },
         );
 
@@ -630,6 +631,10 @@ where
                 }
             }
             StagedCommitKindSummary::UpdateMetadata => {
+                // Membership unchanged.
+            }
+            #[cfg(feature = "test-utils")]
+            StagedCommitKindSummary::AppDataUpdate { .. } => {
                 // Membership unchanged.
             }
         }

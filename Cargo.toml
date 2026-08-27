@@ -119,6 +119,7 @@ fork-resolution = []
 # use openmls_sqlite_storage + HybridStorageProvider unless this feature is
 # explicitly enabled for fixture work.
 storage-driver-prototype = []
+test-utils = []
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 openmls_sqlite_storage = { version = "=0.3.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }

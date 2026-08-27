@@ -1255,20 +1255,22 @@ impl MLSContext {
                 );
 
                 // First try: MlsMessage-wrapped format (server might send this)
-                if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
-                    crate::debug_log!("[MLS] Key package {} deserialized as MlsMessage", idx);
-                    match mls_msg.extract() {
-                        MlsMessageBodyIn::KeyPackage(kp_in) => {
-                            crate::debug_log!("[MLS] Extracted KeyPackage from MlsMessage");
-                            return kp_in.validate(inner.provider_crypto(), ProtocolVersion::default())
-                                .map_err(|e| {
-                                    crate::error_log!("[MLS] Key package {} validation failed: {:?}", idx, e);
-                                    MLSError::InvalidKeyPackage
-                                });
-                        }
-                        other => {
-                            crate::debug_log!("[MLS] MlsMessage contained unexpected type: {:?}, trying raw format",
-                                std::mem::discriminant(&other));
+                if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
+                    if remaining.is_empty() {
+                        crate::debug_log!("[MLS] Key package {} deserialized as MlsMessage", idx);
+                        match mls_msg.extract() {
+                            MlsMessageBodyIn::KeyPackage(kp_in) => {
+                                crate::debug_log!("[MLS] Extracted KeyPackage from MlsMessage");
+                                return kp_in.validate(inner.provider_crypto(), ProtocolVersion::default())
+                                    .map_err(|e| {
+                                        crate::error_log!("[MLS] Key package {} validation failed: {:?}", idx, e);
+                                        MLSError::InvalidKeyPackage
+                                    });
+                            }
+                            other => {
+                                crate::debug_log!("[MLS] MlsMessage contained unexpected type: {:?}, trying raw format",
+                                    std::mem::discriminant(&other));
+                            }
                         }
                     }
                 }
@@ -1766,21 +1768,23 @@ impl MLSContext {
             .iter()
             .enumerate()
             .map(|(idx, kp_data)| {
-                if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
-                    match mls_msg.extract() {
-                        MlsMessageBodyIn::KeyPackage(kp_in) => {
-                            return kp_in
-                                .validate(inner.provider_crypto(), ProtocolVersion::default())
-                                .map_err(|e| {
-                                    crate::error_log!(
-                                        "[MLS-FFI] swap kp {} validate: {:?}",
-                                        idx,
-                                        e
-                                    );
-                                    MLSError::InvalidKeyPackage
-                                });
+                if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
+                    if remaining.is_empty() {
+                        match mls_msg.extract() {
+                            MlsMessageBodyIn::KeyPackage(kp_in) => {
+                                return kp_in
+                                    .validate(inner.provider_crypto(), ProtocolVersion::default())
+                                    .map_err(|e| {
+                                        crate::error_log!(
+                                            "[MLS-FFI] swap kp {} validate: {:?}",
+                                            idx,
+                                            e
+                                        );
+                                        MLSError::InvalidKeyPackage
+                                    });
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 let (kp_in, _) =
@@ -2032,11 +2036,13 @@ impl MLSContext {
                 .iter()
                 .map(|kp_data| {
                     // Try MlsMessage-wrapped format first
-                    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
-                        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-                            return kp_in
-                                .validate(inner_ctx.provider_crypto(), ProtocolVersion::default())
-                                .map_err(|_| MLSError::InvalidKeyPackage);
+                    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
+                        if remaining.is_empty() {
+                            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+                                return kp_in
+                                    .validate(inner_ctx.provider_crypto(), ProtocolVersion::default())
+                                    .map_err(|_| MLSError::InvalidKeyPackage);
+                            }
                         }
                     }
 
@@ -5742,16 +5748,18 @@ impl MLSContext {
         let crypto = inner.provider_crypto();
 
         // Try MlsMessage-wrapped format first
-        if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-                let kp = kp_in
-                    .validate(crypto, ProtocolVersion::default())
-                    .map_err(|_| MLSError::InvalidKeyPackage)?;
-                return Ok(kp
-                    .hash_ref(crypto)
-                    .map_err(|_| MLSError::OpenMLSError)?
-                    .as_slice()
-                    .to_vec());
+        if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+            if remaining.is_empty() {
+                if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+                    let kp = kp_in
+                        .validate(crypto, ProtocolVersion::default())
+                        .map_err(|_| MLSError::InvalidKeyPackage)?;
+                    return Ok(kp
+                        .hash_ref(crypto)
+                        .map_err(|_| MLSError::OpenMLSError)?
+                        .as_slice()
+                        .to_vec());
+                }
             }
         }
 
@@ -6173,18 +6181,28 @@ impl MLSContext {
             .as_secs();
         let lifetime =
             openmls::prelude::Lifetime::init(now.saturating_sub(60), now + 29 * 24 * 60 * 60);
+        #[cfg(feature = "test-utils")]
         let mut extension_caps = vec![
             openmls::prelude::ExtensionType::RatchetTree,
             openmls::prelude::ExtensionType::AppDataDictionary,
         ];
+        #[cfg(not(feature = "test-utils"))]
+        let mut extension_caps = vec![];
         if last_resort {
             extension_caps.push(openmls::prelude::ExtensionType::LastResort);
         }
+
+        #[cfg(feature = "test-utils")]
+        let proposals: &[openmls::prelude::ProposalType] =
+            &[openmls::prelude::ProposalType::AppDataUpdate];
+        #[cfg(not(feature = "test-utils"))]
+        let proposals: &[openmls::prelude::ProposalType] = &[];
+
         let capabilities = Capabilities::new(
             Some(&[openmls::prelude::ProtocolVersion::Mls10]),
             Some(&[ciphersuite]),
             Some(&extension_caps),
-            Some(&[openmls::prelude::ProposalType::AppDataUpdate]),
+            Some(proposals),
             Some(&[CredentialType::Basic]),
         );
         let mut builder = KeyPackage::builder()
@@ -6205,10 +6223,9 @@ impl MLSContext {
             )
             .map_err(|e| MLSError::OpenMLS(format!("Failed to build KeyPackage: {:?}", e)))?;
 
-        // Serialize key package wrapped in MlsMessage framing (canonical wire format)
+        // Serialize key package
         let key_package = key_package_bundle.key_package().clone();
-        let key_package_msg = openmls::prelude::MlsMessageOut::from(key_package.clone());
-        let key_package_data = key_package_msg
+        let key_package_data = key_package
             .tls_serialize_detached()
             .map_err(|_| MLSError::SerializationError)?;
         // Get hash reference (keep both typed and bytes versions)
@@ -6667,6 +6684,7 @@ impl MLSContext {
             },
         }
     }
+    #[cfg(feature = "test-utils")]
     #[doc(hidden)]
     pub fn stage_app_data_update_for_test(
         &self,
@@ -7097,16 +7115,18 @@ pub fn mls_compute_key_package_hash(key_package_bytes: Vec<u8>) -> Result<Vec<u8
     let provider = LibcruxProvider::default();
 
     // Try MlsMessage-wrapped format first
-    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-            let kp = kp_in
-                .validate(provider.crypto(), ProtocolVersion::default())
-                .map_err(|_| MLSError::InvalidKeyPackage)?;
-            return Ok(kp
-                .hash_ref(provider.crypto())
-                .map_err(|_| MLSError::OpenMLSError)?
-                .as_slice()
-                .to_vec());
+    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+        if remaining.is_empty() {
+            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+                let kp = kp_in
+                    .validate(provider.crypto(), ProtocolVersion::default())
+                    .map_err(|_| MLSError::InvalidKeyPackage)?;
+                return Ok(kp
+                    .hash_ref(provider.crypto())
+                    .map_err(|_| MLSError::OpenMLSError)?
+                    .as_slice()
+                    .to_vec());
+            }
         }
     }
 
@@ -7276,14 +7296,16 @@ pub fn mls_extract_key_package_identity(key_package_bytes: Vec<u8>) -> Result<St
     let provider = LibcruxProvider::default();
 
     // Try MlsMessage-wrapped format first
-    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-            let kp = kp_in
-                .validate(provider.crypto(), ProtocolVersion::default())
-                .map_err(|_| MLSError::InvalidKeyPackage)?;
-            let identity_bytes = kp.leaf_node().credential().serialized_content();
-            return String::from_utf8(identity_bytes.to_vec())
-                .map_err(|_| MLSError::invalid_input("Credential identity is not valid UTF-8"));
+    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+        if remaining.is_empty() {
+            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+                let kp = kp_in
+                    .validate(provider.crypto(), ProtocolVersion::default())
+                    .map_err(|_| MLSError::InvalidKeyPackage)?;
+                let identity_bytes = kp.leaf_node().credential().serialized_content();
+                return String::from_utf8(identity_bytes.to_vec())
+                    .map_err(|_| MLSError::invalid_input("Credential identity is not valid UTF-8"));
+            }
         }
     }
 
@@ -7311,12 +7333,14 @@ pub fn mls_extract_key_package_signature_public_key(
     let provider = LibcruxProvider::default();
 
     // Try MlsMessage-wrapped format first
-    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-            let kp = kp_in
-                .validate(provider.crypto(), ProtocolVersion::default())
-                .map_err(|_| MLSError::InvalidKeyPackage)?;
-            return Ok(kp.leaf_node().signature_key().as_slice().to_vec());
+    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+        if remaining.is_empty() {
+            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+                let kp = kp_in
+                    .validate(provider.crypto(), ProtocolVersion::default())
+                    .map_err(|_| MLSError::InvalidKeyPackage)?;
+                return Ok(kp.leaf_node().signature_key().as_slice().to_vec());
+            }
         }
     }
 
@@ -7353,12 +7377,14 @@ pub fn mls_extract_key_package_signature_algorithm(
     let provider = LibcruxProvider::default();
 
     // Try MlsMessage-wrapped format first
-    if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-        if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-            let kp = kp_in
-                .validate(provider.crypto(), ProtocolVersion::default())
-                .map_err(|_| MLSError::InvalidKeyPackage)?;
-            return Ok(normalize_alg_label(&format!("{:?}", kp.ciphersuite())));
+    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
+        if remaining.is_empty() {
+            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
+                let kp = kp_in
+                    .validate(provider.crypto(), ProtocolVersion::default())
+                    .map_err(|_| MLSError::InvalidKeyPackage)?;
+                return Ok(normalize_alg_label(&format!("{:?}", kp.ciphersuite())));
+            }
         }
     }
 
@@ -7706,6 +7732,7 @@ impl MlsCryptoContext for MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         self.update_group_metadata(group_id, metadata_json)
     }
+    #[cfg(feature = "test-utils")]
     fn stage_app_data_update_for_test(
         &self,
         group_id: Vec<u8>,
@@ -7798,18 +7825,26 @@ impl MlsCryptoContext for MLSContext {
         inner.with_group(&gid, |group, provider, signer| {
             let mut validated_by_identity = std::collections::HashMap::<Vec<u8>, KeyPackage>::new();
             for (idx, kp_bytes) in key_packages.iter().enumerate() {
-                let kp = if let Ok((mls_msg, _)) = MlsMessageIn::tls_deserialize_bytes(kp_bytes) {
-                    match mls_msg.extract() {
-                        MlsMessageBodyIn::KeyPackage(kp_in) => kp_in
-                            .validate(provider.crypto(), ProtocolVersion::default())
-                            .map_err(|_| MLSError::InvalidKeyPackage)?,
-                        _ => {
-                            let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
-                                .map_err(|_| MLSError::SerializationError)?;
-                            kp_in
+                let kp = if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(kp_bytes) {
+                    if remaining.is_empty() {
+                        match mls_msg.extract() {
+                            MlsMessageBodyIn::KeyPackage(kp_in) => kp_in
                                 .validate(provider.crypto(), ProtocolVersion::default())
-                                .map_err(|_| MLSError::InvalidKeyPackage)?
+                                .map_err(|_| MLSError::InvalidKeyPackage)?,
+                            _ => {
+                                let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
+                                    .map_err(|_| MLSError::SerializationError)?;
+                                kp_in
+                                    .validate(provider.crypto(), ProtocolVersion::default())
+                                    .map_err(|_| MLSError::InvalidKeyPackage)?
+                            }
                         }
+                    } else {
+                        let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
+                            .map_err(|_| MLSError::SerializationError)?;
+                        kp_in
+                            .validate(provider.crypto(), ProtocolVersion::default())
+                            .map_err(|_| MLSError::InvalidKeyPackage)?
                     }
                 } else {
                     let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
