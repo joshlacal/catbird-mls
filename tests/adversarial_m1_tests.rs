@@ -67,7 +67,8 @@ fn uppercase_device_uuid_is_rejected() {
     let result = prepare_clean_chat_request(
         uppercase_auth,
         CleanChatOperationFfi::GetOwnDevices,
-        serde_json::to_vec(&json!({"actorDeviceId": "11111111-1111-4111-8111-11111111111A"})).unwrap(),
+        serde_json::to_vec(&json!({"actorDeviceId": "11111111-1111-4111-8111-11111111111A"}))
+            .unwrap(),
     );
     assert!(result.is_err());
 }

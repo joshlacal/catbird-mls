@@ -468,13 +468,23 @@ fn stage_pending_incoming_commit(
             });
             Ok(())
         }
-        Entry::Occupied(entry) if entry.get().wire_fingerprint == wire_fingerprint => {
-            crate::debug_log!(
-                "[{}] Exact retransmission retained existing staged commit for group {} epoch {}",
-                context,
-                hex::encode(group_id),
-                target_epoch
-            );
+        Entry::Occupied(mut entry) if entry.get().wire_fingerprint == wire_fingerprint => {
+            if entry.get().staged.is_none() && !entry.get().merge_started {
+                entry.get_mut().staged = Some(staged);
+                crate::debug_log!(
+                    "[{}] Exact retransmission reinstalled staged commit payload for group {} epoch {}",
+                    context,
+                    hex::encode(group_id),
+                    target_epoch
+                );
+            } else {
+                crate::debug_log!(
+                    "[{}] Exact retransmission retained existing staged commit for group {} epoch {}",
+                    context,
+                    hex::encode(group_id),
+                    target_epoch
+                );
+            }
             Ok(())
         }
         Entry::Occupied(_) => {
@@ -1767,7 +1777,8 @@ impl MLSContext {
             .iter()
             .enumerate()
             .map(|(idx, kp_data)| {
-                if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
+                if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data)
+                {
                     if remaining.is_empty() {
                         match mls_msg.extract() {
                             MlsMessageBodyIn::KeyPackage(kp_in) => {
@@ -2035,11 +2046,16 @@ impl MLSContext {
                 .iter()
                 .map(|kp_data| {
                     // Try MlsMessage-wrapped format first
-                    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
+                    if let Ok((mls_msg, remaining)) =
+                        MlsMessageIn::tls_deserialize_bytes(&kp_data.data)
+                    {
                         if remaining.is_empty() {
                             if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
                                 return kp_in
-                                    .validate(inner_ctx.provider_crypto(), ProtocolVersion::default())
+                                    .validate(
+                                        inner_ctx.provider_crypto(),
+                                        ProtocolVersion::default(),
+                                    )
                                     .map_err(|_| MLSError::InvalidKeyPackage);
                             }
                         }
@@ -5192,7 +5208,7 @@ impl MLSContext {
                 ))
             })?;
 
-        let new_epoch = inner.with_group(&gid, |group, provider, _signer| {
+        let merge_res = inner.with_group(&gid, |group, provider, _signer| {
             group.merge_staged_commit(provider, *staged).map_err(|e| {
                 crate::error_log!(
                     "[MLS-FFI] ❌ merge_incoming_commit: merge_staged_commit failed: {:?}",
@@ -5222,7 +5238,23 @@ impl MLSContext {
             }
 
             Ok(epoch_after)
-        })?;
+        });
+
+        let new_epoch = match merge_res {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                let mut pending = self
+                    .pending_incoming_merges
+                    .lock()
+                    .map_err(|_| MLSError::ContextNotInitialized)?;
+                if let Some(entry) = pending.get(&pending_key) {
+                    if !entry.merge_started {
+                        pending.remove(&pending_key);
+                    }
+                }
+                return Err(e);
+            }
+        };
         pending
             .get_mut(&pending_key)
             .ok_or_else(|| {
@@ -7312,8 +7344,9 @@ pub fn mls_extract_key_package_identity(key_package_bytes: Vec<u8>) -> Result<St
                     .validate(provider.crypto(), ProtocolVersion::default())
                     .map_err(|_| MLSError::InvalidKeyPackage)?;
                 let identity_bytes = kp.leaf_node().credential().serialized_content();
-                return String::from_utf8(identity_bytes.to_vec())
-                    .map_err(|_| MLSError::invalid_input("Credential identity is not valid UTF-8"));
+                return String::from_utf8(identity_bytes.to_vec()).map_err(|_| {
+                    MLSError::invalid_input("Credential identity is not valid UTF-8")
+                });
             }
         }
     }
@@ -7750,7 +7783,6 @@ impl MlsCryptoContext for MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         self.stage_app_data_update_for_test(group_id, component_id, data)
     }
-
 
     fn update_group_metadata_encrypted(
         &self,

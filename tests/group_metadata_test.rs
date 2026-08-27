@@ -289,8 +289,8 @@ fn add_members_with_metadata_lets_fresh_group_joiner_decrypt_name() {
 
 #[test]
 fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_before_acceptance() {
-    use openmls::prelude::*;
     use openmls::component::ComponentData;
+    use openmls::prelude::*;
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_libcrux_crypto::Provider as LibcruxProvider;
     use tls_codec::Serialize as TlsSerialize;
@@ -305,7 +305,10 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
         signature_key: alice_signer.to_public_vec().into(),
     };
     let alice_capabilities = Capabilities::builder()
-        .extensions(vec![ExtensionType::RatchetTree, ExtensionType::AppDataDictionary])
+        .extensions(vec![
+            ExtensionType::RatchetTree,
+            ExtensionType::AppDataDictionary,
+        ])
         .proposals(vec![ProposalType::AppDataUpdate])
         .build();
     let mut alice_group = MlsGroup::new_with_group_id(
@@ -329,7 +332,10 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
         signature_key: bob_signer.to_public_vec().into(),
     };
     let bob_capabilities = Capabilities::builder()
-        .extensions(vec![ExtensionType::RatchetTree, ExtensionType::AppDataDictionary])
+        .extensions(vec![
+            ExtensionType::RatchetTree,
+            ExtensionType::AppDataDictionary,
+        ])
         .proposals(vec![ProposalType::AppDataUpdate])
         .build();
     let bob_kp_bundle = KeyPackage::builder()
@@ -343,10 +349,9 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
         .unwrap();
     alice_group.merge_pending_commit(&alice_provider).unwrap();
 
-    let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(
-        welcome.tls_serialize_detached().unwrap().as_slice(),
-    )
-    .unwrap();
+    let (mls_msg, _) =
+        MlsMessageIn::tls_deserialize_bytes(welcome.tls_serialize_detached().unwrap().as_slice())
+            .unwrap();
     let welcome_in = match mls_msg.extract() {
         MlsMessageBodyIn::Welcome(w) => w,
         _ => panic!("Expected Welcome"),
@@ -395,7 +400,12 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
     let changes = updater.changes();
     commit_stage.with_app_data_dictionary_updates(changes);
     let commit_bundle = commit_stage
-        .build(alice_provider.rand(), alice_provider.crypto(), &alice_signer, |_| true)
+        .build(
+            alice_provider.rand(),
+            alice_provider.crypto(),
+            &alice_signer,
+            |_| true,
+        )
         .unwrap()
         .stage_commit(&alice_provider)
         .unwrap();
@@ -410,7 +420,8 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
         .unwrap();
 
     // Receiver returns UnresolvedAppDataCommit
-    let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved) = raw_processed.content() else {
+    let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved) = raw_processed.content()
+    else {
         panic!("Expected UnresolvedAppDataCommit from OpenMLS 0.9 receive API");
     };
 
@@ -440,16 +451,17 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
 
     // Invariant: Bob's metadata dictionary does NOT reflect the update before explicit merge.
     assert_eq!(
-        bob_group
-            .extensions()
-            .app_data_dictionary()
-            .and_then(|d| d.dictionary().get(&catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID)),
+        bob_group.extensions().app_data_dictionary().and_then(|d| d
+            .dictionary()
+            .get(&catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID)),
         None,
         "Bob dictionary must not have updated metadata before merge"
     );
 
     // Acceptance fence: Explicit merge advances Bob's epoch and applies dictionary updates.
-    bob_group.merge_staged_commit(&bob_provider, *staged).unwrap();
+    bob_group
+        .merge_staged_commit(&bob_provider, *staged)
+        .unwrap();
     assert_eq!(bob_group.epoch().as_u64(), 2);
 
     let dict_after = bob_group
@@ -495,7 +507,12 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
     let changes2 = updater2.changes();
     commit_stage2.with_app_data_dictionary_updates(changes2);
     let commit_bundle2 = commit_stage2
-        .build(alice_provider.rand(), alice_provider.crypto(), &alice_signer, |_| true)
+        .build(
+            alice_provider.rand(),
+            alice_provider.crypto(),
+            &alice_signer,
+            |_| true,
+        )
         .unwrap()
         .stage_commit(&alice_provider)
         .unwrap();
@@ -510,7 +527,8 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
         .unwrap();
 
     // Receiver returns UnresolvedAppDataCommit with Remove operation
-    let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved2) = raw_processed2.content() else {
+    let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved2) = raw_processed2.content()
+    else {
         panic!("Expected UnresolvedAppDataCommit for Remove operation");
     };
 
@@ -551,14 +569,15 @@ fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_b
     );
 
     // Acceptance fence: Explicit merge advances Bob's epoch and applies remove dictionary semantics.
-    bob_group.merge_staged_commit(&bob_provider, *staged2).unwrap();
+    bob_group
+        .merge_staged_commit(&bob_provider, *staged2)
+        .unwrap();
     assert_eq!(bob_group.epoch().as_u64(), 3);
 
     assert_eq!(
-        bob_group
-            .extensions()
-            .app_data_dictionary()
-            .and_then(|d| d.dictionary().get(&catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID)),
+        bob_group.extensions().app_data_dictionary().and_then(|d| d
+            .dictionary()
+            .get(&catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID)),
         None,
         "Component 0x8001 must be removed after merge"
     );

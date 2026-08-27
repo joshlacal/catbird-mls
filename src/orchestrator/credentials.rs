@@ -80,7 +80,6 @@ pub trait CredentialStore: CredentialStoreBounds {
         Ok(Some(1))
     }
 
-
     /// Check if credentials exist for a user (device is registered).
     async fn has_credentials(&self, user_did: &str) -> Result<bool>;
 

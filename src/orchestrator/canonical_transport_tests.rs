@@ -119,9 +119,12 @@ fn all_canonical_operations_map_to_valid_unique_xrpc_paths() {
 fn read_query_encoding_escapes_special_characters_cleanly() {
     let auth = CleanChatAuthContext::new(DEVICE_ID.to_owned());
 
-    let conversations = prepare_get_conversations(&auth, 50, Some("cursor with spaces & special=chars"))
-        .expect("query encoding");
-    assert!(conversations.path.contains("pageCursor=cursor%20with%20spaces%20%26%20special%3Dchars"));
+    let conversations =
+        prepare_get_conversations(&auth, 50, Some("cursor with spaces & special=chars"))
+            .expect("query encoding");
+    assert!(conversations
+        .path
+        .contains("pageCursor=cursor%20with%20spaces%20%26%20special%3Dchars"));
 
     let entries = prepare_get_entries(&auth, "123e4567-e89b-42d3-a456-426614174001", 0, 100)
         .expect("entries encoding");
@@ -152,5 +155,8 @@ fn endpoint_error_status_and_recovery_mapping_is_deterministic() {
         ChatErrorCode::ProtocolUpgradeRequired,
         None,
     );
-    assert_eq!(upgrade_req.recovery_outcome(), Some(RecoveryOutcome::ProtocolUpgradeRequired));
+    assert_eq!(
+        upgrade_req.recovery_outcome(),
+        Some(RecoveryOutcome::ProtocolUpgradeRequired)
+    );
 }

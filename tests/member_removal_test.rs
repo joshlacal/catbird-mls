@@ -952,7 +952,9 @@ fn test_remove_nonexistent_member_graceful() {
 // Regression Tests for AAD-Aware Member Removal & Coordinates
 // ============================================================================
 
-fn parse_public_commit_wire(bytes: &[u8]) -> (Vec<u8>, Vec<openmls::messages::proposals_in::ProposalIn>) {
+fn parse_public_commit_wire(
+    bytes: &[u8],
+) -> (Vec<u8>, Vec<openmls::messages::proposals_in::ProposalIn>) {
     use openmls::messages::proposals_in::{ProposalIn, ProposalOrRefIn};
     use openmls::prelude::tls_codec::Deserialize;
     let mut inner = &bytes[4..]; // skip 2 bytes wire format + 2 bytes version
@@ -983,15 +985,11 @@ fn test_removal_commit_aad_and_coordinates_regression() {
     let alice_id = b"did:plc:alice#11111111-1111-4111-8111-111111111111";
     let bob_id = b"did:plc:bob#22222222-2222-4222-8222-222222222222";
 
-    let created = context
-        .create_group(alice_id.to_vec(), None)
-        .unwrap();
+    let created = context.create_group(alice_id.to_vec(), None).unwrap();
     let group_id = created.group_id;
 
     let bob_kp = key_package_for(&context, bob_id);
-    let _add_res = context
-        .add_members(group_id.clone(), vec![bob_kp])
-        .unwrap();
+    let _add_res = context.add_members(group_id.clone(), vec![bob_kp]).unwrap();
     context.merge_pending_commit(group_id.clone()).unwrap();
 
     // Prepare test AAD
@@ -1047,17 +1045,30 @@ fn test_removal_commit_aad_and_coordinates_regression() {
     // 2. Deserialize commit and verify authenticated_data matches EXACTLY
     let (extracted_aad, proposals) = parse_public_commit_wire(&remove_res.commit_data);
     assert_eq!(
-        extracted_aad,
-        aad_bytes,
+        extracted_aad, aad_bytes,
         "Commit authenticated_data must match server-required prefixed canonical CBOR AAD"
     );
 
     // 3. Verify Remove proposal exists and no AppDataUpdate proposal exists
-    assert!(proposals.iter().any(|p| matches!(p, openmls::messages::proposals_in::ProposalIn::Remove(_))), "Removal commit must contain Remove proposal");
-    assert!(!proposals.iter().any(|p| matches!(p, openmls::messages::proposals_in::ProposalIn::AppDataUpdate(_))), "Removal commit must NOT contain AppDataUpdate proposal");
+    assert!(
+        proposals
+            .iter()
+            .any(|p| matches!(p, openmls::messages::proposals_in::ProposalIn::Remove(_))),
+        "Removal commit must contain Remove proposal"
+    );
+    assert!(
+        !proposals.iter().any(|p| matches!(
+            p,
+            openmls::messages::proposals_in::ProposalIn::AppDataUpdate(_)
+        )),
+        "Removal commit must NOT contain AppDataUpdate proposal"
+    );
 
     // Merge the removal commit
-    let new_epoch = context.merge_pending_commit(group_id.clone()).unwrap().new_epoch;
+    let new_epoch = context
+        .merge_pending_commit(group_id.clone())
+        .unwrap()
+        .new_epoch;
     assert_eq!(new_epoch, 2);
 }
 
@@ -1066,9 +1077,7 @@ fn test_staged_failure_clears_aad() {
     let (context, _dir) = new_context();
     let alice_id = b"did:plc:alice#11111111-1111-4111-8111-111111111111";
 
-    let created = context
-        .create_group(alice_id.to_vec(), None)
-        .unwrap();
+    let created = context.create_group(alice_id.to_vec(), None).unwrap();
     let group_id = created.group_id;
 
     // Try to remove a non-existent member with AAD set

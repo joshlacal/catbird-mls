@@ -54,7 +54,9 @@ async fn replace_available_packages_with_one_wrapped(
         last_package = Some(package);
     }
     let package = last_package.expect("registered device publishes key packages");
-    let package_in = if let Ok((msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&package.key_package_data) {
+    let package_in = if let Ok((msg, remaining)) =
+        MlsMessageIn::tls_deserialize_bytes(&package.key_package_data)
+    {
         if remaining.is_empty() {
             match msg.extract() {
                 MlsMessageBodyIn::KeyPackage(kp) => kp,
@@ -694,16 +696,15 @@ async fn wrapped_key_packages_work_through_create_add_and_swap_wrappers() {
     let swap_mallory_did = swap_world.client("Mallory").did.clone();
     let swap_convo = swap_alice
         .orchestrator
-        .create_group(
-            "wrapped swap",
-            None,
-            None,
-        )
+        .create_group("wrapped swap", None, None)
         .await
         .expect("create group");
     swap_alice
         .orchestrator
-        .add_members(&swap_convo.conversation_id, std::slice::from_ref(&swap_bob_did))
+        .add_members(
+            &swap_convo.conversation_id,
+            std::slice::from_ref(&swap_bob_did),
+        )
         .await
         .expect("add Bob");
     replace_available_packages_with_one_wrapped(&swap_world, "Alice", "Mallory", &swap_mallory_did)
@@ -1517,7 +1518,10 @@ async fn legacy_atomic_swap_rejects_device_mismatch_and_resolver_failure() {
         .expect("create group");
     alice
         .orchestrator
-        .add_members(&mismatch_group.conversation_id, std::slice::from_ref(&bob_did))
+        .add_members(
+            &mismatch_group.conversation_id,
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("add Bob");
     let mismatch_epoch = alice
@@ -1545,16 +1549,15 @@ async fn legacy_atomic_swap_rejects_device_mismatch_and_resolver_failure() {
 
     let resolver_group = alice
         .orchestrator
-        .create_group(
-            "legacy swap resolver failure",
-            None,
-            None,
-        )
+        .create_group("legacy swap resolver failure", None, None)
         .await
         .expect("create resolver-failure group");
     alice
         .orchestrator
-        .add_members(&resolver_group.conversation_id, std::slice::from_ref(&bob_did))
+        .add_members(
+            &resolver_group.conversation_id,
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("add Bob");
     alice

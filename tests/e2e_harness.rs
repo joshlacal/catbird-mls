@@ -214,7 +214,12 @@ impl TestWorld {
         client
             .orchestrator
             .api_client()
-            .publish_key_packages(&pkgs, "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519", "", Some(&device_id))
+            .publish_key_packages(
+                &pkgs,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "",
+                Some(&device_id),
+            )
             .await?;
 
         self.authorized_device_keys

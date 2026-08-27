@@ -4,8 +4,8 @@ mod e2e_harness;
 
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
 use async_trait::async_trait;
+use base64::Engine as _;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result as OrchestratorResult};
 use catbird_mls::orchestrator::{
     ConversationState, GroupState, IncomingEnvelope, MLSAPIClient, MLSOrchestrator,
@@ -93,7 +93,11 @@ impl MLSAPIClient for RecordingCommitApi {
         {
             if let Some(ref b) = request.body {
                 if let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) {
-                    let body_obj = v.get("signedRequest").and_then(|s| s.get("body")).or_else(|| v.get("body")).unwrap_or(&v);
+                    let body_obj = v
+                        .get("signedRequest")
+                        .and_then(|s| s.get("body"))
+                        .or_else(|| v.get("body"))
+                        .unwrap_or(&v);
                     let prior = body_obj.get("prior");
                     let convo_id = prior
                         .and_then(|p| p.get("conversationId"))
@@ -103,7 +107,10 @@ impl MLSAPIClient for RecordingCommitApi {
                         .to_string();
                     let auth = prior
                         .and_then(|p| p.get("groupContextHash"))
-                        .and_then(|g| g.as_str().or_else(|| g.get("$bytes").and_then(|b| b.as_str())))
+                        .and_then(|g| {
+                            g.as_str()
+                                .or_else(|| g.get("$bytes").and_then(|b| b.as_str()))
+                        })
                         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
                         .map(|bytes| hex::encode(bytes));
                     self.recovery_reports.lock().unwrap().push((convo_id, auth));
@@ -413,7 +420,10 @@ async fn fork_readd_stages_server_submit_ready_commit_without_merging_first() {
     let key_packages = alice
         .orchestrator
         .api_client()
-        .get_key_packages("00000000-0000-4000-8000-000000000001", &[alice.did.clone(), bob_did])
+        .get_key_packages(
+            "00000000-0000-4000-8000-000000000001",
+            &[alice.did.clone(), bob_did],
+        )
         .await
         .expect("key packages should be available");
     assert!(

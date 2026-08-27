@@ -202,7 +202,8 @@ async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit
         .expect("create_group failed");
 
     let new_group_id =
-        hex::decode("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").expect("fixture must be valid hex");
+        hex::decode("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            .expect("fixture must be valid hex");
     alice
         .orchestrator
         .record_group_reset(&convo.conversation_id, new_group_id, 1)

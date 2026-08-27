@@ -21,9 +21,9 @@ use std::sync::Arc;
 
 use catbird_mls::orchestrator::recovery::RecoveryTracker;
 use catbird_mls::orchestrator::{
-    constants, ConversationState, CredentialStore, IncomingEnvelope,
-    MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, OrchestratorError,
-    PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState, ResetRecordOutcome,
+    constants, ConversationState, CredentialStore, IncomingEnvelope, MLSOrchestrator,
+    MLSStorageBackend, OrchestratorConfig, OrchestratorError, PendingLocalDelete,
+    PersistedRecoveryBackoff, PersistedRecoveryState, ResetRecordOutcome,
 };
 use e2e_harness::TestWorld;
 
@@ -865,7 +865,6 @@ async fn failed_pending_delete_intent_write_refuses_destructive_cleanup() {
 // WS-5 review fixes (2026-06-10)
 // ───────────────────────────────────────────────────────────────────────────
 
-
 /// Event observer that records WS-5.2 recovery-storage escalations.
 #[derive(Default)]
 struct RecordingObserver {
@@ -1187,9 +1186,18 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
-    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
-    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
-    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
+    credentials
+        .store_device_uuid(did, "00000000-0000-4000-8000-000000000001")
+        .await
+        .unwrap();
+    credentials
+        .store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001"))
+        .await
+        .unwrap();
+    credentials
+        .store_signing_key(did, &vec![0u8; 32])
+        .await
+        .unwrap();
     storage
         .ensure_conversation_exists(did, &convo_id, &convo_id)
         .await
@@ -1348,9 +1356,18 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
-    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
-    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
-    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
+    credentials
+        .store_device_uuid(did, "00000000-0000-4000-8000-000000000001")
+        .await
+        .unwrap();
+    credentials
+        .store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001"))
+        .await
+        .unwrap();
+    credentials
+        .store_signing_key(did, &vec![0u8; 32])
+        .await
+        .unwrap();
     storage
         .ensure_conversation_exists(did, &convo_id, &convo_id)
         .await
@@ -1476,9 +1493,18 @@ async fn failing_quarantine_persists_escalate() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
-    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
-    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
-    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
+    credentials
+        .store_device_uuid(did, "00000000-0000-4000-8000-000000000001")
+        .await
+        .unwrap();
+    credentials
+        .store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001"))
+        .await
+        .unwrap();
+    credentials
+        .store_signing_key(did, &vec![0u8; 32])
+        .await
+        .unwrap();
     storage
         .ensure_conversation_exists(did, &convo_id, &convo_id)
         .await

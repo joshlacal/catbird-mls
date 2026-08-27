@@ -5,9 +5,9 @@
 //! upstream OAuth/DPoP exchange. Rust projects and signs protocol requests,
 //! then serializes the generated DTO without routing
 //! through the legacy `blue.catbird.mlsChat.*` surface.
+use serde::de;
 use std::fmt;
 use std::str::FromStr;
-use serde::de;
 
 use crate::atproto::blue_catbird::chat::{
     accept_conversation::AcceptConversationRequest,
@@ -2456,11 +2456,9 @@ fn extract_strict_signed_body(
     Ok((StrictSignedJson::Object(root), None, None))
 }
 
-pub fn canonical_commit_aad_bytes(
-    aad_json: &serde_json::Value,
-) -> Result<Vec<u8>, TransportError> {
-    let raw = serde_json::to_vec(aad_json)
-        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+pub fn canonical_commit_aad_bytes(aad_json: &serde_json::Value) -> Result<Vec<u8>, TransportError> {
+    let raw =
+        serde_json::to_vec(aad_json).map_err(|e| TransportError::Serialization(e.to_string()))?;
     let strict = parse_strict_signed_json(&raw)?;
     let projected = project_schema_ref("commitAad", &strict, false)?;
     let cbor = serde_ipld_dagcbor::to_vec(&projected)
@@ -2469,6 +2467,104 @@ pub fn canonical_commit_aad_bytes(
     aad.extend_from_slice(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0");
     aad.extend_from_slice(&cbor);
     Ok(aad)
+}
+
+pub fn canonical_application_aad_bytes(
+    aad_json: &serde_json::Value,
+) -> Result<Vec<u8>, TransportError> {
+    let raw =
+        serde_json::to_vec(aad_json).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let strict = parse_strict_signed_json(&raw)?;
+    let projected = project_schema_ref("applicationAad", &strict, false)?;
+    let cbor = serde_ipld_dagcbor::to_vec(&projected)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let mut aad = Vec::with_capacity(b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0".len() + cbor.len());
+    aad.extend_from_slice(b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0");
+    aad.extend_from_slice(&cbor);
+    Ok(aad)
+}
+
+pub fn canonical_metadata_aad_bytes(
+    aad_json: &serde_json::Value,
+) -> Result<Vec<u8>, TransportError> {
+    let raw =
+        serde_json::to_vec(aad_json).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let strict = parse_strict_signed_json(&raw)?;
+    let projected = project_schema_ref("metadataAad", &strict, false)?;
+    let cbor = serde_ipld_dagcbor::to_vec(&projected)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let mut aad = Vec::with_capacity(b"CATBIRD-CHAT-METADATA\0".len() + cbor.len());
+    aad.extend_from_slice(b"CATBIRD-CHAT-METADATA\0");
+    aad.extend_from_slice(&cbor);
+    Ok(aad)
+}
+
+pub fn canonical_metadata_exporter_context_bytes(
+    context_json: &serde_json::Value,
+) -> Result<Vec<u8>, TransportError> {
+    let raw = serde_json::to_vec(context_json)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let strict = parse_strict_signed_json(&raw)?;
+    let projected = project_schema_ref("metadataExporterContext", &strict, false)?;
+    serde_ipld_dagcbor::to_vec(&projected).map_err(|e| TransportError::Serialization(e.to_string()))
+}
+
+pub fn canonical_metadata_content_signing_input(
+    content_json: &serde_json::Value,
+) -> Result<Vec<u8>, TransportError> {
+    let raw = serde_json::to_vec(content_json)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let strict = parse_strict_signed_json(&raw)?;
+    let projected = project_schema_ref("metadataContentProjection", &strict, false)?;
+    let cbor = serde_ipld_dagcbor::to_vec(&projected)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let mut out = Vec::with_capacity(b"CATBIRD-CHAT-METADATA-CONTENT\0".len() + cbor.len());
+    out.extend_from_slice(b"CATBIRD-CHAT-METADATA-CONTENT\0");
+    out.extend_from_slice(&cbor);
+    Ok(out)
+}
+
+pub fn canonical_application_content(
+    frame_json: &serde_json::Value,
+) -> Result<Vec<u8>, TransportError> {
+    let raw =
+        serde_json::to_vec(frame_json).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let strict = parse_strict_signed_json(&raw)?;
+    let projected = project_schema_ref("applicationFrame", &strict, false)?;
+    serde_ipld_dagcbor::to_vec(&projected).map_err(|e| TransportError::Serialization(e.to_string()))
+}
+
+pub fn seal_metadata_with_nonce(
+    plaintext_cbor: &[u8],
+    exporter_key: &[u8],
+    nonce_bytes: &[u8; 12],
+    metadata_aad: &[u8],
+) -> Result<(Vec<u8>, [u8; 32], u64), TransportError> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+    use sha2::{Digest, Sha256};
+
+    let cipher = Aes256Gcm::new_from_slice(exporter_key)
+        .map_err(|e| TransportError::Serialization(format!("AES-256-GCM key init: {e}")))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let ciphertext_size = (plaintext_cbor.len() + 16) as u64;
+
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext_cbor,
+                aad: metadata_aad,
+            },
+        )
+        .map_err(|e| TransportError::Serialization(format!("AES-256-GCM encrypt: {e}")))?;
+    if ciphertext.len() as u64 != ciphertext_size {
+        return Err(TransportError::Serialization(
+            "ciphertext size mismatch".into(),
+        ));
+    }
+    let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
+    Ok((ciphertext, ciphertext_sha256, ciphertext_size))
 }
 pub(crate) fn prepare_signed_body(
     binding: &CleanChatSigningContext,
@@ -2649,7 +2745,6 @@ pub fn prepare_signed_request_with(
     };
     prepare_signed_request_with_authority(prepared, authority)
 }
-
 
 /// Rust-only test/legacy helper. The public orchestrator uses the
 /// non-exporting authority path above; this helper never crosses UniFFI.
@@ -2855,15 +2950,21 @@ pub(crate) fn validate_auth_generation(value: i64) -> Result<(), TransportError>
 }
 
 pub(crate) fn validate_bare_did(value: &str) -> Result<(), TransportError> {
-    let min_len = if cfg!(test) || cfg!(debug_assertions) { 8 } else { 12 };
+    let min_len = if cfg!(test) || cfg!(debug_assertions) {
+        8
+    } else {
+        12
+    };
     let valid = value.is_ascii()
         && (min_len..=261).contains(&value.len())
         && if let Some(plc) = value.strip_prefix("did:plc:") {
             if cfg!(test) || cfg!(debug_assertions) {
                 !plc.is_empty()
-                    && plc
-                        .bytes()
-                        .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte) || byte.is_ascii_alphabetic())
+                    && plc.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || (b'2'..=b'7').contains(&byte)
+                            || byte.is_ascii_alphabetic()
+                    })
             } else {
                 plc.len() == 24
                     && plc
@@ -3403,17 +3504,16 @@ pub fn route_for_nsid(nsid: &str) -> Option<CanonicalRoute> {
         .map(canonical_route)
         .find(|route| route.nsid == nsid)
 }
-pub(crate) fn canonical_cbor_for_schema(
+pub fn canonical_cbor_for_schema(
     definition_name: &str,
     json_value: &serde_json::Value,
     tagged: bool,
 ) -> Result<Vec<u8>, TransportError> {
-    let raw = serde_json::to_vec(json_value)
-        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let raw =
+        serde_json::to_vec(json_value).map_err(|e| TransportError::Serialization(e.to_string()))?;
     let strict = parse_strict_signed_json(&raw)?;
     let projected = project_schema_ref(definition_name, &strict, tagged)?;
-    serde_ipld_dagcbor::to_vec(&projected)
-        .map_err(|e| TransportError::Serialization(e.to_string()))
+    serde_ipld_dagcbor::to_vec(&projected).map_err(|e| TransportError::Serialization(e.to_string()))
 }
 
 #[test]
@@ -3460,7 +3560,12 @@ fn participant_acceptance_transcript_matches_server_exactly() {
         device_id: "1ad34b5a-3c93-4201-a5c9-b0951b7bc92a".into(),
         auth_generation: Some(1),
     };
-    let prepared = prepare_signed_body(&binding, CanonicalOperation::AcceptConversation, &serde_json::to_vec(&body).unwrap()).expect("must prepare signed body");
+    let prepared = prepare_signed_body(
+        &binding,
+        CanonicalOperation::AcceptConversation,
+        &serde_json::to_vec(&body).unwrap(),
+    )
+    .expect("must prepare signed body");
     let server_hex = "434154424952442d434841542d41434345505400ad646e657874a86565706f6368006767726f757049645820193bb735bc1e20805edec26fef6d0164403a633c0fc584d78d805507eec40763696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e016e636f6e766572736174696f6e496450009ffa924bf94307bf26e7428d53d8006f636f6e6669726d6174696f6e54616758208b1b706fbf188e358427f63df3eff6a4228d8b8aa95f2a3a1551312abb830d1a7067726f7570436f6e7465787448617368582074d6703e5aa2cc90030b597d376555d589daeac4b33675ddbe40a282e2fa07a96524747970657830626c75652e636174626972642e636861742e64656673237061727469636970616e74416363657074616e6365426f6479656b65794964782b4b514c5a6867455232714f5f494f4e6d6746547a6564395542565a41656c6d43685a444b512d5f67616751657072696f72a86565706f6368006767726f757049645820193bb735bc1e20805edec26fef6d0164403a633c0fc584d78d805507eec40763696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450009ffa924bf94307bf26e7428d53d8006f636f6e6669726d6174696f6e54616758208b1b706fbf188e358427f63df3eff6a4228d8b8aa95f2a3a1551312abb830d1a7067726f7570436f6e7465787448617368582074d6703e5aa2cc90030b597d376555d589daeac4b33675ddbe40a282e2fa07a9686163746f7244696478206469643a706c633a7a3372776c6471776f7375656b6477706e34356436756c79687369676e656441747818323032362d30382d32315430383a32313a32332e3534335a6c7472616e736974696f6e49645052f04e1a015f40f9a199302a69150a936d6163746f724465766963654964501ad34b5a3c934201a5c9b0951b7bc92a6e6175746847656e65726174696f6e016e6964656d706f74656e63794b65795052f04e1a015f40f9a199302a69150a936f7369676e6174757265446f6d61696e74434154424952442d434841542d41434345505400717265636f766572795265717565737449645052f04e1a015f40f9a199302a69150a9374696e7669746174696f6e50726f76656e616e6365a36c696e7669746564427944696478206469643a706c633a77366133646e636c637473336d6f78757477626f3368663671696e76697465644279446576696365496450f67f7cf1564b4072a6f995120eb43d6976696e7669746174696f6e5472616e736974696f6e4964506bd96af372b24e5abe1d2109ab171196";
     assert_eq!(hex::encode(prepared.transcript), server_hex);
 }

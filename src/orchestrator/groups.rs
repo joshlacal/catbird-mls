@@ -1,8 +1,3 @@
-
-use base64::{engine::general_purpose::STANDARD, Engine as _};
-use sha2::{Digest, Sha256};
-use crate::chat_v2::ids::uuid::ConversationId as ValidatedConversationId;
-use crate::error::MLSError;
 use super::api_client::MLSAPIClient;
 use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
@@ -10,6 +5,10 @@ use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::{MLSOrchestrator, OwnCommitExpectation};
 use super::storage::MLSStorageBackend;
 use super::types::*;
+use crate::chat_v2::ids::uuid::ConversationId as ValidatedConversationId;
+use crate::error::MLSError;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use sha2::{Digest, Sha256};
 struct WelcomeJoinRollback<'a> {
     user_did: &'a str,
     conversation_id: Option<&'a str>,
@@ -653,7 +652,9 @@ mod tests {
             .mls_context()
             .add_members_with_metadata(
                 group_id.clone(),
-                vec![crate::types::KeyPackageData { data: bob_kp.key_package_data }],
+                vec![crate::types::KeyPackageData {
+                    data: bob_kp.key_package_data,
+                }],
                 Some("remove epoch fence".into()),
                 None,
                 None,
@@ -696,13 +697,20 @@ mod tests {
             .await
             .expect("fetch metadata snapshot");
         metadata_snapshot["coordinate"]["epoch"] = serde_json::json!(1);
-        metadata_snapshot["nonce"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&nonce));
-        metadata_snapshot["ciphertext"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&ciphertext));
-        metadata_snapshot["ciphertextSha256"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&ciphertext)));
+        metadata_snapshot["nonce"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&nonce));
+        metadata_snapshot["ciphertext"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&ciphertext));
+        metadata_snapshot["ciphertextSha256"] = serde_json::json!(
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&ciphertext))
+        );
         metadata_snapshot["ciphertextSize"] = serde_json::json!(ciphertext.len());
         world
             .delivery_service()
-            .update_conversation_metadata_snapshot_for_test(&conversation.conversation_id, metadata_snapshot);
+            .update_conversation_metadata_snapshot_for_test(
+                &conversation.conversation_id,
+                metadata_snapshot,
+            );
 
         let local_epoch = alice
             .orchestrator
@@ -719,7 +727,11 @@ mod tests {
             .await;
         eprintln!("RES = {:?}", res);
         let error = res.expect_err("higher DS epoch must not authorize merge");
-        assert!(matches!(error, OrchestratorError::EpochMismatch { .. }), "error was: {:?}", error);
+        assert!(
+            matches!(error, OrchestratorError::EpochMismatch { .. }),
+            "error was: {:?}",
+            error
+        );
         assert_eq!(
             alice
                 .orchestrator
@@ -768,7 +780,12 @@ mod tests {
         let _ = alice
             .orchestrator
             .mls_context()
-            .add_members(group_id.clone(), vec![crate::types::KeyPackageData { data: bob_kp.key_package_data }])
+            .add_members(
+                group_id.clone(),
+                vec![crate::types::KeyPackageData {
+                    data: bob_kp.key_package_data,
+                }],
+            )
             .expect("add bob to local tree");
         alice
             .orchestrator
@@ -819,11 +836,7 @@ mod tests {
         // the generated group ID and seed a raw group-keyed conversation row and cache.
         let barrier = alice.storage.pause_next_pending_local_delete_write(true);
 
-        let mut create = Box::pin(alice.orchestrator.create_group(
-            "dedup test",
-            None,
-            None,
-        ));
+        let mut create = Box::pin(alice.orchestrator.create_group("dedup test", None, None));
 
         tokio::select! {
             _ = barrier.wait_until_entered() => {}
@@ -831,7 +844,11 @@ mod tests {
         }
 
         let pending_ids = alice.storage.pending_local_delete_ids();
-        assert_eq!(pending_ids.len(), 1, "raw group delete intent must be armed");
+        assert_eq!(
+            pending_ids.len(),
+            1,
+            "raw group delete intent must be armed"
+        );
         let raw_group_id_hex = pending_ids[0].clone();
 
         // Seed a raw group-keyed projection in storage and in-memory caches.
@@ -840,12 +857,9 @@ mod tests {
             .ensure_conversation_exists(&alice.did, &raw_group_id_hex, &raw_group_id_hex)
             .await
             .expect("seed raw conversation row");
-        alice
-            .orchestrator
-            .conversations()
-            .lock()
-            .await
-            .insert(raw_group_id_hex.clone(), ConversationView {
+        alice.orchestrator.conversations().lock().await.insert(
+            raw_group_id_hex.clone(),
+            ConversationView {
                 group_id: raw_group_id_hex.clone(),
                 conversation_id: raw_group_id_hex.clone(),
                 epoch: 0,
@@ -854,7 +868,8 @@ mod tests {
                 created_at: Some(chrono::Utc::now()),
                 updated_at: Some(chrono::Utc::now()),
                 sequencer_did: None,
-            });
+            },
+        );
         alice
             .orchestrator
             .conversation_states()
@@ -909,7 +924,11 @@ mod tests {
             .list_conversations(&alice.did)
             .await
             .expect("list conversations");
-        assert_eq!(all_convos.len(), 1, "exactly one conversation record must exist");
+        assert_eq!(
+            all_convos.len(),
+            1,
+            "exactly one conversation record must exist"
+        );
         assert_eq!(all_convos[0].conversation_id, server_convo_id);
 
         // In-memory caches must also hold only the stable conversation id.
@@ -988,28 +1007,32 @@ mod tests {
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
 
         // 4. Missing conversationId in response
-        world
-            .delivery_service()
-            .set_next_create_custom_response(200, serde_json::json!({
+        world.delivery_service().set_next_create_custom_response(
+            200,
+            serde_json::json!({
                 "result": {
                     "$type": "blue.catbird.chat.defs#conversationCreatedResult",
                     "coordinates": {
                         "epoch": 0
                     }
                 }
-            }));
+            }),
+        );
         let err = alice
             .orchestrator
             .create_group("missing convo id", None, None)
             .await
             .expect_err("missing conversationId must fail create");
-        assert!(err.to_string().contains("missing result.coordinates.conversationId"));
+        assert!(err
+            .to_string()
+            .contains("missing result.coordinates.conversationId"));
         assert_eq!(alice.storage.conversation_count(), 0);
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn create_group_fails_and_cleans_up_when_active_direct_conversation_exists_and_caller_not_member() {
+    async fn create_group_fails_and_cleans_up_when_active_direct_conversation_exists_and_caller_not_member(
+    ) {
         let mut world = TestWorld::new();
         world.add_client("Alice").await;
         world
@@ -1018,12 +1041,13 @@ mod tests {
             .expect("register alice");
         let alice = world.client("Alice");
 
-        world
-            .delivery_service()
-            .set_next_create_custom_response(400, serde_json::json!({
+        world.delivery_service().set_next_create_custom_response(
+            400,
+            serde_json::json!({
                 "error": "ConversationAlreadyExists",
                 "message": "ConversationAlreadyExists"
-            }));
+            }),
+        );
 
         let err = alice
             .orchestrator
@@ -1032,17 +1056,22 @@ mod tests {
             .expect_err("create must fail with descriptive message");
 
         assert!(
-            err.to_string().contains("a conversation with that person exists but this device has not been added to it"),
+            err.to_string().contains(
+                "a conversation with that person exists but this device has not been added to it"
+            ),
             "expected specific direct conversation message, found: {err}"
         );
         assert_eq!(alice.storage.conversation_count(), 0);
         assert_eq!(alice.storage.pending_local_delete_count(), 0);
-        assert!(alice
-            .orchestrator
-            .mls_context()
-            .list_local_group_ids()
-            .unwrap()
-            .is_empty(), "local MLS group must be cleaned up on failure");
+        assert!(
+            alice
+                .orchestrator
+                .mls_context()
+                .list_local_group_ids()
+                .unwrap()
+                .is_empty(),
+            "local MLS group must be cleaned up on failure"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1065,12 +1094,9 @@ mod tests {
         assert!(ValidatedConversationId::parse("not-a-uuid").is_err());
 
         // 2. Typed rollback context requires ValidatedConversationId for stable binding
-        let mut rollback = CreateGroupRollbackContext::new(
-            group_hex.to_string(),
-            vec![0u8; 16],
-            &alice.did,
-        )
-        .expect("create rollback context");
+        let mut rollback =
+            CreateGroupRollbackContext::new(group_hex.to_string(), vec![0u8; 16], &alice.did)
+                .expect("create rollback context");
         assert_eq!(rollback.stable_conversation_id, None);
         assert_eq!(rollback.cleanup_conversation_id(), group_hex);
 
@@ -1096,13 +1122,25 @@ mod tests {
         assert_ne!(created.group_id, valid_uuid_str);
 
         let convos = alice.orchestrator.conversations().lock().await;
-        assert!(convos.contains_key(valid_uuid_str), "cache must contain validated conversation id");
-        assert!(!convos.contains_key(&created.group_id), "cache must not contain raw group id");
+        assert!(
+            convos.contains_key(valid_uuid_str),
+            "cache must contain validated conversation id"
+        );
+        assert!(
+            !convos.contains_key(&created.group_id),
+            "cache must not contain raw group id"
+        );
         drop(convos);
 
         let states = alice.orchestrator.conversation_states().lock().await;
-        assert!(states.contains_key(valid_uuid_str), "states must contain validated conversation id");
-        assert!(!states.contains_key(&created.group_id), "states must not contain raw group id");
+        assert!(
+            states.contains_key(valid_uuid_str),
+            "states must contain validated conversation id"
+        );
+        assert!(
+            !states.contains_key(&created.group_id),
+            "states must not contain raw group id"
+        );
         drop(states);
 
         let stored = alice
@@ -1110,7 +1148,10 @@ mod tests {
             .get_conversation(&alice.did, valid_uuid_str)
             .await
             .expect("read persisted conversation");
-        assert!(stored.is_some(), "storage projection must be keyed by validated conversation id");
+        assert!(
+            stored.is_some(),
+            "storage projection must be keyed by validated conversation id"
+        );
 
         let stored_raw = alice
             .storage
@@ -1129,10 +1170,7 @@ mod tests {
             .register_device("Alice")
             .await
             .expect("register alice");
-        world
-            .register_device("Bob")
-            .await
-            .expect("register bob");
+        world.register_device("Bob").await.expect("register bob");
         let alice = world.client("Alice");
         let bob = world.client("Bob");
 
@@ -1267,9 +1305,9 @@ mod tests {
             .await
             .expect_err("shorthand $type must fail");
         assert!(
-            err_shorthand
-                .to_string()
-                .contains("unknown create_conversation result type: existingDirectConversationResult"),
+            err_shorthand.to_string().contains(
+                "unknown create_conversation result type: existingDirectConversationResult"
+            ),
             "unexpected error: {err_shorthand}"
         );
     }
@@ -1654,7 +1692,10 @@ mod tests {
         let mut world = TestWorld::new();
         world.add_client("Alice").await;
         world.add_client("Bob").await;
-        world.register_device("Alice").await.expect("register alice");
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
         world.register_device("Bob").await.expect("register bob");
 
         let alice = world.client("Alice");
@@ -1679,8 +1720,12 @@ mod tests {
             .expect("must submit AcceptConversation request to server");
 
         let body_bytes = accept_req.body.as_deref().unwrap_or(&[]);
-        let body_val: serde_json::Value = serde_json::from_slice(body_bytes).expect("parse accept body");
-        let inner = body_val.get("signedRequest").and_then(|s| s.get("body")).unwrap_or(&body_val);
+        let body_val: serde_json::Value =
+            serde_json::from_slice(body_bytes).expect("parse accept body");
+        let inner = body_val
+            .get("signedRequest")
+            .and_then(|s| s.get("body"))
+            .unwrap_or(&body_val);
 
         assert_eq!(
             inner.get("$type").and_then(|v| v.as_str()),
@@ -1709,7 +1754,10 @@ mod tests {
             .accept_conversation("00000000-0000-4000-8000-000000000099")
             .await;
 
-        assert!(res.is_err(), "accept on non-existent conversation must fail closed and propagate error");
+        assert!(
+            res.is_err(),
+            "accept on non-existent conversation must fail closed and propagate error"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1717,7 +1765,10 @@ mod tests {
         let mut world = TestWorld::new();
         world.add_client("Alice").await;
         world.add_client("Bob").await;
-        world.register_device("Alice").await.expect("register alice");
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice");
         world.register_device("Bob").await.expect("register bob");
 
         let alice = world.client("Alice");
@@ -1730,7 +1781,11 @@ mod tests {
             .expect("create conversation");
 
         // Fetch Bob's key package
-        let bob_device_id = bob.orchestrator.require_actor_device_id().await.expect("bob device id");
+        let bob_device_id = bob
+            .orchestrator
+            .require_actor_device_id()
+            .await
+            .expect("bob device id");
         let scoped_did = format!("{}#{}", bob.did, bob_device_id);
         let kp_res = bob
             .orchestrator
@@ -1757,7 +1812,9 @@ mod tests {
                 }
             }
         });
-        world.delivery_service().add_leaf_recovery_inbox_item(inbox_item);
+        world
+            .delivery_service()
+            .add_leaf_recovery_inbox_item(inbox_item);
 
         let initial_epoch = alice
             .orchestrator
@@ -1779,7 +1836,10 @@ mod tests {
             .mls_context()
             .get_epoch(hex::decode(&created.group_id).unwrap())
             .expect("alice epoch after add");
-        assert_eq!(updated_epoch, 1, "local epoch must advance after Add commit");
+        assert_eq!(
+            updated_epoch, 1,
+            "local epoch must advance after Add commit"
+        );
 
         let requests = world.delivery_service().submitted_prepared_requests();
         let transition_req = requests
@@ -1788,8 +1848,12 @@ mod tests {
             .expect("must submit transition with leaf recovery fulfillment");
 
         let body_bytes = transition_req.body.as_deref().unwrap_or(&[]);
-        let body_val: serde_json::Value = serde_json::from_slice(body_bytes).expect("parse transition body");
-        let inner = body_val.get("signedRequest").and_then(|s| s.get("body")).unwrap_or(&body_val);
+        let body_val: serde_json::Value =
+            serde_json::from_slice(body_bytes).expect("parse transition body");
+        let inner = body_val
+            .get("signedRequest")
+            .and_then(|s| s.get("body"))
+            .unwrap_or(&body_val);
         assert_eq!(
             inner.get("$type").and_then(|v| v.as_str()),
             Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody")
@@ -1800,7 +1864,10 @@ mod tests {
     async fn leafless_device_sync_requests_leaf_recovery() {
         let mut world = TestWorld::new();
         world.add_client("Alice").await;
-        world.register_device("Alice").await.expect("register alice device 1");
+        world
+            .register_device("Alice")
+            .await
+            .expect("register alice device 1");
         let alice = world.client("Alice");
 
         let created = alice
@@ -1812,7 +1879,10 @@ mod tests {
 
         // Alice Device 2
         world.add_client_with_did("AliceDev2", &alice_did).await;
-        world.register_device("AliceDev2").await.expect("register alice device 2");
+        world
+            .register_device("AliceDev2")
+            .await
+            .expect("register alice device 2");
         let alice_dev2 = world.client("AliceDev2");
 
         // Make get_group_info fail so join_or_rejoin cannot use External Commit and falls back to leaf recovery
@@ -1833,8 +1903,12 @@ mod tests {
             .expect("leafless device must submit RequestLeafRecovery during sync");
 
         let body_bytes = rec_req.body.as_deref().unwrap_or(&[]);
-        let body_val: serde_json::Value = serde_json::from_slice(body_bytes).expect("parse recovery body");
-        let inner = body_val.get("signedRequest").and_then(|s| s.get("body")).unwrap_or(&body_val);
+        let body_val: serde_json::Value =
+            serde_json::from_slice(body_bytes).expect("parse recovery body");
+        let inner = body_val
+            .get("signedRequest")
+            .and_then(|s| s.get("body"))
+            .unwrap_or(&body_val);
         assert_eq!(
             inner.get("recoveryKind").and_then(|v| v.as_str()),
             Some("add")
@@ -2186,10 +2260,7 @@ where
             tracing::warn!(group_id = %group_id_hex, "Cleaning up local MLS group after create_group failure");
             let cleanup_id = rollback.cleanup_conversation_id();
             let cleanup_complete = self
-                .force_delete_local_with_group(
-                    &cleanup_id,
-                    Some(&rollback.raw_group_id),
-                )
+                .force_delete_local_with_group(&cleanup_id, Some(&rollback.raw_group_id))
                 .await;
             if cleanup_complete && cleanup_id != rollback.raw_group_id {
                 if let Err(error) = self
@@ -2225,28 +2296,46 @@ where
             .mls_context()
             .export_group_info(group_id_bytes.clone(), scoped_identity.as_bytes().to_vec())?;
 
-        let advertised_id = super::recovery::advertised_group_id_from_group_info(&group_info_bytes)?;
+        let advertised_id =
+            super::recovery::advertised_group_id_from_group_info(&group_info_bytes)?;
         if advertised_id != group_id_bytes {
-            return Err(OrchestratorError::InvalidInput("exported GroupInfo group ID mismatch".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "exported GroupInfo group ID mismatch".into(),
+            ));
         }
         let epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         if epoch != 0 {
-            return Err(OrchestratorError::InvalidInput("genesis GroupInfo epoch must be zero".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "genesis GroupInfo epoch must be zero".into(),
+            ));
         }
-        let confirmation_tag: [u8; 32] = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?
+        let confirmation_tag: [u8; 32] = self
+            .mls_context()
+            .get_confirmation_tag(group_id_bytes.clone())?
             .try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("confirmation tag length mismatch".into())))?;
-        let group_context_hash: [u8; 32] = self.mls_context().get_group_context_hash(group_id_bytes.clone())?
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal(
+                    "confirmation tag length mismatch".into(),
+                ))
+            })?;
+        let group_context_hash: [u8; 32] = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())?
             .try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("group context hash length mismatch".into())))?;
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal(
+                    "group context hash length mismatch".into(),
+                ))
+            })?;
 
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use rand::RngCore;
         use sha2::{Digest, Sha256};
 
         let conversation_id = uuid::Uuid::new_v4().to_string();
-        let convo_uuid = uuid::Uuid::parse_str(&conversation_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let convo_uuid = uuid::Uuid::parse_str(&conversation_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
         let transition_id = uuid::Uuid::new_v4().to_string();
         let idempotency_key = transition_id.clone();
         let actor_device_id = self.require_actor_device_id().await?;
@@ -2256,9 +2345,13 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
-        let public_key = self.mls_context().identity_public_key(scoped_identity.as_bytes().to_vec())?;
+        let public_key = self
+            .mls_context()
+            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
 
         let metadata_plaintext = crate::metadata::GroupMetadataV1 {
@@ -2270,7 +2363,9 @@ where
         };
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let metadata_key = self.mls_context().export_metadata_key(group_id_bytes.clone(), 0)?;
+        let metadata_key = self
+            .mls_context()
+            .export_metadata_key(group_id_bytes.clone(), 0)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -2282,7 +2377,11 @@ where
             &nonce,
             &metadata_plaintext,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt metadata snapshot: {e:?}"
+            )))
+        })?;
         let conversation_kind = if initial_members.dids.map_or(0, |m| m.len()) > 1 {
             "group"
         } else if initial_members.dids.map_or(0, |m| m.len()) == 1 {
@@ -2406,16 +2505,13 @@ where
             return Err(error);
         }
 
-        let resp_json: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(|e| {
-                OrchestratorError::Serialization(format!("create_conversation response: {e}"))
-            })?;
+        let resp_json: serde_json::Value = serde_json::from_slice(&response.body).map_err(|e| {
+            OrchestratorError::Serialization(format!("create_conversation response: {e}"))
+        })?;
 
-        let result_obj = resp_json
-            .get("result")
-            .ok_or_else(|| {
-                OrchestratorError::InvalidInput("create_conversation response missing result".into())
-            })?;
+        let result_obj = resp_json.get("result").ok_or_else(|| {
+            OrchestratorError::InvalidInput("create_conversation response missing result".into())
+        })?;
 
         let result_type = result_obj
             .get("$type")
@@ -2516,7 +2612,10 @@ where
                     }
                     // Mismatched cached row is stale; evict it.
                     self.conversations().lock().await.remove(&resp_convo_id_str);
-                    self.conversation_states().lock().await.remove(&resp_convo_id_str);
+                    self.conversation_states()
+                        .lock()
+                        .await
+                        .remove(&resp_convo_id_str);
                 }
 
                 let stored_view = self
@@ -2547,7 +2646,9 @@ where
                     // while migrating child tables and preserving history.
                 }
 
-                let server_view = self.fetch_conversation_for_convo(&resp_convo_id_str).await?;
+                let server_view = self
+                    .fetch_conversation_for_convo(&resp_convo_id_str)
+                    .await?;
                 if server_view.group_id != expected_group_id_hex {
                     return Err(OrchestratorError::InvalidInput(format!(
                         "existingDirectConversationResult groupId mismatch: coordinate specifies '{expected_group_id_hex}', but server conversation view returned '{}'",
@@ -2625,7 +2726,11 @@ where
             }
         }
 
-        let bootstrap_target_epoch = if initial_members.dids.as_ref().map_or(false, |d| !d.is_empty()) {
+        let bootstrap_target_epoch = if initial_members
+            .dids
+            .as_ref()
+            .map_or(false, |d| !d.is_empty())
+        {
             Some(1)
         } else {
             None
@@ -2643,7 +2748,11 @@ where
             self.conversations().lock().await.remove(group_id_hex);
             self.conversation_states().lock().await.remove(group_id_hex);
 
-            rollback.bind_stable_conversation(parsed_conversation_id, group_id_hex, bootstrap_target_epoch)?;
+            rollback.bind_stable_conversation(
+                parsed_conversation_id,
+                group_id_hex,
+                bootstrap_target_epoch,
+            )?;
             self.arm_stable_local_delete_intent(
                 parsed_conversation_id,
                 &rollback.encoded_delete_authority,
@@ -2654,11 +2763,19 @@ where
                 .clear_pending_local_delete(group_id_hex)
                 .await?;
         } else {
-            rollback.bind_stable_conversation(parsed_conversation_id, group_id_hex, bootstrap_target_epoch)?;
+            rollback.bind_stable_conversation(
+                parsed_conversation_id,
+                group_id_hex,
+                bootstrap_target_epoch,
+            )?;
         }
 
-        self.persist_created_conversation_projection(user_did, parsed_conversation_id, group_id_hex)
-            .await?;
+        self.persist_created_conversation_projection(
+            user_did,
+            parsed_conversation_id,
+            group_id_hex,
+        )
+        .await?;
 
         // Crypto merge is not the application commit point. Persist the
         // stable projection before publishing any cache entry, pruning epoch
@@ -2683,7 +2800,11 @@ where
             epoch: ffi_epoch,
             members: member_views,
             metadata: Some(ConversationMetadata {
-                name: if _name.is_empty() { None } else { Some(_name.to_string()) },
+                name: if _name.is_empty() {
+                    None
+                } else {
+                    Some(_name.to_string())
+                },
                 description: _description.map(|d| d.to_string()),
                 avatar_url: None,
             }),
@@ -2701,7 +2822,10 @@ where
 
         self.cleanup_epoch_secrets_if_needed(&convo_view.conversation_id, group_id_hex, ffi_epoch)
             .await;
-        let _ = self.api_client().publish_group_info(&convo_view.conversation_id, &group_info_bytes).await;
+        let _ = self
+            .api_client()
+            .publish_group_info(&convo_view.conversation_id, &group_info_bytes)
+            .await;
         let ffi_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         let mut final_convo = convo_view;
         final_convo.epoch = ffi_epoch;
@@ -2899,10 +3023,7 @@ where
     ///
     /// Prepares and signs `participantAcceptanceBody` using the inviter's
     /// creation transition ID and submits it to `blue.catbird.chat.acceptConversation`.
-    pub async fn accept_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Result<serde_json::Value> {
+    pub async fn accept_conversation(&self, conversation_id: &str) -> Result<serde_json::Value> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
         let actor_device_id = self.require_actor_device_id().await?;
@@ -2910,7 +3031,9 @@ where
         let convo_uuid = if let Ok(parsed) = uuid::Uuid::parse_str(conversation_id) {
             parsed
         } else {
-            let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+            let resolved = self
+                .resolve_legacy_group_identifier(conversation_id)
+                .await?;
             uuid::Uuid::parse_str(&resolved.conversation_id)
                 .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?
         };
@@ -2918,11 +3041,17 @@ where
         // Fetch conversation state via getConversations to obtain coordinates and invitationProvenance
         let convos_req = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100", actor_device_id),
+            path: format!(
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
+                actor_device_id
+            ),
             method: "GET".to_string(),
             body: None,
         };
-        let convos_resp = self.api_client().submit_prepared_request(convos_req).await?;
+        let convos_resp = self
+            .api_client()
+            .submit_prepared_request(convos_req)
+            .await?;
         if convos_resp.status != 200 {
             return Err(OrchestratorError::Api(format!(
                 "getConversations failed with status {}: {}",
@@ -2932,66 +3061,113 @@ where
         }
         let convos_val: serde_json::Value = serde_json::from_slice(&convos_resp.body)
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
-        let items_arr = convos_val.get("items").and_then(|v| v.as_array())
-            .ok_or_else(|| OrchestratorError::Api("getConversations response missing items array".into()))?;
+        let items_arr = convos_val
+            .get("items")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                OrchestratorError::Api("getConversations response missing items array".into())
+            })?;
 
         let convo_uuid_str = convo_uuid.to_string();
-        let matching_item = items_arr.iter().find(|item| {
-            let st = item.get("state").unwrap_or(item);
-            st.get("coordinates")
-                .and_then(|c| c.get("conversationId"))
-                .and_then(|cid| cid.as_str())
-                .map(|cid| cid == convo_uuid_str)
-                .unwrap_or(false)
-        }).ok_or_else(|| OrchestratorError::Api(format!("conversation {} not found in getConversations", convo_uuid_str)))?;
+        let matching_item = items_arr
+            .iter()
+            .find(|item| {
+                let st = item.get("state").unwrap_or(item);
+                st.get("coordinates")
+                    .and_then(|c| c.get("conversationId"))
+                    .and_then(|cid| cid.as_str())
+                    .map(|cid| cid == convo_uuid_str)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                OrchestratorError::Api(format!(
+                    "conversation {} not found in getConversations",
+                    convo_uuid_str
+                ))
+            })?;
 
         let state_obj = matching_item.get("state").unwrap_or(matching_item);
-        let latest_coord = state_obj.get("coordinates").cloned()
-            .ok_or_else(|| OrchestratorError::Api("conversation state missing coordinates".into()))?;
+        let latest_coord = state_obj.get("coordinates").cloned().ok_or_else(|| {
+            OrchestratorError::Api("conversation state missing coordinates".into())
+        })?;
 
-        let participants = state_obj.get("participants").and_then(|v| v.as_array())
-            .ok_or_else(|| OrchestratorError::Api("conversation state missing participants".into()))?;
+        let participants = state_obj
+            .get("participants")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                OrchestratorError::Api("conversation state missing participants".into())
+            })?;
 
-        let my_participant = participants.iter().find(|p| {
-            p.get("userDid").and_then(|v| v.as_str()) == Some(&user_did)
-        }).ok_or_else(|| OrchestratorError::Api("own participant entry not found in conversation state".into()))?;
+        let my_participant = participants
+            .iter()
+            .find(|p| p.get("userDid").and_then(|v| v.as_str()) == Some(&user_did))
+            .ok_or_else(|| {
+                OrchestratorError::Api(
+                    "own participant entry not found in conversation state".into(),
+                )
+            })?;
 
-        let status = my_participant.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+        let status = my_participant
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
         if status == "active" {
             let gid = latest_coord
                 .get("groupId")
-                .and_then(|v| v.as_str().or_else(|| v.get("$bytes").and_then(|b| b.as_str())))
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("$bytes").and_then(|b| b.as_str()))
+                })
                 .unwrap_or("");
             let gch = latest_coord
                 .get("groupContextHash")
-                .and_then(|v| v.as_str().or_else(|| v.get("$bytes").and_then(|b| b.as_str())))
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("$bytes").and_then(|b| b.as_str()))
+                })
                 .unwrap_or("");
             let tag = latest_coord
                 .get("confirmationTag")
-                .and_then(|v| v.as_str().or_else(|| v.get("$bytes").and_then(|b| b.as_str())))
+                .and_then(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("$bytes").and_then(|b| b.as_str()))
+                })
                 .unwrap_or("");
-            let epoch = latest_coord.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
-            let sv = latest_coord.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(0);
-            return self.request_leaf_recovery(
-                &convo_uuid_str,
-                Some("add"),
-                gid,
-                gch,
-                tag,
-                epoch,
-                sv,
-            ).await;
+            let epoch = latest_coord
+                .get("epoch")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let sv = latest_coord
+                .get("stateVersion")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            return self
+                .request_leaf_recovery(&convo_uuid_str, Some("add"), gid, gch, tag, epoch, sv)
+                .await;
         }
 
-        let prov = my_participant.get("invitationProvenance")
-            .ok_or_else(|| OrchestratorError::Api("own participant entry missing invitationProvenance".into()))?;
+        let prov = my_participant.get("invitationProvenance").ok_or_else(|| {
+            OrchestratorError::Api("own participant entry missing invitationProvenance".into())
+        })?;
 
-        let invitation_transition_id = prov.get("invitationTransitionId").and_then(|v| v.as_str())
-            .ok_or_else(|| OrchestratorError::Api("invitationProvenance missing invitationTransitionId".into()))?;
-        let invited_by_did = prov.get("invitedByDid").and_then(|v| v.as_str())
-            .ok_or_else(|| OrchestratorError::Api("invitationProvenance missing invitedByDid".into()))?;
-        let invited_by_device_id = prov.get("invitedByDeviceId").and_then(|v| v.as_str())
-            .ok_or_else(|| OrchestratorError::Api("invitationProvenance missing invitedByDeviceId".into()))?;
+        let invitation_transition_id = prov
+            .get("invitationTransitionId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Api("invitationProvenance missing invitationTransitionId".into())
+            })?;
+        let invited_by_did = prov
+            .get("invitedByDid")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Api("invitationProvenance missing invitedByDid".into())
+            })?;
+        let invited_by_device_id = prov
+            .get("invitedByDeviceId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Api("invitationProvenance missing invitedByDeviceId".into())
+            })?;
 
         self.accept_conversation_with_invitation(
             conversation_id,
@@ -2999,7 +3175,8 @@ where
             invited_by_did,
             invited_by_device_id,
             latest_coord,
-        ).await
+        )
+        .await
     }
 
     /// Accept an invitation to a conversation with known invitation provenance and prior coordinate.
@@ -3020,7 +3197,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -3029,7 +3208,10 @@ where
         let key_id = super::canonical_transport::derive_key_id(&public_key);
 
         let mut next_coord = prior_coord.clone();
-        let prior_sv = prior_coord.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(0);
+        let prior_sv = prior_coord
+            .get("stateVersion")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         if let Some(obj) = next_coord.as_object_mut() {
             obj.insert("stateVersion".to_string(), serde_json::json!(prior_sv + 1));
         }
@@ -3099,7 +3281,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -3110,7 +3294,9 @@ where
         let convo_uuid = if let Ok(parsed) = uuid::Uuid::parse_str(conversation_id) {
             parsed
         } else {
-            let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+            let resolved = self
+                .resolve_legacy_group_identifier(conversation_id)
+                .await?;
             uuid::Uuid::parse_str(&resolved.conversation_id)
                 .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?
         };
@@ -3161,11 +3347,9 @@ where
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
         Ok(output)
     }
-    pub async fn fulfill_leaf_recovery(
-        &self,
-        conversation_id: &str,
-    ) -> Result<serde_json::Value> {
-        self.fulfill_leaf_recovery_with_target(conversation_id, None, None, None, None, None).await
+    pub async fn fulfill_leaf_recovery(&self, conversation_id: &str) -> Result<serde_json::Value> {
+        self.fulfill_leaf_recovery_with_target(conversation_id, None, None, None, None, None)
+            .await
     }
 
     /// Fulfill an open leaf recovery request, optionally taking explicit target recovery metadata.
@@ -3187,7 +3371,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -3195,7 +3381,9 @@ where
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
 
-        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let resolved = self
+            .resolve_legacy_group_identifier(conversation_id)
+            .await?;
         let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id)
             .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?;
         let group_id_bytes = resolved.group_id_bytes()?;
@@ -3207,7 +3395,10 @@ where
             method: "GET".to_string(),
             body: None,
         };
-        let entries_resp = self.api_client().submit_prepared_request(entries_req).await?;
+        let entries_resp = self
+            .api_client()
+            .submit_prepared_request(entries_req)
+            .await?;
         if entries_resp.status != 200 {
             return Err(OrchestratorError::Api(format!(
                 "getEntries failed with status {}: {}",
@@ -3217,16 +3408,26 @@ where
         }
         let entries_val: serde_json::Value = serde_json::from_slice(&entries_resp.body)
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
-        let entries_arr = entries_val.get("entries").and_then(|v| v.as_array())
-            .ok_or_else(|| OrchestratorError::Api("getEntries response missing entries array".into()))?;
-        tracing::debug!(entries_count = entries_arr.len(), "Inspecting getEntries for leaf recovery");
+        let entries_arr = entries_val
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                OrchestratorError::Api("getEntries response missing entries array".into())
+            })?;
+        tracing::debug!(
+            entries_count = entries_arr.len(),
+            "Inspecting getEntries for leaf recovery"
+        );
         let mut open_recovery: Option<serde_json::Value> = None;
         let mut prior_coord: Option<serde_json::Value> = None;
 
         let mut fulfilled_recovery_ids = std::collections::HashSet::new();
         for entry in entries_arr.iter() {
             let entry_type = entry.get("$type").and_then(|v| v.as_str()).unwrap_or("");
-            if entry_type.contains("participantAcceptanceEntry") || entry_type.contains("leafRecoveryFulfillmentEntry") || entry_type.contains("creationEntry") {
+            if entry_type.contains("participantAcceptanceEntry")
+                || entry_type.contains("leafRecoveryFulfillmentEntry")
+                || entry_type.contains("creationEntry")
+            {
                 if let Some(sr) = entry.get("signedRequest").and_then(|sr| sr.get("body")) {
                     if let Some(next_c) = sr.get("next") {
                         prior_coord = Some(next_c.clone());
@@ -3240,7 +3441,9 @@ where
             }
         }
 
-        let identities = self.mls_context().group_member_identities(group_id_bytes.clone())?;
+        let identities = self
+            .mls_context()
+            .group_member_identities(group_id_bytes.clone())?;
         let existing_dids: std::collections::HashSet<String> = identities
             .iter()
             .filter_map(|raw| String::from_utf8(raw.clone()).ok())
@@ -3250,7 +3453,10 @@ where
 
         let convos_req = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50", actor_device_id),
+            path: format!(
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
+                actor_device_id
+            ),
             method: "GET".to_string(),
             body: None,
         };
@@ -3258,15 +3464,26 @@ where
         let mut prior_metadata_snapshot: Option<serde_json::Value> = None;
         if let Ok(convos_resp) = self.api_client().submit_prepared_request(convos_req).await {
             if convos_resp.status == 200 {
-                if let Ok(convos_val) = serde_json::from_slice::<serde_json::Value>(&convos_resp.body) {
-                    inventory_session_id = convos_val.get("inventorySessionId").and_then(|v| v.as_str()).map(ToString::to_string);
+                if let Ok(convos_val) =
+                    serde_json::from_slice::<serde_json::Value>(&convos_resp.body)
+                {
+                    inventory_session_id = convos_val
+                        .get("inventorySessionId")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
                     if let Some(items) = convos_val.get("items").and_then(|v| v.as_array()) {
                         let convo_uuid_str = convo_uuid.to_string();
                         for item in items {
                             let st = item.get("state").unwrap_or(item);
-                            let cid = st.get("coordinates").and_then(|c| c.get("conversationId")).and_then(|v| v.as_str());
+                            let cid = st
+                                .get("coordinates")
+                                .and_then(|c| c.get("conversationId"))
+                                .and_then(|v| v.as_str());
                             if cid == Some(&convo_uuid_str) {
-                                prior_metadata_snapshot = st.get("metadataSnapshot").cloned().or_else(|| st.get("metadata").cloned());
+                                prior_metadata_snapshot = st
+                                    .get("metadataSnapshot")
+                                    .cloned()
+                                    .or_else(|| st.get("metadata").cloned());
                                 if prior_coord.is_none() {
                                     prior_coord = st.get("coordinates").cloned();
                                 }
@@ -3287,25 +3504,47 @@ where
             };
             if let Ok(inbox_resp) = self.api_client().submit_prepared_request(inbox_req).await {
                 if inbox_resp.status == 200 {
-                    if let Ok(inbox_val) = serde_json::from_slice::<serde_json::Value>(&inbox_resp.body) {
+                    if let Ok(inbox_val) =
+                        serde_json::from_slice::<serde_json::Value>(&inbox_resp.body)
+                    {
                         if let Some(items) = inbox_val.get("items").and_then(|v| v.as_array()) {
                             let convo_uuid_str = convo_uuid.to_string();
                             for item in items {
                                 let rec = item.get("recovery").unwrap_or(item);
-                                let cid = rec.get("conversationId").and_then(|v| v.as_str())
-                                    .or_else(|| rec.get("boundCoordinate").and_then(|c| c.get("conversationId")).and_then(|v| v.as_str()));
+                                let cid = rec
+                                    .get("conversationId")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| {
+                                        rec.get("boundCoordinate")
+                                            .and_then(|c| c.get("conversationId"))
+                                            .and_then(|v| v.as_str())
+                                    });
                                 if cid != Some(&convo_uuid_str) {
                                     continue;
                                 }
-                                let r_id = rec.get("recoveryRequestId").and_then(|v| v.as_str()).unwrap_or("");
-                                let r_did = rec.get("requesterDid").and_then(|v| v.as_str()).unwrap_or("");
-                                let r_kind = rec.get("recoveryKind").and_then(|v| v.as_str()).unwrap_or("add");
-                                let status = rec.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                let r_id = rec
+                                    .get("recoveryRequestId")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let r_did = rec
+                                    .get("requesterDid")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let r_kind = rec
+                                    .get("recoveryKind")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("add");
+                                let status =
+                                    rec.get("status").and_then(|v| v.as_str()).unwrap_or("");
                                 if !status.is_empty() && status != "open" {
                                     continue;
                                 }
-                                if let Some(expires_at_str) = rec.get("expiresAt").and_then(|v| v.as_str()) {
-                                    if let Ok(exp) = chrono::DateTime::parse_from_rfc3339(expires_at_str) {
+                                if let Some(expires_at_str) =
+                                    rec.get("expiresAt").and_then(|v| v.as_str())
+                                {
+                                    if let Ok(exp) =
+                                        chrono::DateTime::parse_from_rfc3339(expires_at_str)
+                                    {
                                         if exp < chrono::Utc::now() {
                                             continue;
                                         }
@@ -3338,9 +3577,18 @@ where
         if open_recovery.is_none() {
             for entry in entries_arr.iter() {
                 if let Some(rec) = entry.get("recovery") {
-                    let r_id = rec.get("recoveryRequestId").and_then(|v| v.as_str()).unwrap_or("");
-                    let r_did = rec.get("requesterDid").and_then(|v| v.as_str()).unwrap_or("");
-                    let r_kind = rec.get("recoveryKind").and_then(|v| v.as_str()).unwrap_or("add");
+                    let r_id = rec
+                        .get("recoveryRequestId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let r_did = rec
+                        .get("requesterDid")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let r_kind = rec
+                        .get("recoveryKind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("add");
                     let status = rec.get("status").and_then(|v| v.as_str()).unwrap_or("");
                     if !status.is_empty() && status != "open" {
                         continue;
@@ -3374,69 +3622,123 @@ where
             }
         }
 
-        let (recovery_request_id, requester_did, requester_device_id, key_package_ref_b64, kp_bytes) = if let (Some(r_id), Some(r_did), Some(r_dev)) = (
+        let (
+            recovery_request_id,
+            requester_did,
+            requester_device_id,
+            key_package_ref_b64,
+            kp_bytes,
+        ) = if let (Some(r_id), Some(r_did), Some(r_dev)) = (
             explicit_recovery_request_id,
             explicit_requester_did,
             explicit_requester_device_id,
         ) {
-            let (kp_bytes, ref_b64) = if let (Some(kp_b64), Some(r_b64)) = (explicit_key_package_b64, explicit_key_package_ref_b64) {
-                let bytes = STANDARD.decode(kp_b64).map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+            let (kp_bytes, ref_b64) = if let (Some(kp_b64), Some(r_b64)) =
+                (explicit_key_package_b64, explicit_key_package_ref_b64)
+            {
+                let bytes = STANDARD
+                    .decode(kp_b64)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
                 (bytes, r_b64.to_string())
             } else if let Some(rec) = &open_recovery {
-                let reservation = rec.get("reservation")
+                let reservation = rec
+                    .get("reservation")
                     .ok_or_else(|| OrchestratorError::Api("recovery missing reservation".into()))?;
-                let ref_b64 = reservation.get("keyPackageRef").and_then(|v| v.as_str())
-                    .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackageRef".into()))?.to_string();
+                let ref_b64 = reservation
+                    .get("keyPackageRef")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        OrchestratorError::Api("reservation missing keyPackageRef".into())
+                    })?
+                    .to_string();
                 let kp_bytes = if let Some(kp_obj) = reservation.get("keyPackage") {
                     if let Some(b_str) = kp_obj.get("bytes").and_then(|v| v.as_str()) {
-                        STANDARD.decode(b_str).map_err(|e| OrchestratorError::Serialization(e.to_string()))?
+                        STANDARD
+                            .decode(b_str)
+                            .map_err(|e| OrchestratorError::Serialization(e.to_string()))?
                     } else {
                         return Err(OrchestratorError::Api("keyPackage missing bytes".into()));
                     }
                 } else {
-                    return Err(OrchestratorError::Api("reservation missing keyPackage".into()));
+                    return Err(OrchestratorError::Api(
+                        "reservation missing keyPackage".into(),
+                    ));
                 };
                 (kp_bytes, ref_b64)
             } else if let Some(kp_b64) = explicit_key_package_b64 {
-                let bytes = STANDARD.decode(kp_b64).map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+                let bytes = STANDARD
+                    .decode(kp_b64)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
                 let ref_b64 = STANDARD.encode(Sha256::digest(&bytes));
                 (bytes, ref_b64)
             } else {
-                return Err(OrchestratorError::Api("explicit recovery fulfillment requires key package bytes and ref".into()));
+                return Err(OrchestratorError::Api(
+                    "explicit recovery fulfillment requires key package bytes and ref".into(),
+                ));
             };
-            (r_id.to_string(), r_did.to_string(), r_dev.to_string(), ref_b64, kp_bytes)
+            (
+                r_id.to_string(),
+                r_did.to_string(),
+                r_dev.to_string(),
+                ref_b64,
+                kp_bytes,
+            )
         } else {
             let recovery = open_recovery.ok_or_else(|| {
                 OrchestratorError::Api("no open leaf recovery found to fulfill".into())
             })?;
             tracing::debug!(recovery = ?recovery, "Target open recovery found");
 
-            let recovery_request_id = recovery.get("recoveryRequestId").and_then(|v| v.as_str())
-                .ok_or_else(|| OrchestratorError::Api("recovery missing recoveryRequestId".into()))?.to_string();
-            let requester_did = recovery.get("requesterDid").and_then(|v| v.as_str())
-                .ok_or_else(|| OrchestratorError::Api("recovery missing requesterDid".into()))?.to_string();
-            let requester_device_id = recovery.get("requesterDeviceId").and_then(|v| v.as_str())
-                .ok_or_else(|| OrchestratorError::Api("recovery missing requesterDeviceId".into()))?.to_string();
+            let recovery_request_id = recovery
+                .get("recoveryRequestId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| OrchestratorError::Api("recovery missing recoveryRequestId".into()))?
+                .to_string();
+            let requester_did = recovery
+                .get("requesterDid")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| OrchestratorError::Api("recovery missing requesterDid".into()))?
+                .to_string();
+            let requester_device_id = recovery
+                .get("requesterDeviceId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| OrchestratorError::Api("recovery missing requesterDeviceId".into()))?
+                .to_string();
 
-            let reservation = recovery.get("reservation")
+            let reservation = recovery
+                .get("reservation")
                 .ok_or_else(|| OrchestratorError::Api("recovery missing reservation".into()))?;
-            let key_package_ref_b64 = reservation.get("keyPackageRef").and_then(|v| v.as_str())
-                .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackageRef".into()))?.to_string();
+            let key_package_ref_b64 = reservation
+                .get("keyPackageRef")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackageRef".into()))?
+                .to_string();
 
             let kp_bytes = if let Some(kp_obj) = reservation.get("keyPackage") {
                 if let Some(b_str) = kp_obj.get("bytes").and_then(|v| v.as_str()) {
-                    STANDARD.decode(b_str).map_err(|e| OrchestratorError::Serialization(e.to_string()))?
+                    STANDARD
+                        .decode(b_str)
+                        .map_err(|e| OrchestratorError::Serialization(e.to_string()))?
                 } else {
                     return Err(OrchestratorError::Api("keyPackage missing bytes".into()));
                 }
             } else {
-                return Err(OrchestratorError::Api("reservation missing keyPackage".into()));
+                return Err(OrchestratorError::Api(
+                    "reservation missing keyPackage".into(),
+                ));
             };
-            (recovery_request_id, requester_did, requester_device_id, key_package_ref_b64, kp_bytes)
+            (
+                recovery_request_id,
+                requester_did,
+                requester_device_id,
+                key_package_ref_b64,
+                kp_bytes,
+            )
         };
 
-
-        let identities = self.mls_context().group_member_identities(group_id_bytes.clone())?;
+        let identities = self
+            .mls_context()
+            .group_member_identities(group_id_bytes.clone())?;
         let remove_dids: Vec<String> = identities
             .iter()
             .filter_map(|raw| String::from_utf8(raw.clone()).ok())
@@ -3446,13 +3748,23 @@ where
         let transition_id = uuid::Uuid::new_v4().to_string();
         let welcome_id = uuid::Uuid::new_v4().to_string();
 
-        let prior = prior_coord.ok_or_else(|| OrchestratorError::Api("could not determine prior coordinate".into()))?;
-        let prior_sv = prior.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(1);
+        let prior = prior_coord
+            .ok_or_else(|| OrchestratorError::Api("could not determine prior coordinate".into()))?;
+        let prior_sv = prior
+            .get("stateVersion")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
         let prior_epoch = prior.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
 
         let pm = prior_metadata_snapshot.unwrap_or(serde_json::json!({}));
-        let metadata_version = pm.get("metadataVersion").and_then(|v| v.as_i64()).unwrap_or(1);
-        let origin_transition_id = pm.get("originTransitionId").cloned().unwrap_or(serde_json::json!(transition_id));
+        let metadata_version = pm
+            .get("metadataVersion")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1);
+        let origin_transition_id = pm
+            .get("originTransitionId")
+            .cloned()
+            .unwrap_or(serde_json::json!(transition_id));
         let author_proof = pm.get("authorProof").cloned().unwrap_or_else(|| {
             serde_json::json!({
                 "authGenerationAtOrigin": pm.get("authorAuthGeneration").and_then(|v| v.as_i64()).unwrap_or(auth_generation),
@@ -3468,16 +3780,28 @@ where
         });
         let avatar_binding = pm.get("avatarBinding").cloned();
 
-        let prior_ct_b64 = pm.get("ciphertext")
-            .and_then(|v| v.get("$bytes").and_then(|b| b.as_str()).or_else(|| v.as_str()))
+        let prior_ct_b64 = pm
+            .get("ciphertext")
+            .and_then(|v| {
+                v.get("$bytes")
+                    .and_then(|b| b.as_str())
+                    .or_else(|| v.as_str())
+            })
             .unwrap_or("");
-        let prior_nonce_b64 = pm.get("nonce")
-            .and_then(|v| v.get("$bytes").and_then(|b| b.as_str()).or_else(|| v.as_str()))
+        let prior_nonce_b64 = pm
+            .get("nonce")
+            .and_then(|v| {
+                v.get("$bytes")
+                    .and_then(|b| b.as_str())
+                    .or_else(|| v.as_str())
+            })
             .unwrap_or("");
         let prior_ct = STANDARD.decode(prior_ct_b64).unwrap_or_default();
         let prior_nonce = STANDARD.decode(prior_nonce_b64).unwrap_or_default();
 
-        let epoch_0_key = self.mls_context().export_metadata_key(group_id_bytes.clone(), prior_epoch)?;
+        let epoch_0_key = self
+            .mls_context()
+            .export_metadata_key(group_id_bytes.clone(), prior_epoch)?;
         let epoch_0_key_arr: [u8; 32] = epoch_0_key.as_slice().try_into().unwrap_or([0u8; 32]);
         let full_blob = if prior_ct.len() >= 28 {
             prior_ct.clone()
@@ -3495,7 +3819,8 @@ where
                 prior_epoch,
                 metadata_version as u64,
                 &full_blob,
-            ).unwrap_or_else(|e| {
+            )
+            .unwrap_or_else(|e| {
                 tracing::debug!(error = ?e, "Decrypt metadata failed");
                 crate::metadata::GroupMetadataV1 {
                     version: metadata_version as u32,
@@ -3517,7 +3842,10 @@ where
 
         let mut aad_prior = prior.clone();
         if let Some(obj) = aad_prior.as_object_mut() {
-            obj.insert("conversationId".to_string(), serde_json::json!(STANDARD.encode(convo_uuid.as_bytes())));
+            obj.insert(
+                "conversationId".to_string(),
+                serde_json::json!(STANDARD.encode(convo_uuid.as_bytes())),
+            );
         }
 
         let aad_json = serde_json::json!({
@@ -3527,14 +3855,17 @@ where
             "transitionId": STANDARD.encode(uuid::Uuid::parse_str(&transition_id).map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?.as_bytes()),
             "prior": aad_prior
         });
-        let aad_cbor = super::canonical_transport::canonical_cbor_for_schema("commitAad", &aad_json, false)
-            .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+        let aad_cbor =
+            super::canonical_transport::canonical_cbor_for_schema("commitAad", &aad_json, false)
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
         let mut aad_bytes = b"CATBIRD-CHAT-MLS-AAD-COMMIT\0".to_vec();
         aad_bytes.extend_from_slice(&aad_cbor);
 
         let add_res = self.mls_context().add_members_with_aad(
             group_id_bytes.clone(),
-            vec![crate::KeyPackageData { data: kp_bytes.clone() }],
+            vec![crate::KeyPackageData {
+                data: kp_bytes.clone(),
+            }],
             Some(aad_bytes),
         )?;
         let commit_bytes = add_res.commit_data;
@@ -3543,10 +3874,14 @@ where
         let target_epoch = current_epoch + 1;
 
         let next_tag = add_res.next_confirmation_tag.ok_or_else(|| {
-            OrchestratorError::Mls(MLSError::Internal("add_members produced no confirmation tag".into()))
+            OrchestratorError::Mls(MLSError::Internal(
+                "add_members produced no confirmation tag".into(),
+            ))
         })?;
         let next_gch = add_res.next_group_context_hash.ok_or_else(|| {
-            OrchestratorError::Mls(MLSError::Internal("add_members produced no group context hash".into()))
+            OrchestratorError::Mls(MLSError::Internal(
+                "add_members produced no group context hash".into(),
+            ))
         })?;
         let next_coord = serde_json::json!({
             "conversationId": resolved.conversation_id,
@@ -3559,7 +3894,9 @@ where
             "lifecycle": "active"
         });
 
-        let metadata_key = self.mls_context().export_metadata_key_from_pending(group_id_bytes.clone(), target_epoch)?;
+        let metadata_key = self
+            .mls_context()
+            .export_metadata_key_from_pending(group_id_bytes.clone(), target_epoch)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -3574,8 +3911,15 @@ where
             &nonce,
             &metadata_plaintext,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
-        tracing::debug!(ciphertext_len = ciphertext.len(), "Re-encrypted metadata ciphertext");
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt metadata snapshot: {e:?}"
+            )))
+        })?;
+        tracing::debug!(
+            ciphertext_len = ciphertext.len(),
+            "Re-encrypted metadata ciphertext"
+        );
 
         let mut leaf_changes = Vec::new();
         if !remove_dids.is_empty() {
@@ -3611,7 +3955,10 @@ where
             "authorProof": author_proof
         });
         if let Some(ab) = avatar_binding {
-            metadata_snapshot_json.as_object_mut().unwrap().insert("avatarBinding".to_string(), ab);
+            metadata_snapshot_json
+                .as_object_mut()
+                .unwrap()
+                .insert("avatarBinding".to_string(), ab);
         }
 
         let body = serde_json::json!({
@@ -3681,7 +4028,8 @@ where
             )));
         }
 
-        self.mls_context().merge_pending_commit(group_id_bytes.clone())?;
+        self.mls_context()
+            .merge_pending_commit(group_id_bytes.clone())?;
         tracing::info!(conversation_id = %convo_uuid, epoch = target_epoch, "Successfully fulfilled leaf recovery and advanced local epoch");
 
         let output: serde_json::Value = serde_json::from_slice(&server_resp.body)
@@ -3705,7 +4053,10 @@ where
         // Query getConversations to obtain inventorySessionId
         let convos_req = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50", actor_device_id),
+            path: format!(
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
+                actor_device_id
+            ),
             method: "GET".to_string(),
             body: None,
         };
@@ -3717,7 +4068,10 @@ where
             Ok(val) => val,
             Err(_) => return Ok(0),
         };
-        let inventory_session_id = match convos_val.get("inventorySessionId").and_then(|v| v.as_str()) {
+        let inventory_session_id = match convos_val
+            .get("inventorySessionId")
+            .and_then(|v| v.as_str())
+        {
             Some(s) => s,
             None => return Ok(0),
         };
@@ -3744,8 +4098,14 @@ where
         let mut fulfilled_count = 0;
         for item in items {
             let rec = item.get("recovery").unwrap_or(item);
-            let cid = match rec.get("conversationId").and_then(|v| v.as_str())
-                .or_else(|| rec.get("boundCoordinate").and_then(|c| c.get("conversationId")).and_then(|v| v.as_str())) {
+            let cid = match rec
+                .get("conversationId")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    rec.get("boundCoordinate")
+                        .and_then(|c| c.get("conversationId"))
+                        .and_then(|v| v.as_str())
+                }) {
                 Some(c) => c,
                 None => continue,
             };
@@ -3778,7 +4138,10 @@ where
             let r_did = rec.get("requesterDid").and_then(|v| v.as_str());
             let r_dev = rec.get("requesterDeviceId").and_then(|v| v.as_str());
 
-            match self.fulfill_leaf_recovery_with_target(cid, r_id, r_did, r_dev, None, None).await {
+            match self
+                .fulfill_leaf_recovery_with_target(cid, r_id, r_did, r_dev, None, None)
+                .await
+            {
                 Ok(_) => {
                     tracing::info!(conversation_id = %cid, "Successfully fulfilled pending leaf recovery request from inbox");
                     fulfilled_count += 1;
@@ -3800,7 +4163,9 @@ where
         let convo_uuid = if let Ok(parsed) = uuid::Uuid::parse_str(conversation_id) {
             parsed
         } else {
-            let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+            let resolved = self
+                .resolve_legacy_group_identifier(conversation_id)
+                .await?;
             uuid::Uuid::parse_str(&resolved.conversation_id)
                 .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?
         };
@@ -3812,7 +4177,10 @@ where
             method: "GET".to_string(),
             body: None,
         };
-        let entries_resp = self.api_client().submit_prepared_request(entries_req).await?;
+        let entries_resp = self
+            .api_client()
+            .submit_prepared_request(entries_req)
+            .await?;
         if entries_resp.status != 200 {
             return Err(OrchestratorError::Api(format!(
                 "getEntries failed with status {}: {}",
@@ -3822,15 +4190,20 @@ where
         }
         let entries_val: serde_json::Value = serde_json::from_slice(&entries_resp.body)
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
-        let entries_arr = entries_val.get("entries").and_then(|v| v.as_array())
-            .ok_or_else(|| OrchestratorError::Api("getEntries response missing entries array".into()))?;
+        let entries_arr = entries_val
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                OrchestratorError::Api("getEntries response missing entries array".into())
+            })?;
 
         let mut last_err = None;
         for entry in entries_arr.iter().rev() {
             if let Some(sr) = entry.get("signedRequest").and_then(|sr| sr.get("body")) {
                 if let Some(manifest) = sr.get("manifest") {
                     if let Some(wb) = manifest.get("welcomeBundle") {
-                        let welcome_b64 = wb.get("opaqueWelcome")
+                        let welcome_b64 = wb
+                            .get("opaqueWelcome")
                             .or_else(|| wb.get("welcome").and_then(|w| w.get("bytes")))
                             .and_then(|v| v.as_str());
                         if let Some(b64) = welcome_b64 {
@@ -3851,7 +4224,9 @@ where
         if let Some(e) = last_err {
             return Err(e);
         }
-        Err(OrchestratorError::Api("No Welcome message found in conversation entries".into()))
+        Err(OrchestratorError::Api(
+            "No Welcome message found in conversation entries".into(),
+        ))
     }
 
     /// Join an existing group via a Welcome message.
@@ -4134,13 +4509,16 @@ where
             return Ok(());
         }
 
-        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let resolved = self
+            .resolve_legacy_group_identifier(conversation_id)
+            .await?;
         let group_id = &resolved.group_id;
         let conversation_id = &resolved.conversation_id;
         let group_id_bytes = hex::decode(group_id).unwrap_or_default();
 
-        let _convo_uuid = uuid::Uuid::parse_str(conversation_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let _convo_uuid = uuid::Uuid::parse_str(conversation_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
 
         let user_did = self.require_user_did().await?;
         let actor_device_id = self.require_actor_device_id().await?;
@@ -4150,7 +4528,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = format!("{}#{}", user_did, actor_device_id);
         let public_key = self
@@ -4187,9 +4567,7 @@ where
         }
 
         // Fail closed for already-present participants
-        let existing_participants = convo_state
-            .get("participants")
-            .and_then(|v| v.as_array());
+        let existing_participants = convo_state.get("participants").and_then(|v| v.as_array());
 
         let transition_uuid = uuid::Uuid::new_v4();
         let transition_id = transition_uuid.to_string();
@@ -4240,19 +4618,30 @@ where
             a_did.cmp(b_did)
         });
 
-        let prior_sv = prior_coord.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(0);
-        let prior_epoch = prior_coord.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
-        let prior_gen = prior_coord.get("generation").and_then(|v| v.as_u64()).unwrap_or(0);
-        let prior_tag_bytes = extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
-            arr
-        });
-        let prior_gch_bytes = extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
-            arr
-        });
+        let prior_sv = prior_coord
+            .get("stateVersion")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let prior_epoch = prior_coord
+            .get("epoch")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let prior_gen = prior_coord
+            .get("generation")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let prior_tag_bytes =
+            extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
+                arr
+            });
+        let prior_gch_bytes =
+            extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
+                arr
+            });
         let prior_group_id_32 = extract_bytes_32(prior_coord.get("groupId")).unwrap_or_else(|| {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&group_id_bytes[..32.min(group_id_bytes.len())]);
@@ -4329,7 +4718,9 @@ where
         member_dids: &[String],
     ) -> Result<()> {
         self.check_shutdown().await?;
-        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let resolved = self
+            .resolve_legacy_group_identifier(conversation_id)
+            .await?;
         let group_id = &resolved.group_id;
         let conversation_id = &resolved.conversation_id;
         let group_id_bytes = resolved.group_id_bytes()?;
@@ -4349,28 +4740,42 @@ where
 
         use base64::Engine as _;
         use sha2::Digest;
-        let prior_snapshot = self.fetch_current_metadata_snapshot(conversation_id).await?;
+        let prior_snapshot = self
+            .fetch_current_metadata_snapshot(conversation_id)
+            .await?;
         let prior_version = prior_snapshot
             .get("metadataVersion")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| OrchestratorError::InvalidInput("metadataSnapshot.metadataVersion missing".into()))?;
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput("metadataSnapshot.metadataVersion missing".into())
+            })?;
         let decode_bytes = |value: Option<&serde_json::Value>| -> Result<Vec<u8>> {
             let encoded = value
-                .and_then(|v| v.get("$bytes").and_then(|b| b.as_str()).or_else(|| v.as_str()))
-                .ok_or_else(|| OrchestratorError::InvalidInput("metadataSnapshot bytes missing".into()))?;
+                .and_then(|v| {
+                    v.get("$bytes")
+                        .and_then(|b| b.as_str())
+                        .or_else(|| v.as_str())
+                })
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("metadataSnapshot bytes missing".into())
+                })?;
             base64::engine::general_purpose::STANDARD
                 .decode(encoded)
                 .map_err(|e| OrchestratorError::Serialization(e.to_string()))
         };
         let prior_nonce: [u8; 12] = decode_bytes(prior_snapshot.get("nonce"))?
             .try_into()
-            .map_err(|_| OrchestratorError::InvalidInput("metadataSnapshot.nonce must be 12 bytes".into()))?;
+            .map_err(|_| {
+                OrchestratorError::InvalidInput("metadataSnapshot.nonce must be 12 bytes".into())
+            })?;
         let prior_ciphertext = decode_bytes(prior_snapshot.get("ciphertext"))?;
         let prior_key: [u8; 32] = self
             .mls_context()
             .export_metadata_key(group_id_bytes.clone(), current_epoch)?
             .try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into())))?;
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+            })?;
         let metadata = crate::metadata::decrypt_metadata_snapshot(
             &prior_key,
             &group_id_bytes,
@@ -4379,9 +4784,16 @@ where
             &prior_nonce,
             &prior_ciphertext,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("decrypt current metadata: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "decrypt current metadata: {e:?}"
+            )))
+        })?;
 
-        let member_identities: Vec<Vec<u8>> = member_dids.iter().map(|did| did.as_bytes().to_vec()).collect();
+        let member_identities: Vec<Vec<u8>> = member_dids
+            .iter()
+            .map(|did| did.as_bytes().to_vec())
+            .collect();
         let remove_res = self.mls_context().remove_members_with_aad(
             group_id_bytes.clone(),
             member_identities,
@@ -4389,10 +4801,14 @@ where
         )?;
         let commit_bytes = remove_res.commit_data;
         let next_tag = remove_res.next_confirmation_tag.ok_or_else(|| {
-            OrchestratorError::Mls(MLSError::Internal("remove_members produced no confirmation tag".into()))
+            OrchestratorError::Mls(MLSError::Internal(
+                "remove_members produced no confirmation tag".into(),
+            ))
         })?;
         let next_gch = remove_res.next_group_context_hash.ok_or_else(|| {
-            OrchestratorError::Mls(MLSError::Internal("remove_members produced no group context hash".into()))
+            OrchestratorError::Mls(MLSError::Internal(
+                "remove_members produced no group context hash".into(),
+            ))
         })?;
 
         use rand::RngCore;
@@ -4405,7 +4821,11 @@ where
             .mls_context()
             .export_metadata_key_from_pending(group_id_bytes.clone(), target_epoch)?
             .try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("pending metadata key length mismatch".into())))?;
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal(
+                    "pending metadata key length mismatch".into(),
+                ))
+            })?;
         let next_ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
             &pending_key,
             &group_id_bytes,
@@ -4414,15 +4834,27 @@ where
             &next_nonce,
             &metadata,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt removal metadata: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt removal metadata: {e:?}"
+            )))
+        })?;
         if next_ciphertext.len() != prior_ciphertext.len() {
-            let _ = self.mls_context().clear_pending_commit(group_id_bytes.clone());
-            return Err(OrchestratorError::Mls(MLSError::Internal("removal metadata ciphertext length changed".into())));
+            let _ = self
+                .mls_context()
+                .clear_pending_commit(group_id_bytes.clone());
+            return Err(OrchestratorError::Mls(MLSError::Internal(
+                "removal metadata ciphertext length changed".into(),
+            )));
         }
         let mut metadata_snapshot = prior_snapshot;
-        metadata_snapshot["nonce"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(next_nonce));
-        metadata_snapshot["ciphertext"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&next_ciphertext));
-        metadata_snapshot["ciphertextSha256"] = serde_json::json!(base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&next_ciphertext)));
+        metadata_snapshot["nonce"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(next_nonce));
+        metadata_snapshot["ciphertext"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&next_ciphertext));
+        metadata_snapshot["ciphertextSha256"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD
+                .encode(sha2::Sha256::digest(&next_ciphertext)));
         metadata_snapshot["ciphertextSize"] = serde_json::json!(next_ciphertext.len());
         metadata_snapshot["coordinate"] = serde_json::json!({
             "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&next_tag),
@@ -4454,7 +4886,9 @@ where
         match server_result {
             Ok(result) => {
                 if !result.success {
-                    let _ = self.mls_context().clear_pending_commit(group_id_bytes.clone());
+                    let _ = self
+                        .mls_context()
+                        .clear_pending_commit(group_id_bytes.clone());
                     return Err(OrchestratorError::MemberSyncFailed);
                 }
                 if result.new_epoch != target_epoch {
@@ -4514,7 +4948,9 @@ where
                 Ok(())
             }
             Err(e) => {
-                let _ = self.mls_context().clear_pending_commit(group_id_bytes.clone());
+                let _ = self
+                    .mls_context()
+                    .clear_pending_commit(group_id_bytes.clone());
                 Err(e)
             }
         }
@@ -4646,7 +5082,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -4727,7 +5165,9 @@ where
         let resolved = self.resolve_conversation_context(convo_id).await?;
         let group_id_bytes = resolved.group_id_bytes()?;
 
-        let proposal_bytes = self.mls_context().propose_self_remove(group_id_bytes.clone())?;
+        let proposal_bytes = self
+            .mls_context()
+            .propose_self_remove(group_id_bytes.clone())?;
 
         let epoch = {
             let states = self.group_states().lock().await;
@@ -4875,7 +5315,6 @@ where
         self.cleanup_epoch_secrets_if_needed(convo_id, &resolved.group_id, new_epoch)
             .await;
 
-
         tracing::info!(
             convo_id,
             epoch = new_epoch,
@@ -4906,7 +5345,9 @@ where
     ) -> Result<()> {
         self.check_shutdown().await?;
 
-        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let resolved = self
+            .resolve_legacy_group_identifier(conversation_id)
+            .await?;
         let group_id_hex = resolved.group_id.clone();
         let conversation_id = &resolved.conversation_id;
         let group_id_bytes = hex::decode(&group_id_hex).map_err(|_| {
@@ -4924,7 +5365,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -4932,8 +5375,9 @@ where
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
 
-        let convo_uuid = uuid::Uuid::parse_str(conversation_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let convo_uuid = uuid::Uuid::parse_str(conversation_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
         let transition_uuid = uuid::Uuid::new_v4();
         let transition_id = transition_uuid.to_string();
 
@@ -4946,24 +5390,35 @@ where
             .get_group_context_hash(group_id_bytes.clone())
             .unwrap_or_default();
 
-        let (prior_coord, prior_mv, next_entry_seq) = match self.fetch_current_conversation_coordinates(conversation_id).await {
+        let (prior_coord, prior_mv, next_entry_seq) = match self
+            .fetch_current_conversation_coordinates(conversation_id)
+            .await
+        {
             Ok((c, mv, s)) => (c, mv, s),
             Err(_) => (serde_json::json!({}), 0, 1),
         };
         let target_metadata_version = (prior_mv + 1) as u64;
 
-        let prior_sv = prior_coord.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(0);
-        let prior_epoch = prior_coord.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
-        let prior_tag_bytes = extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
-            arr
-        });
-        let prior_gch_bytes = extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
-            arr
-        });
+        let prior_sv = prior_coord
+            .get("stateVersion")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let prior_epoch = prior_coord
+            .get("epoch")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let prior_tag_bytes =
+            extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
+                arr
+            });
+        let prior_gch_bytes =
+            extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
+                arr
+            });
         let prior_group_id_32 = extract_bytes_32(prior_coord.get("groupId")).unwrap_or_else(|| {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&group_id_bytes[..32.min(group_id_bytes.len())]);
@@ -4971,7 +5426,9 @@ where
         });
 
         // 1. Encrypt new metadata blob under the current epoch's exporter key
-        let metadata_key = self.mls_context().export_metadata_key(group_id_bytes.clone(), prior_epoch)?;
+        let metadata_key = self
+            .mls_context()
+            .export_metadata_key(group_id_bytes.clone(), prior_epoch)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -4996,7 +5453,11 @@ where
             &nonce,
             &payload,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt metadata snapshot: {e:?}"
+            )))
+        })?;
 
         let metadata_snapshot = serde_json::json!({
             "coordinate": {
@@ -5643,7 +6104,6 @@ where
                 {
                     match self
                         .storage()
-
                         .clear_reset_pending_for_delete(convo_id, reset.reset_generation)
                         .await
                     {
@@ -5744,7 +6204,6 @@ where
         }
     }
 
-
     async fn submit_commit_transition_helper(
         &self,
         conversation_id: &str,
@@ -5780,14 +6239,13 @@ where
         target_epoch: u64,
     ) -> Result<CommitAadContext> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        let convo_uuid = uuid::Uuid::parse_str(conversation_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let convo_uuid = uuid::Uuid::parse_str(conversation_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
         let transition_uuid = uuid::Uuid::new_v4();
         let transition_id = transition_uuid.to_string();
 
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(group_id.to_vec())?;
+        let tag_bytes = self.mls_context().get_confirmation_tag(group_id.to_vec())?;
         let gc_hash_bytes = self
             .mls_context()
             .get_group_context_hash(group_id.to_vec())?;
@@ -5810,32 +6268,47 @@ where
             }
         }
 
-        let (prior_coord, prior_mv, _next_seq) = match self.fetch_current_conversation_coordinates(conversation_id).await {
+        let (prior_coord, prior_mv, _next_seq) = match self
+            .fetch_current_conversation_coordinates(conversation_id)
+            .await
+        {
             Ok((c, mv, s)) => (c, mv, s),
-            Err(_) => (serde_json::json!({
-                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
-                "conversationId": conversation_id,
-                "epoch": target_epoch.saturating_sub(1),
-                "generation": 0,
-                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash_bytes) },
-                "groupId": { "$bytes": STANDARD.encode(group_id) },
-                "lifecycle": "active",
-                "stateVersion": 0
-            }), 0, 1),
+            Err(_) => (
+                serde_json::json!({
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
+                    "conversationId": conversation_id,
+                    "epoch": target_epoch.saturating_sub(1),
+                    "generation": 0,
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash_bytes) },
+                    "groupId": { "$bytes": STANDARD.encode(group_id) },
+                    "lifecycle": "active",
+                    "stateVersion": 0
+                }),
+                0,
+                1,
+            ),
         };
 
-        let prior_sv = prior_coord.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(0);
-        let prior_epoch = prior_coord.get("epoch").and_then(|v| v.as_u64()).unwrap_or(target_epoch.saturating_sub(1));
-        let prior_tag_bytes = extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
-            arr
-        });
-        let prior_gch_bytes = extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
-            arr
-        });
+        let prior_sv = prior_coord
+            .get("stateVersion")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let prior_epoch = prior_coord
+            .get("epoch")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(target_epoch.saturating_sub(1));
+        let prior_tag_bytes =
+            extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
+                arr
+            });
+        let prior_gch_bytes =
+            extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
+                arr
+            });
         let prior_group_id_32 = extract_bytes_32(prior_coord.get("groupId")).unwrap_or_else(|| {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&group_id[..32.min(group_id.len())]);
@@ -5915,22 +6388,24 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
             .mls_context()
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
-        let transition_id = custom_transition_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let transition_id =
+            custom_transition_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let transition_uuid = uuid::Uuid::parse_str(&transition_id)
             .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?;
         let idempotency_key = transition_id.clone();
-        let convo_uuid = uuid::Uuid::parse_str(conversation_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(group_id.to_vec())?;
+        let convo_uuid = uuid::Uuid::parse_str(conversation_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
+        let tag_bytes = self.mls_context().get_confirmation_tag(group_id.to_vec())?;
         if tag_bytes.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "confirmation tag must be exactly 32 bytes, got {}",
@@ -5950,7 +6425,9 @@ where
         use rand::RngCore;
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let (ciphertext, target_metadata_version) = if let (Some(ct), Some(mv)) = (custom_metadata_ciphertext, custom_metadata_version) {
+        let (ciphertext, target_metadata_version) = if let (Some(ct), Some(mv)) =
+            (custom_metadata_ciphertext, custom_metadata_version)
+        {
             (ct, mv)
         } else {
             let metadata_plaintext = crate::metadata::GroupMetadataV1 {
@@ -5960,7 +6437,9 @@ where
                 avatar_blob_locator: None,
                 avatar_content_type: None,
             };
-            let metadata_key = self.mls_context().export_metadata_key(group_id.to_vec(), target_epoch)?;
+            let metadata_key = self
+                .mls_context()
+                .export_metadata_key(group_id.to_vec(), target_epoch)?;
             let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
                 OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
             })?;
@@ -5971,58 +6450,61 @@ where
                 1,
                 &metadata_plaintext,
             )
-            .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+            .map_err(|e| {
+                OrchestratorError::Mls(MLSError::Internal(format!(
+                    "encrypt metadata snapshot: {e:?}"
+                )))
+            })?;
             (ct, 1)
         };
 
-        let leaf_changes: Vec<serde_json::Value> =
-            if welcome_bytes.is_none() && !member_dids.is_empty() {
-                let identities = self
-                    .mls_context()
-                    .group_member_identities(group_id.to_vec())?;
-                let mut removals = Vec::new();
-                for did in member_dids {
-                    let mut matched = false;
-                    for identity in &identities {
-                        let identity = std::str::from_utf8(identity).map_err(|_| {
-                            OrchestratorError::InvalidInput(
-                                "MLS member credential is not UTF-8".into(),
-                            )
-                        })?;
-                        let Some(device_id) = identity
-                            .strip_prefix(did)
-                            .and_then(|suffix| suffix.strip_prefix('#'))
-                        else {
-                            continue;
-                        };
-                        uuid::Uuid::parse_str(device_id).map_err(|_| {
-                            OrchestratorError::InvalidInput(
-                                "MLS member credential has an invalid device id".into(),
-                            )
-                        })?;
-                        removals.push((did.clone(), device_id.to_owned()));
-                        matched = true;
-                    }
-                    if !matched {
-                        return Err(OrchestratorError::InvalidInput(format!(
-                            "No MLS leaf found for removal target {did}"
-                        )));
-                    }
+        let leaf_changes: Vec<serde_json::Value> = if welcome_bytes.is_none()
+            && !member_dids.is_empty()
+        {
+            let identities = self
+                .mls_context()
+                .group_member_identities(group_id.to_vec())?;
+            let mut removals = Vec::new();
+            for did in member_dids {
+                let mut matched = false;
+                for identity in &identities {
+                    let identity = std::str::from_utf8(identity).map_err(|_| {
+                        OrchestratorError::InvalidInput("MLS member credential is not UTF-8".into())
+                    })?;
+                    let Some(device_id) = identity
+                        .strip_prefix(did)
+                        .and_then(|suffix| suffix.strip_prefix('#'))
+                    else {
+                        continue;
+                    };
+                    uuid::Uuid::parse_str(device_id).map_err(|_| {
+                        OrchestratorError::InvalidInput(
+                            "MLS member credential has an invalid device id".into(),
+                        )
+                    })?;
+                    removals.push((did.clone(), device_id.to_owned()));
+                    matched = true;
                 }
-                removals.sort();
-                removals
-                    .into_iter()
-                    .map(|(user_did, device_id)| {
-                        serde_json::json!({
-                            "$type": "blue.catbird.chat.defs#removeLeaf",
-                            "deviceId": device_id,
-                            "userDid": user_did
-                        })
+                if !matched {
+                    return Err(OrchestratorError::InvalidInput(format!(
+                        "No MLS leaf found for removal target {did}"
+                    )));
+                }
+            }
+            removals.sort();
+            removals
+                .into_iter()
+                .map(|(user_did, device_id)| {
+                    serde_json::json!({
+                        "$type": "blue.catbird.chat.defs#removeLeaf",
+                        "deviceId": device_id,
+                        "userDid": user_did
                     })
-                    .collect()
-            } else {
-                vec![]
-            };
+                })
+                .collect()
+        } else {
+            vec![]
+        };
 
         fn extract_bytes_32(value: Option<&serde_json::Value>) -> Option<[u8; 32]> {
             match value {
@@ -6042,31 +6524,46 @@ where
             }
         }
 
-        let (prior_coord, prior_mv, next_entry_seq) = match self.fetch_current_conversation_coordinates(conversation_id).await {
+        let (prior_coord, prior_mv, next_entry_seq) = match self
+            .fetch_current_conversation_coordinates(conversation_id)
+            .await
+        {
             Ok((c, mv, s)) => (c, mv, s),
-            Err(_) => (serde_json::json!({
-                "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
-                "conversationId": conversation_id,
-                "epoch": target_epoch.saturating_sub(1),
-                "generation": 0,
-                "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash_bytes) },
-                "groupId": { "$bytes": STANDARD.encode(group_id) },
-                "lifecycle": "active",
-                "stateVersion": 0
-            }), 0, 1),
+            Err(_) => (
+                serde_json::json!({
+                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
+                    "conversationId": conversation_id,
+                    "epoch": target_epoch.saturating_sub(1),
+                    "generation": 0,
+                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash_bytes) },
+                    "groupId": { "$bytes": STANDARD.encode(group_id) },
+                    "lifecycle": "active",
+                    "stateVersion": 0
+                }),
+                0,
+                1,
+            ),
         };
-        let prior_sv = prior_coord.get("stateVersion").and_then(|v| v.as_i64()).unwrap_or(0);
-        let prior_epoch = prior_coord.get("epoch").and_then(|v| v.as_u64()).unwrap_or(target_epoch.saturating_sub(1));
-        let prior_tag_bytes = extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
-            arr
-        });
-        let prior_gch_bytes = extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
-            arr
-        });
+        let prior_sv = prior_coord
+            .get("stateVersion")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let prior_epoch = prior_coord
+            .get("epoch")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(target_epoch.saturating_sub(1));
+        let prior_tag_bytes =
+            extract_bytes_32(prior_coord.get("confirmationTag")).unwrap_or_else(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&tag_bytes[..32.min(tag_bytes.len())]);
+                arr
+            });
+        let prior_gch_bytes =
+            extract_bytes_32(prior_coord.get("groupContextHash")).unwrap_or_else(|| {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&gc_hash_bytes[..32.min(gc_hash_bytes.len())]);
+                arr
+            });
         let prior_group_id_32 = extract_bytes_32(prior_coord.get("groupId")).unwrap_or_else(|| {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&group_id[..32.min(group_id.len())]);
@@ -6190,15 +6687,19 @@ where
             let provider = OpenMlsRustCrypto::default();
             let mut deliveries = Vec::with_capacity(packages.len());
             for (package, member_did) in packages.iter().zip(member_dids) {
-                let message = MlsMessageIn::tls_deserialize_exact_bytes(&package.data)
-                    .map_err(|_| OrchestratorError::InvalidInput(
-                        "welcome provenance key package is not a valid MLS message".into(),
-                    ))?;
+                let message =
+                    MlsMessageIn::tls_deserialize_exact_bytes(&package.data).map_err(|_| {
+                        OrchestratorError::InvalidInput(
+                            "welcome provenance key package is not a valid MLS message".into(),
+                        )
+                    })?;
                 let key_package_in = match message.extract() {
                     MlsMessageBodyIn::KeyPackage(key_package) => key_package,
-                    _ => return Err(OrchestratorError::InvalidInput(
-                        "welcome provenance requires a KeyPackage message".into(),
-                    )),
+                    _ => {
+                        return Err(OrchestratorError::InvalidInput(
+                            "welcome provenance requires a KeyPackage message".into(),
+                        ))
+                    }
                 };
                 let key_package = key_package_in
                     .validate(provider.crypto(), ProtocolVersion::default())
@@ -6206,13 +6707,16 @@ where
                 let key_package_ref = key_package
                     .hash_ref(provider.crypto())
                     .map_err(|_| OrchestratorError::Mls(MLSError::OpenMLSError))?;
-                let identity = super::credential_binding::extract_key_package_identity(&package.data)
-                    .map_err(OrchestratorError::InvalidInput)?;
+                let identity =
+                    super::credential_binding::extract_key_package_identity(&package.data)
+                        .map_err(OrchestratorError::InvalidInput)?;
                 let recipient_device_id = identity
                     .strip_prefix(&format!("{member_did}#"))
-                    .ok_or_else(|| OrchestratorError::InvalidInput(
-                        "welcome provenance credential DID does not match recipient".into(),
-                    ))?;
+                    .ok_or_else(|| {
+                        OrchestratorError::InvalidInput(
+                            "welcome provenance credential DID does not match recipient".into(),
+                        )
+                    })?;
                 uuid::Uuid::parse_str(recipient_device_id).map_err(|_| {
                     OrchestratorError::InvalidInput(
                         "welcome provenance credential has an invalid device id".into(),
@@ -6336,9 +6840,7 @@ where
 
         let resolved = self.resolve_conversation_context(conversation_id).await?;
         let group_id_bytes = resolved.group_id_bytes()?;
-        let epoch = self
-            .mls_context()
-            .get_epoch(group_id_bytes.clone())?;
+        let epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         let tag_bytes = self
             .mls_context()
             .get_confirmation_tag(group_id_bytes.clone())?;
@@ -6412,7 +6914,10 @@ where
             ),
             body: Some(ciphertext.to_vec()),
         };
-        let upload_resp = self.api_client().submit_prepared_request(upload_req).await?;
+        let upload_resp = self
+            .api_client()
+            .submit_prepared_request(upload_req)
+            .await?;
         if upload_resp.status != 200 {
             return Err(OrchestratorError::Api(format!(
                 "upload_blob failed: {}",
@@ -6421,27 +6926,46 @@ where
         }
         Ok(())
     }
-    async fn fetch_current_metadata_snapshot(&self, conversation_id: &str) -> Result<serde_json::Value> {
+    async fn fetch_current_metadata_snapshot(
+        &self,
+        conversation_id: &str,
+    ) -> Result<serde_json::Value> {
         let actor_device_id = self.require_actor_device_id().await?;
         let request = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={actor_device_id}&limit=50"),
+            path: format!(
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={actor_device_id}&limit=50"
+            ),
             method: "GET".to_string(),
             body: None,
         };
         let response = self.api_client().submit_prepared_request(request).await?;
         let value: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
-        value.get("items")
+        value
+            .get("items")
             .and_then(|items| items.as_array())
-            .and_then(|items| items.iter().find(|item| {
-                let state = item.get("state").unwrap_or(item);
-                state.get("coordinates")
-                    .and_then(|c| c.get("conversationId"))
-                    .and_then(|v| v.as_str()) == Some(conversation_id)
-            }))
-            .and_then(|item| item.get("state").unwrap_or(item).get("metadataSnapshot").cloned())
-            .ok_or_else(|| OrchestratorError::Api("metadataSnapshot missing from current conversation state".into()))
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    let state = item.get("state").unwrap_or(item);
+                    state
+                        .get("coordinates")
+                        .and_then(|c| c.get("conversationId"))
+                        .and_then(|v| v.as_str())
+                        == Some(conversation_id)
+                })
+            })
+            .and_then(|item| {
+                item.get("state")
+                    .unwrap_or(item)
+                    .get("metadataSnapshot")
+                    .cloned()
+            })
+            .ok_or_else(|| {
+                OrchestratorError::Api(
+                    "metadataSnapshot missing from current conversation state".into(),
+                )
+            })
     }
 
     pub(crate) async fn fetch_current_conversation_state_and_coordinates(
@@ -6451,32 +6975,63 @@ where
         let actor_device_id = self.require_actor_device_id().await?;
         let convos_req = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50", actor_device_id),
+            path: format!(
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
+                actor_device_id
+            ),
             method: "GET".to_string(),
             body: None,
         };
-        let resp = self.api_client().submit_prepared_request(convos_req).await?;
+        let resp = self
+            .api_client()
+            .submit_prepared_request(convos_req)
+            .await?;
         if resp.status == 200 {
             if let Ok(convos_val) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
                 if let Some(items) = convos_val.get("items").and_then(|v| v.as_array()) {
                     for item in items {
                         let st = item.get("state").unwrap_or(item);
-                        let cid = st.get("coordinates").and_then(|c| c.get("conversationId")).and_then(|v| v.as_str());
+                        let cid = st
+                            .get("coordinates")
+                            .and_then(|c| c.get("conversationId"))
+                            .and_then(|v| v.as_str());
                         if cid == Some(conversation_id) {
-                            let coord = st.get("coordinates").cloned().unwrap_or(serde_json::json!({}));
-                            let mv = st.get("metadataSnapshot").and_then(|m| m.get("metadataVersion")).and_then(|v| v.as_i64()).unwrap_or(0);
-                            let mut next_entry_seq = st.get("snapshotSeq").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                            let coord = st
+                                .get("coordinates")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            let mv = st
+                                .get("metadataSnapshot")
+                                .and_then(|m| m.get("metadataVersion"))
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or(0);
+                            let mut next_entry_seq =
+                                st.get("snapshotSeq").and_then(|v| v.as_u64()).unwrap_or(0) + 1;
                             let entries_req = super::canonical_transport::PreparedRequest {
                                 operation: super::canonical_transport::CanonicalOperation::GetEntries,
                                 path: format!("/xrpc/blue.catbird.chat.getEntries?conversationId={}&actorDeviceId={}&afterSeq=0&limit=100", conversation_id, actor_device_id),
                                 method: "GET".to_string(),
                                 body: None,
                             };
-                            if let Ok(entries_resp) = self.api_client().submit_prepared_request(entries_req).await {
+                            if let Ok(entries_resp) =
+                                self.api_client().submit_prepared_request(entries_req).await
+                            {
                                 if entries_resp.status == 200 {
-                                    if let Ok(entries_val) = serde_json::from_slice::<serde_json::Value>(&entries_resp.body) {
-                                        if let Some(entries_arr) = entries_val.get("entries").and_then(|v| v.as_array()) {
-                                            if let Some(max_s) = entries_arr.iter().filter_map(|e| e.get("seq").and_then(|v| v.as_u64())).max() {
+                                    if let Ok(entries_val) =
+                                        serde_json::from_slice::<serde_json::Value>(
+                                            &entries_resp.body,
+                                        )
+                                    {
+                                        if let Some(entries_arr) =
+                                            entries_val.get("entries").and_then(|v| v.as_array())
+                                        {
+                                            if let Some(max_s) = entries_arr
+                                                .iter()
+                                                .filter_map(|e| {
+                                                    e.get("seq").and_then(|v| v.as_u64())
+                                                })
+                                                .max()
+                                            {
                                                 next_entry_seq = max_s + 1;
                                             }
                                         }
@@ -6489,7 +7044,9 @@ where
                 }
             }
         }
-        Err(OrchestratorError::Api(format!("Could not fetch state for conversation {conversation_id}")))
+        Err(OrchestratorError::Api(format!(
+            "Could not fetch state for conversation {conversation_id}"
+        )))
     }
 
     pub(crate) async fn fetch_current_conversation_coordinates(

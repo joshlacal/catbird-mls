@@ -27,8 +27,11 @@ mod canonical_transport_tests;
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
 pub use canonical_transport::{
-    canonical_commit_aad_bytes, canonical_route, decode_clean_chat_blob_response, map_wire_error,
-    prepare_get_conversations, prepare_get_entries, prepare_replenishment, route_for_nsid,
+    canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,
+    canonical_commit_aad_bytes, canonical_metadata_aad_bytes,
+    canonical_metadata_content_signing_input, canonical_metadata_exporter_context_bytes,
+    canonical_route, decode_clean_chat_blob_response, map_wire_error, prepare_get_conversations,
+    prepare_get_entries, prepare_replenishment, route_for_nsid, seal_metadata_with_nonce,
     CanonicalOperation, CleanChatAuthContext, CleanChatError, CleanChatRequest, CleanChatResponse,
     CleanChatSigningContext, GatewayResponse, GatewayTransport, PreparedRequest,
     ReplenishKeyPackagesInput, TransportError,

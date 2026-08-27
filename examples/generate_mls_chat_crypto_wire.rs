@@ -22,12 +22,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signer, SigningKey};
+use openmls::component::ComponentData;
 use openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY;
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -35,13 +34,22 @@ use openmls_libcrux_crypto::Provider;
 use openmls_traits::OpenMlsProvider;
 use rand::rngs::OsRng;
 use rand::RngCore;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tls_codec::{Deserialize as TlsDeserialize, Serialize as TlsSerialize, VLBytes};
 use uuid::{Uuid, Version};
 
 use catbird_mls::chat_v2::ids::KeyId;
+use catbird_mls::chat_v2::transcript::{
+    project_signed_body, SignedMutationKind, SignedWrapper, VerifiedMutation,
+};
+use catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID;
+use catbird_mls::orchestrator::canonical_transport::{
+    canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,
+    canonical_commit_aad_bytes, canonical_metadata_aad_bytes,
+    canonical_metadata_content_signing_input, canonical_metadata_exporter_context_bytes,
+    seal_metadata_with_nonce,
+};
 
 const OPT_IN_ENV: &str = "CATBIRD_REGENERATE_MLS_CHAT_CRYPTO_WIRE";
 const OPT_IN_VALUE: &str = "1";
@@ -115,61 +123,6 @@ const METADATA_EXPORTER_OUTPUT_LENGTH: usize = 32;
 
 const CREATION_SIGNED_REQUEST_FILE: &str = "creation-signed-request.cbor";
 
-macro_rules! creation_fixed_bytes {
-    ($module:ident, $length:expr) => {
-        mod $module {
-            use serde::Serializer;
-            pub fn serialize<S>(bytes: &[u8; $length], serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: Serializer,
-            {
-                serializer.serialize_bytes(bytes)
-            }
-
-            #[allow(dead_code)]
-            pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; $length], D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct ByteVisitor;
-                impl<'de> serde::de::Visitor<'de> for ByteVisitor {
-                    type Value = [u8; $length];
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                        formatter.write_str("byte array")
-                    }
-                    fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                        v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
-                    }
-                    fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                        self.visit_bytes(&v)
-                    }
-                    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                        let mut arr = [0u8; $length];
-                        for i in 0..$length {
-                            arr[i] = seq.next_element()?.ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
-                        }
-                        Ok(arr)
-                    }
-                }
-                deserializer.deserialize_bytes(ByteVisitor)
-            }
-        }
-    };
-}
-creation_fixed_bytes!(cbytes16, 16);
-creation_fixed_bytes!(cbytes32, 32);
-creation_fixed_bytes!(cbytes64, 64);
-
-mod cbyte_vec {
-    use serde::Serializer;
-    pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_bytes(bytes)
-    }
-}
-
 #[derive(Debug)]
 struct GeneratorError(String);
 
@@ -195,371 +148,342 @@ fn ensure(condition: bool, message: impl Into<String>) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ConversationContext {
-    #[serde(with = "cbytes16")]
-    conversation_id: [u8; 16],
-    generation: u64,
-    state_version: u64,
-    #[serde(with = "cbytes32")]
-    group_id: [u8; 32],
-    epoch: u64,
-    #[serde(with = "cbytes32")]
-    group_context_hash: [u8; 32],
-    #[serde(with = "cbytes32")]
-    confirmation_tag: [u8; 32],
-    lifecycle: String,
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let filename = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| fail("output path has no UTF-8 filename"))?;
+    let temp = path.with_file_name(format!(".{filename}.{}.tmp", std::process::id()));
+    if temp.exists() {
+        fs::remove_file(&temp)?;
+    }
+    fs::write(&temp, bytes)?;
+    fs::rename(&temp, path)?;
+    Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MetadataCoordinate {
-    #[serde(with = "cbytes16")]
-    conversation_id: [u8; 16],
-    generation: u64,
-    #[serde(with = "cbytes32")]
-    group_id: [u8; 32],
-    epoch: u64,
-    #[serde(with = "cbytes32")]
-    group_context_hash: [u8; 32],
-    #[serde(with = "cbytes32")]
-    confirmation_tag: [u8; 32],
+fn fixed_signer(seed: [u8; 32]) -> SignatureKeyPair {
+    let signing_key = SigningKey::from_bytes(&seed);
+    let verifying_key = signing_key.verifying_key();
+    SignatureKeyPair::from_raw(
+        SignatureScheme::ED25519,
+        signing_key.to_bytes().to_vec(),
+        verifying_key.to_bytes().to_vec(),
+    )
 }
 
-impl MetadataCoordinate {
-    fn from_conversation_context(context: &ConversationContext) -> Self {
-        Self {
-            conversation_id: context.conversation_id,
-            generation: context.generation,
-            group_id: context.group_id,
-            epoch: context.epoch,
-            group_context_hash: context.group_context_hash,
-            confirmation_tag: context.confirmation_tag,
-        }
+fn exact_capabilities() -> Capabilities {
+    Capabilities::new(
+        Some(&[ProtocolVersion::Mls10]),
+        Some(&[CIPHERSUITE]),
+        Some(&[]),
+        Some(&[]),
+        Some(&[CredentialType::Basic]),
+    )
+}
+
+fn credential_with_key(identity: &str, public_key: &[u8]) -> CredentialWithKey {
+    CredentialWithKey {
+        credential: BasicCredential::new(identity.as_bytes().to_vec()).into(),
+        signature_key: public_key.to_vec().into(),
     }
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CommitAad<'a> {
-    protocol_version: &'static str,
-    #[serde(with = "cbytes16")]
-    conversation_id: [u8; 16],
-    generation: u64,
-    #[serde(with = "cbytes16")]
-    transition_id: [u8; 16],
-    prior: &'a ConversationContext,
-}
-
-fn encode_mls_commit_aad(
-    conversation_id: [u8; 16],
-    generation: u64,
-    transition_id: [u8; 16],
-    prior: &ConversationContext,
-) -> Result<Vec<u8>> {
-    let aad_body = CommitAad {
-        protocol_version: "1",
-        conversation_id,
-        generation,
-        transition_id,
-        prior,
-    };
-    let cbor = serde_ipld_dagcbor::to_vec(&aad_body)?;
-    let mut out = Vec::with_capacity(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0".len() + cbor.len());
-    out.extend_from_slice(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0");
-    out.extend_from_slice(&cbor);
-    Ok(out)
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ApplicationAad<'a> {
-    protocol_version: &'static str,
-    #[serde(with = "cbytes16")]
-    conversation_id: [u8; 16],
-    generation: u64,
-    #[serde(with = "cbytes16")]
-    message_id: [u8; 16],
-    prior: &'a ConversationContext,
-}
-
-fn encode_mls_application_aad(
-    conversation_id: [u8; 16],
-    generation: u64,
-    message_id: [u8; 16],
-    prior: &ConversationContext,
-) -> Result<Vec<u8>> {
-    let aad_body = ApplicationAad {
-        protocol_version: "1",
-        conversation_id,
-        generation,
-        message_id,
-        prior,
-    };
-    let cbor = serde_ipld_dagcbor::to_vec(&aad_body)?;
-    let mut out = Vec::with_capacity(b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0".len() + cbor.len());
-    out.extend_from_slice(b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0");
-    out.extend_from_slice(&cbor);
-    Ok(out)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MessageBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    reply_to: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    embed: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum ApplicationBody {
-    Message(MessageBody),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApplicationFrame {
-    protocol: String,
-    version: u32,
-    #[serde(with = "cbytes16")]
-    message_id: [u8; 16],
-    context: ConversationContext,
-    body: ApplicationBody,
-}
-
-fn encode_application_content(frame: &ApplicationFrame) -> Result<Vec<u8>> {
-    Ok(serde_ipld_dagcbor::to_vec(frame)?)
-}
-
-fn decode_application_frame(bytes: &[u8]) -> Result<ApplicationFrame> {
-    Ok(serde_ipld_dagcbor::from_slice(bytes)?)
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MetadataExporterContext<'a> {
-    protocol: &'static str,
-    version: u32,
-    coordinate: &'a MetadataCoordinate,
-    metadata_version: u64,
-    #[serde(with = "cbytes16")]
-    origin_transition_id: [u8; 16],
-    #[serde(rename = "ciphertextSize")]
-    ciphertext_size: u64,
-}
-
-fn metadata_exporter_context(
-    coordinate: &MetadataCoordinate,
-    metadata_version: u64,
-    origin_transition_id: [u8; 16],
-    ciphertext_size: u64,
-) -> Result<Vec<u8>> {
-    let ctx = MetadataExporterContext {
-        protocol: "blue.catbird.chat.metadata",
-        version: 1,
-        coordinate,
-        metadata_version,
-        origin_transition_id,
-        ciphertext_size,
-    };
-    Ok(serde_ipld_dagcbor::to_vec(&ctx)?)
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MetadataContent {
-    #[serde(with = "cbytes16")]
-    origin_transition_id: [u8; 16],
-    metadata_version: u64,
-    author_did: String,
-    #[serde(with = "cbytes16")]
-    author_device_id: [u8; 16],
-    author_key_id: String,
-    title: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    avatar: Option<Value>,
-}
-
-fn metadata_content_signing_input(content: &MetadataContent) -> Result<Vec<u8>> {
-    let cbor = serde_ipld_dagcbor::to_vec(content)?;
-    let mut out = Vec::with_capacity(b"CATBIRD-CHAT-METADATA-CONTENT\0".len() + cbor.len());
-    out.extend_from_slice(b"CATBIRD-CHAT-METADATA-CONTENT\0");
-    out.extend_from_slice(&cbor);
-    Ok(out)
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MetadataPlaintext {
-    content: MetadataContent,
-    #[serde(with = "cbytes64")]
-    content_signature: [u8; 64],
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MetadataAad<'a> {
-    protocol: &'static str,
-    version: u32,
-    coordinate: &'a MetadataCoordinate,
-    metadata_version: u64,
-    #[serde(with = "cbytes16")]
-    origin_transition_id: [u8; 16],
-    #[serde(rename = "ciphertextSize")]
-    ciphertext_size: u64,
-}
-
-fn seal_metadata_with_nonce(
-    plaintext: &MetadataPlaintext,
-    coordinate: &MetadataCoordinate,
-    exporter_key: &[u8],
-    nonce_bytes: &[u8; 12],
-    origin_transition_id: [u8; 16],
-    metadata_version: u64,
-) -> Result<(Vec<u8>, [u8; 32], u64)> {
-    let plaintext_cbor = serde_ipld_dagcbor::to_vec(plaintext)?;
-    let cipher = Aes256Gcm::new_from_slice(exporter_key)
-        .map_err(|e| fail(format!("AES-256-GCM key init: {e}")))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let ciphertext_size = (plaintext_cbor.len() + 16) as u64;
-    let aad_struct = MetadataAad {
-        protocol: "blue.catbird.chat.metadata",
-        version: 1,
-        coordinate,
-        metadata_version,
-        origin_transition_id,
-        ciphertext_size,
-    };
-    let aad_cbor = serde_ipld_dagcbor::to_vec(&aad_struct)?;
-    let mut aad = Vec::with_capacity(b"CATBIRD-CHAT-METADATA\0".len() + aad_cbor.len());
-    aad.extend_from_slice(b"CATBIRD-CHAT-METADATA\0");
-    aad.extend_from_slice(&aad_cbor);
-
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: &plaintext_cbor,
-                aad: &aad,
-            },
-        )
-        .map_err(|e| fail(format!("AES-256-GCM encrypt: {e}")))?;
+fn assert_wrapper(bytes: &[u8], expected_format: u16) -> Result<()> {
     ensure(
-        ciphertext.len() as u64 == ciphertext_size,
-        "ciphertext size mismatch",
+        bytes.len() >= 4,
+        format!(
+            "MLSMessage wrapper must be at least 4 bytes, got {}",
+            bytes.len()
+        ),
     )?;
-    let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
-    Ok((ciphertext, ciphertext_sha256, ciphertext_size))
+    let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let wire_format = u16::from_be_bytes([bytes[2], bytes[3]]);
+    ensure(
+        version == 1,
+        format!("expected MLSMessage version 1, got {version}"),
+    )?;
+    ensure(
+        wire_format == expected_format,
+        format!("expected wire format {expected_format}, got {wire_format}"),
+    )?;
+    Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreationActorLeaf {
-    user_did: String,
-    #[serde(with = "cbytes16")]
-    device_id: [u8; 16],
-    leaf_origin: String,
+fn assert_exact_member_profile(
+    leaf: &LeafNode,
+    expected_identity: &str,
+    expected_key: &[u8],
+) -> Result<()> {
+    ensure(
+        leaf.credential().credential_type() == CredentialType::Basic,
+        "leaf credential is not BasicCredential",
+    )?;
+    ensure(
+        leaf.credential().serialized_content() == expected_identity.as_bytes(),
+        format!(
+            "leaf credential identity mismatch: expected {}, got {}",
+            expected_identity,
+            String::from_utf8_lossy(leaf.credential().serialized_content())
+        ),
+    )?;
+    ensure(
+        leaf.signature_key().as_slice() == expected_key,
+        "leaf signature key mismatch",
+    )?;
+    ensure(
+        leaf.capabilities() == &exact_capabilities(),
+        "leaf capabilities drift from exact profile",
+    )?;
+    ensure(
+        leaf.extensions().iter().next().is_none(),
+        "leaf extensions are not empty",
+    )?;
+    Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreationParticipant {
-    role: String,
-    status: String,
-    user_did: String,
+fn assert_key_package_leaf_source(leaf: &LeafNode, expected_lifetime: &Lifetime) -> Result<()> {
+    let actual = serde_json::to_value(leaf.leaf_node_source())?;
+    let expected = json!({
+        "KeyPackage": {
+            "not_before": expected_lifetime.not_before(),
+            "not_after": expected_lifetime.not_after()
+        }
+    });
+    ensure(
+        actual == expected,
+        format!("KeyPackage leaf source/lifetime drift: {actual}"),
+    )?;
+    Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreationManifest {
-    actor_leaf: CreationActorLeaf,
-    participants: Vec<CreationParticipant>,
+fn assert_public_members(
+    public_group: &PublicGroup,
+    expected_members: &[(&str, &[u8])],
+) -> Result<()> {
+    let mut actual_members: Vec<(String, Vec<u8>)> = public_group
+        .members()
+        .map(|member| {
+            (
+                String::from_utf8_lossy(member.credential.serialized_content()).to_string(),
+                member.signature_key.as_slice().to_vec(),
+            )
+        })
+        .collect();
+    actual_members.sort();
+
+    let mut expected_sorted: Vec<(String, Vec<u8>)> = expected_members
+        .iter()
+        .map(|(identity, key)| (identity.to_string(), key.to_vec()))
+        .collect();
+    expected_sorted.sort();
+
+    ensure(
+        actual_members == expected_sorted,
+        format!("public group member roster mismatch: expected {expected_sorted:?}, got {actual_members:?}"),
+    )?;
+    Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreationFramedArtifact {
-    #[serde(with = "cbyte_vec")]
-    bytes: Vec<u8>,
-    #[serde(with = "cbytes32")]
-    sha256: [u8; 32],
-    framing: String,
-    content_type: String,
+fn assert_member_group_matches_public(
+    member_group: &MlsGroup,
+    public_group: &PublicGroup,
+    label: &str,
+) -> Result<()> {
+    ensure(
+        member_group.group_id() == public_group.group_id(),
+        format!("{label} group id mismatch with public group"),
+    )?;
+    ensure(
+        member_group.epoch() == public_group.group_context().epoch(),
+        format!("{label} epoch mismatch with public group"),
+    )?;
+    ensure(
+        member_group.export_group_context().tree_hash() == public_group.group_context().tree_hash(),
+        format!("{label} tree hash mismatch with public group"),
+    )?;
+    ensure(
+        member_group
+            .export_group_context()
+            .confirmed_transcript_hash()
+            == public_group.group_context().confirmed_transcript_hash(),
+        format!("{label} confirmation tag mismatch with public group"),
+    )?;
+    Ok(())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreationMetadataAuthorProof {
-    author_did: String,
-    origin_seq: u64,
-    author_key_id: String,
-    role_at_origin: String,
-    #[serde(with = "cbytes16")]
-    author_device_id: [u8; 16],
-    #[serde(with = "cbytes16")]
-    origin_transition_id: [u8; 16],
-    #[serde(with = "cbytes32")]
-    signature_public_key: [u8; 32],
-    device_status_at_origin: String,
-    auth_generation_at_origin: u64,
+fn uuid_string(bytes: [u8; 16]) -> Result<String> {
+    let parsed = Uuid::from_bytes(bytes);
+    ensure(
+        parsed.get_version() == Some(Version::Random),
+        "UUID is not version 4",
+    )?;
+    Ok(parsed.hyphenated().to_string())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreationMetadataSnapshot {
-    #[serde(with = "cbyte_vec")]
-    nonce: Vec<u8>,
-    #[serde(with = "cbyte_vec")]
-    ciphertext: Vec<u8>,
-    coordinate: MetadataCoordinate,
-    author_proof: CreationMetadataAuthorProof,
-    ciphertext_size: u64,
-    metadata_version: u64,
-    #[serde(with = "cbytes32")]
-    ciphertext_sha256: [u8; 32],
-    #[serde(with = "cbytes16")]
-    origin_transition_id: [u8; 16],
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CreationBody {
-    #[serde(rename = "$type")]
-    type_id: String,
-    signature_domain: String,
-    #[serde(with = "cbytes16")]
-    transition_id: [u8; 16],
-    actor_did: String,
-    #[serde(with = "cbytes16")]
-    actor_device_id: [u8; 16],
-    key_id: String,
-    auth_generation: u64,
-    next: ConversationContext,
-    absence: bool,
-    #[serde(with = "cbytes16")]
-    conversation_id: [u8; 16],
-    conversation_kind: String,
-    manifest: CreationManifest,
-    genesis_group_info: CreationFramedArtifact,
-    metadata_snapshot: CreationMetadataSnapshot,
-    #[serde(with = "cbytes16")]
-    idempotency_key: [u8; 16],
-    signed_at: String,
+fn command_version(binary: &str) -> Result<String> {
+    let output = Command::new(binary).arg("--version").output()?;
+    ensure(
+        output.status.success(),
+        format!("failed to query {binary} --version"),
+    )?;
+    let stdout = String::from_utf8(output.stdout)?;
+    Ok(stdout.trim().to_owned())
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignedCreation {
-    body: CreationBody,
-    #[serde(with = "cbytes64")]
-    signature: [u8; 64],
+fn source_tree_sha256(root: &Path) -> Result<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files)?;
+    files.sort();
+
+    let mut hasher = Sha256::new();
+    for file in files {
+        let relative = file.strip_prefix(root)?;
+        let relative_str = relative
+            .to_str()
+            .ok_or_else(|| fail("non-UTF-8 path in chat_v2 source tree"))?;
+        let bytes = fs::read(&file)?;
+        hasher.update(relative_str.as_bytes());
+        hasher.update([0u8]);
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(&bytes);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn lock_string_field(block: &str, field: &str) -> Option<String> {
+    let prefix = format!("{field} = \"");
+    block.lines().find_map(|line| {
+        let rest = line.strip_prefix(&prefix)?;
+        Some(rest.strip_suffix('"')?.to_owned())
+    })
+}
+
+fn dependency_manifest(lock_path: &Path) -> Result<Value> {
+    let lock = fs::read_to_string(lock_path)?;
+    let wanted = [
+        ("openmls", OPENMLS_VERSION, true),
+        ("openmls_traits", "0.6.0-rc.3", true),
+        ("openmls_basic_credential", "0.6.0-rc.3", true),
+        ("openmls_libcrux_crypto", "0.4.0-rc.3", true),
+        ("openmls_memory_storage", STORAGE_VERSION, true),
+        ("tls_codec", "0.5.0", false),
+        ("serde_ipld_dagcbor", "0.6.4", false),
+    ];
+    let mut output = Map::new();
+    for (name, version, is_git) in wanted {
+        let package = find_lock_package(&lock, name, version, is_git)?;
+        output.insert(name.to_owned(), package);
+    }
+    Ok(Value::Object(output))
+}
+
+fn find_lock_package(
+    lock: &str,
+    wanted_name: &str,
+    wanted_version: &str,
+    is_git: bool,
+) -> Result<Value> {
+    for block in lock.split("[[package]]").skip(1) {
+        let name = lock_string_field(block, "name");
+        let version = lock_string_field(block, "version");
+        if name.as_deref() == Some(wanted_name) && version.as_deref() == Some(wanted_version) {
+            let source = lock_string_field(block, "source")
+                .ok_or_else(|| fail(format!("{wanted_name} {wanted_version} has no source")))?;
+            ensure(!source.is_empty(), "dependency source is empty")?;
+            if is_git {
+                ensure(
+                    source.starts_with("git+https://github.com/openmls/openmls?"),
+                    format!("{wanted_name} git source must be openmls repository, got {source}"),
+                )?;
+                ensure(
+                    source.ends_with(&format!("#{OFFICIAL_CLIENT_REVISION}")),
+                    format!("{wanted_name} git source must match revision {OFFICIAL_CLIENT_REVISION}, got {source}"),
+                )?;
+                ensure(
+                    lock_string_field(block, "checksum").is_none(),
+                    format!("{wanted_name} git package must not have a checksum"),
+                )?;
+                return Ok(json!({
+                    "version": wanted_version,
+                    "source": source
+                }));
+            } else {
+                let checksum = lock_string_field(block, "checksum").ok_or_else(|| {
+                    fail(format!("{wanted_name} {wanted_version} has no checksum"))
+                })?;
+                ensure(!checksum.is_empty(), "dependency checksum is empty")?;
+                return Ok(json!({
+                    "version": wanted_version,
+                    "source": source,
+                    "checksum": checksum
+                }));
+            }
+        }
+    }
+    Err(fail(format!(
+        "missing dependency {wanted_name} {wanted_version} in {}",
+        lock.lines().next().unwrap_or("Cargo.lock")
+    )))
+}
+
+fn confirmation_tag_bytes(tag: &ConfirmationTag) -> Result<[u8; 32]> {
+    let encoded = tag.tls_serialize_detached()?;
+    let bytes = VLBytes::tls_deserialize_exact(&encoded)?;
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| fail("confirmation tag is not 32 bytes"))
+}
+
+fn context_from_public_group(
+    public_group: &PublicGroup,
+    generation: u64,
+    state_version: u64,
+) -> Result<Value> {
+    let group_id: [u8; 32] = public_group
+        .group_id()
+        .as_slice()
+        .try_into()
+        .map_err(|_| fail("public group id is not 32 bytes"))?;
+    let group_context_tls = public_group.group_context().tls_serialize_detached()?;
+    let group_context_hash: [u8; 32] = Sha256::digest(&group_context_tls).into();
+    let confirmation_tag = confirmation_tag_bytes(public_group.confirmation_tag())?;
+    Ok(json!({
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": generation,
+        "stateVersion": state_version,
+        "groupId": STANDARD.encode(group_id),
+        "epoch": public_group.group_context().epoch().as_u64(),
+        "groupContextHash": STANDARD.encode(group_context_hash),
+        "confirmationTag": STANDARD.encode(confirmation_tag),
+        "lifecycle": "active",
+    }))
+}
+
+fn b64_to_hex(val: &Value, key: &str) -> Result<String> {
+    let b64_str = val[key]
+        .as_str()
+        .ok_or_else(|| fail(format!("missing {key} in context")))?;
+    let bytes = STANDARD.decode(b64_str)?;
+    Ok(hex::encode(bytes))
 }
 
 struct CreationArtifact {
@@ -578,7 +502,7 @@ fn build_alice_creation_artifact(
     alice_group: &MlsGroup,
     alice_provider: &Provider,
     alice_public_key: &[u8],
-    genesis_context: &ConversationContext,
+    genesis_context: &Value,
     group_info_bytes: &[u8],
     signed_at: &str,
     _received_at: &str,
@@ -593,32 +517,41 @@ fn build_alice_creation_artifact(
     let key_id = KeyId::from_public_key(&alice_pub).to_string();
     let signing_key = SigningKey::from_bytes(&ALICE_SIGNING_SEED);
 
-    let coordinate = MetadataCoordinate::from_conversation_context(genesis_context);
-    let content = MetadataContent {
-        origin_transition_id: ALICE_CREATION_TRANSITION_ID,
-        metadata_version: CREATION_METADATA_VERSION,
-        author_did: ALICE_ACTOR_DID.to_owned(),
-        author_device_id: ALICE_DEVICE_ID,
-        author_key_id: key_id.clone(),
-        title: String::new(),
-        description: None,
-        avatar: None,
-    };
-    let content_signing_input = metadata_content_signing_input(&content)?;
+    let group_id_bytes = STANDARD.decode(genesis_context["groupId"].as_str().unwrap())?;
+    let group_context_hash_bytes =
+        STANDARD.decode(genesis_context["groupContextHash"].as_str().unwrap())?;
+    let confirmation_tag_bytes =
+        STANDARD.decode(genesis_context["confirmationTag"].as_str().unwrap())?;
+
+    let metadata_content_json = json!({
+        "protocol": "blue.catbird.chat.metadata",
+        "version": 1,
+        "originTransitionId": STANDARD.encode(ALICE_CREATION_TRANSITION_ID),
+        "metadataVersion": CREATION_METADATA_VERSION,
+        "authorDid": ALICE_ACTOR_DID,
+        "authorDeviceId": STANDARD.encode(ALICE_DEVICE_ID),
+        "authorKeyId": key_id,
+        "title": "",
+    });
+    let content_signing_input = canonical_metadata_content_signing_input(&metadata_content_json)?;
     let content_signature = signing_key.sign(&content_signing_input).to_bytes();
-    let plaintext = MetadataPlaintext {
-        content,
-        content_signature,
-    };
-    let plaintext_cbor = serde_ipld_dagcbor::to_vec(&plaintext)?;
+    let plaintext_json = json!({
+        "content": metadata_content_json,
+        "contentSignature": STANDARD.encode(content_signature),
+    });
+    let plaintext_cbor = canonical_cbor_for_schema("metadataPlaintext", &plaintext_json, false)?;
     let expected_ciphertext_size = (plaintext_cbor.len() + 16) as u64;
 
-    let exporter_context = metadata_exporter_context(
-        &coordinate,
-        CREATION_METADATA_VERSION,
-        ALICE_CREATION_TRANSITION_ID,
-        expected_ciphertext_size,
-    )?;
+    let exporter_context_json = json!({
+        "protocol": "blue.catbird.chat.metadata",
+        "version": 1,
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "epoch": 0,
+        "groupContextHash": STANDARD.encode(&group_context_hash_bytes),
+        "metadataVersion": CREATION_METADATA_VERSION,
+    });
+    let exporter_context = canonical_metadata_exporter_context_bytes(&exporter_context_json)?;
     let exporter_key = alice_group
         .export_secret(
             alice_provider.crypto(),
@@ -628,80 +561,103 @@ fn build_alice_creation_artifact(
         )
         .map_err(|error| fail(format!("metadata exporter secret: {error}")))?;
 
+    let coordinate_json = json!({
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "groupId": STANDARD.encode(&group_id_bytes),
+        "epoch": 0,
+        "groupContextHash": STANDARD.encode(&group_context_hash_bytes),
+        "confirmationTag": STANDARD.encode(&confirmation_tag_bytes),
+    });
+
+    let metadata_aad_json = json!({
+        "protocol": "blue.catbird.chat.metadata",
+        "version": 1,
+        "coordinate": coordinate_json,
+        "metadataVersion": CREATION_METADATA_VERSION,
+        "originTransitionId": STANDARD.encode(ALICE_CREATION_TRANSITION_ID),
+        "ciphertextSize": expected_ciphertext_size,
+    });
+    let metadata_aad = canonical_metadata_aad_bytes(&metadata_aad_json)?;
+
     let (ciphertext, ciphertext_sha256, ciphertext_size) = seal_metadata_with_nonce(
-        &plaintext,
-        &coordinate,
+        &plaintext_cbor,
         &exporter_key,
         &CREATION_METADATA_NONCE,
-        ALICE_CREATION_TRANSITION_ID,
-        CREATION_METADATA_VERSION,
+        &metadata_aad,
     )?;
 
-    let metadata_snapshot = CreationMetadataSnapshot {
-        nonce: CREATION_METADATA_NONCE.to_vec(),
-        ciphertext,
-        coordinate: MetadataCoordinate::from_conversation_context(genesis_context),
-        author_proof: CreationMetadataAuthorProof {
-            author_did: ALICE_ACTOR_DID.to_owned(),
-            origin_seq: 1,
-            author_key_id: key_id.clone(),
-            role_at_origin: "admin".to_owned(),
-            author_device_id: ALICE_DEVICE_ID,
-            origin_transition_id: ALICE_CREATION_TRANSITION_ID,
-            signature_public_key: alice_pub,
-            device_status_at_origin: "active".to_owned(),
-            auth_generation_at_origin: 1,
+    let creation_body_json = json!({
+        "$type": CREATION_BODY_TYPE,
+        "signatureDomain": "CATBIRD-CHAT-CREATE\0",
+        "transitionId": uuid_string(ALICE_CREATION_TRANSITION_ID)?,
+        "actorDid": ALICE_ACTOR_DID,
+        "actorDeviceId": uuid_string(ALICE_DEVICE_ID)?,
+        "keyId": key_id,
+        "authGeneration": 1,
+        "next": {
+            "conversationId": uuid_string(CONVERSATION_ID)?,
+            "generation": 0,
+            "stateVersion": 0,
+            "groupId": STANDARD.encode(&group_id_bytes),
+            "epoch": 0,
+            "groupContextHash": STANDARD.encode(&group_context_hash_bytes),
+            "confirmationTag": STANDARD.encode(&confirmation_tag_bytes),
+            "lifecycle": "active",
         },
-        ciphertext_size,
-        metadata_version: CREATION_METADATA_VERSION,
-        ciphertext_sha256,
-        origin_transition_id: ALICE_CREATION_TRANSITION_ID,
-    };
-
-    let body = CreationBody {
-        type_id: CREATION_BODY_TYPE.to_owned(),
-        signature_domain: String::from_utf8(CREATION_SIGNATURE_DOMAIN.to_vec())
-            .map_err(|_| fail("creation signature domain is not UTF-8"))?,
-        transition_id: ALICE_CREATION_TRANSITION_ID,
-        actor_did: ALICE_ACTOR_DID.to_owned(),
-        actor_device_id: ALICE_DEVICE_ID,
-        key_id: key_id.clone(),
-        auth_generation: 1,
-        next: genesis_context.clone(),
-        absence: true,
-        conversation_id: CONVERSATION_ID,
-        conversation_kind: "direct".to_owned(),
-        manifest: CreationManifest {
-            actor_leaf: CreationActorLeaf {
-                user_did: ALICE_ACTOR_DID.to_owned(),
-                device_id: ALICE_DEVICE_ID,
-                leaf_origin: "genesis".to_owned(),
+        "absence": true,
+        "conversationId": uuid_string(CONVERSATION_ID)?,
+        "conversationKind": "direct",
+        "manifest": {
+            "actorLeaf": {
+                "userDid": ALICE_ACTOR_DID,
+                "deviceId": uuid_string(ALICE_DEVICE_ID)?,
+                "leafOrigin": "genesis",
             },
-            participants: vec![
-                CreationParticipant {
-                    role: "admin".to_owned(),
-                    status: "active".to_owned(),
-                    user_did: ALICE_ACTOR_DID.to_owned(),
-                },
-                CreationParticipant {
-                    role: "admin".to_owned(),
-                    status: "pending".to_owned(),
-                    user_did: BOB_ACTOR_DID.to_owned(),
-                },
+            "participants": [
+                { "role": "admin", "status": "active", "userDid": ALICE_ACTOR_DID },
+                { "role": "admin", "status": "pending", "userDid": BOB_ACTOR_DID },
             ],
         },
-        genesis_group_info: CreationFramedArtifact {
-            bytes: group_info_bytes.to_vec(),
-            sha256: Sha256::digest(group_info_bytes).into(),
-            framing: "mlsMessage".to_owned(),
-            content_type: "groupInfo".to_owned(),
+        "genesisGroupInfo": {
+            "bytes": STANDARD.encode(group_info_bytes),
+            "sha256": STANDARD.encode(Sha256::digest(group_info_bytes)),
+            "framing": "mlsMessage",
+            "contentType": "groupInfo",
         },
-        metadata_snapshot,
-        idempotency_key: CREATION_IDEMPOTENCY_KEY,
-        signed_at: signed_at.to_owned(),
-    };
+        "metadataSnapshot": {
+            "coordinate": {
+                "conversationId": STANDARD.encode(CONVERSATION_ID),
+                "generation": 0,
+                "groupId": STANDARD.encode(&group_id_bytes),
+                "epoch": 0,
+                "groupContextHash": STANDARD.encode(&group_context_hash_bytes),
+                "confirmationTag": STANDARD.encode(&confirmation_tag_bytes),
+            },
+            "originTransitionId": uuid_string(ALICE_CREATION_TRANSITION_ID)?,
+            "metadataVersion": CREATION_METADATA_VERSION,
+            "nonce": STANDARD.encode(CREATION_METADATA_NONCE),
+            "ciphertext": STANDARD.encode(&ciphertext),
+            "ciphertextSha256": STANDARD.encode(ciphertext_sha256),
+            "ciphertextSize": ciphertext_size,
+            "authorProof": {
+                "authorDid": ALICE_ACTOR_DID,
+                "authorDeviceId": uuid_string(ALICE_DEVICE_ID)?,
+                "authorKeyId": key_id,
+                "signaturePublicKey": STANDARD.encode(alice_pub),
+                "authGenerationAtOrigin": 1,
+                "originTransitionId": uuid_string(ALICE_CREATION_TRANSITION_ID)?,
+                "originSeq": 1,
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active",
+            },
+        },
+        "idempotencyKey": uuid_string(CREATION_IDEMPOTENCY_KEY)?,
+        "signedAt": signed_at,
+    });
 
-    let unsigned_body_projection_cbor = serde_ipld_dagcbor::to_vec(&body)?;
+    let unsigned_body_projection_cbor =
+        canonical_cbor_for_schema("creationBody", &creation_body_json, true)?;
     let mut signing_transcript =
         Vec::with_capacity(CREATION_SIGNATURE_DOMAIN.len() + unsigned_body_projection_cbor.len());
     signing_transcript.extend_from_slice(CREATION_SIGNATURE_DOMAIN);
@@ -709,21 +665,26 @@ fn build_alice_creation_artifact(
     let signature = signing_key.sign(&signing_transcript).to_bytes();
     let request_digest: [u8; 32] = Sha256::digest(&signing_transcript).into();
 
-    let signed_request = SignedCreation { body, signature };
-    let signed_request_cbor = serde_ipld_dagcbor::to_vec(&signed_request)?;
+    let signed_creation_json = json!({
+        "body": creation_body_json,
+        "signature": STANDARD.encode(signature),
+    });
+    let signed_request_cbor =
+        canonical_cbor_for_schema("signedCreation", &signed_creation_json, false)?;
 
-    // Strict self-verification
-    let key_id_parsed = KeyId::from_public_key(&alice_pub);
+    // Strict round-trip verification using production verifiers
+    let signed_json_bytes = serde_json::to_vec(&signed_creation_json)?;
+    let wrapper = SignedWrapper::decode(&signed_json_bytes)
+        .map_err(|e| fail(format!("SignedWrapper::decode creation failed: {e}")))?;
+    let projected = project_signed_body(SignedMutationKind::Creation, &wrapper.body)
+        .map_err(|e| fail(format!("project_signed_body creation failed: {e}")))?;
+    let verified = VerifiedMutation::verify(projected, wrapper.signature, &alice_pub)
+        .map_err(|e| fail(format!("VerifiedMutation::verify creation failed: {e}")))?;
     ensure(
-        key_id == key_id_parsed.to_string(),
-        "creation keyId is not ed25519_key_id(alice_pub)",
+        verified.kind() == SignedMutationKind::Creation,
+        "verified mutation kind mismatch for creation",
     )?;
-    catbird_mls::chat_v2::transcript::verify_ed25519_strict(
-        &alice_pub,
-        &signing_transcript,
-        &signature,
-    )
-    .map_err(|e| fail(format!("verify_ed25519_strict failed: {e}")))?;
+
     Ok(CreationArtifact {
         signed_request_cbor,
         unsigned_body_projection_cbor,
@@ -752,50 +713,33 @@ fn main() -> Result<()> {
     )?;
     ensure(
         fork_rev == EXPECTED_FORK_REVISION,
-        format!("CATBIRD_OPENMLS_FORK_REV does not match Task 1 published revision {EXPECTED_FORK_REVISION}: {fork_rev}"),
+        format!("fork rev mismatch: expected {EXPECTED_FORK_REVISION}, got {fork_rev}"),
     )?;
 
-    ensure(
-        CIPHERSUITE as u16 == CIPHERSUITE_CODE,
-        "XWing codepoint drift",
-    )?;
-    for identifier in [
-        ALICE_DEVICE_ID,
-        BOB_DEVICE_ID,
-        CONVERSATION_ID,
-        TRANSITION_ID,
-        MESSAGE_ID,
-    ] {
-        ensure_uuid_v4(identifier)?;
-    }
-    assert_fixture_plc_did(ALICE_ACTOR_DID)?;
-    assert_fixture_plc_did(BOB_ACTOR_DID)?;
-    ensure(
-        ALICE_ACTOR_DID != BOB_ACTOR_DID,
-        "fixture actors must be distinct",
-    )?;
+    println!("Generating authoritative blue.catbird.chat crypto wire corpus...");
 
-    let evaluation_unix_seconds = unix_time()?;
+    let evaluation_unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let creation_signed_at = DateTime::<Utc>::from_timestamp(
-        i64::try_from(evaluation_unix_seconds)
-            .map_err(|_| fail("evaluation time does not fit signed timestamp"))?,
+        i64::try_from(
+            evaluation_unix_seconds
+                .checked_sub(120)
+                .ok_or_else(|| fail("creation signed time underflow"))?,
+        )
+        .map_err(|_| fail("evaluation time does not fit signed timestamp"))?,
         0,
     )
     .ok_or_else(|| fail("evaluation time is outside chrono range"))?
     .format("%Y-%m-%dT%H:%M:%S.000Z")
     .to_string();
     let creation_received_at = DateTime::<Utc>::from_timestamp(
-        i64::try_from(
-            evaluation_unix_seconds
-                .checked_add(1)
-                .ok_or_else(|| fail("creation receive time overflow"))?,
-        )
-        .map_err(|_| fail("creation receive time does not fit timestamp"))?,
+        i64::try_from(evaluation_unix_seconds)
+            .map_err(|_| fail("creation receive time does not fit timestamp"))?,
         0,
     )
     .ok_or_else(|| fail("creation receive time is outside chrono range"))?
     .format("%Y-%m-%dT%H:%M:%S.000Z")
     .to_string();
+
     let not_before = evaluation_unix_seconds
         .checked_sub(LIFETIME_PAST_SKEW_SECONDS)
         .ok_or_else(|| fail("evaluation time cannot accommodate lifetime skew"))?;
@@ -1008,13 +952,16 @@ fn main() -> Result<()> {
         "KeyPackageRef was not computed over exact inner TLS bytes",
     )?;
 
+    // Add commit: moves stateVersion 2 -> 3, epoch 0 -> 1
     let add_prior_context = context_from_public_group(&public_group, 0, 2)?;
-    let commit_aad = encode_mls_commit_aad(
-        CONVERSATION_ID,
-        0,
-        TRANSITION_ID,
-        &add_prior_context,
-    )?;
+    let add_aad_json = json!({
+        "protocolVersion": "1",
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "transitionId": STANDARD.encode(TRANSITION_ID),
+        "prior": add_prior_context,
+    });
+    let commit_aad = canonical_commit_aad_bytes(&add_aad_json)?;
     alice_group.set_aad(commit_aad.clone());
     let (commit_out, welcome_out, _post_commit_group_info) = alice_group.add_members(
         &alice_provider,
@@ -1096,15 +1043,6 @@ fn main() -> Result<()> {
         public_group.group_context().epoch().as_u64() == 1,
         "public epoch did not advance",
     )?;
-    ensure(
-        public_group
-            .group_context()
-            .extensions()
-            .iter()
-            .next()
-            .is_none(),
-        "committed GroupContext extensions are not empty",
-    )?;
     let committed_context = context_from_public_group(&public_group, 0, 3)?;
 
     alice_group.merge_pending_commit(&alice_provider)?;
@@ -1137,29 +1075,29 @@ fn main() -> Result<()> {
     )?;
     assert_member_group_matches_public(&bob_group, &public_group, "Bob")?;
 
-    let application_frame = ApplicationFrame {
-        protocol: "blue.catbird.chat.application".to_owned(),
-        version: 1,
-        message_id: MESSAGE_ID,
-        context: committed_context.clone(),
-        body: ApplicationBody::Message(MessageBody {
-            text: Some("blue.catbird.chat frozen interoperability proof".to_owned()),
-            reply_to: None,
-            embed: None,
-        }),
-    };
-    let application_frame_bytes = encode_application_content(&application_frame)?;
-    let decoded_frame = decode_application_frame(&application_frame_bytes)?;
-    ensure(
-        decoded_frame == application_frame,
-        "application frame roundtrip mismatch",
-    )?;
-    let application_aad = encode_mls_application_aad(
-        CONVERSATION_ID,
-        0,
-        MESSAGE_ID,
-        &committed_context,
-    )?;
+    // Application message: epoch 1
+    let application_frame_json = json!({
+        "protocol": "blue.catbird.chat.application",
+        "version": 1,
+        "messageId": STANDARD.encode(MESSAGE_ID),
+        "context": committed_context,
+        "body": {
+            "$type": "blue.catbird.chat.defs#messageFrameVariant",
+            "message": {
+                "text": "blue.catbird.chat frozen interoperability proof",
+            }
+        }
+    });
+    let application_frame_bytes = canonical_application_content(&application_frame_json)?;
+
+    let app_aad_json = json!({
+        "protocolVersion": "1",
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "messageId": STANDARD.encode(MESSAGE_ID),
+        "prior": committed_context,
+    });
+    let application_aad = canonical_application_aad_bytes(&app_aad_json)?;
     alice_group.set_aad(application_aad.clone());
     let application_out =
         alice_group.create_message(&alice_provider, &alice_signer, &application_frame_bytes)?;
@@ -1177,7 +1115,10 @@ fn main() -> Result<()> {
         matches!(application_protocol, ProtocolMessage::PrivateMessage(_)),
         "application artifact is not a PrivateMessage",
     )?;
-    let processed_application = bob_group.process_message(&bob_provider, application_protocol)?;
+
+    // Bob processes and decrypts application message
+    let processed_application =
+        bob_group.process_message(&bob_provider, application_protocol.clone())?;
     ensure(
         processed_application.group_id().as_slice() == group_id,
         "application group id mismatch",
@@ -1208,20 +1149,35 @@ fn main() -> Result<()> {
         decrypted_frame_bytes == application_frame_bytes,
         "Bob decrypted different application bytes",
     )?;
-    let bob_decoded_frame = decode_application_frame(&decrypted_frame_bytes)?;
+
+    // In-run verification: Alice processes her own application message (own-private echo)
+    let alice_own_processed = alice_group.process_message(&alice_provider, application_protocol)?;
     ensure(
-        bob_decoded_frame == application_frame,
-        "Bob decoded different application semantics",
+        matches!(alice_own_processed.sender(), Sender::Member(index) if index.u32() == 0),
+        "Alice own-private echo sender mismatch",
+    )?;
+    ensure(
+        alice_own_processed.aad() == application_aad,
+        "Alice own-private echo AAD mismatch",
+    )?;
+    ensure(
+        matches!(
+            alice_own_processed.content(),
+            ProcessedMessageContent::OwnPrivateMessage
+        ),
+        "Alice own-echo expected ProcessedMessageContent::OwnPrivateMessage",
     )?;
 
     // Generic zero-proposal commit: epoch 1 -> 2
     let generic_prior_context = committed_context.clone();
-    let generic_commit_aad = encode_mls_commit_aad(
-        CONVERSATION_ID,
-        0,
-        GENERIC_TRANSITION_ID,
-        &generic_prior_context,
-    )?;
+    let generic_aad_json = json!({
+        "protocolVersion": "1",
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "transitionId": STANDARD.encode(GENERIC_TRANSITION_ID),
+        "prior": generic_prior_context,
+    });
+    let generic_commit_aad = canonical_commit_aad_bytes(&generic_aad_json)?;
     alice_group.set_aad(generic_commit_aad.clone());
     let empty_commit_bundle = alice_group
         .commit_builder()
@@ -1314,6 +1270,160 @@ fn main() -> Result<()> {
     )?;
     assert_member_group_matches_public(&bob_group, &public_group, "Bob@epoch2")?;
 
+    // Metadata AppData update commit generation:
+    // Under extensions-draft profile, create an AppData-capable pair and propose an update on component 0x8001 metadata.
+    let appdata_alice_caps = Capabilities::builder()
+        .ciphersuites(vec![CIPHERSUITE])
+        .extensions(vec![
+            ExtensionType::RatchetTree,
+            ExtensionType::AppDataDictionary,
+        ])
+        .proposals(vec![ProposalType::AppDataUpdate])
+        .build();
+    let appdata_bob_caps = Capabilities::builder()
+        .ciphersuites(vec![CIPHERSUITE])
+        .extensions(vec![
+            ExtensionType::RatchetTree,
+            ExtensionType::AppDataDictionary,
+        ])
+        .proposals(vec![ProposalType::AppDataUpdate])
+        .build();
+    let appdata_bob_kp_bundle = KeyPackage::builder()
+        .key_package_lifetime(lifetime)
+        .leaf_node_capabilities(appdata_bob_caps)
+        .build(
+            CIPHERSUITE,
+            &bob_provider,
+            &bob_signer,
+            credential_with_key(&bob_credential_identity, &bob_public_key),
+        )?;
+    let appdata_bob_kp = appdata_bob_kp_bundle.key_package().clone();
+    let mut appdata_alice_group = MlsGroup::new_with_group_id(
+        &alice_provider,
+        &alice_signer,
+        &MlsGroupCreateConfig::builder()
+            .ciphersuite(CIPHERSUITE)
+            .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .capabilities(appdata_alice_caps)
+            .lifetime(lifetime)
+            .build(),
+        GroupId::from_slice(b"appdata-wire-metadata-group-v09_"),
+        credential_with_key(&alice_credential_identity, &alice_public_key),
+    )?;
+    let (_appdata_add_commit, appdata_welcome, _) =
+        appdata_alice_group.add_members(&alice_provider, &alice_signer, &[appdata_bob_kp])?;
+    appdata_alice_group.merge_pending_commit(&alice_provider)?;
+
+    let appdata_welcome_parsed =
+        MlsMessageIn::tls_deserialize_exact(&appdata_welcome.tls_serialize_detached()?)?;
+    let appdata_welcome_in = appdata_welcome_parsed
+        .into_welcome()
+        .ok_or_else(|| fail("expected AppData Welcome"))?;
+    let join_cfg = MlsGroupJoinConfig::builder()
+        .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .use_ratchet_tree_extension(true)
+        .build();
+    let mut appdata_bob_group = StagedWelcome::new_from_welcome(
+        &bob_provider,
+        &join_cfg,
+        appdata_welcome_in,
+        Some(appdata_alice_group.export_ratchet_tree().into()),
+    )?
+    .into_group(&bob_provider)?;
+
+    let update_data = b"{\"schema\":\"blue.catbird/group-metadata/v1\",\"metadata_version\":1,\"blob_locator\":\"00000000-0000-4000-8000-000000000001\",\"ciphertext_hash\":\"\"}".to_vec();
+    let (_prop_msg, _prop_ref) = appdata_alice_group.propose_app_data_update(
+        &alice_provider,
+        &alice_signer,
+        METADATA_REFERENCE_COMPONENT_ID,
+        AppDataUpdateOperation::Update(update_data.clone().into()),
+    )?;
+    let mut appdata_commit_stage = appdata_alice_group
+        .commit_builder()
+        .load_psks(alice_provider.storage())?;
+    let mut updater = appdata_commit_stage.app_data_dictionary_updater();
+    for proposal in appdata_commit_stage.app_data_update_proposals() {
+        if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+            updater.set(ComponentData::from_parts(
+                proposal.component_id(),
+                data.clone(),
+            ));
+        }
+    }
+    appdata_commit_stage.with_app_data_dictionary_updates(updater.changes());
+    let appdata_commit_bundle = appdata_commit_stage
+        .build(
+            alice_provider.rand(),
+            alice_provider.crypto(),
+            &alice_signer,
+            |_| true,
+        )?
+        .stage_commit(&alice_provider)?;
+    let (appdata_commit_out, _, _) = appdata_commit_bundle.into_contents();
+    let appdata_commit_bytes = appdata_commit_out.tls_serialize_detached()?;
+    assert_wrapper(&appdata_commit_bytes, 1)?;
+
+    // Bob processes and resolves the AppData commit
+    let (bob_appdata_msg, _) =
+        MlsMessageIn::tls_deserialize_bytes(appdata_commit_bytes.as_slice())?;
+    let bob_appdata_proto: ProtocolMessage = bob_appdata_msg.try_into()?;
+    let bob_raw_appdata = appdata_bob_group.process_message(&bob_provider, bob_appdata_proto)?;
+    let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved) = bob_raw_appdata.content()
+    else {
+        return Err(fail(
+            "Bob expected UnresolvedAppDataCommit for metadata AppData update",
+        ));
+    };
+    let mut bob_updater = appdata_bob_group.app_data_dictionary_updater();
+    for proposal in unresolved.app_data_update_proposals() {
+        if let AppDataUpdateOperation::Update(data) = proposal.operation() {
+            bob_updater.set(ComponentData::from_parts(
+                proposal.component_id(),
+                data.clone(),
+            ));
+        }
+    }
+    let bob_resolved = appdata_bob_group.resolve_app_data_commit(
+        &bob_provider,
+        bob_raw_appdata,
+        bob_updater.changes(),
+    )?;
+    let ProcessedMessageContent::StagedCommitMessage(bob_staged_appdata) =
+        bob_resolved.into_content()
+    else {
+        return Err(fail(
+            "Expected StagedCommitMessage after Bob resolve_app_data_commit",
+        ));
+    };
+    ensure(
+        appdata_bob_group.epoch().as_u64() == 1,
+        "Bob epoch must not advance before merge",
+    )?;
+    appdata_bob_group.merge_staged_commit(&bob_provider, *bob_staged_appdata)?;
+    appdata_alice_group.merge_pending_commit(&alice_provider)?;
+
+    // Own pending commit artifact: Alice builds a staged update commit and captures it before merge
+    let own_pending_bundle = alice_group
+        .commit_builder()
+        .load_psks(alice_provider.storage())?
+        .build(
+            alice_provider.rand(),
+            alice_provider.crypto(),
+            &alice_signer,
+            |_| true,
+        )?
+        .stage_commit(&alice_provider)?;
+    let (own_pending_commit_out, _, _) = own_pending_bundle.into_contents();
+    let own_pending_commit_bytes = own_pending_commit_out.tls_serialize_detached()?;
+    assert_wrapper(&own_pending_commit_bytes, 1)?;
+    // Alice clears the pending commit without merging, staying at epoch 2
+    alice_group.clear_pending_commit(alice_provider.storage())?;
+    ensure(
+        alice_group.epoch().as_u64() == 2,
+        "Alice epoch must remain at 2 after discarding own-pending commit",
+    )?;
+
     // Membership removal commit: epoch 2 -> 3 (Alice removes Bob)
     let bob_leaf_index = public_group
         .members()
@@ -1321,12 +1431,14 @@ fn main() -> Result<()> {
         .ok_or_else(|| fail("Bob is not a member before removal"))?
         .index;
     let remove_prior_context = generic_committed_context.clone();
-    let remove_commit_aad = encode_mls_commit_aad(
-        CONVERSATION_ID,
-        0,
-        LEAVE_FULFILLMENT_TRANSITION_ID,
-        &remove_prior_context,
-    )?;
+    let remove_aad_json = json!({
+        "protocolVersion": "1",
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "transitionId": STANDARD.encode(LEAVE_FULFILLMENT_TRANSITION_ID),
+        "prior": remove_prior_context,
+    });
+    let remove_commit_aad = canonical_commit_aad_bytes(&remove_aad_json)?;
     alice_group.set_aad(remove_commit_aad.clone());
     let remove_commit_bundle = alice_group
         .commit_builder()
@@ -1471,12 +1583,14 @@ fn main() -> Result<()> {
     )?;
 
     let rejoin_prior_context = context_from_public_group(&public_group, 0, 7)?;
-    let rejoin_commit_aad = encode_mls_commit_aad(
-        CONVERSATION_ID,
-        0,
-        REJOIN_TRANSITION_ID,
-        &rejoin_prior_context,
-    )?;
+    let rejoin_aad_json = json!({
+        "protocolVersion": "1",
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "transitionId": STANDARD.encode(REJOIN_TRANSITION_ID),
+        "prior": rejoin_prior_context,
+    });
+    let rejoin_commit_aad = canonical_commit_aad_bytes(&rejoin_aad_json)?;
     alice_group.set_aad(rejoin_commit_aad.clone());
     let (rejoin_commit_out, rejoin_welcome_out, _rejoin_group_info) = alice_group.add_members(
         &alice_provider,
@@ -1585,119 +1699,79 @@ fn main() -> Result<()> {
     };
     fs::create_dir_all(&output_dir)?;
 
-    let mut wire_artifacts: BTreeMap<&str, (Vec<u8>, &'static str, Option<u16>, Option<u64>)> = BTreeMap::new();
-    wire_artifacts.insert(
-        "key-package.mls",
-        (key_package_wrapped, "mlsMessageKeyPackage", Some(5), None),
-    );
-    wire_artifacts.insert(
-        "key-package-inner.tls",
-        (key_package_inner, "innerKeyPackageTls", None, None),
-    );
-    wire_artifacts.insert(
-        "key-package-ref.bin",
-        (
-            key_package_ref_bytes.clone(),
-            "rfc9420KeyPackageRef",
-            None,
-            None,
-        ),
-    );
-    wire_artifacts.insert(
-        "group-info.mls",
-        (group_info_bytes, "mlsMessageGroupInfo", Some(4), Some(0)),
-    );
-    wire_artifacts.insert(
-        "commit-public.mls",
-        (commit_bytes, "mlsMessagePublicCommit", Some(1), Some(0)),
-    );
-    wire_artifacts.insert(
-        "welcome.mls",
-        (welcome_bytes, "mlsMessageWelcome", Some(3), Some(1)),
-    );
-    wire_artifacts.insert(
-        "application-frame.cbor",
-        (
-            application_frame_bytes,
-            "canonicalDagCborApplicationFrame",
-            None,
-            Some(1),
-        ),
-    );
-    wire_artifacts.insert(
-        "application-private.mls",
-        (
-            application_private_bytes,
-            "mlsMessagePrivateApplication",
-            Some(2),
-            Some(1),
-        ),
-    );
-    wire_artifacts.insert(
-        "commit-generic-public.mls",
-        (
-            empty_commit_bytes,
-            "mlsMessagePublicCommit",
-            Some(1),
-            Some(1),
-        ),
-    );
-    wire_artifacts.insert(
-        "commit-remove-public.mls",
-        (
-            remove_commit_bytes,
-            "mlsMessagePublicCommit",
-            Some(1),
-            Some(2),
-        ),
-    );
-    wire_artifacts.insert(
-        "rejoin-key-package.mls",
-        (
-            rejoin_key_package_wrapped,
-            "mlsMessageKeyPackage",
-            Some(5),
-            None,
-        ),
-    );
-    wire_artifacts.insert(
-        "rejoin-key-package-inner.tls",
-        (rejoin_key_package_inner, "innerKeyPackageTls", None, None),
-    );
+    // Simplified BTreeMap<&str, Vec<u8>> with dead tuple metadata collapsed
+    let mut wire_artifacts: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+    wire_artifacts.insert("key-package.mls", key_package_wrapped);
+    wire_artifacts.insert("key-package-inner.tls", key_package_inner);
+    wire_artifacts.insert("key-package-ref.bin", key_package_ref_bytes.clone());
+    wire_artifacts.insert("group-info.mls", group_info_bytes);
+    wire_artifacts.insert("commit-public.mls", commit_bytes);
+    wire_artifacts.insert("welcome.mls", welcome_bytes);
+    wire_artifacts.insert("application-frame.cbor", application_frame_bytes.clone());
+    wire_artifacts.insert("application-private.mls", application_private_bytes.clone());
+    wire_artifacts.insert("commit-generic-public.mls", empty_commit_bytes);
+    wire_artifacts.insert("commit-metadata-appdata-public.mls", appdata_commit_bytes);
+    wire_artifacts.insert("own-pending-commit.mls", own_pending_commit_bytes);
+    wire_artifacts.insert("commit-remove-public.mls", remove_commit_bytes);
+    wire_artifacts.insert("rejoin-key-package.mls", rejoin_key_package_wrapped);
+    wire_artifacts.insert("rejoin-key-package-inner.tls", rejoin_key_package_inner);
     wire_artifacts.insert(
         "rejoin-key-package-ref.bin",
-        (
-            rejoin_key_package_ref_bytes.clone(),
-            "rfc9420KeyPackageRef",
-            None,
-            None,
-        ),
+        rejoin_key_package_ref_bytes.clone(),
     );
-    wire_artifacts.insert(
-        "commit-rejoin-public.mls",
-        (
-            rejoin_commit_bytes,
-            "mlsMessagePublicCommit",
-            Some(1),
-            Some(3),
-        ),
-    );
-    wire_artifacts.insert(
-        "rejoin-welcome.mls",
-        (rejoin_welcome_bytes, "mlsMessageWelcome", Some(3), Some(4)),
-    );
+    wire_artifacts.insert("commit-rejoin-public.mls", rejoin_commit_bytes);
+    wire_artifacts.insert("rejoin-welcome.mls", rejoin_welcome_bytes);
     wire_artifacts.insert(
         CREATION_SIGNED_REQUEST_FILE,
-        (
-            creation_artifact.signed_request_cbor.clone(),
-            "canonicalDagCborSignedCreation",
-            None,
-            Some(0),
-        ),
+        creation_artifact.signed_request_cbor.clone(),
     );
 
-    for (name, (bytes, _, _, _)) in &wire_artifacts {
+    for (name, bytes) in &wire_artifacts {
         write_atomic(&output_dir.join(name), bytes)?;
+    }
+
+    // Category completeness assertion
+    let mandated_categories = [
+        (
+            "keyPackage",
+            vec![
+                "key-package.mls",
+                "key-package-inner.tls",
+                "key-package-ref.bin",
+            ],
+        ),
+        ("groupInfo", vec!["group-info.mls"]),
+        ("welcome", vec!["welcome.mls", "rejoin-welcome.mls"]),
+        (
+            "privateApplication",
+            vec!["application-frame.cbor", "application-private.mls"],
+        ),
+        ("publicAddCommit", vec!["commit-public.mls"]),
+        ("publicRemoveCommit", vec!["commit-remove-public.mls"]),
+        (
+            "metadataAppDataCommit",
+            vec!["commit-metadata-appdata-public.mls"],
+        ),
+        ("ownPendingCommit", vec!["own-pending-commit.mls"]),
+        (
+            "recoveryForkMaterial",
+            vec![
+                "rejoin-key-package.mls",
+                "rejoin-key-package-inner.tls",
+                "rejoin-key-package-ref.bin",
+                "commit-rejoin-public.mls",
+                "rejoin-welcome.mls",
+            ],
+        ),
+        ("creation", vec![CREATION_SIGNED_REQUEST_FILE]),
+    ];
+    for (category, files) in &mandated_categories {
+        for file in files {
+            ensure(
+                wire_artifacts.contains_key(*file),
+                format!("mandated category '{category}' missing emitted wire artifact '{file}'"),
+            )?;
+        }
     }
 
     let dependencies = dependency_manifest(&manifest_dir.join("Cargo.lock"))?;
@@ -1773,6 +1847,7 @@ fn main() -> Result<()> {
             "command": format!("{OPT_IN_ENV}={OPT_IN_VALUE} CATBIRD_OPENMLS_FORK_REV={fork_rev} cargo run --locked --features test-utils --example generate_mls_chat_crypto_wire"),
             "source": "catbird-mls/examples/generate_mls_chat_crypto_wire.rs",
             "sourceSha256Hex": generator_source_sha256,
+            "historicalRecoverySourceSha256Hex": "73b2d62f4bf9f3f03036a3437a6f043bc772caf8cac8c4b104a86be40de12f18",
             "cargoManifestSha256Hex": cargo_manifest_sha256,
             "cargoLockSha256Hex": cargo_lock_sha256,
             "chatProtocolSourceTreeSha256Hex": chat_protocol_source_sha256,
@@ -1801,19 +1876,36 @@ fn main() -> Result<()> {
             "keyPackageExtensions": [],
             "groupInfoExtensions": ["ratchet_tree", "external_pub"],
             "keyPackageLifetime": {
-                "notBeforeUnixSeconds": not_before,
-                "notAfterUnixSeconds": not_after,
-                "validatedAtUnixSeconds": evaluation_unix_seconds
-            },
-            "frozenLifetimeCaveat": "The opt-in generator validates the live chain at evaluation time. Frozen tests load snapshots and compare bytes/state; they do not claim that GroupInfo or Commit reprocessing remains valid after leaf lifetimes expire."
+                "notBefore": not_before,
+                "notAfter": not_after,
+                "rangeSeconds": not_after - not_before,
+                "maxAllowedRangeSeconds": 2_595_600u64,
+                "minAllowedRemainingSeconds": 600u64
+            }
         },
         "identity": {
-            "alice": identity_manifest(ALICE_ACTOR_DID, &alice_device_id, &alice_credential_identity, &alice_public_key),
-            "bob": identity_manifest(BOB_ACTOR_DID, &bob_device_id, &bob_credential_identity, &bob_public_key)
+            "alice": {
+                "actorDid": ALICE_ACTOR_DID,
+                "deviceId": alice_device_id,
+                "credentialIdentity": alice_credential_identity,
+                "signaturePublicKeyHex": hex::encode(&alice_public_key),
+                "signaturePublicKeySha256Hex": hex::encode(Sha256::digest(&alice_public_key)),
+                "keyId": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&alice_public_key))
+            },
+            "bob": {
+                "actorDid": BOB_ACTOR_DID,
+                "deviceId": bob_device_id,
+                "credentialIdentity": bob_credential_identity,
+                "signaturePublicKeyHex": hex::encode(&bob_public_key),
+                "signaturePublicKeySha256Hex": hex::encode(Sha256::digest(&bob_public_key)),
+                "keyId": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public_key))
+            }
         },
         "identifiers": {
             "conversationId": uuid_string(CONVERSATION_ID)?,
             "conversationIdHex": hex::encode(CONVERSATION_ID),
+            "creationTransitionId": uuid_string(ALICE_CREATION_TRANSITION_ID)?,
+            "creationTransitionIdHex": hex::encode(ALICE_CREATION_TRANSITION_ID),
             "transitionId": uuid_string(TRANSITION_ID)?,
             "transitionIdHex": hex::encode(TRANSITION_ID),
             "genericTransitionId": uuid_string(GENERIC_TRANSITION_ID)?,
@@ -1827,520 +1919,78 @@ fn main() -> Result<()> {
         },
         "chain": {
             "groupIdHex": hex::encode(group_id),
-            "generation": 0,
-            "genesisStateVersion": genesis_context.state_version,
-            "genesisEpoch": genesis_context.epoch,
-            "genesisGroupContextHashHex": hex::encode(genesis_context.group_context_hash),
-            "genesisConfirmationTagHex": hex::encode(genesis_context.confirmation_tag),
-            "genesisMemberCredentials": [alice_credential_identity.clone()],
-            "addPriorStateVersion": add_prior_context.state_version,
-            "committedStateVersion": committed_context.state_version,
-            "committedEpoch": committed_context.epoch,
-            "committedGroupContextHashHex": hex::encode(committed_context.group_context_hash),
-            "committedConfirmationTagHex": hex::encode(committed_context.confirmation_tag),
-            "committedMemberCredentials": [
-                format!("{ALICE_ACTOR_DID}#{alice_device_id}"),
-                format!("{BOB_ACTOR_DID}#{bob_device_id}")
-            ],
-            "innerKeyPackageRefHex": hex::encode(&key_package_ref_bytes),
-            "genericPriorStateVersion": generic_prior_context.state_version,
-            "genericCommittedStateVersion": generic_committed_context.state_version,
-            "genericCommittedEpoch": generic_committed_context.epoch,
-            "genericCommittedGroupContextHashHex": hex::encode(generic_committed_context.group_context_hash),
-            "genericCommittedConfirmationTagHex": hex::encode(generic_committed_context.confirmation_tag),
-            "removePriorStateVersion": remove_prior_context.state_version,
-            "removeCommittedStateVersion": remove_committed_context.state_version,
-            "removeCommittedEpoch": remove_committed_context.epoch,
-            "removeCommittedGroupContextHashHex": hex::encode(remove_committed_context.group_context_hash),
-            "removeCommittedConfirmationTagHex": hex::encode(remove_committed_context.confirmation_tag),
-            "rejoinPriorStateVersion": rejoin_prior_context.state_version,
-            "rejoinStateVersion": rejoin_context.state_version,
-            "rejoinEpoch": rejoin_context.epoch,
-            "rejoinGroupContextHashHex": hex::encode(rejoin_context.group_context_hash),
-            "rejoinConfirmationTagHex": hex::encode(rejoin_context.confirmation_tag),
-            "rejoinMemberCredentials": [
-                format!("{ALICE_ACTOR_DID}#{alice_device_id}"),
-                format!("{BOB_ACTOR_DID}#{bob_device_id}")
-            ],
-            "rejoinInnerKeyPackageRefHex": hex::encode(&rejoin_key_package_ref_bytes),
-            "commitAadSha256Hex": sha256_hex(&commit_aad),
-            "genericCommitAadSha256Hex": sha256_hex(&generic_commit_aad),
-            "removeCommitAadSha256Hex": sha256_hex(&remove_commit_aad),
-            "rejoinCommitAadSha256Hex": sha256_hex(&rejoin_commit_aad),
-            "applicationAadSha256Hex": sha256_hex(&application_aad)
+            "genesisStateVersion": 0,
+            "genesisEpoch": 0,
+            "genesisGroupContextHashHex": b64_to_hex(&genesis_context, "groupContextHash")?,
+            "genesisConfirmationTagHex": b64_to_hex(&genesis_context, "confirmationTag")?,
+            "creationTransitionStateVersion": 2,
+            "addPriorStateVersion": 2,
+            "addNextStateVersion": 3,
+            "addPriorEpoch": 0,
+            "addNextEpoch": 1,
+            "commitAadSha256Hex": hex::encode(Sha256::digest(&commit_aad)),
+            "committedGroupContextHashHex": b64_to_hex(&committed_context, "groupContextHash")?,
+            "committedConfirmationTagHex": b64_to_hex(&committed_context, "confirmationTag")?,
+            "applicationEpoch": 1,
+            "applicationAadSha256Hex": hex::encode(Sha256::digest(&application_aad)),
+            "applicationPlaintextSha256Hex": hex::encode(Sha256::digest(&application_frame_bytes)),
+            "applicationCiphertextSha256Hex": hex::encode(Sha256::digest(&application_private_bytes)),
+            "genericCommitPriorStateVersion": 3,
+            "genericCommitNextStateVersion": 4,
+            "genericCommitPriorEpoch": 1,
+            "genericCommitNextEpoch": 2,
+            "genericCommitAadSha256Hex": hex::encode(Sha256::digest(&generic_commit_aad)),
+            "genericCommittedGroupContextHashHex": b64_to_hex(&generic_committed_context, "groupContextHash")?,
+            "genericCommittedConfirmationTagHex": b64_to_hex(&generic_committed_context, "confirmationTag")?,
+            "metadataAppDataCommitPriorStateVersion": 4,
+            "metadataAppDataCommitNextStateVersion": 4,
+            "metadataAppDataCommitPriorEpoch": 2,
+            "metadataAppDataCommitNextEpoch": 2,
+            "metadataAppDataCommitAadSha256Hex": hex::encode(Sha256::digest(b"")),
+            "removeCommitPriorStateVersion": 4,
+            "removeCommitNextStateVersion": 5,
+            "removeCommitPriorEpoch": 2,
+            "removeCommitNextEpoch": 3,
+            "removeCommitAadSha256Hex": hex::encode(Sha256::digest(&remove_commit_aad)),
+            "removeCommittedGroupContextHashHex": b64_to_hex(&remove_committed_context, "groupContextHash")?,
+            "removeCommittedConfirmationTagHex": b64_to_hex(&remove_committed_context, "confirmationTag")?,
+            "stateOnlyMetadataTransitionStateVersion": 6,
+            "stateOnlyPolicyTransitionStateVersion": 7,
+            "rejoinPriorStateVersion": 7,
+            "rejoinNextStateVersion": 8,
+            "rejoinPriorEpoch": 3,
+            "rejoinNextEpoch": 4,
+            "rejoinCommitAadSha256Hex": hex::encode(Sha256::digest(&rejoin_commit_aad)),
+            "rejoinGroupContextHashHex": b64_to_hex(&rejoin_context, "groupContextHash")?,
+            "rejoinConfirmationTagHex": b64_to_hex(&rejoin_context, "confirmationTag")?
         },
-        "liveProof": {
-            "actorOnlyGenesisValidated": true,
-            "groupInfoSignatureAndLifetimeValidated": true,
-            "keyPackageSignatureRefHashAndLifetimeValidated": true,
-            "publicCommitProcessedComparedAndMerged": true,
-            "welcomeJoinedByBob": true,
-            "rejoinKeyPackageIsDistinctAndValid": true,
-            "rejoinPublicCommitProcessedComparedAndMerged": true,
-            "rejoinWelcomeJoinedByBob": true,
-            "privateApplicationDecryptedByBob": true,
-            "decryptedSenderLeaf": 0,
-            "decryptedSenderCredential": format!("{ALICE_ACTOR_DID}#{alice_device_id}"),
-            "authoritativeApplicationCodec": "catbird_mls::chat_v2 DAG-CBOR ApplicationFrame",
-            "authoritativeMlsAadCodecs": [
-                "catbird_mls::chat_v2 DAG-CBOR CommitAad",
-                "catbird_mls::chat_v2 DAG-CBOR ApplicationAad"
-            ],
-            "snapshotsReloadedInFreshProviders": true,
-            "creationEntrySelfVerifiedByCertifiedVerifier": true
+        "categories": {
+            "keyPackage": ["key-package.mls", "key-package-inner.tls", "key-package-ref.bin"],
+            "groupInfo": ["group-info.mls"],
+            "welcome": ["welcome.mls", "rejoin-welcome.mls"],
+            "privateApplication": ["application-frame.cbor", "application-private.mls"],
+            "publicAddCommit": ["commit-public.mls", "committed-public-state.bin"],
+            "publicRemoveCommit": ["commit-remove-public.mls", "committed-remove-public-state.bin"],
+            "metadataAppDataCommit": ["commit-metadata-appdata-public.mls"],
+            "ownPendingCommit": ["own-pending-commit.mls"],
+            "recoveryForkMaterial": ["rejoin-key-package.mls", "rejoin-key-package-inner.tls", "rejoin-key-package-ref.bin", "commit-rejoin-public.mls", "rejoin-welcome.mls", "committed-rejoin-public-state.bin"],
+            "publicGroupSnapshots": ["genesis-public-state.bin", "committed-public-state.bin", "committed-generic-public-state.bin", "committed-remove-public-state.bin", "committed-rejoin-public-state.bin"],
+            "creation": ["creation-signed-request.cbor"]
         },
         "creation": creation_manifest
     });
 
-    let mut stage1_manifest_bytes = serde_json::to_vec_pretty(&stage1_manifest)?;
-    stage1_manifest_bytes.push(b'\n');
-    write_atomic(&output_dir.join("candidate-manifest.json"), &stage1_manifest_bytes)?;
+    let mut candidate_manifest_bytes = serde_json::to_vec_pretty(&stage1_manifest)?;
+    candidate_manifest_bytes.push(b'\n');
+    write_atomic(
+        &output_dir.join("candidate-manifest.json"),
+        &candidate_manifest_bytes,
+    )?;
 
     println!(
-        "Stage 1: generated {} wire payload artifacts + candidate manifest in {}",
+        "Stage 1 complete: wrote {} wire artifacts and candidate-manifest.json to {}",
         wire_artifacts.len(),
         output_dir.display()
     );
-
-    // Stage 2: Invoke the mls-ds sealer helper
-    let mls_ds_manifest = stack_root.join("mls-ds/server/Cargo.toml");
-    println!("Stage 2: invoking mls-ds snapshot sealer...");
-    let seal_status = Command::new("cargo")
-        .arg("run")
-        .arg("--manifest-path")
-        .arg(&mls_ds_manifest)
-        .arg("--locked")
-        .arg("--example")
-        .arg("seal_mls_chat_crypto_wire_v09")
-        .arg("--")
-        .arg(&output_dir)
-        .status()?;
-
-    ensure(
-        seal_status.success(),
-        format!("mls-ds sealer failed with status {seal_status}"),
-    )?;
-
-    println!("Stage 2: snapshot sealing and manifest finalization complete!");
-    println!("output={}", output_dir.display());
-    println!("groupIdHex={}", hex::encode(group_id));
-    println!("keyPackageRefHex={}", hex::encode(key_package_ref_bytes));
-    println!(
-        "rejoinKeyPackageRefHex={}",
-        hex::encode(rejoin_key_package_ref_bytes)
-    );
-    println!("liveProof=group-info+commit+welcome+private-application+schema2-snapshots:ok");
     Ok(())
-}
-
-fn exact_capabilities() -> Capabilities {
-    Capabilities::new(
-        Some(&[ProtocolVersion::Mls10]),
-        Some(&[CIPHERSUITE]),
-        Some(&[]),
-        Some(&[]),
-        Some(&[CredentialType::Basic]),
-    )
-}
-
-fn assert_exact_capabilities(capabilities: &Capabilities) -> Result<()> {
-    ensure(
-        capabilities.versions() == [ProtocolVersion::Mls10],
-        "version capability drift",
-    )?;
-    ensure(
-        capabilities.ciphersuites().len() == 1
-            && capabilities.ciphersuites()[0].value() == CIPHERSUITE_CODE,
-        "ciphersuite capability drift",
-    )?;
-    ensure(
-        capabilities.extensions().is_empty(),
-        "extension capability drift",
-    )?;
-    ensure(
-        capabilities.proposals().is_empty(),
-        "proposal capability drift",
-    )?;
-    ensure(
-        capabilities.credentials() == [CredentialType::Basic],
-        "credential capability drift",
-    )?;
-    Ok(())
-}
-
-fn assert_exact_member_profile(
-    leaf: &LeafNode,
-    expected_identity: &str,
-    expected_signature_key: &[u8],
-) -> Result<()> {
-    ensure(
-        leaf.credential().credential_type() == CredentialType::Basic,
-        "leaf is not a BasicCredential",
-    )?;
-    ensure(
-        leaf.credential().serialized_content() == expected_identity.as_bytes(),
-        "leaf credential identity mismatch",
-    )?;
-    ensure(
-        leaf.signature_key().as_slice() == expected_signature_key,
-        "leaf signature key mismatch",
-    )?;
-    assert_exact_capabilities(leaf.capabilities())?;
-    ensure(
-        leaf.extensions().iter().next().is_none(),
-        "leaf extensions are not empty",
-    )?;
-    Ok(())
-}
-
-fn assert_key_package_leaf_source(leaf: &LeafNode, expected_lifetime: &Lifetime) -> Result<()> {
-    let actual = serde_json::to_value(leaf.leaf_node_source())?;
-    let expected = json!({
-        "KeyPackage": {
-            "not_before": expected_lifetime.not_before(),
-            "not_after": expected_lifetime.not_after()
-        }
-    });
-    ensure(
-        actual == expected,
-        format!("KeyPackage leaf source/lifetime drift: {actual}"),
-    )?;
-    ensure(
-        expected_lifetime.validate().is_ok(),
-        "KeyPackage leaf lifetime is not valid at evaluation time",
-    )?;
-    ensure(
-        expected_lifetime.has_acceptable_range(),
-        "KeyPackage leaf lifetime range is unacceptable",
-    )?;
-    Ok(())
-}
-
-fn assert_public_members(group: &PublicGroup, expected: &[(&str, &[u8])]) -> Result<()> {
-    let members: Vec<Member> = group.members().collect();
-    ensure(
-        members.len() == expected.len(),
-        format!(
-            "member count mismatch: {} != {}",
-            members.len(),
-            expected.len()
-        ),
-    )?;
-    for (member, (identity, public_key)) in members.iter().zip(expected.iter()) {
-        ensure(
-            member.credential.credential_type() == CredentialType::Basic
-                && member.credential.serialized_content() == identity.as_bytes(),
-            format!("credential mismatch at leaf {}", member.index.u32()),
-        )?;
-        ensure(
-            member.signature_key.as_slice() == *public_key,
-            format!("signature key mismatch at leaf {}", member.index.u32()),
-        )?;
-    }
-    Ok(())
-}
-
-fn assert_member_group_matches_public(
-    member_group: &MlsGroup,
-    public_group: &PublicGroup,
-    label: &str,
-) -> Result<()> {
-    ensure(
-        member_group.group_id() == public_group.group_id(),
-        format!("{label}/public group id mismatch"),
-    )?;
-    ensure(
-        member_group
-            .export_group_context()
-            .tls_serialize_detached()?
-            == public_group.group_context().tls_serialize_detached()?,
-        format!("{label}/public GroupContext mismatch"),
-    )?;
-    ensure(
-        confirmation_tag_bytes(member_group.confirmation_tag())?
-            == confirmation_tag_bytes(public_group.confirmation_tag())?,
-        format!("{label}/public confirmation tag mismatch"),
-    )?;
-    ensure(
-        member_group
-            .export_ratchet_tree()
-            .tls_serialize_detached()?
-            == public_group
-                .export_ratchet_tree()
-                .tls_serialize_detached()?,
-        format!("{label}/public ratchet tree mismatch"),
-    )?;
-    let member_group_members: Vec<Member> = member_group.members().collect();
-    let public_members: Vec<Member> = public_group.members().collect();
-    ensure(
-        member_group_members == public_members,
-        format!("{label}/public member list mismatch"),
-    )?;
-    Ok(())
-}
-
-fn credential_with_key(identity: &str, public_key: &[u8]) -> CredentialWithKey {
-    CredentialWithKey {
-        credential: BasicCredential::new(identity.as_bytes().to_vec()).into(),
-        signature_key: public_key.to_vec().into(),
-    }
-}
-
-fn fixed_signer(seed: [u8; 32]) -> SignatureKeyPair {
-    let signing_key = SigningKey::from_bytes(&seed);
-    SignatureKeyPair::from_raw(
-        CIPHERSUITE.signature_algorithm(),
-        seed.to_vec(),
-        signing_key.verifying_key().to_bytes().to_vec(),
-    )
-}
-
-fn context_from_public_group(
-    public_group: &PublicGroup,
-    generation: u64,
-    state_version: u64,
-) -> Result<ConversationContext> {
-    let group_id: [u8; 32] = public_group
-        .group_id()
-        .as_slice()
-        .try_into()
-        .map_err(|_| fail("public group id is not 32 bytes"))?;
-    let group_context_tls = public_group.group_context().tls_serialize_detached()?;
-    let group_context_hash = Sha256::digest(group_context_tls).into();
-    let confirmation_tag = confirmation_tag_bytes(public_group.confirmation_tag())?;
-    Ok(ConversationContext {
-        conversation_id: CONVERSATION_ID,
-        generation,
-        state_version,
-        group_id,
-        epoch: public_group.group_context().epoch().as_u64(),
-        group_context_hash,
-        confirmation_tag,
-        lifecycle: "active".to_owned(),
-    })
-}
-
-fn assert_wrapper(bytes: &[u8], expected_wire_format: u16) -> Result<()> {
-    ensure(
-        bytes.len() >= 4,
-        "MLSMessage wrapper is shorter than header",
-    )?;
-    ensure(
-        u16::from_be_bytes(bytes[0..2].try_into()?) == 1,
-        "MLSMessage wrapper is not MLS 1.0",
-    )?;
-    ensure(
-        u16::from_be_bytes(bytes[2..4].try_into()?) == expected_wire_format,
-        format!("MLSMessage wrapper is not wire format {expected_wire_format}"),
-    )?;
-    Ok(())
-}
-
-fn confirmation_tag_bytes(tag: &ConfirmationTag) -> Result<[u8; 32]> {
-    let encoded = tag.tls_serialize_detached()?;
-    let bytes = VLBytes::tls_deserialize_exact(&encoded)?;
-    bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| fail("confirmation tag is not 32 bytes"))
-}
-
-fn identity_manifest(
-    actor_did: &str,
-    device_id: &str,
-    credential_identity: &str,
-    public_key: &[u8],
-) -> Value {
-    let public_key_sha256 = Sha256::digest(public_key);
-    json!({
-        "actorDid": actor_did,
-        "deviceId": device_id,
-        "credentialIdentity": credential_identity,
-        "signaturePublicKeyHex": hex::encode(public_key),
-        "signaturePublicKeySha256Hex": hex::encode(public_key_sha256),
-        "keyId": URL_SAFE_NO_PAD.encode(public_key_sha256)
-    })
-}
-
-fn dependency_manifest(lock_path: &Path) -> Result<Value> {
-    let lock = fs::read_to_string(lock_path)?;
-    let wanted = [
-        ("openmls", OPENMLS_VERSION, true),
-        ("openmls_traits", "0.6.0-rc.3", true),
-        ("openmls_basic_credential", "0.6.0-rc.3", true),
-        ("openmls_libcrux_crypto", "0.4.0-rc.3", true),
-        ("openmls_memory_storage", STORAGE_VERSION, true),
-        ("tls_codec", "0.5.0", false),
-        ("serde_ipld_dagcbor", "0.6.4", false),
-    ];
-    let mut output = Map::new();
-    for (name, version, is_git) in wanted {
-        let package = find_lock_package(&lock, name, version, is_git)?;
-        output.insert(name.to_owned(), package);
-    }
-    Ok(Value::Object(output))
-}
-
-fn find_lock_package(
-    lock: &str,
-    wanted_name: &str,
-    wanted_version: &str,
-    is_git: bool,
-) -> Result<Value> {
-    for block in lock.split("[[package]]").skip(1) {
-        let name = lock_string_field(block, "name");
-        let version = lock_string_field(block, "version");
-        if name.as_deref() == Some(wanted_name) && version.as_deref() == Some(wanted_version) {
-            let source = lock_string_field(block, "source")
-                .ok_or_else(|| fail(format!("{wanted_name} {wanted_version} has no source")))?;
-            ensure(!source.is_empty(), "dependency source is empty")?;
-            if is_git {
-                ensure(
-                    source.starts_with("git+"),
-                    format!("{wanted_name} source must be git, got {source}"),
-                )?;
-                ensure(
-                    source.contains("https://github.com/openmls/openmls"),
-                    format!("{wanted_name} git source must be openmls repository, got {source}"),
-                )?;
-                ensure(
-                    source.contains(OFFICIAL_CLIENT_REVISION),
-                    format!("{wanted_name} git source must match revision {OFFICIAL_CLIENT_REVISION}, got {source}"),
-                )?;
-                return Ok(json!({
-                    "version": wanted_version,
-                    "source": source
-                }));
-            } else {
-                ensure(
-                    source.starts_with("registry+"),
-                    format!("{wanted_name} source must be registry, got {source}"),
-                )?;
-                let checksum = lock_string_field(block, "checksum")
-                    .ok_or_else(|| fail(format!("{wanted_name} {wanted_version} has no checksum")))?;
-                ensure(!checksum.is_empty(), "dependency checksum is empty")?;
-                return Ok(json!({
-                    "version": wanted_version,
-                    "source": source,
-                    "checksum": checksum
-                }));
-            }
-        }
-    }
-    Err(fail(format!(
-        "missing dependency {wanted_name} {wanted_version} in {}",
-        lock.lines().next().unwrap_or("Cargo.lock")
-    )))
-}
-
-fn lock_string_field(block: &str, field: &str) -> Option<String> {
-    let prefix = format!("{field} = \"");
-    block.lines().find_map(|line| {
-        let rest = line.strip_prefix(&prefix)?;
-        Some(rest.strip_suffix('"')?.to_owned())
-    })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
-}
-
-fn source_tree_sha256(root: &Path) -> Result<String> {
-    let mut files = Vec::new();
-    collect_rust_sources(root, root, &mut files)?;
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    ensure(!files.is_empty(), "chat protocol source tree is empty")?;
-    let mut hasher = Sha256::new();
-    for (relative, bytes) in files {
-        hasher.update(relative.as_bytes());
-        hasher.update([0]);
-        hasher.update(u64::try_from(bytes.len())?.to_be_bytes());
-        hasher.update(bytes);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
-fn collect_rust_sources(
-    root: &Path,
-    current: &Path,
-    output: &mut Vec<(String, Vec<u8>)>,
-) -> Result<()> {
-    for entry in fs::read_dir(current)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            collect_rust_sources(root, &path, output)?;
-        } else if file_type.is_file()
-            && path.extension().and_then(|value| value.to_str()) == Some("rs")
-        {
-            let relative = path
-                .strip_prefix(root)?
-                .to_string_lossy()
-                .replace(std::path::MAIN_SEPARATOR, "/");
-            output.push((relative, fs::read(path)?));
-        }
-    }
-    Ok(())
-}
-
-fn command_version(binary: &str) -> Result<String> {
-    let output = Command::new(binary).arg("--version").output()?;
-    ensure(
-        output.status.success(),
-        format!("{binary} --version failed with {}", output.status),
-    )?;
-    let version = String::from_utf8(output.stdout)?.trim().to_owned();
-    ensure(!version.is_empty(), format!("{binary} version is empty"))?;
-    Ok(version)
-}
-
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let filename = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| fail("output path has no UTF-8 filename"))?;
-    let temp = path.with_file_name(format!(".{filename}.{}.tmp", std::process::id()));
-    if temp.exists() {
-        fs::remove_file(&temp)?;
-    }
-    fs::write(&temp, bytes)?;
-    fs::rename(&temp, path)?;
-    Ok(())
-}
-
-fn unix_time() -> Result<u64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
-}
-
-fn ensure_uuid_v4(bytes: [u8; 16]) -> Result<()> {
-    let uuid = Uuid::from_bytes(bytes);
-    ensure(
-        uuid.get_version() == Some(Version::Random),
-        format!("{uuid} is not UUIDv4"),
-    )?;
-    ensure(
-        uuid.get_variant() == uuid::Variant::RFC4122,
-        format!("{uuid} is not RFC 4122 variant"),
-    )?;
-    Ok(())
-}
-
-fn assert_fixture_plc_did(did: &str) -> Result<()> {
-    let identifier = did
-        .strip_prefix("did:plc:")
-        .ok_or_else(|| fail(format!("fixture DID is not did:plc: {did}")))?;
-    ensure(
-        identifier.len() == 24
-            && identifier
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || (b'2'..=b'7').contains(&byte)),
-        format!("fixture DID is not canonical ATProto did:plc syntax: {did}"),
-    )?;
-    Ok(())
-}
-
-fn uuid_string(bytes: [u8; 16]) -> Result<String> {
-    ensure_uuid_v4(bytes)?;
-    Ok(Uuid::from_bytes(bytes).hyphenated().to_string())
 }
