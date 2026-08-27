@@ -87,9 +87,7 @@ fn generated_key_package_satisfies_clean_contract_and_matches_fixture() {
     );
     assert_eq!(
         capabilities.ciphersuites(),
-        &[VerifiableCiphersuite::from(
-            openmls::prelude::Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519
-        )]
+        &[VerifiableCiphersuite::from(openmls::prelude::Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519)]
     );
     assert_eq!(
         capabilities.credentials(),
@@ -118,11 +116,7 @@ fn generated_key_package_satisfies_clean_contract_and_matches_fixture() {
     let wrapped = MlsMessageOut::from(validated.clone())
         .tls_serialize_detached()
         .expect("serialize wrapped wire message");
-    assert_eq!(
-        &wrapped[..4],
-        &[0x00, 0x01, 0x00, 0x05],
-        "wire format 5 header"
-    );
+    assert_eq!(&wrapped[..4], &[0x00, 0x01, 0x00, 0x05], "wire format 5 header");
     assert_eq!(&wrapped, &result.key_package_data);
     // Verify OpenMLS hash_ref matches hash_ref
     let expected_hash_ref = validated
@@ -239,24 +233,10 @@ fn freshly_created_group_creator_leaf_satisfies_clean_lifetime_and_capabilities(
     assert_eq!(context.protocol_version, 0x0001, "MLS 1.0 protocol version");
     assert_eq!(context.ciphersuite, 0x004D, "XWING ciphersuite 0x004D");
     assert_eq!(context.epoch, 0, "genesis epoch must be 0");
-    assert_eq!(
-        context.group_id.as_slice(),
-        created.group_id.as_slice(),
-        "group_id matches"
-    );
-    assert_eq!(
-        context.tree_hash.as_slice().len(),
-        32,
-        "tree hash is 32 bytes"
-    );
-    assert!(
-        context.confirmed_transcript_hash.as_slice().is_empty(),
-        "genesis confirmed transcript hash must be empty"
-    );
-    assert!(
-        context.extensions.is_empty(),
-        "genesis group context extensions must be empty"
-    );
+    assert_eq!(context.group_id.as_slice(), created.group_id.as_slice(), "group_id matches");
+    assert_eq!(context.tree_hash.as_slice().len(), 32, "tree hash is 32 bytes");
+    assert!(context.confirmed_transcript_hash.as_slice().is_empty(), "genesis confirmed transcript hash must be empty");
+    assert!(context.extensions.is_empty(), "genesis group context extensions must be empty");
 
     // Genesis GroupInfo extensions: exactly ratchet_tree (2) and external_pub (4)
     let ratchet_tree_ext = group_info
@@ -266,12 +246,9 @@ fn freshly_created_group_creator_leaf_satisfies_clean_lifetime_and_capabilities(
         .expect("ratchet tree extension (type 2) must be present");
     // Parse singleton ratchet tree from the extension_data VLBytes
     let mut rt_slice = ratchet_tree_ext.extension_data.as_slice();
-    let encoded_nodes =
-        VLBytes::tls_deserialize(&mut rt_slice).expect("deserialize ratchet tree nodes vector");
-    assert!(
-        rt_slice.is_empty(),
-        "no trailing bytes in ratchet tree extension"
-    );
+    let encoded_nodes = VLBytes::tls_deserialize(&mut rt_slice)
+        .expect("deserialize ratchet tree nodes vector");
+    assert!(rt_slice.is_empty(), "no trailing bytes in ratchet tree extension");
 
     let mut nodes = encoded_nodes.as_slice();
     let present = u8::tls_deserialize(&mut nodes).expect("deserialize present flag");
@@ -282,24 +259,13 @@ fn freshly_created_group_creator_leaf_satisfies_clean_lifetime_and_capabilities(
 
     let wire_leaf = WireLeafNode::tls_deserialize(&mut nodes)
         .expect("deserialize creator leaf node from ratchet tree");
-    assert!(
-        nodes.is_empty(),
-        "singleton genesis tree has no further nodes"
-    );
+    assert!(nodes.is_empty(), "singleton genesis tree has no further nodes");
 
     // Check clean capabilities on the creator leaf node
     let capabilities = &wire_leaf.payload.capabilities;
     assert_eq!(capabilities.versions, &[0x0001], "MLS 1.0");
-    assert_eq!(
-        capabilities.ciphersuites,
-        &[0x004D],
-        "XWING ciphersuite 0x004D"
-    );
-    assert_eq!(
-        capabilities.credentials,
-        &[0x0001],
-        "BasicCredential 0x0001"
-    );
+    assert_eq!(capabilities.ciphersuites, &[0x004D], "XWING ciphersuite 0x004D");
+    assert_eq!(capabilities.credentials, &[0x0001], "BasicCredential 0x0001");
     assert!(
         capabilities.extensions.is_empty(),
         "creator leaf capabilities extensions must be empty"
@@ -345,11 +311,7 @@ fn freshly_created_group_creator_leaf_satisfies_clean_lifetime_and_capabilities(
                 "creator leaf lifetime span ({span}s) must be <= MAX_KEY_PACKAGE_LIFETIME_SECONDS ({MAX_KEY_PACKAGE_LIFETIME_SECONDS}s)"
             );
             // Assert it matches the client's 29-day configuration window (29 days + 60s = 2,505,660s)
-            assert_eq!(
-                span,
-                29 * 24 * 3600 + 60,
-                "lifetime span must match the 29-day + 60s client window"
-            );
+            assert_eq!(span, 29 * 24 * 3600 + 60, "lifetime span must match the 29-day + 60s client window");
         }
         other => panic!("expected KeyPackage leaf node source, got {:?}", other),
     }

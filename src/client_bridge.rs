@@ -614,8 +614,7 @@ impl MLSAPIClient for ClientAPIAdapter {
     async fn submit_prepared_request(
         &self,
         request: crate::orchestrator::canonical_transport::PreparedRequest,
-    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse>
-    {
+    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse> {
         let route = request.operation.route();
         let query_bytes = if request.method == "GET" && request.path.contains('?') {
             request

@@ -761,13 +761,11 @@ impl MLSAPIClient for HttpDSClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?
             .to_vec();
-        Ok(
-            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
-                status,
-                content_type,
-                body,
-            },
-        )
+        Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+            status,
+            content_type,
+            body,
+        })
     }
 
     async fn get_conversations(
@@ -822,10 +820,7 @@ impl MLSAPIClient for HttpDSClient {
         _from_epoch: Option<u32>,
         _to_epoch: Option<u32>,
     ) -> OrcResult<(Vec<IncomingEnvelope>, Option<String>)> {
-        let mut params = vec![
-            ("convoId", convo_id.to_string()),
-            ("limit", limit.to_string()),
-        ];
+        let mut params = vec![("convoId", convo_id.to_string()), ("limit", limit.to_string())];
         if let Some(c) = cursor {
             params.push(("cursor", c.to_string()));
         }

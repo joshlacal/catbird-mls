@@ -48,7 +48,6 @@ use catbird_mls::orchestrator::canonical_transport::{
     canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,
     canonical_commit_aad_bytes, canonical_metadata_aad_bytes,
     canonical_metadata_content_signing_input, canonical_metadata_exporter_context_bytes,
-    seal_metadata_with_nonce,
 };
 
 const OPT_IN_ENV: &str = "CATBIRD_REGENERATE_MLS_CHAT_CRYPTO_WIRE";
@@ -486,6 +485,37 @@ fn b64_to_hex(val: &Value, key: &str) -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
+fn local_seal_metadata_with_nonce(
+    plaintext_cbor: &[u8],
+    exporter_key: &[u8],
+    nonce_bytes: &[u8; 12],
+    metadata_aad: &[u8],
+) -> Result<(Vec<u8>, [u8; 32], u64)> {
+    use aes_gcm::aead::{Aead, KeyInit, Payload};
+    use aes_gcm::{Aes256Gcm, Nonce};
+
+    let cipher = Aes256Gcm::new_from_slice(exporter_key)
+        .map_err(|e| fail(format!("AES-256-GCM key init: {e}")))?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let ciphertext_size = (plaintext_cbor.len() + 16) as u64;
+
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext_cbor,
+                aad: metadata_aad,
+            },
+        )
+        .map_err(|e| fail(format!("AES-256-GCM encrypt: {e}")))?;
+    ensure(
+        ciphertext.len() as u64 == ciphertext_size,
+        "ciphertext size mismatch",
+    )?;
+    let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
+    Ok((ciphertext, ciphertext_sha256, ciphertext_size))
+}
+
 struct CreationArtifact {
     signed_request_cbor: Vec<u8>,
     unsigned_body_projection_cbor: Vec<u8>,
@@ -580,7 +610,7 @@ fn build_alice_creation_artifact(
     });
     let metadata_aad = canonical_metadata_aad_bytes(&metadata_aad_json)?;
 
-    let (ciphertext, ciphertext_sha256, ciphertext_size) = seal_metadata_with_nonce(
+    let (ciphertext, ciphertext_sha256, ciphertext_size) = local_seal_metadata_with_nonce(
         &plaintext_cbor,
         &exporter_key,
         &CREATION_METADATA_NONCE,

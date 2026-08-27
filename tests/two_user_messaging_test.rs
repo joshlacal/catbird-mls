@@ -94,9 +94,16 @@ fn default_join_config() -> MlsGroupJoinConfig {
 fn extract_welcome(welcome_msg_out: MlsMessageOut) -> Welcome {
     let bytes = welcome_msg_out.tls_serialize_detached().unwrap();
     let mls_message_in = MlsMessageIn::tls_deserialize_exact(&bytes[..]).unwrap();
-    mls_message_in
-        .into_welcome()
-        .expect("Expected Welcome message")
+    match mls_message_in.extract() {
+        MlsMessageBodyIn::Welcome(w) => w,
+        _ => panic!("Expected Welcome message"),
+    }
+}
+
+fn to_protocol_message(msg_out: MlsMessageOut) -> ProtocolMessage {
+    let bytes = msg_out.tls_serialize_detached().unwrap();
+    let msg_in = MlsMessageIn::tls_deserialize_exact(&bytes[..]).unwrap();
+    msg_in.try_into_protocol_message().unwrap()
 }
 
 // Helper to extract ProcessedMessage from ProtocolMessage
@@ -228,7 +235,7 @@ fn test_two_user_rapid_messaging() {
     // STEP 6: Bob processes Alice's message (verifies Alice's sender chain)
     // ========================================================================
 
-    let alice_msg_1_protocol = alice_msg_1.into_protocol_message().unwrap();
+    let alice_msg_1_protocol = to_protocol_message(alice_msg_1);
 
     let received_msg_1 =
         process_and_extract_message(&mut bob_group, &bob_provider, alice_msg_1_protocol);
@@ -262,7 +269,7 @@ fn test_two_user_rapid_messaging() {
     // STEP 8: Alice receives and processes Bob's message
     // ========================================================================
 
-    let bob_msg_1_protocol = bob_msg_1.into_protocol_message().unwrap();
+    let bob_msg_1_protocol = to_protocol_message(bob_msg_1);
 
     let received_msg_2 =
         process_and_extract_message(&mut alice_group, &alice_provider, bob_msg_1_protocol);
@@ -357,7 +364,7 @@ fn test_two_user_multiple_messages() {
         let alice_received = process_and_extract_message(
             &mut bob_group,
             &bob_provider,
-            alice_msg.into_protocol_message().unwrap(),
+            to_protocol_message(alice_msg),
         );
 
         assert!(
@@ -384,7 +391,7 @@ fn test_two_user_multiple_messages() {
         let bob_received = process_and_extract_message(
             &mut alice_group,
             &alice_provider,
-            bob_msg.into_protocol_message().unwrap(),
+            to_protocol_message(bob_msg),
         );
 
         assert!(
@@ -476,7 +483,7 @@ fn test_two_user_out_of_order_messages() {
     let result_2 = process_and_extract_message(
         &mut bob_group,
         &bob_provider,
-        alice_msg_2.into_protocol_message().unwrap(),
+        to_protocol_message(alice_msg_2),
     );
     println!("📨 Delivered message 2: {:?}", result_2.is_ok());
 
@@ -484,7 +491,7 @@ fn test_two_user_out_of_order_messages() {
     let result_1 = process_and_extract_message(
         &mut bob_group,
         &bob_provider,
-        alice_msg_1.into_protocol_message().unwrap(),
+        to_protocol_message(alice_msg_1),
     );
     println!("📨 Delivered message 1: {:?}", result_1.is_ok());
 
@@ -492,7 +499,7 @@ fn test_two_user_out_of_order_messages() {
     let result_3 = process_and_extract_message(
         &mut bob_group,
         &bob_provider,
-        alice_msg_3.into_protocol_message().unwrap(),
+        to_protocol_message(alice_msg_3),
     );
     println!("📨 Delivered message 3: {:?}", result_3.is_ok());
 

@@ -130,7 +130,9 @@ impl EndpointError {
     /// always starts automatic enrollment.
     pub fn recovery_outcome(&self) -> Option<RecoveryOutcome> {
         match &self.code {
-            ChatErrorCode::DeviceNotRegistered => Some(RecoveryOutcome::NeedsEnrollment),
+            ChatErrorCode::DeviceNotRegistered => {
+                Some(RecoveryOutcome::NeedsEnrollment)
+            }
             ChatErrorCode::KeyPackageUnavailable | ChatErrorCode::RecipientNotReady => {
                 Some(RecoveryOutcome::RecipientNotEnrolled)
             }

@@ -3529,23 +3529,33 @@ impl MLSContext {
 
         self.with_group(&gid, |group, provider, signer| {
             // Deserialize and validate key package
-            let kp_in = if let Ok((mls_msg, remaining)) =
-                MlsMessageIn::tls_deserialize_bytes(key_package_data)
-            {
-                if remaining.is_empty() {
-                    match mls_msg.extract() {
-                        MlsMessageBodyIn::KeyPackage(kp_in) => kp_in,
-                        _ => {
-                            let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
-                                .map_err(|e| {
-                                    crate::error_log!(
-                                        "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
-                                        e
-                                    );
-                                    MLSError::SerializationError
-                                })?;
-                            kp_in
+            let kp_in =
+                if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(key_package_data) {
+                    if remaining.is_empty() {
+                        match mls_msg.extract() {
+                            MlsMessageBodyIn::KeyPackage(kp_in) => kp_in,
+                            _ => {
+                                let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
+                                    .map_err(|e| {
+                                        crate::error_log!(
+                                            "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
+                                            e
+                                        );
+                                        MLSError::SerializationError
+                                    })?;
+                                kp_in
+                            }
                         }
+                    } else {
+                        let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
+                            .map_err(|e| {
+                                crate::error_log!(
+                                    "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
+                                    e
+                                );
+                                MLSError::SerializationError
+                            })?;
+                        kp_in
                     }
                 } else {
                     let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
@@ -3557,18 +3567,7 @@ impl MLSContext {
                             MLSError::SerializationError
                         })?;
                     kp_in
-                }
-            } else {
-                let (kp_in, _) =
-                    KeyPackageIn::tls_deserialize_bytes(key_package_data).map_err(|e| {
-                        crate::error_log!(
-                            "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
-                            e
-                        );
-                        MLSError::SerializationError
-                    })?;
-                kp_in
-            };
+                };
 
             let key_package = kp_in
                 .validate(provider.crypto(), ProtocolVersion::default())

@@ -35,10 +35,7 @@ where
 
         let stored_key = match self.credentials().get_signing_key(user_did).await? {
             Some(key) => key,
-            None => match self
-                .mls_context()
-                .export_identity_key(identity.as_bytes().to_vec())
-            {
+            None => match self.mls_context().export_identity_key(identity.as_bytes().to_vec()) {
                 Ok(key) => {
                     let _ = self.credentials().store_signing_key(user_did, &key).await;
                     key
@@ -109,9 +106,9 @@ where
                     .ok();
                 let server_device = match local_device_id.as_deref() {
                     Some(device_id) => match self.api_client().list_devices(device_id).await {
-                        Ok(devices) => devices
-                            .into_iter()
-                            .find(|device| device.device_id == device_id),
+                        Ok(devices) => {
+                            devices.into_iter().find(|device| device.device_id == device_id)
+                        }
                         // This probe is device-scoped, so an unregistered device cannot
                         // read it — the server answers `DeviceNotRegistered`. That is the
                         // probe's answer, not a failure to obtain one: there is no server
@@ -232,9 +229,7 @@ where
         )
         .map_err(|error| OrchestratorError::Credential(error.to_string()))?;
         if prepared.body.is_none() {
-            return Err(OrchestratorError::Credential(
-                "prepared enrollment has no body".into(),
-            ));
+            return Err(OrchestratorError::Credential("prepared enrollment has no body".into()));
         }
 
         // Register with server (include initial key package)
@@ -370,9 +365,7 @@ where
             .into_iter()
             .find(|d| d.device_id == target_device_id || d.device_uuid == target_device_id)
             .and_then(|d| d.auth_generation)
-            .ok_or_else(|| {
-                OrchestratorError::InvalidInput("target device auth generation unavailable".into())
-            })?;
+            .ok_or_else(|| OrchestratorError::InvalidInput("target device auth generation unavailable".into()))?;
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#deviceRevocationBody",
             "actorDid": user_did,

@@ -260,9 +260,7 @@ fn last_resort_create_marks_package_and_persists_bundle() {
     assert!(!result.hash_ref.is_empty());
     assert_eq!(ctx.get_key_package_bundle_count().unwrap(), 1);
 
-    let (kp_in, remaining) = if let Ok((msg, remaining)) =
-        openmls::prelude::MlsMessageIn::tls_deserialize_bytes(&result.key_package_data)
-    {
+    let (kp_in, remaining) = if let Ok((msg, remaining)) = openmls::prelude::MlsMessageIn::tls_deserialize_bytes(&result.key_package_data) {
         match msg.extract() {
             openmls::prelude::MlsMessageBodyIn::KeyPackage(kp) => (kp, remaining),
             _ => panic!("expected KeyPackage message"),
@@ -281,8 +279,5 @@ fn last_resort_create_marks_package_and_persists_bundle() {
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
         .expect("generated key package should validate");
-    assert!(
-        !kp.leaf_node().signature_key().as_slice().is_empty(),
-        "generated package must be valid"
-    );
+    assert!(!kp.leaf_node().signature_key().as_slice().is_empty(), "generated package must be valid");
 }

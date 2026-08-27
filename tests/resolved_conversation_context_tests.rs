@@ -562,12 +562,7 @@ async fn migrate_stable_conversation_id_for_test(
         .map_or(old_view.epoch, |s| s.epoch);
     let _ = client
         .storage
-        .update_join_info(
-            new_conversation_id,
-            &client.did,
-            catbird_mls::orchestrator::JoinMethod::Creator,
-            latest_epoch,
-        )
+        .update_join_info(new_conversation_id, &client.did, catbird_mls::orchestrator::JoinMethod::Creator, latest_epoch)
         .await;
     client
         .storage
@@ -2099,10 +2094,7 @@ async fn commit_self_remove_proposals_uses_active_group_for_rotated_stable_conve
     let group_id = conversation.group_id.clone();
     alice
         .orchestrator
-        .add_members(
-            &conversation.conversation_id,
-            std::slice::from_ref(&bob_did),
-        )
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob_did))
         .await
         .expect("add bob");
     let bob_api = world.delivery_service().clone_as(&bob.did);
@@ -2201,10 +2193,7 @@ async fn pending_proposal_commit_merges_only_after_server_acceptance() {
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
     alice
         .orchestrator
-        .add_members(
-            &conversation.conversation_id,
-            std::slice::from_ref(&bob.did),
-        )
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
         .await
         .expect("add bob");
     let welcome = world
@@ -2315,10 +2304,7 @@ async fn empty_application_message_is_not_treated_as_an_epoch_commit() {
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
     alice
         .orchestrator
-        .add_members(
-            &conversation.conversation_id,
-            std::slice::from_ref(&bob.did),
-        )
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
         .await
         .expect("add bob");
     let welcome = world
@@ -2389,10 +2375,7 @@ async fn sender_binding_rejection_discards_staged_proposal_before_commit() {
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
     alice
         .orchestrator
-        .add_members(
-            &conversation.conversation_id,
-            std::slice::from_ref(&bob.did),
-        )
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
         .await
         .expect("add bob");
     let welcome = world
@@ -2472,10 +2455,7 @@ async fn unknown_hex_identifier_cannot_be_treated_as_an_authoritative_group_mapp
         .remove(&hex_identifier);
     alice
         .storage
-        .delete_conversations(
-            &alice.did,
-            &[&hex_identifier, &conversation.conversation_id],
-        )
+        .delete_conversations(&alice.did, &[&hex_identifier, &conversation.conversation_id])
         .await
         .expect("remove authoritative mapping");
 

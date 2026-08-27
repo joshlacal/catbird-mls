@@ -86,27 +86,27 @@ fn default_join_config() -> MlsGroupJoinConfig {
 fn extract_welcome(welcome_msg_out: MlsMessageOut) -> Welcome {
     let bytes = welcome_msg_out.tls_serialize_detached().unwrap();
     let mls_message_in = MlsMessageIn::tls_deserialize_exact(&bytes[..]).unwrap();
-    mls_message_in
-        .into_welcome()
-        .expect("Expected Welcome message")
+    match mls_message_in.extract() {
+        MlsMessageBodyIn::Welcome(w) => w,
+        _ => panic!("Expected Welcome message"),
+    }
 }
 
-// Helper to create a provider with deserialized storage
-fn provider_with_storage(storage_bytes: &[u8]) -> OpenMlsRustCrypto {
-    let mut cursor = std::io::Cursor::new(storage_bytes);
-    let storage = openmls_memory_storage::MemoryStorage::deserialize(&mut cursor).unwrap();
+fn to_protocol_message(msg_out: MlsMessageOut) -> ProtocolMessage {
+    let bytes = msg_out.tls_serialize_detached().unwrap();
+    let msg_in = MlsMessageIn::tls_deserialize_exact(&bytes[..]).unwrap();
+    msg_in.try_into_protocol_message().unwrap()
+}
 
-    // OpenMlsRustCrypto doesn't expose a constructor that takes storage,
-    // so we need to create a new provider and replace its storage
+// Helper to create a provider with cloned storage
+fn provider_with_storage(
+    storage_values: &std::collections::HashMap<Vec<u8>, Vec<u8>>,
+) -> OpenMlsRustCrypto {
     let provider = OpenMlsRustCrypto::default();
-
-    // Replace the storage contents
     let mut provider_values = provider.storage().values.write().unwrap();
-    let storage_values = storage.values.read().unwrap();
     provider_values.clear();
     provider_values.extend(storage_values.clone());
     drop(provider_values);
-
     provider
 }
 
@@ -170,8 +170,7 @@ fn test_creator_can_decrypt_after_restart() {
         .create_message(&bob_provider, &bob.signer, b"Hello Alice before restart")
         .unwrap();
 
-    let processed1 =
-        alice_group.process_message(&alice_provider, bob_msg1.into_protocol_message().unwrap());
+    let processed1 = alice_group.process_message(&alice_provider, to_protocol_message(bob_msg1));
     assert!(
         processed1.is_ok(),
         "❌ Alice should decrypt Bob's message BEFORE restart, got: {:?}",
@@ -183,11 +182,7 @@ fn test_creator_can_decrypt_after_restart() {
     // CRITICAL: Serialize Alice's storage RIGHT HERE
     // ========================================================================
 
-    let mut alice_storage_bytes = Vec::new();
-    alice_provider
-        .storage()
-        .serialize(&mut alice_storage_bytes)
-        .unwrap();
+    let alice_storage_bytes = alice_provider.storage().values.read().unwrap().clone();
 
     let alice_entry_count = alice_provider.storage().values.read().unwrap().len();
     println!(
@@ -228,8 +223,7 @@ fn test_creator_can_decrypt_after_restart() {
 
     println!("📨 Bob created message after Alice's restart");
 
-    let processed2 =
-        alice_group2.process_message(&alice_provider2, bob_msg2.into_protocol_message().unwrap());
+    let processed2 = alice_group2.process_message(&alice_provider2, to_protocol_message(bob_msg2));
 
     assert!(
         processed2.is_ok(),
@@ -285,30 +279,21 @@ fn test_both_sides_can_decrypt_after_restart() {
         .create_message(&bob_provider, &bob.signer, b"msg1")
         .unwrap();
     alice_group
-        .process_message(&alice_provider, bob_msg1.into_protocol_message().unwrap())
+        .process_message(&alice_provider, to_protocol_message(bob_msg1))
         .unwrap();
 
     let alice_msg1 = alice_group
         .create_message(&alice_provider, &alice.signer, b"msg2")
         .unwrap();
     bob_group
-        .process_message(&bob_provider, alice_msg1.into_protocol_message().unwrap())
+        .process_message(&bob_provider, to_protocol_message(alice_msg1))
         .unwrap();
 
     println!("✅ Both sides exchanged messages before restart");
 
     // Serialize BOTH sides
-    let mut alice_storage_bytes = Vec::new();
-    alice_provider
-        .storage()
-        .serialize(&mut alice_storage_bytes)
-        .unwrap();
-
-    let mut bob_storage_bytes = Vec::new();
-    bob_provider
-        .storage()
-        .serialize(&mut bob_storage_bytes)
-        .unwrap();
+    let alice_storage_bytes = alice_provider.storage().values.read().unwrap().clone();
+    let bob_storage_bytes = bob_provider.storage().values.read().unwrap().clone();
 
     println!(
         "📊 Alice entries: {}",
@@ -336,8 +321,7 @@ fn test_both_sides_can_decrypt_after_restart() {
     let bob_msg2 = bob_group2
         .create_message(&bob_provider2, &bob.signer, b"msg3")
         .unwrap();
-    let result =
-        alice_group2.process_message(&alice_provider2, bob_msg2.into_protocol_message().unwrap());
+    let result = alice_group2.process_message(&alice_provider2, to_protocol_message(bob_msg2));
 
     assert!(
         result.is_ok(),
@@ -373,8 +357,7 @@ fn test_serialize_at_different_stages() {
     )
     .unwrap();
 
-    let mut snapshot1 = Vec::new();
-    alice_provider.storage().serialize(&mut snapshot1).unwrap();
+    let snapshot1 = alice_provider.storage().values.read().unwrap().clone();
     let count1 = alice_provider.storage().values.read().unwrap().len();
     println!("📊 Stage 1 (after group creation): {} entries", count1);
 
@@ -384,8 +367,7 @@ fn test_serialize_at_different_stages() {
         .add_members(&alice_provider, &alice.signer, &[bob_key_package])
         .unwrap();
 
-    let mut snapshot2 = Vec::new();
-    alice_provider.storage().serialize(&mut snapshot2).unwrap();
+    let snapshot2 = alice_provider.storage().values.read().unwrap().clone();
     let count2 = alice_provider.storage().values.read().unwrap().len();
     println!(
         "📊 Stage 2 (after add_members, before merge): {} entries",
@@ -395,8 +377,7 @@ fn test_serialize_at_different_stages() {
     // Stage 3: After merge
     alice_group.merge_pending_commit(&alice_provider).unwrap();
 
-    let mut snapshot3 = Vec::new();
-    alice_provider.storage().serialize(&mut snapshot3).unwrap();
+    let snapshot3 = alice_provider.storage().values.read().unwrap().clone();
     let count3 = alice_provider.storage().values.read().unwrap().len();
     println!("📊 Stage 3 (after merge): {} entries", count3);
 
@@ -413,11 +394,10 @@ fn test_serialize_at_different_stages() {
         .create_message(&bob_provider, &bob.signer, b"msg")
         .unwrap();
     alice_group
-        .process_message(&alice_provider, bob_msg.into_protocol_message().unwrap())
+        .process_message(&alice_provider, to_protocol_message(bob_msg))
         .unwrap();
 
-    let mut snapshot4 = Vec::new();
-    alice_provider.storage().serialize(&mut snapshot4).unwrap();
+    let snapshot4 = alice_provider.storage().values.read().unwrap().clone();
     let count4 = alice_provider.storage().values.read().unwrap().len();
     println!("📊 Stage 4 (after first message): {} entries", count4);
 
@@ -434,7 +414,7 @@ fn test_serialize_at_different_stages() {
         let bob_msg2 = bob_group
             .create_message(&bob_provider, &bob.signer, b"test")
             .unwrap();
-        let result = group.process_message(&provider, bob_msg2.into_protocol_message().unwrap());
+        let result = group.process_message(&provider, to_protocol_message(bob_msg2));
 
         assert!(
             result.is_ok(),

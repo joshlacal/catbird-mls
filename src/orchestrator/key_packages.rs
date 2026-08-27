@@ -36,7 +36,8 @@ where
         let kp_result = self.mls_context().create_key_package(identity_bytes)?;
 
         // Publish key package using signed canonical request
-        self.publish_key_packages_batch(&[kp_result]).await?;
+        self.publish_key_packages_batch(&[kp_result])
+            .await?;
         Ok(())
     }
 
@@ -184,10 +185,7 @@ where
             .await
     }
 
-    async fn publish_key_packages_batch(
-        &self,
-        key_packages: &[crate::types::KeyPackageResult],
-    ) -> Result<()> {
+    async fn publish_key_packages_batch(&self, key_packages: &[crate::types::KeyPackageResult]) -> Result<()> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
         let user_did = self.require_user_did().await?;

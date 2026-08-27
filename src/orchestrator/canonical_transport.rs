@@ -2469,6 +2469,7 @@ pub fn canonical_commit_aad_bytes(aad_json: &serde_json::Value) -> Result<Vec<u8
     Ok(aad)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_application_aad_bytes(
     aad_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
@@ -2484,6 +2485,7 @@ pub fn canonical_application_aad_bytes(
     Ok(aad)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_aad_bytes(
     aad_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
@@ -2499,6 +2501,7 @@ pub fn canonical_metadata_aad_bytes(
     Ok(aad)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_exporter_context_bytes(
     context_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
@@ -2509,6 +2512,7 @@ pub fn canonical_metadata_exporter_context_bytes(
     serde_ipld_dagcbor::to_vec(&projected).map_err(|e| TransportError::Serialization(e.to_string()))
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_content_signing_input(
     content_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
@@ -2524,6 +2528,7 @@ pub fn canonical_metadata_content_signing_input(
     Ok(out)
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_application_content(
     frame_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
@@ -2532,39 +2537,6 @@ pub fn canonical_application_content(
     let strict = parse_strict_signed_json(&raw)?;
     let projected = project_schema_ref("applicationFrame", &strict, false)?;
     serde_ipld_dagcbor::to_vec(&projected).map_err(|e| TransportError::Serialization(e.to_string()))
-}
-
-pub fn seal_metadata_with_nonce(
-    plaintext_cbor: &[u8],
-    exporter_key: &[u8],
-    nonce_bytes: &[u8; 12],
-    metadata_aad: &[u8],
-) -> Result<(Vec<u8>, [u8; 32], u64), TransportError> {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::{Aes256Gcm, Nonce};
-    use sha2::{Digest, Sha256};
-
-    let cipher = Aes256Gcm::new_from_slice(exporter_key)
-        .map_err(|e| TransportError::Serialization(format!("AES-256-GCM key init: {e}")))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let ciphertext_size = (plaintext_cbor.len() + 16) as u64;
-
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext_cbor,
-                aad: metadata_aad,
-            },
-        )
-        .map_err(|e| TransportError::Serialization(format!("AES-256-GCM encrypt: {e}")))?;
-    if ciphertext.len() as u64 != ciphertext_size {
-        return Err(TransportError::Serialization(
-            "ciphertext size mismatch".into(),
-        ));
-    }
-    let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
-    Ok((ciphertext, ciphertext_sha256, ciphertext_size))
 }
 pub(crate) fn prepare_signed_body(
     binding: &CleanChatSigningContext,

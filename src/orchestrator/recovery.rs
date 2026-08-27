@@ -2,11 +2,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 use web_time::Instant;
 
-use crate::error::MLSError;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use sha2::{Digest, Sha256};
 use tls_codec::DeserializeBytes;
+use crate::error::MLSError;
 
 use super::api_client::MLSAPIClient;
 use super::constants;
@@ -1185,9 +1185,7 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential(
-                "auth_generation must be >= 1".into(),
-            ));
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -1209,9 +1207,8 @@ where
                 gc_hash.len()
             ))));
         }
-        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id).map_err(|e| {
-            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
-        })?;
+        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
 
         use rand::RngCore;
         let mut nonce = [0u8; 12];
@@ -1223,7 +1220,9 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self.mls_context().safe_export_secret(gid.clone(), 0x8001)?;
+        let metadata_key = self
+            .mls_context()
+            .safe_export_secret(gid.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -1234,11 +1233,7 @@ where
             1,
             &metadata_plaintext,
         )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
-            )))
-        })?;
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -1331,8 +1326,7 @@ where
         let send_res = self
             .submit_signed_clean_chat_request(
                 super::canonical_transport::CanonicalOperation::SubmitTransition,
-                serde_json::to_vec(&body)
-                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+                serde_json::to_vec(&body).map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
             )
             .await;
 
@@ -2825,9 +2819,7 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential(
-                "auth_generation must be >= 1".into(),
-            ));
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -2853,9 +2845,8 @@ where
                 gc_hash.len()
             ))));
         }
-        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id).map_err(|e| {
-            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
-        })?;
+        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
 
         use rand::RngCore;
         let mut nonce = [0u8; 12];
@@ -2880,11 +2871,7 @@ where
             1,
             &metadata_plaintext,
         )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
-            )))
-        })?;
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -2986,12 +2973,8 @@ where
         let server_result: std::result::Result<AddMembersServerResult, OrchestratorError> =
             match server_resp {
                 Ok(resp) if resp.status == 200 => {
-                    let resp_json: serde_json::Value =
-                        serde_json::from_slice(&resp.body).map_err(|e| {
-                            OrchestratorError::Serialization(format!(
-                                "SubmitTransition response: {e}"
-                            ))
-                        })?;
+                    let resp_json: serde_json::Value = serde_json::from_slice(&resp.body)
+                        .map_err(|e| OrchestratorError::Serialization(format!("SubmitTransition response: {e}")))?;
                     let epoch = resp_json
                         .get("result")
                         .and_then(|r| r.get("epoch"))
@@ -3410,10 +3393,9 @@ where
         // recovery deliberately leaves the complete existing cursor unchanged.
 
         let scoped_identity = self.require_scoped_identity().await?;
-        let _ = self.mls_context().export_group_info(
-            ext_commit_result.group_id,
-            scoped_identity.as_bytes().to_vec(),
-        );
+        let _ = self
+            .mls_context()
+            .export_group_info(ext_commit_result.group_id, scoped_identity.as_bytes().to_vec());
 
         tracing::info!(convo_id, new_epoch = merged, "Force rejoin successful");
         Ok(())
@@ -5344,10 +5326,7 @@ where
         Ok(conversation.members.iter().map(|m| m.did.clone()).collect())
     }
 
-    pub(crate) async fn fetch_conversation_for_convo(
-        &self,
-        convo_id: &str,
-    ) -> Result<ConversationView> {
+    pub(crate) async fn fetch_conversation_for_convo(&self, convo_id: &str) -> Result<ConversationView> {
         let mut cursor: Option<String> = None;
         let mut pagination = PaginationGuard::for_conversations("reset conversation lookup");
         loop {
@@ -5676,18 +5655,14 @@ where
         let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
         let convo_id = &resolved.conversation_id;
         let group_id_bytes = resolved.group_id_bytes()?;
-        let gc_hash = self
-            .mls_context()
-            .get_group_context_hash(group_id_bytes.clone())?;
+        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone())?;
         if gc_hash.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "group context hash must be exactly 32 bytes, got {}",
                 gc_hash.len()
             ))));
         }
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(group_id_bytes.clone())?;
+        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?;
         if tag_bytes.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "confirmation tag must be exactly 32 bytes, got {}",
@@ -5746,9 +5721,7 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential(
-                "auth_generation must be >= 1".into(),
-            ));
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -5776,9 +5749,8 @@ where
                 gc_hash.len()
             ))));
         }
-        let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| {
-            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
-        })?;
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
 
         use rand::RngCore;
         let mut nonce = [0u8; 12];
@@ -5803,11 +5775,7 @@ where
             1,
             &metadata_plaintext,
         )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
-            )))
-        })?;
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
 
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
@@ -5947,7 +5915,11 @@ where
         })
     }
 
-    async fn submit_reset_request_prepared(&self, convo_id: &str, reason: &str) -> Result<()> {
+    async fn submit_reset_request_prepared(
+        &self,
+        convo_id: &str,
+        reason: &str,
+    ) -> Result<()> {
         let reason_enum = match reason {
             "localStateLost" | "poisonedState" | "epochDivergence" | "manualRecovery" => reason,
             _ => "manualRecovery",
@@ -5960,9 +5932,7 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential(
-                "auth_generation must be >= 1".into(),
-            ));
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -5971,18 +5941,14 @@ where
         let key_id = super::canonical_transport::derive_key_id(&public_key);
         let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
         let group_id_bytes = resolved.group_id_bytes()?;
-        let gc_hash = self
-            .mls_context()
-            .get_group_context_hash(group_id_bytes.clone())?;
+        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone())?;
         if gc_hash.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "group context hash must be exactly 32 bytes, got {}",
                 gc_hash.len()
             ))));
         }
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(group_id_bytes.clone())?;
+        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?;
         if tag_bytes.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "confirmation tag must be exactly 32 bytes, got {}",
@@ -6034,9 +6000,7 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential(
-                "auth_generation must be >= 1".into(),
-            ));
+            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -6048,73 +6012,33 @@ where
             .map_err(|_| OrchestratorError::InvalidInput("invalid new_group_id hex".into()))?;
         let (group_info_group_id, successor_epoch) = {
             let (gid, epoch) = {
-                crate::message_limits::validate_inbound_mls_message_len(
-                    group_info.len(),
-                    "group_info",
-                )?;
+                crate::message_limits::validate_inbound_mls_message_len(group_info.len(), "group_info")?;
                 let (message, remaining) = MlsMessageIn::tls_deserialize_bytes(group_info)
                     .map_err(|_| OrchestratorError::InvalidInput("malformed GroupInfo".into()))?;
-                if !remaining.is_empty() {
-                    return Err(OrchestratorError::InvalidInput(
-                        "GroupInfo trailing bytes".into(),
-                    ));
-                }
+                if !remaining.is_empty() { return Err(OrchestratorError::InvalidInput("GroupInfo trailing bytes".into())); }
                 match message.extract() {
-                    MlsMessageBodyIn::GroupInfo(info) => {
-                        (info.group_id().as_slice().to_vec(), info.epoch().as_u64())
-                    }
+                    MlsMessageBodyIn::GroupInfo(info) => (info.group_id().as_slice().to_vec(), info.epoch().as_u64()),
                     _ => return Err(OrchestratorError::InvalidInput("not GroupInfo".into())),
                 }
             };
             (gid, epoch)
         };
         if group_info_group_id != new_group_id_bytes || successor_epoch != 0 {
-            return Err(OrchestratorError::InvalidInput(
-                "exported reset GroupInfo coordinate mismatch".into(),
-            ));
+            return Err(OrchestratorError::InvalidInput("exported reset GroupInfo coordinate mismatch".into()));
         }
         let prior_context = self.resolve_conversation_context(convo_id).await?;
         let prior_group_id = prior_context.group_id_bytes()?;
         let prior_epoch = self.mls_context().get_epoch(prior_group_id.clone())?;
-        let prior_tag: [u8; 32] = self
-            .mls_context()
-            .get_confirmation_tag(prior_group_id.clone())?
-            .try_into()
-            .map_err(|_| {
-                OrchestratorError::Mls(MLSError::Internal(
-                    "prior confirmation tag length mismatch".into(),
-                ))
-            })?;
-        let prior_gc_hash: [u8; 32] = self
-            .mls_context()
-            .get_group_context_hash(prior_group_id.clone())?
-            .try_into()
-            .map_err(|_| {
-                OrchestratorError::Mls(MLSError::Internal(
-                    "prior group context hash length mismatch".into(),
-                ))
-            })?;
-        let successor_tag: [u8; 32] = self
-            .mls_context()
-            .get_confirmation_tag(new_group_id_bytes.clone())?
-            .try_into()
-            .map_err(|_| {
-                OrchestratorError::Mls(MLSError::Internal(
-                    "successor confirmation tag length mismatch".into(),
-                ))
-            })?;
-        let successor_gc_hash: [u8; 32] = self
-            .mls_context()
-            .get_group_context_hash(new_group_id_bytes.clone())?
-            .try_into()
-            .map_err(|_| {
-                OrchestratorError::Mls(MLSError::Internal(
-                    "successor group context hash length mismatch".into(),
-                ))
-            })?;
-        let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| {
-            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
-        })?;
+        let prior_tag: [u8; 32] = self.mls_context().get_confirmation_tag(prior_group_id.clone())?.try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("prior confirmation tag length mismatch".into())))?;
+        let prior_gc_hash: [u8; 32] = self.mls_context().get_group_context_hash(prior_group_id.clone())?.try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("prior group context hash length mismatch".into())))?;
+        let successor_tag: [u8; 32] = self.mls_context().get_confirmation_tag(new_group_id_bytes.clone())?.try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("successor confirmation tag length mismatch".into())))?;
+        let successor_gc_hash: [u8; 32] = self.mls_context().get_group_context_hash(new_group_id_bytes.clone())?.try_into()
+            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("successor group context hash length mismatch".into())))?;
+        let convo_uuid = uuid::Uuid::parse_str(convo_id)
+            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
         let prior_generation = payload.reset_generation;
 
         use rand::RngCore;
@@ -6127,9 +6051,7 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self
-            .mls_context()
-            .safe_export_secret(new_group_id_bytes.clone(), 0x8001)?;
+        let metadata_key = self.mls_context().safe_export_secret(new_group_id_bytes.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -6140,11 +6062,7 @@ where
             1,
             &metadata_plaintext,
         )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
-            )))
-        })?;
+        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
 
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#resetActivationBody",

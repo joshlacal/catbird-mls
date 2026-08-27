@@ -93,9 +93,10 @@ fn default_join_config() -> MlsGroupJoinConfig {
 fn extract_welcome(welcome_msg_out: MlsMessageOut) -> Welcome {
     let bytes = welcome_msg_out.tls_serialize_detached().unwrap();
     let mls_message_in = MlsMessageIn::tls_deserialize_exact(&bytes[..]).unwrap();
-    mls_message_in
-        .into_welcome()
-        .expect("Expected Welcome message")
+    match mls_message_in.extract() {
+        MlsMessageBodyIn::Welcome(w) => w,
+        _ => panic!("Expected Welcome message"),
+    }
 }
 
 fn find_member_index(group: &MlsGroup, identity: &[u8]) -> Option<LeafNodeIndex> {
@@ -412,7 +413,7 @@ fn test_basic_member_removal() {
     // Bob processes Alice's add commit
     let add_commit_bytes = add_commit.tls_serialize_detached().unwrap();
     let add_commit_msg = MlsMessageIn::tls_deserialize_exact(&add_commit_bytes[..]).unwrap();
-    let add_protocol = add_commit_msg.into_protocol_message().unwrap();
+    let add_protocol = add_commit_msg.try_into_protocol_message().unwrap();
     let add_processed = bob_group
         .process_message(&bob_provider, add_protocol)
         .unwrap();
@@ -462,7 +463,7 @@ fn test_basic_member_removal() {
     // Charlie processes remove commit
     let remove_commit_bytes = remove_commit.tls_serialize_detached().unwrap();
     let remove_msg = MlsMessageIn::tls_deserialize_exact(&remove_commit_bytes[..]).unwrap();
-    let remove_protocol = remove_msg.into_protocol_message().unwrap();
+    let remove_protocol = remove_msg.try_into_protocol_message().unwrap();
     let remove_processed = charlie_group
         .process_message(&charlie_provider, remove_protocol)
         .unwrap();
@@ -559,7 +560,7 @@ fn test_removed_member_cannot_decrypt() {
     // Bob processes commit
     let add_bytes = add_commit.tls_serialize_detached().unwrap();
     let add_msg = MlsMessageIn::tls_deserialize_exact(&add_bytes[..]).unwrap();
-    let add_proto = add_msg.into_protocol_message().unwrap();
+    let add_proto = add_msg.try_into_protocol_message().unwrap();
     if let ProcessedMessageContent::StagedCommitMessage(staged) = bob_group
         .process_message(&bob_provider, add_proto)
         .unwrap()
@@ -594,7 +595,7 @@ fn test_removed_member_cannot_decrypt() {
 
     let pre_bytes = pre_removal_msg.tls_serialize_detached().unwrap();
     let pre_msg = MlsMessageIn::tls_deserialize_exact(&pre_bytes[..]).unwrap();
-    let pre_proto = pre_msg.into_protocol_message().unwrap();
+    let pre_proto = pre_msg.try_into_protocol_message().unwrap();
 
     let pre_result = bob_group.process_message(&bob_provider, pre_proto);
     assert!(pre_result.is_ok(), "Bob should decrypt pre-removal message");
@@ -612,7 +613,7 @@ fn test_removed_member_cannot_decrypt() {
     // Charlie processes remove
     let remove_bytes = remove_commit.tls_serialize_detached().unwrap();
     let remove_msg = MlsMessageIn::tls_deserialize_exact(&remove_bytes[..]).unwrap();
-    let remove_proto = remove_msg.into_protocol_message().unwrap();
+    let remove_proto = remove_msg.try_into_protocol_message().unwrap();
     if let ProcessedMessageContent::StagedCommitMessage(staged) = charlie_group
         .process_message(&charlie_provider, remove_proto)
         .unwrap()
@@ -642,7 +643,7 @@ fn test_removed_member_cannot_decrypt() {
     // Charlie CAN decrypt
     let post_bytes = post_removal_msg.tls_serialize_detached().unwrap();
     let charlie_post_msg = MlsMessageIn::tls_deserialize_exact(&post_bytes[..]).unwrap();
-    let charlie_post_proto = charlie_post_msg.into_protocol_message().unwrap();
+    let charlie_post_proto = charlie_post_msg.try_into_protocol_message().unwrap();
 
     let charlie_result = charlie_group.process_message(&charlie_provider, charlie_post_proto);
     assert!(
@@ -653,7 +654,7 @@ fn test_removed_member_cannot_decrypt() {
 
     // Bob CANNOT decrypt (his group state is stale)
     let bob_post_msg = MlsMessageIn::tls_deserialize_exact(&post_bytes[..]).unwrap();
-    let bob_post_proto = bob_post_msg.into_protocol_message().unwrap();
+    let bob_post_proto = bob_post_msg.try_into_protocol_message().unwrap();
 
     let bob_result = bob_group.process_message(&bob_provider, bob_post_proto);
 

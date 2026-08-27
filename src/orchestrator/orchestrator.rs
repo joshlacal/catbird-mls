@@ -582,6 +582,7 @@ where
         Ok(format!("{user_did}#{device_id}"))
     }
 
+
     /// Read the lifecycle-bound user for destructive cleanup that may resume
     /// during `initialize` before the public authenticated state becomes
     /// Ready. Callers must already hold the lifecycle/transition ownership

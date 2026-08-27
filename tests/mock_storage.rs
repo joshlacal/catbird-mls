@@ -1651,16 +1651,8 @@ impl MLSStorageBackend for MockStorage {
         since_epoch: Option<i32>,
     ) -> Result<Vec<SequencerReceipt>> {
         let inner = self.inner.lock().unwrap();
-        let matched_gid = inner
-            .conversations
-            .values()
-            .find(|c| c.conversation_id == convo_id)
-            .map(|c| c.group_id.clone());
-        let matched_cid = inner
-            .conversations
-            .values()
-            .find(|c| c.group_id == convo_id)
-            .map(|c| c.conversation_id.clone());
+        let matched_gid = inner.conversations.values().find(|c| c.conversation_id == convo_id).map(|c| c.group_id.clone());
+        let matched_cid = inner.conversations.values().find(|c| c.group_id == convo_id).map(|c| c.conversation_id.clone());
         Ok(inner
             .sequencer_receipts
             .iter()
@@ -1676,21 +1668,15 @@ impl MLSStorageBackend for MockStorage {
 
     async fn clear_sequencer_receipts(&self, conversation_id: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let matched_gid = inner
-            .conversations
-            .values()
-            .find(|c| c.conversation_id == conversation_id)
-            .map(|c| c.group_id.clone());
-        let matched_cid = inner
-            .conversations
-            .values()
-            .find(|c| c.group_id == conversation_id)
-            .map(|c| c.conversation_id.clone());
-        inner.sequencer_receipts.retain(|r| {
-            r.convo_id != conversation_id
-                && matched_gid.as_deref() != Some(&r.convo_id)
-                && matched_cid.as_deref() != Some(&r.convo_id)
-        });
+        let matched_gid = inner.conversations.values().find(|c| c.conversation_id == conversation_id).map(|c| c.group_id.clone());
+        let matched_cid = inner.conversations.values().find(|c| c.group_id == conversation_id).map(|c| c.conversation_id.clone());
+        inner
+            .sequencer_receipts
+            .retain(|r| {
+                r.convo_id != conversation_id
+                    && matched_gid.as_deref() != Some(&r.convo_id)
+                    && matched_cid.as_deref() != Some(&r.convo_id)
+            });
         Ok(())
     }
 

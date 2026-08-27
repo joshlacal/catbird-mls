@@ -1,7 +1,9 @@
 mod e2e_harness;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use catbird_mls::orchestrator::{CanonicalOperation, OrchestratorError};
+use catbird_mls::orchestrator::{
+    CanonicalOperation, OrchestratorError,
+};
 use e2e_harness::TestWorld;
 use serde_json::Value;
 
@@ -11,10 +13,7 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
     world.add_client("Alice").await;
     world.add_client("Bob").await;
 
-    world
-        .register_device("Alice")
-        .await
-        .expect("register alice");
+    world.register_device("Alice").await.expect("register alice");
     let bob_did = world.register_device("Bob").await.expect("register bob");
     let alice = world.client("Alice");
 
@@ -36,10 +35,7 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
     // Call add_members with Bob's DID
     alice
         .orchestrator
-        .add_members(
-            &conversation.conversation_id,
-            std::slice::from_ref(&bob_did),
-        )
+        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob_did))
         .await
         .expect("add_members should succeed with policy invitation");
 
@@ -70,19 +66,13 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
         .expect("SubmitTransition request must be recorded");
 
     assert_eq!(transition_req.method, "POST");
-    assert_eq!(
-        transition_req.path,
-        "/xrpc/blue.catbird.chat.submitTransition"
-    );
+    assert_eq!(transition_req.path, "/xrpc/blue.catbird.chat.submitTransition");
 
-    let wire: Value =
-        serde_json::from_slice(transition_req.body.as_deref().unwrap()).expect("parse wire JSON");
+    let wire: Value = serde_json::from_slice(transition_req.body.as_deref().unwrap())
+        .expect("parse wire JSON");
 
     let signed_req = wire.get("signedRequest").expect("signedRequest present");
-    let sig_b64 = signed_req
-        .get("signature")
-        .and_then(|v| v.as_str())
-        .expect("signature string");
+    let sig_b64 = signed_req.get("signature").and_then(|v| v.as_str()).expect("signature string");
     assert_eq!(
         STANDARD.decode(sig_b64).expect("decode signature").len(),
         64,
@@ -99,10 +89,7 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
         Some("CATBIRD-CHAT-POLICY\0")
     );
 
-    let transition_id = body
-        .get("transitionId")
-        .and_then(|v| v.as_str())
-        .expect("transitionId");
+    let transition_id = body.get("transitionId").and_then(|v| v.as_str()).expect("transitionId");
     assert!(
         uuid::Uuid::parse_str(transition_id).is_ok(),
         "transitionId must be valid UUIDv4"
@@ -130,66 +117,27 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
     );
 
     assert!(body.get("keyId").and_then(|v| v.as_str()).is_some());
-    assert!(
-        body.get("authGeneration")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            >= 1
-    );
+    assert!(body.get("authGeneration").and_then(|v| v.as_i64()).unwrap_or(0) >= 1);
 
     // Verify coordinates
     let prior = body.get("prior").expect("prior coordinates");
     let next = body.get("next").expect("next coordinates");
 
-    let prior_sv = prior
-        .get("stateVersion")
-        .and_then(|v| v.as_i64())
-        .expect("prior stateVersion");
-    let next_sv = next
-        .get("stateVersion")
-        .and_then(|v| v.as_i64())
-        .expect("next stateVersion");
+    let prior_sv = prior.get("stateVersion").and_then(|v| v.as_i64()).expect("prior stateVersion");
+    let next_sv = next.get("stateVersion").and_then(|v| v.as_i64()).expect("next stateVersion");
     assert_eq!(
         next_sv,
         prior_sv + 1,
         "next stateVersion must increment prior by exactly 1"
     );
 
-    assert_eq!(
-        prior.get("epoch"),
-        next.get("epoch"),
-        "epoch must be unchanged"
-    );
-    assert_eq!(
-        prior.get("generation"),
-        next.get("generation"),
-        "generation must be unchanged"
-    );
-    assert_eq!(
-        prior.get("groupId"),
-        next.get("groupId"),
-        "groupId must be unchanged"
-    );
-    assert_eq!(
-        prior.get("groupContextHash"),
-        next.get("groupContextHash"),
-        "groupContextHash must be unchanged"
-    );
-    assert_eq!(
-        prior.get("confirmationTag"),
-        next.get("confirmationTag"),
-        "confirmationTag must be unchanged"
-    );
-    assert_eq!(
-        prior.get("lifecycle"),
-        next.get("lifecycle"),
-        "lifecycle must be active"
-    );
-    assert_eq!(
-        prior.get("conversationId"),
-        next.get("conversationId"),
-        "conversationId must match"
-    );
+    assert_eq!(prior.get("epoch"), next.get("epoch"), "epoch must be unchanged");
+    assert_eq!(prior.get("generation"), next.get("generation"), "generation must be unchanged");
+    assert_eq!(prior.get("groupId"), next.get("groupId"), "groupId must be unchanged");
+    assert_eq!(prior.get("groupContextHash"), next.get("groupContextHash"), "groupContextHash must be unchanged");
+    assert_eq!(prior.get("confirmationTag"), next.get("confirmationTag"), "confirmationTag must be unchanged");
+    assert_eq!(prior.get("lifecycle"), next.get("lifecycle"), "lifecycle must be active");
+    assert_eq!(prior.get("conversationId"), next.get("conversationId"), "conversationId must match");
 
     // Verify participantChanges
     let changes = body
@@ -207,19 +155,18 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
         change.get("userDid").and_then(|v| v.as_str()),
         Some(bob_did.as_str())
     );
-    assert_eq!(change.get("role").and_then(|v| v.as_str()), Some("member"));
+    assert_eq!(
+        change.get("role").and_then(|v| v.as_str()),
+        Some("member")
+    );
     assert_eq!(
         change.get("status").and_then(|v| v.as_str()),
         Some("pending")
     );
 
-    let provenance = change
-        .get("invitationProvenance")
-        .expect("invitationProvenance");
+    let provenance = change.get("invitationProvenance").expect("invitationProvenance");
     assert_eq!(
-        provenance
-            .get("invitationTransitionId")
-            .and_then(|v| v.as_str()),
+        provenance.get("invitationTransitionId").and_then(|v| v.as_str()),
         Some(transition_id)
     );
     assert_eq!(
@@ -232,10 +179,7 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
     );
 
     // Verify signedAt timestamp format
-    let signed_at = body
-        .get("signedAt")
-        .and_then(|v| v.as_str())
-        .expect("signedAt string");
+    let signed_at = body.get("signedAt").and_then(|v| v.as_str()).expect("signedAt string");
     assert!(
         chrono::DateTime::parse_from_rfc3339(signed_at).is_ok(),
         "signedAt must be RFC 3339 formatted"
@@ -246,10 +190,7 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
 async fn add_members_multi_did_strictly_sorted() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
-    world
-        .register_device("Alice")
-        .await
-        .expect("register alice");
+    world.register_device("Alice").await.expect("register alice");
     let alice = world.client("Alice");
 
     let conversation = alice
@@ -279,8 +220,8 @@ async fn add_members_multi_did_strictly_sorted() {
         .find(|r| r.operation == CanonicalOperation::SubmitTransition)
         .expect("SubmitTransition request must be recorded");
 
-    let wire: Value =
-        serde_json::from_slice(transition_req.body.as_deref().unwrap()).expect("parse wire JSON");
+    let wire: Value = serde_json::from_slice(transition_req.body.as_deref().unwrap())
+        .expect("parse wire JSON");
 
     let body = wire
         .get("signedRequest")
@@ -313,10 +254,7 @@ async fn add_members_multi_did_strictly_sorted() {
 async fn add_members_rejects_duplicate_dids_and_self_add() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
-    world
-        .register_device("Alice")
-        .await
-        .expect("register alice");
+    world.register_device("Alice").await.expect("register alice");
     let alice = world.client("Alice");
 
     let conversation = alice
@@ -351,10 +289,7 @@ async fn add_members_fails_closed_for_direct_conversations() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     world.add_client("Bob").await;
-    world
-        .register_device("Alice")
-        .await
-        .expect("register alice");
+    world.register_device("Alice").await.expect("register alice");
     let bob_did = world.register_device("Bob").await.expect("register bob");
     let alice = world.client("Alice");
 
@@ -378,10 +313,7 @@ async fn add_members_fails_closed_for_direct_conversations() {
 async fn add_members_fails_closed_on_non_2xx_server_response() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
-    world
-        .register_device("Alice")
-        .await
-        .expect("register alice");
+    world.register_device("Alice").await.expect("register alice");
     let alice = world.client("Alice");
 
     let conversation = alice
@@ -393,7 +325,9 @@ async fn add_members_fails_closed_on_non_2xx_server_response() {
     let bob_did = "did:plc:bobservererrortest123".to_string();
 
     // Inject commit_group_change / SubmitTransition failure
-    world.delivery_service().fail_next_commit_group_change();
+    world
+        .delivery_service()
+        .fail_next_commit_group_change();
 
     let err = alice
         .orchestrator
