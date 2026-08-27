@@ -470,3 +470,55 @@ fn storage_lifecycle_status_reports_busy_interrupt_suspend_and_close() {
         Some("flush_and_prepare_close")
     );
 }
+#[test]
+fn sqlite_storage_provider_sqlcipher_encryption_verified() {
+    use openmls_sqlite_storage::{Codec, SqliteStorageProvider};
+    use rusqlite::Connection;
+
+    #[derive(Default)]
+    struct TestJsonCodec;
+
+    impl Codec for TestJsonCodec {
+        type Error = serde_json::Error;
+
+        fn to_vec<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Self::Error> {
+            serde_json::to_vec(value)
+        }
+
+        fn from_slice<T: serde::de::DeserializeOwned>(slice: &[u8]) -> Result<T, Self::Error> {
+            serde_json::from_slice(slice)
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("encrypted_storage_proof.db");
+
+    let conn = Connection::open(&db_path).expect("open connection");
+    conn.pragma_update(None, "cipher_memory_security", "OFF")
+        .expect("cipher_memory_security");
+    conn.pragma_update(None, "key", "test-sqlcipher-key-9876543210")
+        .expect("set pragma key");
+
+    let cipher_version: String = conn
+        .query_row("PRAGMA cipher_version", [], |row| row.get(0))
+        .expect("query cipher_version");
+    assert!(
+        !cipher_version.is_empty(),
+        "PRAGMA cipher_version must return non-empty version string from SQLCipher"
+    );
+
+    let mut provider = SqliteStorageProvider::<TestJsonCodec, Connection>::new(conn);
+    provider.run_migrations().expect("run migrations");
+
+    drop(provider);
+
+    let raw_bytes = std::fs::read(&db_path).expect("read db file");
+    assert!(
+        raw_bytes.len() >= 16,
+        "database file must have at least 16 bytes"
+    );
+    assert!(
+        !raw_bytes.starts_with(b"SQLite format 3\0"),
+        "raw database header must be encrypted ciphertext, NOT plaintext SQLite format 3"
+    );
+}

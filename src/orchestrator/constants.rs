@@ -69,7 +69,7 @@ pub const FAILOVER_MIN_DURATION: Duration = Duration::from_secs(120);
 /// expires, after which fresh resolution must reject it.
 pub const DEVICE_KEY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
-// §Safe Export — Puncturable PRF component IDs (extensions-draft-08)
+// §Safe Export — Puncturable PRF component IDs (extensions-draft)
 /// Component ID for epoch blob decryption key (forward-secure within epochs).
 pub const SAFE_EXPORT_EPOCH_BLOB_KEY: u16 = 0;
 /// Component ID for group metadata encryption key (forward-secure within epochs).

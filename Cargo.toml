@@ -25,15 +25,15 @@ catbird-atproto = { path = "../catbird-atproto", version = "0.1.0", features = [
 # - Group creation fails if GroupId already exists in storage
 # - join_by_external_commit deprecated → use external_commit_builder
 # - ProposalType, ExtensionType, CredentialType enums have Grease(u16) variant
-openmls = { version = "0.8", features = ["test-utils", "js", "extensions-draft-08", "fork-resolution"] }
-openmls_traits = { version = "0.5", features = ["extensions-draft-08"] }
-openmls_basic_credential = "0.5"
-openmls_libcrux_crypto = { version = "0.3", features = ["extensions-draft-08"] }
-openmls_rust_crypto = { version = "0.5", features = ["test-utils"] }
-openmls_memory_storage = { version = "0.5", features = ["test-utils", "extensions-draft-08"] }
+openmls = { version = "=0.9.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["test-utils", "js", "extensions-draft", "fork-resolution", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_basic_credential = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_libcrux_crypto = { version = "=0.4.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_rust_crypto = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["test-utils", "extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+openmls_memory_storage = { version = "=0.6.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["test-utils", "extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tls_codec = "0.4"
+tls_codec = "=0.5.0"
 thiserror = "1.0"
 zeroize = { version = "1.7", features = ["derive"] }
 base64 = "0.22"
@@ -121,16 +121,16 @@ fork-resolution = []
 storage-driver-prototype = []
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
-openmls_sqlite_storage = { version = "0.2", features = ["extensions-draft-08"] }
-rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher"] }
+openmls_sqlite_storage = { version = "=0.3.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 audiopus = { version = "0.3.0-rc.0" }
 audiopus_sys = { version = "0.2", features = ["static"] }
 ogg = "0.9"
 
 [target.'cfg(all(target_os = "android", not(target_arch = "wasm32")))'.dependencies]
-openmls_sqlite_storage = { version = "0.2", features = ["extensions-draft-08"] }
-rusqlite = { version = "0.32", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+openmls_sqlite_storage = { version = "=0.3.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 audiopus = { version = "0.3.0-rc.0" }
 audiopus_sys = { version = "0.2", features = ["static"] }
@@ -143,7 +143,9 @@ web-sys = { version = "0.3", features = ["Window", "Performance", "console"] }
 # WASM-compatible getrandom feature unification across transitive semver lines.
 getrandom = { version = "0.2", features = ["js"] }
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+getrandom04_test = { package = "getrandom", version = "=0.4.3", features = ["wasm_js"] }
 
 [profile.release]
 debug = true  # Generate debug symbols for dSYM creation

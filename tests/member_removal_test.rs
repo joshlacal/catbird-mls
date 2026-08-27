@@ -952,11 +952,9 @@ fn test_remove_nonexistent_member_graceful() {
 // Regression Tests for AAD-Aware Member Removal & Coordinates
 // ============================================================================
 
-fn parse_public_commit_wire(bytes: &[u8]) -> (Vec<u8>, Vec<Proposal>) {
-    use openmls::messages::proposals_in::ProposalOrRefIn;
+fn parse_public_commit_wire(bytes: &[u8]) -> (Vec<u8>, Vec<openmls::messages::proposals_in::ProposalIn>) {
+    use openmls::messages::proposals_in::{ProposalIn, ProposalOrRefIn};
     use openmls::prelude::tls_codec::Deserialize;
-    use openmls_rust_crypto::OpenMlsRustCrypto;
-    let crypto = OpenMlsRustCrypto::default();
     let mut inner = &bytes[4..]; // skip 2 bytes wire format + 2 bytes version
     let _group_id = VLBytes::tls_deserialize(&mut inner).unwrap();
     let _epoch = u64::tls_deserialize(&mut inner).unwrap();
@@ -968,10 +966,9 @@ fn parse_public_commit_wire(bytes: &[u8]) -> (Vec<u8>, Vec<Proposal>) {
     let mut proposals = proposal_vector.as_slice();
     let mut parsed_proposals = Vec::new();
     while !proposals.is_empty() {
-        let p_or_ref_in = ProposalOrRefIn::tls_deserialize(&mut proposals).unwrap();
-        let validated = p_or_ref_in.validate(crypto.crypto(), Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519, ProtocolVersion::default()).unwrap();
-        match validated {
-            ProposalOrRef::Proposal(p) => parsed_proposals.push(*p),
+        let p_or_ref = ProposalOrRefIn::tls_deserialize(&mut proposals).unwrap();
+        match p_or_ref {
+            ProposalOrRefIn::Proposal(p) => parsed_proposals.push(*p),
             _ => panic!("Expected inline proposal in commit"),
         }
     }
@@ -1056,8 +1053,8 @@ fn test_removal_commit_aad_and_coordinates_regression() {
     );
 
     // 3. Verify Remove proposal exists and no AppDataUpdate proposal exists
-    assert!(proposals.iter().any(|p| matches!(p, Proposal::Remove(_))), "Removal commit must contain Remove proposal");
-    assert!(!proposals.iter().any(|p| matches!(p, Proposal::AppDataUpdate(_))), "Removal commit must NOT contain AppDataUpdate proposal");
+    assert!(proposals.iter().any(|p| matches!(p, openmls::messages::proposals_in::ProposalIn::Remove(_))), "Removal commit must contain Remove proposal");
+    assert!(!proposals.iter().any(|p| matches!(p, openmls::messages::proposals_in::ProposalIn::AppDataUpdate(_))), "Removal commit must NOT contain AppDataUpdate proposal");
 
     // Merge the removal commit
     let new_epoch = context.merge_pending_commit(group_id.clone()).unwrap().new_epoch;

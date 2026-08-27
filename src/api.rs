@@ -2,7 +2,6 @@ use base64::Engine as _;
 use openmls::component::ComponentData;
 use openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY;
 use openmls::messages::group_info::VerifiableGroupInfo;
-use openmls::messages::proposals_in::ProposalOrRefIn;
 use openmls::prelude::tls_codec::{Deserialize, Serialize};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
@@ -22,7 +21,7 @@ use crate::message_limits::{
     validate_outbound_key_package_lengths,
 };
 use crate::mls_context::MLSContext as MLSContextInner;
-use crate::orchestrator::mls_provider::MlsCryptoContext;
+use crate::orchestrator::mls_provider::{MlsCryptoContext, MlsDecryptOutcome};
 use crate::types::*;
 
 use crate::keychain::KeychainAccess;
@@ -237,50 +236,7 @@ impl MLSContext {
     }
 }
 
-fn compute_app_data_updates(
-    group: &MlsGroup,
-    crypto: &impl OpenMlsCrypto,
-    committed_proposals: &[ProposalOrRefIn],
-) -> Result<Option<AppDataUpdates>, MLSError> {
-    let mut updater = group.app_data_dictionary_updater();
-    let mut saw_app_data_update = false;
 
-    for proposal_or_ref in committed_proposals.iter() {
-        let validated = proposal_or_ref
-            .clone()
-            .validate(crypto, group.ciphersuite(), ProtocolVersion::default())
-            .map_err(|e| MLSError::OpenMLS(format!("validate AppData proposal: {:?}", e)))?;
-
-        let proposal: Box<Proposal> = match validated {
-            ProposalOrRef::Proposal(proposal) => proposal,
-            ProposalOrRef::Reference(reference) => group
-                .proposal_store()
-                .proposals()
-                .find(|p| p.proposal_reference_ref() == &*reference)
-                .map(|p| Box::new(p.proposal().clone()))
-                .ok_or_else(|| MLSError::OpenMLS("AppData proposal reference missing".into()))?,
-        };
-
-        let Proposal::AppDataUpdate(app_data_update) = *proposal else {
-            continue;
-        };
-
-        saw_app_data_update = true;
-        match app_data_update.operation() {
-            AppDataUpdateOperation::Update(data) => updater.set(ComponentData::from_parts(
-                app_data_update.component_id(),
-                data.clone(),
-            )),
-            AppDataUpdateOperation::Remove => updater.remove(&app_data_update.component_id()),
-        }
-    }
-
-    Ok(if saw_app_data_update {
-        updater.changes()
-    } else {
-        None
-    })
-}
 
 /// Map an OpenMLS [`ProcessMessageError`] to a typed [`MLSError`] class (N38).
 ///
@@ -340,24 +296,34 @@ fn process_protocol_message<Provider: OpenMlsProvider>(
     protocol_msg: ProtocolMessage,
     context: &str,
 ) -> Result<ProcessedMessage, MLSError> {
-    let unverified_message = group
-        .unprotect_message(provider, protocol_msg)
-        .map_err(|e| map_process_message_error(e, "unprotect_message", context))?;
+    let processed = group
+        .process_message(provider, protocol_msg)
+        .map_err(|e| map_process_message_error(e, "process_message", context))?;
 
-    let app_data_updates =
-        if let Some(committed_proposals) = unverified_message.committed_proposals() {
-            compute_app_data_updates(group, provider.crypto(), committed_proposals)?
-        } else {
-            None
-        };
+    if let ProcessedMessageContent::UnresolvedAppDataCommit(unresolved) = processed.content() {
+        use openmls::messages::proposals::AppDataUpdateOperation;
+        let mut updater = group.app_data_dictionary_updater();
+        for proposal in unresolved.app_data_update_proposals() {
+            match proposal.operation() {
+                AppDataUpdateOperation::Update(data) => {
+                    updater.set(ComponentData::from_parts(
+                        proposal.component_id(),
+                        data.clone(),
+                    ));
+                }
+                AppDataUpdateOperation::Remove => {
+                    updater.remove(&proposal.component_id());
+                }
+            }
+        }
+        let app_data_updates = updater.changes();
+        let processed = group
+            .resolve_app_data_commit(provider, processed, app_data_updates)
+            .map_err(|_| MLSError::InvalidCommit)?;
+        return Ok(processed);
+    }
 
-    group
-        .process_unverified_message_with_app_data_updates(
-            provider,
-            unverified_message,
-            app_data_updates,
-        )
-        .map_err(|e| map_process_message_error(e, "process_message", context))
+    Ok(processed)
 }
 
 /// MLS context wrapper for FFI
@@ -2596,8 +2562,12 @@ impl MLSContext {
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
-        self.decrypt_message_classified(group_id, ciphertext)
-            .map_err(flatten_decrypt_error_for_ffi)
+        match self.decrypt_message_classified(group_id, ciphertext) {
+            Ok(MlsDecryptOutcome::Message(result)) => Ok(result),
+            Ok(MlsDecryptOutcome::OwnPrivateMessage { .. })
+            | Ok(MlsDecryptOutcome::OwnPendingCommit) => Err(MLSError::DecryptionFailed),
+            Err(err) => Err(flatten_decrypt_error_for_ffi(err)),
+        }
     }
 
     /// Async variant of decrypt_message - offloads crypto work to avoid blocking
@@ -2696,6 +2666,14 @@ impl MLSContext {
 
                     crate::debug_log!("[DECRYPT-ASYNC] ✅ Message processed successfully");
 
+                    match processed.content() {
+                        ProcessedMessageContent::OwnPrivateMessage
+                        | ProcessedMessageContent::OwnPendingCommit => {
+                            return Err(MLSError::DecryptionFailed);
+                        }
+                        _ => {}
+                    }
+
                     // Extract sender credential BEFORE consuming the processed message
                     let sender_cred = processed.credential().clone();
                     let sender_credential = CredentialData {
@@ -2762,6 +2740,15 @@ impl MLSContext {
                                 DecryptContentType::Commit,
                                 None,
                                 Some(staged),
+                            ))
+                        }
+                        ProcessedMessageContent::OwnPrivateMessage
+                        | ProcessedMessageContent::OwnPendingCommit => {
+                            Err(MLSError::DecryptionFailed)
+                        }
+                        ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                            Err(MLSError::Internal(
+                                "unresolved AppData commit escaped process_protocol_message".to_string(),
                             ))
                         }
                     }
@@ -2954,6 +2941,14 @@ impl MLSContext {
 
             crate::debug_log!("[MLS-FFI] Processing message content type...");
 
+            match processed.content() {
+                ProcessedMessageContent::OwnPrivateMessage
+                | ProcessedMessageContent::OwnPendingCommit => {
+                    return Err(MLSError::DecryptionFailed);
+                }
+                _ => {}
+            }
+
             // Extract sender credential BEFORE consuming the processed message
             let sender_credential = processed.credential();
             let sender = CredentialData {
@@ -2961,7 +2956,6 @@ impl MLSContext {
                 identity: sender_credential.serialized_content().to_vec(),
             };
             crate::debug_log!("[MLS-FFI] Sender extracted: {} bytes identity", sender.identity.len());
-
             match processed.into_content() {
                 ProcessedMessageContent::ApplicationMessage(app_msg) => {
                     let plaintext = app_msg.into_bytes();
@@ -3119,6 +3113,15 @@ impl MLSContext {
                         commit_metadata: metadata_info,
                     }, Some(staged)))
                 },
+                ProcessedMessageContent::OwnPrivateMessage
+                | ProcessedMessageContent::OwnPendingCommit => {
+                    Err(MLSError::DecryptionFailed)
+                }
+                ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                    Err(MLSError::Internal(
+                        "unresolved AppData commit escaped process_protocol_message".to_string(),
+                    ))
+                }
             }
         });
 
@@ -3224,6 +3227,13 @@ impl MLSContext {
                     crate::error_log!("[MLS-FFI-ASYNC] ERROR: process_message failed: {:?}", e);
                     MLSError::DecryptionFailed
                 })?;
+                match processed.content() {
+                    ProcessedMessageContent::OwnPrivateMessage
+                    | ProcessedMessageContent::OwnPendingCommit => {
+                        return Err(MLSError::DecryptionFailed);
+                    }
+                    _ => {}
+                }
 
                 let sender_credential = processed.credential();
                 let sender = CredentialData {
@@ -3357,6 +3367,15 @@ impl MLSContext {
                             commit_metadata: metadata_info,
                         }, Some(staged)))
                     },
+                    ProcessedMessageContent::OwnPrivateMessage
+                    | ProcessedMessageContent::OwnPendingCommit => {
+                        Err(MLSError::DecryptionFailed)
+                    }
+                    ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                        Err(MLSError::Internal(
+                            "unresolved AppData commit escaped process_protocol_message".to_string(),
+                        ))
+                    }
                 }
             });
 
@@ -6238,7 +6257,7 @@ impl MLSContext {
         &self,
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
-    ) -> Result<DecryptResult, MLSError> {
+    ) -> Result<MlsDecryptOutcome, MLSError> {
         self.check_suspended()?;
         validate_inbound_mls_message_len(ciphertext.len(), "ciphertext")?;
         let wire_fingerprint = incoming_commit_wire_fingerprint(&ciphertext);
@@ -6341,14 +6360,10 @@ impl MLSContext {
             );
         }
 
-        let (
-            plaintext,
-            epoch,
-            sender_credential,
-            content_type,
-            queued_proposal_opt,
-            staged_commit_opt,
-        ): IncomingDecryptStage = inner.with_group(&gid, |group, provider, _signer| {
+        let (stage_opt, direct_outcome_opt): (
+            Option<IncomingDecryptStage>,
+            Option<MlsDecryptOutcome>,
+        ) = inner.with_group(&gid, |group, provider, _signer| {
             // 🔍 DIAGNOSTIC: Get current epoch and estimated generation BEFORE processing
             let current_epoch = group.epoch().as_u64();
             crate::info_log!("[DECRYPT] 📊 PRE-PROCESSING STATE:");
@@ -6390,13 +6405,6 @@ impl MLSContext {
                         crate::error_log!("[DECRYPT]   2. Concurrent access (multiple threads racing)");
                         crate::error_log!("[DECRYPT]   3. Storage corruption (secret tree not persisted correctly)");
                     }
-
-                    // N38: propagate the typed error class produced by
-                    // `map_process_message_error`. The FFI-facing
-                    // `decrypt_message` wrapper re-flattens these to
-                    // `DecryptionFailed`; the orchestrator trait path keeps
-                    // them so the peer-bad classifier and the WrongEpoch
-                    // silent-skip arm can fire on real OpenMLS errors.
                     e
                 })?;
 
@@ -6409,6 +6417,25 @@ impl MLSContext {
             crate::info_log!("[DECRYPT]   Epoch after: {}", epoch_after);
             if epoch_after != current_epoch {
                 crate::warn_log!("[DECRYPT]   ⚠️ Epoch CHANGED during processing! {} -> {}", current_epoch, epoch_after);
+            }
+
+            match processed.content() {
+                ProcessedMessageContent::OwnPrivateMessage => {
+                    let aad_sha256 = sha2::Sha256::digest(processed.aad()).into();
+                    let ciphertext_sha256 = sha2::Sha256::digest(&ciphertext).into();
+                    return Ok((
+                        None,
+                        Some(MlsDecryptOutcome::OwnPrivateMessage {
+                            epoch: message_epoch,
+                            aad_sha256,
+                            ciphertext_sha256,
+                        }),
+                    ));
+                }
+                ProcessedMessageContent::OwnPendingCommit => {
+                    return Ok((None, Some(MlsDecryptOutcome::OwnPendingCommit)));
+                }
+                _ => {}
             }
 
             // Extract sender credential BEFORE consuming the processed message
@@ -6424,22 +6451,28 @@ impl MLSContext {
                     let bytes = app_msg.into_bytes();
                     crate::debug_log!("[DECRYPT] ApplicationMessage processed: {} bytes", bytes.len());
                     Ok((
-                        bytes,
-                        message_epoch,
-                        sender_credential,
-                        DecryptContentType::Application,
-                        None,
+                        Some((
+                            bytes,
+                            message_epoch,
+                            sender_credential,
+                            DecryptContentType::Application,
+                            None,
+                            None,
+                        )),
                         None,
                     ))
                 },
                 ProcessedMessageContent::ProposalMessage(prop) => {
                     crate::debug_log!("[DECRYPT] ProposalMessage received: {:?}", std::any::type_name_of_val(&prop));
                     Ok((
-                        vec![],
-                        message_epoch,
-                        sender_credential,
-                        DecryptContentType::Proposal,
-                        Some(*prop),
+                        Some((
+                            vec![],
+                            message_epoch,
+                            sender_credential,
+                            DecryptContentType::Proposal,
+                            Some(*prop),
+                            None,
+                        )),
                         None,
                     ))
                 },
@@ -6469,15 +6502,44 @@ impl MLSContext {
                     // Return the staged commit in the 4th tuple slot; the caller (decrypt_message)
                     // will stash it in `pending_incoming_merges` keyed by (group_id, target_epoch).
                     Ok((
-                        vec![],
-                        target_epoch,
-                        sender_credential,
-                        DecryptContentType::Commit,
+                        Some((
+                            vec![],
+                            target_epoch,
+                            sender_credential,
+                            DecryptContentType::Commit,
+                            None,
+                            Some(staged),
+                        )),
                         None,
-                        Some(staged),
                     ))
                 },
+                ProcessedMessageContent::OwnPrivateMessage
+                | ProcessedMessageContent::OwnPendingCommit => {
+                    Err(MLSError::Internal(
+                        "own message variant escaped initial check".to_string(),
+                    ))
+                }
+                ProcessedMessageContent::UnresolvedAppDataCommit(_) => {
+                    Err(MLSError::Internal(
+                        "unresolved AppData commit escaped process_protocol_message".to_string(),
+                    ))
+                }
             }
+        })?;
+
+        if let Some(outcome) = direct_outcome_opt {
+            return Ok(outcome);
+        }
+
+        let (
+            plaintext,
+            epoch,
+            sender_credential,
+            content_type,
+            queued_proposal_opt,
+            staged_commit_opt,
+        ) = stage_opt.ok_or_else(|| {
+            MLSError::Internal("missing decrypt stage result".to_string())
         })?;
 
         let proposal_ref = if let Some(proposal) = queued_proposal_opt {
@@ -6547,14 +6609,14 @@ impl MLSContext {
             sequence_number
         );
 
-        Ok(DecryptResult {
+        Ok(MlsDecryptOutcome::Message(DecryptResult {
             plaintext,
             epoch,
             sequence_number,
             sender_credential,
             content_type,
             proposal_ref,
-        })
+        }))
     }
 }
 
@@ -7531,11 +7593,18 @@ impl MlsCryptoContext for MLSContext {
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError> {
-        // N38: the orchestrator gets the CLASS-PRESERVING decrypt so its
-        // WrongEpoch silent-skip arm and Layer-3 peer-bad quarantine
-        // classifier (`messaging.rs`) see real OpenMLS error classes. The
-        // FFI-exported `decrypt_message` keeps flattening to
-        // `DecryptionFailed` for iOS/catmos-cli compatibility.
+        match self.decrypt_message_classified(group_id, ciphertext)? {
+            MlsDecryptOutcome::Message(result) => Ok(result),
+            MlsDecryptOutcome::OwnPrivateMessage { .. }
+            | MlsDecryptOutcome::OwnPendingCommit => Err(MLSError::DecryptionFailed),
+        }
+    }
+
+    fn decrypt_message_outcome(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<MlsDecryptOutcome, MLSError> {
         self.decrypt_message_classified(group_id, ciphertext)
     }
 

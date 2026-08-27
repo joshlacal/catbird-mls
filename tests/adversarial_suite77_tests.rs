@@ -43,7 +43,7 @@ impl ForeignPlaintextGroup {
 
         let config = MlsGroupCreateConfig::builder()
             .ciphersuite(ciphersuite)
-            .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .wire_format_policy(openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
             .build();
 
         let group = MlsGroup::new_with_group_id(

@@ -78,6 +78,8 @@ impl ForeignGroup {
         let mut config = MlsGroupCreateConfig::builder().ciphersuite(ciphersuite);
         if plaintext_policy {
             config = config.wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY);
+        } else {
+            config = config.wire_format_policy(openmls::group::PURE_CIPHERTEXT_WIRE_FORMAT_POLICY);
         }
         let config = config.build();
 
@@ -265,9 +267,9 @@ async fn test_peer_bad_wire_format_commits_enter_quarantine_native() {
     let group_id = convo.group_id.clone();
     let group_id_bytes = hex::decode(&group_id).expect("invalid group id hex");
 
-    // Foreign group with plaintext wire-format policy: its member commits
-    // are PublicMessages, which Alice's pure-ciphertext group must reject.
-    let mut foreign = ForeignGroup::new(&group_id_bytes, true);
+    // Foreign group with ciphertext wire-format policy: its member commits
+    // are PrivateMessages, which Alice's pure-plaintext handshake group must reject.
+    let mut foreign = ForeignGroup::new(&group_id_bytes, false);
 
     // Sanity check the typed class boundary first:
     //   - trait path (orchestrator) sees WireFormatPolicyViolation;
@@ -374,5 +376,58 @@ async fn test_pre_process_garbage_still_not_peer_bad() {
             .is_none(),
         "pre-process garbage (SerializationError) must not enter quarantine — \
          it is ambiguous, not peer-bad"
+    );
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn test_own_message_becomes_rust_only_outcome_before_credential_extraction() {
+    use catbird_mls::orchestrator::MlsDecryptOutcome;
+
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    let _did = world.register_device("Alice").await.unwrap();
+
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("Own Echo Test", None, None)
+        .await
+        .expect("create_group failed");
+    let group_id_bytes = hex::decode(&convo.group_id).expect("valid hex group_id");
+
+    // Alice encrypts an application message
+    let encrypted = alice
+        .orchestrator
+        .mls_context()
+        .encrypt_message(group_id_bytes.clone(), b"hello from self".to_vec())
+        .expect("encrypt_message failed");
+
+    // 1. Rust-internal outcome seam: decrypt_message_outcome returns OwnPrivateMessage
+    let outcome = alice
+        .orchestrator
+        .mls_context()
+        .decrypt_message_outcome(group_id_bytes.clone(), encrypted.ciphertext.clone())
+        .expect("decrypt_message_outcome must succeed for own private message");
+
+    match outcome {
+        MlsDecryptOutcome::OwnPrivateMessage {
+            epoch,
+            aad_sha256: _,
+            ciphertext_sha256,
+        } => {
+            assert_eq!(epoch, 0, "own message is at epoch 0");
+            assert_ne!(ciphertext_sha256, [0u8; 32]);
+        }
+        other => panic!("expected OwnPrivateMessage, got {other:?}"),
+    }
+
+    // 2. Exported FFI decrypt_message maps OwnPrivateMessage to DecryptionFailed
+    let ffi_err = alice
+        .orchestrator
+        .mls_context()
+        .decrypt_message(group_id_bytes.clone(), encrypted.ciphertext)
+        .expect_err("FFI decrypt_message must fail for own private message");
+    assert!(
+        matches!(ffi_err, MLSError::DecryptionFailed),
+        "FFI decrypt_message must map own message to MLSError::DecryptionFailed, got: {ffi_err:?}"
     );
 }

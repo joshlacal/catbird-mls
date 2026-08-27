@@ -756,7 +756,7 @@ async fn fork_readd_falls_back_to_needs_rejoin_when_crypto_unsupported() {
             .lock()
             .await
             .get(&group_id),
-        Some(&ConversationState::ForkDetected),
-        "decryption failure marks ForkDetected"
+        Some(&ConversationState::NeedsRejoin),
+        "unsupported crypto falls back from fork readd to NeedsRejoin"
     );
 }

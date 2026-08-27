@@ -90,6 +90,7 @@ pub struct EncryptResult {
     pub padded_size: u32,
 }
 
+#[derive(Debug, Clone)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct DecryptResult {
     pub plaintext: Vec<u8>,
@@ -158,7 +159,7 @@ pub struct MergePendingCommitResult {
     pub commit_metadata: Option<CommitMetadataInfo>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct CredentialData {
     pub credential_type: String,

@@ -47,7 +47,7 @@ pub use credential_binding::{
 pub use credentials::{CleanChatSigningAuthority, CredentialStore};
 pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
-pub use mls_provider::MlsCryptoContext;
+pub use mls_provider::{MlsCryptoContext, MlsDecryptOutcome};
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
 pub use storage::MLSStorageBackend;
 pub use types::*;

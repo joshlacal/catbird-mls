@@ -1,6 +1,17 @@
 use crate::error::MLSError;
 use crate::types::*;
 
+#[derive(Debug)]
+pub enum MlsDecryptOutcome {
+    Message(DecryptResult),
+    OwnPrivateMessage {
+        epoch: u64,
+        aad_sha256: [u8; 32],
+        ciphertext_sha256: [u8; 32],
+    },
+    OwnPendingCommit,
+}
+
 /// Conditional bounds for MlsCryptoContext.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait MlsCryptoContextBounds: Send + Sync {}
@@ -298,6 +309,15 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         group_id: Vec<u8>,
         ciphertext: Vec<u8>,
     ) -> Result<DecryptResult, MLSError>;
+    fn decrypt_message_outcome(
+        &self,
+        group_id: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<MlsDecryptOutcome, MLSError> {
+        self.decrypt_message(group_id, ciphertext)
+            .map(MlsDecryptOutcome::Message)
+    }
+
 
     /// Make all MLS storage mutations performed by the current operation
     /// durable before the orchestrator publishes a matching epoch projection

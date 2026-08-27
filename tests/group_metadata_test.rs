@@ -286,3 +286,135 @@ fn add_members_with_metadata_lets_fresh_group_joiner_decrypt_name() {
     assert_eq!(decrypted.title, "Engineering");
     assert_eq!(decrypted.description, "the eng team");
 }
+#[test]
+fn component_0x8001_update_and_remove_returns_staged_commit_and_does_not_merge_before_acceptance() {
+    let (alice, _adir) = make_context();
+    let (bob, _bdir) = make_context();
+
+    // Alice creates a NAMED group (contains component 0x8001 metadata).
+    let config = GroupConfig {
+        group_name: Some("Initial Name".to_string()),
+        group_description: Some("initial desc".to_string()),
+        ..Default::default()
+    };
+    let created = alice
+        .create_group(b"did:plc:alice".to_vec(), Some(config))
+        .unwrap();
+    let group_id = created.group_id.clone();
+
+    // Bob joins via Welcome.
+    let bob_kp = bob.create_key_package(b"did:plc:bob".to_vec()).unwrap();
+    let add = alice
+        .add_members_with_metadata(
+            group_id.clone(),
+            vec![catbird_mls::KeyPackageData {
+                data: bob_kp.key_package_data,
+            }],
+            Some("Initial Name".to_string()),
+            Some("initial desc".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+    alice.merge_pending_commit(group_id.clone()).unwrap();
+    bob.process_welcome(add.welcome_data, b"did:plc:bob".to_vec(), None)
+        .unwrap();
+
+    assert_eq!(alice.get_epoch(group_id.clone()).unwrap(), 1);
+    assert_eq!(bob.get_epoch(group_id.clone()).unwrap(), 1);
+
+    // 1. Alice performs an UPDATE on component 0x8001 metadata.
+    let update_outcome = alice
+        .update_group_metadata_encrypted(
+            group_id.clone(),
+            Some("Updated Name".to_string()),
+            Some("updated desc".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Bob processes the commit message via decrypt_message.
+    let decrypt_res = bob
+        .decrypt_message(group_id.clone(), update_outcome.commit_bytes)
+        .unwrap();
+    assert_eq!(
+        decrypt_res.content_type,
+        catbird_mls::DecryptContentType::Commit
+    );
+    assert_eq!(decrypt_res.epoch, 2);
+
+    // Invariant: Bob's local epoch has NOT merged yet before explicit acceptance.
+    assert_eq!(
+        bob.get_epoch(group_id.clone()).unwrap(),
+        1,
+        "Bob epoch must remain at 1 before explicit merge"
+    );
+
+    // Explicit merge advances Bob's epoch.
+    let new_epoch = bob.merge_incoming_commit(group_id.clone(), 2).unwrap();
+    assert_eq!(new_epoch, 2);
+    assert_eq!(
+        bob.get_epoch(group_id.clone()).unwrap(),
+        2,
+        "Bob epoch must advance to 2 after explicit merge"
+    );
+
+    // Bob can now derive metadata key and decrypt the updated metadata blob.
+    let info = bob
+        .get_current_metadata(group_id.clone())
+        .unwrap()
+        .expect("bob must have metadata info");
+    let key: [u8; 32] = info.metadata_key.as_slice().try_into().unwrap();
+    let decrypted = catbird_mls::metadata::decrypt_metadata_blob(
+        &key,
+        &group_id,
+        info.epoch,
+        update_outcome.metadata_version,
+        &update_outcome.metadata_blob_ciphertext,
+    )
+    .unwrap();
+    assert_eq!(decrypted.title, "Updated Name");
+    assert_eq!(decrypted.description, "updated desc");
+
+    // Alice also merges her pending commit to stay synchronized.
+    alice.merge_pending_commit(group_id.clone()).unwrap();
+    assert_eq!(alice.get_epoch(group_id.clone()).unwrap(), 2);
+
+    // 2. Alice updates metadata again with empty fields (REMOVE/clear semantics).
+    let clear_outcome = alice
+        .update_group_metadata_encrypted(
+            group_id.clone(),
+            Some("".to_string()),
+            Some("".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Bob processes the second commit message.
+    let decrypt_res2 = bob
+        .decrypt_message(group_id.clone(), clear_outcome.commit_bytes)
+        .unwrap();
+    assert_eq!(
+        decrypt_res2.content_type,
+        catbird_mls::DecryptContentType::Commit
+    );
+    assert_eq!(decrypt_res2.epoch, 3);
+
+    // Invariant: Bob's local epoch has NOT merged yet before explicit acceptance.
+    assert_eq!(
+        bob.get_epoch(group_id.clone()).unwrap(),
+        2,
+        "Bob epoch must remain at 2 before explicit merge"
+    );
+
+    // Explicit merge advances Bob's epoch to 3.
+    let new_epoch2 = bob.merge_incoming_commit(group_id.clone(), 3).unwrap();
+    assert_eq!(new_epoch2, 3);
+    assert_eq!(
+        bob.get_epoch(group_id.clone()).unwrap(),
+        3,
+        "Bob epoch must advance to 3 after explicit merge"
+    );
+}
