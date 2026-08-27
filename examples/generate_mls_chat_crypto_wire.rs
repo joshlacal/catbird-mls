@@ -43,7 +43,7 @@ use catbird_mls::chat_v2::ids::KeyId;
 use catbird_mls::chat_v2::transcript::{
     project_signed_body, SignedMutationKind, SignedWrapper, VerifiedMutation,
 };
-use catbird_mls::metadata::METADATA_REFERENCE_COMPONENT_ID;
+use catbird_mls::metadata::{GroupMetadataV1, METADATA_REFERENCE_COMPONENT_ID};
 use catbird_mls::orchestrator::canonical_transport::{
     canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,
     canonical_commit_aad_bytes, canonical_metadata_aad_bytes,
@@ -121,6 +121,29 @@ const METADATA_EXPORTER_LABEL: &str = "blue.catbird.chat.metadata.v1";
 const METADATA_EXPORTER_OUTPUT_LENGTH: usize = 32;
 
 const CREATION_SIGNED_REQUEST_FILE: &str = "creation-signed-request.cbor";
+const TRANSITION_METADATA_SV1_FILE: &str = "transition-metadata-sv1.cbor";
+const TRANSITION_POLICY_SV2_FILE: &str = "transition-policy-sv2.cbor";
+const TRANSITION_METADATA_SV6_FILE: &str = "transition-metadata-sv6.cbor";
+const TRANSITION_POLICY_SV7_FILE: &str = "transition-policy-sv7.cbor";
+
+const TRANSITION_METADATA_SV1_ID: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
+];
+const TRANSITION_POLICY_SV2_ID: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12,
+];
+const TRANSITION_METADATA_SV6_ID: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16,
+];
+const TRANSITION_POLICY_SV7_ID: [u8; 16] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x17,
+];
+const METADATA_SV1_NONCE: [u8; 12] = [
+    0x86, 0x20, 0xf1, 0x3a, 0x12, 0x21, 0x01, 0xc3, 0x60, 0x8b, 0x42, 0x31,
+];
+const METADATA_SV6_NONCE: [u8; 12] = [
+    0x86, 0x20, 0xf1, 0x3a, 0x12, 0x21, 0x01, 0xc3, 0x60, 0x8b, 0x42, 0x36,
+];
 
 #[derive(Debug)]
 struct GeneratorError(String);
@@ -485,35 +508,238 @@ fn b64_to_hex(val: &Value, key: &str) -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
-fn local_seal_metadata_with_nonce(
-    plaintext_cbor: &[u8],
-    exporter_key: &[u8],
-    nonce_bytes: &[u8; 12],
-    metadata_aad: &[u8],
-) -> Result<(Vec<u8>, [u8; 32], u64)> {
-    use aes_gcm::aead::{Aead, KeyInit, Payload};
-    use aes_gcm::{Aes256Gcm, Nonce};
+fn build_state_metadata_transition(
+    alice_group: &MlsGroup,
+    alice_provider: &Provider,
+    alice_public_key: &[u8],
+    prior_context: &Value,
+    next_state_version: u64,
+    transition_id: [u8; 16],
+    metadata_version: u64,
+    nonce: &[u8; 12],
+    signed_at: &str,
+) -> Result<(Vec<u8>, Value)> {
+    let alice_pub: [u8; 32] = alice_public_key
+        .try_into()
+        .map_err(|_| fail("alice public key is not 32 bytes"))?;
+    let key_id = KeyId::from_public_key(&alice_pub).to_string();
+    let signing_key = SigningKey::from_bytes(&ALICE_SIGNING_SEED);
 
-    let cipher = Aes256Gcm::new_from_slice(exporter_key)
-        .map_err(|e| fail(format!("AES-256-GCM key init: {e}")))?;
-    let nonce = Nonce::from_slice(nonce_bytes);
-    let ciphertext_size = (plaintext_cbor.len() + 16) as u64;
+    let group_id_bytes = STANDARD.decode(prior_context["groupId"].as_str().unwrap())?;
+    let group_context_hash_bytes =
+        STANDARD.decode(prior_context["groupContextHash"].as_str().unwrap())?;
+    let confirmation_tag_bytes =
+        STANDARD.decode(prior_context["confirmationTag"].as_str().unwrap())?;
+    let epoch = prior_context["epoch"].as_u64().unwrap();
 
-    let ciphertext = cipher
-        .encrypt(
-            nonce,
-            Payload {
-                msg: plaintext_cbor,
-                aad: metadata_aad,
-            },
+    let mut next_context = prior_context.clone();
+    next_context["stateVersion"] = json!(next_state_version);
+
+    let mut prior_coord = prior_context.clone();
+    prior_coord["conversationId"] = json!(uuid_string(CONVERSATION_ID)?);
+    let mut next_coord = prior_coord.clone();
+    next_coord["stateVersion"] = json!(next_state_version);
+
+    let metadata_plaintext = GroupMetadataV1 {
+        version: 1,
+        title: format!("blue.catbird.chat metadata state {next_state_version}"),
+        description: String::new(),
+        avatar_blob_locator: None,
+        avatar_content_type: None,
+    };
+
+    let exporter_context_json = json!({
+        "protocol": "blue.catbird.chat.metadata",
+        "version": 1,
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "epoch": epoch,
+        "groupContextHash": STANDARD.encode(&group_context_hash_bytes),
+        "metadataVersion": metadata_version,
+    });
+    let exporter_context = canonical_metadata_exporter_context_bytes(&exporter_context_json)?;
+    let exporter_key = alice_group
+        .export_secret(
+            alice_provider.crypto(),
+            METADATA_EXPORTER_LABEL,
+            &exporter_context,
+            METADATA_EXPORTER_OUTPUT_LENGTH,
         )
-        .map_err(|e| fail(format!("AES-256-GCM encrypt: {e}")))?;
-    ensure(
-        ciphertext.len() as u64 == ciphertext_size,
-        "ciphertext size mismatch",
-    )?;
+        .map_err(|error| fail(format!("metadata exporter secret: {error}")))?;
+    let mut exporter_key_arr = [0u8; 32];
+    exporter_key_arr.copy_from_slice(&exporter_key);
+
+    let ciphertext = catbird_mls::metadata::encrypt_metadata_snapshot_with_nonce(
+        &exporter_key_arr,
+        &group_id_bytes,
+        epoch,
+        metadata_version,
+        nonce,
+        &metadata_plaintext,
+    )
+    .map_err(|e| fail(format!("metadata snapshot encrypt: {e}")))?;
     let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
-    Ok((ciphertext, ciphertext_sha256, ciphertext_size))
+    let ciphertext_size = ciphertext.len() as u64;
+
+    let coordinate_json = json!({
+        "conversationId": STANDARD.encode(CONVERSATION_ID),
+        "generation": 0,
+        "groupId": STANDARD.encode(&group_id_bytes),
+        "epoch": epoch,
+        "groupContextHash": STANDARD.encode(&group_context_hash_bytes),
+        "confirmationTag": STANDARD.encode(&confirmation_tag_bytes),
+    });
+
+    let metadata_body_json = json!({
+        "$type": "blue.catbird.chat.defs#metadataTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-METADATA\0",
+        "transitionId": uuid_string(transition_id)?,
+        "actorDid": ALICE_ACTOR_DID,
+        "actorDeviceId": uuid_string(ALICE_DEVICE_ID)?,
+        "keyId": key_id,
+        "authGeneration": 1,
+        "prior": prior_coord,
+        "next": next_coord,
+        "metadataSnapshot": {
+            "coordinate": coordinate_json,
+            "originTransitionId": uuid_string(transition_id)?,
+            "metadataVersion": metadata_version,
+            "nonce": STANDARD.encode(nonce),
+            "ciphertext": STANDARD.encode(&ciphertext),
+            "ciphertextSha256": STANDARD.encode(ciphertext_sha256),
+            "ciphertextSize": ciphertext_size,
+            "authorProof": {
+                "authorDid": ALICE_ACTOR_DID,
+                "authorDeviceId": uuid_string(ALICE_DEVICE_ID)?,
+                "authorKeyId": key_id,
+                "signaturePublicKey": STANDARD.encode(alice_pub),
+                "authGenerationAtOrigin": 1,
+                "originTransitionId": uuid_string(transition_id)?,
+                "originSeq": next_state_version,
+                "roleAtOrigin": "admin",
+                "deviceStatusAtOrigin": "active",
+            },
+        },
+        "idempotencyKey": uuid_string(transition_id)?,
+        "signedAt": signed_at,
+    });
+
+    let unsigned_projection_cbor =
+        canonical_cbor_for_schema("metadataTransitionBody", &metadata_body_json, true)?;
+    let mut signing_transcript =
+        Vec::with_capacity(b"CATBIRD-CHAT-METADATA\0".len() + unsigned_projection_cbor.len());
+    signing_transcript.extend_from_slice(b"CATBIRD-CHAT-METADATA\0");
+    signing_transcript.extend_from_slice(&unsigned_projection_cbor);
+    let signature = signing_key.sign(&signing_transcript).to_bytes();
+
+    let signed_json = json!({
+        "body": metadata_body_json,
+        "signature": STANDARD.encode(signature),
+    });
+    let signed_cbor = canonical_cbor_for_schema("signedMetadataTransition", &signed_json, false)?;
+
+    let signed_json_bytes = serde_json::to_vec(&signed_json)?;
+    let wrapper = SignedWrapper::decode(&signed_json_bytes).map_err(|e| {
+        fail(format!(
+            "SignedWrapper::decode metadata transition failed: {e}"
+        ))
+    })?;
+    let projected = project_signed_body(SignedMutationKind::MetadataTransition, &wrapper.body)
+        .map_err(|e| {
+            fail(format!(
+                "project_signed_body metadata transition failed: {e}"
+            ))
+        })?;
+    let verified =
+        VerifiedMutation::verify(projected, wrapper.signature, &alice_pub).map_err(|e| {
+            fail(format!(
+                "VerifiedMutation::verify metadata transition failed: {e}"
+            ))
+        })?;
+    ensure(
+        verified.kind() == SignedMutationKind::MetadataTransition,
+        "verified mutation kind mismatch for metadata transition",
+    )?;
+
+    Ok((signed_cbor, next_context))
+}
+
+fn build_state_policy_transition(
+    alice_public_key: &[u8],
+    prior_context: &Value,
+    next_state_version: u64,
+    transition_id: [u8; 16],
+    signed_at: &str,
+) -> Result<(Vec<u8>, Value)> {
+    let alice_pub: [u8; 32] = alice_public_key
+        .try_into()
+        .map_err(|_| fail("alice public key is not 32 bytes"))?;
+    let key_id = KeyId::from_public_key(&alice_pub).to_string();
+    let signing_key = SigningKey::from_bytes(&ALICE_SIGNING_SEED);
+
+    let mut next_context = prior_context.clone();
+    next_context["stateVersion"] = json!(next_state_version);
+
+    let mut prior_coord = prior_context.clone();
+    prior_coord["conversationId"] = json!(uuid_string(CONVERSATION_ID)?);
+    let mut next_coord = prior_coord.clone();
+    next_coord["stateVersion"] = json!(next_state_version);
+
+    let policy_body_json = json!({
+        "$type": "blue.catbird.chat.defs#policyTransitionBody",
+        "signatureDomain": "CATBIRD-CHAT-POLICY\0",
+        "transitionId": uuid_string(transition_id)?,
+        "actorDid": ALICE_ACTOR_DID,
+        "actorDeviceId": uuid_string(ALICE_DEVICE_ID)?,
+        "keyId": key_id,
+        "authGeneration": 1,
+        "prior": prior_coord,
+        "next": next_coord,
+        "participantChanges": [
+            {
+                "$type": "blue.catbird.chat.defs#changeParticipantRole",
+                "userDid": ALICE_ACTOR_DID,
+                "role": "admin",
+            }
+        ],
+        "idempotencyKey": uuid_string(transition_id)?,
+        "signedAt": signed_at,
+    });
+
+    let unsigned_projection_cbor =
+        canonical_cbor_for_schema("policyTransitionBody", &policy_body_json, true)?;
+    let mut signing_transcript =
+        Vec::with_capacity(b"CATBIRD-CHAT-POLICY\0".len() + unsigned_projection_cbor.len());
+    signing_transcript.extend_from_slice(b"CATBIRD-CHAT-POLICY\0");
+    signing_transcript.extend_from_slice(&unsigned_projection_cbor);
+    let signature = signing_key.sign(&signing_transcript).to_bytes();
+
+    let signed_json = json!({
+        "body": policy_body_json,
+        "signature": STANDARD.encode(signature),
+    });
+    let signed_cbor = canonical_cbor_for_schema("signedPolicyTransition", &signed_json, false)?;
+
+    let signed_json_bytes = serde_json::to_vec(&signed_json)?;
+    let wrapper = SignedWrapper::decode(&signed_json_bytes).map_err(|e| {
+        fail(format!(
+            "SignedWrapper::decode policy transition failed: {e}"
+        ))
+    })?;
+    let projected = project_signed_body(SignedMutationKind::PolicyTransition, &wrapper.body)
+        .map_err(|e| fail(format!("project_signed_body policy transition failed: {e}")))?;
+    let verified =
+        VerifiedMutation::verify(projected, wrapper.signature, &alice_pub).map_err(|e| {
+            fail(format!(
+                "VerifiedMutation::verify policy transition failed: {e}"
+            ))
+        })?;
+    ensure(
+        verified.kind() == SignedMutationKind::PolicyTransition,
+        "verified mutation kind mismatch for policy transition",
+    )?;
+
+    Ok((signed_cbor, next_context))
 }
 
 struct CreationArtifact {
@@ -610,12 +836,26 @@ fn build_alice_creation_artifact(
     });
     let metadata_aad = canonical_metadata_aad_bytes(&metadata_aad_json)?;
 
-    let (ciphertext, ciphertext_sha256, ciphertext_size) = local_seal_metadata_with_nonce(
-        &plaintext_cbor,
-        &exporter_key,
+    let metadata_plaintext = GroupMetadataV1 {
+        version: 1,
+        title: String::new(),
+        description: String::new(),
+        avatar_blob_locator: None,
+        avatar_content_type: None,
+    };
+    let mut exporter_key_arr = [0u8; 32];
+    exporter_key_arr.copy_from_slice(&exporter_key);
+    let ciphertext = catbird_mls::metadata::encrypt_metadata_snapshot_with_nonce(
+        &exporter_key_arr,
+        &group_id_bytes,
+        0,
+        CREATION_METADATA_VERSION,
         &CREATION_METADATA_NONCE,
-        &metadata_aad,
-    )?;
+        &metadata_plaintext,
+    )
+    .map_err(|e| fail(format!("metadata snapshot encrypt: {e}")))?;
+    let ciphertext_sha256: [u8; 32] = Sha256::digest(&ciphertext).into();
+    let ciphertext_size = ciphertext.len() as u64;
 
     let creation_body_json = json!({
         "$type": CREATION_BODY_TYPE,
@@ -917,6 +1157,28 @@ fn main() -> Result<()> {
         &creation_received_at,
     )?;
 
+    // State-only metadata transition: stateVersion 0 -> 1 (epoch 0)
+    let (transition_metadata_sv1_cbor, sv1_context) = build_state_metadata_transition(
+        &alice_group,
+        &alice_provider,
+        &alice_public_key,
+        &genesis_context,
+        1,
+        TRANSITION_METADATA_SV1_ID,
+        2,
+        &METADATA_SV1_NONCE,
+        &creation_signed_at,
+    )?;
+
+    // State-only policy transition: stateVersion 1 -> 2 (epoch 0)
+    let (transition_policy_sv2_cbor, sv2_context) = build_state_policy_transition(
+        &alice_public_key,
+        &sv1_context,
+        2,
+        TRANSITION_POLICY_SV2_ID,
+        &creation_signed_at,
+    )?;
+
     let bob_key_package_bundle = KeyPackage::builder()
         .key_package_lifetime(lifetime)
         .leaf_node_capabilities(exact_capabilities())
@@ -983,7 +1245,7 @@ fn main() -> Result<()> {
     )?;
 
     // Add commit: moves stateVersion 2 -> 3, epoch 0 -> 1
-    let add_prior_context = context_from_public_group(&public_group, 0, 2)?;
+    let add_prior_context = sv2_context;
     let add_aad_json = json!({
         "protocolVersion": "1",
         "conversationId": STANDARD.encode(CONVERSATION_ID),
@@ -1549,6 +1811,28 @@ fn main() -> Result<()> {
     )?;
     assert_member_group_matches_public(&alice_group, &public_group, "Alice@epoch3")?;
 
+    // State-only metadata transition: stateVersion 5 -> 6 (epoch 3)
+    let (transition_metadata_sv6_cbor, sv6_context) = build_state_metadata_transition(
+        &alice_group,
+        &alice_provider,
+        &alice_public_key,
+        &remove_committed_context,
+        6,
+        TRANSITION_METADATA_SV6_ID,
+        3,
+        &METADATA_SV6_NONCE,
+        &creation_signed_at,
+    )?;
+
+    // State-only policy transition: stateVersion 6 -> 7 (epoch 3)
+    let (transition_policy_sv7_cbor, sv7_context) = build_state_policy_transition(
+        &alice_public_key,
+        &sv6_context,
+        7,
+        TRANSITION_POLICY_SV7_ID,
+        &creation_signed_at,
+    )?;
+
     // Post-removal rejoin: epoch 3 -> 4 (Alice adds Bob again)
     let rejoin_bob_provider = Provider::new()?;
     bob_signer.store(rejoin_bob_provider.storage())?;
@@ -1612,7 +1896,7 @@ fn main() -> Result<()> {
         "rejoin KeyPackageRef was not computed over exact inner TLS bytes",
     )?;
 
-    let rejoin_prior_context = context_from_public_group(&public_group, 0, 7)?;
+    let rejoin_prior_context = sv7_context;
     let rejoin_aad_json = json!({
         "protocolVersion": "1",
         "conversationId": STANDARD.encode(CONVERSATION_ID),
@@ -1755,6 +2039,10 @@ fn main() -> Result<()> {
         CREATION_SIGNED_REQUEST_FILE,
         creation_artifact.signed_request_cbor.clone(),
     );
+    wire_artifacts.insert(TRANSITION_METADATA_SV1_FILE, transition_metadata_sv1_cbor);
+    wire_artifacts.insert(TRANSITION_POLICY_SV2_FILE, transition_policy_sv2_cbor);
+    wire_artifacts.insert(TRANSITION_METADATA_SV6_FILE, transition_metadata_sv6_cbor);
+    wire_artifacts.insert(TRANSITION_POLICY_SV7_FILE, transition_policy_sv7_cbor);
 
     for (name, bytes) in &wire_artifacts {
         write_atomic(&output_dir.join(name), bytes)?;
@@ -1794,6 +2082,15 @@ fn main() -> Result<()> {
             ],
         ),
         ("creation", vec![CREATION_SIGNED_REQUEST_FILE]),
+        (
+            "stateOnlyTransitions",
+            vec![
+                TRANSITION_METADATA_SV1_FILE,
+                TRANSITION_POLICY_SV2_FILE,
+                TRANSITION_METADATA_SV6_FILE,
+                TRANSITION_POLICY_SV7_FILE,
+            ],
+        ),
     ];
     for (category, files) in &mandated_categories {
         for file in files {
@@ -1936,12 +2233,20 @@ fn main() -> Result<()> {
             "conversationIdHex": hex::encode(CONVERSATION_ID),
             "creationTransitionId": uuid_string(ALICE_CREATION_TRANSITION_ID)?,
             "creationTransitionIdHex": hex::encode(ALICE_CREATION_TRANSITION_ID),
+            "transitionMetadataSv1Id": uuid_string(TRANSITION_METADATA_SV1_ID)?,
+            "transitionMetadataSv1IdHex": hex::encode(TRANSITION_METADATA_SV1_ID),
+            "transitionPolicySv2Id": uuid_string(TRANSITION_POLICY_SV2_ID)?,
+            "transitionPolicySv2IdHex": hex::encode(TRANSITION_POLICY_SV2_ID),
             "transitionId": uuid_string(TRANSITION_ID)?,
             "transitionIdHex": hex::encode(TRANSITION_ID),
             "genericTransitionId": uuid_string(GENERIC_TRANSITION_ID)?,
             "genericTransitionIdHex": hex::encode(GENERIC_TRANSITION_ID),
             "leaveFulfillmentTransitionId": uuid_string(LEAVE_FULFILLMENT_TRANSITION_ID)?,
             "leaveFulfillmentTransitionIdHex": hex::encode(LEAVE_FULFILLMENT_TRANSITION_ID),
+            "transitionMetadataSv6Id": uuid_string(TRANSITION_METADATA_SV6_ID)?,
+            "transitionMetadataSv6IdHex": hex::encode(TRANSITION_METADATA_SV6_ID),
+            "transitionPolicySv7Id": uuid_string(TRANSITION_POLICY_SV7_ID)?,
+            "transitionPolicySv7IdHex": hex::encode(TRANSITION_POLICY_SV7_ID),
             "rejoinTransitionId": uuid_string(REJOIN_TRANSITION_ID)?,
             "rejoinTransitionIdHex": hex::encode(REJOIN_TRANSITION_ID),
             "messageId": uuid_string(MESSAGE_ID)?,
@@ -2005,7 +2310,13 @@ fn main() -> Result<()> {
             "ownPendingCommit": ["own-pending-commit.mls"],
             "recoveryForkMaterial": ["rejoin-key-package.mls", "rejoin-key-package-inner.tls", "rejoin-key-package-ref.bin", "commit-rejoin-public.mls", "rejoin-welcome.mls", "committed-rejoin-public-state.bin"],
             "publicGroupSnapshots": ["genesis-public-state.bin", "committed-public-state.bin", "committed-generic-public-state.bin", "committed-remove-public-state.bin", "committed-rejoin-public-state.bin"],
-            "creation": ["creation-signed-request.cbor"]
+            "creation": ["creation-signed-request.cbor"],
+            "stateOnlyTransitions": [
+                "transition-metadata-sv1.cbor",
+                "transition-policy-sv2.cbor",
+                "transition-metadata-sv6.cbor",
+                "transition-policy-sv7.cbor"
+            ]
         },
         "creation": creation_manifest
     });

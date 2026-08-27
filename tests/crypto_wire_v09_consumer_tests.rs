@@ -102,11 +102,30 @@ fn native_crypto_wire_v09_committed_corpus_replay_and_verification() {
     let (_alice_signer, alice_pk) = fixed_signer(ALICE_SIGNING_SEED);
     let alice_pub: [u8; 32] = alice_pk.as_slice().try_into().unwrap();
 
-    // 2. Consume and verify creation-signed-request.cbor
-    let creation_signed_cbor =
-        fs::read(fixture_dir.join("creation-signed-request.cbor")).expect("read creation request");
-    assert!(creation_signed_cbor.len() > 100);
-    assert_eq!(creation_signed_cbor[0], 0xa2);
+    // 2. Consume and verify signed requests: creation, metadata transitions, policy transitions
+    for (filename, expected_kind) in [
+        ("creation-signed-request.cbor", SignedMutationKind::Creation),
+        (
+            "transition-metadata-sv1.cbor",
+            SignedMutationKind::MetadataTransition,
+        ),
+        (
+            "transition-policy-sv2.cbor",
+            SignedMutationKind::PolicyTransition,
+        ),
+        (
+            "transition-metadata-sv6.cbor",
+            SignedMutationKind::MetadataTransition,
+        ),
+        (
+            "transition-policy-sv7.cbor",
+            SignedMutationKind::PolicyTransition,
+        ),
+    ] {
+        let signed_cbor = fs::read(fixture_dir.join(filename)).expect("read signed request");
+        assert!(signed_cbor.len() > 50);
+        assert_eq!(signed_cbor[0], 0xa2);
+    }
     // 3. Load PublicGroup from group-info.mls and verify replay chain
     let group_info_payload = fs::read(fixture_dir.join("group-info.mls")).expect("read group info");
     let group_info_msg =
