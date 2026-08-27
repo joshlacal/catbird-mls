@@ -6190,24 +6190,15 @@ where
             let provider = OpenMlsRustCrypto::default();
             let mut deliveries = Vec::with_capacity(packages.len());
             for (package, member_did) in packages.iter().zip(member_dids) {
-                let key_package_in = if let Ok(message) = MlsMessageIn::tls_deserialize_exact_bytes(&package.data) {
-                    match message.extract() {
-                        MlsMessageBodyIn::KeyPackage(key_package) => key_package,
-                        _ => return Err(OrchestratorError::InvalidInput(
-                            "welcome provenance requires a KeyPackage message".into(),
-                        )),
-                    }
-                } else {
-                    let (kp_in, remaining) = openmls::prelude::KeyPackageIn::tls_deserialize_bytes(&package.data)
-                        .map_err(|_| OrchestratorError::InvalidInput(
-                            "welcome provenance key package is not a valid MLS message".into(),
-                        ))?;
-                    if !remaining.is_empty() {
-                        return Err(OrchestratorError::InvalidInput(
-                            "welcome provenance key package has trailing bytes".into(),
-                        ));
-                    }
-                    kp_in
+                let message = MlsMessageIn::tls_deserialize_exact_bytes(&package.data)
+                    .map_err(|_| OrchestratorError::InvalidInput(
+                        "welcome provenance key package is not a valid MLS message".into(),
+                    ))?;
+                let key_package_in = match message.extract() {
+                    MlsMessageBodyIn::KeyPackage(key_package) => key_package,
+                    _ => return Err(OrchestratorError::InvalidInput(
+                        "welcome provenance requires a KeyPackage message".into(),
+                    )),
                 };
                 let key_package = key_package_in
                     .validate(provider.crypto(), ProtocolVersion::default())

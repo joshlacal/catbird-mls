@@ -6223,9 +6223,10 @@ impl MLSContext {
             )
             .map_err(|e| MLSError::OpenMLS(format!("Failed to build KeyPackage: {:?}", e)))?;
 
-        // Serialize key package
+        // Serialize key package wrapped in MlsMessage framing (canonical wire format)
         let key_package = key_package_bundle.key_package().clone();
-        let key_package_data = key_package
+        let key_package_msg = openmls::prelude::MlsMessageOut::from(key_package.clone());
+        let key_package_data = key_package_msg
             .tls_serialize_detached()
             .map_err(|_| MLSError::SerializationError)?;
         // Get hash reference (keep both typed and bytes versions)

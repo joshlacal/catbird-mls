@@ -4,7 +4,8 @@ mod epoch_secret_test_support;
 use async_trait::async_trait;
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use openmls::prelude::{
-    KeyPackageIn, MlsMessageOut, ProtocolVersion, VerifiableCiphersuite,
+    KeyPackageIn, MlsMessageBodyIn, MlsMessageIn, MlsMessageOut, ProtocolVersion,
+    VerifiableCiphersuite,
 };
 use openmls_libcrux_crypto::Provider as LibcruxProvider;
 use openmls_traits::OpenMlsProvider;
@@ -61,10 +62,16 @@ fn generated_key_package_satisfies_clean_contract_and_matches_fixture() {
     assert_eq!(result.signature_public_key.len(), 32);
 
     // Validate with libcrux provider
-    let (kp_in, remaining) = KeyPackageIn::tls_deserialize_bytes(&result.key_package_data)
-        .expect("deserialize raw key package bytes");
+    let (msg_in, remaining) = MlsMessageIn::tls_deserialize_bytes(&result.key_package_data)
+        .expect("deserialize wrapped key package message");
     assert!(remaining.is_empty(), "no trailing bytes");
-
+    let kp_in = match msg_in.extract() {
+        MlsMessageBodyIn::KeyPackage(kp) => kp,
+        other => panic!(
+            "expected KeyPackage message body, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    };
     let provider = LibcruxProvider::new().expect("libcrux provider");
     let validated = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
@@ -110,7 +117,7 @@ fn generated_key_package_satisfies_clean_contract_and_matches_fixture() {
         .tls_serialize_detached()
         .expect("serialize wrapped wire message");
     assert_eq!(&wrapped[..4], &[0x00, 0x01, 0x00, 0x05], "wire format 5 header");
-    assert_eq!(&wrapped[4..], &result.key_package_data);
+    assert_eq!(&wrapped, &result.key_package_data);
     // Verify OpenMLS hash_ref matches hash_ref
     let expected_hash_ref = validated
         .hash_ref(provider.crypto())
