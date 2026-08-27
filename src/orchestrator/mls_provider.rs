@@ -318,7 +318,6 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
             .map(MlsDecryptOutcome::Message)
     }
 
-
     /// Make all MLS storage mutations performed by the current operation
     /// durable before the orchestrator publishes a matching epoch projection
     /// or advances a delivery-service cursor.
