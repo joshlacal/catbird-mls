@@ -664,26 +664,15 @@ impl MLSContext {
             MLSContextInner::new(storage_path, encryption_key, keychain)?;
         let storage_registry = Arc::new(StorageConnectionRegistry::new(interrupt_handles));
 
-        // Reconcile any drift between the manifest cache and OpenMLS's
-        // authoritative key_package storage. Drops stale entries left
-        // behind by Welcomes that consumed a KP from OpenMLS storage but
-        // didn't update the manifest. Without this, the cold-start KP
-        // sync re-advertises the dead hashes to the server, which keeps
-        // handing them out for new Welcomes that then fail
-        // `NoMatchingKeyPackage`. Best-effort: a reconcile failure is
-        // logged but doesn't block context creation.
-        match context.reconcile_key_package_bundles() {
-            Ok(0) => {
+        match context.reconcile_key_package_bundles()? {
+            0 => {
                 crate::debug_log!("[MLS-FFI] KP reconcile on init: no drift");
             }
-            Ok(removed) => {
+            removed => {
                 crate::info_log!(
                     "[MLS-FFI] KP reconcile on init: removed {} stale manifest entries",
                     removed
                 );
-            }
-            Err(e) => {
-                crate::warn_log!("[MLS-FFI] KP reconcile on init failed (non-fatal): {:?}", e);
             }
         }
 
@@ -1463,11 +1452,6 @@ impl MLSContext {
             // the metadata blob at the post-add epoch under the SAME locator
             // that gets embedded in the commit below.
             let planned_reference_json_for_reseal = planned_reference_json.clone();
-            let join_config = openmls::group::MlsGroupJoinConfig::builder()
-                .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
-                .use_ratchet_tree_extension(true)
-                .build();
-            let _ = group.set_configuration(provider.storage(), &join_config);
             if let Some(aad_bytes) = &aad {
                 group.set_aad(aad_bytes.clone());
             }
@@ -1834,7 +1818,7 @@ impl MLSContext {
                     }
                 }
             }
-            if indices.is_empty() {
+            if !remove_identities.is_empty() && indices.is_empty() {
                 return Err(MLSError::invalid_input("No members found to remove"));
             }
 
@@ -3743,26 +3727,35 @@ impl MLSContext {
                 // re-publish them.
                 if matches!(e, WelcomeError::NoMatchingKeyPackage) {
                     let cache = inner.key_package_bundles();
-                    let stale: Vec<Vec<u8>> = welcome_secret_hashes
+                    let crypto = inner.provider.crypto();
+                    let pairs: Vec<(String, Vec<u8>)> = welcome_secret_hashes
                         .iter()
-                        .filter(|h| cache.contains_key(*h))
-                        .cloned()
+                        .filter_map(|h| {
+                            let encoded_ref =
+                                crate::mls_context::encoded_key_package_ref(cache, crypto, h)?;
+                            Some((hex::encode(h), encoded_ref))
+                        })
                         .collect();
-                    if !stale.is_empty() {
+                    if !pairs.is_empty() {
                         crate::info_log!(
                             "[MLS-FFI] [KP-RECONCILE] NoMatchingKeyPackage: purging {} stale manifest entries the Welcome referenced",
-                            stale.len()
+                            pairs.len()
                         );
-                        let bundles = inner.key_package_bundles_mut();
-                        for h in &stale {
-                            bundles.remove(h);
-                        }
-                        let stale_hex: Vec<String> = stale.iter().map(hex::encode).collect();
-                        if let Err(write_err) = inner.manifest_storage.delete_bundles(&stale_hex) {
-                            crate::warn_log!(
-                                "[MLS-FFI] [KP-RECONCILE] failed to persist purge: {:?}",
-                                write_err
-                            );
+                        match inner.manifest_storage.delete_bundle_entries(&pairs) {
+                            Ok(_) => {
+                                let bundles = inner.key_package_bundles_mut();
+                                for (hex_ref, _) in &pairs {
+                                    if let Ok(hash_ref) = hex::decode(hex_ref) {
+                                        bundles.remove(&hash_ref);
+                                    }
+                                }
+                            }
+                            Err(write_err) => {
+                                crate::warn_log!(
+                                    "[MLS-FFI] [KP-RECONCILE] failed to persist purge: {:?}",
+                                    write_err
+                                );
+                            }
                         }
                     }
                 }
@@ -5673,12 +5666,47 @@ impl MLSContext {
             hash_refs.len()
         );
 
+        // 1. Collect (hex_ref, encoded_ref) pairs under immutable borrow
+        let bundle_pairs = {
+            let bundles = inner.key_package_bundles();
+            let mut pairs = Vec::new();
+            for hash_ref in &hash_refs {
+                if let Some(bundle) = bundles.get(hash_ref) {
+                    let typed_ref = bundle
+                        .key_package()
+                        .hash_ref(inner.provider.crypto())
+                        .map_err(|e| {
+                            MLSError::Internal(format!("compute key package hash ref: {e:?}"))
+                        })?;
+                    let encoded_ref = serde_json::to_vec(&typed_ref).map_err(|e| {
+                        MLSError::Internal(format!("serialize key package ref: {e:?}"))
+                    })?;
+                    pairs.push((hex::encode(hash_ref), encoded_ref));
+                }
+            }
+            pairs
+        };
+
+        // 2. Delete from both tables in single SQLite transaction
+        self.check_suspended()?;
+        let persistent_deleted = inner
+            .manifest_storage
+            .delete_bundle_entries(&bundle_pairs)?;
+
+        // 3. Force database flush after bundle deletion
+        self.check_suspended()?;
+        inner.flush_database().map_err(|e| {
+            crate::error_log!(
+                "[MLS-FFI] ⚠️ WARNING: Failed to flush database after bundle deletion: {:?}",
+                e
+            );
+            e
+        })?;
+        crate::debug_log!("[MLS-FFI] ✅ Database flushed after bundle deletion");
+
+        // 4. Delete from in-memory cache only after persistent deletion succeeds
         let mut deleted_count = 0u64;
-
-        // Get mutable access to in-memory bundles
         let bundles = inner.key_package_bundles_mut();
-
-        // Delete from in-memory cache
         for hash_ref in &hash_refs {
             if bundles.remove(hash_ref).is_some() {
                 deleted_count += 1;
@@ -5696,23 +5724,6 @@ impl MLSContext {
             deleted_count,
             bundles.len()
         );
-
-        // Delete from persistent storage (per-row; bail if app is suspending — 0xdead10cc prevention)
-        self.check_suspended()?;
-        let hex_refs: Vec<String> = hash_refs.iter().map(hex::encode).collect();
-        let persistent_deleted = inner.manifest_storage.delete_bundles(&hex_refs)?;
-
-        // 🔒 CRITICAL FIX: Force database flush after bundle deletion
-        // Ensures deleted bundles are not restored from WAL after app restart
-        self.check_suspended()?;
-        inner.flush_database().map_err(|e| {
-            crate::error_log!(
-                "[MLS-FFI] ⚠️ WARNING: Failed to flush database after bundle deletion: {:?}",
-                e
-            );
-            e
-        })?;
-        crate::debug_log!("[MLS-FFI] ✅ Database flushed after bundle deletion");
 
         crate::info_log!(
             "[MLS-FFI] 💾 Persistent storage: {} bundles removed, {} remain",
@@ -6135,6 +6146,67 @@ impl MLSContext {
 // Non-exported (in-process only) methods. Deliberately OUTSIDE the
 // `#[uniffi::export]` impl block so UniFFI never sees them.
 impl MLSContext {
+    #[cfg(any(feature = "test-utils", feature = "e2e-aad"))]
+    pub fn self_update_with_aad_for_test(
+        &self,
+        group_id: Vec<u8>,
+        aad: Vec<u8>,
+    ) -> Result<AddMembersResult, MLSError> {
+        self.set_group_aad_for_test(&group_id, aad)?;
+        let result = self.self_update(group_id.clone());
+        self.set_group_aad_for_test(&group_id, Vec::new())?;
+        result
+    }
+
+    #[cfg(any(feature = "test-utils", feature = "e2e-aad"))]
+    pub fn encrypt_message_with_aad_for_test(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+    ) -> Result<EncryptResult, MLSError> {
+        self.check_suspended()?;
+        let _storage_operation = self.begin_storage_operation("encrypt_message_with_aad_for_test");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        let ciphertext = inner.with_group(&gid, |group, provider, signer| {
+            group.set_aad(aad);
+            let result = group
+                .create_message(provider, signer, &plaintext)
+                .map_err(|_| MLSError::EncryptionFailed)
+                .and_then(|message| {
+                    message
+                        .tls_serialize_detached()
+                        .map_err(|_| MLSError::SerializationError)
+                });
+            group.set_aad(Vec::new());
+            result
+        })?;
+        let (ciphertext, padded_size) = pad_ciphertext(&ciphertext);
+        Ok(EncryptResult {
+            ciphertext,
+            padded_size,
+        })
+    }
+
+    #[cfg(any(feature = "test-utils", feature = "e2e-aad"))]
+    fn set_group_aad_for_test(&self, group_id: &[u8], aad: Vec<u8>) -> Result<(), MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(group_id);
+        inner.with_group(&gid, |group, _, _| {
+            group.set_aad(aad);
+            Ok(())
+        })
+    }
+
     /// Look up the persistent identity signer, creating + registering one if
     /// absent. Must be called with the inner lock held.
     fn resolve_or_create_signer(

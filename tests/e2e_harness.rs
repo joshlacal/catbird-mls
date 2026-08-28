@@ -31,15 +31,15 @@ use mock_storage::MockStorage;
 // ---------------------------------------------------------------------------
 // In-memory keychain for tests (no iOS Keychain available)
 // ---------------------------------------------------------------------------
-
-struct InMemoryKeychain {
-    store: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+#[derive(Clone, Default)]
+pub struct InMemoryKeychain {
+    pub store: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl InMemoryKeychain {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            store: std::sync::Mutex::new(HashMap::new()),
+            store: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -76,6 +76,7 @@ pub struct TestClient {
         MLSOrchestrator<MockStorage, MockDeliveryService, MockCredentials, MLSContext>,
     pub storage: MockStorage,
     pub credentials: MockCredentials,
+    pub keychain: InMemoryKeychain,
     /// Temp directory holding this client's MLS database; cleaned up on drop.
     pub _temp_dir: std::path::PathBuf,
 }
@@ -139,11 +140,11 @@ impl TestWorld {
         let db_path = temp_dir.join("mls.db");
 
         // Each client gets its own keychain, storage, and credentials
-        let keychain = Box::new(InMemoryKeychain::new());
+        let keychain = InMemoryKeychain::new();
         let mls_context = MLSContext::new(
             db_path.to_string_lossy().to_string(),
             format!("test-key-{}", name),
-            keychain,
+            Box::new(keychain.clone()),
         )
         .expect("failed to create MLSContext");
         epoch_secret_test_support::install(&mls_context);
@@ -171,6 +172,7 @@ impl TestWorld {
             orchestrator,
             storage,
             credentials,
+            keychain,
             _temp_dir: temp_dir,
         };
 
@@ -214,7 +216,12 @@ impl TestWorld {
         client
             .orchestrator
             .api_client()
-            .publish_key_packages(&pkgs, "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519", "", Some(&device_id))
+            .publish_key_packages(
+                &pkgs,
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "",
+                Some(&device_id),
+            )
             .await?;
 
         self.authorized_device_keys

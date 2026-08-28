@@ -19,14 +19,15 @@ use mock_api_client::MockDeliveryService;
 use mock_credentials::MockCredentials;
 use mock_storage::MockStorage;
 
+#[derive(Clone, Default)]
 struct InMemoryKeychain {
-    store: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+    store: Arc<std::sync::Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl InMemoryKeychain {
     fn new() -> Self {
         Self {
-            store: std::sync::Mutex::new(HashMap::new()),
+            store: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 }
@@ -267,11 +268,12 @@ fn reattach_after_suspend_on_fresh_engine_restores_initialized_phase_without_sta
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("mls.db");
     let storage = Arc::new(MockStorage::new());
+    let keychain = InMemoryKeychain::new();
 
     let first_context = MLSContext::new(
         db_path.to_string_lossy().to_string(),
         "test-key".to_string(),
-        Box::new(InMemoryKeychain::new()),
+        Box::new(keychain.clone()),
     )
     .expect("first MLSContext");
     let first_engine = MlsEngine::new(
@@ -296,7 +298,7 @@ fn reattach_after_suspend_on_fresh_engine_restores_initialized_phase_without_sta
     let second_context = MLSContext::new(
         db_path.to_string_lossy().to_string(),
         "test-key".to_string(),
-        Box::new(InMemoryKeychain::new()),
+        Box::new(keychain.clone()),
     )
     .expect("second MLSContext");
     let second_engine = MlsEngine::new(

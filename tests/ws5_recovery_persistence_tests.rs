@@ -21,9 +21,9 @@ use std::sync::Arc;
 
 use catbird_mls::orchestrator::recovery::RecoveryTracker;
 use catbird_mls::orchestrator::{
-    constants, ConversationState, CredentialStore, IncomingEnvelope,
-    MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, OrchestratorError,
-    PendingLocalDelete, PersistedRecoveryBackoff, PersistedRecoveryState, ResetRecordOutcome,
+    constants, ConversationState, CredentialStore, IncomingEnvelope, MLSOrchestrator,
+    MLSStorageBackend, OrchestratorConfig, OrchestratorError, PendingLocalDelete,
+    PersistedRecoveryBackoff, PersistedRecoveryState, ResetRecordOutcome,
 };
 use e2e_harness::TestWorld;
 
@@ -865,7 +865,6 @@ async fn failed_pending_delete_intent_write_refuses_destructive_cleanup() {
 // WS-5 review fixes (2026-06-10)
 // ───────────────────────────────────────────────────────────────────────────
 
-
 /// Event observer that records WS-5.2 recovery-storage escalations.
 #[derive(Default)]
 struct RecordingObserver {
@@ -1096,7 +1095,7 @@ impl catbird_mls::orchestrator::MlsCryptoContext for FailingCrypto {
         Ok(1)
     }
     fn get_confirmation_tag(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, catbird_mls::MLSError> {
-        Err(catbird_mls::MLSError::Internal("unused in test".into()))
+        Ok(vec![0x24_u8; 32])
     }
     fn export_group_info(
         &self,
@@ -1165,6 +1164,41 @@ impl catbird_mls::orchestrator::MlsCryptoContext for FailingCrypto {
     ) -> Result<Vec<u8>, catbird_mls::MLSError> {
         Err(catbird_mls::MLSError::Internal("unused in test".into()))
     }
+    fn get_group_context_hash(&self, _group_id: Vec<u8>) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        Ok(vec![0x23_u8; 32])
+    }
+    fn identity_public_key(&self, _identity: Vec<u8>) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x42_u8; 32]);
+        Ok(signer.verifying_key().to_bytes().to_vec())
+    }
+
+    fn sign_with_identity_key(
+        &self,
+        _identity: Vec<u8>,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, catbird_mls::MLSError> {
+        use ed25519_dalek::Signer;
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x42_u8; 32]);
+        Ok(signer.sign(&payload).to_bytes().to_vec())
+    }
+}
+async fn configure_test_signing_authority(
+    credentials: &e2e_harness::mock_credentials::MockCredentials,
+    did: &str,
+) {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42_u8; 32]);
+    let signer = openmls_basic_credential::SignatureKeyPair::from_raw(
+        openmls::prelude::SignatureScheme::ED25519,
+        signing_key.to_bytes().to_vec(),
+        signing_key.verifying_key().to_bytes().to_vec(),
+    );
+    credentials
+        .store_signing_key(
+            did,
+            &serde_json::to_vec(&signer).expect("serialize deterministic test signer"),
+        )
+        .await
+        .expect("store deterministic test signer");
 }
 
 /// FIX-3: entering quarantine drops the in-memory failed_rejoins entry; the
@@ -1174,7 +1208,8 @@ impl catbird_mls::orchestrator::MlsCryptoContext for FailingCrypto {
 #[tokio::test(flavor = "multi_thread")]
 async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
     let did = "did:plc:alice";
-    let convo_id = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+    let convo_id = "00000000-0000-4000-8000-0000000000d1".to_string();
+    let group_id = "d1".repeat(32);
     let storage = e2e_harness::mock_storage::MockStorage::new();
     let credentials = e2e_harness::mock_credentials::MockCredentials::new();
     let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
@@ -1187,11 +1222,17 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
-    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
-    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
-    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
+    credentials
+        .store_device_uuid(did, "00000000-0000-4000-8000-000000000001")
+        .await
+        .unwrap();
+    credentials
+        .store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001"))
+        .await
+        .unwrap();
+    configure_test_signing_authority(&credentials, did).await;
     storage
-        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .ensure_conversation_exists(did, &convo_id, &group_id)
         .await
         .expect("seed explicit conversation-to-group mapping");
     // Maxed-out persisted row, as accumulated rejoin failures would write it.
@@ -1204,23 +1245,26 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
 
     // Drive Layer-3 quarantine entry: three distinct peer-bad frames trip
     // RepeatedFramingFailures.
+    let mut frame_errors = Vec::new();
     for i in 0..3 {
         let envelope = IncomingEnvelope {
             conversation_id: convo_id.clone(),
             sender_did: "did:plc:mallory".to_string(),
             ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
             timestamp: chrono::Utc::now(),
-            server_message_id: Some(format!("bad-frame-{i}")),
+            server_message_id: Some(format!("00000000-0000-4000-8000-{:012x}", i + 1)),
             server_epoch: None,
         };
-        let _ = orchestrator.process_incoming(&envelope).await;
+        if let Err(error) = orchestrator.process_incoming(&envelope).await {
+            frame_errors.push(error.to_string());
+        }
     }
     assert!(
         orchestrator
             .get_conversation_quarantine_state(&convo_id)
             .await
             .is_some(),
-        "three peer-bad frames must enter Layer-3 quarantine (test precondition)"
+        "three peer-bad frames must enter Layer-3 quarantine (test precondition): {frame_errors:?}"
     );
 
     assert!(
@@ -1336,7 +1380,8 @@ async fn quarantine_entry_projection_serializes_with_reset_authority() {
 #[tokio::test(flavor = "multi_thread")]
 async fn quarantine_exit_projection_serializes_with_reset_authority() {
     let did = "did:plc:alice";
-    let convo_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    let convo_id = "00000000-0000-4000-8000-0000000000d2".to_string();
+    let group_id = "d2".repeat(32);
     let storage = e2e_harness::mock_storage::MockStorage::new();
     let credentials = e2e_harness::mock_credentials::MockCredentials::new();
     let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
@@ -1348,25 +1393,45 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
-    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
-    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
-    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
+    credentials
+        .store_device_uuid(did, "00000000-0000-4000-8000-000000000001")
+        .await
+        .unwrap();
+    credentials
+        .store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001"))
+        .await
+        .unwrap();
+    configure_test_signing_authority(&credentials, did).await;
     storage
-        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .ensure_conversation_exists(did, &convo_id, &group_id)
         .await
         .expect("seed conversation");
+    let mut frame_errors = Vec::new();
     for i in 0..3 {
-        let _ = orchestrator
-            .process_incoming(&IncomingEnvelope {
-                conversation_id: convo_id.clone(),
-                sender_did: "did:plc:mallory".to_string(),
-                ciphertext: format!("exit-race-{i}").into_bytes(),
-                timestamp: chrono::Utc::now(),
-                server_message_id: Some(format!("exit-race-{i}")),
-                server_epoch: None,
-            })
-            .await;
+        let envelope = IncomingEnvelope {
+            conversation_id: convo_id.clone(),
+            sender_did: "did:plc:mallory".to_string(),
+            ciphertext: format!("exit-race-{i}").into_bytes(),
+            timestamp: chrono::Utc::now(),
+            server_message_id: Some(format!("00000000-0000-4000-8001-{:012x}", i + 1)),
+            server_epoch: None,
+        };
+        if let Err(error) = orchestrator.process_incoming(&envelope).await {
+            frame_errors.push(error.to_string());
+        }
     }
+    assert!(
+        orchestrator
+            .get_conversation_quarantine_state(&convo_id)
+            .await
+            .is_some(),
+        "three peer-bad frames must enter Layer-3 quarantine (test precondition): {frame_errors:?}"
+    );
+    assert!(
+        storage.get_persisted_reset_pending(&convo_id).is_none(),
+        "quarantine entry unexpectedly installed reset authority: {:?}",
+        storage.get_current_state(&convo_id)
+    );
     let state_barrier =
         storage.pause_next_conversation_state_write(&convo_id, ConversationState::Active);
     let exit = orchestrator.user_confirmed_manual_reset(&convo_id);
@@ -1380,6 +1445,7 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
                 .is_err(),
             "reset must wait while quarantine exit owns the transition gate"
         );
+        state_barrier.release();
         recording.await
     };
     let (exit_result, reset_result) =
@@ -1463,7 +1529,8 @@ async fn decrypt_failure_projection_preserves_reset_authority() {
 #[tokio::test(flavor = "multi_thread")]
 async fn failing_quarantine_persists_escalate() {
     let did = "did:plc:alice";
-    let convo_id = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+    let convo_id = "00000000-0000-4000-8000-0000000000d3".to_string();
+    let group_id = "d3".repeat(32);
     let storage = e2e_harness::mock_storage::MockStorage::new();
     let credentials = e2e_harness::mock_credentials::MockCredentials::new();
     let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
@@ -1476,11 +1543,17 @@ async fn failing_quarantine_persists_escalate() {
         OrchestratorConfig::default(),
     );
     orchestrator.initialize(did).await.expect("initialize");
-    credentials.store_device_uuid(did, "00000000-0000-4000-8000-000000000001").await.unwrap();
-    credentials.store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001")).await.unwrap();
-    credentials.store_signing_key(did, &vec![0u8; 32]).await.unwrap();
+    credentials
+        .store_device_uuid(did, "00000000-0000-4000-8000-000000000001")
+        .await
+        .unwrap();
+    credentials
+        .store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001"))
+        .await
+        .unwrap();
+    configure_test_signing_authority(&credentials, did).await;
     storage
-        .ensure_conversation_exists(did, &convo_id, &convo_id)
+        .ensure_conversation_exists(did, &convo_id, &group_id)
         .await
         .expect("seed explicit conversation-to-group mapping");
     let observer = Arc::new(RecordingObserver::default());
@@ -1493,7 +1566,7 @@ async fn failing_quarantine_persists_escalate() {
         sender_did: "did:plc:mallory".to_string(),
         ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
         timestamp: chrono::Utc::now(),
-        server_message_id: Some(format!("bad-frame-{i}")),
+        server_message_id: Some(format!("00000000-0000-4000-8002-{:012x}", i + 1)),
         server_epoch: None,
     };
 

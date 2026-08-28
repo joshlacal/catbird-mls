@@ -13,14 +13,15 @@ use openmls_traits::OpenMlsProvider;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 struct TestKeychain {
-    store: Mutex<HashMap<String, Vec<u8>>>,
+    store: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl TestKeychain {
     fn new() -> Self {
         Self {
-            store: Mutex::new(HashMap::new()),
+            store: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -57,13 +58,17 @@ fn make_db_path() -> (String, std::path::PathBuf) {
     (dir.join("test.db").to_str().unwrap().to_string(), dir)
 }
 
-fn open_context(path: &str) -> Arc<MLSContext> {
+fn open_context_with_keychain(path: &str, keychain: TestKeychain) -> Arc<MLSContext> {
     MLSContext::new(
         path.to_string(),
         "test-key-1234567890123456".to_string(),
-        Box::new(TestKeychain::new()),
+        Box::new(keychain),
     )
     .unwrap()
+}
+
+fn open_context(path: &str) -> Arc<MLSContext> {
+    open_context_with_keychain(path, TestKeychain::new())
 }
 
 const IDENTITY: &[u8] = b"did:plc:batchtest#device-1";
@@ -100,7 +105,8 @@ fn batch_creates_count_distinct_persisted_bundles() {
 #[test]
 fn batch_bundles_survive_context_reopen() {
     let (path, _dir) = make_db_path();
-    let ctx = open_context(&path);
+    let keychain = TestKeychain::new();
+    let ctx = open_context_with_keychain(&path, keychain.clone());
 
     let results = ctx.create_key_packages(IDENTITY.to_vec(), 3).unwrap();
     assert_eq!(results.len(), 3);
@@ -110,7 +116,7 @@ fn batch_bundles_survive_context_reopen() {
     drop(ctx);
 
     // Reopen: bundles must load from per-row storage into the cache.
-    let reopened = open_context(&path);
+    let reopened = open_context_with_keychain(&path, keychain);
     let count = reopened.get_key_package_bundle_count().unwrap();
     assert_eq!(
         count, 3,
@@ -260,7 +266,9 @@ fn last_resort_create_marks_package_and_persists_bundle() {
     assert!(!result.hash_ref.is_empty());
     assert_eq!(ctx.get_key_package_bundle_count().unwrap(), 1);
 
-    let (kp_in, remaining) = if let Ok((msg, remaining)) = openmls::prelude::MlsMessageIn::tls_deserialize_bytes(&result.key_package_data) {
+    let (kp_in, remaining) = if let Ok((msg, remaining)) =
+        openmls::prelude::MlsMessageIn::tls_deserialize_bytes(&result.key_package_data)
+    {
         match msg.extract() {
             openmls::prelude::MlsMessageBodyIn::KeyPackage(kp) => (kp, remaining),
             _ => panic!("expected KeyPackage message"),
@@ -279,5 +287,8 @@ fn last_resort_create_marks_package_and_persists_bundle() {
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
         .expect("generated key package should validate");
-    assert!(!kp.leaf_node().signature_key().as_slice().is_empty(), "generated package must be valid");
+    assert!(
+        !kp.leaf_node().signature_key().as_slice().is_empty(),
+        "generated package must be valid"
+    );
 }

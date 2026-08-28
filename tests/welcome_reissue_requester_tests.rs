@@ -51,7 +51,11 @@ async fn failed_reissue_request_records_attempt_and_backs_off() {
         .expect("create_group failed");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&carol_did))
+        .swap_members(
+            &convo.conversation_id,
+            &[],
+            std::slice::from_ref(&carol_did),
+        )
         .await
         .expect("add Carol");
     let convo_id = convo.conversation_id.clone();

@@ -49,7 +49,11 @@ async fn responds_with_swap_and_idempotency_key() {
         .expect("create_group failed");
     admin
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&recipient_did))
+        .swap_members(
+            &convo.conversation_id,
+            &[],
+            std::slice::from_ref(&recipient_did),
+        )
         .await
         .expect("add recipient");
     let convo_id = convo.conversation_id.clone();
@@ -130,7 +134,11 @@ async fn rotated_reissue_keeps_cleanup_bound_to_stable_conversation() {
         .expect("create group");
     admin
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&recipient_did))
+        .swap_members(
+            &convo.conversation_id,
+            &[],
+            std::slice::from_ref(&recipient_did),
+        )
         .await
         .expect("add recipient");
     let group_id = convo.group_id.clone();

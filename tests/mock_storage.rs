@@ -103,6 +103,7 @@ struct Inner {
     fail_next_complete_reset_pending: bool,
     force_next_complete_reset_pending_false_reload: Option<Option<ConversationState>>,
     fail_next_get_conversation_state: bool,
+    fail_next_needs_rejoin: bool,
     fail_next_conversation_state_for: Option<String>,
     next_conversation_state_override: Option<(String, Option<ConversationState>)>,
     fail_conversation_state_after_reads: Option<(String, u32)>,
@@ -261,9 +262,14 @@ impl MockStorage {
     // ── Test helper methods ──────────────────────────────────────────────
 
     /// Returns the total number of stored conversations.
-    #[allow(dead_code)]
     pub fn conversation_count(&self) -> usize {
-        self.inner.lock().unwrap().conversations.len()
+        self.inner
+            .lock()
+            .unwrap()
+            .conversations
+            .values()
+            .filter(|c| c.is_active)
+            .count()
     }
 
     /// Returns all messages across every conversation, ordered by conversation id.
@@ -598,6 +604,9 @@ impl MockStorage {
     pub fn fail_next_get_conversation_state(&self) {
         self.inner.lock().unwrap().fail_next_get_conversation_state = true;
     }
+    pub fn fail_next_needs_rejoin(&self) {
+        self.inner.lock().unwrap().fail_next_needs_rejoin = true;
+    }
 
     #[allow(dead_code)]
     pub fn fail_next_get_conversation_state_for(&self, conversation_id: &str) {
@@ -838,29 +847,36 @@ impl MLSStorageBackend for MockStorage {
                 "injected ensure_conversation_exists failure".to_string(),
             ));
         }
-        inner
-            .conversations
-            .entry(conversation_id.to_string())
-            .or_insert_with(|| ConversationRecord {
-                conversation_id: conversation_id.to_string(),
-                user_did: user_did.to_string(),
-                group_id: group_id.to_string(),
-                state: ConversationState::Initializing,
-                needs_rejoin: false,
-                join_method: None,
-                join_epoch: None,
-                is_active: true,
-                view: ConversationView {
-                    group_id: group_id.to_string(),
+        if let Some(record) = inner.conversations.get_mut(conversation_id) {
+            record.user_did = user_did.to_string();
+            record.group_id = group_id.to_string();
+            record.is_active = true;
+            record.view.group_id = group_id.to_string();
+        } else {
+            inner.conversations.insert(
+                conversation_id.to_string(),
+                ConversationRecord {
                     conversation_id: conversation_id.to_string(),
-                    epoch: 0,
-                    members: vec![],
-                    metadata: None,
-                    created_at: Some(chrono::Utc::now()),
-                    updated_at: Some(chrono::Utc::now()),
-                    sequencer_did: None,
+                    user_did: user_did.to_string(),
+                    group_id: group_id.to_string(),
+                    state: ConversationState::Initializing,
+                    needs_rejoin: false,
+                    join_method: None,
+                    join_epoch: None,
+                    is_active: true,
+                    view: ConversationView {
+                        group_id: group_id.to_string(),
+                        conversation_id: conversation_id.to_string(),
+                        epoch: 0,
+                        members: vec![],
+                        metadata: None,
+                        created_at: Some(chrono::Utc::now()),
+                        updated_at: Some(chrono::Utc::now()),
+                        sequencer_did: None,
+                    },
                 },
-            });
+            );
+        }
         Ok(())
     }
 
@@ -897,7 +913,7 @@ impl MLSStorageBackend for MockStorage {
         Ok(inner
             .conversations
             .get(conversation_id)
-            .filter(|conversation| conversation.user_did == user_did)
+            .filter(|conversation| conversation.user_did == user_did && conversation.is_active)
             .map(|c| c.view.clone()))
     }
 
@@ -986,9 +1002,6 @@ impl MLSStorageBackend for MockStorage {
                     record.is_active = true;
                     record.needs_rejoin = false;
                 }
-                ConversationState::Failed => {
-                    record.is_active = false;
-                }
                 _ => {}
             }
             record.state = state.clone();
@@ -1013,7 +1026,13 @@ impl MLSStorageBackend for MockStorage {
     }
 
     async fn needs_rejoin(&self, conversation_id: &str) -> Result<bool> {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_needs_rejoin {
+            inner.fail_next_needs_rejoin = false;
+            return Err(OrchestratorError::Storage(
+                "injected needs_rejoin read failure".to_string(),
+            ));
+        }
         Ok(inner
             .conversations
             .get(conversation_id)
@@ -1651,8 +1670,16 @@ impl MLSStorageBackend for MockStorage {
         since_epoch: Option<i32>,
     ) -> Result<Vec<SequencerReceipt>> {
         let inner = self.inner.lock().unwrap();
-        let matched_gid = inner.conversations.values().find(|c| c.conversation_id == convo_id).map(|c| c.group_id.clone());
-        let matched_cid = inner.conversations.values().find(|c| c.group_id == convo_id).map(|c| c.conversation_id.clone());
+        let matched_gid = inner
+            .conversations
+            .values()
+            .find(|c| c.conversation_id == convo_id)
+            .map(|c| c.group_id.clone());
+        let matched_cid = inner
+            .conversations
+            .values()
+            .find(|c| c.group_id == convo_id)
+            .map(|c| c.conversation_id.clone());
         Ok(inner
             .sequencer_receipts
             .iter()
@@ -1668,15 +1695,21 @@ impl MLSStorageBackend for MockStorage {
 
     async fn clear_sequencer_receipts(&self, conversation_id: &str) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let matched_gid = inner.conversations.values().find(|c| c.conversation_id == conversation_id).map(|c| c.group_id.clone());
-        let matched_cid = inner.conversations.values().find(|c| c.group_id == conversation_id).map(|c| c.conversation_id.clone());
-        inner
-            .sequencer_receipts
-            .retain(|r| {
-                r.convo_id != conversation_id
-                    && matched_gid.as_deref() != Some(&r.convo_id)
-                    && matched_cid.as_deref() != Some(&r.convo_id)
-            });
+        let matched_gid = inner
+            .conversations
+            .values()
+            .find(|c| c.conversation_id == conversation_id)
+            .map(|c| c.group_id.clone());
+        let matched_cid = inner
+            .conversations
+            .values()
+            .find(|c| c.group_id == conversation_id)
+            .map(|c| c.conversation_id.clone());
+        inner.sequencer_receipts.retain(|r| {
+            r.convo_id != conversation_id
+                && matched_gid.as_deref() != Some(&r.convo_id)
+                && matched_cid.as_deref() != Some(&r.convo_id)
+        });
         Ok(())
     }
 

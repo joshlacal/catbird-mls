@@ -660,12 +660,11 @@ async fn startup_reconcile_preserves_reset_pending_and_unrecoverable_states_in_r
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn startup_reconcile_does_not_mark_rejoin_when_local_epoch_probe_returns_context_closed() {
+async fn startup_reconcile_propagates_local_epoch_probe_failure() {
     let fixture = StartupReconcileFixture::new();
     fixture
         .persist_local_group("convo-context-closed", ConversationState::Active)
         .await;
-
     fixture
         .engine
         .initialize_user(fixture.did)
@@ -675,23 +674,74 @@ async fn startup_reconcile_does_not_mark_rejoin_when_local_epoch_probe_returns_c
         .flush_and_prepare_close()
         .expect("flush_and_prepare_close");
 
-    let report = fixture
+    fixture
         .engine
         .startup_reconcile()
-        .expect("startup_reconcile");
-
-    assert_eq!(report.scanned, 1);
-    assert_eq!(report.healthy, 0);
-    assert_eq!(report.needs_rejoin, 0);
-    assert_eq!(report.reset_pending, 0);
-    assert_eq!(report.unrecoverable_local, 0);
-    assert!(
-        !fixture.storage.has_rejoin_flag("convo-context-closed"),
-        "context lifecycle errors must not be reclassified as missing local groups"
-    );
+        .expect_err("local epoch probe failure must abort startup reconciliation");
+    assert!(!fixture.storage.has_rejoin_flag("convo-context-closed"));
     assert_eq!(
         fixture.storage.get_current_state("convo-context-closed"),
-        Some(ConversationState::Active),
-        "startup reconcile must preserve the existing persisted state on context errors"
+        Some(ConversationState::Active)
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_reconcile_propagates_reset_authority_and_payload_read_failures() {
+    for successful_reads in [1, 2] {
+        let fixture = StartupReconcileFixture::new();
+        fixture
+            .persist_missing_group(
+                "convo-reset-read",
+                ConversationState::Active,
+                &random_group_id_hex(),
+            )
+            .await;
+        fixture
+            .storage
+            .mark_reset_pending(
+                "convo-reset-read",
+                &random_group_id_hex(),
+                3,
+                1_717_000_000_000,
+            )
+            .await
+            .expect("mark reset pending");
+        fixture
+            .engine
+            .initialize_user(fixture.did)
+            .expect("initialize_user");
+        fixture
+            .storage
+            .fail_get_conversation_state_after_successful_reads(
+                "convo-reset-read",
+                successful_reads,
+            );
+
+        fixture
+            .engine
+            .startup_reconcile()
+            .expect_err("reset authority read failure must abort startup reconciliation");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_reconcile_propagates_needs_rejoin_read_failure() {
+    let fixture = StartupReconcileFixture::new();
+    fixture
+        .persist_missing_group(
+            "convo-rejoin-read",
+            ConversationState::Active,
+            &random_group_id_hex(),
+        )
+        .await;
+    fixture
+        .engine
+        .initialize_user(fixture.did)
+        .expect("initialize_user");
+    fixture.storage.fail_next_needs_rejoin();
+
+    fixture
+        .engine
+        .startup_reconcile()
+        .expect_err("needs_rejoin read failure must abort startup reconciliation");
 }

@@ -283,9 +283,11 @@ where
         conversation_id: &str,
         participant_dids: Vec<String>,
     ) -> Result<(), OrchestratorError> {
-        self.orchestrator
-            .add_members(conversation_id, &participant_dids)
-            .await?;
+        if !participant_dids.is_empty() {
+            self.orchestrator
+                .swap_members(conversation_id, &[], &participant_dids)
+                .await?;
+        }
 
         for did in &participant_dids {
             let _ = self.event_tx.send(ChatEvent::ParticipantJoined {

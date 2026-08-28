@@ -47,6 +47,10 @@ pub use error::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use keychain::*;
 #[cfg(not(target_arch = "wasm32"))]
+pub use mls_context::canonical_signer_keychain_key;
+#[cfg(not(target_arch = "wasm32"))]
+pub use mls_context::validate_serialized_signer_keypair_coherence;
+#[cfg(not(target_arch = "wasm32"))]
 pub use platform_lifecycle::*;
 pub use types::*;
 

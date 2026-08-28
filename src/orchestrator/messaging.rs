@@ -1075,6 +1075,8 @@ where
                     conversation_id = %envelope.conversation_id,
                     "OwnPrivateMessage without durable echo proof; refusing cursor advancement"
                 );
+                self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                    .await;
                 return Err(OrchestratorError::RecoveryFailed(format!(
                     "unverified own-private message outcome for conversation {}",
                     resolved.conversation_id
@@ -1085,6 +1087,8 @@ where
                     conversation_id = %envelope.conversation_id,
                     "OwnPendingCommit reached decrypt outcome without prior durable confirmation; refusing cursor advancement"
                 );
+                self.mark_needs_rejoin_critical(&resolved.conversation_id)
+                    .await;
                 return Err(OrchestratorError::RecoveryFailed(format!(
                     "unverified own pending commit outcome for conversation {}",
                     resolved.conversation_id

@@ -175,13 +175,17 @@ impl RecoverySchedulerFixture {
 
         let convo = bob
             .orchestrator
-            .create_group(
-                "Deferred recovery fixture",
-                Some(&[alice.did.clone()]),
-                None,
-            )
+            .create_group("Deferred recovery fixture", None, None)
             .await
             .expect("create_group failed");
+        bob.orchestrator
+            .swap_members(
+                &convo.conversation_id,
+                &[],
+                std::slice::from_ref(&alice.did),
+            )
+            .await
+            .expect("add Alice and publish Welcome");
 
         alice
             .storage

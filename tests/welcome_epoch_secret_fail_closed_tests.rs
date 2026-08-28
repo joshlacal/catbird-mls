@@ -7,14 +7,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 struct TestKeychain {
-    values: Mutex<HashMap<String, Vec<u8>>>,
+    values: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl TestKeychain {
     fn new() -> Self {
         Self {
-            values: Mutex::new(HashMap::new()),
+            values: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -114,17 +115,25 @@ impl EpochSecretStorage for TrackingEpochSecretStorage {
     }
 }
 
-fn make_context(path: &std::path::Path, store_result: bool) -> Arc<MLSContext> {
+fn make_context_with_keychain(
+    path: &std::path::Path,
+    store_result: bool,
+    keychain: TestKeychain,
+) -> Arc<MLSContext> {
     let context = MLSContext::new(
         path.to_string_lossy().to_string(),
         "test-key-1234567890123456".to_string(),
-        Box::new(TestKeychain::new()),
+        Box::new(keychain),
     )
     .unwrap();
     context
         .set_epoch_secret_storage(Box::new(BooleanEpochSecretStorage { store_result }))
         .unwrap();
     context
+}
+
+fn make_context(path: &std::path::Path, store_result: bool) -> Arc<MLSContext> {
+    make_context_with_keychain(path, store_result, TestKeychain::new())
 }
 
 fn make_tracking_context(
@@ -182,7 +191,8 @@ fn welcome_storage_rejection_rolls_back_joined_group_durably() {
     let bob_path = bob_dir.path().join("bob.db");
 
     let alice = make_context(&alice_path, true);
-    let bob = make_context(&bob_path, false);
+    let bob_keychain = TestKeychain::new();
+    let bob = make_context_with_keychain(&bob_path, false, bob_keychain.clone());
 
     let created = alice
         .create_group(b"did:plc:alice".to_vec(), Some(GroupConfig::default()))
@@ -216,7 +226,7 @@ fn welcome_storage_rejection_rolls_back_joined_group_durably() {
     );
 
     drop(bob);
-    let reopened = make_context(&bob_path, true);
+    let reopened = make_context_with_keychain(&bob_path, true, bob_keychain);
     assert!(
         !reopened.group_exists(created.group_id),
         "failed Welcome adoption must not survive a database reopen"

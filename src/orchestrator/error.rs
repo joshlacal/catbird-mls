@@ -309,9 +309,8 @@ mod tests {
         assert!(err.is_device_not_registered());
 
         // The FFI callbacks surface transport failures as `Api`.
-        let err = OrchestratorError::Api(
-            r#"status 401: {"error":"DeviceNotRegistered"}"#.to_string(),
-        );
+        let err =
+            OrchestratorError::Api(r#"status 401: {"error":"DeviceNotRegistered"}"#.to_string());
         assert!(err.is_device_not_registered());
 
         // Siblings that also answer 401 but must never mint a replacement device.
@@ -335,21 +334,31 @@ mod tests {
     fn is_direct_conversation_not_member_matches_lexicon_code() {
         let err = OrchestratorError::ServerError {
             status: 400,
-            body: r#"{"error":"ConversationAlreadyExists","message":"ConversationAlreadyExists"}"#.to_string(),
+            body: r#"{"error":"ConversationAlreadyExists","message":"ConversationAlreadyExists"}"#
+                .to_string(),
         };
-        assert!(err.is_direct_conversation_not_member(), "ConversationAlreadyExists must classify");
+        assert!(
+            err.is_direct_conversation_not_member(),
+            "ConversationAlreadyExists must classify"
+        );
 
         let api_err = OrchestratorError::Api(
             r#"status 400: {"error":"ConversationAlreadyExists","message":"ConversationAlreadyExists"}"#.to_string(),
         );
-        assert!(api_err.is_direct_conversation_not_member(), "ConversationAlreadyExists via Api must classify");
+        assert!(
+            api_err.is_direct_conversation_not_member(),
+            "ConversationAlreadyExists via Api must classify"
+        );
 
         // Bare error code must classify
         let bare_err = OrchestratorError::ServerError {
             status: 400,
             body: "ConversationAlreadyExists".to_string(),
         };
-        assert!(bare_err.is_direct_conversation_not_member(), "Bare ConversationAlreadyExists must classify");
+        assert!(
+            bare_err.is_direct_conversation_not_member(),
+            "Bare ConversationAlreadyExists must classify"
+        );
 
         // Removed speculative aliases MUST NOT classify (exact match, not substring).
         for alias in [
@@ -390,6 +399,7 @@ mod tests {
         };
         assert!(!unrelated.is_direct_conversation_not_member());
         assert!(!OrchestratorError::NotAuthenticated.is_direct_conversation_not_member());
-        assert!(!OrchestratorError::Api("connection refused".into()).is_direct_conversation_not_member());
+        assert!(!OrchestratorError::Api("connection refused".into())
+            .is_direct_conversation_not_member());
     }
 }

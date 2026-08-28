@@ -54,7 +54,9 @@ async fn replace_available_packages_with_one_wrapped(
         last_package = Some(package);
     }
     let package = last_package.expect("registered device publishes key packages");
-    let package_in = if let Ok((msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&package.key_package_data) {
+    let package_in = if let Ok((msg, remaining)) =
+        MlsMessageIn::tls_deserialize_bytes(&package.key_package_data)
+    {
         if remaining.is_empty() {
             match msg.extract() {
                 MlsMessageBodyIn::KeyPackage(kp) => kp,
@@ -198,7 +200,7 @@ async fn matching_credential_produces_no_warning() {
 
     alice
         .orchestrator
-        .add_members(&convo.group_id, &[bob_did])
+        .swap_members(&convo.group_id, &[], &[bob_did])
         .await
         .expect("add_members with genuine key package failed");
 
@@ -254,7 +256,7 @@ async fn mismatched_key_package_rejects_add_without_epoch_or_pending_commit() {
     let error = world
         .client("Alice")
         .orchestrator
-        .add_members(&convo.group_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.group_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect_err("substituted raw credential root must reject the complete add");
     assert!(
@@ -279,7 +281,7 @@ async fn mismatched_key_package_rejects_add_without_epoch_or_pending_commit() {
     world
         .client("Alice")
         .orchestrator
-        .add_members(&convo.group_id, &[bob_did])
+        .swap_members(&convo.group_id, &[], &[bob_did])
         .await
         .expect("valid retry proves the rejected add left no pending commit");
 }
@@ -309,7 +311,7 @@ async fn missing_key_package_rejects_complete_batch_before_staging() {
 
     let error = alice
         .orchestrator
-        .add_members(&convo.group_id, &[bob_did.clone(), carol_did])
+        .swap_members(&convo.group_id, &[], &[bob_did.clone(), carol_did])
         .await
         .expect_err("partial DS batch must reject atomically");
     assert!(matches!(error, OrchestratorError::InvalidInput(_)));
@@ -325,7 +327,7 @@ async fn missing_key_package_rejects_complete_batch_before_staging() {
 
     alice
         .orchestrator
-        .add_members(&convo.group_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.group_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("valid retry proves partial batch did not create a pending commit");
 }
@@ -363,7 +365,7 @@ async fn successful_no_advance_add_rejects_without_local_roster_mutation() {
     world.delivery_service().no_advance_next_add_members();
     let error = alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect_err("success without epoch advance must be rejected");
     assert!(matches!(error, OrchestratorError::EpochMismatch { .. }));
@@ -396,7 +398,7 @@ async fn successful_no_advance_add_rejects_without_local_roster_mutation() {
 
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("valid retry proves the no-advance rejection discarded pending state");
 }
@@ -469,7 +471,7 @@ async fn public_swap_rejects_substitution_atomically_then_valid_retry_mutates() 
         .expect("create group");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let group_bytes = hex::decode(&convo.group_id).unwrap();
@@ -565,7 +567,7 @@ async fn public_pure_remove_server_failure_discards_then_retry_succeeds() {
         .expect("create group");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let group_bytes = hex::decode(&convo.group_id).unwrap();
@@ -677,8 +679,9 @@ async fn wrapped_key_packages_work_through_create_add_and_swap_wrappers() {
     add_world
         .client("Alice")
         .orchestrator
-        .add_members(
+        .swap_members(
             &add_convo.conversation_id,
+            &[],
             std::slice::from_ref(&add_bob_did),
         )
         .await
@@ -694,16 +697,16 @@ async fn wrapped_key_packages_work_through_create_add_and_swap_wrappers() {
     let swap_mallory_did = swap_world.client("Mallory").did.clone();
     let swap_convo = swap_alice
         .orchestrator
-        .create_group(
-            "wrapped swap",
-            None,
-            None,
-        )
+        .create_group("wrapped swap", None, None)
         .await
         .expect("create group");
     swap_alice
         .orchestrator
-        .add_members(&swap_convo.conversation_id, std::slice::from_ref(&swap_bob_did))
+        .swap_members(
+            &swap_convo.conversation_id,
+            &[],
+            std::slice::from_ref(&swap_bob_did),
+        )
         .await
         .expect("add Bob");
     replace_available_packages_with_one_wrapped(&swap_world, "Alice", "Mallory", &swap_mallory_did)
@@ -735,7 +738,7 @@ async fn public_swap_preserves_pure_removal_compatibility() {
         .expect("create group");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let group_bytes = hex::decode(&convo.group_id).unwrap();
@@ -815,7 +818,7 @@ async fn fork_readd_key_package_fetch_warns_on_mismatch() {
         .expect("create group");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let group_id = convo.group_id.clone();
@@ -1210,7 +1213,7 @@ async fn honest_inbound_sender_is_silent_and_message_processes() {
         .expect("create group");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let group_id = convo.group_id.clone();
@@ -1273,7 +1276,7 @@ async fn spoofed_envelope_sender_is_rejected_before_message_delivery() {
         .expect("create group");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let group_id = convo.group_id.clone();
@@ -1394,7 +1397,7 @@ async fn device_key_mismatch_rejects_add_without_epoch_change() {
     let error = world
         .client("Alice")
         .orchestrator
-        .add_members(&convo.group_id, &[bob_did.clone()])
+        .swap_members(&convo.group_id, &[], &[bob_did.clone()])
         .await
         .expect_err("unauthorized device key must reject add_members");
     assert!(matches!(error, OrchestratorError::InvalidInput(_)));
@@ -1430,7 +1433,7 @@ async fn device_key_mismatch_rejects_add_without_epoch_change() {
     alice.orchestrator.invalidate_device_key_cache().await;
     alice
         .orchestrator
-        .add_members(&convo.group_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.group_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("valid retry proves rejection left no pending commit");
 }
@@ -1460,7 +1463,7 @@ async fn unsupported_device_key_resolution_rejects_before_staging() {
     alice.orchestrator.invalidate_device_key_cache().await;
     let error = alice
         .orchestrator
-        .add_members(&convo.group_id, std::slice::from_ref(&bob_did))
+        .swap_members(&convo.group_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect_err("missing device resolver authority must fail closed");
 
@@ -1517,7 +1520,11 @@ async fn legacy_atomic_swap_rejects_device_mismatch_and_resolver_failure() {
         .expect("create group");
     alice
         .orchestrator
-        .add_members(&mismatch_group.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(
+            &mismatch_group.conversation_id,
+            &[],
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("add Bob");
     let mismatch_epoch = alice
@@ -1545,16 +1552,16 @@ async fn legacy_atomic_swap_rejects_device_mismatch_and_resolver_failure() {
 
     let resolver_group = alice
         .orchestrator
-        .create_group(
-            "legacy swap resolver failure",
-            None,
-            None,
-        )
+        .create_group("legacy swap resolver failure", None, None)
         .await
         .expect("create resolver-failure group");
     alice
         .orchestrator
-        .add_members(&resolver_group.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(
+            &resolver_group.conversation_id,
+            &[],
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("add Bob");
     alice
@@ -1659,7 +1666,7 @@ async fn device_key_match_is_silent_and_cached_within_ttl() {
     world
         .client("Alice")
         .orchestrator
-        .add_members(&convo1.group_id, &[bob_did.clone()])
+        .swap_members(&convo1.group_id, &[], &[bob_did.clone()])
         .await
         .expect("add_members 1 failed");
 
@@ -1684,7 +1691,7 @@ async fn device_key_match_is_silent_and_cached_within_ttl() {
         .expect("create_group 2 failed");
     alice
         .orchestrator
-        .add_members(&convo2.group_id, &[bob_did.clone()])
+        .swap_members(&convo2.group_id, &[], &[bob_did.clone()])
         .await
         .expect("add_members 2 failed");
 

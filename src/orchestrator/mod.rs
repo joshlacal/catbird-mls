@@ -26,6 +26,8 @@ mod canonical_transport_tests;
 
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
+#[cfg(all(feature = "e2e-aad", not(any(test, feature = "test-utils"))))]
+pub use canonical_transport::canonical_application_aad_bytes;
 #[cfg(any(test, feature = "test-utils"))]
 pub use canonical_transport::{
     canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,

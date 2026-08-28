@@ -562,7 +562,12 @@ async fn migrate_stable_conversation_id_for_test(
         .map_or(old_view.epoch, |s| s.epoch);
     let _ = client
         .storage
-        .update_join_info(new_conversation_id, &client.did, catbird_mls::orchestrator::JoinMethod::Creator, latest_epoch)
+        .update_join_info(
+            new_conversation_id,
+            &client.did,
+            catbird_mls::orchestrator::JoinMethod::Creator,
+            latest_epoch,
+        )
         .await;
     client
         .storage
@@ -711,7 +716,7 @@ async fn authoritative_conversation_mapping_wins_over_stale_legacy_group_state()
 
     alice
         .orchestrator
-        .add_members(STABLE_CONVERSATION_ID, std::slice::from_ref(&bob_did))
+        .swap_members(STABLE_CONVERSATION_ID, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("stale legacy state must not redirect staged group mutation");
     let active = alice
@@ -1225,7 +1230,7 @@ async fn startup_delete_rediscovers_all_persisted_predecessors_after_intent_cras
     let restarted_context = MLSContext::new(
         alice._temp_dir.join("mls.db").to_string_lossy().to_string(),
         "test-key-Alice".to_string(),
-        Box::new(NoopKeychain),
+        Box::new(alice.keychain.clone()),
     )
     .expect("reopen persisted MLS context");
     let restarted = MLSOrchestrator::new(
@@ -1295,25 +1300,11 @@ async fn pending_local_delete_from_alice_never_replays_in_bob_lifecycle() {
     );
     assert_eq!(alice.storage.pending_local_delete_count(), 1);
 
-    struct NoopKeychain;
-    #[async_trait::async_trait]
-    impl KeychainAccess for NoopKeychain {
-        async fn read(&self, _key: String) -> Result<Option<Vec<u8>>, MLSError> {
-            Ok(None)
-        }
-        async fn write(&self, _key: String, _value: Vec<u8>) -> Result<(), MLSError> {
-            Ok(())
-        }
-        async fn delete(&self, _key: String) -> Result<(), MLSError> {
-            Ok(())
-        }
-    }
-
     let bob_dir = tempfile::tempdir().expect("Bob tempdir");
     let bob_context = MLSContext::new(
         bob_dir.path().join("mls.db").to_string_lossy().to_string(),
         "bob-tenant-delete-key".into(),
-        Box::new(NoopKeychain),
+        Box::new(crate::e2e_harness::InMemoryKeychain::new()),
     )
     .expect("Bob MLS context");
     epoch_secret_test_support::install(&bob_context);
@@ -1365,20 +1356,6 @@ async fn unbound_legacy_delete_preserves_bob_with_same_conversation_id() {
         .await
         .expect("remove Alice conversation row");
 
-    struct BobKeychain;
-    #[async_trait::async_trait]
-    impl KeychainAccess for BobKeychain {
-        async fn read(&self, _key: String) -> Result<Option<Vec<u8>>, MLSError> {
-            Ok(None)
-        }
-        async fn write(&self, _key: String, _value: Vec<u8>) -> Result<(), MLSError> {
-            Ok(())
-        }
-        async fn delete(&self, _key: String) -> Result<(), MLSError> {
-            Ok(())
-        }
-    }
-
     let bob_did = "did:plc:bob";
     let bob_group = vec![0xb0; 32];
     let bob_group_id = hex::encode(&bob_group);
@@ -1386,8 +1363,8 @@ async fn unbound_legacy_delete_preserves_bob_with_same_conversation_id() {
     let bob_dir = tempfile::tempdir().expect("Bob tempdir");
     let bob_context = MLSContext::new(
         bob_dir.path().join("mls.db").to_string_lossy().to_string(),
-        "bob-legacy-tenant-key".into(),
-        Box::new(BobKeychain),
+        "bob-legacy-delete-key".into(),
+        Box::new(crate::e2e_harness::InMemoryKeychain::new()),
     )
     .expect("Bob MLS context");
     epoch_secret_test_support::install(&bob_context);
@@ -2094,7 +2071,11 @@ async fn commit_self_remove_proposals_uses_active_group_for_rotated_stable_conve
     let group_id = conversation.group_id.clone();
     alice
         .orchestrator
-        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(
+            &conversation.conversation_id,
+            &[],
+            std::slice::from_ref(&bob_did),
+        )
         .await
         .expect("add bob");
     let bob_api = world.delivery_service().clone_as(&bob.did);
@@ -2193,7 +2174,11 @@ async fn pending_proposal_commit_merges_only_after_server_acceptance() {
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
     alice
         .orchestrator
-        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
+        .swap_members(
+            &conversation.conversation_id,
+            &[],
+            std::slice::from_ref(&bob.did),
+        )
         .await
         .expect("add bob");
     let welcome = world
@@ -2304,7 +2289,11 @@ async fn empty_application_message_is_not_treated_as_an_epoch_commit() {
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
     alice
         .orchestrator
-        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
+        .swap_members(
+            &conversation.conversation_id,
+            &[],
+            std::slice::from_ref(&bob.did),
+        )
         .await
         .expect("add bob");
     let welcome = world
@@ -2375,7 +2364,11 @@ async fn sender_binding_rejection_discards_staged_proposal_before_commit() {
     let group_id_bytes = hex::decode(&conversation.group_id).expect("group id");
     alice
         .orchestrator
-        .add_members(&conversation.conversation_id, std::slice::from_ref(&bob.did))
+        .swap_members(
+            &conversation.conversation_id,
+            &[],
+            std::slice::from_ref(&bob.did),
+        )
         .await
         .expect("add bob");
     let welcome = world
@@ -2455,13 +2448,16 @@ async fn unknown_hex_identifier_cannot_be_treated_as_an_authoritative_group_mapp
         .remove(&hex_identifier);
     alice
         .storage
-        .delete_conversations(&alice.did, &[&hex_identifier, &conversation.conversation_id])
+        .delete_conversations(
+            &alice.did,
+            &[&hex_identifier, &conversation.conversation_id],
+        )
         .await
         .expect("remove authoritative mapping");
 
     let result = alice
         .orchestrator
-        .add_members(&hex_identifier, std::slice::from_ref(&bob_did))
+        .swap_members(&hex_identifier, &[], std::slice::from_ref(&bob_did))
         .await;
     assert!(
         matches!(
@@ -2514,7 +2510,7 @@ async fn staged_confirm_normalizes_exact_legacy_state_to_active_group_key() {
 
     alice
         .orchestrator
-        .add_members(STABLE_CONVERSATION_ID, std::slice::from_ref(&bob_did))
+        .swap_members(STABLE_CONVERSATION_ID, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("confirm staged commit from exact legacy state");
 
@@ -2598,7 +2594,7 @@ async fn receive_uses_resolved_group_id_but_stores_under_stable_conversation_id(
     let group_id = conversation.group_id.clone();
     alice
         .orchestrator
-        .add_members(&conversation.conversation_id, &[bob_did.clone()])
+        .swap_members(&conversation.conversation_id, &[], &[bob_did.clone()])
         .await
         .expect("add bob");
     let bob_api = world.delivery_service().clone_as(&bob.did);
@@ -2689,7 +2685,7 @@ async fn welcome_join_persists_history_under_stable_conversation_id() {
     let group_id = conversation.group_id.clone();
     alice
         .orchestrator
-        .add_members(&conversation.conversation_id, &[bob_did.clone()])
+        .swap_members(&conversation.conversation_id, &[], &[bob_did.clone()])
         .await
         .expect("add bob");
     world
@@ -2803,7 +2799,7 @@ async fn epoch_cleanup_keeps_crypto_group_and_storage_conversation_id_separate()
     for _ in 0..3 {
         alice
             .orchestrator
-            .add_members(STABLE_CONVERSATION_ID, std::slice::from_ref(&bob_did))
+            .swap_members(STABLE_CONVERSATION_ID, &[], std::slice::from_ref(&bob_did))
             .await
             .expect("advance epoch by adding bob");
         alice
@@ -2865,7 +2861,7 @@ async fn swap_members_uses_resolved_group_after_server_accepts_stable_conversati
         .expect("refresh stable conversation mapping");
     alice
         .orchestrator
-        .add_members(STABLE_CONVERSATION_ID, std::slice::from_ref(&bob_did))
+        .swap_members(STABLE_CONVERSATION_ID, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add bob before swap");
     alice

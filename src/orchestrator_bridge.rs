@@ -1900,7 +1900,8 @@ impl MLSAPIClient for APIAdapter {
     async fn submit_prepared_request(
         &self,
         request: crate::orchestrator::canonical_transport::PreparedRequest,
-    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse> {
+    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse>
+    {
         let route = request.operation.route();
         let query_bytes = if request.method == "GET" && request.path.contains('?') {
             request
@@ -2056,7 +2057,8 @@ impl MLSAPIClient for APIAdapter {
         &self,
         convo_id: &str,
         message_ids: &[String],
-    ) -> crate::orchestrator::Result<Vec<(String, crate::orchestrator::types::DeliveryStatus)>> {
+    ) -> crate::orchestrator::Result<Vec<(String, crate::orchestrator::types::DeliveryStatus)>>
+    {
         self.0
             .get_delivery_status(convo_id.to_string(), message_ids.to_vec())
             .map(|list| {
@@ -2522,9 +2524,12 @@ impl OrchestratorBridge {
                 .inner
                 .resolve_legacy_group_identifier(&group_id)
                 .await?;
-            self.inner
-                .add_members(&resolved.conversation_id, &member_dids)
-                .await
+            if !member_dids.is_empty() {
+                self.inner
+                    .swap_members(&resolved.conversation_id, &[], &member_dids)
+                    .await?;
+            }
+            Ok::<(), OrchestratorError>(())
         })?;
         Ok(())
     }
@@ -3504,6 +3509,7 @@ pub fn ffi_decode_opus_to_pcm(opus_data: Vec<u8>) -> Result<Vec<u8>, Orchestrato
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     fn full_security_capabilities() -> SecurityStorageCapabilities {
         SecurityStorageCapabilities {
@@ -4117,6 +4123,7 @@ mod tests {
         welcome_calls: Arc<AtomicUsize>,
         receipt_response: Mutex<Option<FFISequencerReceipt>>,
         server_status: std::sync::atomic::AtomicU16,
+        registered_device: std::sync::OnceLock<FFIDeviceInfo>,
     }
 
     impl WelcomeCountingApiCallback {
@@ -4126,6 +4133,7 @@ mod tests {
                 welcome_calls,
                 receipt_response: Mutex::new(None),
                 server_status: std::sync::atomic::AtomicU16::new(0),
+                registered_device: std::sync::OnceLock::new(),
             }
         }
     }
@@ -4158,11 +4166,52 @@ mod tests {
             _query: Option<Vec<u8>>,
         ) -> Result<FFIGatewayResponse, OrchestratorBridgeError> {
             let resp_body = if nsid == "blue.catbird.chat.enrollDevice" {
-                let inner = body.as_deref().and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok()).unwrap_or_default();
-                let inner_body = inner.get("signedRequest").and_then(|s| s.get("body")).or_else(|| inner.get("body")).unwrap_or(&inner);
-                let dev_id = inner_body.get("deviceId").and_then(|d| d.as_str()).unwrap_or("00000000-0000-4000-8000-000000000001");
-                let key_id = inner_body.get("keyId").and_then(|k| k.as_str()).unwrap_or("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-                let sig_pk = inner_body.get("signaturePublicKey").and_then(|s| s.as_str()).unwrap_or("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+                let inner = body
+                    .as_deref()
+                    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+                    .unwrap_or_default();
+                let inner_body = inner
+                    .get("signedRequest")
+                    .and_then(|signed| signed.get("body"))
+                    .or_else(|| inner.get("body"))
+                    .unwrap_or(&inner);
+                let actor_did = inner_body
+                    .get("actorDid")
+                    .and_then(|did| did.as_str())
+                    .unwrap_or(&self.current_did);
+                let dev_id = inner_body
+                    .get("deviceId")
+                    .and_then(|device| device.as_str())
+                    .unwrap_or("00000000-0000-4000-8000-000000000001");
+                let key_id = inner_body
+                    .get("keyId")
+                    .and_then(|key| key.as_str())
+                    .unwrap_or("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+                let sig_pk = inner_body
+                    .get("signaturePublicKey")
+                    .and_then(|key| {
+                        key.as_str()
+                            .or_else(|| key.get("$bytes").and_then(|bytes| bytes.as_str()))
+                    })
+                    .unwrap_or("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+                let signature_public_key = base64::engine::general_purpose::STANDARD
+                    .decode(sig_pk)
+                    .unwrap_or_else(|_| vec![0; 32]);
+                let device = FFIDeviceInfo {
+                    device_id: dev_id.to_string(),
+                    mls_did: format!("{actor_did}#{dev_id}"),
+                    device_uuid: dev_id.to_string(),
+                    created_at: Some(
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ),
+                    key_id: Some(key_id.to_string()),
+                    signature_public_key: Some(signature_public_key),
+                    auth_generation: Some(1),
+                    status: Some("active".into()),
+                    available_package_count: Some(50),
+                    reserved_package_count: Some(0),
+                };
+                let _ = self.registered_device.set(device);
                 serde_json::to_vec(&serde_json::json!({
                     "device": {
                         "deviceId": dev_id,
@@ -4236,15 +4285,12 @@ mod tests {
             })
         }
 
-
-
         fn list_devices(
             &self,
             _actor_device_id: String,
         ) -> Result<Vec<FFIDeviceInfo>, OrchestratorBridgeError> {
-            Ok(vec![])
+            Ok(self.registered_device.get().cloned().into_iter().collect())
         }
-
 
         fn get_group_info(&self, _convo_id: String) -> Result<Vec<u8>, OrchestratorBridgeError> {
             Err(OrchestratorBridgeError::ServerError {
@@ -4266,8 +4312,6 @@ mod tests {
             })
         }
 
-
-
         fn get_group_metadata_blob(
             &self,
             _convo_id: String,
@@ -4279,7 +4323,6 @@ mod tests {
                 body: "no metadata blob in test".into(),
             })
         }
-
     }
 
     #[derive(Default)]

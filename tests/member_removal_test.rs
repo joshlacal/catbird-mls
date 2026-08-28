@@ -279,6 +279,28 @@ fn swap_with_fragment_qualified_identity_removes_only_that_device() {
     assert!(identities.iter().any(|identity| identity == target_laptop));
     assert!(identities.iter().any(|identity| identity == replacement));
 }
+#[test]
+fn swap_with_empty_removals_performs_pure_add() {
+    let member = b"did:plc:creator#phone";
+    let new_member = b"did:plc:newbie#phone";
+    let (context, group_id, _dir) = context_group_with_members(&[member]);
+    let epoch_before = context.get_epoch(group_id.clone()).unwrap();
+
+    let result = context
+        .swap_members(
+            group_id.clone(),
+            vec![],
+            vec![key_package_for(&context, new_member)],
+        )
+        .expect("swap_members with empty remove_identities must succeed as pure-add");
+    assert!(!result.commit_data.is_empty());
+    context.merge_pending_commit(group_id.clone()).unwrap();
+
+    let identities = member_identities(&context, &group_id);
+    assert!(identities.iter().any(|identity| identity == member));
+    assert!(identities.iter().any(|identity| identity == new_member));
+    assert_eq!(context.get_epoch(group_id).unwrap(), epoch_before + 1);
+}
 
 #[test]
 fn swap_no_match_preserves_epoch_membership_and_pending_commit_state() {

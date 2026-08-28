@@ -830,7 +830,7 @@ async fn secret_reuse_without_durable_envelope_evidence_fails_closed_without_rej
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn own_private_message_missing_proof_withholds_cursor_without_rejoin() {
+async fn own_private_message_missing_proof_withholds_cursor_and_marks_rejoin() {
     let conversation_id = "7172737475767778797a7b7c7d7e7f80";
     let message_id = "unproven-own-echo";
     let fixture = controlled_inbound_fixture(
@@ -857,7 +857,7 @@ async fn own_private_message_missing_proof_withholds_cursor_without_rejoin() {
     assert!(error
         .to_string()
         .contains("unverified own-private message outcome"));
-    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+    assert!(fixture.storage.has_rejoin_flag(conversation_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -961,7 +961,7 @@ async fn own_private_message_entry_id_collision_withholds_cursor() {
     assert!(error
         .to_string()
         .contains("unverified own-private message outcome"));
-    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+    assert!(fixture.storage.has_rejoin_flag(conversation_id));
 
     // Proof for entry-1 is still intact
     assert!(fixture
@@ -1018,7 +1018,7 @@ async fn own_private_message_conversation_mismatch_withholds_cursor() {
     assert!(error
         .to_string()
         .contains("unverified own-private message outcome"));
-    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+    assert!(fixture.storage.has_rejoin_flag(conversation_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1061,7 +1061,7 @@ async fn own_private_message_group_or_epoch_mismatch_withholds_cursor() {
     assert!(error
         .to_string()
         .contains("unverified own-private message outcome"));
-    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+    assert!(fixture.storage.has_rejoin_flag(conversation_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1104,7 +1104,7 @@ async fn own_private_message_ciphertext_mutation_withholds_cursor() {
     assert!(error
         .to_string()
         .contains("unverified own-private message outcome"));
-    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+    assert!(fixture.storage.has_rejoin_flag(conversation_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1145,7 +1145,7 @@ async fn own_private_message_aad_mutation_withholds_cursor() {
     assert!(error
         .to_string()
         .contains("unverified own-private message outcome"));
-    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+    assert!(fixture.storage.has_rejoin_flag(conversation_id));
 }
 
 #[test]
@@ -1268,7 +1268,7 @@ async fn own_pending_commit_untracked_restarted_withholds_cursor() {
     assert!(error
         .to_string()
         .contains("unverified own pending commit outcome"));
-    assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+    assert!(fixture.storage.has_rejoin_flag(conversation_id));
 }
 
 #[tokio::test(flavor = "multi_thread")]

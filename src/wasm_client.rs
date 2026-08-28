@@ -216,8 +216,11 @@ where
         conversation_id: &str,
         participant_dids: Vec<String>,
     ) -> Result<(), OrchestratorError> {
+        if participant_dids.is_empty() {
+            return Ok(());
+        }
         self.orchestrator
-            .add_members(conversation_id, &participant_dids)
+            .swap_members(conversation_id, &[], &participant_dids)
             .await
     }
 

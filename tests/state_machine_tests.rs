@@ -209,7 +209,7 @@ async fn test_commit_messages_advance_epoch() {
         .expect("alice create_group failed");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, &[bob_did.clone()])
+        .swap_members(&convo.conversation_id, &[], &[bob_did.clone()])
         .await
         .expect("alice add_members failed");
     let group_id = convo.group_id.clone();
@@ -254,7 +254,7 @@ async fn test_commit_messages_advance_epoch() {
     // the conversation, which Alice's next `fetch_messages` will pull.
     let carol_did = world.client("Carol").did.clone();
     bob.orchestrator
-        .add_members(&group_id, &[carol_did])
+        .swap_members(&group_id, &[], &[carol_did])
         .await
         .expect("bob add_members(carol) failed");
     let bob_epoch_after_add = bob
@@ -444,7 +444,7 @@ async fn test_add_members_server_rejection_cleanup() {
     // Alice tries to add Bob — should fail with MemberSyncFailed
     let result = alice
         .orchestrator
-        .add_members(group_id, &[bob.did.clone()])
+        .swap_members(group_id, &[], &[bob.did.clone()])
         .await;
     assert!(
         result.is_err(),
@@ -456,7 +456,7 @@ async fn test_add_members_server_rejection_cleanup() {
     // add is still lingering in OpenMLS.
     let result2 = alice
         .orchestrator
-        .add_members(group_id, &[bob.did.clone()])
+        .swap_members(group_id, &[], &[bob.did.clone()])
         .await;
 
     assert!(
@@ -687,7 +687,9 @@ async fn test_concurrent_force_rejoin_deduped() {
     assert!(r1.is_ok(), "First force_rejoin failed: {:?}", r1.err());
     assert!(r2.is_ok(), "Second force_rejoin failed: {:?}", r2.err());
     assert_eq!(
-        world.delivery_service().external_commit_count(&convo.conversation_id),
+        world
+            .delivery_service()
+            .external_commit_count(&convo.conversation_id),
         1,
         "Only one external commit should be sent for concurrent force_rejoin calls"
     );
@@ -725,7 +727,9 @@ async fn test_concurrent_join_or_rejoin_deduped() {
     assert!(r1.is_ok(), "First join_or_rejoin failed: {:?}", r1.err());
     assert!(r2.is_ok(), "Second join_or_rejoin failed: {:?}", r2.err());
     assert_eq!(
-        world.delivery_service().external_commit_count(&convo.conversation_id),
+        world
+            .delivery_service()
+            .external_commit_count(&convo.conversation_id),
         1,
         "Only one external commit should be sent for concurrent join_or_rejoin calls"
     );
@@ -790,7 +794,9 @@ async fn test_sync_rejoin_skips_when_attempt_in_flight() {
         "Sync should skip in-flight rejoin instead of waiting; elapsed={sync_elapsed:?}"
     );
     assert_eq!(
-        world.delivery_service().external_commit_count(&convo.conversation_id),
+        world
+            .delivery_service()
+            .external_commit_count(&convo.conversation_id),
         1,
         "Sync should not trigger a second external commit while rejoin is in-flight"
     );
@@ -827,7 +833,9 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
         .await
         .expect("read superseded conversation state")
         .expect("superseded conversation state exists");
-    let old_messages = alice.storage.get_conversation_messages(&convo.conversation_id);
+    let old_messages = alice
+        .storage
+        .get_conversation_messages(&convo.conversation_id);
     alice
         .storage
         .ensure_conversation_exists(&alice.did, &conversation_id, &group_id)
@@ -943,7 +951,7 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
 
     alice
         .orchestrator
-        .add_members(&conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("post-rejoin staged commit through stable conversation id");
     let cached = alice
@@ -984,7 +992,10 @@ async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
 
     world.delivery_service().fail_next_get_group_info();
 
-    let first = alice.orchestrator.force_rejoin(&convo.conversation_id).await;
+    let first = alice
+        .orchestrator
+        .force_rejoin(&convo.conversation_id)
+        .await;
     assert!(
         alice
             .orchestrator
@@ -993,7 +1004,10 @@ async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
         "GroupInfo fetch failure must preserve the existing local group"
     );
 
-    let second = alice.orchestrator.force_rejoin(&convo.conversation_id).await;
+    let second = alice
+        .orchestrator
+        .force_rejoin(&convo.conversation_id)
+        .await;
     match second {
         Err(OrchestratorError::RecoveryFailed(msg)) => {
             assert!(
@@ -1005,7 +1019,9 @@ async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
     }
 
     assert_eq!(
-        world.delivery_service().get_group_info_call_count(&convo.conversation_id),
+        world
+            .delivery_service()
+            .get_group_info_call_count(&convo.conversation_id),
         1,
         "Cooldown retry should not call get_group_info again"
     );
@@ -1054,10 +1070,15 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
     // per-conversation cooldown armed.
     world.delivery_service().fail_next_get_group_info();
 
-    let first = alice.orchestrator.join_or_rejoin(&convo.conversation_id).await;
+    let first = alice
+        .orchestrator
+        .join_or_rejoin(&convo.conversation_id)
+        .await;
     assert!(first.is_err(), "First join_or_rejoin should fail");
     assert_eq!(
-        world.delivery_service().get_group_info_call_count(&convo.conversation_id),
+        world
+            .delivery_service()
+            .get_group_info_call_count(&convo.conversation_id),
         1,
         "first attempt should fetch GroupInfo exactly once (EC fallback)"
     );
@@ -1066,7 +1087,10 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
     // recovery policy probes get_group_info (one extra, successful call)
     // and authorizes External Commit — but the per-convo cooldown from the
     // failed first attempt must suppress it before the EC GroupInfo fetch.
-    let second = alice.orchestrator.join_or_rejoin(&convo.conversation_id).await;
+    let second = alice
+        .orchestrator
+        .join_or_rejoin(&convo.conversation_id)
+        .await;
     match second {
         Err(OrchestratorError::RecoveryFailed(msg)) => {
             assert!(
@@ -1077,7 +1101,9 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
         other => panic!("Expected RecoveryFailed cooldown error, got: {other:?}"),
     }
     assert_eq!(
-        world.delivery_service().get_group_info_call_count(&convo.conversation_id),
+        world
+            .delivery_service()
+            .get_group_info_call_count(&convo.conversation_id),
         2,
         "cooldown retry may run the welcome-recovery policy probe (+1) but \
          must NOT reach the External Commit GroupInfo fetch"

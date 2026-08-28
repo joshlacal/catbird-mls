@@ -161,7 +161,7 @@ async fn missing_local_group_uses_welcome_before_external_commit() {
         .expect("create_group failed");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, &[bob_did.clone()])
+        .swap_members(&convo.conversation_id, &[], &[bob_did.clone()])
         .await
         .expect("add bob");
 
@@ -202,7 +202,8 @@ async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit
         .expect("create_group failed");
 
     let new_group_id =
-        hex::decode("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff").expect("fixture must be valid hex");
+        hex::decode("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
+            .expect("fixture must be valid hex");
     alice
         .orchestrator
         .record_group_reset(&convo.conversation_id, new_group_id, 1)
@@ -279,7 +280,7 @@ async fn stale_needs_rejoin_on_healthy_local_group_clears_without_recovery_io() 
         result,
         ConversationReadyResult {
             recovery_state: ConversationRecoveryState::Healthy,
-            epoch: Some(1),
+            epoch: Some(0),
             send_allowed: true,
         }
     );
@@ -296,7 +297,7 @@ async fn stale_needs_rejoin_on_healthy_local_group_clears_without_recovery_io() 
         world
             .delivery_service()
             .welcome_fetch_count(&convo.conversation_id),
-        1
+        0
     );
     assert_eq!(
         world

@@ -316,7 +316,7 @@ async fn process_incoming_message_catches_up_missing_commits_before_decrypting()
         .expect("create_group failed");
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, &[bob_did.clone()])
+        .swap_members(&convo.conversation_id, &[], &[bob_did.clone()])
         .await
         .expect("add bob");
 
@@ -327,7 +327,7 @@ async fn process_incoming_message_catches_up_missing_commits_before_decrypting()
 
     alice
         .orchestrator
-        .add_members(&convo.conversation_id, &[carol_did])
+        .swap_members(&convo.conversation_id, &[], &[carol_did])
         .await
         .expect("add carol");
 

@@ -1349,14 +1349,11 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     assert_eq!(alice_epoch_baseline, bob_epoch_baseline);
     assert_eq!(alice_epoch_baseline, 1);
     // Alice stages a genuine AppData Update commit (component 0x8001)
-    let expected_metadata_1 = b"{\"version\":1,\"locator\":\"metadata-loc-1\",\"hash\":\"\"}".to_vec();
+    let expected_metadata_1 =
+        b"{\"version\":1,\"locator\":\"metadata-loc-1\",\"hash\":\"\"}".to_vec();
     let plan = alice
         .orchestrator
-        .stage_app_data_update_commit_for_test(
-            &group_id,
-            0x8001,
-            Some(expected_metadata_1.clone()),
-        )
+        .stage_app_data_update_commit_for_test(&group_id, 0x8001, Some(expected_metadata_1.clone()))
         .await
         .expect("stage update metadata");
     assert_eq!(plan.source_epoch, 1);
@@ -1456,6 +1453,10 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
         "error must be from real decrypt OwnPendingCommit outcome, got: {}",
         restart_error
     );
+    assert!(
+        alice.storage.has_rejoin_flag(&convo.conversation_id),
+        "unproven OwnPendingCommit must enter durable recovery"
+    );
 
     // Group epoch must NOT have merged or advanced in Alice's group
     let alice_epoch_after_restart_echo = alice
@@ -1487,14 +1488,11 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     // -----------------------------------------------------------------------
     // Phase 3: Exercise volatile tracking fence on a second AppData commit
     // -----------------------------------------------------------------------
-    let expected_metadata_2 = b"{\"version\":2,\"locator\":\"metadata-loc-2\",\"hash\":\"\"}".to_vec();
+    let expected_metadata_2 =
+        b"{\"version\":2,\"locator\":\"metadata-loc-2\",\"hash\":\"\"}".to_vec();
     let plan2 = alice
         .orchestrator
-        .stage_app_data_update_commit_for_test(
-            &group_id,
-            0x8001,
-            Some(expected_metadata_2.clone()),
-        )
+        .stage_app_data_update_commit_for_test(&group_id, 0x8001, Some(expected_metadata_2.clone()))
         .await
         .expect("stage second update metadata");
     assert_eq!(plan2.source_epoch, 2);

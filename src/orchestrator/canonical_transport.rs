@@ -2456,88 +2456,66 @@ fn extract_strict_signed_body(
     Ok((StrictSignedJson::Object(root), None, None))
 }
 
-pub fn canonical_commit_aad_bytes(aad_json: &serde_json::Value) -> Result<Vec<u8>, TransportError> {
-    let raw =
-        serde_json::to_vec(aad_json).map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let strict = parse_strict_signed_json(&raw)?;
-    let projected = project_schema_ref("commitAad", &strict, false)?;
-    let cbor = serde_ipld_dagcbor::to_vec(&projected)
-        .map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let mut aad = Vec::with_capacity(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0".len() + cbor.len());
-    aad.extend_from_slice(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0");
+/// `domain || dag-cbor(project(definition_name, json_value))`.
+fn canonical_aad_with_domain(
+    domain: &[u8],
+    definition_name: &str,
+    json_value: &serde_json::Value,
+) -> Result<Vec<u8>, TransportError> {
+    let cbor = canonical_cbor_for_schema_impl(definition_name, json_value, false)?;
+    let mut aad = Vec::with_capacity(domain.len() + cbor.len());
+    aad.extend_from_slice(domain);
     aad.extend_from_slice(&cbor);
     Ok(aad)
 }
 
-#[cfg(any(test, feature = "test-utils"))]
+pub fn canonical_commit_aad_bytes(aad_json: &serde_json::Value) -> Result<Vec<u8>, TransportError> {
+    canonical_aad_with_domain(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0", "commitAad", aad_json)
+}
+
+#[cfg(any(test, feature = "test-utils", feature = "e2e-aad"))]
 pub fn canonical_application_aad_bytes(
     aad_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
-    let raw =
-        serde_json::to_vec(aad_json).map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let strict = parse_strict_signed_json(&raw)?;
-    let projected = project_schema_ref("applicationAad", &strict, false)?;
-    let cbor = serde_ipld_dagcbor::to_vec(&projected)
-        .map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let mut aad = Vec::with_capacity(b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0".len() + cbor.len());
-    aad.extend_from_slice(b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0");
-    aad.extend_from_slice(&cbor);
-    Ok(aad)
+    canonical_aad_with_domain(
+        b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0",
+        "applicationAad",
+        aad_json,
+    )
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_aad_bytes(
     aad_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
-    let raw =
-        serde_json::to_vec(aad_json).map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let strict = parse_strict_signed_json(&raw)?;
-    let projected = project_schema_ref("metadataAad", &strict, false)?;
-    let cbor = serde_ipld_dagcbor::to_vec(&projected)
-        .map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let mut aad = Vec::with_capacity(b"CATBIRD-CHAT-METADATA\0".len() + cbor.len());
-    aad.extend_from_slice(b"CATBIRD-CHAT-METADATA\0");
-    aad.extend_from_slice(&cbor);
-    Ok(aad)
+    canonical_aad_with_domain(b"CATBIRD-CHAT-METADATA\0", "metadataAad", aad_json)
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_exporter_context_bytes(
     context_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
-    let raw = serde_json::to_vec(context_json)
-        .map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let strict = parse_strict_signed_json(&raw)?;
-    let projected = project_schema_ref("metadataExporterContext", &strict, false)?;
-    serde_ipld_dagcbor::to_vec(&projected).map_err(|e| TransportError::Serialization(e.to_string()))
+    canonical_cbor_for_schema_impl("metadataExporterContext", context_json, false)
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_content_signing_input(
     content_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
-    let raw = serde_json::to_vec(content_json)
-        .map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let strict = parse_strict_signed_json(&raw)?;
-    let projected = project_schema_ref("metadataContentProjection", &strict, false)?;
-    let cbor = serde_ipld_dagcbor::to_vec(&projected)
-        .map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let mut out = Vec::with_capacity(b"CATBIRD-CHAT-METADATA-CONTENT\0".len() + cbor.len());
-    out.extend_from_slice(b"CATBIRD-CHAT-METADATA-CONTENT\0");
-    out.extend_from_slice(&cbor);
-    Ok(out)
+    canonical_aad_with_domain(
+        b"CATBIRD-CHAT-METADATA-CONTENT\0",
+        "metadataContentProjection",
+        content_json,
+    )
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_application_content(
     frame_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
-    let raw =
-        serde_json::to_vec(frame_json).map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let strict = parse_strict_signed_json(&raw)?;
-    let projected = project_schema_ref("applicationFrame", &strict, false)?;
-    serde_ipld_dagcbor::to_vec(&projected).map_err(|e| TransportError::Serialization(e.to_string()))
+    canonical_cbor_for_schema_impl("applicationFrame", frame_json, false)
 }
+
 pub(crate) fn prepare_signed_body(
     binding: &CleanChatSigningContext,
     operation: CanonicalOperation,
@@ -3476,7 +3454,7 @@ pub fn route_for_nsid(nsid: &str) -> Option<CanonicalRoute> {
         .map(canonical_route)
         .find(|route| route.nsid == nsid)
 }
-pub fn canonical_cbor_for_schema(
+fn canonical_cbor_for_schema_impl(
     definition_name: &str,
     json_value: &serde_json::Value,
     tagged: bool,
@@ -3486,6 +3464,15 @@ pub fn canonical_cbor_for_schema(
     let strict = parse_strict_signed_json(&raw)?;
     let projected = project_schema_ref(definition_name, &strict, tagged)?;
     serde_ipld_dagcbor::to_vec(&projected).map_err(|e| TransportError::Serialization(e.to_string()))
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn canonical_cbor_for_schema(
+    definition_name: &str,
+    json_value: &serde_json::Value,
+    tagged: bool,
+) -> Result<Vec<u8>, TransportError> {
+    canonical_cbor_for_schema_impl(definition_name, json_value, tagged)
 }
 
 #[test]

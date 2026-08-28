@@ -45,28 +45,26 @@ where
             let convo_id = convo.conversation_id.clone();
             let transition_lock = self.rejoin_lock(&convo_id).await;
             let transition_guard = transition_lock.lock().await;
-            let persisted_state = match self.storage().get_conversation_state(&convo_id).await {
-                Ok(state) => state,
-                Err(e) => {
-                    tracing::warn!(
-                        conversation_id = %convo_id,
-                        error = %e,
-                        "Failed to read persisted conversation state during startup reconcile"
-                    );
-                    self.conversation_states()
-                        .lock()
-                        .await
-                        .get(&convo_id)
-                        .cloned()
-                }
-            };
+            let persisted_state = self.storage().get_conversation_state(&convo_id).await?;
+
+            // Fail closed on either view of the reset authority: the helper
+            // re-reads storage, so a ResetPending seen by the first read must
+            // still win if a racing writer clears it in between.
+            let is_reset_pending = self
+                .reset_blocks_non_reset_transition_locked(&convo_id)
+                .await?
+                || matches!(
+                    persisted_state,
+                    Some(ConversationState::ResetPending { .. })
+                );
+
+            if is_reset_pending {
+                self.reset_pending_payload_result(&convo_id).await?;
+                report.reset_pending += 1;
+                continue;
+            }
 
             match persisted_state {
-                Some(ConversationState::ResetPending { .. }) => {
-                    let _ = self.reset_pending_payload_result(&convo_id).await?;
-                    report.reset_pending += 1;
-                    continue;
-                }
                 Some(state @ ConversationState::Quarantined { .. })
                 | Some(state @ ConversationState::Failed) => {
                     if self
@@ -102,17 +100,7 @@ where
             }
             drop(transition_guard);
 
-            let needs_rejoin = match self.storage().needs_rejoin(&convo_id).await {
-                Ok(flag) => flag,
-                Err(e) => {
-                    tracing::warn!(
-                        conversation_id = %convo_id,
-                        error = %e,
-                        "needs_rejoin read failed during startup reconcile"
-                    );
-                    false
-                }
-            };
+            let needs_rejoin = self.storage().needs_rejoin(&convo_id).await?;
             if needs_rejoin {
                 // P0.2: same health-probe gate for the persisted boolean path —
                 // a sticky needs_rejoin=true on a healthy local group must not
@@ -126,25 +114,15 @@ where
                 continue;
             }
 
-            match self.local_group_epoch_result(&convo_id).await {
-                Ok(Some(_)) => {
-                    report.healthy += 1;
-                    continue;
-                }
-                Ok(None) => {
+            match self.local_group_epoch_result(&convo_id).await? {
+                Some(_) => report.healthy += 1,
+                None => {
                     tracing::info!(
                         conversation_id = %convo_id,
                         "Startup reconcile marked missing local group for rejoin"
                     );
                     self.project_startup_needs_rejoin(&convo_id).await;
                     report.needs_rejoin += 1;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        conversation_id = %convo_id,
-                        error = %err,
-                        "Startup reconcile preserved existing state after local epoch probe failed"
-                    );
                 }
             }
         }
@@ -596,7 +574,9 @@ where
                                             error = %e,
                                             "Failed to join group via join_or_rejoin; falling back to requesting leaf recovery"
                                         );
-                                        if let Err(rec_err) = self.accept_conversation(conversation_id).await {
+                                        if let Err(rec_err) =
+                                            self.accept_conversation(conversation_id).await
+                                        {
                                             tracing::warn!(
                                                 conversation_id = %conversation_id,
                                                 group_id = %group_id,

@@ -302,7 +302,13 @@ where
     ) -> Result<GroupMutationResult> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
-        crate::async_runtime::block_on(self.orchestrator.add_members(convo_id, member_dids))?;
+        if !member_dids.is_empty() {
+            crate::async_runtime::block_on(self.orchestrator.swap_members(
+                convo_id,
+                &[],
+                member_dids,
+            ))?;
+        }
         let conversation = self.refresh_conversation_snapshot(convo_id)?;
         Ok(GroupMutationResult { conversation })
     }

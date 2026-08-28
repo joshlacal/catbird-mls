@@ -132,7 +132,9 @@ where
             CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
         }
 
-        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let resolved = self
+            .resolve_legacy_group_identifier(conversation_id)
+            .await?;
 
         // Enforce the same device-key authority for every public route,
         // including legacy callers that still pass a mutable group ID.
@@ -233,9 +235,11 @@ where
                     .await
                     .ok()
                     .map(|ctx| ctx.aad_bytes);
-                let remove_res = self
-                    .mls_context()
-                    .remove_members_with_aad(group_id_bytes.clone(), member_identities, aad_bytes)?;
+                let remove_res = self.mls_context().remove_members_with_aad(
+                    group_id_bytes.clone(),
+                    member_identities,
+                    aad_bytes,
+                )?;
                 (
                     remove_res.commit_data,
                     None,
@@ -255,13 +259,19 @@ where
                     remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
                 let (commit_bytes, welcome_bytes) = if add_dids.is_empty() {
                     let aad_bytes = self
-                        .prepare_commit_aad_context(conversation_id, &group_id_bytes, source_epoch + 1)
+                        .prepare_commit_aad_context(
+                            conversation_id,
+                            &group_id_bytes,
+                            source_epoch + 1,
+                        )
                         .await
                         .ok()
                         .map(|ctx| ctx.aad_bytes);
-                    let remove_res = self
-                        .mls_context()
-                        .remove_members_with_aad(group_id_bytes.clone(), remove_ids, aad_bytes)?;
+                    let remove_res = self.mls_context().remove_members_with_aad(
+                        group_id_bytes.clone(),
+                        remove_ids,
+                        aad_bytes,
+                    )?;
                     (remove_res.commit_data, None)
                 } else {
                     let swap_result = self.mls_context().swap_members(
@@ -379,7 +389,9 @@ where
         component_id: u16,
         data: Option<Vec<u8>>,
     ) -> Result<CommitPlan> {
-        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let resolved = self
+            .resolve_legacy_group_identifier(conversation_id)
+            .await?;
         let group_id = &resolved.group_id;
         let conversation_id = &resolved.conversation_id;
         let group_id_bytes = hex::decode(group_id)
@@ -393,13 +405,13 @@ where
                 )));
             }
         }
-        let source_epoch = self
-            .mls_context()
-            .get_epoch(group_id_bytes.clone())?;
+        let source_epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
 
-        let commit_bytes = self
-            .mls_context()
-            .stage_app_data_update_for_test(group_id_bytes.clone(), component_id, data)?;
+        let commit_bytes = self.mls_context().stage_app_data_update_for_test(
+            group_id_bytes.clone(),
+            component_id,
+            data,
+        )?;
 
         let user_did = self.require_user_did().await?;
         let scoped_identity = match self.credentials().get_device_uuid(&user_did).await? {
@@ -447,7 +459,6 @@ where
             target_epoch,
         })
     }
-
 
     /// Confirm a previously staged commit: merge it locally, advance the
     /// epoch, durably project the resulting group state, update the in-memory

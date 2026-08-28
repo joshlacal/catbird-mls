@@ -1739,7 +1739,11 @@ impl MLSAPIClient for MockDeliveryService {
                     .effective_did_from_guard(&guard)
                     .unwrap_or_else(|| "did:plc:mock".to_string());
 
-                let server_entry_id = uuid::Uuid::new_v4().to_string();
+                let server_entry_id = if message_id.is_empty() {
+                    uuid::Uuid::new_v4().to_string()
+                } else {
+                    message_id.to_string()
+                };
                 let msg = StoredMessage {
                     id: server_entry_id.clone(),
                     conversation_id: convo_id.to_string(),
@@ -1940,14 +1944,22 @@ impl MLSAPIClient for MockDeliveryService {
                     .get("prior")
                     .and_then(|p| p.get("conversationId"))
                     .or_else(|| inner_body.get("conversationId"))
+                    .or_else(|| inner_body.get("aad").and_then(|a| a.get("conversationId")))
                     .and_then(|c| c.as_str())
+                    .map(|c| {
+                        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(c) {
+                            if let Ok(uuid) = uuid::Uuid::from_slice(&bytes) {
+                                return uuid.to_string();
+                            }
+                        }
+                        c.to_string()
+                    })
                     .unwrap_or_default();
                 let delay_ms = self.state.lock().unwrap().process_external_commit_delay_ms;
                 if delay_ms > 0 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
                 let mut guard = self.state.lock().unwrap();
-                *guard.external_commit_counts.entry(convo_id.to_string()).or_default() += 1;
                 let idempotency_key = inner_body
                     .get("idempotencyKey")
                     .and_then(|i| i.as_str())
@@ -1992,7 +2004,7 @@ impl MLSAPIClient for MockDeliveryService {
                     let output = serde_json::json!({
                         "result": {
                             "applied": false,
-                            "epoch": guard.conversations.get(convo_id).map_or(0, |c| c.view.epoch)
+                            "epoch": guard.conversations.get(&convo_id).map_or(0, |c| c.view.epoch)
                         }
                     });
                     return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
@@ -2021,8 +2033,8 @@ impl MLSAPIClient for MockDeliveryService {
 
                 let key_pkg_dids: Vec<String> = guard.key_packages.keys().cloned().collect();
                 let is_policy_transition = inner_body.get("participantChanges").is_some();
-                let mut new_epoch = if let Some(stored) = if guard.conversations.contains_key(convo_id) {
-                    guard.conversations.get(convo_id)
+                let mut new_epoch = if let Some(stored) = if guard.conversations.contains_key(&convo_id) {
+                    guard.conversations.get(&convo_id)
                 } else {
                     guard.conversations.values().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
                 } {
@@ -2031,13 +2043,16 @@ impl MLSAPIClient for MockDeliveryService {
                     0
                 };
                 if !is_policy_transition {
-                    if let Some(stored) = if guard.conversations.contains_key(convo_id) {
-                        guard.conversations.get_mut(convo_id)
+                    if let Some(stored) = if guard.conversations.contains_key(&convo_id) {
+                        guard.conversations.get_mut(&convo_id)
                     } else {
                         guard.conversations.values_mut().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id)
                     } {
                         stored.view.epoch += 1;
                         new_epoch = stored.view.epoch;
+                        if let Some(snapshot) = inner_body.get("metadataSnapshot") {
+                            stored.metadata_snapshot = Some(snapshot.clone());
+                        }
                         let leaf_changes = inner_body.get("manifest").and_then(|m| m.get("leafChanges")).and_then(|l| l.as_array());
                         if let Some(changes) = leaf_changes.filter(|c| !c.is_empty()) {
                             for change in changes {
@@ -2065,6 +2080,27 @@ impl MLSAPIClient for MockDeliveryService {
                     .and_then(|b| b.as_str())
                     .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
                     .unwrap_or_default();
+                let is_commit_transition = inner_body
+                    .get("$type")
+                    .and_then(|t| t.as_str())
+                    .map_or(false, |t| t == "blue.catbird.chat.defs#commitTransitionBody");
+                let is_external = is_commit_transition
+                    && inner_body
+                        .get("next")
+                        .and_then(|n| n.get("stateVersion"))
+                        .and_then(|v| v.as_i64())
+                        .map_or(false, |sv| sv == 0);
+                if is_external {
+                    *guard.external_commit_counts.entry(convo_id.to_string()).or_default() += 1;
+                    let group_id_opt = if let Some(c) = guard.conversations.get(&convo_id) {
+                        Some(c.view.group_id.clone())
+                    } else {
+                        guard.conversations.values().find(|c| c.view.conversation_id == convo_id || c.view.group_id == convo_id).map(|c| c.view.group_id.clone())
+                    };
+                    if let Some(gid) = group_id_opt {
+                        *guard.external_commit_counts.entry(gid).or_default() += 1;
+                    }
+                }
                 if !commit_bytes.is_empty() {
                     guard
                         .messages
@@ -2094,7 +2130,7 @@ impl MLSAPIClient for MockDeliveryService {
                             .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
                     });
                 if let Some(w_bytes) = welcome_bytes_opt {
-                    let group_id_opt = guard.conversations.get(convo_id).map(|c| c.view.group_id.clone());
+                    let group_id_opt = guard.conversations.get(&convo_id).map(|c| c.view.group_id.clone());
                     for (k, _) in guard.key_packages.clone() {
                         if k != did {
                             guard

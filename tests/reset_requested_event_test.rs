@@ -1453,7 +1453,7 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .expect("create baseline conversation");
     alice
         .orchestrator
-        .add_members(&original.conversation_id, &[bob.did.clone()])
+        .swap_members(&original.conversation_id, &[], &[bob.did.clone()])
         .await
         .expect("add bob to baseline");
     let baseline_welcome = world
@@ -1491,7 +1491,7 @@ async fn loser_device_adopts_verified_winner_welcome_before_exact_reset_completi
         .expect("winner creates replacement group and Welcome");
     alice
         .orchestrator
-        .add_members(&winner.conversation_id, &[bob.did.clone()])
+        .swap_members(&winner.conversation_id, &[], &[bob.did.clone()])
         .await
         .expect("add bob to winner");
     world
@@ -1722,7 +1722,7 @@ async fn setup_winner_welcome_adoption_fixture(
         .expect("create baseline");
     alice
         .orchestrator
-        .add_members(&original.conversation_id, &[bob.did.clone()])
+        .swap_members(&original.conversation_id, &[], &[bob.did.clone()])
         .await
         .expect("add bob to baseline");
     let baseline_welcome = world
@@ -1755,7 +1755,7 @@ async fn setup_winner_welcome_adoption_fixture(
         .expect("create winner");
     alice
         .orchestrator
-        .add_members(&winner.conversation_id, &[bob.did.clone()])
+        .swap_members(&winner.conversation_id, &[], &[bob.did.clone()])
         .await
         .expect("add bob to winner");
     world

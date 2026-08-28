@@ -2,11 +2,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 use web_time::Instant;
 
+use crate::error::MLSError;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use sha2::{Digest, Sha256};
 use tls_codec::DeserializeBytes;
-use crate::error::MLSError;
 
 use super::api_client::MLSAPIClient;
 use super::constants;
@@ -1185,7 +1185,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -1207,8 +1209,9 @@ where
                 gc_hash.len()
             ))));
         }
-        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
 
         use rand::RngCore;
         let mut nonce = [0u8; 12];
@@ -1220,9 +1223,7 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self
-            .mls_context()
-            .safe_export_secret(gid.clone(), 0x8001)?;
+        let metadata_key = self.mls_context().safe_export_secret(gid.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -1233,7 +1234,11 @@ where
             1,
             &metadata_plaintext,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt metadata snapshot: {e:?}"
+            )))
+        })?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -1326,7 +1331,8 @@ where
         let send_res = self
             .submit_signed_clean_chat_request(
                 super::canonical_transport::CanonicalOperation::SubmitTransition,
-                serde_json::to_vec(&body).map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
+                serde_json::to_vec(&body)
+                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
             )
             .await;
 
@@ -2170,9 +2176,10 @@ where
         };
 
         let self_is_member = match self.require_user_did().await {
-            Ok(user_did) => members
-                .iter()
-                .any(|id| id.as_slice() == user_did.as_bytes()),
+            Ok(user_did) => members.iter().any(|identity| {
+                std::str::from_utf8(identity)
+                    .is_ok_and(|text| credential_root_matches_exact(text, &user_did))
+            }),
             Err(_) => false,
         };
 
@@ -2819,7 +2826,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -2845,8 +2854,9 @@ where
                 gc_hash.len()
             ))));
         }
-        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let convo_uuid = uuid::Uuid::parse_str(&resolved.conversation_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
 
         use rand::RngCore;
         let mut nonce = [0u8; 12];
@@ -2871,7 +2881,11 @@ where
             1,
             &metadata_plaintext,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt metadata snapshot: {e:?}"
+            )))
+        })?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -2973,8 +2987,12 @@ where
         let server_result: std::result::Result<AddMembersServerResult, OrchestratorError> =
             match server_resp {
                 Ok(resp) if resp.status == 200 => {
-                    let resp_json: serde_json::Value = serde_json::from_slice(&resp.body)
-                        .map_err(|e| OrchestratorError::Serialization(format!("SubmitTransition response: {e}")))?;
+                    let resp_json: serde_json::Value =
+                        serde_json::from_slice(&resp.body).map_err(|e| {
+                            OrchestratorError::Serialization(format!(
+                                "SubmitTransition response: {e}"
+                            ))
+                        })?;
                     let epoch = resp_json
                         .get("result")
                         .and_then(|r| r.get("epoch"))
@@ -3393,9 +3411,10 @@ where
         // recovery deliberately leaves the complete existing cursor unchanged.
 
         let scoped_identity = self.require_scoped_identity().await?;
-        let _ = self
-            .mls_context()
-            .export_group_info(ext_commit_result.group_id, scoped_identity.as_bytes().to_vec());
+        let _ = self.mls_context().export_group_info(
+            ext_commit_result.group_id,
+            scoped_identity.as_bytes().to_vec(),
+        );
 
         tracing::info!(convo_id, new_epoch = merged, "Force rejoin successful");
         Ok(())
@@ -5326,7 +5345,10 @@ where
         Ok(conversation.members.iter().map(|m| m.did.clone()).collect())
     }
 
-    pub(crate) async fn fetch_conversation_for_convo(&self, convo_id: &str) -> Result<ConversationView> {
+    pub(crate) async fn fetch_conversation_for_convo(
+        &self,
+        convo_id: &str,
+    ) -> Result<ConversationView> {
         let mut cursor: Option<String> = None;
         let mut pagination = PaginationGuard::for_conversations("reset conversation lookup");
         loop {
@@ -5655,14 +5677,18 @@ where
         let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
         let convo_id = &resolved.conversation_id;
         let group_id_bytes = resolved.group_id_bytes()?;
-        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone())?;
+        let gc_hash = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())?;
         if gc_hash.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "group context hash must be exactly 32 bytes, got {}",
                 gc_hash.len()
             ))));
         }
-        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?;
+        let tag_bytes = self
+            .mls_context()
+            .get_confirmation_tag(group_id_bytes.clone())?;
         if tag_bytes.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "confirmation tag must be exactly 32 bytes, got {}",
@@ -5721,7 +5747,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -5749,8 +5777,9 @@ where
                 gc_hash.len()
             ))));
         }
-        let convo_uuid = uuid::Uuid::parse_str(convo_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
 
         use rand::RngCore;
         let mut nonce = [0u8; 12];
@@ -5775,7 +5804,11 @@ where
             1,
             &metadata_plaintext,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt metadata snapshot: {e:?}"
+            )))
+        })?;
 
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
@@ -5915,11 +5948,7 @@ where
         })
     }
 
-    async fn submit_reset_request_prepared(
-        &self,
-        convo_id: &str,
-        reason: &str,
-    ) -> Result<()> {
+    async fn submit_reset_request_prepared(&self, convo_id: &str, reason: &str) -> Result<()> {
         let reason_enum = match reason {
             "localStateLost" | "poisonedState" | "epochDivergence" | "manualRecovery" => reason,
             _ => "manualRecovery",
@@ -5932,7 +5961,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -5941,14 +5972,18 @@ where
         let key_id = super::canonical_transport::derive_key_id(&public_key);
         let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
         let group_id_bytes = resolved.group_id_bytes()?;
-        let gc_hash = self.mls_context().get_group_context_hash(group_id_bytes.clone())?;
+        let gc_hash = self
+            .mls_context()
+            .get_group_context_hash(group_id_bytes.clone())?;
         if gc_hash.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "group context hash must be exactly 32 bytes, got {}",
                 gc_hash.len()
             ))));
         }
-        let tag_bytes = self.mls_context().get_confirmation_tag(group_id_bytes.clone())?;
+        let tag_bytes = self
+            .mls_context()
+            .get_confirmation_tag(group_id_bytes.clone())?;
         if tag_bytes.len() != 32 {
             return Err(OrchestratorError::Mls(MLSError::Internal(format!(
                 "confirmation tag must be exactly 32 bytes, got {}",
@@ -6000,7 +6035,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         let scoped_identity = self.require_scoped_identity().await?;
         let public_key = self
@@ -6012,33 +6049,73 @@ where
             .map_err(|_| OrchestratorError::InvalidInput("invalid new_group_id hex".into()))?;
         let (group_info_group_id, successor_epoch) = {
             let (gid, epoch) = {
-                crate::message_limits::validate_inbound_mls_message_len(group_info.len(), "group_info")?;
+                crate::message_limits::validate_inbound_mls_message_len(
+                    group_info.len(),
+                    "group_info",
+                )?;
                 let (message, remaining) = MlsMessageIn::tls_deserialize_bytes(group_info)
                     .map_err(|_| OrchestratorError::InvalidInput("malformed GroupInfo".into()))?;
-                if !remaining.is_empty() { return Err(OrchestratorError::InvalidInput("GroupInfo trailing bytes".into())); }
+                if !remaining.is_empty() {
+                    return Err(OrchestratorError::InvalidInput(
+                        "GroupInfo trailing bytes".into(),
+                    ));
+                }
                 match message.extract() {
-                    MlsMessageBodyIn::GroupInfo(info) => (info.group_id().as_slice().to_vec(), info.epoch().as_u64()),
+                    MlsMessageBodyIn::GroupInfo(info) => {
+                        (info.group_id().as_slice().to_vec(), info.epoch().as_u64())
+                    }
                     _ => return Err(OrchestratorError::InvalidInput("not GroupInfo".into())),
                 }
             };
             (gid, epoch)
         };
         if group_info_group_id != new_group_id_bytes || successor_epoch != 0 {
-            return Err(OrchestratorError::InvalidInput("exported reset GroupInfo coordinate mismatch".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "exported reset GroupInfo coordinate mismatch".into(),
+            ));
         }
         let prior_context = self.resolve_conversation_context(convo_id).await?;
         let prior_group_id = prior_context.group_id_bytes()?;
         let prior_epoch = self.mls_context().get_epoch(prior_group_id.clone())?;
-        let prior_tag: [u8; 32] = self.mls_context().get_confirmation_tag(prior_group_id.clone())?.try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("prior confirmation tag length mismatch".into())))?;
-        let prior_gc_hash: [u8; 32] = self.mls_context().get_group_context_hash(prior_group_id.clone())?.try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("prior group context hash length mismatch".into())))?;
-        let successor_tag: [u8; 32] = self.mls_context().get_confirmation_tag(new_group_id_bytes.clone())?.try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("successor confirmation tag length mismatch".into())))?;
-        let successor_gc_hash: [u8; 32] = self.mls_context().get_group_context_hash(new_group_id_bytes.clone())?.try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("successor group context hash length mismatch".into())))?;
-        let convo_uuid = uuid::Uuid::parse_str(convo_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let prior_tag: [u8; 32] = self
+            .mls_context()
+            .get_confirmation_tag(prior_group_id.clone())?
+            .try_into()
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal(
+                    "prior confirmation tag length mismatch".into(),
+                ))
+            })?;
+        let prior_gc_hash: [u8; 32] = self
+            .mls_context()
+            .get_group_context_hash(prior_group_id.clone())?
+            .try_into()
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal(
+                    "prior group context hash length mismatch".into(),
+                ))
+            })?;
+        let successor_tag: [u8; 32] = self
+            .mls_context()
+            .get_confirmation_tag(new_group_id_bytes.clone())?
+            .try_into()
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal(
+                    "successor confirmation tag length mismatch".into(),
+                ))
+            })?;
+        let successor_gc_hash: [u8; 32] = self
+            .mls_context()
+            .get_group_context_hash(new_group_id_bytes.clone())?
+            .try_into()
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal(
+                    "successor group context hash length mismatch".into(),
+                ))
+            })?;
+        let convo_uuid = uuid::Uuid::parse_str(convo_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
         let prior_generation = payload.reset_generation;
 
         use rand::RngCore;
@@ -6051,7 +6128,9 @@ where
             avatar_blob_locator: None,
             avatar_content_type: None,
         };
-        let metadata_key = self.mls_context().safe_export_secret(new_group_id_bytes.clone(), 0x8001)?;
+        let metadata_key = self
+            .mls_context()
+            .safe_export_secret(new_group_id_bytes.clone(), 0x8001)?;
         let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
             OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
         })?;
@@ -6062,7 +6141,11 @@ where
             1,
             &metadata_plaintext,
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt metadata snapshot: {e:?}"
+            )))
+        })?;
 
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#resetActivationBody",
@@ -6240,19 +6323,92 @@ mod tests {
         world.add_client("Bob").await;
         world.register_device("Alice").await.unwrap();
         let bob_did = world.register_device("Bob").await.unwrap();
-        let group = world
-            .client("Alice")
+        let alice = world.client("Alice");
+        let bob = world.client("Bob");
+        let group = alice
             .orchestrator
-            .create_group(label, Some(&[bob_did]), None)
+            .create_group(label, Some(std::slice::from_ref(&bob_did)), None)
             .await
             .expect("create fork fixture");
-        let epoch = world
-            .client("Alice")
+
+        let bob_device_id = bob
+            .orchestrator
+            .require_actor_device_id()
+            .await
+            .expect("bob device id");
+        let key_package = bob
+            .orchestrator
+            .mls_context()
+            .create_key_package(format!("{bob_did}#{bob_device_id}").into_bytes())
+            .expect("create Bob fork fixture key package");
+        world
+            .delivery_service()
+            .add_leaf_recovery_inbox_item(serde_json::json!({
+                "recovery": {
+                    "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
+                    "conversationId": group.conversation_id,
+                    "requesterDid": bob_did,
+                    "requesterDeviceId": bob_device_id,
+                    "recoveryKind": "add",
+                    "status": "open",
+                    "reservation": {
+                        "keyPackageRef": STANDARD.encode(&key_package.hash_ref),
+                        "keyPackage": {
+                            "bytes": STANDARD.encode(&key_package.key_package_data)
+                        }
+                    }
+                }
+            }));
+        assert_eq!(
+            alice
+                .orchestrator
+                .fulfill_pending_leaf_recoveries()
+                .await
+                .expect("add Bob to fork fixture"),
+            1,
+            "fork fixture must contain a complement member"
+        );
+
+        let epoch = alice
             .orchestrator
             .mls_context()
             .get_epoch(hex::decode(&group.group_id).expect("group id hex"))
             .expect("source epoch");
+        assert_eq!(epoch, 1, "Bob add commit must advance the fixture");
+        let mut durable_state = alice
+            .storage
+            .get_group_state(&group.group_id)
+            .await
+            .expect("read fork fixture group state")
+            .expect("fork fixture group state exists");
+        durable_state.epoch = epoch;
+        alice
+            .storage
+            .set_group_state(&durable_state)
+            .await
+            .expect("persist fork fixture add epoch");
+        alice
+            .orchestrator
+            .group_states()
+            .lock()
+            .await
+            .insert(group.group_id.clone(), durable_state);
         (world, group.conversation_id, group.group_id, epoch)
+    }
+
+    #[cfg(feature = "fork-resolution")]
+    fn canonical_transition_submission_count(
+        world: &crate::recovery_e2e_harness::TestWorld,
+    ) -> usize {
+        world
+            .delivery_service()
+            .submitted_prepared_requests()
+            .iter()
+            .filter(|request| {
+                request.operation
+                    == crate::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
+            })
+            .count()
     }
 
     #[cfg(feature = "fork-resolution")]
@@ -6271,6 +6427,7 @@ mod tests {
             .mls_context()
             .get_epoch(hex::decode(&target.group_id).expect("target group id hex"))
             .expect("target epoch");
+        let submissions_before = canonical_transition_submission_count(&world);
 
         assert!(
             alice
@@ -6297,11 +6454,9 @@ mod tests {
             "ResetPending must reject fork readd at entry"
         );
         assert_eq!(
-            world
-                .delivery_service()
-                .commit_group_change_count(&conversation_id, "forkReadd"),
-            0,
-            "rejected fork readd must not submit a commit"
+            canonical_transition_submission_count(&world),
+            submissions_before,
+            "rejected fork readd must not submit a transition"
         );
         assert_eq!(
             alice
@@ -6328,18 +6483,12 @@ mod tests {
         let (world, conversation_id, group_id, source_epoch) =
             fork_readd_fixture("fork reset unreadable").await;
         let alice = world.client("Alice");
+        let submissions_before = canonical_transition_submission_count(&world);
         assert!(
             alice
                 .orchestrator
                 .project_fork_detected_if_active(&conversation_id, source_epoch)
                 .await
-        );
-        assert_eq!(
-            world
-                .delivery_service()
-                .commit_group_change_count(&conversation_id, "forkReadd"),
-            0,
-            "failed-closed authority read must not submit a commit"
         );
         alice
             .storage
@@ -6352,6 +6501,11 @@ mod tests {
                 .await
                 .is_err(),
             "unreadable reset authority must reject fork readd"
+        );
+        assert_eq!(
+            canonical_transition_submission_count(&world),
+            submissions_before,
+            "failed-closed authority read must not submit a transition"
         );
         assert_eq!(
             alice
@@ -6370,6 +6524,7 @@ mod tests {
         let (world, conversation_id, _group_id, source_epoch) =
             fork_readd_fixture("fork missing projection").await;
         let alice = world.client("Alice");
+        let submissions_before = canonical_transition_submission_count(&world);
         assert!(
             alice
                 .orchestrator
@@ -6394,10 +6549,8 @@ mod tests {
             "missing durable-projection source must fail closed, got {result:?}"
         );
         assert_eq!(
-            world
-                .delivery_service()
-                .commit_group_change_count(&conversation_id, "forkReadd"),
-            0,
+            canonical_transition_submission_count(&world),
+            submissions_before,
             "missing projection must be detected before server submission"
         );
         assert_eq!(
@@ -6418,6 +6571,7 @@ mod tests {
         let (world, conversation_id, group_id, source_epoch) =
             fork_readd_fixture("fork durable projection failure").await;
         let alice = world.client("Alice");
+        let submissions_before = canonical_transition_submission_count(&world);
         assert!(
             alice
                 .orchestrator
@@ -6458,11 +6612,9 @@ mod tests {
             "durable projection failure must abort fork readd, got {result:?}"
         );
         assert_eq!(
-            world
-                .delivery_service()
-                .commit_group_change_count(&conversation_id, "forkReadd"),
-            1,
-            "failure injection must occur after server acceptance and local merge"
+            canonical_transition_submission_count(&world),
+            submissions_before + 1,
+            "failure injection must occur after canonical server acceptance and local merge"
         );
         assert_eq!(
             alice

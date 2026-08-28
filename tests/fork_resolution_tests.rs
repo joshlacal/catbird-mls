@@ -4,8 +4,8 @@ mod e2e_harness;
 
 use std::sync::{Arc, Mutex};
 
-use base64::Engine as _;
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use catbird_mls::orchestrator::error::{OrchestratorError, Result as OrchestratorResult};
 use catbird_mls::orchestrator::{
     ConversationState, GroupState, IncomingEnvelope, MLSAPIClient, MLSOrchestrator,
@@ -23,11 +23,29 @@ use e2e_harness::{TestClient, TestWorld};
 use openmls::prelude::{MlsMessageIn, Welcome};
 use tls_codec::Deserialize;
 
+/// Canonical requests carry their payload as `{"signedRequest": {"body": …}}`, `{"body": …}`,
+/// or as the bare payload itself.
+fn canonical_body(wrapper: &serde_json::Value) -> &serde_json::Value {
+    wrapper
+        .get("signedRequest")
+        .and_then(|signed| signed.get("body"))
+        .or_else(|| wrapper.get("body"))
+        .unwrap_or(wrapper)
+}
+
+/// Canonical byte fields serialize either as `{"$bytes": "<base64>"}` or as a bare base64 string.
+fn base64_field<'a>(body: &'a serde_json::Value, pointer: &str) -> Option<&'a str> {
+    let value = body.pointer(pointer)?;
+    value
+        .get("$bytes")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.as_str())
+}
+
 #[derive(Debug, Clone)]
 struct CommitSubmission {
     convo_id: String,
     commit_data: Vec<u8>,
-    action: String,
     confirmation_tag: Option<String>,
 }
 
@@ -80,35 +98,75 @@ impl MLSAPIClient for RecordingCommitApi {
         &self,
         request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
     ) -> OrchestratorResult<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
-        if self.fail_commits
-            && request.operation
-                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
-        {
-            return Err(OrchestratorError::Api(
-                "injected commit failure".to_string(),
-            ));
-        }
-        if request.operation
-            == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestReset
-        {
-            if let Some(ref b) = request.body {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(b) {
-                    let body_obj = v.get("signedRequest").and_then(|s| s.get("body")).or_else(|| v.get("body")).unwrap_or(&v);
-                    let prior = body_obj.get("prior");
-                    let convo_id = prior
-                        .and_then(|p| p.get("conversationId"))
-                        .or_else(|| body_obj.get("conversationId"))
-                        .and_then(|c| c.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let auth = prior
-                        .and_then(|p| p.get("groupContextHash"))
-                        .and_then(|g| g.as_str().or_else(|| g.get("$bytes").and_then(|b| b.as_str())))
-                        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-                        .map(|bytes| hex::encode(bytes));
-                    self.recovery_reports.lock().unwrap().push((convo_id, auth));
+        use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+
+        match request.operation {
+            CanonicalOperation::SubmitTransition => {
+                let wrapper: serde_json::Value = serde_json::from_slice(
+                    request
+                        .body
+                        .as_deref()
+                        .ok_or_else(|| OrchestratorError::Serialization("missing body".into()))?,
+                )
+                .map_err(|error| OrchestratorError::Serialization(error.to_string()))?;
+                let body = canonical_body(&wrapper);
+                let convo_id = body
+                    .pointer("/prior/conversationId")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        OrchestratorError::Serialization(
+                            "submitTransition missing prior conversationId".into(),
+                        )
+                    })?
+                    .to_string();
+                let commit_data = base64_field(body, "/commit/bytes")
+                    .ok_or_else(|| {
+                        OrchestratorError::Serialization(
+                            "submitTransition missing commit bytes".into(),
+                        )
+                    })
+                    .and_then(|encoded| {
+                        STANDARD
+                            .decode(encoded)
+                            .map_err(|error| OrchestratorError::Serialization(error.to_string()))
+                    })?;
+                let confirmation_tag =
+                    base64_field(body, "/next/confirmationTag").map(ToString::to_string);
+                self.submissions.lock().unwrap().push(CommitSubmission {
+                    convo_id,
+                    commit_data,
+                    confirmation_tag,
+                });
+
+                if self.fail_commits {
+                    return Err(OrchestratorError::Api(
+                        "injected commit failure".to_string(),
+                    ));
                 }
             }
+            CanonicalOperation::RequestReset => {
+                let parsed = request
+                    .body
+                    .as_deref()
+                    .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok());
+                if let Some(wrapper) = parsed {
+                    let body = canonical_body(&wrapper);
+                    let convo_id = body
+                        .pointer("/prior/conversationId")
+                        .or_else(|| body.get("conversationId"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let authenticator = base64_field(body, "/prior/groupContextHash")
+                        .and_then(|encoded| STANDARD.decode(encoded).ok())
+                        .map(hex::encode);
+                    self.recovery_reports
+                        .lock()
+                        .unwrap()
+                        .push((convo_id, authenticator));
+                }
+            }
+            _ => {}
         }
         self.inner.submit_prepared_request(request).await
     }
@@ -294,16 +352,73 @@ async fn setup_alice_bob_group(label: &str) -> (TestWorld, String) {
 
     world.register_device("Alice").await.unwrap();
     let bob_did = world.register_device("Bob").await.unwrap();
-
-    let group_id = world
-        .client("Alice")
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let created = alice
         .orchestrator
-        .create_group(label, Some(&[bob_did]), None)
+        .create_group(label, Some(std::slice::from_ref(&bob_did)), None)
         .await
-        .expect("Alice create_group with Bob should succeed")
-        .group_id;
+        .expect("Alice create_group with Bob should succeed");
 
-    (world, group_id)
+    let bob_device_id = bob
+        .orchestrator
+        .require_actor_device_id()
+        .await
+        .expect("Bob device id");
+    let key_package = bob
+        .orchestrator
+        .mls_context()
+        .create_key_package(format!("{bob_did}#{bob_device_id}").into_bytes())
+        .expect("Bob fork fixture key package");
+    world
+        .delivery_service()
+        .add_leaf_recovery_inbox_item(serde_json::json!({
+            "recovery": {
+                "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
+                "conversationId": created.conversation_id,
+                "requesterDid": bob_did,
+                "requesterDeviceId": bob_device_id,
+                "recoveryKind": "add",
+                "status": "open",
+                "reservation": {
+                    "keyPackageRef": STANDARD.encode(&key_package.hash_ref),
+                    "keyPackage": {
+                        "bytes": STANDARD.encode(&key_package.key_package_data)
+                    }
+                }
+            }
+        }));
+    assert_eq!(
+        alice
+            .orchestrator
+            .fulfill_pending_leaf_recoveries()
+            .await
+            .expect("add Bob to fork fixture"),
+        1
+    );
+
+    let epoch = epoch_for(alice, &created.group_id);
+    assert_eq!(epoch, 1);
+    let mut durable_state = alice
+        .storage
+        .get_group_state(&created.group_id)
+        .await
+        .expect("read fork fixture group state")
+        .expect("fork fixture group state exists");
+    durable_state.epoch = epoch;
+    alice
+        .storage
+        .set_group_state(&durable_state)
+        .await
+        .expect("persist fork fixture add epoch");
+    alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .insert(created.group_id.clone(), durable_state);
+
+    (world, created.group_id)
 }
 
 fn epoch_for(client: &TestClient, group_id: &str) -> u64 {
@@ -312,6 +427,60 @@ fn epoch_for(client: &TestClient, group_id: &str) -> u64 {
         .mls_context()
         .get_epoch(hex::decode(group_id).expect("valid group id hex"))
         .expect("get_epoch should succeed")
+}
+
+async fn conversation_id_for(client: &TestClient, group_id: &str) -> String {
+    client
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .values()
+        .find(|conversation| conversation.group_id == group_id)
+        .expect("conversation mapping for group")
+        .conversation_id
+        .clone()
+}
+
+/// Mirror the server-authorized rotation of `group_id` onto a fresh stable conversation id,
+/// retiring the superseded projection, and return the new stable conversation id.
+async fn rotate_to_stable_conversation(
+    world: &TestWorld,
+    client: &TestClient,
+    group_id: &str,
+) -> String {
+    let stable_conversation_id = uuid::Uuid::new_v4().to_string();
+    world
+        .delivery_service()
+        .rekey_conversation_for_test(group_id, &stable_conversation_id);
+    client
+        .storage
+        .ensure_conversation_exists(&client.did, &stable_conversation_id, group_id)
+        .await
+        .expect("migrate stable conversation storage row");
+    client
+        .storage
+        .set_conversation_state(&stable_conversation_id, ConversationState::Active)
+        .await
+        .expect("persist migrated stable conversation as Active");
+    client
+        .storage
+        .delete_conversations(&client.did, &[group_id])
+        .await
+        .expect("retire superseded stable-conversation projection");
+    {
+        let mut conversations = client.orchestrator.conversations().lock().await;
+        if let Some(mut migrated) = conversations.remove(group_id) {
+            migrated.conversation_id = stable_conversation_id.clone();
+            conversations.insert(stable_conversation_id.clone(), migrated);
+        }
+    }
+    client
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("refresh rotated stable conversation mapping");
+    stable_conversation_id
 }
 
 async fn build_recording_orchestrator(
@@ -334,27 +503,23 @@ async fn build_recording_orchestrator(
         .await
         .unwrap();
 
-    let source_group_state = {
-        source
-            .orchestrator
-            .group_states()
-            .lock()
-            .await
-            .get(group_id)
-            .cloned()
-            .expect("source group state should exist")
-    };
-    let source_conversation = {
-        source
-            .orchestrator
-            .conversations()
-            .lock()
-            .await
-            .values()
-            .find(|conversation| conversation.group_id == group_id)
-            .cloned()
-            .expect("source conversation mapping should exist")
-    };
+    let source_group_state = source
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .get(group_id)
+        .cloned()
+        .expect("source group state should exist");
+    let source_conversation = source
+        .orchestrator
+        .conversations()
+        .lock()
+        .await
+        .values()
+        .find(|conversation| conversation.group_id == group_id)
+        .cloned()
+        .expect("source conversation mapping should exist");
 
     orchestrator
         .group_states()
@@ -413,7 +578,10 @@ async fn fork_readd_stages_server_submit_ready_commit_without_merging_first() {
     let key_packages = alice
         .orchestrator
         .api_client()
-        .get_key_packages("00000000-0000-4000-8000-000000000001", &[alice.did.clone(), bob_did])
+        .get_key_packages(
+            "00000000-0000-4000-8000-000000000001",
+            &[alice.did.clone(), bob_did],
+        )
         .await
         .expect("key packages should be available");
     assert!(
@@ -462,18 +630,18 @@ async fn fork_readd_orchestrator_submits_then_merges_and_clears_state() {
     let alice = world.client("Alice");
     let bob_did = world.client("Bob").did.clone();
     let source_epoch = epoch_for(alice, &group_id);
+    let conversation_id = conversation_id_for(alice, &group_id).await;
 
     let api = RecordingCommitApi::new(world.api_service.clone_as(&alice.did), false);
     let api_probe = api.clone();
     let orchestrator = build_recording_orchestrator(alice, api, &group_id).await;
 
-    trigger_fork_detection(&orchestrator, &group_id, &bob_did).await;
+    trigger_fork_detection(&orchestrator, &conversation_id, &bob_did).await;
 
     let submissions = api_probe.submissions();
     assert_eq!(submissions.len(), 1, "fork recovery should submit once");
     let submitted = &submissions[0];
-    assert_eq!(submitted.convo_id, group_id);
-    assert_eq!(submitted.action, "forkReadd");
+    assert_eq!(submitted.convo_id, conversation_id);
     assert!(
         submitted
             .confirmation_tag
@@ -487,14 +655,14 @@ async fn fork_readd_orchestrator_submits_then_merges_and_clears_state() {
     assert_eq!(
         epoch_for(alice, &group_id),
         source_epoch + 1,
-        "orchestrator should merge locally only after commit_group_change ACK"
+        "orchestrator should merge locally only after canonical submitTransition ACK"
     );
     assert_eq!(
         orchestrator
             .conversation_states()
             .lock()
             .await
-            .get(&group_id),
+            .get(&conversation_id),
         Some(&ConversationState::Active),
         "successful fork readd should clear ForkDetected state"
     );
@@ -506,38 +674,7 @@ async fn fork_readd_resolves_rotated_stable_conversation_to_active_group() {
     let (world, group_id) = setup_alice_bob_group("fork-rotated-stable").await;
     let alice = world.client("Alice");
     let bob_did = world.client("Bob").did.clone();
-    let stable_conversation_id = format!("convo-{group_id}");
-
-    world
-        .delivery_service()
-        .rekey_conversation_for_test(&group_id, &stable_conversation_id);
-    alice
-        .storage
-        .ensure_conversation_exists(&alice.did, &stable_conversation_id, &group_id)
-        .await
-        .expect("migrate stable conversation storage row");
-    alice
-        .storage
-        .set_conversation_state(&stable_conversation_id, ConversationState::Active)
-        .await
-        .expect("persist migrated stable conversation as Active");
-    alice
-        .storage
-        .delete_conversations(&alice.did, &[&group_id])
-        .await
-        .expect("retire superseded stable-conversation projection");
-    {
-        let mut conversations = alice.orchestrator.conversations().lock().await;
-        if let Some(mut migrated) = conversations.remove(&group_id) {
-            migrated.conversation_id = stable_conversation_id.clone();
-            conversations.insert(stable_conversation_id.clone(), migrated);
-        }
-    }
-    alice
-        .orchestrator
-        .sync_with_server(false)
-        .await
-        .expect("refresh rotated stable conversation mapping");
+    let stable_conversation_id = rotate_to_stable_conversation(&world, alice, &group_id).await;
     let source_epoch = epoch_for(alice, &group_id);
 
     let api = RecordingCommitApi::new(world.api_service.clone_as(&alice.did), false);
@@ -545,7 +682,9 @@ async fn fork_readd_resolves_rotated_stable_conversation_to_active_group() {
     let orchestrator = build_recording_orchestrator(alice, api, &group_id).await;
     {
         let mut states = orchestrator.group_states().lock().await;
-        let current = states.remove(&group_id).expect("current group state");
+        let mut current = states.remove(&group_id).expect("current group state");
+        current.conversation_id = stable_conversation_id.clone();
+        current.members = vec![alice.did.clone(), bob_did.clone()];
         states.insert(stable_conversation_id.clone(), current);
     }
 
@@ -554,7 +693,6 @@ async fn fork_readd_resolves_rotated_stable_conversation_to_active_group() {
     let submissions = api_probe.submissions();
     assert_eq!(submissions.len(), 1, "fork recovery should submit once");
     assert_eq!(submissions[0].convo_id, stable_conversation_id);
-    assert_eq!(submissions[0].action, "forkReadd");
     assert_eq!(
         orchestrator
             .mls_context()
@@ -591,37 +729,7 @@ async fn recovery_vote_authenticator_ignores_stale_legacy_group_state() {
         .create_group("recovery-vote-unrelated", None, None)
         .await
         .expect("create unrelated group");
-    let stable_conversation_id = uuid::Uuid::new_v4().to_string();
-    world
-        .delivery_service()
-        .rekey_conversation_for_test(&group_id, &stable_conversation_id);
-    alice
-        .storage
-        .ensure_conversation_exists(&alice.did, &stable_conversation_id, &group_id)
-        .await
-        .expect("persist authorized stable-conversation migration");
-    alice
-        .storage
-        .set_conversation_state(&stable_conversation_id, ConversationState::Active)
-        .await
-        .expect("persist migrated stable conversation as Active");
-    alice
-        .storage
-        .delete_conversations(&alice.did, &[&group_id])
-        .await
-        .expect("retire superseded stable-conversation projection");
-    {
-        let mut conversations = alice.orchestrator.conversations().lock().await;
-        if let Some(mut migrated) = conversations.remove(&group_id) {
-            migrated.conversation_id = stable_conversation_id.clone();
-            conversations.insert(stable_conversation_id.clone(), migrated);
-        }
-    }
-    alice
-        .orchestrator
-        .sync_with_server(false)
-        .await
-        .expect("refresh rotated mapping");
+    let stable_conversation_id = rotate_to_stable_conversation(&world, alice, &group_id).await;
 
     let api = RecordingCommitApi::new(world.api_service.clone_as(&alice.did), false);
     let api_probe = api.clone();
@@ -660,12 +768,13 @@ async fn fork_readd_does_not_merge_and_falls_to_rejoin_when_submit_fails() {
     let alice = world.client("Alice");
     let bob_did = world.client("Bob").did.clone();
     let source_epoch = epoch_for(alice, &group_id);
+    let conversation_id = conversation_id_for(alice, &group_id).await;
 
     let api = RecordingCommitApi::new(world.api_service.clone_as(&alice.did), true);
     let api_probe = api.clone();
     let orchestrator = build_recording_orchestrator(alice, api, &group_id).await;
 
-    trigger_fork_detection(&orchestrator, &group_id, &bob_did).await;
+    trigger_fork_detection(&orchestrator, &conversation_id, &bob_did).await;
 
     let submissions = api_probe.submissions();
     assert_eq!(submissions.len(), 1, "fork recovery should submit once");
@@ -681,12 +790,12 @@ async fn fork_readd_does_not_merge_and_falls_to_rejoin_when_submit_fails() {
             .conversation_states()
             .lock()
             .await
-            .get(&group_id),
+            .get(&conversation_id),
         Some(&ConversationState::NeedsRejoin),
         "server submit failure should fall back to NeedsRejoin"
     );
     assert!(
-        alice.storage.has_rejoin_flag(&group_id),
+        alice.storage.has_rejoin_flag(&conversation_id),
         "NeedsRejoin fallback should be persisted"
     );
     let merge_attempt = alice

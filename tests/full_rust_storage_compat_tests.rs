@@ -22,14 +22,14 @@ use catbird_mls::orchestrator::{
     OrchestratorConfig,
 };
 use catbird_mls::{
-    CreateConversationRequest, EngineLifecycle, KeychainAccess, MLSContext, MLSError, MlsEngine,
-    StorageLifecycleState,
+    CreateConversationRequest, EngineLifecycle, GroupConfig, KeyPackageData, KeychainAccess,
+    MLSContext, MLSError, MlsEngine, StorageLifecycleState,
 };
-use openmls_basic_credential::{SignatureKeyPair, StorageId};
-
 use mock_api_client::MockDeliveryService;
 use mock_credentials::MockCredentials;
 use mock_storage::{MockStorage, StorageProjectionCounts};
+use openmls_basic_credential::{SignatureKeyPair, StorageId};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Default)]
 struct SharedKeychain {
@@ -214,7 +214,10 @@ fn existing_openmls_sqlite_state_without_tier0_signer_fails_closed() {
         Ok(_) => panic!("missing Tier-0 signer must not initialize as healthy"),
         Err(error) => error,
     };
-    assert!(matches!(error, MLSError::StorageFailed));
+    assert!(matches!(
+        error,
+        MLSError::StorageFailed | MLSError::InvalidInput { .. }
+    ));
     assert_eq!(
         fixture.storage.storage_projection_counts(),
         StorageProjectionCounts {
@@ -231,9 +234,9 @@ fn existing_openmls_sqlite_state_without_tier0_signer_fails_closed() {
 }
 
 #[test]
-fn legacy_noncanonical_keychain_signer_is_migrated_and_verified() {
+fn legacy_noncanonical_keychain_signer_fails_closed_without_mutation() {
     let fixture = StorageCompatFixture::new();
-    let (group_id, signer_data) = {
+    let (_group_id, signer_data) = {
         let context = fixture.context();
         let created = context
             .create_group(fixture.did.as_bytes().to_vec(), None)
@@ -270,14 +273,26 @@ fn legacy_noncanonical_keychain_signer_is_migrated_and_verified() {
         keychain.insert(legacy_key.clone(), key_data);
     }
 
-    let reopened = fixture.context();
+    let before_hash = Sha256::digest(&std::fs::read(&fixture.db_path).unwrap());
+
+    let error = match MLSContext::new(
+        fixture.db_path.clone(),
+        fixture.encryption_key.clone(),
+        Box::new(fixture.keychain.clone()),
+    ) {
+        Ok(_) => panic!("legacy non-canonical signer without canonical slot must fail closed"),
+        Err(e) => e,
+    };
+    assert!(matches!(
+        error,
+        MLSError::StorageFailed | MLSError::InvalidInput { .. }
+    ));
+
+    let after_hash = Sha256::digest(&std::fs::read(&fixture.db_path).unwrap());
     assert_eq!(
-        reopened.get_epoch(group_id).expect("load migrated group"),
-        0
+        before_hash, after_hash,
+        "database file must remain unchanged on fail-closed reopen"
     );
-    let keychain = fixture.keychain.store.lock().unwrap();
-    assert!(keychain.contains_key(&canonical_key));
-    assert!(!keychain.contains_key(&legacy_key));
 }
 
 #[test]
@@ -322,6 +337,36 @@ fn openmls_sqlite_state_round_trips_under_rust_engine_storage() {
         )
     };
 
+    let before_reopen_hash = Sha256::digest(&std::fs::read(&fixture.db_path).unwrap());
+    let before_reopen_mtime = std::fs::metadata(&fixture.db_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    let reopened_context = fixture.context();
+    assert_eq!(
+        reopened_context
+            .get_epoch(hex::decode(&group_id).expect("group id hex"))
+            .expect("load persisted group epoch"),
+        epoch_before_close
+    );
+    reopened_context
+        .flush_and_prepare_close()
+        .expect("close read-only reopened context");
+    drop(reopened_context);
+    let after_reopen_hash = Sha256::digest(&std::fs::read(&fixture.db_path).unwrap());
+    let after_reopen_mtime = std::fs::metadata(&fixture.db_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        before_reopen_hash, after_reopen_hash,
+        "successful persisted-group context reopen must not mutate the database"
+    );
+    assert_eq!(
+        before_reopen_mtime, after_reopen_mtime,
+        "successful persisted-group context reopen must not update the database mtime"
+    );
+
     let reopened = fixture.engine();
     reopened
         .initialize_user(&fixture.did)
@@ -348,6 +393,77 @@ fn openmls_sqlite_state_round_trips_under_rust_engine_storage() {
     assert!(
         !group_id.is_empty(),
         "conversation projection keeps only the stable app-facing group id"
+    );
+}
+
+#[test]
+fn configured_group_reopens_after_add_members_without_mutation() {
+    let alice_fixture = StorageCompatFixture::new();
+    let bob_fixture = StorageCompatFixture::new();
+    let alice = alice_fixture.context();
+    let bob = bob_fixture.context();
+    let config = GroupConfig {
+        max_past_epochs: 2,
+        out_of_order_tolerance: 7,
+        maximum_forward_distance: 321,
+        ..GroupConfig::default()
+    };
+    let group_id = alice
+        .create_group(b"did:plc:alice".to_vec(), Some(config))
+        .expect("create configured group")
+        .group_id;
+    let bob_key_package = bob
+        .create_key_package(b"did:plc:bob".to_vec())
+        .expect("create Bob key package");
+    alice
+        .add_members(
+            group_id.clone(),
+            vec![KeyPackageData {
+                data: bob_key_package.key_package_data,
+            }],
+        )
+        .expect("add Bob");
+    alice
+        .merge_pending_commit(group_id.clone())
+        .expect("merge add-members commit");
+    let expected_epoch = alice.get_epoch(group_id.clone()).expect("read epoch");
+    alice
+        .flush_and_prepare_close()
+        .expect("close configured group");
+    drop(alice);
+    bob.flush_and_prepare_close().expect("close Bob context");
+    drop(bob);
+
+    let before_reopen_hash =
+        Sha256::digest(std::fs::read(&alice_fixture.db_path).expect("read database"));
+    let before_reopen_mtime = std::fs::metadata(&alice_fixture.db_path)
+        .expect("database metadata")
+        .modified()
+        .expect("database mtime");
+    let reopened = alice_fixture.context();
+    assert_eq!(
+        reopened
+            .get_epoch(group_id)
+            .expect("load configured group after add-members"),
+        expected_epoch
+    );
+    reopened
+        .flush_and_prepare_close()
+        .expect("close reopened configured group");
+    drop(reopened);
+
+    assert_eq!(
+        before_reopen_hash,
+        Sha256::digest(std::fs::read(&alice_fixture.db_path).expect("read reopened database")),
+        "successful configured-group reopen must not mutate the database"
+    );
+    assert_eq!(
+        before_reopen_mtime,
+        std::fs::metadata(&alice_fixture.db_path)
+            .expect("reopened database metadata")
+            .modified()
+            .expect("reopened database mtime"),
+        "successful configured-group reopen must not update the database mtime"
     );
 }
 
@@ -520,5 +636,1086 @@ fn sqlite_storage_provider_sqlcipher_encryption_verified() {
     assert!(
         !raw_bytes.starts_with(b"SQLite format 3\0"),
         "raw database header must be encrypted ciphertext, NOT plaintext SQLite format 3"
+    );
+}
+
+fn derive_test_cipher_salt_hex(encryption_key: &str) -> String {
+    let digest = Sha256::digest(encryption_key.as_bytes());
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn open_test_connection(path: &std::path::Path, encryption_key: &str) -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open(path).expect("open test database");
+    connection
+        .pragma_update(None, "cipher_memory_security", "OFF")
+        .unwrap();
+    connection
+        .pragma_update(None, "key", encryption_key)
+        .unwrap();
+    connection
+        .pragma_update(None, "cipher_plaintext_header_size", 32)
+        .unwrap();
+    connection
+        .pragma_update(
+            None,
+            "cipher_salt",
+            format!("x'{}'", derive_test_cipher_salt_hex(encryption_key)),
+        )
+        .unwrap();
+    connection
+        .pragma_update(None, "cipher_page_size", 4096)
+        .unwrap();
+    connection.pragma_update(None, "kdf_iter", 256000).unwrap();
+    connection
+        .pragma_update(None, "cipher_hmac_algorithm", "HMAC_SHA512")
+        .unwrap();
+    connection
+        .pragma_update(None, "cipher_kdf_algorithm", "PBKDF2_HMAC_SHA512")
+        .unwrap();
+    connection
+}
+
+#[test]
+fn reopen_existing_db_validates_schema_and_rejects_missing_table_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("existing_table_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create a valid initial database
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    // 2. Corrupt by dropping a mandatory OpenMLS V5 table.
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute("DROP TABLE vc_operation_trees", [])
+            .expect("drop table");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    // 3. Reopen must fail validation and NOT touch the file
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopening database with missing table must fail validation");
+    assert!(
+        err.to_string().contains("missing")
+            || err.to_string().contains("table")
+            || err.to_string().contains("Required table")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "file hash must remain unchanged on validation error"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "file mtime must remain unchanged on validation error"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_unexpected_or_malformed_schema_objects_without_mutation() {
+    let mutations = [
+        "CREATE TABLE unexpected_table (value TEXT)",
+        "CREATE INDEX unexpected_index ON mls_manifests(value)",
+        "CREATE VIEW unexpected_view AS SELECT key FROM mls_manifests",
+        "CREATE TRIGGER unexpected_trigger AFTER INSERT ON mls_manifests BEGIN SELECT 1; END",
+        "DROP INDEX vc_retained_key_package_material_epoch_id;
+         CREATE INDEX vc_retained_key_package_material_epoch_id
+         ON vc_retained_key_package_material(provider_version)",
+        "PRAGMA writable_schema = ON;
+         UPDATE sqlite_master
+         SET sql = replace(sql, '''application_export_tree''', '''legacy_removed''')
+         WHERE name = 'openmls_group_data';
+         PRAGMA writable_schema = OFF",
+        "PRAGMA writable_schema = ON;
+         UPDATE sqlite_master
+         SET sql = replace(sql, 'value TEXT NOT NULL', 'value TEXT NOT NULL DEFAULT ''x''')
+         WHERE name = 'mls_manifests';
+         PRAGMA writable_schema = OFF",
+        "PRAGMA writable_schema = ON;
+         UPDATE sqlite_master
+         SET sql = replace(sql, 'value TEXT NOT NULL', 'value TEXT NOT NULL REFERENCES mls_manifests(key)')
+         WHERE name = 'mls_manifests';
+         PRAGMA writable_schema = OFF",
+        "PRAGMA writable_schema = ON;
+         UPDATE sqlite_master
+         SET sql = replace(sql, 'PRIMARY KEY AUTOINCREMENT', 'PRIMARY KEY')
+         WHERE name = 'openmls_own_leaf_nodes';
+         PRAGMA writable_schema = OFF",
+    ];
+
+    for (case, mutation) in mutations.into_iter().enumerate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join(format!("schema-object-{case}.db"));
+        let key = "test-encryption-key-for-validation";
+        let keychain = SharedKeychain::default();
+        let context = MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            key.to_string(),
+            Box::new(keychain.clone()),
+        )
+        .expect("create initial valid database");
+        drop(context);
+
+        open_test_connection(&db_path, key)
+            .execute_batch(mutation)
+            .expect("apply schema mutation");
+        let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+        let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+        MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            key.to_string(),
+            Box::new(keychain),
+        )
+        .err()
+        .expect("unexpected or malformed schema object must fail validation");
+        assert_eq!(
+            before_hash,
+            Sha256::digest(&std::fs::read(&db_path).unwrap()),
+            "failed schema validation must not mutate case {case}"
+        );
+        assert_eq!(
+            before_mtime,
+            std::fs::metadata(&db_path).unwrap().modified().unwrap(),
+            "failed schema validation must not update mtime for case {case}"
+        );
+    }
+}
+
+#[test]
+fn reopen_existing_db_rejects_old_or_future_refinery_version_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("existing_refinery_version_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create a valid initial database
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    // 2. Corrupt refinery versions by inserting future version 7
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute("INSERT INTO openmls_sqlite_storage_migrations (version, name, applied_on, checksum) VALUES (7, 'future_migration', '2099-01-01', '0')", []).expect("insert future migration");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    // 3. Reopen must fail validation and NOT touch the file
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopening database with future refinery version must fail validation");
+    assert!(err
+        .to_string()
+        .contains("Refinery schema versions mismatch"));
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "file hash must remain unchanged on validation error"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "file mtime must remain unchanged on validation error"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_corrupt_bundle_row_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("existing_bundle_corrupt_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create a valid initial database
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    // 2. Corrupt by inserting an invalid bundle row
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute("INSERT INTO mls_key_package_bundles (hash_ref, bundle_b64, created_at) VALUES ('aabbcc', 'not-valid-base64!', 12345)", []).expect("insert corrupt bundle");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    // 3. Reopen must fail validation and NOT touch the file
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopening database with corrupt bundle row must fail validation");
+    assert!(err.to_string().contains("Corrupt") || err.to_string().contains("bundle"));
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "file hash must remain unchanged on validation error"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "file mtime must remain unchanged on validation error"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_missing_or_malformed_openmls_column_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("existing_malformed_column_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create a valid initial database
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    // 2. Corrupt openmls_encryption_keys table by recreating it without the required 'value' column
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute("DROP TABLE openmls_encryption_keys", [])
+            .expect("drop table");
+        conn.execute("CREATE TABLE openmls_encryption_keys (provider_version INTEGER NOT NULL, public_key BLOB PRIMARY KEY)", []).expect("create table without key_pair col");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    // 3. Reopen must fail validation and NOT touch the file
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopening database with malformed column descriptor must fail validation");
+    assert!(
+        err.to_string().contains("openmls_encryption_keys")
+            && (err.to_string().contains("schema mismatch")
+                || err.to_string().contains("Required column"))
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "file hash must remain unchanged on validation error"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "file mtime must remain unchanged on validation error"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_stale_pending_external_join_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("existing_stale_join_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create a valid initial database
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    // 2. Corrupt by inserting a stale pending_external_join for a non-existent group
+    {
+        let conn = open_test_connection(&db_path, key);
+        let stale_join_json = serde_json::json!({
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff": {
+                "group_id": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                "signer_public_key": vec![0x42; 32],
+                "created_at": 12345
+            }
+        });
+        conn.execute("INSERT OR REPLACE INTO mls_manifests (key, value) VALUES ('pending_external_joins', ?1)", [stale_join_json.to_string()]).expect("insert stale join");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    // 3. Reopen must fail validation and NOT touch the file
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopening database with stale pending join must fail validation");
+    assert!(
+        err.to_string().contains("Stale pending_external_join")
+            || err.to_string().contains("pending_external_joins")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "file hash must remain unchanged on validation error"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "file mtime must remain unchanged on validation error"
+    );
+}
+
+#[test]
+fn reopen_existing_db_succeeds_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("existing_clean_reopen_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create a valid initial database
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    // 2. Reopen valid database
+    let reopened = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("reopen valid existing database");
+    drop(reopened);
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "valid reopen without writes must leave file hash unchanged"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "valid reopen without writes must leave file mtime unchanged"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_bundle_drift_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("existing_bundle_drift_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create a valid initial database and publish a key package bundle
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    let _kp = ctx
+        .create_key_package(b"did:plc:alice#device-1".to_vec())
+        .expect("create key package");
+    ctx.flush_and_prepare_close().expect("flush and close");
+    // 2. Introduce drift: delete row from openmls_key_packages while keeping it in mls_key_package_bundles
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute("DELETE FROM openmls_key_packages", [])
+            .expect("delete key package");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    // 3. Reopen must detect drift and fail closed without touching the file
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopening database with key package drift must fail validation");
+    assert!(
+        err.to_string()
+            .contains("missing from openmls_key_packages")
+            || err.to_string().contains("drift")
+            || err.to_string().contains("Key package drift")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed drift validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed drift validation must not update mtime"
+    );
+}
+
+#[test]
+fn reopen_existing_db_succeeds_after_public_delete_with_parity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("delete_parity_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create DB and publish 2 key packages
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    let kp1 = ctx
+        .create_key_package(b"did:plc:alice#device-1".to_vec())
+        .expect("create kp1");
+    let kp2 = ctx
+        .create_key_package(b"did:plc:alice#device-1".to_vec())
+        .expect("create kp2");
+
+    let deleted = ctx
+        .delete_key_package_bundles(vec![kp1.hash_ref.clone()])
+        .expect("delete bundle");
+    assert_eq!(deleted, 1);
+    ctx.flush_and_prepare_close().expect("close");
+
+    // 2. Reopen must pass validation with exact 1-to-1 parity
+    let reopened = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("reopen after delete must succeed with exact parity");
+
+    let deleted_second = reopened
+        .delete_key_package_bundles(vec![kp2.hash_ref])
+        .expect("delete second bundle");
+    assert_eq!(deleted_second, 1);
+    let deleted_absent = reopened
+        .delete_key_package_bundles(vec![kp1.hash_ref])
+        .expect("delete absent bundle");
+    assert_eq!(deleted_absent, 0);
+}
+
+#[test]
+fn reopen_existing_db_succeeds_after_prune_with_parity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("prune_parity_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create DB and publish 2 key packages
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    let kp1 = ctx
+        .create_key_package(b"did:plc:alice#device-1".to_vec())
+        .expect("create kp1");
+    let kp2 = ctx
+        .create_key_package(b"did:plc:alice#device-1".to_vec())
+        .expect("create kp2");
+    ctx.flush_and_prepare_close().expect("flush and close");
+
+    // 2. Backdate kp1 row past 90 days
+    {
+        let conn = open_test_connection(&db_path, key);
+        let backdated = 1000i64;
+        conn.execute(
+            "UPDATE mls_key_package_bundles SET created_at = ?1 WHERE hash_ref = ?2",
+            rusqlite::params![backdated, hex::encode(&kp1.hash_ref)],
+        )
+        .expect("backdate");
+    }
+
+    // 3. Reopen fresh: on fresh create / reconcile path it prunes and synchronizes
+    let reopened = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("reopen valid existing database");
+
+    let deleted_expired = reopened
+        .delete_key_package_bundles(vec![kp1.hash_ref.clone()])
+        .expect("delete already-pruned bundle");
+    assert_eq!(deleted_expired, 0);
+    let deleted_second = reopened
+        .delete_key_package_bundles(vec![kp2.hash_ref])
+        .expect("delete second bundle");
+    assert_eq!(deleted_second, 1);
+    let deleted_absent = reopened
+        .delete_key_package_bundles(vec![kp1.hash_ref])
+        .expect("delete absent bundle");
+    assert_eq!(deleted_absent, 0);
+}
+#[test]
+fn reopen_existing_db_rejects_non_empty_openmls_signature_keys_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("sig_keys_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    // 1. Create DB
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    // 2. Corrupt by inserting row into openmls_signature_keys
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute(
+            "INSERT INTO openmls_signature_keys (provider_version, public_key, signature_key) VALUES (1, X'01020304', X'05060708')",
+            [],
+        )
+        .expect("insert into openmls_signature_keys");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    // 3. Reopen must fail validation
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopening with non-empty openmls_signature_keys must fail validation");
+    assert!(err
+        .to_string()
+        .contains("openmls_signature_keys must be empty on preflight"));
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed signature_keys validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed signature_keys validation must not update mtime"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_relabeled_bundle_hash_ref_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("relabel_bundle_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    let kp = ctx
+        .create_key_package(b"did:plc:alice#device-1".to_vec())
+        .expect("create kp");
+    ctx.flush_and_prepare_close().expect("close");
+
+    // Corrupt hash_ref in mls_key_package_bundles
+    {
+        let conn = open_test_connection(&db_path, key);
+        let fake_hash = vec![0x99u8; kp.hash_ref.len()];
+        conn.execute(
+            "UPDATE mls_key_package_bundles SET hash_ref = ?1 WHERE hash_ref = ?2",
+            rusqlite::params![hex::encode(&fake_hash), hex::encode(&kp.hash_ref)],
+        )
+        .expect("relabel hash_ref");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopen with relabeled hash_ref must fail validation");
+    assert!(err
+        .to_string()
+        .contains("does not match computed key package ref"));
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed relabel validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed relabel validation must not update mtime"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_duplicate_manifest_group_id_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("dup_group_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    // Insert duplicate group_id into manifest
+    {
+        let conn = open_test_connection(&db_path, key);
+        let dup_json =
+            serde_json::to_string(&vec!["01020304".to_string(), "01020304".to_string()]).unwrap();
+        conn.execute(
+            "INSERT INTO mls_manifests (key, value) VALUES ('group_ids', ?1)",
+            [&dup_json],
+        )
+        .expect("insert duplicate group_ids");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopen with duplicate group_id in manifest must fail validation");
+    assert!(err.to_string().contains("Duplicate group_id"));
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed duplicate group validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed duplicate group validation must not update mtime"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_extra_unmanifested_group_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("extra_group_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    epoch_secret_test_support::install(&ctx);
+    let _res = ctx
+        .create_group("did:plc:alice#device-1".as_bytes().to_vec(), None)
+        .expect("create group");
+    ctx.flush_and_prepare_close().expect("close");
+
+    // Remove group_id from manifest (simulating crash before persist_group_id)
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute("DELETE FROM mls_manifests WHERE key = 'group_ids'", [])
+            .expect("clear group_ids manifest");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopen with unmanifested DB group must fail validation");
+    assert!(
+        err.to_string()
+            .contains("Manifest group_ids mismatch with openmls_group_data")
+            || err.to_string().contains("unmanifested")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed unmanifested DB group validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed unmanifested DB group validation must not update mtime"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_tampered_page_without_modifying_file_or_sidecar() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("tampered_page_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    let _kp = ctx
+        .create_key_package(b"did:plc:alice#device-1".to_vec())
+        .expect("create kp");
+    ctx.flush_and_prepare_close().expect("close");
+
+    // Tamper with bytes in the middle of the database file
+    let mut file_bytes = std::fs::read(&db_path).unwrap();
+    let tamper_offset = file_bytes.len() / 2;
+    for b in &mut file_bytes[tamper_offset..tamper_offset + 16] {
+        *b ^= 0xFF;
+    }
+    std::fs::write(&db_path, &file_bytes).unwrap();
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopen with tampered page must fail integrity check");
+    assert!(
+        err.to_string().contains("integrity_check") || err.to_string().contains("Failed to open")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed integrity check must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed integrity check must not update mtime"
+    );
+
+    // Verify no WAL or SHM sidecar file was created
+    let wal_path = db_path.with_extension("db-wal");
+    let shm_path = db_path.with_extension("db-shm");
+    assert!(
+        !wal_path.exists(),
+        "no wal sidecar should be created on failed preflight"
+    );
+    assert!(
+        !shm_path.exists(),
+        "no shm sidecar should be created on failed preflight"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_corrupt_nonempty_group_data_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("corrupt_group_data_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    epoch_secret_test_support::install(&ctx);
+    let res = ctx
+        .create_group("did:plc:alice#device-1".as_bytes().to_vec(), None)
+        .expect("create group");
+    ctx.flush_and_prepare_close().expect("close");
+
+    // Corrupt group_data BLOB to valid non-empty JSON that fails MlsGroup::load
+    {
+        let conn = open_test_connection(&db_path, key);
+        let corrupt_json = b"{\"invalid\": \"group_state\"}";
+        let group_id_json =
+            serde_json::to_vec(&openmls::prelude::GroupId::from_slice(&res.group_id)).unwrap();
+        conn.execute(
+            "UPDATE openmls_group_data SET group_data = ?1 WHERE group_id = ?2",
+            rusqlite::params![corrupt_json.as_slice(), group_id_json],
+        )
+        .expect("update group_data");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopen with corrupt group_data must fail validation");
+    assert!(
+        err.to_string().contains("MlsGroup::load failed") || err.to_string().contains("Corrupt")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed group_data validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed group_data validation must not update mtime"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_swapped_valid_signer_keypair_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("swapped_signer_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    let _kp = ctx
+        .create_key_package(b"did:plc:alice#device-1".to_vec())
+        .expect("create kp");
+    ctx.flush_and_prepare_close().expect("close");
+
+    // Read manifested signer pk
+    let conn = open_test_connection(&db_path, key);
+    let signers_json: String = conn
+        .query_row(
+            "SELECT value FROM mls_manifests WHERE key = 'signers'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read signers manifest");
+    let signers_map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&signers_json).unwrap();
+    let (_, hex_pk) = signers_map.into_iter().next().unwrap();
+
+    let diff_pair =
+        openmls_basic_credential::SignatureKeyPair::new(openmls::prelude::SignatureScheme::ED25519)
+            .expect("create diff key pair");
+
+    // Overwrite keychain entry with diff_pair at the exact stored slot
+    let key_to_overwrite = keychain
+        .store
+        .lock()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let diff_pair_json = serde_json::to_vec(&diff_pair).unwrap();
+    keychain
+        .store
+        .lock()
+        .unwrap()
+        .insert(key_to_overwrite, diff_pair_json);
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopen with swapped signer keypair must fail validation");
+    assert!(
+        err.to_string().contains("public key mismatch")
+            || err.to_string().contains("SignatureKeyPair")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed swapped signer validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed swapped signer validation must not update mtime"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_missing_signers_manifest_with_groups_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("missing_signers_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    epoch_secret_test_support::install(&ctx);
+    let _res = ctx
+        .create_group("did:plc:alice#device-1".as_bytes().to_vec(), None)
+        .expect("create group");
+    ctx.flush_and_prepare_close().expect("close");
+
+    // Delete signers manifest row
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute("DELETE FROM mls_manifests WHERE key = 'signers'", [])
+            .expect("delete signers manifest");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopen with groups but missing signers manifest must fail validation");
+    assert!(
+        err.to_string().contains("own leaf credential not bound")
+            || err.to_string().contains("signers")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed signers validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed signers validation must not update mtime"
+    );
+}
+
+#[test]
+fn reopen_existing_db_rejects_on_conflict_replace_ddl_without_modifying_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("on_conflict_ddl_test.db");
+    let key = "test-encryption-key-for-validation";
+    let keychain = SharedKeychain::default();
+
+    let ctx = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("create initial valid database");
+    drop(ctx);
+
+    // Modify schema with PRAGMA writable_schema to add ON CONFLICT REPLACE
+    {
+        let conn = open_test_connection(&db_path, key);
+        conn.execute("PRAGMA writable_schema = ON", [])
+            .expect("enable writable_schema");
+        conn.execute(
+            "UPDATE sqlite_master SET sql = 'CREATE TABLE mls_manifests (key TEXT PRIMARY KEY ON CONFLICT REPLACE, value TEXT NOT NULL)' WHERE name = 'mls_manifests'",
+            [],
+        )
+        .expect("update DDL with ON CONFLICT REPLACE");
+    }
+
+    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+    let err = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .err()
+    .expect("reopen with ON CONFLICT REPLACE DDL must fail validation");
+    assert!(
+        err.to_string().contains("unsupported DDL constraints")
+            || err.to_string().contains("conflict resolution")
+    );
+
+    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
+    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+    assert_eq!(
+        before_hash, after_hash,
+        "failed DDL validation must not mutate file"
+    );
+    assert_eq!(
+        before_mtime, after_mtime,
+        "failed DDL validation must not update mtime"
     );
 }

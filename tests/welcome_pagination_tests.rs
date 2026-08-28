@@ -41,7 +41,7 @@ async fn assert_failed_join_is_fully_rolled_back(failure: JoinWriteFailure) {
     world
         .client("Alice")
         .orchestrator
-        .add_members(&target.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&target.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let bob = world.client("Bob");
@@ -153,7 +153,7 @@ async fn join_group_finds_welcome_target_beyond_first_conversation_page() {
     world
         .client("Alice")
         .orchestrator
-        .add_members(&target.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&target.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     world
@@ -200,7 +200,7 @@ async fn join_group_rolls_back_crypto_state_when_conversation_lookup_fails() {
     world
         .client("Alice")
         .orchestrator
-        .add_members(&target.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&target.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let bob = world.client("Bob");
@@ -260,7 +260,7 @@ async fn join_or_rejoin_projection_failure_withholds_cache_and_active_success() 
     world
         .client("Alice")
         .orchestrator
-        .add_members(&target.conversation_id, std::slice::from_ref(&bob_did))
+        .swap_members(&target.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
     let bob = world.client("Bob");
