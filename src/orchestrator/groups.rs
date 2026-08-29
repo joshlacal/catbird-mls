@@ -3254,6 +3254,39 @@ where
             .and_then(|v| v.as_str())
             .unwrap_or("pending");
         if status == "active" {
+            // We are a member whose device holds no leaf: only a live leaf of
+            // another participant can add us back. When no such leaf exists,
+            // or our open request already outlived the server TTL unfulfilled,
+            // waiting cannot help — an admin device resets the conversation.
+            let server_state = super::reset_flow::ServerConversationState::from_state_json(
+                &convo_uuid_str,
+                state_obj,
+            )?;
+            let is_admin = my_participant.get("role").and_then(|v| v.as_str()) == Some("admin");
+            let waited = self
+                .recovery_tracker()
+                .lock()
+                .await
+                .leaf_recovery_wait(&convo_uuid_str);
+            let nobody_can_add_us = server_state.nobody_else_can_add(&user_did);
+            let waited_out = waited.is_some_and(|w| w >= super::reset_flow::LEAF_RECOVERY_TTL);
+            if is_admin && (nobody_can_add_us || waited_out) {
+                crate::warn_log!(
+                    "[RESET] convo={} leaf recovery cannot succeed (nobody_else_can_add={}, waited={:?}); resetting",
+                    convo_uuid_str,
+                    nobody_can_add_us,
+                    waited
+                );
+                let outcome = self
+                    .reset_conversation(&convo_uuid_str, "localStateLost")
+                    .await?;
+                return Ok(serde_json::json!({ "reset": format!("{outcome:?}") }));
+            }
+            if waited.is_some_and(|w| w < super::reset_flow::LEAF_RECOVERY_TTL) {
+                // Our add request is still open server-side; re-requesting
+                // only earns LeafRecoveryAlreadyOpen.
+                return Ok(serde_json::json!({ "leafRecovery": "open" }));
+            }
             let gid = latest_coord
                 .get("groupId")
                 .and_then(|v| {
@@ -3283,9 +3316,28 @@ where
                 .get("stateVersion")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
-            return self
+            let result = self
                 .request_leaf_recovery(&convo_uuid_str, Some("add"), gid, gch, tag, epoch, sv)
                 .await;
+            match &result {
+                Ok(_) => {
+                    self.recovery_tracker()
+                        .lock()
+                        .await
+                        .note_leaf_recovery_requested(&convo_uuid_str);
+                }
+                Err(err) if err.to_string().contains("LeafRecoveryAlreadyOpen") => {
+                    // Opened by an earlier process of ours; start the clock now
+                    // so an unfulfilled request still escalates.
+                    let mut tracker = self.recovery_tracker().lock().await;
+                    if tracker.leaf_recovery_wait(&convo_uuid_str).is_none() {
+                        tracker.note_leaf_recovery_requested(&convo_uuid_str);
+                    }
+                    return Ok(serde_json::json!({ "leafRecovery": "open" }));
+                }
+                Err(_) => {}
+            }
+            return result;
         }
 
         let prov = my_participant.get("invitationProvenance").ok_or_else(|| {

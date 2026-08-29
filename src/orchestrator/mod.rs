@@ -15,6 +15,7 @@ pub mod orchestrator;
 pub mod ordering;
 pub(crate) mod pagination;
 pub mod recovery;
+pub mod reset_flow;
 pub mod staged_commit;
 pub mod storage;
 pub mod sync;

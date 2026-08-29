@@ -41,6 +41,9 @@ struct StoredConversation {
     conversation_kind: String,
     metadata_snapshot: Option<serde_json::Value>,
     participants: Option<Vec<serde_json::Value>>,
+    /// `deviceLeafView`s reported in `state.leaves`; omitted from the wire
+    /// response while `None`, like a pre-leaves server.
+    leaves: Option<Vec<serde_json::Value>>,
 }
 
 fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Value {
@@ -65,7 +68,7 @@ fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Val
             "ciphertext": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
         })
     });
-    serde_json::json!({
+    let mut state = serde_json::json!({
         "conversationKind": conversation.conversation_kind.clone(),
         "coordinates": {
             "conversationId": conversation.view.conversation_id.clone(),
@@ -80,7 +83,11 @@ fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Val
         "participants": participants,
         "metadataSnapshot": metadata_snapshot,
         "snapshotSeq": 1
-    })
+    });
+    if let Some(leaves) = &conversation.leaves {
+        state["leaves"] = serde_json::Value::Array(leaves.clone());
+    }
+    state
 }
 
 #[derive(Debug, Clone)]
@@ -709,6 +716,35 @@ impl MockDeliveryService {
         }
     }
 
+    /// Report these `deviceLeafView`s in `state.leaves` for a conversation.
+    #[allow(dead_code)]
+    pub fn set_conversation_leaves_for_test(&self, convo_id: &str, leaves: Vec<serde_json::Value>) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(c) = guard.conversations.get_mut(convo_id) {
+            c.leaves = Some(leaves);
+        }
+    }
+
+    /// Report these `participantView`s in `state.participants` for a conversation.
+    #[allow(dead_code)]
+    pub fn set_conversation_participants_for_test(&self, convo_id: &str, participants: Vec<serde_json::Value>) {
+        let mut guard = self.state.lock().unwrap();
+        if let Some(c) = guard.conversations.get_mut(convo_id) {
+            c.participants = Some(participants);
+        }
+    }
+
+    /// Bodies of every `activateReset` the mock accepted, oldest first.
+    #[allow(dead_code)]
+    pub fn activate_reset_bodies(&self) -> Vec<serde_json::Value> {
+        self.submitted_prepared_requests()
+            .into_iter()
+            .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ActivateReset)
+            .filter_map(|r| serde_json::from_slice::<serde_json::Value>(r.body.as_deref()?).ok())
+            .map(|v| v.get("signedRequest").and_then(|s| s.get("body")).cloned().unwrap_or(v))
+            .collect()
+    }
+
     /// Force the server-side `sequencerDid` of a conversation (WS-4 rung 2
     /// exposure tests; ADR-010 D4).
     #[allow(dead_code)]
@@ -954,6 +990,7 @@ impl MockDeliveryService {
             conversation_kind,
             metadata_snapshot: None,
             participants: None,
+            leaves: None,
         };
 
         guard.conversations.insert(conversation_id.clone(), stored);

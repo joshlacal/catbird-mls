@@ -439,6 +439,25 @@ where
                 }
             }
 
+            // Another device reset this conversation: the server now names a
+            // different MLS group. Every failure counted against the retired
+            // generation is stale — a locked-out tracker here would keep this
+            // device from requesting leaf recovery against the fresh leaf.
+            if previous_view
+                .as_ref()
+                .is_some_and(|prev| prev.group_id != convo.group_id)
+            {
+                crate::info_log!(
+                    "[sync] convo={} server group changed {} -> {}; clearing recovery backoff",
+                    conversation_id,
+                    previous_view.as_ref().map(|p| p.group_id.as_str()).unwrap_or(""),
+                    convo.group_id
+                );
+                let mut tracker = self.recovery_tracker().lock().await;
+                tracker.clear_for_fresh_reset(conversation_id);
+                tracker.clear_leaf_recovery_wait(conversation_id);
+            }
+
             // Detect a stale persisted GroupState: the orchestrator has a
             // record for this convo, but the local MLS context does NOT have
             // the group. This happens when a prior sync attempted to join,

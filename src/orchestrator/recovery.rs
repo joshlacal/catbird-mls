@@ -366,6 +366,11 @@ pub struct RecoveryTracker {
     /// is persisted via MLSStorageBackend::mark_quarantined; the in-memory
     /// copy lets the orchestrator gate sends/rejoins without an async DB hop.
     quarantined: HashMap<String, QuarantineSnapshot>,
+    /// When this device last opened an `add` leaf-recovery request per
+    /// conversation. Re-requesting before the server TTL lapses only earns a
+    /// `LeafRecoveryAlreadyOpen`; once it has lapsed unfulfilled, nobody is
+    /// coming and the caller escalates to a reset.
+    leaf_recovery_requested_at: HashMap<String, Instant>,
 }
 
 /// In-memory quarantine snapshot, mirroring ConversationState::Quarantined.
@@ -384,7 +389,30 @@ impl RecoveryTracker {
             max_attempts,
             peer_bad_commits: HashMap::new(),
             quarantined: HashMap::new(),
+            leaf_recovery_requested_at: HashMap::new(),
         }
+    }
+
+    pub(crate) fn note_leaf_recovery_requested(&mut self, convo_id: &str) {
+        self.note_leaf_recovery_requested_at(convo_id, Instant::now());
+    }
+
+    /// Test hook: pretend the request was opened at `at`.
+    pub fn note_leaf_recovery_requested_at(&mut self, convo_id: &str, at: Instant) {
+        self.leaf_recovery_requested_at
+            .insert(convo_id.to_string(), at);
+    }
+
+    /// `Some(elapsed)` while a leaf-recovery request opened by this device
+    /// is still being waited on; `None` when none was recorded.
+    pub(crate) fn leaf_recovery_wait(&self, convo_id: &str) -> Option<Duration> {
+        self.leaf_recovery_requested_at
+            .get(convo_id)
+            .map(|at| at.elapsed())
+    }
+
+    pub(crate) fn clear_leaf_recovery_wait(&mut self, convo_id: &str) {
+        self.leaf_recovery_requested_at.remove(convo_id);
     }
 
     pub fn cooldown_for_attempts(&self, attempts: u32) -> Duration {
@@ -624,6 +652,7 @@ impl RecoveryTracker {
         self.successful_rejoins.remove(convo_id);
         self.peer_bad_commits.remove(convo_id);
         self.quarantined.remove(convo_id);
+        self.leaf_recovery_requested_at.remove(convo_id);
     }
 
     /// Hydrate backoff state from storage on startup (WS-5.4, invariant E7).
@@ -5652,16 +5681,15 @@ where
         self.notify_quarantine_cleared(convo_id, via).await;
     }
 
-    /// Public API: user-confirmed manual reset. Reports failure to the server
-    /// (so the A7 reset pyramid counts the user vote) and clears local quarantine.
+    /// Public API: user-confirmed manual reset. Requests and (as an admin)
+    /// activates a clean-chat reset from server state, then clears local
+    /// quarantine so the successor generation is not gated by the dead one.
     pub async fn user_confirmed_manual_reset(&self, convo_id: &str) -> Result<()> {
         self.check_shutdown().await?;
-        // Report deliberate user vote so server quorum (spec section 8.6) can
-        // include this client. Reason is logged in the structured tracing log.
         let auth = self.epoch_authenticator_hex(convo_id).await;
         tracing::info!(convo_id, auth = ?auth, "user_confirmed_manual_reset: manual reset confirmed by user");
-        self.submit_reset_request_prepared(convo_id, "manualRecovery")
-            .await?;
+        let outcome = self.reset_conversation(convo_id, "manualRecovery").await?;
+        tracing::info!(convo_id, ?outcome, "user_confirmed_manual_reset: reset outcome");
         self.exit_quarantine(
             convo_id,
             crate::orchestrator::types::QuarantineExitReason::UserConfirmedReset,
@@ -6023,77 +6051,12 @@ where
         })
     }
 
+    /// Record a `requestReset` bound to the server's *current* coordinate.
+    /// Reads nothing from local MLS state, so it works from a device whose
+    /// group is gone — the situation a reset exists for.
     async fn submit_reset_request_prepared(&self, convo_id: &str, reason: &str) -> Result<()> {
-        let reason_enum = match reason {
-            "localStateLost" | "poisonedState" | "epochDivergence" | "manualRecovery" => reason,
-            _ => "manualRecovery",
-        };
-        let user_did = self.require_user_did().await?;
-        let actor_device_id = self.require_actor_device_id().await?;
-        let auth_generation = self
-            .credentials()
-            .get_auth_generation(&user_did)
-            .await?
-            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
-        if auth_generation < 1 {
-            return Err(OrchestratorError::Credential(
-                "auth_generation must be >= 1".into(),
-            ));
-        }
-        let scoped_identity = self.require_scoped_identity().await?;
-        let public_key = self
-            .mls_context()
-            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
-        let key_id = super::canonical_transport::derive_key_id(&public_key);
-        let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
-        let group_id_bytes = resolved.group_id_bytes()?;
-        let gc_hash = self
-            .mls_context()
-            .get_group_context_hash(group_id_bytes.clone())?;
-        if gc_hash.len() != 32 {
-            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
-                "group context hash must be exactly 32 bytes, got {}",
-                gc_hash.len()
-            ))));
-        }
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(group_id_bytes.clone())?;
-        if tag_bytes.len() != 32 {
-            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
-                "confirmation tag must be exactly 32 bytes, got {}",
-                tag_bytes.len()
-            ))));
-        }
-        let body = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#resetRequestBody",
-            "actorDeviceId": actor_device_id,
-            "actorDid": user_did,
-            "authGeneration": auth_generation,
-            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-            "keyId": key_id,
-            "prior": {
-                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&tag_bytes),
-                "conversationId": convo_id,
-                "epoch": 0,
-                "generation": 0,
-                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&gc_hash),
-                "groupId": base64::engine::general_purpose::STANDARD.encode(&group_id_bytes),
-                "lifecycle": "active",
-                "stateVersion": 0
-            },
-            "reason": reason_enum,
-            "resetRequestId": uuid::Uuid::new_v4().to_string(),
-            "signatureDomain": "CATBIRD-CHAT-RESET-REQUEST\0",
-            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        });
-        self.submit_signed_clean_chat_request(
-            super::canonical_transport::CanonicalOperation::RequestReset,
-            serde_json::to_vec(&body)
-                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
-        )
-        .await?;
-        Ok(())
+        let state = self.fetch_server_conversation_state(convo_id).await?;
+        self.ensure_reset_request(&state, reason).await.map(|_| ())
     }
 
     async fn submit_activate_reset_prepared(
