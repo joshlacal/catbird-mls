@@ -1782,7 +1782,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn fulfill_leaf_recovery_produces_add_commit_and_welcome() {
+    async fn fulfill_leaf_recovery_discovers_acceptance_entry_without_requester_inbox() {
         let mut world = TestWorld::new();
         world.add_client("Alice").await;
         world.add_client("Bob").await;
@@ -1816,26 +1816,30 @@ mod tests {
         let kp_b64 = STANDARD.encode(&kp_res.key_package_data);
         let kp_ref_b64 = STANDARD.encode(&kp_res.hash_ref);
 
-        let recovery_req_id = uuid::Uuid::new_v4().to_string();
-        let inbox_item = serde_json::json!({
+        bob.orchestrator
+            .accept_conversation(&created.conversation_id)
+            .await
+            .expect("bob accepts conversation");
+        world
+            .delivery_service()
+            .set_participant_leaf_count(&created.conversation_id, &bob.did, 0);
+        world.delivery_service().add_entry(serde_json::json!({
+            "$type": "blue.catbird.chat.defs#participantAcceptanceEntry",
             "recovery": {
-                "recoveryRequestId": recovery_req_id,
+                "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
                 "conversationId": created.conversation_id,
                 "requesterDid": bob.did,
                 "requesterDeviceId": bob_device_id,
                 "recoveryKind": "add",
                 "status": "open",
                 "reservation": {
-                    "keyPackageRef": kp_ref_b64,
+                    "keyPackageRef": { "$bytes": kp_ref_b64 },
                     "keyPackage": {
-                        "bytes": kp_b64
+                        "bytes": { "$bytes": kp_b64 }
                     }
                 }
             }
-        });
-        world
-            .delivery_service()
-            .add_leaf_recovery_inbox_item(inbox_item);
+        }));
 
         let initial_epoch = alice
             .orchestrator
@@ -1843,8 +1847,20 @@ mod tests {
             .get_epoch(hex::decode(&created.group_id).unwrap())
             .expect("alice initial epoch");
         assert_eq!(initial_epoch, 0);
+        world.delivery_service().fail_next_commit_group_change();
+        let failed_count = alice
+            .orchestrator
+            .fulfill_pending_leaf_recoveries()
+            .await
+            .expect("server rejection stays isolated");
+        assert_eq!(failed_count, 0);
+        let merge_result = alice
+            .orchestrator
+            .mls_context()
+            .merge_pending_commit(hex::decode(&created.group_id).unwrap())
+            .expect("rejected transition leaves no pending commit");
+        assert_eq!(merge_result.new_epoch, 0);
 
-        // Alice fulfills pending leaf recoveries
         let count = alice
             .orchestrator
             .fulfill_pending_leaf_recoveries()
@@ -2096,6 +2112,34 @@ impl Drop for GroupCreationGuard<'_> {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
+}
+
+fn encoded_bytes_base64(value: Option<&serde_json::Value>) -> Option<&str> {
+    value.and_then(|value| {
+        value
+            .get("$bytes")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| value.as_str())
+    })
+}
+
+/// Decode a leaf recovery reservation's key package into `(bytes, base64 ref)`.
+fn recovery_reservation_key_package(recovery: &serde_json::Value) -> Result<(Vec<u8>, String)> {
+    let reservation = recovery
+        .get("reservation")
+        .ok_or_else(|| OrchestratorError::Api("recovery missing reservation".into()))?;
+    let key_package_ref_b64 = encoded_bytes_base64(reservation.get("keyPackageRef"))
+        .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackageRef".into()))?
+        .to_string();
+    let key_package = reservation
+        .get("keyPackage")
+        .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackage".into()))?;
+    let key_package_b64 = encoded_bytes_base64(key_package.get("bytes"))
+        .ok_or_else(|| OrchestratorError::Api("keyPackage missing bytes".into()))?;
+    let key_package_bytes = STANDARD
+        .decode(key_package_b64)
+        .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+    Ok((key_package_bytes, key_package_ref_b64))
 }
 
 fn extract_bytes_32(value: Option<&serde_json::Value>) -> Option<[u8; 32]> {
@@ -3640,30 +3684,7 @@ where
                     .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
                 (bytes, r_b64.to_string())
             } else if let Some(rec) = &open_recovery {
-                let reservation = rec
-                    .get("reservation")
-                    .ok_or_else(|| OrchestratorError::Api("recovery missing reservation".into()))?;
-                let ref_b64 = reservation
-                    .get("keyPackageRef")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        OrchestratorError::Api("reservation missing keyPackageRef".into())
-                    })?
-                    .to_string();
-                let kp_bytes = if let Some(kp_obj) = reservation.get("keyPackage") {
-                    if let Some(b_str) = kp_obj.get("bytes").and_then(|v| v.as_str()) {
-                        STANDARD
-                            .decode(b_str)
-                            .map_err(|e| OrchestratorError::Serialization(e.to_string()))?
-                    } else {
-                        return Err(OrchestratorError::Api("keyPackage missing bytes".into()));
-                    }
-                } else {
-                    return Err(OrchestratorError::Api(
-                        "reservation missing keyPackage".into(),
-                    ));
-                };
-                (kp_bytes, ref_b64)
+                recovery_reservation_key_package(rec)?
             } else if let Some(kp_b64) = explicit_key_package_b64 {
                 let bytes = STANDARD
                     .decode(kp_b64)
@@ -3704,28 +3725,7 @@ where
                 .ok_or_else(|| OrchestratorError::Api("recovery missing requesterDeviceId".into()))?
                 .to_string();
 
-            let reservation = recovery
-                .get("reservation")
-                .ok_or_else(|| OrchestratorError::Api("recovery missing reservation".into()))?;
-            let key_package_ref_b64 = reservation
-                .get("keyPackageRef")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| OrchestratorError::Api("reservation missing keyPackageRef".into()))?
-                .to_string();
-
-            let kp_bytes = if let Some(kp_obj) = reservation.get("keyPackage") {
-                if let Some(b_str) = kp_obj.get("bytes").and_then(|v| v.as_str()) {
-                    STANDARD
-                        .decode(b_str)
-                        .map_err(|e| OrchestratorError::Serialization(e.to_string()))?
-                } else {
-                    return Err(OrchestratorError::Api("keyPackage missing bytes".into()));
-                }
-            } else {
-                return Err(OrchestratorError::Api(
-                    "reservation missing keyPackage".into(),
-                ));
-            };
+            let (kp_bytes, key_package_ref_b64) = recovery_reservation_key_package(&recovery)?;
             (
                 recovery_request_id,
                 requester_did,
@@ -4008,21 +4008,34 @@ where
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         });
 
-        let server_resp = self
+        let submit_result = self
             .submit_signed_clean_chat_request(
                 super::canonical_transport::CanonicalOperation::SubmitTransition,
                 serde_json::to_vec(&body)
                     .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
             )
-            .await?;
+            .await
+            .and_then(|response| {
+                if response.status == 200 {
+                    Ok(response)
+                } else {
+                    Err(OrchestratorError::Api(format!(
+                        "submitTransition (leafRecoveryFulfillment) failed with status {}: {}",
+                        response.status,
+                        String::from_utf8_lossy(&response.body)
+                    )))
+                }
+            });
 
-        if server_resp.status != 200 {
-            return Err(OrchestratorError::Api(format!(
-                "submitTransition (leafRecoveryFulfillment) failed with status {}: {}",
-                server_resp.status,
-                String::from_utf8_lossy(&server_resp.body)
-            )));
-        }
+        let server_resp = match submit_result {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = self
+                    .mls_context()
+                    .clear_pending_commit(group_id_bytes.clone());
+                return Err(error);
+            }
+        };
 
         self.mls_context()
             .merge_pending_commit(group_id_bytes.clone())?;
@@ -4033,14 +4046,64 @@ where
         Ok(output)
     }
 
-    /// Polls `blue.catbird.chat.getLeafRecoveryInbox` and fulfills any open recovery requests
-    /// for conversations where this client is an active member.
+    /// Best-effort fetch of this device's leaf recovery inbox. Every failure is
+    /// warned and reported as empty so conversation-entry discovery still runs.
+    async fn leaf_recovery_inbox_items(
+        &self,
+        actor_device_id: &str,
+        inventory_session_id: &str,
+    ) -> Vec<serde_json::Value> {
+        let request = super::canonical_transport::PreparedRequest {
+            operation: super::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox,
+            path: format!("/xrpc/blue.catbird.chat.getLeafRecoveryInbox?actorDeviceId={}&inventorySessionId={}&limit=50", actor_device_id, inventory_session_id),
+            method: "GET".to_string(),
+            body: None,
+        };
+        let response = match self.api_client().submit_prepared_request(request).await {
+            Ok(response) if response.status == 200 => response,
+            Ok(response) => {
+                tracing::warn!(status = response.status, "Leaf recovery inbox request failed; continuing with conversation-entry discovery");
+                return Vec::new();
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Leaf recovery inbox request failed; continuing with conversation-entry discovery");
+                return Vec::new();
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&response.body) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to decode leaf recovery inbox; continuing with conversation-entry discovery");
+                return Vec::new();
+            }
+        };
+        match value.get("items").and_then(|items| items.as_array()) {
+            Some(items) => items.clone(),
+            None => {
+                tracing::warn!("Leaf recovery inbox response omitted items; continuing with conversation-entry discovery");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Whether this device holds usable local MLS state for `conversation_id`.
+    async fn has_local_group_state(&self, conversation_id: &str) -> bool {
+        let Ok(resolved) = self.resolve_legacy_group_identifier(conversation_id).await else {
+            return false;
+        };
+        let Ok(group_id_bytes) = resolved.group_id_bytes() else {
+            return false;
+        };
+        self.mls_context().get_epoch(group_id_bytes).is_ok()
+    }
+
+    /// Fulfills open leaf recoveries discovered through the exact-device inbox or
+    /// active zero-leaf participants in the conversation inventory.
     pub async fn fulfill_pending_leaf_recoveries(&self) -> Result<usize> {
         self.check_shutdown().await?;
-        let user_did = match self.require_user_did().await {
-            Ok(did) => did,
-            Err(_) => return Ok(0),
-        };
+        if self.require_user_did().await.is_err() {
+            return Ok(0);
+        }
         let actor_device_id = match self.require_actor_device_id().await {
             Ok(dev) => dev,
             Err(_) => return Ok(0),
@@ -4064,35 +4127,23 @@ where
             Ok(val) => val,
             Err(_) => return Ok(0),
         };
-        let inventory_session_id = match convos_val
+        let inbox_items = match convos_val
             .get("inventorySessionId")
-            .and_then(|v| v.as_str())
+            .and_then(|value| value.as_str())
         {
-            Some(s) => s,
-            None => return Ok(0),
-        };
-
-        let inbox_req = super::canonical_transport::PreparedRequest {
-            operation: super::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox,
-            path: format!("/xrpc/blue.catbird.chat.getLeafRecoveryInbox?actorDeviceId={}&inventorySessionId={}&limit=50", actor_device_id, inventory_session_id),
-            method: "GET".to_string(),
-            body: None,
-        };
-        let inbox_resp = match self.api_client().submit_prepared_request(inbox_req).await {
-            Ok(resp) if resp.status == 200 => resp,
-            _ => return Ok(0),
-        };
-        let inbox_val: serde_json::Value = match serde_json::from_slice(&inbox_resp.body) {
-            Ok(val) => val,
-            Err(_) => return Ok(0),
-        };
-        let items = match inbox_val.get("items").and_then(|v| v.as_array()) {
-            Some(arr) => arr,
-            None => return Ok(0),
+            Some(inventory_session_id) => {
+                self.leaf_recovery_inbox_items(&actor_device_id, inventory_session_id)
+                    .await
+            }
+            None => {
+                tracing::warn!("Conversation inventory omitted inventorySessionId; continuing with conversation-entry discovery");
+                Vec::new()
+            }
         };
 
         let mut fulfilled_count = 0;
-        for item in items {
+        let mut attempted_conversations = std::collections::HashSet::new();
+        for item in &inbox_items {
             let rec = item.get("recovery").unwrap_or(item);
             let cid = match rec
                 .get("conversationId")
@@ -4117,16 +4168,10 @@ where
                 }
             }
 
-            // Check if we have local active group state for this conversation
-            let resolved = match self.resolve_legacy_group_identifier(cid).await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let gid_bytes = match resolved.group_id_bytes() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if self.mls_context().get_epoch(gid_bytes).is_err() {
+            if !self.has_local_group_state(cid).await {
+                continue;
+            }
+            if !attempted_conversations.insert(cid.to_string()) {
                 continue;
             }
 
@@ -4144,6 +4189,53 @@ where
                 }
                 Err(e) => {
                     tracing::warn!(conversation_id = %cid, error = %e, "Failed to fulfill leaf recovery request from inbox");
+                }
+            }
+        }
+
+        if let Some(conversation_items) = convos_val.get("items").and_then(|value| value.as_array())
+        {
+            for item in conversation_items {
+                let Some(state) = item.get("state") else {
+                    continue;
+                };
+                let has_active_zero_leaf = state
+                    .get("participants")
+                    .and_then(|value| value.as_array())
+                    .is_some_and(|participants| {
+                        participants.iter().any(|participant| {
+                            participant.get("status").and_then(|value| value.as_str())
+                                == Some("active")
+                                && participant
+                                    .get("leafCount")
+                                    .and_then(|value| value.as_u64())
+                                    == Some(0)
+                        })
+                    });
+                if !has_active_zero_leaf {
+                    continue;
+                }
+                let Some(cid) = state
+                    .get("coordinates")
+                    .and_then(|value| value.get("conversationId"))
+                    .and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                if !attempted_conversations.insert(cid.to_string()) {
+                    continue;
+                }
+                if !self.has_local_group_state(cid).await {
+                    continue;
+                }
+                match self.fulfill_leaf_recovery(cid).await {
+                    Ok(_) => {
+                        tracing::info!(conversation_id = %cid, "Successfully fulfilled pending leaf recovery request from conversation entries");
+                        fulfilled_count += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(conversation_id = %cid, error = %e, "Failed to fulfill leaf recovery request from conversation entries");
+                    }
                 }
             }
         }

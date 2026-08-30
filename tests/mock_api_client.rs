@@ -202,6 +202,8 @@ struct MockState {
 
     /// Leaf recovery inbox items served to GetLeafRecoveryInbox.
     leaf_recovery_inbox_items: Vec<serde_json::Value>,
+    /// Conversation control entries served to GetEntries.
+    entries: Vec<serde_json::Value>,
     /// Cached `add_members_with_idempotency` results keyed by idempotency key.
     /// A repeat call with an already-seen key replays the cached result WITHOUT
     /// advancing the server epoch — mirroring the DS
@@ -315,6 +317,26 @@ impl MockDeliveryService {
             .unwrap()
             .leaf_recovery_inbox_items
             .push(item);
+    }
+    pub fn add_entry(&self, entry: serde_json::Value) {
+        self.state.lock().unwrap().entries.push(entry);
+    }
+
+    pub fn set_participant_leaf_count(&self, conversation_id: &str, did: &str, leaf_count: u64) {
+        let mut state = self.state.lock().unwrap();
+        let participant = state
+            .conversations
+            .get_mut(conversation_id)
+            .and_then(|conversation| conversation.participants.as_mut())
+            .and_then(|participants| {
+                participants.iter_mut().find(|participant| {
+                    participant.get("userDid").and_then(|value| value.as_str()) == Some(did)
+                })
+            })
+            .and_then(serde_json::Value::as_object_mut);
+        if let Some(participant) = participant {
+            participant.insert("leafCount".to_string(), serde_json::json!(leaf_count));
+        }
     }
 
     pub fn set_conversation_hidden_from_list(&self, conversation_id: &str, hidden: bool) {
@@ -2453,7 +2475,7 @@ impl MLSAPIClient for MockDeliveryService {
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetEntries => {
                 let output = serde_json::json!({
-                    "entries": []
+                    "entries": self.state.lock().unwrap().entries.clone()
                 });
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
