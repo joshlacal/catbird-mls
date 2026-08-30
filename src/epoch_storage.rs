@@ -208,7 +208,6 @@ mod tests {
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_rust_crypto::OpenMlsRustCrypto;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     struct TestEpochSecretStorage {
         store_result: bool,
