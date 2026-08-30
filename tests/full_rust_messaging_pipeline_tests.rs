@@ -369,3 +369,67 @@ async fn process_incoming_message_catches_up_missing_commits_before_decrypting()
             if message_id == &sent.id && convo_id == &convo.conversation_id
     )));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_fetches_app_messages_beyond_the_first_page() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice");
+    let bob_did = world.register_device("Bob").await.expect("register bob");
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let conversation = alice
+        .orchestrator
+        .create_group("Paginated receive", None, None)
+        .await
+        .expect("create group");
+    alice
+        .orchestrator
+        .swap_members(&conversation.conversation_id, &[], &[bob_did])
+        .await
+        .expect("add bob");
+    bob.orchestrator
+        .ensure_conversation_ready(&conversation.conversation_id)
+        .await
+        .expect("bob joins");
+
+    for index in 1..=101 {
+        alice
+            .orchestrator
+            .send_message(
+                &conversation.conversation_id,
+                &format!("paginated message {index}"),
+            )
+            .await
+            .expect("send message");
+    }
+
+    bob.orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("sync bob");
+
+    let app_epoch_ranges = world.delivery_service().app_message_epoch_ranges();
+    assert!(
+        !app_epoch_ranges.is_empty()
+            && app_epoch_ranges
+                .iter()
+                .all(|(from_epoch, to_epoch)| from_epoch.is_some() && from_epoch == to_epoch),
+        "app-message sync must request one exact epoch"
+    );
+
+    let received = bob
+        .storage
+        .get_conversation_messages(&conversation.conversation_id);
+    assert!(
+        received
+            .iter()
+            .any(|message| message.text == "paginated message 101"),
+        "sync must follow the canonical continuation cursor"
+    );
+}

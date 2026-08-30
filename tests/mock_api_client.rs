@@ -148,6 +148,8 @@ struct MockState {
 
     /// Messages per conversation, in insertion order.
     messages: HashMap<String, Vec<StoredMessage>>,
+    /// Epoch windows requested by canonical app-message sync passes.
+    app_message_epoch_ranges: Vec<(Option<u32>, Option<u32>)>,
 
     /// Key packages per DID (consumed FIFO by `get_key_packages`).
     key_packages: HashMap<String, Vec<StoredKeyPackage>>,
@@ -320,6 +322,10 @@ impl MockDeliveryService {
     }
     pub fn add_entry(&self, entry: serde_json::Value) {
         self.state.lock().unwrap().entries.push(entry);
+    }
+
+    pub fn app_message_epoch_ranges(&self) -> Vec<(Option<u32>, Option<u32>)> {
+        self.state.lock().unwrap().app_message_epoch_ranges.clone()
     }
 
     pub fn set_participant_leaf_count(&self, conversation_id: &str, did: &str, leaf_count: u64) {
@@ -2568,6 +2574,10 @@ impl MLSAPIClient for MockDeliveryService {
             "injected get_messages failure",
         )?;
 
+        if message_type == Some("app") {
+            guard.app_message_epoch_ranges.push((from_epoch, to_epoch));
+        }
+
         let all_messages = guard
             .messages
             .get(convo_id)
@@ -2589,7 +2599,7 @@ impl MLSAPIClient for MockDeliveryService {
                     if mt == "commit" && !m.is_commit {
                         return false;
                     }
-                    if (mt == "message" || mt == "application") && m.is_commit {
+                    if matches!(mt, "app" | "message" | "application") && m.is_commit {
                         return false;
                     }
                 }

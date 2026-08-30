@@ -11,6 +11,8 @@ use super::pagination::PaginationGuard;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
+const APP_MESSAGE_SYNC_PAGE_SIZE: u32 = 100;
+
 fn member_matches_user_root_exact(member_did: &str, expected_root_did: &str) -> bool {
     super::credential_binding::credential_root_did(member_did) == expected_root_did
 }
@@ -128,6 +130,38 @@ where
         }
 
         Ok(report)
+    }
+
+    async fn fetch_current_epoch_app_messages(
+        &self,
+        conversation_id: &str,
+        app_epoch: u32,
+    ) -> Result<usize> {
+        // ponytail: replay from seq 0 until storage exposes a durable
+        // per-conversation cursor; the pagination guard keeps that replay bounded.
+        let mut cursor = None;
+        let mut processed = 0;
+        let mut pagination = PaginationGuard::for_messages("sync app messages");
+
+        loop {
+            let (messages, next_cursor) = self
+                .fetch_messages(
+                    conversation_id,
+                    cursor.as_deref(),
+                    APP_MESSAGE_SYNC_PAGE_SIZE,
+                    Some("app"),
+                    Some(app_epoch),
+                    Some(app_epoch),
+                )
+                .await?;
+            pagination.observe_page(messages.len(), next_cursor.as_deref())?;
+            processed += messages.len();
+
+            let Some(next_cursor) = next_cursor else {
+                return Ok(processed);
+            };
+            cursor = Some(next_cursor);
+        }
     }
 
     /// Sync conversations with the server.
@@ -737,13 +771,12 @@ where
             // `process_incoming` is never called for app payloads, so
             // `storage.store_message` never fires and the UI shows nothing).
             //
-            // Pulls the most recent messages for the current local epoch.
-            // After Welcome/External Commit recovery, older epoch material is
-            // often intentionally unavailable on this device. Replaying those
-            // stale ciphertexts makes the UI look broken while OpenMLS reports
-            // WrongEpoch/TooDistantInThePast. Commit catch-up above is the
-            // path for epoch advancement; this pass is for current-epoch app
-            // traffic.
+            // Pulls every canonical page for the current local epoch. After
+            // Welcome/External Commit recovery, older epoch material is often
+            // intentionally unavailable on this device. Replaying those stale
+            // ciphertexts makes the UI look broken while OpenMLS reports
+            // WrongEpoch/TooDistantInThePast. Commit catch-up above is the path
+            // for epoch advancement; this pass is for current-epoch app traffic.
             // get_epoch Err means the group is missing locally; Ok(epoch) —
             // including epoch 0, which is legitimate between group creation
             // and the first commit — means fetch app traffic for that epoch.
@@ -771,28 +804,21 @@ where
                 }
             };
             match self
-                .fetch_messages(
-                    conversation_id,
-                    None,
-                    20,
-                    Some("app"),
-                    Some(app_epoch),
-                    None,
-                )
+                .fetch_current_epoch_app_messages(conversation_id, app_epoch)
                 .await
             {
-                Ok((msgs, _)) => {
-                    if !msgs.is_empty() {
+                Ok(processed) => {
+                    if processed > 0 {
                         tracing::debug!(
                             conversation_id = %conversation_id,
                             group_id = %group_id,
-                            new = msgs.len(),
+                            new = processed,
                             "Sync app-message pass processed messages"
                         );
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(
+                    tracing::warn!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
                         error = %e,

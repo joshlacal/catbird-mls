@@ -2,15 +2,18 @@ use std::collections::HashSet;
 
 use super::error::{OrchestratorError, Result};
 
-/// Hard limits for server-controlled conversation pagination.
+/// Hard limits for server-controlled pagination.
 ///
-/// Conversation listings are a recovery and synchronization input, so a
-/// remote peer must not be able to keep a client in an unbounded cursor loop
-/// or make it retain an unbounded result set. Ten thousand conversations is
-/// deliberately well above normal client use while keeping memory and network
-/// work finite.
+/// Conversation listings and message backfills are recovery and
+/// synchronization inputs, so a remote peer must not be able to keep a client
+/// in an unbounded cursor loop or make it retain an unbounded result set. Ten
+/// thousand items is deliberately well above normal client use while keeping
+/// memory and network work finite.
 pub(crate) const MAX_CONVERSATION_PAGES: usize = 100;
 pub(crate) const MAX_CONVERSATION_ITEMS: usize = 10_000;
+
+pub(crate) const MAX_MESSAGE_PAGES: usize = 100;
+pub(crate) const MAX_MESSAGE_ITEMS: usize = 10_000;
 
 /// Tracks a single cursor-pagination traversal and rejects remote responses
 /// that would make it unbounded.
@@ -27,6 +30,10 @@ pub(crate) struct PaginationGuard {
 impl PaginationGuard {
     pub(crate) fn for_conversations(context: &'static str) -> Self {
         Self::with_limits(context, MAX_CONVERSATION_PAGES, MAX_CONVERSATION_ITEMS)
+    }
+
+    pub(crate) fn for_messages(context: &'static str) -> Self {
+        Self::with_limits(context, MAX_MESSAGE_PAGES, MAX_MESSAGE_ITEMS)
     }
 
     fn with_limits(context: &'static str, max_pages: usize, max_items: usize) -> Self {
