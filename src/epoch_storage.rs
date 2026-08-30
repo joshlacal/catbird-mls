@@ -6,7 +6,6 @@
 // for retaining epoch secrets beyond OpenMLS's in-memory retention policy.
 
 use crate::error::MLSError;
-use crate::orchestrator::constants::SAFE_EXPORT_EPOCH_BLOB_KEY;
 use crate::types::EpochSecretStorage;
 use openmls::prelude::*;
 use std::sync::{Arc, RwLock};
@@ -75,8 +74,8 @@ impl EpochSecretManager {
     /// This should be called BEFORE processing a commit that advances the epoch.
     /// The exported secret allows decrypting messages from the current epoch
     /// even after the group has advanced to a new epoch.
-    /// Uses safe_export_secret (Puncturable PRF) when available for intra-epoch
-    /// forward secrecy, falling back to export_secret for legacy groups.
+    /// Uses the deterministic RFC 9420 exporter so retries produce the same
+    /// durable value for a given group and epoch.
     pub async fn export_current_epoch_secret<Provider: OpenMlsProvider>(
         &self,
         group: &mut MlsGroup,
@@ -91,38 +90,17 @@ impl EpochSecretManager {
             current_epoch
         );
 
-        // Try safe_export_secret first (Puncturable PRF, forward-secure within epoch).
-        // Falls back to export_secret for groups without application_export_tree.
-        let secret = match group.safe_export_secret(
-            provider.crypto(),
-            provider.storage(),
-            SAFE_EXPORT_EPOCH_BLOB_KEY,
-        ) {
-            Ok(s) => {
-                crate::info_log!(
-                    "[EPOCH-STORAGE] Used safe_export_secret (PPRF) for epoch {}",
-                    current_epoch
-                );
-                s
-            }
-            Err(e) => {
-                crate::info_log!(
-                    "[EPOCH-STORAGE] safe_export_secret unavailable ({:?}), falling back to export_secret",
+        let label = format!("epoch_secret_{}", current_epoch);
+        let context = group_id_hex.as_bytes();
+        let secret = group
+            .export_secret(provider.crypto(), &label, context, 32)
+            .map_err(|e| {
+                crate::error_log!(
+                    "[EPOCH-STORAGE] ERROR: Failed to export epoch secret: {:?}",
                     e
                 );
-                let label = format!("epoch_secret_{}", current_epoch);
-                let context = group_id_hex.as_bytes();
-                group
-                    .export_secret(provider.crypto(), &label, context, 32)
-                    .map_err(|e| {
-                        crate::error_log!(
-                            "[EPOCH-STORAGE] ERROR: Failed to export epoch secret: {:?}",
-                            e
-                        );
-                        MLSError::SecretExportFailed
-                    })?
-            }
-        };
+                MLSError::SecretExportFailed
+            })?;
 
         crate::debug_log!(
             "[EPOCH-STORAGE] Exported {} bytes for epoch {}",
@@ -130,7 +108,6 @@ impl EpochSecretManager {
             current_epoch
         );
 
-        let secret = secret.to_vec();
         self.persist_epoch_secret(group_id_hex, current_epoch, secret.clone())
             .await?;
         Ok(secret)
@@ -228,7 +205,10 @@ impl Default for EpochSecretManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_rust_crypto::OpenMlsRustCrypto;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     struct TestEpochSecretStorage {
         store_result: bool,
@@ -330,5 +310,50 @@ mod tests {
             .await
             .expect("confirmed exact delete must succeed");
         assert_eq!(storage.delete_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_epoch_export_is_idempotent() {
+        let provider = OpenMlsRustCrypto::default();
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let signer =
+            SignatureKeyPair::new(ciphersuite.signature_algorithm()).expect("create signer");
+        let credential_with_key = CredentialWithKey {
+            credential: BasicCredential::new(b"did:plc:epoch-export".to_vec()).into(),
+            signature_key: signer.public().into(),
+        };
+        let config = MlsGroupCreateConfig::builder()
+            .ciphersuite(ciphersuite)
+            .capabilities(crate::mls_context::metadata_leaf_capabilities())
+            .use_ratchet_tree_extension(true)
+            .build();
+        let mut group = MlsGroup::new_with_group_id(
+            &provider,
+            &signer,
+            &config,
+            GroupId::from_slice(b"epoch-export-group"),
+            credential_with_key,
+        )
+        .expect("create group");
+        let manager = EpochSecretManager::new();
+        let storage = Arc::new(TestEpochSecretStorage {
+            store_result: true,
+            store_calls: AtomicUsize::new(0),
+            delete_result: true,
+            delete_calls: AtomicUsize::new(0),
+        });
+        manager.set_storage(storage.clone()).unwrap();
+
+        let first = manager
+            .export_current_epoch_secret(&mut group, &provider)
+            .await
+            .expect("first export");
+        let second = manager
+            .export_current_epoch_secret(&mut group, &provider)
+            .await
+            .expect("repeated export must be accepted");
+
+        assert_eq!(first, second);
+        assert_eq!(storage.store_calls.load(Ordering::SeqCst), 2);
     }
 }

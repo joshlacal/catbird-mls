@@ -69,12 +69,6 @@ pub const FAILOVER_MIN_DURATION: Duration = Duration::from_secs(120);
 /// expires, after which fresh resolution must reject it.
 pub const DEVICE_KEY_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
-// §Safe Export — Puncturable PRF component IDs (extensions-draft)
-/// Component ID for epoch blob decryption key (forward-secure within epochs).
-pub const SAFE_EXPORT_EPOCH_BLOB_KEY: u16 = 0;
-/// Component ID for group metadata encryption key (forward-secure within epochs).
-pub const SAFE_EXPORT_METADATA_KEY: u16 = 1;
-
 // Layer 3 Quarantine (defense-in-depth against epoch storms).
 /// One peer producing this many peer-bad commit failures triggers quarantine.
 pub const QUARANTINE_SINGLE_PEER_HITS: u32 = 3;
