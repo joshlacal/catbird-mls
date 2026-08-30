@@ -798,13 +798,60 @@ mod tests {
             .mls_context()
             .get_epoch(group_id.clone())
             .expect("local epoch");
+        let metadata_key = alice
+            .orchestrator
+            .mls_context()
+            .export_metadata_key(group_id.clone(), local_epoch)
+            .expect("export metadata key");
+        let metadata_key: [u8; 32] = metadata_key.try_into().expect("metadata key length");
+        let metadata = crate::metadata::GroupMetadataV1 {
+            version: 1,
+            title: "swap epoch fence".to_string(),
+            description: String::new(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
+        };
+        let nonce = [1u8; 12];
+        let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
+            &metadata_key,
+            &group_id,
+            local_epoch,
+            1,
+            &nonce,
+            &metadata,
+        )
+        .expect("encrypt metadata snapshot");
+        let mut metadata_snapshot = alice
+            .orchestrator
+            .fetch_current_metadata_snapshot(&conversation.conversation_id)
+            .await
+            .expect("fetch metadata snapshot");
+        metadata_snapshot["coordinate"]["epoch"] = serde_json::json!(local_epoch);
+        metadata_snapshot["nonce"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(nonce));
+        metadata_snapshot["ciphertext"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&ciphertext));
+        metadata_snapshot["ciphertextSha256"] = serde_json::json!(
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&ciphertext))
+        );
+        metadata_snapshot["ciphertextSize"] = serde_json::json!(ciphertext.len());
+        world
+            .delivery_service()
+            .update_conversation_metadata_snapshot_for_test(
+                &conversation.conversation_id,
+                metadata_snapshot,
+            );
         world
             .delivery_service()
             .set_conversation_epoch_for_test(&conversation.conversation_id, local_epoch + 7);
 
         let error = alice
             .orchestrator
-            .swap_members(&conversation.group_id, &[bob_did], &[carol_did])
+            .swap_members(
+                &conversation.group_id,
+                &[bob_did.clone()],
+                &[carol_did.clone()],
+            )
             .await
             .expect_err("higher DS epoch must not authorize merge");
         assert!(matches!(error, OrchestratorError::EpochMismatch { .. }));
@@ -812,8 +859,39 @@ mod tests {
             alice
                 .orchestrator
                 .mls_context()
-                .get_epoch(group_id)
+                .get_epoch(group_id.clone())
                 .expect("local epoch after rejection"),
+            local_epoch
+        );
+
+        world
+            .delivery_service()
+            .set_conversation_epoch_for_test(&conversation.conversation_id, local_epoch);
+        let mut metadata_snapshot = alice
+            .orchestrator
+            .fetch_current_metadata_snapshot(&conversation.conversation_id)
+            .await
+            .expect("fetch metadata snapshot");
+        metadata_snapshot["ciphertext"] = serde_json::json!("not-base64");
+        world
+            .delivery_service()
+            .update_conversation_metadata_snapshot_for_test(
+                &conversation.conversation_id,
+                metadata_snapshot,
+            );
+
+        let error = alice
+            .orchestrator
+            .swap_members(&conversation.group_id, &[bob_did], &[carol_did])
+            .await
+            .expect_err("unreadable metadata must not authorize merge");
+        assert!(matches!(error, OrchestratorError::Serialization(_)));
+        assert_eq!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_epoch(group_id)
+                .expect("local epoch after unreadable metadata"),
             local_epoch
         );
     }
@@ -1797,7 +1875,7 @@ mod tests {
 
         let created = alice
             .orchestrator
-            .create_group("alice group", Some(&[bob.did.clone()]), None)
+            .create_group("a", Some(&[bob.did.clone()]), None)
             .await
             .expect("create conversation");
 
@@ -1878,19 +1956,40 @@ mod tests {
             "local epoch must advance after Add commit"
         );
 
+        use crate::orchestrator::canonical_transport::CanonicalOperation;
         let requests = world.delivery_service().submitted_prepared_requests();
+        let inner_body = |body: Option<&[u8]>| -> serde_json::Value {
+            let val: serde_json::Value =
+                serde_json::from_slice(body.unwrap_or_default()).expect("parse request body");
+            val.pointer("/signedRequest/body").cloned().unwrap_or(val)
+        };
+        let creation_req = requests
+            .iter()
+            .find(|r| r.operation == CanonicalOperation::CreateConversation)
+            .expect("must submit conversation creation");
         let transition_req = requests
             .iter()
-            .find(|r| r.operation == crate::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition)
+            .rfind(|r| r.operation == CanonicalOperation::SubmitTransition)
             .expect("must submit transition with leaf recovery fulfillment");
+        let creation_inner = inner_body(creation_req.body.as_deref());
+        let inner = inner_body(transition_req.body.as_deref());
 
-        let body_bytes = transition_req.body.as_deref().unwrap_or(&[]);
-        let body_val: serde_json::Value =
-            serde_json::from_slice(body_bytes).expect("parse transition body");
-        let inner = body_val
-            .get("signedRequest")
-            .and_then(|s| s.get("body"))
-            .unwrap_or(&body_val);
+        let ciphertext_len = |body: &serde_json::Value| {
+            let value = body
+                .pointer("/metadataSnapshot/ciphertext")
+                .expect("metadata ciphertext");
+            let encoded = value
+                .get("$bytes")
+                .and_then(|bytes| bytes.as_str())
+                .or_else(|| value.as_str())
+                .expect("metadata ciphertext bytes");
+            STANDARD.decode(encoded).expect("valid ciphertext").len()
+        };
+        assert_eq!(
+            ciphertext_len(&inner),
+            ciphertext_len(&creation_inner),
+            "metadata resealing must preserve ciphertext length"
+        );
         assert_eq!(
             inner.get("$type").and_then(|v| v.as_str()),
             Some("blue.catbird.chat.defs#leafRecoveryFulfillmentBody")
@@ -3753,9 +3852,10 @@ where
             .get("stateVersion")
             .and_then(|v| v.as_i64())
             .unwrap_or(1);
-        let prior_epoch = prior.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
 
-        let pm = prior_metadata_snapshot.unwrap_or(serde_json::json!({}));
+        let pm = prior_metadata_snapshot.ok_or_else(|| {
+            OrchestratorError::InvalidInput("prior metadataSnapshot missing".into())
+        })?;
         let metadata_version = pm
             .get("metadataVersion")
             .and_then(|v| v.as_i64())
@@ -3779,65 +3879,8 @@ where
         });
         let avatar_binding = pm.get("avatarBinding").cloned();
 
-        let prior_ct_b64 = pm
-            .get("ciphertext")
-            .and_then(|v| {
-                v.get("$bytes")
-                    .and_then(|b| b.as_str())
-                    .or_else(|| v.as_str())
-            })
-            .unwrap_or("");
-        let prior_nonce_b64 = pm
-            .get("nonce")
-            .and_then(|v| {
-                v.get("$bytes")
-                    .and_then(|b| b.as_str())
-                    .or_else(|| v.as_str())
-            })
-            .unwrap_or("");
-        let prior_ct = STANDARD.decode(prior_ct_b64).unwrap_or_default();
-        let prior_nonce = STANDARD.decode(prior_nonce_b64).unwrap_or_default();
-
-        let epoch_0_key = self
-            .mls_context()
-            .export_metadata_key(group_id_bytes.clone(), prior_epoch)?;
-        let epoch_0_key_arr: [u8; 32] = epoch_0_key.as_slice().try_into().unwrap_or([0u8; 32]);
-        let full_blob = if prior_ct.len() >= 28 {
-            prior_ct.clone()
-        } else if prior_nonce.len() == 12 {
-            let mut b = prior_nonce.clone();
-            b.extend_from_slice(&prior_ct);
-            b
-        } else {
-            prior_ct.clone()
-        };
-        let metadata_plaintext = if !full_blob.is_empty() {
-            crate::metadata::decrypt_metadata_blob(
-                &epoch_0_key_arr,
-                &group_id_bytes,
-                prior_epoch,
-                metadata_version as u64,
-                &full_blob,
-            )
-            .unwrap_or_else(|e| {
-                tracing::debug!(error = ?e, "Decrypt metadata failed");
-                crate::metadata::GroupMetadataV1 {
-                    version: metadata_version as u32,
-                    title: requester_did.clone(),
-                    description: "".to_string(),
-                    avatar_blob_locator: None,
-                    avatar_content_type: None,
-                }
-            })
-        } else {
-            crate::metadata::GroupMetadataV1 {
-                version: metadata_version as u32,
-                title: requester_did.clone(),
-                description: "".to_string(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-            }
-        };
+        let metadata_plaintext =
+            self.decrypt_metadata_snapshot_value(&pm, &group_id_bytes, metadata_version as u64)?;
 
         let mut aad_prior = prior.clone();
         if let Some(obj) = aad_prior.as_object_mut() {
@@ -6537,103 +6580,37 @@ where
         use rand::RngCore;
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let (ciphertext, target_metadata_version) = if let (Some(ct), Some(mv)) =
-            (custom_metadata_ciphertext, custom_metadata_version)
-        {
-            (ct, mv)
-        } else {
-            let empty_metadata = |version: u32| crate::metadata::GroupMetadataV1 {
-                version,
-                title: String::new(),
-                description: String::new(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-            };
-            let (metadata_plaintext, target_mv) =
-                match self.fetch_current_metadata_snapshot(conversation_id).await {
-                    Err(_) => (empty_metadata(1), 1),
-                    Ok(prior_snap) => {
-                        let prior_mv = prior_snap
-                            .get("metadataVersion")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(1);
-                        let prior_epoch = prior_snap
-                            .get("coordinate")
-                            .and_then(|c| c.get("epoch"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(target_epoch.saturating_sub(1));
-                        let decode_b = |val: Option<&serde_json::Value>| -> Option<Vec<u8>> {
-                            let s = val.and_then(|v| {
-                                v.get("$bytes")
-                                    .and_then(|b| b.as_str())
-                                    .or_else(|| v.as_str())
-                            })?;
-                            STANDARD.decode(s).ok()
-                        };
-                        let fallback_version = u32::try_from(
-                            prior_snap
-                                .get("version")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(1),
-                        )
-                        .map_err(|e| {
-                            OrchestratorError::InvalidInput(format!(
-                                "metadata schema version overflow: {e}"
-                            ))
-                        })?;
-                        // Carry the prior plaintext forward when it can be recovered;
-                        // any missing/unreadable piece falls back to empty metadata at
-                        // the prior schema version rather than failing the commit.
-                        let recovered = (|| -> Option<crate::metadata::GroupMetadataV1> {
-                            let p_nonce: [u8; 12] =
-                                decode_b(prior_snap.get("nonce"))?.try_into().ok()?;
-                            let p_ct = decode_b(prior_snap.get("ciphertext"))?;
-                            let p_key = self
-                                .mls_context()
-                                .export_metadata_key(group_id.to_vec(), prior_epoch)
-                                .ok()?;
-                            let p_key_arr: [u8; 32] = p_key.as_slice().try_into().ok()?;
-                            crate::metadata::decrypt_metadata_snapshot(
-                                &p_key_arr,
-                                group_id,
-                                prior_epoch,
-                                prior_mv,
-                                &p_nonce,
-                                &p_ct,
-                            )
-                            .ok()
-                        })();
-                        (
-                            recovered.unwrap_or_else(|| empty_metadata(fallback_version)),
-                            prior_mv,
-                        )
-                    }
-                };
-            let metadata_key = self
-                .mls_context()
-                .export_metadata_key_from_pending(group_id.to_vec(), target_epoch)
-                .or_else(|_| {
-                    self.mls_context()
-                        .export_metadata_key(group_id.to_vec(), target_epoch)
+        let (ciphertext, target_metadata_version) =
+            if let (Some(ct), Some(mv)) = (custom_metadata_ciphertext, custom_metadata_version) {
+                (ct, mv)
+            } else {
+                let (metadata_plaintext, target_mv) = self
+                    .decrypt_current_metadata_snapshot(conversation_id, group_id)
+                    .await?;
+                let metadata_key_arr: [u8; 32] = self
+                    .mls_context()
+                    .export_metadata_key_from_pending(group_id.to_vec(), target_epoch)?
+                    .try_into()
+                    .map_err(|_| {
+                        OrchestratorError::Mls(MLSError::Internal(
+                            "metadata key length mismatch".into(),
+                        ))
+                    })?;
+                let ct = crate::metadata::encrypt_metadata_snapshot_with_nonce(
+                    &metadata_key_arr,
+                    group_id,
+                    target_epoch,
+                    target_mv,
+                    &nonce,
+                    &metadata_plaintext,
+                )
+                .map_err(|e| {
+                    OrchestratorError::Mls(MLSError::Internal(format!(
+                        "encrypt metadata snapshot: {e:?}"
+                    )))
                 })?;
-            let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
-                OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
-            })?;
-            let ct = crate::metadata::encrypt_metadata_snapshot_with_nonce(
-                &metadata_key_arr,
-                group_id,
-                target_epoch,
-                target_mv,
-                &nonce,
-                &metadata_plaintext,
-            )
-            .map_err(|e| {
-                OrchestratorError::Mls(MLSError::Internal(format!(
-                    "encrypt metadata snapshot: {e:?}"
-                )))
-            })?;
-            (ct, target_mv)
-        };
+                (ct, target_mv)
+            };
 
         let leaf_changes: Vec<serde_json::Value> = if welcome_bytes.is_none()
             && !member_dids.is_empty()
@@ -7114,7 +7091,7 @@ where
         }
         Ok(())
     }
-    async fn fetch_current_metadata_snapshot(
+    pub(crate) async fn fetch_current_metadata_snapshot(
         &self,
         conversation_id: &str,
     ) -> Result<serde_json::Value> {
@@ -7154,6 +7131,90 @@ where
                     "metadataSnapshot missing from current conversation state".into(),
                 )
             })
+    }
+
+    /// Decrypt a canonical `metadataSnapshot` (12-byte nonce carried beside
+    /// `ciphertext || tag`) with the metadata key of the epoch it was sealed at.
+    pub(crate) fn decrypt_metadata_snapshot_value(
+        &self,
+        snapshot: &serde_json::Value,
+        group_id: &[u8],
+        metadata_version: u64,
+    ) -> Result<crate::metadata::GroupMetadataV1> {
+        let metadata_epoch = snapshot
+            .pointer("/coordinate/epoch")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput(
+                    "prior metadataSnapshot.coordinate.epoch missing".into(),
+                )
+            })?;
+        let decode_bytes = |field: &str| -> Result<Vec<u8>> {
+            let value = snapshot.get(field).ok_or_else(|| {
+                OrchestratorError::InvalidInput(format!("prior metadataSnapshot.{field} missing"))
+            })?;
+            let encoded = value
+                .get("$bytes")
+                .and_then(|bytes| bytes.as_str())
+                .or_else(|| value.as_str())
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput(format!(
+                        "prior metadataSnapshot.{field} is not bytes"
+                    ))
+                })?;
+            STANDARD.decode(encoded).map_err(|error| {
+                OrchestratorError::Serialization(format!(
+                    "invalid prior metadataSnapshot.{field}: {error}"
+                ))
+            })
+        };
+        let nonce: [u8; 12] = decode_bytes("nonce")?.try_into().map_err(|_| {
+            OrchestratorError::InvalidInput("prior metadataSnapshot.nonce must be 12 bytes".into())
+        })?;
+        let ciphertext = decode_bytes("ciphertext")?;
+        let key: [u8; 32] = self
+            .mls_context()
+            .export_metadata_key(group_id.to_vec(), metadata_epoch)?
+            .try_into()
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal(
+                    "prior metadata key length mismatch".into(),
+                ))
+            })?;
+        crate::metadata::decrypt_metadata_snapshot(
+            &key,
+            group_id,
+            metadata_epoch,
+            metadata_version,
+            &nonce,
+            &ciphertext,
+        )
+        .map_err(|error| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "decrypt prior metadata snapshot: {error:?}"
+            )))
+        })
+    }
+
+    pub(crate) async fn decrypt_current_metadata_snapshot(
+        &self,
+        conversation_id: &str,
+        group_id: &[u8],
+    ) -> Result<(crate::metadata::GroupMetadataV1, u64)> {
+        let snapshot = self
+            .fetch_current_metadata_snapshot(conversation_id)
+            .await?;
+        let metadata_version = snapshot
+            .get("metadataVersion")
+            .and_then(|value| value.as_u64())
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput(
+                    "prior metadataSnapshot.metadataVersion missing".into(),
+                )
+            })?;
+        let metadata =
+            self.decrypt_metadata_snapshot_value(&snapshot, group_id, metadata_version)?;
+        Ok((metadata, metadata_version))
     }
 
     pub(crate) async fn fetch_current_conversation_state_and_coordinates(

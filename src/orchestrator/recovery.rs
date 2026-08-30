@@ -1165,6 +1165,16 @@ where
             self.escalate_fork_to_rejoin(convo_id).await;
             return Err(error);
         }
+        let (metadata_plaintext, metadata_version) = match self
+            .decrypt_current_metadata_snapshot(&resolved.conversation_id, &gid)
+            .await
+        {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(error);
+            }
+        };
 
         let kps: Vec<Vec<u8>> = kp_refs.iter().map(|r| r.key_package_data.clone()).collect();
         let (commit, _) = match self
@@ -1213,32 +1223,42 @@ where
             OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
         })?;
 
-        use rand::RngCore;
-        let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
-            version: 1,
-            title: "".to_string(),
-            description: "".to_string(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
+        let metadata = (|| -> Result<([u8; 12], Vec<u8>)> {
+            use rand::RngCore;
+            let mut nonce = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            let metadata_key: [u8; 32] = self
+                .mls_context()
+                .export_metadata_key_from_pending(gid.clone(), target_epoch)?
+                .try_into()
+                .map_err(|_| {
+                    OrchestratorError::Mls(MLSError::Internal(
+                        "pending metadata key length mismatch".into(),
+                    ))
+                })?;
+            let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
+                &metadata_key,
+                &gid,
+                target_epoch,
+                metadata_version,
+                &nonce,
+                &metadata_plaintext,
+            )
+            .map_err(|error| {
+                OrchestratorError::Mls(MLSError::Internal(format!(
+                    "encrypt metadata snapshot: {error:?}"
+                )))
+            })?;
+            Ok((nonce, ciphertext))
+        })();
+        let (nonce, ciphertext) = match metadata {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                let _ = self.mls_context().clear_pending_commit(gid.clone());
+                self.escalate_fork_to_rejoin(convo_id).await;
+                return Err(error);
+            }
         };
-        let metadata_key = self.mls_context().safe_export_secret(gid.clone(), 0x8001)?;
-        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
-            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
-        })?;
-        let ciphertext = crate::metadata::encrypt_metadata_blob(
-            &metadata_key_arr,
-            &gid,
-            target_epoch,
-            1,
-            &metadata_plaintext,
-        )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
-            )))
-        })?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -1299,7 +1319,7 @@ where
                     "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
                     "groupId": { "$bytes": STANDARD.encode(&gid) }
                 },
-                "metadataVersion": 1,
+                "metadataVersion": metadata_version,
                 "nonce": { "$bytes": STANDARD.encode(&nonce) },
                 "originTransitionId": transition_id
             },
@@ -2781,6 +2801,10 @@ where
                 "recipient {recipient_user_did} not present in local MLS group state"
             )));
         }
+        let current_group_id = resolved.group_id_bytes()?;
+        let (metadata_plaintext, metadata_version) = self
+            .decrypt_current_metadata_snapshot(&resolved.conversation_id, &current_group_id)
+            .await?;
 
         // Fetch a fresh key package for the recipient and stage the swap. Same
         // body shape as `swap_members`, but ships through
@@ -2858,34 +2882,46 @@ where
             OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
         })?;
 
-        use rand::RngCore;
-        let mut nonce = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
-            version: 1,
-            title: "".to_string(),
-            description: "".to_string(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
+        let metadata = (|| -> Result<([u8; 12], Vec<u8>)> {
+            use rand::RngCore;
+            let mut nonce = [0u8; 12];
+            rand::thread_rng().fill_bytes(&mut nonce);
+            let metadata_key: [u8; 32] = self
+                .mls_context()
+                .export_metadata_key_from_pending(group_id_bytes.clone(), plan.target_epoch)?
+                .try_into()
+                .map_err(|_| {
+                    OrchestratorError::Mls(MLSError::Internal(
+                        "pending metadata key length mismatch".into(),
+                    ))
+                })?;
+            let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
+                &metadata_key,
+                &group_id_bytes,
+                plan.target_epoch,
+                metadata_version,
+                &nonce,
+                &metadata_plaintext,
+            )
+            .map_err(|error| {
+                OrchestratorError::Mls(MLSError::Internal(format!(
+                    "encrypt metadata snapshot: {error:?}"
+                )))
+            })?;
+            Ok((nonce, ciphertext))
+        })();
+        let (nonce, ciphertext) = match metadata {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.discard_pending_after_failed_operation(
+                    plan.handle,
+                    "respond_to_welcome_reissue metadata",
+                    &error.to_string(),
+                )
+                .await?;
+                return Err(error);
+            }
         };
-        let metadata_key = self
-            .mls_context()
-            .safe_export_secret(group_id_bytes.clone(), 0x8001)?;
-        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
-            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
-        })?;
-        let ciphertext = crate::metadata::encrypt_metadata_blob(
-            &metadata_key_arr,
-            &group_id_bytes,
-            plan.target_epoch,
-            1,
-            &metadata_plaintext,
-        )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
-            )))
-        })?;
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::{Digest, Sha256};
 
@@ -2946,7 +2982,7 @@ where
                     "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
                     "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
-                "metadataVersion": 1,
+                "metadataVersion": metadata_version,
                 "nonce": { "$bytes": STANDARD.encode(&nonce) },
                 "originTransitionId": transition_id
             },
@@ -5733,6 +5769,49 @@ where
         Ok(())
     }
 
+    async fn locally_known_metadata(
+        &self,
+        convo_id: &str,
+    ) -> Result<crate::metadata::GroupMetadataV1> {
+        let cached = self
+            .conversations()
+            .lock()
+            .await
+            .get(convo_id)
+            .and_then(|conversation| conversation.metadata.clone());
+        let metadata = match cached {
+            Some(metadata) => Some(metadata),
+            None => {
+                let user_did = self.require_user_did().await?;
+                self.storage()
+                    .get_conversation(&user_did, convo_id)
+                    .await?
+                    .and_then(|conversation| conversation.metadata)
+            }
+        };
+        let (title, description, avatar_blob_locator) = match metadata {
+            Some(metadata) => (
+                metadata.name.unwrap_or_default(),
+                metadata.description.unwrap_or_default(),
+                metadata.avatar_url,
+            ),
+            None => {
+                tracing::warn!(
+                    convo_id,
+                    "no locally cached conversation metadata available; sealing an empty snapshot"
+                );
+                (String::new(), String::new(), None)
+            }
+        };
+        Ok(crate::metadata::GroupMetadataV1 {
+            version: 1,
+            title,
+            description,
+            avatar_blob_locator,
+            avatar_content_type: None,
+        })
+    }
+
     async fn submit_external_commit_prepared(
         &self,
         convo_id: &str,
@@ -5784,29 +5863,25 @@ where
         use rand::RngCore;
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
-            version: 1,
-            title: "".to_string(),
-            description: "".to_string(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        };
-        let metadata_key = self
+        let metadata_plaintext = self.locally_known_metadata(convo_id).await?;
+        let metadata_key: [u8; 32] = self
             .mls_context()
-            .safe_export_secret(group_id_bytes.clone(), 0x8001)?;
-        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
-            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
-        })?;
-        let ciphertext = crate::metadata::encrypt_metadata_blob(
-            &metadata_key_arr,
+            .export_metadata_key(group_id_bytes.clone(), target_epoch)?
+            .try_into()
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+            })?;
+        let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
+            &metadata_key,
             &group_id_bytes,
             target_epoch,
-            1,
+            u64::from(metadata_plaintext.version),
+            &nonce,
             &metadata_plaintext,
         )
-        .map_err(|e| {
+        .map_err(|error| {
             OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
+                "encrypt metadata snapshot: {error:?}"
             )))
         })?;
 
@@ -5872,7 +5947,7 @@ where
                     "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
                     "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) }
                 },
-                "metadataVersion": 1,
+                "metadataVersion": metadata_plaintext.version,
                 "nonce": { "$bytes": STANDARD.encode(&nonce) },
                 "originTransitionId": transition_id
             },
@@ -6121,29 +6196,25 @@ where
         use rand::RngCore;
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let metadata_plaintext = crate::metadata::GroupMetadataV1 {
-            version: 1,
-            title: "".to_string(),
-            description: "".to_string(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-        };
-        let metadata_key = self
+        let metadata_plaintext = self.locally_known_metadata(convo_id).await?;
+        let metadata_key: [u8; 32] = self
             .mls_context()
-            .safe_export_secret(new_group_id_bytes.clone(), 0x8001)?;
-        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
-            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
-        })?;
-        let ciphertext = crate::metadata::encrypt_metadata_blob(
-            &metadata_key_arr,
+            .export_metadata_key(new_group_id_bytes.clone(), successor_epoch)?
+            .try_into()
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+            })?;
+        let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
+            &metadata_key,
             &new_group_id_bytes,
-            0,
-            1,
+            successor_epoch,
+            u64::from(metadata_plaintext.version),
+            &nonce,
             &metadata_plaintext,
         )
-        .map_err(|e| {
+        .map_err(|error| {
             OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
+                "encrypt metadata snapshot: {error:?}"
             )))
         })?;
 
@@ -6196,7 +6267,7 @@ where
                     "groupContextHash": base64::engine::general_purpose::STANDARD.encode(successor_gc_hash),
                     "groupId": base64::engine::general_purpose::STANDARD.encode(&new_group_id_bytes)
                 },
-                "metadataVersion": 1,
+                "metadataVersion": metadata_plaintext.version,
                 "nonce": base64::engine::general_purpose::STANDARD.encode(&nonce),
                 "originTransitionId": transition_id
             },
@@ -6409,6 +6480,31 @@ mod tests {
                     == crate::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
             })
             .count()
+    }
+
+    fn submitted_inner_body(
+        request: &crate::orchestrator::canonical_transport::PreparedRequest,
+    ) -> serde_json::Value {
+        let value: serde_json::Value =
+            serde_json::from_slice(request.body.as_deref().unwrap_or_default())
+                .expect("parse submitted request body");
+        value
+            .pointer("/signedRequest/body")
+            .cloned()
+            .unwrap_or(value)
+    }
+
+    fn metadata_snapshot_bytes(snapshot: &serde_json::Value, field: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        let value = snapshot.get(field).expect("metadata snapshot field");
+        let encoded = value
+            .get("$bytes")
+            .and_then(|bytes| bytes.as_str())
+            .or_else(|| value.as_str())
+            .expect("metadata snapshot bytes");
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid metadata snapshot base64")
     }
 
     #[cfg(feature = "fork-resolution")]
@@ -6625,6 +6721,44 @@ mod tests {
             source_epoch + 1,
             "regression must exercise failure after the local crypto merge"
         );
+        let transition = world
+            .delivery_service()
+            .submitted_prepared_requests()
+            .into_iter()
+            .rfind(|request| {
+                request.operation
+                    == crate::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
+            })
+            .expect("fork readd transition");
+        let body = submitted_inner_body(&transition);
+        let snapshot = body
+            .get("metadataSnapshot")
+            .expect("fork readd metadata snapshot");
+        let nonce: [u8; 12] = metadata_snapshot_bytes(snapshot, "nonce")
+            .try_into()
+            .expect("canonical metadata nonce");
+        let ciphertext = metadata_snapshot_bytes(snapshot, "ciphertext");
+        let group_id_bytes = hex::decode(&group_id).expect("group id hex");
+        let metadata_key: [u8; 32] = alice
+            .orchestrator
+            .mls_context()
+            .export_metadata_key(group_id_bytes.clone(), source_epoch + 1)
+            .expect("fork readd metadata key")
+            .try_into()
+            .expect("metadata key length");
+        let metadata = crate::metadata::decrypt_metadata_snapshot(
+            &metadata_key,
+            &group_id_bytes,
+            source_epoch + 1,
+            snapshot
+                .get("metadataVersion")
+                .and_then(|value| value.as_u64())
+                .expect("metadata version"),
+            &nonce,
+            &ciphertext,
+        )
+        .expect("fork readd metadata must decrypt canonically");
+        assert_eq!(metadata.title, "fork durable projection failure");
         assert_eq!(
             alice
                 .orchestrator
@@ -6806,6 +6940,46 @@ mod tests {
         assert!(
             matches!(&result, Err(OrchestratorError::Storage(message)) if message.contains("set_group_state")),
             "durable group-state failure must abort force rejoin, got {result:?}"
+        );
+        let transition = world
+            .delivery_service()
+            .submitted_prepared_requests()
+            .into_iter()
+            .rfind(|request| {
+                request.operation
+                    == crate::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
+            })
+            .expect("external commit transition");
+        let body = submitted_inner_body(&transition);
+        let snapshot = body
+            .get("metadataSnapshot")
+            .expect("external commit metadata snapshot");
+        assert_eq!(
+            metadata_snapshot_bytes(snapshot, "nonce").len(),
+            12,
+            "metadata nonce must be carried separately"
+        );
+        let ciphertext = metadata_snapshot_bytes(snapshot, "ciphertext");
+        let expected_plaintext = crate::metadata::GroupMetadataV1 {
+            version: 1,
+            title: "durable rejoin projection".into(),
+            description: String::new(),
+            avatar_blob_locator: None,
+            avatar_content_type: None,
+        };
+        assert_eq!(
+            ciphertext.len(),
+            serde_json::to_vec(&expected_plaintext)
+                .expect("serialize expected metadata")
+                .len()
+                + 16,
+            "external commit must preserve cached metadata and carry only ciphertext plus tag"
+        );
+        assert_eq!(
+            snapshot
+                .get("ciphertextSize")
+                .and_then(|value| value.as_u64()),
+            Some(ciphertext.len() as u64)
         );
         assert!(
             alice.storage.has_rejoin_flag(&conversation_id),

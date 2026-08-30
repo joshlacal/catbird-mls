@@ -566,6 +566,58 @@ async fn stale_bootstrap_completion_cannot_mask_newer_reset_generation() {
             .expect("generation 2 rejoin flag");
     };
     let (stale_result, ()) = tokio::join!(stale_completion, commit_newer_reset);
+    let activation = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .rfind(|request| {
+            request.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ActivateReset
+        })
+        .expect("reset activation request");
+    let submitted: serde_json::Value =
+        serde_json::from_slice(activation.body.as_deref().unwrap_or_default())
+            .expect("parse reset activation request");
+    let body = submitted
+        .pointer("/signedRequest/body")
+        .cloned()
+        .unwrap_or(submitted);
+    let snapshot = body
+        .get("metadataSnapshot")
+        .expect("reset activation metadata snapshot");
+    let decode = |field: &str| {
+        use base64::Engine as _;
+        let value = snapshot.get(field).expect("metadata snapshot field");
+        let encoded = value
+            .get("$bytes")
+            .and_then(|bytes| bytes.as_str())
+            .or_else(|| value.as_str())
+            .expect("metadata snapshot bytes");
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid metadata snapshot base64")
+    };
+    assert_eq!(
+        decode("nonce").len(),
+        12,
+        "metadata nonce must be carried separately"
+    );
+    let ciphertext = decode("ciphertext");
+    let expected_plaintext = catbird_mls::metadata::GroupMetadataV1 {
+        version: 1,
+        title: "bootstrap generation race".into(),
+        description: String::new(),
+        avatar_blob_locator: None,
+        avatar_content_type: None,
+    };
+    assert_eq!(
+        ciphertext.len(),
+        serde_json::to_vec(&expected_plaintext)
+            .expect("serialize expected metadata")
+            .len()
+            + 16,
+        "reset activation must preserve cached metadata and carry only ciphertext plus tag"
+    );
 
     assert!(
         stale_result.is_err(),
