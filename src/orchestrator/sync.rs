@@ -366,6 +366,13 @@ where
                 .await
                 .insert(conversation_id.to_string(), convo.clone());
 
+            // Every write and recovery probe below (sequencer mapping, group
+            // state, join/accept) resolves through this conversation row, so
+            // materialize it before any of them run.
+            self.storage()
+                .ensure_conversation_exists(user_did, conversation_id, group_id)
+                .await?;
+
             // ADR-010 D4: record the conversation→sequencer mapping. Routing
             // does NOT consult this yet (WS-4 rung 3); every sync refresh
             // overwrites the mapping, which trivially satisfies the D4 rule-4
@@ -633,11 +640,6 @@ where
             let conversation_id = effective_convo.conversation_id.as_str();
             let group_id = effective_convo.group_id.as_str();
             let server_epoch = effective_convo.epoch;
-
-            // Ensure conversation record exists in storage
-            self.storage()
-                .ensure_conversation_exists(user_did, conversation_id, group_id)
-                .await?;
 
             // Check for epoch reconciliation — fetch and process missing commits
             let local_epoch = {

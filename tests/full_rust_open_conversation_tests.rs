@@ -189,6 +189,38 @@ async fn missing_local_group_uses_welcome_before_external_commit() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sync_persists_conversation_before_recovery_io() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_did = world.register_device("Bob").await.unwrap();
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("Bootstrap ordering", Some(&[bob_did]), None)
+        .await
+        .expect("create_group failed");
+
+    bob.storage.fail_next_ensure_conversation_exists();
+    let result = bob.orchestrator.sync_with_server(false).await;
+
+    assert!(
+        result.is_err(),
+        "a failed conversation projection must abort sync"
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .welcome_fetch_count(&convo.conversation_id),
+        0,
+        "sync must persist the stable conversation/group binding before recovery reads or network I/O"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn reset_pending_without_welcome_attempts_bootstrap_before_external_commit() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
