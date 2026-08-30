@@ -43,6 +43,46 @@ struct StoredConversation {
     participants: Option<Vec<serde_json::Value>>,
 }
 
+fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Value {
+    let participants = conversation.participants.clone().unwrap_or_else(|| {
+        conversation
+            .members
+            .iter()
+            .map(|did| {
+                serde_json::json!({
+                    "userDid": did,
+                    "role": "admin",
+                    "status": "active"
+                })
+            })
+            .collect()
+    });
+    let group_id_bytes = hex::decode(&conversation.view.group_id).unwrap_or_else(|_| vec![0u8; 32]);
+    let metadata_snapshot = conversation.metadata_snapshot.clone().unwrap_or_else(|| {
+        serde_json::json!({
+            "metadataVersion": 1,
+            "nonce": base64::engine::general_purpose::STANDARD.encode([0u8; 12]),
+            "ciphertext": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+        })
+    });
+    serde_json::json!({
+        "conversationKind": conversation.conversation_kind.clone(),
+        "coordinates": {
+            "conversationId": conversation.view.conversation_id.clone(),
+            "groupId": base64::engine::general_purpose::STANDARD.encode(group_id_bytes),
+            "epoch": conversation.view.epoch,
+            "generation": 0,
+            "stateVersion": 0,
+            "lifecycle": "active",
+            "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+            "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+        },
+        "participants": participants,
+        "metadataSnapshot": metadata_snapshot,
+        "snapshotSeq": 1
+    })
+}
+
 #[derive(Debug, Clone)]
 struct StoredKeyPackage {
     data: Vec<u8>,
@@ -2337,45 +2377,52 @@ impl MLSAPIClient for MockDeliveryService {
                     body: serde_json::to_vec(&serde_json::json!({"result": {"requested": true}})).unwrap(),
                 })
             }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversationState => {
+                let query = request.path.split_once('?').map_or("", |(_, query)| query);
+                let conversation_id = query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("conversationId="))
+                    .ok_or_else(|| {
+                        OrchestratorError::InvalidInput(
+                            "getConversationState missing conversationId".into(),
+                        )
+                    })?;
+                let guard = self.state.lock().unwrap();
+                let Some(conversation) = guard.conversations.get(conversation_id) else {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 404,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&serde_json::json!({
+                            "error": "ConversationNotFound"
+                        }))
+                        .unwrap(),
+                    });
+                };
+                let output = serde_json::json!({
+                    "state": conversation_state_json(conversation),
+                    "pendingResetRequests": [],
+                    "pendingLeaveRequests": []
+                });
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&output).unwrap(),
+                })
+            }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversations => {
                 let guard = self.state.lock().unwrap();
-                let items: Vec<serde_json::Value> = guard.conversations.values().map(|c| {
-                    let participants: Vec<serde_json::Value> = if let Some(ref parts) = c.participants {
-                        parts.clone()
-                    } else {
-                        c.members.iter().map(|did| {
-                            serde_json::json!({
-                                "userDid": did,
-                                "role": "admin",
-                                "status": "active"
-                            })
-                        }).collect()
-                    };
-                    let group_id_bytes = hex::decode(&c.view.group_id).unwrap_or_else(|_| vec![0u8; 32]);
-                    let meta = c.metadata_snapshot.clone().unwrap_or_else(|| serde_json::json!({
-                        "metadataVersion": 1,
-                        "nonce": base64::engine::general_purpose::STANDARD.encode([0u8; 12]),
-                        "ciphertext": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
-                    }));
-                    serde_json::json!({
-                        "state": {
-                            "conversationKind": c.conversation_kind.clone(),
-                            "coordinates": {
-                                "conversationId": c.view.conversation_id,
-                                "groupId": base64::engine::general_purpose::STANDARD.encode(&group_id_bytes),
-                                "epoch": c.view.epoch,
-                                "generation": 0,
-                                "stateVersion": 0,
-                                "lifecycle": "active",
-                                "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
-                                "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
-                            },
-                            "participants": participants,
-                            "metadataSnapshot": meta,
-                            "snapshotSeq": 1
-                        }
+                let items: Vec<serde_json::Value> = guard
+                    .conversations
+                    .values()
+                    .filter(|conversation| {
+                        !guard
+                            .hidden_conversation_ids
+                            .contains(&conversation.view.conversation_id)
                     })
-                }).collect();
+                    .map(|conversation| {
+                        serde_json::json!({"state": conversation_state_json(conversation)})
+                    })
+                    .collect();
                 let output = serde_json::json!({
                     "items": items,
                     "inventorySessionId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",

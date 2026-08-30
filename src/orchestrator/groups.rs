@@ -1706,6 +1706,9 @@ mod tests {
             .create_group("alice group", Some(&[bob.did.clone()]), None)
             .await
             .expect("create conversation");
+        world
+            .delivery_service()
+            .set_conversation_hidden_from_list(&created.conversation_id, true);
 
         // Bob accepts conversation
         bob.orchestrator
@@ -1714,6 +1717,24 @@ mod tests {
             .expect("bob accepts conversation");
 
         let requests = world.delivery_service().submitted_prepared_requests();
+        let state_req = requests
+            .iter()
+            .find(|r| {
+                r.operation
+                    == crate::orchestrator::canonical_transport::CanonicalOperation::GetConversationState
+            })
+            .expect("accept must fetch a fresh conversation state");
+        assert!(
+            state_req.path.contains(&created.conversation_id),
+            "state request must target the accepted conversation"
+        );
+        assert!(
+            !requests.iter().any(|r| {
+                r.operation
+                    == crate::orchestrator::canonical_transport::CanonicalOperation::GetConversations
+            }),
+            "accept must not use a retained getConversations inventory snapshot"
+        );
         let accept_req = requests
             .iter()
             .find(|r| r.operation == crate::orchestrator::canonical_transport::CanonicalOperation::AcceptConversation)
@@ -3040,55 +3061,31 @@ where
                 .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?
         };
 
-        // Fetch conversation state via getConversations to obtain coordinates and invitationProvenance
-        let convos_req = super::canonical_transport::PreparedRequest {
-            operation: super::canonical_transport::CanonicalOperation::GetConversations,
+        // Inventory pages are retained snapshots and may predate this invitation.
+        // Acceptance needs a fresh point read of the known conversation.
+        let convo_uuid_str = convo_uuid.to_string();
+        let state_req = super::canonical_transport::PreparedRequest {
+            operation: super::canonical_transport::CanonicalOperation::GetConversationState,
             path: format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
-                actor_device_id
+                "/xrpc/blue.catbird.chat.getConversationState?actorDeviceId={}&conversationId={}",
+                actor_device_id, convo_uuid_str
             ),
             method: "GET".to_string(),
             body: None,
         };
-        let convos_resp = self
-            .api_client()
-            .submit_prepared_request(convos_req)
-            .await?;
-        if convos_resp.status != 200 {
+        let state_resp = self.api_client().submit_prepared_request(state_req).await?;
+        if state_resp.status != 200 {
             return Err(OrchestratorError::Api(format!(
-                "getConversations failed with status {}: {}",
-                convos_resp.status,
-                String::from_utf8_lossy(&convos_resp.body)
+                "getConversationState failed with status {}: {}",
+                state_resp.status,
+                String::from_utf8_lossy(&state_resp.body)
             )));
         }
-        let convos_val: serde_json::Value = serde_json::from_slice(&convos_resp.body)
+        let state_val: serde_json::Value = serde_json::from_slice(&state_resp.body)
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
-        let items_arr = convos_val
-            .get("items")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                OrchestratorError::Api("getConversations response missing items array".into())
-            })?;
-
-        let convo_uuid_str = convo_uuid.to_string();
-        let matching_item = items_arr
-            .iter()
-            .find(|item| {
-                let st = item.get("state").unwrap_or(item);
-                st.get("coordinates")
-                    .and_then(|c| c.get("conversationId"))
-                    .and_then(|cid| cid.as_str())
-                    .map(|cid| cid == convo_uuid_str)
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| {
-                OrchestratorError::Api(format!(
-                    "conversation {} not found in getConversations",
-                    convo_uuid_str
-                ))
-            })?;
-
-        let state_obj = matching_item.get("state").unwrap_or(matching_item);
+        let state_obj = state_val.get("state").ok_or_else(|| {
+            OrchestratorError::Api("getConversationState response missing state".into())
+        })?;
         let latest_coord = state_obj.get("coordinates").cloned().ok_or_else(|| {
             OrchestratorError::Api("conversation state missing coordinates".into())
         })?;
