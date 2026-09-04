@@ -1948,7 +1948,7 @@ where
                 group_context_hash.len()
             ))));
         }
-        let state_version = {
+        let (generation, state_version) = {
             let convos_req = super::canonical_transport::PreparedRequest {
                 operation: super::canonical_transport::CanonicalOperation::GetConversations,
                 path: format!(
@@ -1973,25 +1973,27 @@ where
                         let coords = state.get("coordinates")?;
                         let cid = coords.get("conversationId").and_then(|c| c.as_str())?;
                         if cid == convo_id {
-                            coords.get("stateVersion").and_then(|sv| sv.as_i64())
+                            let g = coords.get("generation").and_then(|g| g.as_i64()).unwrap_or(0);
+                            let sv = coords.get("stateVersion").and_then(|sv| sv.as_i64()).unwrap_or(0);
+                            Some((g, sv))
                         } else {
                             None
                         }
                     })
                 })
-                .unwrap_or(1)
+                .unwrap_or((0, 0))
         };
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#applicationSendBody",
             "aad": {
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
-                "generation": 0,
+                "generation": generation,
                 "messageId": STANDARD.encode(msg_uuid.as_bytes()),
                 "prior": {
                     "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
                     "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
                     "epoch": epoch,
-                    "generation": 0,
+                    "generation": generation,
                     "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
                     "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                     "lifecycle": "active",
@@ -2015,7 +2017,7 @@ where
                 "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
                 "conversationId": conversation_id,
                 "epoch": epoch,
-                "generation": 0,
+                "generation": generation,
                 "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
                 "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
                 "lifecycle": "active",
