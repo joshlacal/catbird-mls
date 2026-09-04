@@ -1158,7 +1158,16 @@ struct StorageAdapter(Arc<dyn OrchestratorStorageCallback>);
 struct APIAdapter(Arc<dyn OrchestratorAPICallback>);
 
 /// Wraps OrchestratorCredentialCallback to implement CredentialStore.
-struct CredentialAdapter(Arc<dyn OrchestratorCredentialCallback>);
+struct CredentialAdapter(
+    Arc<dyn OrchestratorCredentialCallback>,
+    Arc<std::sync::RwLock<std::collections::HashMap<String, i64>>>,
+);
+
+impl CredentialAdapter {
+    fn new(callback: Arc<dyn OrchestratorCredentialCallback>) -> Self {
+        Self(callback, Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())))
+    }
+}
 
 // -- Conversion helpers --
 
@@ -2124,13 +2133,29 @@ impl CredentialStore for CredentialAdapter {
                 key_id.to_string(),
             )
             .map_err(bridge_err)?
-            .map(|authority| CleanChatSigningAuthority {
-                public_key: authority.public_key,
-                signature: authority.signature,
-                device_id: authority.device_id,
-                auth_generation: authority.auth_generation,
+            .map(|authority| {
+                if let Some(gen) = authority.auth_generation {
+                    if let Ok(mut lock) = self.1.write() {
+                        lock.insert(user_did.to_string(), gen);
+                    }
+                }
+                CleanChatSigningAuthority {
+                    public_key: authority.public_key,
+                    signature: authority.signature,
+                    device_id: authority.device_id,
+                    auth_generation: authority.auth_generation,
+                }
             });
         Ok(authority)
+    }
+
+    async fn get_auth_generation(&self, user_did: &str) -> crate::orchestrator::Result<Option<i64>> {
+        if let Ok(lock) = self.1.read() {
+            if let Some(&gen) = lock.get(user_did) {
+                return Ok(Some(gen));
+            }
+        }
+        Ok(Some(1))
     }
 
     async fn delete_signing_key(&self, user_did: &str) -> crate::orchestrator::Result<()> {
@@ -2387,7 +2412,7 @@ impl OrchestratorBridge {
 
         let storage = Arc::new(StorageAdapter(Arc::from(storage)));
         let api_client = Arc::new(APIAdapter(Arc::from(api_client)));
-        let credentials = Arc::new(CredentialAdapter(Arc::from(credentials)));
+        let credentials = Arc::new(CredentialAdapter::new(Arc::from(credentials)));
         let engine = Arc::new(MlsEngine::new(
             mls_context,
             storage,
@@ -4459,8 +4484,8 @@ mod tests {
             let credential_callback = Arc::new(RecordingCredentialCallback::default());
             *credential_callback.authorized_device_keys.lock().unwrap() =
                 Some(vec![vec![9, 8], vec![7, 6]]);
-            let normal = CredentialAdapter(credential_callback.clone());
-            let client = crate::client_bridge::ClientCredentialAdapter(credential_callback.clone());
+            let normal = CredentialAdapter::new(credential_callback.clone());
+            let client = crate::client_bridge::ClientCredentialAdapter::new(credential_callback.clone());
             for adapter in [
                 &normal as &dyn CredentialStore,
                 &client as &dyn CredentialStore,

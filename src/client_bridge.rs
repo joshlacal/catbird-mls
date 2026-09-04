@@ -5,6 +5,8 @@
 // Swift/Kotlin provides storage, API, and credential backends via callbacks.
 
 use std::sync::Arc;
+use std::collections::HashMap;
+use crate::orchestrator::credentials::CleanChatSigningAuthority;
 
 use crate::api::MLSContext;
 use crate::client::{CatbirdClient, ChatMessage, Conversation};
@@ -33,7 +35,16 @@ use crate::orchestrator::types::*;
 
 pub(crate) struct ClientStorageAdapter(pub(crate) Arc<dyn OrchestratorStorageCallback>);
 pub(crate) struct ClientAPIAdapter(pub(crate) Arc<dyn OrchestratorAPICallback>);
-pub(crate) struct ClientCredentialAdapter(pub(crate) Arc<dyn OrchestratorCredentialCallback>);
+pub(crate) struct ClientCredentialAdapter(
+    pub(crate) Arc<dyn OrchestratorCredentialCallback>,
+    pub(crate) Arc<std::sync::RwLock<HashMap<String, i64>>>,
+);
+
+impl ClientCredentialAdapter {
+    pub(crate) fn new(callback: Arc<dyn OrchestratorCredentialCallback>) -> Self {
+        Self(callback, Arc::new(std::sync::RwLock::new(HashMap::new())))
+    }
+}
 
 // -- Conversion helpers (duplicated from orchestrator_bridge for independence) --
 
@@ -908,6 +919,45 @@ impl CredentialStore for ClientCredentialAdapter {
             .get_authorized_device_keys(user_did.to_string())
             .map_err(bridge_err)
     }
+
+    async fn sign_clean_chat_transcript(
+        &self,
+        user_did: &str,
+        transcript: &[u8],
+        key_id: &str,
+    ) -> crate::orchestrator::Result<Option<CleanChatSigningAuthority>> {
+        let authority = self
+            .0
+            .sign_clean_chat_transcript(
+                user_did.to_string(),
+                transcript.to_vec(),
+                key_id.to_string(),
+            )
+            .map_err(bridge_err)?
+            .map(|authority| {
+                if let Some(gen) = authority.auth_generation {
+                    if let Ok(mut lock) = self.1.write() {
+                        lock.insert(user_did.to_string(), gen);
+                    }
+                }
+                CleanChatSigningAuthority {
+                    public_key: authority.public_key,
+                    signature: authority.signature,
+                    device_id: authority.device_id,
+                    auth_generation: authority.auth_generation,
+                }
+            });
+        Ok(authority)
+    }
+
+    async fn get_auth_generation(&self, user_did: &str) -> crate::orchestrator::Result<Option<i64>> {
+        if let Ok(lock) = self.1.read() {
+            if let Some(&gen) = lock.get(user_did) {
+                return Ok(Some(gen));
+            }
+        }
+        Ok(Some(1))
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -973,7 +1023,7 @@ impl CatbirdClientBridge {
             mls_context,
             Arc::new(ClientStorageAdapter(Arc::from(storage))),
             Arc::new(ClientAPIAdapter(Arc::from(api_client))),
-            Arc::new(ClientCredentialAdapter(Arc::from(credentials))),
+            Arc::new(ClientCredentialAdapter::new(Arc::from(credentials))),
             orch_config,
         ))
         .map_err(OrchestratorBridgeError::from)?;
