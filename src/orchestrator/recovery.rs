@@ -5327,7 +5327,8 @@ where
             }
         }
         // Wrong-epoch is the canonical self-bad signal.
-        if err.is_wrong_epoch() {
+        // Wrong-epoch or wrong-group (superseded generation) is not peer-bad.
+        if err.is_wrong_epoch() || err.is_wrong_group_id() {
             return false;
         }
         match err {

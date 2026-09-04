@@ -1103,6 +1103,13 @@ where
                     convo_id: envelope.conversation_id.clone(),
                 });
             }
+            Err(e) if e.is_wrong_group_id() => {
+                tracing::debug!(
+                    conversation_id = %envelope.conversation_id,
+                    "Skipping entry from superseded generation (WrongGroupId)"
+                );
+                return Ok(None);
+            }
             Err(e) if e.is_wrong_epoch() => {
                 // WrongEpoch is normally an old/replayed message, but it can
                 // also be redelivery after OpenMLS mutated the group and its

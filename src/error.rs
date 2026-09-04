@@ -253,6 +253,18 @@ impl MLSError {
         }
     }
 
+    /// Whether this error represents an OpenMLS WrongGroupId rejection (e.g.
+    /// an entry from a superseded generation after a conversation reset).
+    /// These are NORMAL during sync catch-up when reading historical entries
+    /// across reset boundaries and MUST NOT cause send/sync to fail.
+    pub fn is_wrong_group_id(&self) -> bool {
+        match self {
+            Self::OpenMLS(msg) => msg.contains("WrongGroupId"),
+            Self::CommitProcessingFailed { message } => message.contains("WrongGroupId"),
+            _ => false,
+        }
+    }
+
     /// Whether OpenMLS rejected a decrypt because the generation secret was
     /// already punctured. This is not, by itself, proof that the corresponding
     /// delivery-service envelope reached durable application storage: an
@@ -347,6 +359,15 @@ mod decrypt_class_tests {
         )
         .is_secret_reuse());
         assert!(!MLSError::InvalidCommit.is_secret_reuse());
+    }
+
+    #[test]
+    fn wrong_group_id_classifier_matches_openmls_form() {
+        assert!(MLSError::OpenMLS("process_message failed: ValidationError(WrongGroupId)".into()).is_wrong_group_id());
+        assert!(MLSError::CommitProcessingFailed {
+            message: "process_message failed: ValidationError(WrongGroupId)".into(),
+        }.is_wrong_group_id());
+        assert!(!MLSError::OpenMLS(WRONG_EPOCH.into()).is_wrong_group_id());
     }
 
     #[test]
