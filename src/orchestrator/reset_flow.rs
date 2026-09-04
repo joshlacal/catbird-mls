@@ -122,6 +122,19 @@ impl ServerConversationState {
         })
     }
 
+    /// True when the server still lists an unrevoked leaf for this exact
+    /// device — leaf recovery must then be `replace`, not `add`. Unknown
+    /// leaves default to `add`.
+    pub(crate) fn own_device_holds_leaf(&self, user_did: &str, device_id: &str) -> bool {
+        self.leaves.as_ref().is_some_and(|leaves| {
+            leaves.iter().any(|leaf| {
+                leaf.get("userDid").and_then(|v| v.as_str()) == Some(user_did)
+                    && leaf.get("deviceId").and_then(|v| v.as_str()) == Some(device_id)
+                    && leaf.get("deviceStatus").and_then(|v| v.as_str()) != Some("revoked")
+            })
+        })
+    }
+
     fn coordinate_i64(&self, field: &str) -> Result<i64> {
         self.coordinates
             .get(field)
@@ -285,7 +298,13 @@ where
             );
             return Ok(ResetOutcome::Requested);
         }
-        let epoch = self.activate_reset(&user_did, &state, &reset_request_id).await?;
+        // The activation's metadata author proof must name the seq the
+        // activation entry lands at: one past the current entry tail (which
+        // now includes the request entry when we appended one).
+        let origin_seq = self.latest_entry_seq(&convo_id).await? + 1;
+        let epoch = self
+            .activate_reset(&user_did, &state, &reset_request_id, origin_seq)
+            .await?;
         crate::info_log!("[RESET] convo={} activated successor generation ({})", convo_id, reason);
         Ok(ResetOutcome::Activated { epoch })
     }
@@ -298,6 +317,67 @@ where
         uuid::Uuid::parse_str(&resolved.conversation_id)
             .map(|u| u.to_string())
             .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))
+    }
+
+    /// Re-admit this leafless device: ask a live leaf of another participant
+    /// to add (or replace) our leaf, or reset when that can never succeed.
+    ///
+    /// Only a live leaf of *another* participant can fulfil our request. When
+    /// no such leaf exists, or our open request already outlived the server
+    /// TTL unfulfilled, waiting cannot help — an admin device resets the
+    /// conversation instead. Every coordinate comes from `state`, never from
+    /// local MLS state, so this works from a blank device.
+    ///
+    /// Returns `{"epoch": n}` when a reset was activated here, otherwise the
+    /// server's leaf-recovery output or `{"leafRecovery": "open"}`.
+    pub(crate) async fn recover_leaf_or_reset(
+        &self,
+        state: &ServerConversationState,
+        user_did: &str,
+    ) -> Result<serde_json::Value> {
+        let convo_id = state.conversation_id.as_str();
+        let (role, _) = state.own_role_status(user_did)?;
+        let waited = self.recovery_tracker().lock().await.leaf_recovery_wait(convo_id);
+        let nobody_can_add_us = state.nobody_else_can_add(user_did);
+        let waited_out = waited.is_some_and(|w| w >= LEAF_RECOVERY_TTL);
+        if role == "admin" && (nobody_can_add_us || waited_out) {
+            crate::warn_log!(
+                "[RESET] convo={} leaf recovery cannot succeed (nobody_else_can_add={}, waited={:?}); resetting",
+                convo_id,
+                nobody_can_add_us,
+                waited
+            );
+            return match self.reset_conversation(convo_id, "localStateLost").await? {
+                ResetOutcome::Activated { epoch } => Ok(serde_json::json!({ "epoch": epoch })),
+                ResetOutcome::Requested => Ok(serde_json::json!({ "reset": "requested" })),
+            };
+        }
+        if waited.is_some_and(|w| w < LEAF_RECOVERY_TTL) {
+            // Our add request is still open server-side; re-requesting only
+            // earns LeafRecoveryAlreadyOpen.
+            return Ok(serde_json::json!({ "leafRecovery": "open" }));
+        }
+        let actor_device_id = self.require_actor_device_id().await?;
+        let kind = if state.own_device_holds_leaf(user_did, &actor_device_id) {
+            "replace"
+        } else {
+            "add"
+        };
+        let result = self.request_leaf_recovery(state, kind).await;
+        let mut tracker = self.recovery_tracker().lock().await;
+        match &result {
+            Ok(_) => tracker.note_leaf_recovery_requested(convo_id),
+            Err(err) if err.to_string().contains("LeafRecoveryAlreadyOpen") => {
+                // Opened by an earlier process of ours; start the clock now so
+                // an unfulfilled request still escalates.
+                if tracker.leaf_recovery_wait(convo_id).is_none() {
+                    tracker.note_leaf_recovery_requested(convo_id);
+                }
+                return Ok(serde_json::json!({ "leafRecovery": "open" }));
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     /// Submit `requestReset` bound to the server's current coordinate and
@@ -397,11 +477,53 @@ where
             .map(str::to_string))
     }
 
+    /// Seq of the last entry in `convo_id`'s log, paged to the tail.
+    async fn latest_entry_seq(&self, convo_id: &str) -> Result<u64> {
+        let actor_device_id = self.require_actor_device_id().await?;
+        let mut after_seq = 0u64;
+        let mut pagination = PaginationGuard::for_messages("reset entry tail");
+        loop {
+            let response = self
+                .api_client()
+                .submit_prepared_request(PreparedRequest {
+                    operation: CanonicalOperation::GetEntries,
+                    path: format!(
+                        "/xrpc/blue.catbird.chat.getEntries?actorDeviceId={actor_device_id}&conversationId={convo_id}&afterSeq={after_seq}&limit=100"
+                    ),
+                    method: "GET".to_string(),
+                    body: None,
+                })
+                .await?;
+            if response.status != 200 {
+                return Err(OrchestratorError::ServerError {
+                    status: response.status,
+                    body: String::from_utf8_lossy(&response.body).into_owned(),
+                });
+            }
+            let page: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+            let entries = page.get("entries").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let next = page.get("nextAfterSeq").and_then(|v| v.as_u64());
+            let has_more = page.get("hasMore").and_then(|v| v.as_bool()).unwrap_or(false);
+            let next_cursor = next.map(|n| n.to_string());
+            pagination.observe_page(entries.len(), next_cursor.as_deref())?;
+            after_seq = entries
+                .iter()
+                .filter_map(|e| e.get("seq").and_then(|v| v.as_u64()))
+                .fold(after_seq, u64::max)
+                .max(next.unwrap_or(0));
+            if !has_more || entries.is_empty() {
+                return Ok(after_seq);
+            }
+        }
+    }
+
     async fn activate_reset(
         &self,
         user_did: &str,
         state: &ServerConversationState,
         reset_request_id: &str,
+        origin_seq: u64,
     ) -> Result<u64> {
         let actor_device_id = self.require_actor_device_id().await?;
         let auth_generation = self.require_auth_generation(user_did).await?;
@@ -427,7 +549,7 @@ where
         )?;
 
         match self
-            .submit_reset_activation(user_did, &actor_device_id, auth_generation, &key_id, &public_key, &identity_bytes, state, reset_request_id, &new_group_id)
+            .submit_reset_activation(user_did, &actor_device_id, auth_generation, &key_id, &public_key, &identity_bytes, state, reset_request_id, &new_group_id, origin_seq)
             .await
         {
             Ok(()) => {}
@@ -458,6 +580,7 @@ where
         state: &ServerConversationState,
         reset_request_id: &str,
         new_group_id: &[u8],
+        origin_seq: u64,
     ) -> Result<()> {
         let group_info = self
             .mls_context()
@@ -542,7 +665,7 @@ where
                     "authorDid": user_did,
                     "authorKeyId": key_id,
                     "deviceStatusAtOrigin": "active",
-                    "originSeq": 1,
+                    "originSeq": origin_seq,
                     "originTransitionId": transition_id,
                     "roleAtOrigin": "admin",
                     "signaturePublicKey": { "$bytes": STANDARD.encode(public_key) }
@@ -602,9 +725,35 @@ where
             .filter_map(|p| p.get("userDid").and_then(|v| v.as_str()).map(str::to_string))
             .collect();
 
+        // `ensure_conversation_exists` never rebinds an existing row's group
+        // (both platforms treat a differing group as an idempotent legacy
+        // row). The durable rebinding contract is mark + complete reset
+        // pending, which projects the mapping, epoch, Active tag, and clears
+        // the rejoin flag in one backend commit.
+        let reset_generation = i32::try_from(state.coordinate_i64("generation")? + 1)
+            .map_err(|_| OrchestratorError::InvalidInput("reset generation overflow".into()))?;
         self.storage()
             .ensure_conversation_exists(user_did, convo_id, &group_id_hex)
             .await?;
+        self.storage()
+            .mark_reset_pending(
+                convo_id,
+                &group_id_hex,
+                reset_generation,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?;
+        if !self
+            .storage()
+            .complete_reset_pending(convo_id, reset_generation, &group_id_hex, 0)
+            .await?
+        {
+            return Err(OrchestratorError::ResetCompletionNotCommitted {
+                convo_id: convo_id.to_string(),
+                reset_generation,
+                reason: "backend rejected the activated successor generation".to_string(),
+            });
+        }
         let group_state = GroupState {
             group_id: group_id_hex.clone(),
             conversation_id: convo_id.to_string(),
@@ -612,10 +761,6 @@ where
             members: members.clone(),
         };
         self.storage().set_group_state(&group_state).await?;
-        self.storage().clear_rejoin_flag(convo_id).await?;
-        self.storage()
-            .set_conversation_state(convo_id, ConversationState::Active)
-            .await?;
 
         self.group_states()
             .lock()

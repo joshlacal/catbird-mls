@@ -2420,6 +2420,10 @@ impl MLSAPIClient for MockDeliveryService {
                         if !new_group_id_hex.is_empty() {
                             stored.view.group_id = new_group_id_hex;
                         }
+                        // The successor generation starts from the fresh
+                        // snapshot the activator submitted; the prior
+                        // generation's snapshot is unreadable in the new group.
+                        stored.metadata_snapshot = inner_body.get("metadataSnapshot").cloned();
                     }
                     guard.group_infos.insert(convo_id.to_string(), group_info_bytes);
                 } else {

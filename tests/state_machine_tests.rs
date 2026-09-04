@@ -716,9 +716,12 @@ async fn test_concurrent_join_or_rejoin_deduped() {
         .delete_group(group_id_bytes)
         .expect("delete_group failed");
 
+    // Clean-chat has no GroupInfo: a leafless admin with no other live leaf
+    // recovers by resetting the conversation from server state.
     world
         .delivery_service()
-        .set_process_external_commit_delay_ms(100);
+        .set_conversation_leaves_for_test(&convo.conversation_id, vec![]);
+    world.delivery_service().set_bootstrap_reset_group_success(true);
 
     let join1 = alice.orchestrator.join_or_rejoin(&convo.conversation_id);
     let join2 = alice.orchestrator.join_or_rejoin(&convo.conversation_id);
@@ -729,9 +732,9 @@ async fn test_concurrent_join_or_rejoin_deduped() {
     assert_eq!(
         world
             .delivery_service()
-            .external_commit_count(&convo.conversation_id),
+            .bootstrap_reset_group_call_count(&convo.conversation_id),
         1,
-        "Only one external commit should be sent for concurrent join_or_rejoin calls"
+        "Only one reset should be activated for concurrent join_or_rejoin calls"
     );
 }
 
@@ -873,44 +876,46 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
         .delete_group(group_id_bytes.clone())
         .expect("delete_group failed");
 
+    // Clean-chat has no GroupInfo: the leafless admin recovers by resetting
+    // the conversation from server state, keyed by the stable conversation id.
+    world
+        .delivery_service()
+        .set_conversation_leaves_for_test(&conversation_id, vec![]);
+    world.delivery_service().set_bootstrap_reset_group_success(true);
+
     let result = alice.orchestrator.sync_with_server(false).await;
     assert!(result.is_ok(), "sync failed: {:?}", result.err());
 
-    // Two GroupInfo fetches, BOTH keyed by the stable conversation id:
-    // (1) the WelcomeRecoveryDecision policy probe added by Phase C
-    //     (commits ea82f4f / 4598446 — `route_welcome_recovery_decision`
-    //     checks GroupInfo availability before authorizing External Commit;
-    //     the original test predates it and expected a single call), and
-    // (2) the External Commit fetch in `force_rejoin_unlocked`.
     assert_eq!(
         world
             .delivery_service()
-            .get_group_info_call_count(&conversation_id),
-        2,
-        "sync rejoin should fetch GroupInfo by stable conversation ID \
-         (policy probe + External Commit fetch)"
-    );
-    assert_eq!(
-        world
-            .delivery_service()
-            .get_group_info_call_count(&group_id),
-        0,
-        "sync rejoin must not fetch GroupInfo by mutable MLS group ID"
-    );
-    assert_eq!(
-        world
-            .delivery_service()
-            .external_commit_count(&conversation_id),
+            .bootstrap_reset_group_call_count(&conversation_id),
         1,
-        "External Commit should be submitted against the stable conversation ID"
+        "sync rejoin should reset by stable conversation ID"
     );
+    assert_eq!(
+        world.delivery_service().bootstrap_reset_group_call_count(&group_id),
+        0,
+        "sync rejoin must not key recovery by mutable MLS group ID"
+    );
+    let old_group_id = group_id;
+    let group_id = alice
+        .orchestrator
+        .group_states()
+        .lock()
+        .await
+        .values()
+        .find(|state| state.conversation_id == conversation_id)
+        .map(|state| state.group_id.clone())
+        .expect("rejoined conversation has a current group state");
+    assert_ne!(group_id, old_group_id, "reset must activate a successor group");
     assert!(
         alice
             .orchestrator
             .mls_context()
-            .get_epoch(group_id_bytes)
+            .get_epoch(hex::decode(&group_id).expect("group id hex"))
             .is_ok(),
-        "External Commit should restore local MLS state for the original group ID"
+        "reset should restore local MLS state under the successor group ID"
     );
 
     // Reproduce the pre-fix cache shape: the current state was stored under
@@ -1027,23 +1032,10 @@ async fn test_force_rejoin_cooldown_suppresses_immediate_retry() {
     );
 }
 
-/// HISTORY (N36): this test originally armed a single get_group_info
-/// failure and expected the welcome-404 path to reach the External Commit
-/// fallback directly. The Phase C WelcomeRecoveryDecision routing (commits
-/// ea82f4f / 4598446, "Route missing welcomes through recovery policy")
-/// changed that contract: an EXPECTED welcome miss (404/410) now consults
-/// the recovery policy first, which probes get_group_info itself and — when
-/// the probe also fails — SURRENDERS without burning an External Commit
-/// attempt (so no rejoin-failure cooldown is armed). The rejoin cooldown
-/// (`enforce_rejoin_backoff`) now only gates the EC fallback itself.
-///
-/// The test therefore drives the EC fallback directly: a non-404 welcome
-/// error skips the policy (join_or_rejoin treats it as "can't trust that no
-/// welcome exists"), the EC GroupInfo fetch fails, and a rejoin failure is
-/// recorded. The immediate retry must then be suppressed by the per-convo
-/// cooldown BEFORE any second External Commit GroupInfo fetch.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
+    use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     let _did = world.register_device("Alice").await.unwrap();
@@ -1054,58 +1046,44 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
         .create_group("Join Cooldown Test", None, None)
         .await
         .expect("create_group failed");
-    let group_id = &convo.group_id;
-
-    let group_id_bytes = hex::decode(group_id).expect("invalid group id hex");
+    let group_id_bytes = hex::decode(&convo.group_id).expect("invalid group id hex");
     alice
         .orchestrator
         .mls_context()
         .delete_group(group_id_bytes)
         .expect("delete_group failed");
 
-    // Non-404 welcome error → skip the WelcomeRecoveryDecision policy and
-    // go straight to the External Commit fallback...
-    world.delivery_service().fail_next_get_welcome();
-    // ...whose GroupInfo fetch then fails → rejoin failure recorded →
-    // per-conversation cooldown armed.
-    world.delivery_service().fail_next_get_group_info();
-
-    let first = alice
-        .orchestrator
-        .join_or_rejoin(&convo.conversation_id)
-        .await;
-    assert!(first.is_err(), "First join_or_rejoin should fail");
-    assert_eq!(
+    let leaf_recovery_requests = || {
         world
             .delivery_service()
-            .get_group_info_call_count(&convo.conversation_id),
-        1,
-        "first attempt should fetch GroupInfo exactly once (EC fallback)"
-    );
+            .submitted_prepared_requests()
+            .iter()
+            .filter(|r| r.operation == CanonicalOperation::RequestLeafRecovery)
+            .count()
+    };
 
-    // Immediate retry: the welcome miss is now an expected 404, so the
-    // recovery policy probes get_group_info (one extra, successful call)
-    // and authorizes External Commit — but the per-convo cooldown from the
-    // failed first attempt must suppress it before the EC GroupInfo fetch.
-    let second = alice
-        .orchestrator
-        .join_or_rejoin(&convo.conversation_id)
-        .await;
+    // The server reports no leaf set, so a reset is never assumed safe: the
+    // device asks a live leaf to re-add it and waits.
+    let first = alice.orchestrator.join_or_rejoin(&convo.conversation_id).await;
+    assert!(first.is_err(), "leafless device must not be joined yet");
+    assert_eq!(leaf_recovery_requests(), 1, "first attempt opens a leaf recovery request");
+
+    // Immediate retry: the request is still open server-side; re-requesting
+    // only earns LeafRecoveryAlreadyOpen, so it must not hit the server.
+    let second = alice.orchestrator.join_or_rejoin(&convo.conversation_id).await;
     match second {
-        Err(OrchestratorError::RecoveryFailed(msg)) => {
-            assert!(
-                msg.contains("cooldown"),
-                "Expected cooldown suppression, got: {msg}"
-            );
-        }
-        other => panic!("Expected RecoveryFailed cooldown error, got: {other:?}"),
+        Err(OrchestratorError::RecoveryFailed(msg)) => assert!(
+            msg.contains("leafRecovery") && msg.contains("open"),
+            "Expected open-request suppression, got: {msg}"
+        ),
+        other => panic!("Expected RecoveryFailed open-request error, got: {other:?}"),
     }
+    assert_eq!(leaf_recovery_requests(), 1, "retry must not re-request leaf recovery");
     assert_eq!(
         world
             .delivery_service()
             .get_group_info_call_count(&convo.conversation_id),
-        2,
-        "cooldown retry may run the welcome-recovery policy probe (+1) but \
-         must NOT reach the External Commit GroupInfo fetch"
+        0,
+        "clean-chat recovery must never fetch GroupInfo"
     );
 }

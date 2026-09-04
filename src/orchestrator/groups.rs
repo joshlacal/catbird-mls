@@ -3254,90 +3254,13 @@ where
             .and_then(|v| v.as_str())
             .unwrap_or("pending");
         if status == "active" {
-            // We are a member whose device holds no leaf: only a live leaf of
-            // another participant can add us back. When no such leaf exists,
-            // or our open request already outlived the server TTL unfulfilled,
-            // waiting cannot help — an admin device resets the conversation.
+            // Already a member, but this device holds no leaf: a live leaf of
+            // another participant must re-add us, or an admin resets.
             let server_state = super::reset_flow::ServerConversationState::from_state_json(
                 &convo_uuid_str,
                 state_obj,
             )?;
-            let is_admin = my_participant.get("role").and_then(|v| v.as_str()) == Some("admin");
-            let waited = self
-                .recovery_tracker()
-                .lock()
-                .await
-                .leaf_recovery_wait(&convo_uuid_str);
-            let nobody_can_add_us = server_state.nobody_else_can_add(&user_did);
-            let waited_out = waited.is_some_and(|w| w >= super::reset_flow::LEAF_RECOVERY_TTL);
-            if is_admin && (nobody_can_add_us || waited_out) {
-                crate::warn_log!(
-                    "[RESET] convo={} leaf recovery cannot succeed (nobody_else_can_add={}, waited={:?}); resetting",
-                    convo_uuid_str,
-                    nobody_can_add_us,
-                    waited
-                );
-                let outcome = self
-                    .reset_conversation(&convo_uuid_str, "localStateLost")
-                    .await?;
-                return Ok(serde_json::json!({ "reset": format!("{outcome:?}") }));
-            }
-            if waited.is_some_and(|w| w < super::reset_flow::LEAF_RECOVERY_TTL) {
-                // Our add request is still open server-side; re-requesting
-                // only earns LeafRecoveryAlreadyOpen.
-                return Ok(serde_json::json!({ "leafRecovery": "open" }));
-            }
-            let gid = latest_coord
-                .get("groupId")
-                .and_then(|v| {
-                    v.as_str()
-                        .or_else(|| v.get("$bytes").and_then(|b| b.as_str()))
-                })
-                .unwrap_or("");
-            let gch = latest_coord
-                .get("groupContextHash")
-                .and_then(|v| {
-                    v.as_str()
-                        .or_else(|| v.get("$bytes").and_then(|b| b.as_str()))
-                })
-                .unwrap_or("");
-            let tag = latest_coord
-                .get("confirmationTag")
-                .and_then(|v| {
-                    v.as_str()
-                        .or_else(|| v.get("$bytes").and_then(|b| b.as_str()))
-                })
-                .unwrap_or("");
-            let epoch = latest_coord
-                .get("epoch")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let sv = latest_coord
-                .get("stateVersion")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            let result = self
-                .request_leaf_recovery(&convo_uuid_str, Some("add"), gid, gch, tag, epoch, sv)
-                .await;
-            match &result {
-                Ok(_) => {
-                    self.recovery_tracker()
-                        .lock()
-                        .await
-                        .note_leaf_recovery_requested(&convo_uuid_str);
-                }
-                Err(err) if err.to_string().contains("LeafRecoveryAlreadyOpen") => {
-                    // Opened by an earlier process of ours; start the clock now
-                    // so an unfulfilled request still escalates.
-                    let mut tracker = self.recovery_tracker().lock().await;
-                    if tracker.leaf_recovery_wait(&convo_uuid_str).is_none() {
-                        tracker.note_leaf_recovery_requested(&convo_uuid_str);
-                    }
-                    return Ok(serde_json::json!({ "leafRecovery": "open" }));
-                }
-                Err(_) => {}
-            }
-            return result;
+            return self.recover_leaf_or_reset(&server_state, &user_did).await;
         }
 
         let prov = my_participant.get("invitationProvenance").ok_or_else(|| {
@@ -3455,16 +3378,13 @@ where
         tracing::info!(conversation_id = %conversation_id, "Successfully accepted conversation");
         Ok(output)
     }
-    /// Request leaf recovery for an accepted participant whose previous reservation expired or needs re-opening.
-    pub async fn request_leaf_recovery(
+    /// Request leaf recovery (`add` when this device holds no leaf, `replace`
+    /// when the server still lists one) bound to the server's exact current
+    /// coordinate, which is what `requestLeafRecovery` compares byte-for-byte.
+    pub(crate) async fn request_leaf_recovery(
         &self,
-        conversation_id: &str,
-        recovery_kind: Option<&str>,
-        group_id: &str,
-        group_context_hash: &str,
-        confirmation_tag: &str,
-        epoch: u64,
-        state_version: i64,
+        state: &super::reset_flow::ServerConversationState,
+        recovery_kind: &str,
     ) -> Result<serde_json::Value> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
@@ -3484,27 +3404,7 @@ where
             .mls_context()
             .identity_public_key(scoped_identity.as_bytes().to_vec())?;
         let key_id = super::canonical_transport::derive_key_id(&public_key);
-
-        let convo_uuid = if let Ok(parsed) = uuid::Uuid::parse_str(conversation_id) {
-            parsed
-        } else {
-            let resolved = self
-                .resolve_legacy_group_identifier(conversation_id)
-                .await?;
-            uuid::Uuid::parse_str(&resolved.conversation_id)
-                .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))?
-        };
-
-        let prior_coord = serde_json::json!({
-            "conversationId": convo_uuid.to_string(),
-            "groupId": group_id,
-            "epoch": epoch,
-            "generation": 0,
-            "stateVersion": state_version,
-            "groupContextHash": group_context_hash,
-            "confirmationTag": confirmation_tag,
-            "lifecycle": "active"
-        });
+        let prior_coord = state.prior_json()?;
 
         let recovery_request_id = uuid::Uuid::new_v4().to_string();
         let body = serde_json::json!({
@@ -3515,7 +3415,7 @@ where
             "idempotencyKey": recovery_request_id.clone(),
             "keyId": key_id,
             "prior": prior_coord,
-            "recoveryKind": recovery_kind.unwrap_or("add"),
+            "recoveryKind": recovery_kind,
             "recoveryRequestId": recovery_request_id,
             "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\0",
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)

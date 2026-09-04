@@ -79,7 +79,7 @@ async fn leafless_admin_with_no_foreign_leaf_resets_instead_of_waiting() {
         .accept_conversation(&convo_id)
         .await
         .expect("accept_conversation escalates to reset");
-    assert_eq!(outcome["reset"], format!("{:?}", ResetOutcome::Activated { epoch: 0 }));
+    assert_eq!(outcome["epoch"], 0, "reset activated here; caller is back in the group");
 
     assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 0, "no doomed leaf recovery");
     assert_eq!(count(&world, CanonicalOperation::RequestReset), 1);
@@ -191,7 +191,7 @@ async fn leafless_admin_waits_on_live_peer_leaf_then_escalates_after_ttl() {
         .accept_conversation(&convo_id)
         .await
         .expect("expired wait escalates");
-    assert_eq!(outcome["reset"], format!("{:?}", ResetOutcome::Activated { epoch: 0 }));
+    assert_eq!(outcome["epoch"], 0, "reset activated here; caller is back in the group");
     assert_eq!(count(&world, CanonicalOperation::RequestReset), 1);
     assert_eq!(world.delivery_service().bootstrap_reset_group_call_count(&convo_id), 1);
 }

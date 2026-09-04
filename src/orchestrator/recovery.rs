@@ -3,7 +3,7 @@ use std::time::Duration;
 use web_time::Instant;
 
 use crate::error::MLSError;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::Engine;
 use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
 use sha2::{Digest, Sha256};
 use tls_codec::DeserializeBytes;
@@ -18,8 +18,7 @@ use super::pagination::PaginationGuard;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 use super::welcome_recovery::{
-    classify_server_error, classify_welcome_processing_error, decide_welcome_recovery,
-    LastRecoveryError, WelcomeRecoveryDecision, WelcomeRecoveryInput,
+    classify_server_error, classify_welcome_processing_error, LastRecoveryError,
 };
 
 pub(crate) enum DeferredRecoveryOutcome {
@@ -2310,156 +2309,6 @@ where
         Ok(())
     }
 
-    async fn route_welcome_recovery_decision(
-        &self,
-        convo_id: &str,
-        user_did: &str,
-        last_error: LastRecoveryError,
-    ) -> Result<bool> {
-        // Merge the storage-backed log with the session-scoped in-memory log
-        // and take whichever has MORE attempts. Storage backends may leave the
-        // persistence hooks as the no-op trait defaults (the FFI-backed
-        // platforms historically did); with only the storage log, this arm
-        // re-ran with attempt_count == 0 every sync tick and the backoff
-        // ladder never engaged.
-        let attempts = {
-            let stored = self
-                .storage()
-                .get_welcome_reissue_attempt_log(convo_id)
-                .await?;
-            let mem = self
-                .reissue_attempts_mem()
-                .lock()
-                .await
-                .get(convo_id)
-                .cloned()
-                .unwrap_or_default();
-            if mem.attempt_count() > stored.attempt_count() {
-                mem
-            } else {
-                stored
-            }
-        };
-
-        let has_groupinfo = self.api_client().get_group_info(convo_id).await.is_ok();
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        let decision = decide_welcome_recovery(WelcomeRecoveryInput {
-            attempts,
-            last_error,
-            has_groupinfo,
-            last_seen_epoch: self.local_group_epoch(convo_id).await.unwrap_or(0),
-            now_ms,
-        });
-
-        match decision {
-            WelcomeRecoveryDecision::RequestReissue {
-                reason,
-                retry_after,
-            } => {
-                if !retry_after.is_zero() {
-                    crate::warn_log!(
-                        "[WELCOME-RECOVERY] convo={} reissue suppressed, retry after {}s",
-                        convo_id,
-                        retry_after.as_secs()
-                    );
-                    return Err(OrchestratorError::RecoveryFailed(format!(
-                        "Welcome reissue suppressed for {convo_id}: retry after {}s",
-                        retry_after.as_secs()
-                    )));
-                }
-
-                let recipient_device_did = self
-                    .credentials()
-                    .get_mls_did(user_did)
-                    .await?
-                    .unwrap_or_else(|| user_did.to_string());
-                let reissue_result = self
-                    .submit_leaf_recovery_request(convo_id, &recipient_device_did, &reason)
-                    .await;
-                // Record the attempt REGARDLESS of the request outcome. A
-                // failing or unwired reissue backend (the ApiClient default
-                // returns "not implemented"; the iOS FFI callback historically
-                // lacked this method) previously bailed out via `?` before the
-                // attempt was recorded, so every sync tick re-entered this arm
-                // with attempt_count == 0 — an unbounded ~5s retry loop that
-                // never backed off and never escalated to External Commit.
-                // Consuming an attempt slot on failure keeps the reissue
-                // backoff ladder moving and lets `decide_welcome_recovery`
-                // reach ExternalCommitWithHistoryGap once attempts exhaust.
-                self.storage()
-                    .record_welcome_reissue_attempt(convo_id, now_ms)
-                    .await?;
-                self.reissue_attempts_mem()
-                    .lock()
-                    .await
-                    .entry(convo_id.to_string())
-                    .or_default()
-                    .attempts
-                    .push(crate::orchestrator::welcome_recovery::ReissueAttempt {
-                        attempted_at_ms: now_ms,
-                    });
-                self.storage().mark_needs_rejoin(convo_id).await?;
-                match reissue_result {
-                    Ok(_) => {
-                        crate::warn_log!(
-                            "[WELCOME-RECOVERY] convo={} reissue REQUESTED (attempt recorded)",
-                            convo_id
-                        );
-                        Err(OrchestratorError::RecoveryFailed(format!(
-                            "Welcome reissue requested for {convo_id}"
-                        )))
-                    }
-                    Err(e) => {
-                        crate::warn_log!(
-                            "[WELCOME-RECOVERY] convo={} reissue request FAILED (attempt recorded, will back off then escalate): {}",
-                            convo_id,
-                            e
-                        );
-                        Err(OrchestratorError::RecoveryFailed(format!(
-                            "Welcome reissue request failed for {convo_id}: {e}"
-                        )))
-                    }
-                }
-            }
-            WelcomeRecoveryDecision::ExternalCommitWithHistoryGap { last_seen_epoch } => {
-                tracing::warn!(
-                    convo_id,
-                    last_seen_epoch,
-                    "Welcome recovery exhausted reissue path; authorizing External Commit with history gap"
-                );
-                crate::warn_log!(
-                    "[WELCOME-RECOVERY] convo={} reissue path exhausted — authorizing External Commit with history gap",
-                    convo_id
-                );
-                Ok(true)
-            }
-            WelcomeRecoveryDecision::Surrender {
-                reason,
-                retry_after,
-            } => {
-                self.conversation_states()
-                    .lock()
-                    .await
-                    .insert(convo_id.to_string(), ConversationState::Failed);
-                if let Err(e) = self
-                    .storage()
-                    .set_conversation_state(convo_id, ConversationState::Failed)
-                    .await
-                {
-                    tracing::warn!(error = %e, convo_id, "Failed to persist Failed state after Welcome recovery surrender");
-                }
-                Err(OrchestratorError::RecoveryFailed(match retry_after {
-                    Some(delay) => format!(
-                        "Welcome recovery surrendered for {convo_id}: {reason}; retry after {}s",
-                        delay.as_secs()
-                    ),
-                    None => format!("Welcome recovery surrendered for {convo_id}: {reason}"),
-                }))
-            }
-            WelcomeRecoveryDecision::Accept { .. } => Ok(false),
-        }
-    }
-
     pub(crate) async fn group_id_hex_for_conversation(&self, convo_id: &str) -> Option<String> {
         self.resolve_conversation_context(convo_id)
             .await
@@ -4141,19 +3990,22 @@ where
         //   - convos where bootstrap failed for a non-409 reason
         //   - convos where Welcome failed with a non-404/410 error and we
         //     skipped bootstrap defensively
-        if let Some(last_error) = welcome_recovery_error {
-            let allow_external_commit = self
-                .route_welcome_recovery_decision(convo_id, &user_did, last_error)
-                .await?;
-            if !allow_external_commit {
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} External Commit NOT AUTHORIZED by welcome-recovery route (e.g. reissue requested/exhausted) — staying NeedsRejoin",
-                    convo_id
-                );
-                return Err(OrchestratorError::RecoveryFailed(format!(
-                    "Welcome recovery did not authorize External Commit for {convo_id}"
-                )));
+        if welcome_recovery_error.is_some() {
+            // Clean-chat exposes no GroupInfo, so External Commit can never
+            // succeed here. A live leaf of another participant must re-add
+            // us, or an admin resets; both bind the server's coordinate.
+            let state = self.fetch_server_conversation_state(convo_id).await?;
+            let outcome = self.recover_leaf_or_reset(&state, &user_did).await?;
+            if let Some(epoch) = outcome.get("epoch").and_then(|v| v.as_u64()) {
+                self.clear_rejoin_failures(convo_id).await?;
+                crate::warn_log!("[REJOIN-DIAG] convo={} reset activated epoch={}", convo_id, epoch);
+                return Ok(epoch);
             }
+            self.storage().mark_needs_rejoin(convo_id).await?;
+            crate::warn_log!("[REJOIN-DIAG] convo={} leaf recovery pending: {}", convo_id, outcome);
+            return Err(OrchestratorError::RecoveryFailed(format!(
+                "leaf recovery pending for {convo_id}: {outcome}"
+            )));
         }
         if let Err(err) = self.enforce_rejoin_backoff(convo_id).await {
             crate::warn_log!(
@@ -5717,84 +5569,6 @@ where
         if let Some(obs) = self.current_event_observer().await {
             obs.on_conversation_quarantine_cleared(convo_id, via);
         }
-    }
-
-    async fn submit_leaf_recovery_request(
-        &self,
-        convo_id: &str,
-        recipient_device_did: &str,
-        reason: &str,
-    ) -> Result<()> {
-        let user_did = self.require_user_did().await?;
-        let actor_device_id = self.require_actor_device_id().await?;
-        let auth_generation = self
-            .credentials()
-            .get_auth_generation(&user_did)
-            .await?
-            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
-        let scoped_identity = self.require_scoped_identity().await?;
-        let public_key = self
-            .mls_context()
-            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
-        let key_id = super::canonical_transport::derive_key_id(&public_key);
-        let recovery_request_id = uuid::Uuid::new_v4().to_string();
-        let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
-        let convo_id = &resolved.conversation_id;
-        let group_id_bytes = resolved.group_id_bytes()?;
-        let gc_hash = self
-            .mls_context()
-            .get_group_context_hash(group_id_bytes.clone())?;
-        if gc_hash.len() != 32 {
-            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
-                "group context hash must be exactly 32 bytes, got {}",
-                gc_hash.len()
-            ))));
-        }
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(group_id_bytes.clone())?;
-        if tag_bytes.len() != 32 {
-            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
-                "confirmation tag must be exactly 32 bytes, got {}",
-                tag_bytes.len()
-            ))));
-        }
-        let body = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
-            "actorDeviceId": actor_device_id,
-            "actorDid": user_did,
-            "authGeneration": auth_generation,
-            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-            "keyId": key_id,
-            "prior": {
-                "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&tag_bytes),
-                "conversationId": convo_id,
-                "epoch": 0,
-                "generation": 0,
-                "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&gc_hash),
-                "groupId": base64::engine::general_purpose::STANDARD.encode(&group_id_bytes),
-                "lifecycle": "active",
-                "stateVersion": 0
-            },
-            "recoveryKind": "replace",
-            "recoveryRequestId": recovery_request_id,
-            "signatureDomain": "CATBIRD-CHAT-LEAF-RECOVERY-REQUEST\0",
-            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        });
-        let response = self
-            .submit_signed_clean_chat_request(
-                super::canonical_transport::CanonicalOperation::RequestLeafRecovery,
-                serde_json::to_vec(&body)
-                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
-            )
-            .await?;
-        if response.status != 200 {
-            return Err(OrchestratorError::Api(format!(
-                "request_welcome_reissue failed: {}",
-                response.status
-            )));
-        }
-        Ok(())
     }
 
     async fn locally_known_metadata(

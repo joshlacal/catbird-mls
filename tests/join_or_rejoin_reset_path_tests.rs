@@ -167,7 +167,7 @@ async fn test_fresh_reset_skips_existing_global_gate_for_bootstrap() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn get_welcome_404_without_groupinfo_surrenders_via_recovery_policy() {
+async fn get_welcome_404_never_falls_through_to_external_commit() {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     let _did = world.register_device("Alice").await.unwrap();
@@ -181,17 +181,22 @@ async fn get_welcome_404_without_groupinfo_surrenders_via_recovery_policy() {
         .await
         .expect("test conversation should be persisted");
 
-    let result = alice.orchestrator.join_or_rejoin(convo_id).await;
-    let err = result.expect_err("404 Welcome with no GroupInfo must surrender");
+    // Clean-chat has no GroupInfo: a 404 Welcome routes to server-state leaf
+    // recovery (or reset), never to External Commit. The server knows no such
+    // conversation, so recovery fails closed on that.
+    let err = alice
+        .orchestrator
+        .join_or_rejoin(convo_id)
+        .await
+        .expect_err("404 Welcome for an unknown conversation must fail closed");
     let msg = format!("{err}");
-
     assert!(
-        msg.contains("Welcome recovery surrendered")
-            && msg.contains("welcome_and_group_info_unavailable"),
-        "get_welcome 404 should be routed through WelcomeRecoveryDecision; got {msg}"
+        !msg.contains("GroupInfo"),
+        "get_welcome 404 must not reach the External Commit GroupInfo path; got {msg}"
     );
-    assert!(
-        !msg.contains("Failed to fetch GroupInfo"),
-        "get_welcome 404 skipped the WelcomeRecoveryDecision policy and fell through to External Commit; got {msg}"
+    assert_eq!(
+        world.delivery_service().get_group_info_call_count(convo_id),
+        0,
+        "clean-chat recovery must never fetch GroupInfo"
     );
 }
