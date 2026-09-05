@@ -13,6 +13,8 @@ use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 use crate::{StorageLifecycleState, StorageLifecycleStatus};
 use serde::Deserialize;
 
+mod server_events;
+
 pub use crate::orchestrator::MessageProcessingResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +297,8 @@ where
         })
     }
 
+    /// Invite accounts and return the refreshed participant roster. Device
+    /// leaves and the MLS epoch change only after acceptance and fulfillment.
     pub fn add_members(
         &self,
         convo_id: &str,
@@ -303,11 +307,7 @@ where
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
         if !member_dids.is_empty() {
-            crate::async_runtime::block_on(self.orchestrator.swap_members(
-                convo_id,
-                &[],
-                member_dids,
-            ))?;
+            crate::async_runtime::block_on(self.orchestrator.add_members(convo_id, member_dids))?;
         }
         let conversation = self.refresh_conversation_snapshot(convo_id)?;
         Ok(GroupMutationResult { conversation })
@@ -320,7 +320,7 @@ where
     ) -> Result<GroupMutationResult> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
-        crate::async_runtime::block_on(self.orchestrator.remove_members(convo_id, member_dids))?;
+        crate::async_runtime::block_on(self.orchestrator.remove_accounts(convo_id, member_dids))?;
         let conversation = self.refresh_conversation_snapshot(convo_id)?;
         Ok(GroupMutationResult { conversation })
     }
@@ -328,7 +328,12 @@ where
     pub fn leave_conversation(&self, convo_id: &str) -> Result<LeaveResult> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
-        let group_id = self.current_conversation_group_id(convo_id)?;
+        // This is advisory result metadata. Leaving is authorized by fresh
+        // server state, even when this device has no readable local snapshot.
+        let group_id = self.current_conversation_group_id(convo_id).unwrap_or_else(|error| {
+            tracing::warn!(conversation_id = convo_id, %error, "Cannot read advisory local group ID before leave");
+            None
+        });
         crate::async_runtime::block_on(self.orchestrator.leave_group(convo_id))?;
         Ok(LeaveResult {
             conversation_id: convo_id.to_string(),
@@ -337,8 +342,26 @@ where
     }
 
     pub fn process_server_event(&self, event_json: &str) -> Result<Vec<EngineEvent>> {
+        const MAX_EVENT_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+        if event_json.len() > MAX_EVENT_JSON_BYTES {
+            return Err(OrchestratorError::InvalidInput(
+                "server event JSON exceeds maximum allowed size of 16MiB".into(),
+            ));
+        }
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
+        let value: serde_json::Value = serde_json::from_str(event_json).map_err(|err| {
+            OrchestratorError::InvalidInput(format!("Failed to decode server event JSON: {err}"))
+        })?;
+        if value.get("$type").and_then(|t| t.as_str())
+            == Some("blue.catbird.internal#inventoryHintBatch")
+        {
+            return crate::async_runtime::block_on(self.process_inventory_hint_batch(value));
+        }
+        if value.get("$type").is_some() || value.get("payload").is_some() {
+            let hint = server_events::CanonicalHint::parse(value)?;
+            return crate::async_runtime::block_on(self.process_canonical_hint(hint));
+        }
         let event: ServerEventEnvelope = serde_json::from_str(event_json).map_err(|err| {
             OrchestratorError::InvalidInput(format!("Failed to decode server event JSON: {err}"))
         })?;
@@ -384,6 +407,51 @@ where
                 Ok(events_for_reset_outcome(&convo_id, outcome))
             }
         }
+    }
+
+    async fn process_inventory_hint_batch(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<Vec<EngineEvent>> {
+        server_events::exact_fields(&value, &["events"])?;
+        let events_val = value
+            .get("events")
+            .ok_or_else(|| OrchestratorError::InvalidInput("batch missing events field".into()))?;
+        let events = events_val.as_array().ok_or_else(|| {
+            OrchestratorError::InvalidInput("batch events must be an array".into())
+        })?;
+        if events.len() > 10_000 {
+            return Err(OrchestratorError::InvalidInput(
+                "batch exceeds maximum limit of 10000 events".into(),
+            ));
+        }
+
+        // Validate all hints strictly before any inventory fetch or effect.
+        let hints: Vec<server_events::CanonicalHint> = events
+            .iter()
+            .cloned()
+            .map(server_events::CanonicalHint::parse)
+            .collect::<Result<Vec<_>>>()?;
+
+        if hints.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snapshot = Arc::new(
+            self.orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await?,
+        );
+
+        crate::orchestrator::with_batch_inventory_scope(snapshot, async {
+            let mut all_events = Vec::new();
+            for hint in hints {
+                let events = self.process_canonical_hint(hint).await?;
+                all_events.extend(events);
+            }
+            Ok(all_events)
+        })
+        .await
     }
 
     pub fn process_incoming_message(

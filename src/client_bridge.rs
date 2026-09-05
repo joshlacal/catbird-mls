@@ -52,8 +52,13 @@ fn bridge_err(e: OrchestratorBridgeError) -> crate::orchestrator::error::Orchest
     crate::orchestrator_bridge::bridge_mappers::bridge_error_to_internal(e)
 }
 
-fn ffi_to_convo_view(ffi: &crate::orchestrator_bridge::FFIConversationView) -> ConversationView {
-    ConversationView {
+fn ffi_to_convo_view(ffi: &crate::orchestrator_bridge::FFIConversationView) -> crate::orchestrator::Result<ConversationView> {
+    let canonical_state = ffi.canonical_state_json.as_ref().map(|json|
+        crate::orchestrator::canonical_transport::decode_conversation_state(json.as_bytes())
+            .map_err(|error| crate::orchestrator::OrchestratorError::InvalidInput(error.to_string()))
+    ).transpose()?;
+    let view = ConversationView {
+        canonical_state,
         group_id: ffi.group_id.clone(),
         conversation_id: ffi.conversation_id.clone(),
         epoch: ffi.epoch,
@@ -92,7 +97,9 @@ fn ffi_to_convo_view(ffi: &crate::orchestrator_bridge::FFIConversationView) -> C
         // ADR-010 A6): UniFFI record shapes are deliberately unchanged in
         // rung 2.
         sequencer_did: None,
-    }
+    };
+    crate::orchestrator::admission::validate_conversation_view(&view)?;
+    Ok(view)
 }
 
 fn ffi_to_message(ffi: &crate::orchestrator_bridge::FFIMessage) -> Message {
@@ -207,8 +214,8 @@ impl MLSStorageBackend for ClientStorageAdapter {
     ) -> crate::orchestrator::Result<Option<ConversationView>> {
         self.0
             .get_conversation(user_did.to_string(), conversation_id.to_string())
-            .map(|opt| opt.map(|ffi| ffi_to_convo_view(&ffi)))
-            .map_err(bridge_err)
+            .map_err(bridge_err)?
+            .as_ref().map(ffi_to_convo_view).transpose()
     }
 
     async fn list_conversations(
@@ -217,8 +224,8 @@ impl MLSStorageBackend for ClientStorageAdapter {
     ) -> crate::orchestrator::Result<Vec<ConversationView>> {
         self.0
             .list_conversations(user_did.to_string())
-            .map(|v| v.iter().map(ffi_to_convo_view).collect())
-            .map_err(bridge_err)
+            .map_err(bridge_err)?
+            .iter().map(ffi_to_convo_view).collect()
     }
 
     async fn delete_conversations(
@@ -306,6 +313,15 @@ impl MLSStorageBackend for ClientStorageAdapter {
                 landed_epoch,
             )
             .map_err(bridge_err)
+    }
+
+    async fn complete_account_exit(&self, conversation_id: &str, expected_group_id_hex: &str,
+        expected_reset_generation: Option<i32>, terminal_epoch: u64, terminal_state: ConversationState) -> crate::orchestrator::Result<bool> {
+        if !matches!(terminal_state, ConversationState::Closed | ConversationState::DeviceRemoved) {
+            return Err(crate::orchestrator::OrchestratorError::Storage("invalid account exit state".into()));
+        }
+        self.0.complete_account_exit(conversation_id.into(), expected_group_id_hex.into(),
+            expected_reset_generation, terminal_epoch, terminal_state.tag().into()).map_err(bridge_err)
     }
 
     async fn clear_reset_pending_for_delete(
@@ -529,6 +545,7 @@ impl MLSStorageBackend for ClientStorageAdapter {
             "mark_reset_pending",
             "adopt_reset_pending_target",
             "complete_reset_pending",
+            "complete_account_exit",
             "clear_reset_pending_for_delete",
             "mark_quarantined",
             "clear_quarantine",
@@ -657,13 +674,11 @@ impl MLSAPIClient for ClientAPIAdapter {
         limit: u32,
         cursor: Option<&str>,
     ) -> crate::orchestrator::Result<ConversationListPage> {
-        self.0
-            .get_conversations(limit, cursor.map(|s| s.to_string()))
-            .map(|ffi| ConversationListPage {
-                conversations: ffi.conversations.iter().map(ffi_to_convo_view).collect(),
-                cursor: ffi.cursor,
-            })
-            .map_err(bridge_err)
+        let ffi = self.0.get_conversations(limit, cursor.map(str::to_string)).map_err(bridge_err)?;
+        Ok(ConversationListPage {
+            conversations: ffi.conversations.iter().map(ffi_to_convo_view).collect::<crate::orchestrator::Result<Vec<_>>>()?,
+            cursor: ffi.cursor,
+        })
     }
 
     async fn get_messages(
@@ -684,25 +699,13 @@ impl MLSAPIClient for ClientAPIAdapter {
                 from_epoch,
                 to_epoch,
             )
-            .map(|ffi| {
-                let envelopes = ffi
-                    .envelopes
-                    .into_iter()
-                    .map(|m| IncomingEnvelope {
-                        conversation_id: m.conversation_id,
-                        sender_did: m.sender_did,
-                        ciphertext: m.ciphertext,
-                        timestamp: m
-                            .timestamp
-                            .parse::<chrono::DateTime<chrono::Utc>>()
-                            .unwrap_or_else(|_| chrono::Utc::now()),
-                        server_message_id: m.server_message_id,
-                        server_epoch: None,
-                    })
-                    .collect();
-                (envelopes, ffi.cursor)
-            })
             .map_err(bridge_err)
+            .and_then(|ffi| {
+                let envelopes = ffi.envelopes.into_iter()
+                    .map(|m| crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(m, None))
+                    .collect::<crate::orchestrator::Result<Vec<_>>>()?;
+                Ok((envelopes, ffi.cursor))
+            })
     }
 
     async fn get_key_packages(

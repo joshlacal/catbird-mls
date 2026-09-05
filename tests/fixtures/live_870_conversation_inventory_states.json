@@ -1,0 +1,354 @@
+[
+  {
+    "$type": "blue.catbird.chat.defs#conversationInventoryState",
+    "state": {
+      "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+      "conversationKind": "group",
+      "coordinates": {
+        "confirmationTag": {
+          "$bytes": "9qIZroEKa5gTWHdxev3jIoKvonvZXZY9zEqXKJ0swRk="
+        },
+        "conversationId": "205799c6-6995-46c3-9900-20de0bbfb8ec",
+        "epoch": 1,
+        "generation": 0,
+        "groupContextHash": {
+          "$bytes": "+r1RKSs0Li9N9e47f56IlixoZ4dYwba3+TGq8VkaOV0="
+        },
+        "groupId": {
+          "$bytes": "TWdHRF37IVXSHPQIsvBr8SgyChwq36yw2bnCfHkcjjQ="
+        },
+        "lifecycle": "active",
+        "stateVersion": 3
+      },
+      "leaves": [
+        {
+          "deviceId": "1d41737f-128f-42ff-b0f5-1b8e95fddf50",
+          "deviceStatus": "active",
+          "joinKeyPackageRef": {
+            "$bytes": "mzyW2P18kfulKgkrZ0Dej6CYMWG+NyIdTC2rZ8M0nt0="
+          },
+          "keyId": "es9f1BJgGYW3uNZfOrNlQhSlP2EA-6m_7jtFAMS2b0w",
+          "leafOrigin": "keyPackage",
+          "userDid": "did:plc:34x52srgxttjewbke5hguloh"
+        },
+        {
+          "deviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+          "deviceStatus": "active",
+          "keyId": "iuzlptFIIufW9vZ7OTpDaj3Z2eqgmYCI7FIScaKaHR8",
+          "leafOrigin": "genesis",
+          "userDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+        }
+      ],
+      "metadataSnapshot": {
+        "authorProof": {
+          "authGenerationAtOrigin": 1,
+          "authorDeviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+          "authorDid": "did:plc:yirep3fqwvhazp5kcimfo2ne",
+          "authorKeyId": "iuzlptFIIufW9vZ7OTpDaj3Z2eqgmYCI7FIScaKaHR8",
+          "deviceStatusAtOrigin": "active",
+          "originSeq": 1,
+          "originTransitionId": "f685b1ea-5277-43d2-9141-6c203309eab5",
+          "roleAtOrigin": "admin",
+          "signaturePublicKey": {
+            "$bytes": "xW/CAxqMMvnkA9RmaAPVdzq4/vl/GknJPWnruxH/pL0="
+          }
+        },
+        "ciphertext": {
+          "$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        "ciphertextSha256": {
+          "$bytes": "Z3jHx7a2wcJz5mgWmnZSpoHahq1i0D98WqEgQFBp/rI="
+        },
+        "ciphertextSize": 81,
+        "coordinate": {
+          "confirmationTag": {
+            "$bytes": "9qIZroEKa5gTWHdxev3jIoKvonvZXZY9zEqXKJ0swRk="
+          },
+          "conversationId": {
+            "$bytes": "IFeZxmmVRsOZACDeC7+47A=="
+          },
+          "epoch": 1,
+          "generation": 0,
+          "groupContextHash": {
+            "$bytes": "+r1RKSs0Li9N9e47f56IlixoZ4dYwba3+TGq8VkaOV0="
+          },
+          "groupId": {
+            "$bytes": "TWdHRF37IVXSHPQIsvBr8SgyChwq36yw2bnCfHkcjjQ="
+          }
+        },
+        "metadataVersion": 1,
+        "nonce": {
+          "$bytes": "rteA/SoPx05Cz29B"
+        },
+        "originTransitionId": "f685b1ea-5277-43d2-9141-6c203309eab5"
+      },
+      "participants": [
+        {
+          "invitationProvenance": {
+            "invitationTransitionId": "f685b1ea-5277-43d2-9141-6c203309eab5",
+            "invitedByDeviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+            "invitedByDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+          },
+          "leafCount": 1,
+          "role": "member",
+          "status": "active",
+          "userDid": "did:plc:34x52srgxttjewbke5hguloh"
+        },
+        {
+          "invitationProvenance": {
+            "invitationTransitionId": "f685b1ea-5277-43d2-9141-6c203309eab5",
+            "invitedByDeviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+            "invitedByDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+          },
+          "leafCount": 0,
+          "role": "member",
+          "status": "active",
+          "userDid": "did:plc:oq3qa6f332ergklpj2dvd3up"
+        },
+        {
+          "leafCount": 1,
+          "role": "admin",
+          "status": "active",
+          "userDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+        }
+      ],
+      "sequencerDid": "did:web:chat.catbird.blue",
+      "sequencerTerm": 0,
+      "snapshotSeq": 4
+    }
+  },
+  {
+    "$type": "blue.catbird.chat.defs#conversationInventoryState",
+    "state": {
+      "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+      "conversationKind": "group",
+      "coordinates": {
+        "confirmationTag": {
+          "$bytes": "H0MOH8KZreDU8CLHjf+6k4lGkczul4Tw/xnrlRn4fQ0="
+        },
+        "conversationId": "788cb318-330b-41d8-9f38-31dd06f19a88",
+        "epoch": 5,
+        "generation": 0,
+        "groupContextHash": {
+          "$bytes": "fy5ysPrCRWXf38gyVribesDf9cfuqj8A8nDunB5+0yc="
+        },
+        "groupId": {
+          "$bytes": "uYWYDgl1elv5o28gwKHLQ/MZKEv1Lp4pOdA4d1VCXPw="
+        },
+        "lifecycle": "active",
+        "stateVersion": 7
+      },
+      "leaves": [
+        {
+          "deviceId": "1d41737f-128f-42ff-b0f5-1b8e95fddf50",
+          "deviceStatus": "active",
+          "joinKeyPackageRef": {
+            "$bytes": "qDR5IOHTxUPrmrjaKYANaIg/240UnqFs4UuSLWQ/H9M="
+          },
+          "keyId": "es9f1BJgGYW3uNZfOrNlQhSlP2EA-6m_7jtFAMS2b0w",
+          "leafOrigin": "keyPackage",
+          "userDid": "did:plc:34x52srgxttjewbke5hguloh"
+        },
+        {
+          "deviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+          "deviceStatus": "active",
+          "keyId": "iuzlptFIIufW9vZ7OTpDaj3Z2eqgmYCI7FIScaKaHR8",
+          "leafOrigin": "genesis",
+          "userDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+        }
+      ],
+      "metadataSnapshot": {
+        "authorProof": {
+          "authGenerationAtOrigin": 1,
+          "authorDeviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+          "authorDid": "did:plc:yirep3fqwvhazp5kcimfo2ne",
+          "authorKeyId": "iuzlptFIIufW9vZ7OTpDaj3Z2eqgmYCI7FIScaKaHR8",
+          "deviceStatusAtOrigin": "active",
+          "originSeq": 1,
+          "originTransitionId": "f19b9851-21d1-4f7f-a12f-afa0131bda31",
+          "roleAtOrigin": "admin",
+          "signaturePublicKey": {
+            "$bytes": "xW/CAxqMMvnkA9RmaAPVdzq4/vl/GknJPWnruxH/pL0="
+          }
+        },
+        "ciphertext": {
+          "$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        },
+        "ciphertextSha256": {
+          "$bytes": "B1Vh7/LNOtWGd2+pBPAEAoLF9qJh9qj9agpSTRTNLSw="
+        },
+        "ciphertextSize": 77,
+        "coordinate": {
+          "confirmationTag": {
+            "$bytes": "H0MOH8KZreDU8CLHjf+6k4lGkczul4Tw/xnrlRn4fQ0="
+          },
+          "conversationId": {
+            "$bytes": "eIyzGDMLQdifODHdBvGaiA=="
+          },
+          "epoch": 5,
+          "generation": 0,
+          "groupContextHash": {
+            "$bytes": "fy5ysPrCRWXf38gyVribesDf9cfuqj8A8nDunB5+0yc="
+          },
+          "groupId": {
+            "$bytes": "uYWYDgl1elv5o28gwKHLQ/MZKEv1Lp4pOdA4d1VCXPw="
+          }
+        },
+        "metadataVersion": 1,
+        "nonce": {
+          "$bytes": "o2UB9NWT2Z2HbmeF"
+        },
+        "originTransitionId": "f19b9851-21d1-4f7f-a12f-afa0131bda31"
+      },
+      "participants": [
+        {
+          "invitationProvenance": {
+            "invitationTransitionId": "f19b9851-21d1-4f7f-a12f-afa0131bda31",
+            "invitedByDeviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+            "invitedByDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+          },
+          "leafCount": 1,
+          "role": "member",
+          "status": "active",
+          "userDid": "did:plc:34x52srgxttjewbke5hguloh"
+        },
+        {
+          "leafCount": 1,
+          "role": "admin",
+          "status": "active",
+          "userDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+        }
+      ],
+      "sequencerDid": "did:web:chat.catbird.blue",
+      "sequencerTerm": 0,
+      "snapshotSeq": 16
+    }
+  },
+  {
+    "$type": "blue.catbird.chat.defs#conversationInventoryState",
+    "state": {
+      "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+      "conversationKind": "direct",
+      "coordinates": {
+        "confirmationTag": {
+          "$bytes": "nzifvfjio0EK1RQeffPc6ZP5fxe+a8XGobwWE8gRmgc="
+        },
+        "conversationId": "e37e11f2-7236-4436-909b-6e644c51c698",
+        "epoch": 3,
+        "generation": 0,
+        "groupContextHash": {
+          "$bytes": "VCNl/1xTwxRlkC96kU7WNBRruGPsKwQiEPfKKjHGlxg="
+        },
+        "groupId": {
+          "$bytes": "4IylhsWNXWa3NZqvdllXjM1C3oiZwqoI6XfWIqIA1JI="
+        },
+        "lifecycle": "active",
+        "stateVersion": 4
+      },
+      "leaves": [
+        {
+          "deviceId": "5d9b4ed9-0298-4544-a4cb-9944433b93f5",
+          "deviceStatus": "active",
+          "joinKeyPackageRef": {
+            "$bytes": "P5Lj5P+ASqSVPJCaoPuL9AaV/fc9tX+Ou52mqLIb284="
+          },
+          "keyId": "qICKWiC-i7oQ3cC4bVkyVm2_duPki4-PszOkvBAOr7g",
+          "leafOrigin": "keyPackage",
+          "userDid": "did:plc:oq3qa6f332ergklpj2dvd3up"
+        },
+        {
+          "deviceId": "ec247b70-d391-45db-a035-fa4658fce42b",
+          "deviceStatus": "active",
+          "joinKeyPackageRef": {
+            "$bytes": "VVEkIoKDIxjiCtDz7LWhuPs3OMSQ+EzRcJrokaJrIrY="
+          },
+          "keyId": "3rqzogeQRYwagH46hbq_dxexXpi5ExwM1VVFeclbspU",
+          "leafOrigin": "keyPackage",
+          "userDid": "did:plc:oq3qa6f332ergklpj2dvd3up"
+        },
+        {
+          "deviceId": "ec85d622-d53d-4cf8-b24e-adc3c10d32fc",
+          "deviceStatus": "active",
+          "joinKeyPackageRef": {
+            "$bytes": "WWc0qqP2svIH/6d9o1EiNMa1Aq7ipTBW/E5yVaI0JSI="
+          },
+          "keyId": "qslCDUhNUZVHw3hffx0TO5xV1PM8lX01AYVbqVrnFdA",
+          "leafOrigin": "keyPackage",
+          "userDid": "did:plc:oq3qa6f332ergklpj2dvd3up"
+        },
+        {
+          "deviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+          "deviceStatus": "active",
+          "keyId": "iuzlptFIIufW9vZ7OTpDaj3Z2eqgmYCI7FIScaKaHR8",
+          "leafOrigin": "genesis",
+          "userDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+        }
+      ],
+      "metadataSnapshot": {
+        "authorProof": {
+          "authGenerationAtOrigin": 1,
+          "authorDeviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+          "authorDid": "did:plc:yirep3fqwvhazp5kcimfo2ne",
+          "authorKeyId": "iuzlptFIIufW9vZ7OTpDaj3Z2eqgmYCI7FIScaKaHR8",
+          "deviceStatusAtOrigin": "active",
+          "originSeq": 1,
+          "originTransitionId": "c9e26b4a-0d0a-465b-98c0-696e507488bf",
+          "roleAtOrigin": "admin",
+          "signaturePublicKey": {
+            "$bytes": "xW/CAxqMMvnkA9RmaAPVdzq4/vl/GknJPWnruxH/pL0="
+          }
+        },
+        "ciphertext": {
+          "$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        "ciphertextSha256": {
+          "$bytes": "VVJ0i1rrUA9Xs9H0pW5Ol4kZiRjGY+cSMU6pmQJuuJY="
+        },
+        "ciphertextSize": 78,
+        "coordinate": {
+          "confirmationTag": {
+            "$bytes": "nzifvfjio0EK1RQeffPc6ZP5fxe+a8XGobwWE8gRmgc="
+          },
+          "conversationId": {
+            "$bytes": "434R8nI2RDaQm25kTFHGmA=="
+          },
+          "epoch": 3,
+          "generation": 0,
+          "groupContextHash": {
+            "$bytes": "VCNl/1xTwxRlkC96kU7WNBRruGPsKwQiEPfKKjHGlxg="
+          },
+          "groupId": {
+            "$bytes": "4IylhsWNXWa3NZqvdllXjM1C3oiZwqoI6XfWIqIA1JI="
+          }
+        },
+        "metadataVersion": 1,
+        "nonce": {
+          "$bytes": "WkVK4ZLmwPMjy4fZ"
+        },
+        "originTransitionId": "c9e26b4a-0d0a-465b-98c0-696e507488bf"
+      },
+      "participants": [
+        {
+          "invitationProvenance": {
+            "invitationTransitionId": "c9e26b4a-0d0a-465b-98c0-696e507488bf",
+            "invitedByDeviceId": "dc7d907a-1cd4-45bb-840d-d7c9d17c7d6c",
+            "invitedByDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+          },
+          "leafCount": 3,
+          "role": "admin",
+          "status": "active",
+          "userDid": "did:plc:oq3qa6f332ergklpj2dvd3up"
+        },
+        {
+          "leafCount": 1,
+          "role": "admin",
+          "status": "active",
+          "userDid": "did:plc:yirep3fqwvhazp5kcimfo2ne"
+        }
+      ],
+      "sequencerDid": "did:web:chat.catbird.blue",
+      "sequencerTerm": 0,
+      "snapshotSeq": 13
+    }
+  }
+]

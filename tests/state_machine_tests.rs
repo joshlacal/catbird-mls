@@ -1067,18 +1067,29 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
     let first = alice.orchestrator.join_or_rejoin(&convo.conversation_id).await;
     assert!(first.is_err(), "leafless device must not be joined yet");
     assert_eq!(leaf_recovery_requests(), 1, "first attempt opens a leaf recovery request");
+    let original_request = world.delivery_service().submitted_prepared_requests().into_iter()
+        .find(|request| request.operation == CanonicalOperation::RequestLeafRecovery)
+        .expect("first request remains recorded");
 
     // Immediate retry: the request is still open server-side; re-requesting
     // only earns LeafRecoveryAlreadyOpen, so it must not hit the server.
     let second = alice.orchestrator.join_or_rejoin(&convo.conversation_id).await;
     match second {
         Err(OrchestratorError::RecoveryFailed(msg)) => assert!(
-            msg.contains("leafRecovery") && msg.contains("open"),
-            "Expected open-request suppression, got: {msg}"
+            msg.starts_with("leaf recovery pending for ") && msg.contains(&convo.conversation_id),
+            "Expected pending recovery while reusing the open request, got: {msg}"
         ),
         other => panic!("Expected RecoveryFailed open-request error, got: {other:?}"),
     }
     assert_eq!(leaf_recovery_requests(), 1, "retry must not re-request leaf recovery");
+    let retained_request = world.delivery_service().submitted_prepared_requests().into_iter()
+        .find(|request| request.operation == CanonicalOperation::RequestLeafRecovery)
+        .expect("open request remains recorded");
+    assert_eq!(retained_request.body, original_request.body,
+        "retry must preserve the exact signed recovery request");
+    assert!(!world.delivery_service().submitted_prepared_requests().iter()
+        .any(|request| request.operation == CanonicalOperation::RequestReset),
+        "waiting for a current leaf must not open a destructive reset");
     assert_eq!(
         world
             .delivery_service()

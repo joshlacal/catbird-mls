@@ -55,6 +55,18 @@ struct GroupLifecycleFixture {
 }
 
 impl GroupLifecycleFixture {
+    fn seed_creator_leaf(&self, cid: &str) {
+        let create = self.api.submitted_prepared_requests().into_iter()
+            .filter_map(|request| request.body)
+            .filter_map(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+            .find(|request| request["signedRequest"]["body"]["$type"] == "blue.catbird.chat.defs#creationBody")
+            .expect("signed genesis request");
+        let body = &create["signedRequest"]["body"];
+        self.api.set_conversation_leaves_for_test(cid, vec![serde_json::json!({
+            "userDid":body["actorDid"],"deviceId":body["actorDeviceId"],"deviceStatus":"active","leafIndex":0
+        })]);
+    }
+
     async fn with_one_recipient_key_package() -> Self {
         let mut world = TestWorld::new();
         world.add_client("Bob").await;
@@ -113,6 +125,7 @@ async fn add_remove_resolve_stable_conversation_id_to_current_group_id() {
         .expect("create conversation");
     let original_group_id = created.conversation.group_id.clone();
     let stable_convo_id = "00000000-0000-4000-8000-000000000001";
+    fixture.seed_creator_leaf(&created.conversation.conversation_id);
 
     fixture
         .api
@@ -201,12 +214,13 @@ async fn add_remove_and_leave_return_updated_snapshots() {
         })
         .expect("create conversation");
     let convo_id = created.conversation.conversation_id.clone();
+    fixture.seed_creator_leaf(&convo_id);
 
     let added: GroupMutationResult = fixture
         .engine
         .add_members(&convo_id, &["did:plc:bob".into()])
         .expect("add members");
-    assert!(added.conversation.epoch > created.conversation.epoch);
+    assert_eq!(added.conversation.epoch, created.conversation.epoch, "inviting creates pending account membership without an MLS Add");
     assert!(added
         .conversation
         .members
@@ -217,7 +231,7 @@ async fn add_remove_and_leave_return_updated_snapshots() {
         .engine
         .remove_members(&convo_id, &["did:plc:bob".into()])
         .expect("remove members");
-    assert!(removed.conversation.epoch > added.conversation.epoch);
+    assert_eq!(removed.conversation.epoch, added.conversation.epoch, "removing a pending zero-leaf invitation changes policy only");
     assert!(!removed
         .conversation
         .members

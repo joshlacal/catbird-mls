@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -175,6 +176,8 @@ where
     /// Defaults off so existing clients keep dropping non-displayable control
     /// payloads. Catbird iOS enables this only in Rust-authoritative mode.
     store_control_messages: AtomicBool,
+    /// Unique instance identifier used to bind execution-local scopes.
+    pub(crate) instance_id: u64,
 }
 
 struct EpochCleanupTargets<'a> {
@@ -239,6 +242,26 @@ pub(crate) enum StagedCommitKindSummary {
     },
 }
 
+static NEXT_ORCHESTRATOR_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static NEXT_BATCH_EXECUTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(not(target_arch = "wasm32"))]
+tokio::task_local! {
+    pub(crate) static BATCH_INVENTORY_CONTEXT: Arc<AuthorizedInventorySnapshot>;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn with_batch_inventory_scope<F, R>(
+    snapshot: Arc<AuthorizedInventorySnapshot>,
+    f: F,
+) -> R
+where
+    F: Future<Output = R>,
+{
+    BATCH_INVENTORY_CONTEXT.scope(snapshot, f).await
+}
+
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -288,6 +311,7 @@ where
             event_observer: Mutex::new(None),
             device_key_cache: Mutex::new(HashMap::new()),
             store_control_messages: AtomicBool::new(false),
+            instance_id: NEXT_ORCHESTRATOR_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -304,6 +328,176 @@ where
         &self,
     ) -> Option<Arc<dyn super::event_observer::OrchestratorEventObserver>> {
         self.event_observer.lock().await.clone()
+    }
+
+    /// Return the currently scoped batch inventory snapshot, if any.
+    /// Fails closed if the snapshot belongs to a different orchestrator instance,
+    /// or if lifecycle state indicates user_did mismatch.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn batch_inventory_snapshot(&self) -> Option<Arc<AuthorizedInventorySnapshot>> {
+        BATCH_INVENTORY_CONTEXT
+            .try_with(|snapshot| {
+                if snapshot.owner_instance_id != self.instance_id {
+                    return None;
+                }
+                let Ok(state) = self.lifecycle_state.try_lock() else {
+                    return None;
+                };
+                match &*state {
+                    OrchestratorLifecycleState::Ready { user_did } => {
+                        if user_did != &snapshot.user_did {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                Some(snapshot.clone())
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// On WASM targets, batch inventory execution contexts are not available.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn batch_inventory_snapshot(&self) -> Option<Arc<AuthorizedInventorySnapshot>> {
+        None
+    }
+
+    /// Fetch an authorized inventory snapshot across all pages for the current device.
+    pub(crate) async fn fetch_authorized_inventory_snapshot(
+        &self,
+    ) -> Result<AuthorizedInventorySnapshot> {
+        self.check_shutdown().await?;
+        let did = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let mut page_cursor: Option<String> = None;
+        let mut pagination =
+            super::pagination::PaginationGuard::for_conversations("authorized inventory batch");
+        let mut inventory_items = Vec::new();
+        let mut session_id = String::new();
+        let mut event_cursor = String::new();
+        let mut expires_at = None;
+        let mut is_first_page = true;
+
+        loop {
+            let mut path = format!(
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
+                super::canonical_transport::encode_query(&device)
+            );
+            if let Some(cursor) = &page_cursor {
+                path.push_str("&pageCursor=");
+                path.push_str(&super::canonical_transport::encode_query(cursor));
+            }
+            let response = self
+                .api_client()
+                .submit_prepared_request(super::canonical_transport::PreparedRequest {
+                    operation: super::canonical_transport::CanonicalOperation::GetConversations,
+                    path,
+                    method: "GET".into(),
+                    body: None,
+                })
+                .await?;
+            if response.status != 200 {
+                return Err(OrchestratorError::ServerError {
+                    status: response.status,
+                    body: String::from_utf8_lossy(&response.body).into_owned(),
+                });
+            }
+            let page: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+
+            let session = page
+                .get("inventorySessionId")
+                .and_then(|v| v.as_str())
+                .filter(|s| (1..=512).contains(&s.len()))
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("missing or invalid inventorySessionId".into())
+                })?;
+            let fence = page
+                .get("snapshotEventCursor")
+                .and_then(|v| v.as_str())
+                .filter(|s| (1..=512).contains(&s.len()))
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("missing or invalid snapshotEventCursor".into())
+                })?;
+
+            if is_first_page {
+                session_id = session.to_string();
+                event_cursor = fence.to_string();
+                expires_at = page
+                    .get("snapshotExpiresAt")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                is_first_page = false;
+            } else if session != session_id || fence != event_cursor {
+                return Err(OrchestratorError::InvalidInput(
+                    "inventory session changed during pagination".into(),
+                ));
+            }
+
+            let items = page["items"].as_array().ok_or_else(|| {
+                OrchestratorError::InvalidInput("Conversation inventory is missing items.".into())
+            })?;
+
+            let has_more = page
+                .get("hasMore")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("missing or non-boolean hasMore".into())
+                })?;
+
+            let next = match page.get("nextPageCursor") {
+                Some(serde_json::Value::String(s)) => {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.clone())
+                    }
+                }
+                Some(serde_json::Value::Null) | None => None,
+                Some(_) => {
+                    return Err(OrchestratorError::InvalidInput(
+                        "non-string nextPageCursor".into(),
+                    ));
+                }
+            };
+
+            if has_more != next.is_some() {
+                return Err(OrchestratorError::InvalidInput(
+                    "hasMore boolean does not match next-cursor presence".into(),
+                ));
+            }
+
+            pagination.observe_page(items.len(), next.as_deref())?;
+            inventory_items.extend(items.iter().cloned());
+
+            page_cursor = next;
+            if page_cursor.is_none() {
+                break;
+            }
+        }
+
+        let mut conversations = std::collections::HashMap::new();
+        for item in &inventory_items {
+            let state = item.get("state").unwrap_or(item);
+            if let Some(view) = super::admission::conversation_view_from_state_json(state) {
+                conversations.insert(view.conversation_id.clone(), view);
+            }
+        }
+
+        let execution_id = NEXT_BATCH_EXECUTION_ID.fetch_add(1, Ordering::Relaxed);
+
+        Ok(AuthorizedInventorySnapshot {
+            owner_instance_id: self.instance_id,
+            execution_id,
+            session_id,
+            event_cursor,
+            expires_at,
+            items: inventory_items,
+            conversations,
+            user_did: did,
+            device_id: device,
+        })
     }
 
     /// Initialize the orchestrator for a user.
@@ -458,6 +652,14 @@ where
             }
         }
 
+        // Restore exact pending-control blockers and completed own-Commit
+        // expectations before inbound streams or send APIs can run. No network
+        // or destructive recovery occurs at this boundary.
+        if let Err(error) = self.hydrate_prepared_control_journal(user_did).await {
+            *self.lifecycle_state.lock().await = OrchestratorLifecycleState::FailedInitialization;
+            return Err(error);
+        }
+
         *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Ready {
             user_did: user_did.to_string(),
         };
@@ -474,6 +676,9 @@ where
             OrchestratorLifecycleState::Suspended {
                 user_did: suspended_did,
             } if suspended_did == user_did => {
+                // Suspension clears volatile blockers and own-Commit proofs.
+                // Restore their durable journal authority before streams resume.
+                self.hydrate_prepared_control_journal(user_did).await?;
                 *lifecycle = OrchestratorLifecycleState::Ready {
                     user_did: user_did.to_string(),
                 };
@@ -521,6 +726,9 @@ where
         let mut lifecycle = self.lifecycle_state.lock().await;
         match &*lifecycle {
             OrchestratorLifecycleState::Uninitialized => {
+                // A fresh runtime attached to retained crypto needs the same
+                // offline control authority as a normal initialization.
+                self.hydrate_prepared_control_journal(user_did).await?;
                 *lifecycle = OrchestratorLifecycleState::Ready {
                     user_did: user_did.to_string(),
                 };
@@ -725,6 +933,137 @@ where
     /// Access the conversations cache.
     pub fn conversations(&self) -> &Mutex<HashMap<ConversationId, ConversationView>> {
         &self.conversations
+    }
+
+    /// Read the current account's display projection after native sync. The
+    /// platform store establishes which conversations exist; a matching native
+    /// view supplies the roster, roles and epoch it has already reconciled.
+    /// This read never changes membership or recovery state.
+    pub async fn conversation_display_snapshot(
+        &self,
+        user_did: &str,
+    ) -> Result<Vec<ConversationView>> {
+        let _lifecycle_owner = self.lifecycle_operation.lock().await;
+        if self.require_user_did().await? != user_did {
+            return Err(OrchestratorError::NotAuthenticated);
+        }
+        let candidates = self.storage.list_conversations(user_did).await?;
+        let mut rows = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            let transition = self.rejoin_lock(&candidate.conversation_id).await;
+            let _transition_owner = transition.lock().await;
+            // Reset adoption or local deletion may have completed while this
+            // read waited for ownership. get_conversation also returns hidden
+            // retained rows on some hosts, so re-read the visible inventory.
+            let Some(row) = self
+                .storage
+                .list_conversations(user_did)
+                .await?
+                .into_iter()
+                .find(|row| row.conversation_id == candidate.conversation_id)
+            else {
+                continue;
+            };
+            let durable_state = self
+                .storage
+                .get_conversation_state(&row.conversation_id)
+                .await?;
+            let runtime_state = self
+                .conversation_states
+                .lock()
+                .await
+                .get(&row.conversation_id)
+                .cloned();
+            let states = [durable_state.as_ref(), runtime_state.as_ref()];
+            let permanent_or_reset = states.iter().flatten().any(|state| {
+                matches!(
+                    state,
+                    ConversationState::Closed | ConversationState::ResetPending { .. }
+                )
+            });
+            let removed = states
+                .iter()
+                .flatten()
+                .any(|state| matches!(state, ConversationState::DeviceRemoved));
+            if permanent_or_reset || removed {
+                let mut display = row.clone();
+                // A retained old invitation is not permission to leave the
+                // terminal UI. None here suppresses presentation only; the
+                // native authenticated policy and saved history are retained.
+                display.canonical_state = None;
+                if removed && !permanent_or_reset {
+                    let mut policy = self.restore_conversation_policy(user_did, row)?;
+                    let runtime = self
+                        .conversations
+                        .lock()
+                        .await
+                        .get(&policy.conversation_id)
+                        .cloned();
+                    if let Some(runtime) = runtime.filter(|view| view.group_id == policy.group_id) {
+                        policy = self.restore_conversation_policy(
+                            user_did,
+                            super::admission::merge_conversation_view(Some(&policy), runtime)?,
+                        )?;
+                    }
+                    if policy.group_id == display.group_id
+                        && self
+                            .is_pending_invitation_after_departure(user_did, &policy)
+                            .await?
+                    {
+                        // Display authenticated renewed consent without
+                        // changing DeviceRemoved or admitting an MLS leaf.
+                        display.epoch = display.epoch.max(policy.epoch);
+                        display.members = policy.members;
+                        display.canonical_state = policy.canonical_state;
+                    }
+                }
+                rows.push(display);
+                continue;
+            }
+            // Restore the authenticated policy even when the host projection
+            // predates the canonical policy field. Native persistence owns its
+            // monotonicity; a stale runtime row cannot undo later acceptance.
+            let row = self.restore_conversation_policy(user_did, row)?;
+            let runtime = self
+                .conversations
+                .lock()
+                .await
+                .get(&row.conversation_id)
+                .cloned();
+            let Some(runtime) = runtime.filter(|view| {
+                view.conversation_id == row.conversation_id
+                    && view.group_id == row.group_id
+                    && view.epoch >= row.epoch
+            }) else {
+                rows.push(row);
+                continue;
+            };
+            let mut runtime = self.restore_conversation_policy(
+                user_did,
+                super::admission::merge_conversation_view(Some(&row), runtime)?,
+            )?;
+            // A canonical inventory can omit encrypted metadata already known
+            // to this device. Retain only same-generation known fields.
+            if let Some(stored) = &row.metadata {
+                let metadata = runtime.metadata.get_or_insert(ConversationMetadata {
+                    name: None,
+                    description: None,
+                    avatar_url: None,
+                });
+                if metadata.name.is_none() {
+                    metadata.name = stored.name.clone();
+                }
+                if metadata.description.is_none() {
+                    metadata.description = stored.description.clone();
+                }
+                if metadata.avatar_url.is_none() {
+                    metadata.avatar_url = stored.avatar_url.clone();
+                }
+            }
+            rows.push(runtime);
+        }
+        rows.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
+        Ok(rows)
     }
 
     /// Access the group states cache.
@@ -1004,3 +1343,120 @@ mod epoch_cleanup_target_tests {
         assert_eq!(targets.cutoff_epoch, 2);
     }
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod conversation_display_race_tests {
+    use super::*;
+    use crate::recovery_e2e_harness::TestWorld;
+    use std::future::{poll_fn, Future};
+    use std::task::Poll;
+
+    const CID: &str = "11111111-1111-4111-8111-111111111111";
+    const OLD: &str = "000102030405060708090a0b0c0d0e0f";
+    const NEW: &str = "101112131415161718191a1b1c1d1e1f";
+
+    async fn world() -> TestWorld {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        let alice = world.client("Alice");
+        alice.orchestrator.initialize(&alice.did).await.unwrap();
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, CID, OLD)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_conversation_state(CID, ConversationState::Active)
+            .await
+            .unwrap();
+        let row = alice
+            .storage
+            .get_conversation(&alice.did, CID)
+            .await
+            .unwrap()
+            .unwrap();
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(CID.into(), row);
+        world
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_completed_while_waiting_cannot_return_the_retired_group() {
+        let world = world().await;
+        let alice = world.client("Alice");
+        let transition = alice.orchestrator.rejoin_lock(CID).await;
+        let guard = transition.lock().await;
+        let reads = alice.storage.startup_probe_counts().list_conversations;
+        let mut projection = Box::pin(alice.orchestrator.conversation_display_snapshot(&alice.did));
+        poll_fn(|context| {
+            assert!(projection.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            alice.storage.startup_probe_counts().list_conversations,
+            reads + 1
+        );
+        alice
+            .storage
+            .mark_reset_pending(CID, NEW, 1, 1)
+            .await
+            .unwrap();
+        assert!(alice
+            .storage
+            .complete_reset_pending(CID, 1, NEW, 0)
+            .await
+            .unwrap());
+        let successor = alice
+            .storage
+            .get_conversation(&alice.did, CID)
+            .await
+            .unwrap()
+            .unwrap();
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(CID.into(), successor);
+        drop(guard);
+        let rows = projection.await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group_id, NEW);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_deletion_while_waiting_cannot_resurrect_a_hidden_retained_row() {
+        let world = world().await;
+        let alice = world.client("Alice");
+        let transition = alice.orchestrator.rejoin_lock(CID).await;
+        let guard = transition.lock().await;
+        let reads = alice.storage.startup_probe_counts().list_conversations;
+        let mut projection = Box::pin(alice.orchestrator.conversation_display_snapshot(&alice.did));
+        poll_fn(|context| {
+            assert!(projection.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            alice.storage.startup_probe_counts().list_conversations,
+            reads + 1
+        );
+        alice
+            .storage
+            .delete_conversations(&alice.did, &[CID])
+            .await
+            .unwrap();
+        drop(guard);
+        assert!(projection.await.unwrap().is_empty());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "control_journal_resume_tests.rs"]
+mod control_journal_resume_tests;

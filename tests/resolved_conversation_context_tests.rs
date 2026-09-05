@@ -1442,6 +1442,7 @@ async fn unbound_legacy_delete_preserves_bob_with_same_conversation_id() {
             created_at: None,
             updated_at: None,
             sequencer_did: None,
+            canonical_state: None,
         },
     );
     bob_orchestrator.group_states().lock().await.insert(
@@ -2127,6 +2128,7 @@ async fn commit_self_remove_proposals_uses_active_group_for_rotated_stable_conve
             timestamp: Utc::now(),
             server_message_id: Some("rotated-self-remove-proposal".to_string()),
             server_epoch: None,
+            server_sequence: None,
         })
         .await
         .expect("alice processes self-remove proposal");
@@ -2217,6 +2219,7 @@ async fn pending_proposal_commit_merges_only_after_server_acceptance() {
             timestamp: Utc::now(),
             server_message_id: Some("pending-proposal-acceptance-fence".to_string()),
             server_epoch: None,
+            server_sequence: None,
         })
         .await
         .expect("Alice authorizes and queues the proposal");
@@ -2327,6 +2330,7 @@ async fn empty_application_message_is_not_treated_as_an_epoch_commit() {
             timestamp: Utc::now(),
             server_message_id: Some("empty-application-discriminator".to_string()),
             server_epoch: Some(epoch_before),
+            server_sequence: None,
         })
         .await
         .expect("empty application message must decrypt without commit processing");
@@ -2401,6 +2405,7 @@ async fn sender_binding_rejection_discards_staged_proposal_before_commit() {
             timestamp: Utc::now(),
             server_message_id: Some("proposal-spoofed-envelope".to_string()),
             server_epoch: None,
+            server_sequence: None,
         })
         .await
         .expect_err("envelope/credential mismatch must reject the proposal");
@@ -2749,6 +2754,7 @@ async fn unknown_conversation_fails_closed_before_consuming_own_commit_state() {
             timestamp: Utc::now(),
             server_message_id: None,
             server_epoch: None,
+            server_sequence: None,
         })
         .await
         .expect_err("unknown conversation must fail closed");

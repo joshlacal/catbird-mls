@@ -45,6 +45,7 @@ fn conversation_view_round_trips_sequencer_did() {
         created_at: None,
         updated_at: None,
         sequencer_did: Some("did:web:ds-b.example".to_string()),
+        canonical_state: None,
     };
 
     let value = serde_json::to_value(&view).expect("serializes");
@@ -70,6 +71,7 @@ fn conversation_view_omits_none_sequencer_did() {
         created_at: None,
         updated_at: None,
         sequencer_did: None,
+        canonical_state: None,
     };
     let value = serde_json::to_value(&view).expect("serializes");
     assert!(value.get("sequencerDid").is_none());
@@ -228,6 +230,7 @@ fn typed_convo_view_sequencer_did_flows_through() {
         created_at: None,
         updated_at: None,
         sequencer_did: typed.sequencer_did.as_ref().map(|d| d.as_str().to_string()),
+        canonical_state: None,
     };
     assert_eq!(view.sequencer_did.as_deref(), Some("did:web:ds-b.example"));
 }

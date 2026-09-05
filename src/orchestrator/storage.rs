@@ -29,6 +29,7 @@ pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
     "mark_reset_pending",
     "adopt_reset_pending_target",
     "complete_reset_pending",
+    "complete_account_exit",
     "clear_reset_pending_for_delete",
     "set_conversation_sequencer",
     "mark_quarantined",
@@ -130,6 +131,16 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
         conversation_id: &str,
         state: ConversationState,
     ) -> Result<()>;
+
+    /// Only a freshly verified exact Welcome may retire a local device removal.
+    /// Platforms persist this separately from generic Active projection.
+    async fn clear_device_removal_after_verified_welcome(&self, conversation_id: &str) -> Result<()> {
+        if matches!(self.get_conversation_state(conversation_id).await?, Some(ConversationState::Closed)) {
+            return Err(super::error::OrchestratorError::InvalidInput("This conversation is closed.".into()));
+        }
+        self.set_conversation_state(conversation_id, ConversationState::Active).await
+    }
+
 
     /// Read the persisted conversation state, if any.
     ///
@@ -279,6 +290,35 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
     ) -> Result<bool> {
         Err(super::error::OrchestratorError::Storage(
             "complete_reset_pending is required for reset recovery".to_string(),
+        ))
+    }
+
+    /// Publish an accepted account exit without deleting any history or keys.
+    /// A reset-capable backend MUST atomically match the exact pending target
+    /// and generation, preserve its high-water fence and old group aliases,
+    /// project the accepted terminal group/epoch/state, and clear only live
+    /// reset/rejoin work. An exact completed terminal tuple is idempotent.
+    /// Some(generation) with no live reset permits only that exact terminal
+    /// tuple and retained generation. A fresh exit after reset completion uses
+    /// None; None rejects live reset work but preserves historical high-water.
+    /// This operation is called only with a newly validated or retained exact
+    /// accepted exit proof. Closed is permanent and permits only exact retries.
+    /// DeviceRemoved is local access state, so a NEW accepted exit may advance
+    /// it to Closed/DeviceRemoved at the same group with nondecreasing epoch,
+    /// or at an exactly matched reset target. It is never departure authority
+    /// by itself; the caller's durable signed accepted request supplies that.
+    async fn complete_account_exit(
+        &self,
+        _conversation_id: &str,
+        _expected_group_id_hex: &str,
+        _expected_reset_generation: Option<i32>,
+        _terminal_epoch: u64,
+        _terminal_state: ConversationState,
+    ) -> Result<bool> {
+        // Separate read/set awaits cannot implement this CAS: another host
+        // lifecycle writer could install a reset between them.
+        Err(super::error::OrchestratorError::Storage(
+            "atomic account exit projection is not supported".into(),
         ))
     }
 

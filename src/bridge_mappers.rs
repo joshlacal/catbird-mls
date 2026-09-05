@@ -97,6 +97,8 @@ pub(crate) fn ffi_conversation_state_to_internal(
         "active" => Ok(ConversationState::Active),
         "fork_detected" => Ok(ConversationState::ForkDetected),
         "needs_rejoin" => Ok(ConversationState::NeedsRejoin),
+        "device_removed" => Ok(ConversationState::DeviceRemoved),
+        "closed" => Ok(ConversationState::Closed),
         "failed" => Ok(ConversationState::Failed),
         "reset_pending" => Ok(ConversationState::ResetPending {
             new_group_id: ffi.new_group_id.ok_or_else(|| {

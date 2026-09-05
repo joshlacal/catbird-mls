@@ -23,7 +23,7 @@ use crate::message_limits::{
 };
 use crate::mls_context::MLSContext as MLSContextInner;
 use crate::orchestrator::mls_provider::OwnEchoProof;
-use crate::orchestrator::mls_provider::{MlsCryptoContext, MlsDecryptOutcome};
+use crate::orchestrator::mls_provider::{IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome};
 use crate::types::*;
 
 use crate::keychain::KeychainAccess;
@@ -418,6 +418,95 @@ struct PendingIncomingCommit {
     /// distinguishes a durability-barrier retry from a different commit that
     /// happened to reach the same epoch.
     merge_started: bool,
+    /// Verified from this exact staged Commit, retained across barrier retries.
+    self_removed: bool,
+}
+
+/// Persisted before applying a verified self-removal. An interrupted merge is
+/// proven only by its exact successor public context; inactivity by itself is
+/// never evidence that this wire message was accepted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct IncomingRemovalReceipt {
+    version: u8,
+    group_id: Vec<u8>,
+    wire_fingerprint: [u8; 32],
+    source_epoch: u64,
+    target_epoch: u64,
+    target_credential_identity: Vec<u8>,
+    expected_context_hash: [u8; 32],
+    confirmed_context_hash: Option<[u8; 32]>,
+}
+
+fn incoming_removal_receipt_key(group_id: &[u8]) -> String {
+    format!("incoming-removal-v1:{}", hex::encode(group_id))
+}
+
+impl IncomingRemovalReceipt {
+    fn proves_removal(
+        &self,
+        group_id: &[u8],
+        wire_fingerprint: [u8; 32],
+        epoch: u64,
+        is_active: bool,
+        context_hash: [u8; 32],
+    ) -> bool {
+        if self.version != 1
+            || self.group_id != group_id
+            || self.wire_fingerprint != wire_fingerprint
+            || self.source_epoch.checked_add(1) != Some(self.target_epoch)
+            || self.target_credential_identity.is_empty()
+            || is_active
+        {
+            return false;
+        }
+        match self.confirmed_context_hash {
+            Some(confirmed) => {
+                confirmed == context_hash
+                    && (epoch == self.source_epoch || epoch == self.target_epoch)
+            }
+            // A process may die after OpenMLS's inactive public state writes
+            // but before confirmation. Only its authenticated successor hash
+            // closes this gap; an inactive source snapshot is insufficient.
+            None => epoch == self.target_epoch && context_hash == self.expected_context_hash,
+        }
+    }
+}
+
+fn incoming_removal_snapshot(
+    inner: &MLSContextInner,
+    group_id: &[u8],
+) -> Result<(u64, bool, [u8; 32]), MLSError> {
+    inner.with_group_ref(&GroupId::from_slice(group_id), |group, _| {
+        let bytes = group
+            .public_group()
+            .group_context()
+            .tls_serialize_detached()
+            .map_err(|_| MLSError::SerializationError)?;
+        Ok((group.epoch().as_u64(), group.is_active(), Sha256::digest(bytes).into()))
+    })
+}
+
+fn confirm_incoming_removal_receipt(
+    inner: &MLSContextInner,
+    group_id: &[u8],
+    target_epoch: u64,
+    wire_fingerprint: [u8; 32],
+) -> Result<(), MLSError> {
+    let key = incoming_removal_receipt_key(group_id);
+    let mut receipt = inner.manifest_storage.read_manifest::<IncomingRemovalReceipt>(&key)?
+        .ok_or(MLSError::MergeFailed)?;
+    let (epoch, active, context_hash) = incoming_removal_snapshot(inner, group_id)?;
+    if receipt.group_id != group_id
+        || receipt.wire_fingerprint != wire_fingerprint
+        || receipt.target_epoch != target_epoch
+        || active
+        || (epoch != receipt.source_epoch && epoch != target_epoch)
+        || (epoch == target_epoch && context_hash != receipt.expected_context_hash)
+    {
+        return Err(MLSError::MergeFailed);
+    }
+    receipt.confirmed_context_hash = Some(context_hash);
+    inner.manifest_storage.write_manifest(&key, &receipt)
 }
 
 type PendingIncomingCommitMap = HashMap<(Vec<u8>, u64), PendingIncomingCommit>;
@@ -462,6 +551,7 @@ fn stage_pending_incoming_commit(
     match pending.entry(key) {
         Entry::Vacant(entry) => {
             entry.insert(PendingIncomingCommit {
+                self_removed: staged.self_removed(),
                 staged: Some(staged),
                 wire_fingerprint,
                 merge_started: false,
@@ -1743,6 +1833,21 @@ impl MLSContext {
         remove_identities: Vec<Vec<u8>>,
         add_key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError> {
+        self.swap_members_with_aad(group_id, remove_identities, add_key_packages, None)
+    }
+}
+
+// Rust orchestrator primitive; the existing UniFFI surface remains unchanged.
+impl MLSContext {
+    /// Stage one atomic Remove+Add Commit, preserving authenticated transition
+    /// bytes and exposing its successor coordinate before the server accepts it.
+    pub fn swap_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        remove_identities: Vec<Vec<u8>>,
+        add_key_packages: Vec<KeyPackageData>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<AddMembersResult, MLSError> {
         self.check_suspended()?;
         validate_outbound_key_package_data_batch(&add_key_packages)?;
         crate::info_log!(
@@ -1809,79 +1914,107 @@ impl MLSContext {
         }
 
         let gid = GroupId::from_slice(&group_id);
-        let (commit_data, welcome_data) = inner.with_group(&gid, |group, provider, signer| {
-            let mut indices = Vec::new();
-            for identity in &remove_identities {
-                for index in MLSContextInner::find_member_indices(group, identity) {
-                    if !indices.contains(&index) {
-                        indices.push(index);
+        let (commit_data, welcome_data, next_tag, next_gch) =
+            inner.with_group(&gid, |group, provider, signer| {
+                let mut indices = Vec::new();
+                for identity in &remove_identities {
+                    for index in MLSContextInner::find_member_indices(group, identity) {
+                        if !indices.contains(&index) {
+                            indices.push(index);
+                        }
                     }
                 }
-            }
-            if !remove_identities.is_empty() && indices.is_empty() {
-                return Err(MLSError::invalid_input("No members found to remove"));
-            }
-
-            let planned_ref = crate::metadata::planned_metadata_reference_json(
-                crate::metadata::current_metadata_reference(group).as_ref(),
-                false, /* post-Phase-A: legacy 0xff00 path retired */
-                false,
-            )
-            .map_err(|e| MLSError::Internal(format!("plan metadata ref: {:?}", e)))?;
-
-            let has_app_data_dict = group.extensions().app_data_dictionary().is_some();
-            let cb = group
-                .commit_builder()
-                .propose_removals(indices)
-                .propose_adds(kps.iter().cloned());
-            let mut cs =
-                cb.load_psks(provider.storage())
-                    .map_err(|e| MLSError::AddMembersFailed {
-                        message: format!("swap load_psks: {:?}", e),
-                    })?;
-            if has_app_data_dict {
-                if let Some(ref_json) = planned_ref {
-                    let mut u = cs.app_data_dictionary_updater();
-                    u.set(ComponentData::from_parts(
-                        crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
-                        ref_json.into(),
-                    ));
-                    cs.with_app_data_dictionary_updates(u.changes());
+                if !remove_identities.is_empty() && indices.is_empty() {
+                    return Err(MLSError::invalid_input("No members found to remove"));
                 }
-            }
-            let bundle = cs
-                .build(provider.rand(), provider.crypto(), signer, |_| true)
-                .map_err(|e| MLSError::AddMembersFailed {
-                    message: format!("swap build: {:?}", e),
-                })?
-                .stage_commit(provider)
-                .map_err(|e| MLSError::AddMembersFailed {
-                    message: format!("swap stage: {:?}", e),
+
+                let planned_ref = crate::metadata::planned_metadata_reference_json(
+                    crate::metadata::current_metadata_reference(group).as_ref(),
+                    false, /* post-Phase-A: legacy 0xff00 path retired */
+                    false,
+                )
+                .map_err(|e| MLSError::Internal(format!("plan metadata ref: {:?}", e)))?;
+
+                let has_app_data_dict = group.extensions().app_data_dictionary().is_some();
+                if let Some(aad_bytes) = &aad {
+                    group.set_aad(aad_bytes.clone());
+                }
+                let bundle_result = (|| -> Result<_, MLSError> {
+                    let cb = group
+                        .commit_builder()
+                        .propose_removals(indices)
+                        .propose_adds(kps.iter().cloned());
+                    let mut cs = cb.load_psks(provider.storage()).map_err(|e| {
+                        MLSError::AddMembersFailed {
+                            message: format!("swap load_psks: {:?}", e),
+                        }
+                    })?;
+                    // The signed recovery manifest authorizes only Remove+Add. The
+                    // separate v2 metadata snapshot does not authorize AppDataUpdate.
+                    if aad.is_none() && has_app_data_dict {
+                        if let Some(ref_json) = planned_ref {
+                            let mut u = cs.app_data_dictionary_updater();
+                            u.set(ComponentData::from_parts(
+                                crate::metadata::METADATA_REFERENCE_COMPONENT_ID,
+                                ref_json.into(),
+                            ));
+                            cs.with_app_data_dictionary_updates(u.changes());
+                        }
+                    }
+                    cs.build(provider.rand(), provider.crypto(), signer, |_| true)
+                        .map_err(|e| MLSError::AddMembersFailed {
+                            message: format!("swap build: {:?}", e),
+                        })?
+                        .stage_commit(provider)
+                        .map_err(|e| MLSError::AddMembersFailed {
+                            message: format!("swap stage: {:?}", e),
+                        })
+                })();
+                if aad.is_some() {
+                    group.set_aad(Vec::new());
+                }
+                let bundle = bundle_result?;
+                let (commit, welcome, _) = bundle.into_contents();
+                let welcome = welcome.ok_or_else(|| MLSError::AddMembersFailed {
+                    message: "swap: no Welcome".into(),
                 })?;
-            let (commit, welcome, _) = bundle.into_contents();
-            let welcome = welcome.ok_or_else(|| MLSError::AddMembersFailed {
-                message: "swap: no Welcome".into(),
+                let cb = commit
+                    .tls_serialize_detached()
+                    .map_err(|_| MLSError::SerializationError)?;
+                let next_tag = MlsMessageIn::tls_deserialize_exact_bytes(&cb)
+                    .ok()
+                    .and_then(|message| match message.extract() {
+                        MlsMessageBodyIn::PublicMessage(message) => {
+                            message.confirmation_tag().cloned()
+                        }
+                        _ => None,
+                    })
+                    .and_then(|tag| tag.tls_serialize_detached().ok())
+                    .map(|bytes| bytes[bytes.len().saturating_sub(32)..].to_vec());
+                let next_gch = group
+                    .pending_commit()
+                    .and_then(|pending| pending.group_context().tls_serialize_detached().ok())
+                    .map(|bytes| Sha256::digest(bytes).to_vec());
+                let wm = MlsMessageOut::from_welcome(welcome, ProtocolVersion::default());
+                let wb = wm
+                    .tls_serialize_detached()
+                    .map_err(|_| MLSError::SerializationError)?;
+                Ok((cb, wb, next_tag, next_gch))
             })?;
-            let cb = commit
-                .tls_serialize_detached()
-                .map_err(|_| MLSError::SerializationError)?;
-            let wm = MlsMessageOut::from_welcome(welcome, ProtocolVersion::default());
-            let wb = wm
-                .tls_serialize_detached()
-                .map_err(|_| MLSError::SerializationError)?;
-            Ok((cb, wb))
-        })?;
         Ok(AddMembersResult {
             commit_data,
             welcome_data,
             metadata_blob_locator: None,
             metadata_blob_ciphertext: None,
             metadata_version: None,
-            next_confirmation_tag: None,
-            next_group_context_hash: None,
+            next_confirmation_tag: next_tag,
+            next_group_context_hash: next_gch,
         })
     }
+}
 
+#[uniffi::export]
+impl MLSContext {
     /// Propose adding a member (does not commit)
     ///
     /// Creates a proposal that can be committed later with commit_pending_proposals.
@@ -5103,7 +5236,10 @@ impl MLSContext {
     ///   - Validated the incoming commit against its recovery/sync policy
     ///   - Persisted any pre-merge state it needs (ordering, ack state, etc.)
     ///
-    /// Returns the new (post-merge) epoch.
+    /// Returns the accepted Commit's target epoch. A removed device is now
+    /// inactive and has no successor secrets even if its public epoch advances.
+    /// Rust orchestrators use `merge_incoming_commit_with_outcome` to distinguish
+    /// this terminal membership transition from an active epoch advance.
     ///
     /// This method durably flushes the OpenMLS merge before returning, but it
     /// deliberately does not prune retained epoch secrets. The caller must
@@ -5125,6 +5261,19 @@ impl MLSContext {
         group_id: Vec<u8>,
         target_epoch: u64,
     ) -> Result<u64, MLSError> {
+        self.merge_incoming_commit_with_outcome(group_id, target_epoch)
+            .map(IncomingCommitMergeOutcome::epoch)
+    }
+}
+
+// Exact-device terminal membership is an in-process orchestrator contract.
+// Keep this outcome separate from the existing UniFFI u64 merge API.
+impl MLSContext {
+    pub fn merge_incoming_commit_with_outcome(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<IncomingCommitMergeOutcome, MLSError> {
         self.check_suspended()?;
 
         let mut guard = self
@@ -5155,14 +5304,21 @@ impl MLSContext {
             ))
         })?;
         let merge_started = pending_entry.merge_started;
+        let self_removed = pending_entry.self_removed;
+        let wire_fingerprint = pending_entry.wire_fingerprint;
         let gid = GroupId::from_slice(&group_id);
         let expected_source = target_epoch.checked_sub(1).ok_or_else(|| {
             MLSError::invalid_input("incoming commit target epoch must be greater than zero")
         })?;
 
-        let epoch_before =
-            inner.with_group_ref(&gid, |group, _provider| Ok(group.epoch().as_u64()))?;
-        if epoch_before == target_epoch {
+        let (epoch_before, active_before) = inner.with_group_ref(&gid, |group, _provider| {
+            Ok((group.epoch().as_u64(), group.is_active()))
+        })?;
+        let terminal_retry = merge_started
+            && self_removed
+            && !active_before
+            && (epoch_before == expected_source || epoch_before == target_epoch);
+        if epoch_before == target_epoch || terminal_retry {
             if !merge_started {
                 // Reaching the same epoch is insufficient proof that this exact
                 // staged commit was applied; another fork commit may have won.
@@ -5170,6 +5326,20 @@ impl MLSContext {
                     local: epoch_before,
                     remote: expected_source,
                 });
+            }
+            let outcome = if self_removed && !active_before {
+                IncomingCommitMergeOutcome::Removed {
+                    epoch: target_epoch,
+                }
+            } else if !self_removed && active_before {
+                IncomingCommitMergeOutcome::Active {
+                    epoch: target_epoch,
+                }
+            } else {
+                return Err(MLSError::MergeFailed);
+            };
+            if self_removed {
+                confirm_incoming_removal_receipt(inner, &group_id, target_epoch, wire_fingerprint)?;
             }
             // A prior attempt can mutate OpenMLS and then fail the checkpoint.
             // Retry the barrier and consume the handle only after it succeeds.
@@ -5182,13 +5352,45 @@ impl MLSContext {
                     target_epoch
                 ))
             })?;
-            return Ok(target_epoch);
+            return Ok(outcome);
         }
         if epoch_before != expected_source {
             return Err(MLSError::EpochMismatch {
                 local: epoch_before,
                 remote: expected_source,
             });
+        }
+        if !active_before {
+            return Err(MLSError::MergeFailed);
+        }
+        if self_removed {
+            let staged = pending.get(&pending_key)
+                .and_then(|entry| entry.staged.as_ref())
+                .ok_or(MLSError::MergeFailed)?;
+            let expected_context = staged.group_context().tls_serialize_detached()
+                .map_err(|_| MLSError::SerializationError)?;
+            let target_credential_identity = inner.with_group_ref(&gid, |group, _| {
+                group.own_leaf_node()
+                    .map(|leaf| leaf.credential().serialized_content().to_vec())
+                    .ok_or(MLSError::MergeFailed)
+            })?;
+            let receipt = IncomingRemovalReceipt {
+                version: 1,
+                group_id: group_id.clone(),
+                wire_fingerprint,
+                source_epoch: expected_source,
+                target_epoch,
+                target_credential_identity,
+                expected_context_hash: Sha256::digest(expected_context).into(),
+                confirmed_context_hash: None,
+            };
+            inner.manifest_storage.write_manifest(
+                &incoming_removal_receipt_key(&group_id), &receipt,
+            )?;
+            // Install the exact verified intent durably before OpenMLS can
+            // erase the local leaf. A crash cannot leave an unexplained
+            // inactive group that would require guessing which Commit won.
+            inner.flush_database()?;
         }
         let staged = pending
             .get_mut(&pending_key)
@@ -5218,6 +5420,17 @@ impl MLSContext {
                 epoch_after
             );
 
+            if self_removed && !group.is_active() {
+                // OpenMLS versions may retain the source public epoch or
+                // install the successor public tree when removing us. Neither
+                // grants successor secrets or continuing device membership.
+                if epoch_after == expected_source || epoch_after == target_epoch {
+                    return Ok(IncomingCommitMergeOutcome::Removed { epoch: target_epoch });
+                }
+            }
+            if self_removed || !group.is_active() {
+                return Err(MLSError::MergeFailed);
+            }
             if epoch_after != target_epoch {
                 crate::error_log!(
                     "[MLS-FFI] ❌ CRITICAL: merge_incoming_commit target mismatch: expected {}, got {}",
@@ -5230,16 +5443,14 @@ impl MLSContext {
                 });
             }
 
-            Ok(epoch_after)
+            Ok(IncomingCommitMergeOutcome::Active { epoch: epoch_after })
         });
 
         let new_epoch = match merge_res {
             Ok(epoch) => epoch,
             Err(e) => {
-                let mut pending = self
-                    .pending_incoming_merges
-                    .lock()
-                    .map_err(|_| MLSError::ContextNotInitialized)?;
+                // `pending` is already locked for the exact staged handle.
+                // Re-locking this non-reentrant mutex deadlocks error recovery.
                 if let Some(entry) = pending.get(&pending_key) {
                     if !entry.merge_started {
                         pending.remove(&pending_key);
@@ -5258,6 +5469,10 @@ impl MLSContext {
                 ))
             })?
             .merge_started = true;
+
+        if self_removed {
+            confirm_incoming_removal_receipt(inner, &group_id, target_epoch, wire_fingerprint)?;
+        }
 
         // Persist merge result.
         inner.flush_database().map_err(|e| {
@@ -5279,6 +5494,54 @@ impl MLSContext {
         Ok(new_epoch)
     }
 
+    pub fn group_is_active(&self, group_id: Vec<u8>) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        inner.with_group_ref(&GroupId::from_slice(&group_id), |group, _| {
+            Ok(group.is_active())
+        })
+    }
+
+    pub fn verified_incoming_removal(
+        &self,
+        group_id: Vec<u8>,
+        message: Vec<u8>,
+    ) -> Result<Option<u64>, MLSError> {
+        self.check_suspended()?;
+        validate_inbound_mls_message_len(message.len(), "ciphertext")?;
+        let mut guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let key = incoming_removal_receipt_key(&group_id);
+        let Some(mut receipt) = inner.manifest_storage
+            .read_manifest::<IncomingRemovalReceipt>(&key)? else {
+                return Ok(None);
+            };
+        let fingerprint = incoming_commit_wire_fingerprint(&message);
+        // Check the exact wire binding before consulting any terminal group
+        // state. A different envelope gains no receipt merely by arriving
+        // after our removal.
+        if receipt.group_id != group_id || receipt.wire_fingerprint != fingerprint {
+            return Ok(None);
+        }
+        let (epoch, active, context_hash) = incoming_removal_snapshot(inner, &group_id)?;
+        if !receipt.proves_removal(&group_id, fingerprint, epoch, active, context_hash) {
+            return Ok(None);
+        }
+        if receipt.confirmed_context_hash.is_none() {
+            receipt.confirmed_context_hash = Some(context_hash);
+            inner.manifest_storage.write_manifest(&key, &receipt)?;
+        }
+        inner.flush_database()?;
+        Ok(Some(receipt.target_epoch))
+    }
+}
+
+#[uniffi::export]
+impl MLSContext {
     /// Task #33: discard an incoming `StagedCommit` that was previously staged,
     /// without advancing the local epoch.
     ///
@@ -7635,6 +7898,34 @@ impl MlsCryptoContext for MLSContext {
         MLSContext::flush_storage(self)
     }
 
+    fn put_prepared_control(&self, record: &crate::orchestrator::control_journal::PreparedControlRecord) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::control_journal::native::put(&inner.manifest_storage, record)
+    }
+
+    fn get_prepared_control(&self, group: &str) -> Result<Option<crate::orchestrator::control_journal::PreparedControlRecord>, MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::control_journal::native::get(&inner.manifest_storage, group)
+    }
+
+    fn list_prepared_controls(&self) -> Result<Vec<crate::orchestrator::control_journal::PreparedControlRecord>, MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::control_journal::native::list(&inner.manifest_storage)
+    }
+
+    fn remove_prepared_control(&self, group: &str, transition: &str) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::control_journal::native::remove_rejected(&inner.manifest_storage, group, transition)
+    }
+
     fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
         MLSContext::storage_lifecycle_status(self)
     }
@@ -7708,6 +7999,16 @@ impl MlsCryptoContext for MLSContext {
         add_key_packages: Vec<KeyPackageData>,
     ) -> Result<AddMembersResult, MLSError> {
         self.swap_members(group_id, remove_identities, add_key_packages)
+    }
+
+    fn swap_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        remove_identities: Vec<Vec<u8>>,
+        add_key_packages: Vec<KeyPackageData>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<AddMembersResult, MLSError> {
+        MLSContext::swap_members_with_aad(self, group_id, remove_identities, add_key_packages, aad)
     }
 
     fn group_member_identities(&self, group_id: Vec<u8>) -> Result<Vec<Vec<u8>>, MLSError> {
@@ -7799,6 +8100,26 @@ impl MlsCryptoContext for MLSContext {
         self.merge_incoming_commit(group_id, target_epoch)
     }
 
+    fn merge_incoming_commit_with_outcome(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<IncomingCommitMergeOutcome, MLSError> {
+        MLSContext::merge_incoming_commit_with_outcome(self, group_id, target_epoch)
+    }
+
+    fn group_is_active(&self, group_id: Vec<u8>) -> Result<bool, MLSError> {
+        MLSContext::group_is_active(self, group_id)
+    }
+
+    fn verified_incoming_removal(
+        &self,
+        group_id: Vec<u8>,
+        message: Vec<u8>,
+    ) -> Result<Option<u64>, MLSError> {
+        MLSContext::verified_incoming_removal(self, group_id, message)
+    }
+
     fn discard_incoming_commit(
         &self,
         group_id: Vec<u8>,
@@ -7882,6 +8203,75 @@ impl MlsCryptoContext for MLSContext {
         config: Option<GroupConfig>,
     ) -> Result<WelcomeResult, MLSError> {
         self.process_welcome(welcome_data, identity, config)
+    }
+
+    fn process_welcome_delivery(&self, delivery: &crate::orchestrator::welcome_ack::WelcomeDelivery,
+        identity: Vec<u8>, config: Option<GroupConfig>) -> Result<WelcomeResult, MLSError> {
+        self.check_suspended()?;
+        let mut guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::welcome_ack::native::adopt(inner, delivery, &identity, config)
+    }
+
+    fn get_conversation_policy(&self, user_did: &str, conversation_id: &str)
+        -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::admission::native::get(&inner.manifest_storage, user_did, conversation_id)
+    }
+
+    fn get_conversation_departure(&self, user_did: &str, conversation_id: &str)
+        -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::admission::native::get_departure(&inner.manifest_storage, user_did, conversation_id)
+    }
+
+
+    fn put_conversation_departure(&self, user_did: &str,
+        coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::admission::native::put_departure(&inner.manifest_storage, user_did, coordinate)
+    }
+
+    fn put_conversation_policy(&self, user_did: &str,
+        state: &catbird_atproto::blue_catbird::chat::ConversationState) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::admission::native::put(&inner.manifest_storage, user_did, state)
+    }
+
+    fn list_account_exits(&self) -> Result<Vec<crate::orchestrator::account_exit::AccountExitRecord>, MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::account_exit::native::list(&inner.manifest_storage)
+    }
+
+    fn put_account_exit(&self, record: &crate::orchestrator::account_exit::AccountExitRecord) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::account_exit::native::put(&inner.manifest_storage, record)
+    }
+
+    fn list_welcome_acceptances(&self) -> Result<Vec<crate::orchestrator::welcome_ack::WelcomeAcceptance>, MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::welcome_ack::native::list(&inner.manifest_storage)
+    }
+
+    fn update_welcome_acceptance(&self, record: &crate::orchestrator::welcome_ack::WelcomeAcceptance) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::welcome_ack::native::update(&inner.manifest_storage, record)
     }
 
     fn cleanup_epoch_secrets(
@@ -8444,5 +8834,38 @@ mod epoch_projection_tests {
                 remote: 9
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod incoming_removal_receipt_tests {
+    use super::IncomingRemovalReceipt;
+
+    #[test]
+    fn unconfirmed_removal_requires_exact_inactive_successor() {
+        let receipt = IncomingRemovalReceipt {
+            version: 1,
+            group_id: vec![1, 2],
+            wire_fingerprint: [3; 32],
+            source_epoch: 4,
+            target_epoch: 5,
+            target_credential_identity: b"did:plc:bob#phone".to_vec(),
+            expected_context_hash: [6; 32],
+            confirmed_context_hash: None,
+        };
+        assert!(receipt.proves_removal(&[1, 2], [3; 32], 5, false, [6; 32]));
+        assert!(!receipt.proves_removal(&[1, 2], [3; 32], 5, true, [6; 32]));
+        assert!(!receipt.proves_removal(&[1, 2], [3; 32], 4, false, [6; 32]));
+        assert!(!receipt.proves_removal(&[1, 2], [3; 32], 5, false, [7; 32]));
+        assert!(!receipt.proves_removal(&[1, 2], [7; 32], 5, false, [6; 32]));
+        assert!(!receipt.proves_removal(&[1, 3], [3; 32], 5, false, [6; 32]));
+
+        // A source-epoch inactive state is safe only after this exact staged
+        // self-removal was confirmed in the original merge process.
+        let mut confirmed = receipt;
+        confirmed.confirmed_context_hash = Some([8; 32]);
+        assert!(confirmed.proves_removal(&[1, 2], [3; 32], 4, false, [8; 32]));
+        assert!(!confirmed.proves_removal(&[1, 2], [3; 32], 4, true, [8; 32]));
+        assert!(!confirmed.proves_removal(&[1, 2], [3; 32], 6, false, [8; 32]));
     }
 }
