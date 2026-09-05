@@ -208,6 +208,7 @@ async fn own_commit_echo_requires_durable_local_confirmation() {
             timestamp: chrono::Utc::now(),
             server_message_id: Some("accepted-response-lost".to_string()),
             server_epoch: Some(plan.target_epoch),
+            server_sequence: None,
         })
         .await
         .expect_err("an unconfirmed own commit must withhold success/cursor advancement");
@@ -1442,6 +1443,7 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
             timestamp: chrono::Utc::now(),
             server_message_id: Some("restarted-unconfirmed-appdata-commit".to_string()),
             server_epoch: Some(plan.target_epoch),
+            server_sequence: None,
         })
         .await
         .expect_err("unconfirmed OwnPendingCommit after restart must withhold cursor advance");
@@ -1508,6 +1510,7 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
             timestamp: chrono::Utc::now(),
             server_message_id: Some("tracked-unconfirmed-commit".to_string()),
             server_epoch: Some(plan2.target_epoch),
+            server_sequence: None,
         })
         .await
         .expect_err("tracked unconfirmed commit must withhold cursor advance");
@@ -1549,6 +1552,7 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
             timestamp: chrono::Utc::now(),
             server_message_id: Some("tracked-accepted-commit".to_string()),
             server_epoch: Some(plan2.target_epoch),
+            server_sequence: None,
         })
         .await
         .expect("durably confirmed commit echo must be skipped cleanly");
@@ -1640,6 +1644,7 @@ async fn test_stage_commit_mismatched_identity_withholds_cursor() {
             timestamp: chrono::Utc::now(),
             server_message_id: Some("mismatched-convo-commit".to_string()),
             server_epoch: Some(plan.target_epoch),
+            server_sequence: None,
         })
         .await
         .expect_err("mismatched identity expectation must withhold cursor");

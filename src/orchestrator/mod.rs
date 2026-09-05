@@ -1,14 +1,23 @@
+pub mod account_exit;
+mod account_removal;
+pub mod admission;
 pub mod api_client;
 pub mod canonical_transport;
 pub mod constants;
+pub mod control_journal;
 pub mod credential_binding;
 pub mod credentials;
 pub mod crypto_provider;
 pub mod devices;
+mod direct_adoption;
 pub mod error;
 pub mod event_observer;
 pub mod groups;
+mod incoming;
 pub mod key_packages;
+mod leaf_recovery;
+pub mod leave_fulfillment;
+pub mod lifecycle;
 pub mod messaging;
 pub mod mls_provider;
 pub mod orchestrator;
@@ -19,7 +28,9 @@ pub mod reset_flow;
 pub mod staged_commit;
 pub mod storage;
 pub mod sync;
+pub mod terminal_lifecycle;
 pub mod types;
+pub mod welcome_ack;
 pub mod welcome_recovery;
 
 #[cfg(test)]
@@ -57,6 +68,8 @@ pub use credentials::{CleanChatSigningAuthority, CredentialStore};
 pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
 pub use mls_provider::{MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof};
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use orchestrator::with_batch_inventory_scope;
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
 pub use storage::MLSStorageBackend;
 pub use types::*;

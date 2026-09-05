@@ -80,6 +80,15 @@ pub trait OrchestratorStorageCallback: Send + Sync {
         state: String,
     ) -> Result<(), OrchestratorBridgeError>;
 
+    fn complete_account_exit(
+        &self,
+        conversation_id: String,
+        expected_group_id_hex: String,
+        expected_reset_generation: Option<i32>,
+        terminal_epoch: u64,
+        terminal_state: String,
+    ) -> Result<bool, OrchestratorBridgeError>;
+
     fn get_conversation_state(
         &self,
         conversation_id: String,
@@ -395,6 +404,8 @@ pub struct FFIMemberView {
 
 #[derive(uniffi::Record, Clone)]
 pub struct FFIConversationView {
+    /// Full canonical conversationState JSON; None is unknown admission.
+    pub canonical_state_json: Option<String>,
     pub group_id: String,
     /// Stable conversation identifier (survives group resets).
     pub conversation_id: String,
@@ -573,6 +584,8 @@ pub struct FFIIncomingEnvelope {
     pub ciphertext: Vec<u8>,
     pub timestamp: String,
     pub server_message_id: Option<String>,
+    pub server_sequence: Option<u64>,
+    pub server_epoch: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -1171,8 +1184,15 @@ impl CredentialAdapter {
 
 // -- Conversion helpers --
 
-fn convo_view_to_ffi(cv: &ConversationView) -> FFIConversationView {
-    FFIConversationView {
+fn convo_view_to_ffi(cv: &ConversationView) -> crate::orchestrator::Result<FFIConversationView> {
+    crate::orchestrator::admission::validate_conversation_view(cv)?;
+    let canonical_state_json = cv.canonical_state.as_ref().map(|state| {
+        crate::orchestrator::canonical_transport::encode_conversation_state(state)
+            .map(|bytes| String::from_utf8(bytes).expect("JSON is UTF-8"))
+            .map_err(|error| crate::orchestrator::OrchestratorError::InvalidInput(error.to_string()))
+    }).transpose()?;
+    Ok(FFIConversationView {
+        canonical_state_json,
         group_id: cv.group_id.clone(),
         conversation_id: cv.conversation_id.clone(),
         epoch: cv.epoch,
@@ -1192,11 +1212,16 @@ fn convo_view_to_ffi(cv: &ConversationView) -> FFIConversationView {
         avatar_url: cv.metadata.as_ref().and_then(|m| m.avatar_url.clone()),
         created_at: cv.created_at.map(|t| t.to_rfc3339()),
         updated_at: cv.updated_at.map(|t| t.to_rfc3339()),
-    }
+    })
 }
 
-fn ffi_to_convo_view(ffi: &FFIConversationView) -> ConversationView {
-    ConversationView {
+fn ffi_to_convo_view(ffi: &FFIConversationView) -> crate::orchestrator::Result<ConversationView> {
+    let canonical_state = ffi.canonical_state_json.as_ref().map(|json|
+        crate::orchestrator::canonical_transport::decode_conversation_state(json.as_bytes())
+            .map_err(|error| crate::orchestrator::OrchestratorError::InvalidInput(error.to_string()))
+    ).transpose()?;
+    let view = ConversationView {
+        canonical_state,
         group_id: ffi.group_id.clone(),
         conversation_id: ffi.conversation_id.clone(),
         epoch: ffi.epoch,
@@ -1235,7 +1260,9 @@ fn ffi_to_convo_view(ffi: &FFIConversationView) -> ConversationView {
         // ADR-010 A6): UniFFI record shapes are deliberately unchanged in
         // rung 2.
         sequencer_did: None,
-    }
+    };
+    crate::orchestrator::admission::validate_conversation_view(&view)?;
+    Ok(view)
 }
 
 fn ffi_to_message(ffi: &FFIMessage) -> Message {
@@ -1271,21 +1298,30 @@ fn message_to_ffi(msg: &Message) -> FFIMessage {
     }
 }
 
-fn ffi_incoming_envelope_to_internal(
+pub(crate) fn ffi_incoming_envelope_to_internal(
     envelope: FFIIncomingEnvelope,
     server_epoch: Option<u64>,
-) -> IncomingEnvelope {
-    IncomingEnvelope {
+) -> crate::orchestrator::Result<IncomingEnvelope> {
+    if envelope.server_epoch.zip(server_epoch).is_some_and(|(field, argument)| field != argument) {
+        return Err(crate::orchestrator::OrchestratorError::InvalidInput("Conflicting incoming message epochs".into()));
+    }
+    if envelope.server_sequence.is_some() {
+        crate::chat_v2::ids::CanonicalTimestamp::parse(&envelope.timestamp)
+            .map_err(|_| crate::orchestrator::OrchestratorError::InvalidInput("Invalid canonical message timestamp".into()))?;
+    }
+    let timestamp = envelope.timestamp.parse::<chrono::DateTime<chrono::Utc>>()
+        .map_err(|_| crate::orchestrator::OrchestratorError::InvalidInput("Invalid incoming message timestamp".into()))?;
+    let result = IncomingEnvelope {
         conversation_id: envelope.conversation_id,
         sender_did: envelope.sender_did,
         ciphertext: envelope.ciphertext,
-        timestamp: envelope
-            .timestamp
-            .parse::<chrono::DateTime<chrono::Utc>>()
-            .unwrap_or_else(|_| chrono::Utc::now()),
+        timestamp,
         server_message_id: envelope.server_message_id,
-        server_epoch,
-    }
+        server_sequence: envelope.server_sequence,
+        server_epoch: envelope.server_epoch.or(server_epoch),
+    };
+    result.validate_server_metadata()?;
+    Ok(result)
 }
 
 fn engine_event_to_ffi(event: &EngineEvent) -> FFIEngineEvent {
@@ -1486,8 +1522,8 @@ impl MLSStorageBackend for StorageAdapter {
     ) -> crate::orchestrator::Result<Option<ConversationView>> {
         self.0
             .get_conversation(user_did.to_string(), conversation_id.to_string())
-            .map(|opt| opt.map(|ffi| ffi_to_convo_view(&ffi)))
-            .map_err(bridge_err)
+            .map_err(bridge_err)?
+            .as_ref().map(ffi_to_convo_view).transpose()
     }
 
     async fn list_conversations(
@@ -1496,8 +1532,8 @@ impl MLSStorageBackend for StorageAdapter {
     ) -> crate::orchestrator::Result<Vec<ConversationView>> {
         self.0
             .list_conversations(user_did.to_string())
-            .map(|v| v.iter().map(ffi_to_convo_view).collect())
-            .map_err(bridge_err)
+            .map_err(bridge_err)?
+            .iter().map(ffi_to_convo_view).collect()
     }
 
     async fn delete_conversations(
@@ -1524,6 +1560,19 @@ impl MLSStorageBackend for StorageAdapter {
         self.0
             .set_conversation_state(conversation_id.to_string(), state.tag().to_string())
             .map_err(bridge_err)
+    }
+
+    async fn clear_device_removal_after_verified_welcome(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
+        self.0.set_conversation_state(conversation_id.to_string(), "active_after_welcome".to_string()).map_err(bridge_err)
+    }
+
+    async fn complete_account_exit(&self, conversation_id: &str, expected_group_id_hex: &str,
+        expected_reset_generation: Option<i32>, terminal_epoch: u64, terminal_state: ConversationState) -> crate::orchestrator::Result<bool> {
+        if !matches!(terminal_state, ConversationState::Closed | ConversationState::DeviceRemoved) {
+            return Err(crate::orchestrator::OrchestratorError::Storage("invalid account exit state".into()));
+        }
+        self.0.complete_account_exit(conversation_id.into(), expected_group_id_hex.into(),
+            expected_reset_generation, terminal_epoch, terminal_state.tag().into()).map_err(bridge_err)
     }
 
     async fn get_conversation_state(
@@ -1628,6 +1677,7 @@ impl MLSStorageBackend for StorageAdapter {
             "mark_reset_pending",
             "adopt_reset_pending_target",
             "complete_reset_pending",
+            "complete_account_exit",
             "clear_reset_pending_for_delete",
             "mark_quarantined",
             "clear_quarantine",
@@ -1941,13 +1991,11 @@ impl MLSAPIClient for APIAdapter {
         limit: u32,
         cursor: Option<&str>,
     ) -> crate::orchestrator::Result<ConversationListPage> {
-        self.0
-            .get_conversations(limit, cursor.map(|s| s.to_string()))
-            .map(|ffi| ConversationListPage {
-                conversations: ffi.conversations.iter().map(ffi_to_convo_view).collect(),
-                cursor: ffi.cursor,
-            })
-            .map_err(bridge_err)
+        let ffi = self.0.get_conversations(limit, cursor.map(str::to_string)).map_err(bridge_err)?;
+        Ok(ConversationListPage {
+            conversations: ffi.conversations.iter().map(ffi_to_convo_view).collect::<crate::orchestrator::Result<Vec<_>>>()?,
+            cursor: ffi.cursor,
+        })
     }
 
     async fn get_messages(
@@ -1968,15 +2016,13 @@ impl MLSAPIClient for APIAdapter {
                 from_epoch,
                 to_epoch,
             )
-            .map(|ffi| {
-                let envelopes = ffi
-                    .envelopes
-                    .into_iter()
-                    .map(|m| ffi_incoming_envelope_to_internal(m, None))
-                    .collect();
-                (envelopes, ffi.cursor)
-            })
             .map_err(bridge_err)
+            .and_then(|ffi| {
+                let envelopes = ffi.envelopes.into_iter()
+                    .map(|m| ffi_incoming_envelope_to_internal(m, None))
+                    .collect::<crate::orchestrator::Result<Vec<_>>>()?;
+                Ok((envelopes, ffi.cursor))
+            })
     }
 
     async fn get_key_packages(
@@ -2501,7 +2547,7 @@ impl OrchestratorBridge {
             members_ref,
             description.as_deref(),
         ))?;
-        Ok(convo_view_to_ffi(&convo))
+        Ok(convo_view_to_ffi(&convo)?)
     }
 
     /// Create a new MLS conversation through the Rust-owned engine and
@@ -2521,7 +2567,7 @@ impl OrchestratorBridge {
             })
             .map_err(OrchestratorBridgeError::from)?;
         Ok(FFICreateConversationResult {
-            conversation: convo_view_to_ffi(&result.conversation),
+            conversation: convo_view_to_ffi(&result.conversation)?,
             commit_data: result.commit_data,
             welcome_data: result.welcome_data,
         })
@@ -2533,7 +2579,7 @@ impl OrchestratorBridge {
         welcome_data: Vec<u8>,
     ) -> Result<FFIConversationView, OrchestratorBridgeError> {
         let convo = crate::async_runtime::block_on(self.inner.join_group(&welcome_data))?;
-        Ok(convo_view_to_ffi(&convo))
+        Ok(convo_view_to_ffi(&convo)?)
     }
 
     /// Add members to an existing group.
@@ -2571,7 +2617,7 @@ impl OrchestratorBridge {
             .add_members(&conversation_id, &member_dids)
             .map_err(OrchestratorBridgeError::from)?;
         Ok(FFIGroupMutationResult {
-            conversation: convo_view_to_ffi(&result.conversation),
+            conversation: convo_view_to_ffi(&result.conversation)?,
         })
     }
 
@@ -2607,7 +2653,7 @@ impl OrchestratorBridge {
             .remove_members(&conversation_id, &member_dids)
             .map_err(OrchestratorBridgeError::from)?;
         Ok(FFIGroupMutationResult {
-            conversation: convo_view_to_ffi(&result.conversation),
+            conversation: convo_view_to_ffi(&result.conversation)?,
         })
     }
 
@@ -2930,7 +2976,7 @@ impl OrchestratorBridge {
         &self,
         envelope: FFIIncomingEnvelope,
     ) -> Result<Option<FFIMessage>, OrchestratorBridgeError> {
-        let inner_envelope = ffi_incoming_envelope_to_internal(envelope, None);
+        let inner_envelope = ffi_incoming_envelope_to_internal(envelope, None)?;
         let result = crate::async_runtime::block_on(self.inner.process_incoming(&inner_envelope))?;
         Ok(result.map(|m| message_to_ffi(&m)))
     }
@@ -2943,7 +2989,7 @@ impl OrchestratorBridge {
     ) -> Result<FFIMessageProcessingResult, OrchestratorBridgeError> {
         let result = self
             .engine
-            .process_incoming_message(ffi_incoming_envelope_to_internal(envelope, server_epoch))
+            .process_incoming_message(ffi_incoming_envelope_to_internal(envelope, server_epoch)?)
             .map_err(OrchestratorBridgeError::from)?;
         Ok(FFIMessageProcessingResult {
             message: result.message.as_ref().map(message_to_ffi),
@@ -2980,15 +3026,16 @@ impl OrchestratorBridge {
         Ok(())
     }
 
-    /// Return the Rust-orchestrator storage projection for full-authority
-    /// clients that need to refresh platform UI caches after sync/recovery.
+    /// Return the current account's reconciled native display projection,
+    /// retaining durable rows when no matching runtime view is available.
     pub fn list_conversations(
         &self,
         user_did: String,
     ) -> Result<Vec<FFIConversationView>, OrchestratorBridgeError> {
-        let conversations =
-            crate::async_runtime::block_on(self.inner.storage().list_conversations(&user_did))?;
-        Ok(conversations.iter().map(convo_view_to_ffi).collect())
+        let conversations = crate::async_runtime::block_on(
+            self.inner.conversation_display_snapshot(&user_did),
+        )?;
+        Ok(conversations.iter().map(convo_view_to_ffi).collect::<crate::orchestrator::Result<Vec<_>>>()?)
     }
 
     pub fn startup_reconcile(&self) -> Result<FFIStartupReconcileReport, OrchestratorBridgeError> {
@@ -3729,6 +3776,7 @@ mod tests {
         reset_payload: Mutex<Option<(String, String, i32, i64)>>,
         reset_clear_requests: Mutex<Vec<(String, Option<i32>, Option<String>, Option<u64>)>>,
         reset_clear_applied: std::sync::atomic::AtomicBool,
+        account_exit_requests: Mutex<Vec<(String, String, Option<i32>, u64, String)>>,
         quarantine_payload: Mutex<Option<(String, String, i64)>>,
         fail_security_writes: std::sync::atomic::AtomicBool,
     }
@@ -3743,6 +3791,24 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    #[tokio::test]
+    async fn account_exit_adapter_preserves_exact_cas_tuple_and_result() {
+        let callback = Arc::new(RecordingStorageCallback::default());
+        let adapter = StorageAdapter(callback.clone());
+        let group = "ab".repeat(32);
+        assert!(!adapter.complete_account_exit("conversation", &group, Some(7), 42, ConversationState::Closed).await.unwrap());
+        callback.reset_clear_applied.store(true, Ordering::SeqCst);
+        assert!(adapter.complete_account_exit("conversation", &group, Some(7), 42, ConversationState::Closed).await.unwrap());
+        assert_eq!(callback.account_exit_requests.lock().unwrap().as_slice(), &[
+            ("conversation".into(), group.clone(), Some(7), 42, "closed".into()),
+            ("conversation".into(), group.clone(), Some(7), 42, "closed".into()),
+        ]);
+        assert!(adapter.complete_account_exit("conversation", &group, None, 42, ConversationState::Active).await.is_err());
+        assert_eq!(callback.account_exit_requests.lock().unwrap().len(), 2);
+        callback.fail_security_writes.store(true, Ordering::SeqCst);
+        assert!(adapter.complete_account_exit("conversation", &group, Some(7), 42, ConversationState::Closed).await.is_err());
     }
 
     impl OrchestratorStorageCallback for RecordingStorageCallback {
@@ -3789,6 +3855,12 @@ mod tests {
             _state: String,
         ) -> Result<(), OrchestratorBridgeError> {
             Ok(())
+        }
+        fn complete_account_exit(&self, conversation_id: String, expected_group_id_hex: String,
+            expected_reset_generation: Option<i32>, terminal_epoch: u64, terminal_state: String) -> Result<bool, OrchestratorBridgeError> {
+            self.reject_injected_security_failure()?;
+            self.account_exit_requests.lock().unwrap().push((conversation_id, expected_group_id_hex, expected_reset_generation, terminal_epoch, terminal_state));
+            Ok(self.reset_clear_applied.load(Ordering::SeqCst))
         }
         fn get_conversation_state(
             &self,
@@ -4190,6 +4262,16 @@ mod tests {
             body: Option<Vec<u8>>,
             _query: Option<Vec<u8>>,
         ) -> Result<FFIGatewayResponse, OrchestratorBridgeError> {
+            if nsid == "blue.catbird.chat.getConversations" {
+                return Ok(FFIGatewayResponse { status: 200, content_type: Some("application/json".into()), body: serde_json::to_vec(&serde_json::json!({
+                    "items":[],"hasMore":false,"inventorySessionId":"00000000-0000-4000-8000-000000000002",
+                    "snapshotEventCursor":"bridge-test-fence","snapshotExpiresAt":"2099-01-01T00:00:00.000Z"
+                })).unwrap() });
+            }
+            if nsid == "blue.catbird.chat.getPendingWelcomes" {
+                self.welcome_calls.fetch_add(1, Ordering::SeqCst);
+                return Ok(FFIGatewayResponse { status: 503, content_type: Some("application/json".into()), body: br#"{"error":"Unavailable"}"#.to_vec() });
+            }
             let resp_body = if nsid == "blue.catbird.chat.enrollDevice" {
                 let inner = body
                     .as_deref()
@@ -5022,7 +5104,7 @@ mod tests {
             mls_context,
             Box::new(RecordingStorageCallback::default()),
             Box::new(WelcomeCountingApiCallback::new(
-                "did:plc:alice",
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
                 welcome_calls.clone(),
             )),
             Box::new(RecordingCredentialCallback::default()),
@@ -5041,11 +5123,12 @@ mod tests {
         .expect("bridge construction");
 
         bridge
-            .initialize("did:plc:alice".to_string())
+            .initialize("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string())
             .expect("bridge initialize");
+        bridge.ensure_device_registered().expect("registered test device");
         let result = bridge.join_or_rejoin("convo-bridge-probe".to_string());
 
-        assert!(result.is_err(), "stubbed GroupInfo should stop recovery");
+        assert!(result.is_err(), "stubbed canonical Welcome response should stop recovery");
         assert_eq!(
             welcome_calls.load(Ordering::SeqCst),
             1,
@@ -5120,6 +5203,7 @@ mod tests {
                     members: vec![],
                     metadata: None,
                     sequencer_did: None,
+                    canonical_state: None,
                     created_at: None,
                     updated_at: None,
                 },
@@ -5211,6 +5295,7 @@ mod tests {
                     members: vec![],
                     metadata: None,
                     sequencer_did: None,
+                    canonical_state: None,
                     created_at: None,
                     updated_at: None,
                 },
@@ -5224,6 +5309,7 @@ mod tests {
                     members: vec![],
                     metadata: None,
                     sequencer_did: None,
+                    canonical_state: None,
                     created_at: None,
                     updated_at: None,
                 },
@@ -5293,7 +5379,7 @@ mod tests {
             mls_context,
             Box::new(RecordingStorageCallback::default()),
             Box::new(WelcomeCountingApiCallback::new(
-                "did:plc:alice",
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
                 Arc::new(AtomicUsize::new(0)),
             )),
             Box::new(RecordingCredentialCallback::default()),
@@ -5312,11 +5398,12 @@ mod tests {
         .expect("bridge construction");
 
         bridge
-            .initialize("did:plc:alice".to_string())
+            .initialize("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string())
             .expect("bridge initialize");
+        bridge.ensure_device_registered().expect("registered test device");
         bridge.shutdown();
         bridge
-            .initialize("did:plc:alice".to_string())
+            .initialize("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string())
             .expect("bridge reinitialize");
         bridge
             .sync_with_server(false)
@@ -5440,6 +5527,7 @@ mod tests {
                     created_at: None,
                     updated_at: None,
                     sequencer_did: None,
+                    canonical_state: None,
                 },
             );
             bridge.inner.group_states().lock().await.insert(
@@ -5539,6 +5627,7 @@ mod tests {
                     created_at: None,
                     updated_at: None,
                     sequencer_did: None,
+                    canonical_state: None,
                 },
             );
             bridge.inner.group_states().lock().await.insert(
@@ -5608,7 +5697,9 @@ mod tests {
                 Some(ConversationState::ResetPending { .. }) => {
                     crate::orchestrator::ConversationRecoveryState::ResetPending
                 }
-                Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
+                Some(ConversationState::Closed)
+                | Some(ConversationState::DeviceRemoved)
+                | Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
                     crate::orchestrator::ConversationRecoveryState::UnrecoverableLocal
                 }
             };

@@ -109,14 +109,15 @@ fn find_member_index(group: &MlsGroup, identity: &[u8]) -> Option<LeafNodeIndex>
     None
 }
 
+#[derive(Clone)]
 struct TestKeychain {
-    store: Mutex<HashMap<String, Vec<u8>>>,
+    store: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl TestKeychain {
     fn new() -> Self {
         Self {
-            store: Mutex::new(HashMap::new()),
+            store: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -155,6 +156,17 @@ fn key_package_for(context: &MLSContext, identity: &[u8]) -> KeyPackageData {
     KeyPackageData {
         data: key_package.key_package_data,
     }
+}
+
+fn open_test_manifest(path: &std::path::Path) -> rusqlite::Connection {
+    use sha2::{Digest, Sha256};
+    let key = "test-key-1234567890123456";
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.pragma_update(None, "cipher_memory_security", "OFF").unwrap();
+    conn.pragma_update(None, "key", key).unwrap();
+    conn.pragma_update(None, "cipher_plaintext_header_size", 32).unwrap();
+    conn.pragma_update(None, "cipher_salt", format!("x'{}'", hex::encode(&Sha256::digest(key)[..16]))).unwrap();
+    conn
 }
 
 fn context_group_with_members(
@@ -279,6 +291,103 @@ fn swap_with_fragment_qualified_identity_removes_only_that_device() {
     assert!(identities.iter().any(|identity| identity == target_laptop));
     assert!(identities.iter().any(|identity| identity == replacement));
 }
+
+#[test]
+fn recovery_swap_authenticates_transition_and_preserves_sibling_until_atomic_merge() {
+    use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
+
+    let target_phone = b"did:plc:target#phone";
+    let target_laptop = b"did:plc:target#laptop";
+    let (context, group_id, _dir) = context_group_with_members(&[target_phone, target_laptop]);
+    let epoch_before = context.get_epoch(group_id.clone()).unwrap();
+    let before = context.debug_group_members(group_id.clone()).unwrap();
+    let old_index = before
+        .members
+        .iter()
+        .find(|member| member.credential_identity == target_phone)
+        .unwrap()
+        .leaf_index;
+    let aad = b"CATBIRD-CHAT-LEAF-RECOVERY-FULFILL\0device-replacement".to_vec();
+    let replacement = key_package_for(&context, target_phone);
+
+    let result = MlsCryptoContext::swap_members_with_aad(
+        context.as_ref(),
+        group_id.clone(),
+        vec![target_phone.to_vec()],
+        vec![replacement],
+        Some(aad.clone()),
+    )
+    .expect("native replacement must retain authenticated transition data");
+
+    assert_eq!(context.get_epoch(group_id.clone()).unwrap(), epoch_before);
+    assert_eq!(
+        member_identities(&context, &group_id).len(),
+        3,
+        "no membership changes before the server accepts"
+    );
+    let (commit_aad, proposals) = parse_public_commit_wire(&result.commit_data);
+    assert_eq!(commit_aad, aad);
+    assert_eq!(proposals.iter().filter(|proposal| matches!(proposal,
+        openmls::messages::proposals_in::ProposalIn::Remove(remove) if remove.removed().u32() == old_index
+    )).count(), 1);
+    assert_eq!(
+        proposals
+            .iter()
+            .filter(|proposal| matches!(
+                proposal,
+                openmls::messages::proposals_in::ProposalIn::Add(_)
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        proposals.len(),
+        2,
+        "the recovery manifest allows no additional proposal effects"
+    );
+    assert!(result.next_confirmation_tag.is_some());
+    assert!(result.next_group_context_hash.is_some());
+
+    context.merge_pending_commit(group_id.clone()).unwrap();
+    assert_eq!(
+        context.get_epoch(group_id.clone()).unwrap(),
+        epoch_before + 1
+    );
+    let after = context.debug_group_members(group_id.clone()).unwrap();
+    assert_eq!(
+        after.members.len(),
+        3,
+        "replace removes one leaf while adding exactly one"
+    );
+    assert!(after
+        .members
+        .iter()
+        .any(|member| member.credential_identity == target_laptop));
+    assert_eq!(
+        after
+            .members
+            .iter()
+            .filter(|member| member.credential_identity == target_phone)
+            .count(),
+        1
+    );
+    assert_eq!(
+        result.next_confirmation_tag.unwrap(),
+        context.get_confirmation_tag(group_id.clone()).unwrap()
+    );
+    assert_eq!(
+        result.next_group_context_hash.unwrap(),
+        context.get_group_context_hash(group_id.clone()).unwrap()
+    );
+    let next_update = context.self_update(group_id).unwrap();
+    assert!(
+        parse_public_commit_wire(&next_update.commit_data)
+            .0
+            .is_empty(),
+        "recovery AAD must not leak to later commits"
+    );
+}
+
 #[test]
 fn swap_with_empty_removals_performs_pure_add() {
     let member = b"did:plc:creator#phone";
@@ -300,6 +409,184 @@ fn swap_with_empty_removals_performs_pure_add() {
     assert!(identities.iter().any(|identity| identity == member));
     assert!(identities.iter().any(|identity| identity == new_member));
     assert_eq!(context.get_epoch(group_id).unwrap(), epoch_before + 1);
+}
+
+#[test]
+fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_membership() {
+    use catbird_mls::orchestrator::mls_provider::{IncomingCommitMergeOutcome, MlsCryptoContext};
+    use catbird_mls::ProcessedContent;
+    use std::time::Duration;
+
+    let (alice, _alice_dir) = new_context();
+    let phone_keychain = TestKeychain::new();
+    let phone_dir = tempfile::tempdir().unwrap();
+    let phone = MLSContext::new(
+        phone_dir.path().join("mls.db").to_string_lossy().to_string(),
+        "test-key-1234567890123456".to_string(),
+        Box::new(phone_keychain.clone()),
+    ).unwrap();
+    epoch_secret_test_support::install(&phone);
+    let (laptop, _laptop_dir) = new_context();
+    let phone_identity = b"did:plc:bob#phone";
+    let laptop_identity = b"did:plc:bob#laptop";
+    let group = alice
+        .create_group(b"did:plc:alice#phone".to_vec(), None)
+        .unwrap()
+        .group_id;
+    let add = alice
+        .add_members(
+            group.clone(),
+            vec![
+                key_package_for(&phone, phone_identity),
+                key_package_for(&laptop, laptop_identity),
+            ],
+        )
+        .unwrap();
+    alice.merge_pending_commit(group.clone()).unwrap();
+    phone
+        .process_welcome(add.welcome_data.clone(), phone_identity.to_vec(), None)
+        .unwrap();
+    laptop
+        .process_welcome(add.welcome_data, laptop_identity.to_vec(), None)
+        .unwrap();
+    let remove = alice
+        .remove_members(group.clone(), vec![phone_identity.to_vec()])
+        .unwrap();
+    alice.merge_pending_commit(group.clone()).unwrap();
+    assert!(matches!(
+        phone
+            .process_message(group.clone(), remove.clone())
+            .unwrap(),
+        ProcessedContent::StagedCommit { new_epoch: 2, .. }
+    ));
+    assert!(matches!(
+        laptop.process_message(group.clone(), remove.clone()).unwrap(),
+        ProcessedContent::StagedCommit { new_epoch: 2, .. }
+    ));
+
+    assert_eq!(
+        MlsCryptoContext::verified_incoming_removal(phone.as_ref(), group.clone(), remove.clone())
+            .unwrap(),
+        None,
+        "staging alone does not prove this device was removed"
+    );
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let merge_phone = phone.clone();
+    let merge_group = group.clone();
+    std::thread::spawn(move || {
+        let _ = sender.send(MlsCryptoContext::merge_incoming_commit_with_outcome(
+            merge_phone.as_ref(),
+            merge_group,
+            2,
+        ));
+    });
+    let merged = receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("processing our removal must not deadlock on the pending-commit mutex")
+        .expect("accepted self-removal is terminal membership, not epoch divergence");
+    assert_eq!(merged, IncomingCommitMergeOutcome::Removed { epoch: 2 });
+    assert_eq!(
+        MlsCryptoContext::verified_incoming_removal(phone.as_ref(), group.clone(), remove.clone())
+            .unwrap(),
+        Some(2)
+    );
+    let mut changed_remove = remove.clone();
+    *changed_remove.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        MlsCryptoContext::verified_incoming_removal(phone.as_ref(), group.clone(), changed_remove)
+            .unwrap(),
+        None,
+        "inactive membership must not acknowledge a different ciphertext"
+    );
+    assert!(!MlsCryptoContext::group_is_active(phone.as_ref(), group.clone()).unwrap());
+    assert!(phone
+        .encrypt_message(group.clone(), b"no longer a member".to_vec())
+        .is_err());
+
+    assert_eq!(
+        MlsCryptoContext::merge_incoming_commit_with_outcome(laptop.as_ref(), group.clone(), 2)
+            .unwrap(),
+        IncomingCommitMergeOutcome::Active { epoch: 2 }
+    );
+    assert!(MlsCryptoContext::group_is_active(laptop.as_ref(), group.clone()).unwrap());
+    let message = alice
+        .encrypt_message(group.clone(), b"sibling stays".to_vec())
+        .unwrap();
+    assert_eq!(
+        laptop
+            .decrypt_message(group.clone(), message.ciphertext)
+            .unwrap()
+            .plaintext,
+        b"sibling stays"
+    );
+    assert!(
+        phone.merge_incoming_commit(group.clone(), 2).is_err(),
+        "successful terminal merge consumes the exact staged token"
+    );
+    phone.flush_and_prepare_close().unwrap();
+    let reopened = MLSContext::new(
+        phone_dir
+            .path()
+            .join("mls.db")
+            .to_string_lossy()
+            .to_string(),
+        "test-key-1234567890123456".to_string(),
+        Box::new(phone_keychain.clone()),
+    )
+    .unwrap();
+    assert!(
+        !reopened.group_is_active(group.clone()).unwrap(),
+        "terminal membership must remain inactive after reopening storage"
+    );
+    assert_eq!(
+        MlsCryptoContext::verified_incoming_removal(reopened.as_ref(), group.clone(), remove.clone()).unwrap(),
+        Some(2),
+        "exact removal proof survives restart before outer projection completes"
+    );
+    reopened.flush_and_prepare_close().unwrap();
+
+    // Reconstruct the durable crash boundary after OpenMLS persisted removal
+    // but before the receipt was confirmed. All MLS state and wire bytes are
+    // real; only the receipt's completion bit is rolled back in this fixture.
+    let receipt_key = format!("incoming-removal-v1:{}", hex::encode(&group));
+    let path = phone_dir.path().join("mls.db");
+    let mut receipt: serde_json::Value = {
+        let db = open_test_manifest(&path);
+        let encoded: String = db.query_row(
+            "SELECT value FROM mls_manifests WHERE key = ?1", [&receipt_key], |row| row.get(0),
+        ).unwrap();
+        serde_json::from_str(&encoded).unwrap()
+    };
+    assert_eq!(receipt["target_credential_identity"], serde_json::json!(phone_identity.as_slice()));
+    assert!(receipt["confirmed_context_hash"].is_array());
+    receipt["confirmed_context_hash"] = serde_json::Value::Null;
+    let expected_hash = receipt["expected_context_hash"].clone();
+    receipt["expected_context_hash"] = serde_json::json!(vec![0u8; 32]);
+    for expected in [None, Some(2)] {
+        {
+            let db = open_test_manifest(&path);
+            db.execute("UPDATE mls_manifests SET value = ?1 WHERE key = ?2",
+                [serde_json::to_string(&receipt).unwrap(), receipt_key.clone()]).unwrap();
+        }
+        let resumed = MLSContext::new(
+            path.to_string_lossy().to_string(),
+            "test-key-1234567890123456".to_string(),
+            Box::new(phone_keychain.clone()),
+        ).unwrap();
+        assert_eq!(
+            MlsCryptoContext::verified_incoming_removal(resumed.as_ref(), group.clone(), remove.clone()).unwrap(),
+            expected,
+            "unconfirmed removal intent requires the exact authenticated successor context"
+        );
+        resumed.flush_and_prepare_close().unwrap();
+        receipt["expected_context_hash"] = expected_hash.clone();
+    }
+    let db = open_test_manifest(&path);
+    let encoded: String = db.query_row(
+        "SELECT value FROM mls_manifests WHERE key = ?1", [&receipt_key], |row| row.get(0),
+    ).unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["confirmed_context_hash"].is_array());
 }
 
 #[test]

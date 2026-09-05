@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
 use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
 use catbird_mls::orchestrator::reset_flow::ResetOutcome;
-use catbird_mls::orchestrator::types::ConversationState;
+use catbird_mls::orchestrator::types::{ConversationState, QuarantineReason};
 use e2e_harness::TestWorld;
 
 /// Alice creates a conversation on device 1; device 2 (same DID, no local
@@ -63,13 +63,13 @@ fn count(world: &TestWorld, op: CanonicalOperation) -> usize {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn leafless_admin_with_no_foreign_leaf_resets_instead_of_waiting() {
+async fn leafless_admin_with_only_revoked_sibling_leaf_resets_instead_of_waiting() {
     let mut world = TestWorld::new();
     let (convo_id, dead_device) = world_with_leafless_second_device(&mut world).await;
     let alice_did = world.client("Alice").did.clone();
     world
         .delivery_service()
-        .set_conversation_leaves_for_test(&convo_id, vec![leaf(&alice_did, &dead_device, "active")]);
+        .set_conversation_leaves_for_test(&convo_id, vec![leaf(&alice_did, &dead_device, "revoked")]);
     let dev2 = world.client("AliceDev2");
     let before = world.delivery_service().conversation_ids();
     assert_eq!(before, vec![convo_id.clone()]);
@@ -155,7 +155,7 @@ async fn leafless_admin_with_no_foreign_leaf_resets_instead_of_waiting() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn leafless_admin_waits_on_live_peer_leaf_then_escalates_after_ttl() {
+async fn leafless_admin_renews_recovery_with_live_peer_after_ttl_without_reset() {
     let mut world = TestWorld::new();
     let (convo_id, _dead_device) = world_with_leafless_second_device(&mut world).await;
     world
@@ -180,7 +180,126 @@ async fn leafless_admin_waits_on_live_peer_leaf_then_escalates_after_ttl() {
     assert_eq!(again["leafRecovery"], "open");
     assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 1);
 
-    // Once the server TTL has lapsed unfulfilled, nobody is coming: reset.
+    // An offline peer may return after the reservation TTL. Expiry lets us
+    // renew the request; it does not prove that the conversation is lost.
+    dev2.orchestrator
+        .recovery_tracker()
+        .lock()
+        .await
+        .note_leaf_recovery_requested_at(&convo_id, Instant::now() - Duration::from_secs(301));
+    dev2
+        .orchestrator
+        .accept_conversation(&convo_id)
+        .await
+        .expect("expired reservation can be renewed");
+    assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 2);
+    assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
+    assert_eq!(world.delivery_service().bootstrap_reset_group_call_count(&convo_id), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn active_sibling_device_requests_add_without_resetting_healthy_group() {
+    let mut world = TestWorld::new();
+    let (convo_id, first_device) = world_with_leafless_second_device(&mut world).await;
+    let alice = world.client("Alice");
+    let original_group = alice.orchestrator.conversations().lock().await[&convo_id]
+        .group_id
+        .clone();
+    world.delivery_service().set_conversation_leaves_for_test(
+        &convo_id,
+        vec![leaf(&alice.did, &first_device, "active")],
+    );
+
+    world
+        .client("AliceDev2")
+        .orchestrator
+        .accept_conversation(&convo_id)
+        .await
+        .expect("a sibling leaf can admit this device");
+
+    assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
+    assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 1);
+    let request = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .find(|request| request.operation == CanonicalOperation::RequestLeafRecovery)
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["signedRequest"]["body"]["recoveryKind"], "add");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(hex::decode(original_group).unwrap())
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lost_local_state_with_live_sibling_requests_exact_device_replacement() {
+    let mut world = TestWorld::new();
+    let (convo_id, first_device) = world_with_leafless_second_device(&mut world).await;
+    let dev2 = world.client("AliceDev2");
+    let second_device = dev2.orchestrator.require_actor_device_id().await.unwrap();
+    world.delivery_service().set_conversation_leaves_for_test(
+        &convo_id,
+        vec![
+            leaf(&dev2.did, &first_device, "active"),
+            leaf(&dev2.did, &second_device, "active"),
+        ],
+    );
+
+    dev2.orchestrator
+        .accept_conversation(&convo_id)
+        .await
+        .expect("request local state replacement");
+
+    assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
+    let request = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .find(|request| request.operation == CanonicalOperation::RequestLeafRecovery)
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(request.body.as_deref().unwrap()).unwrap();
+    assert_eq!(body["signedRequest"]["body"]["recoveryKind"], "replace");
+    assert_eq!(
+        body["signedRequest"]["body"]["actorDeviceId"],
+        second_device
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_leaf_inventory_after_ttl_never_authorizes_reset() {
+    let mut world = TestWorld::new();
+    let (convo_id, _) = world_with_leafless_second_device(&mut world).await;
+    let dev2 = world.client("AliceDev2");
+    dev2.orchestrator
+        .recovery_tracker()
+        .lock()
+        .await
+        .note_leaf_recovery_requested_at(&convo_id, Instant::now() - Duration::from_secs(301));
+
+    dev2.orchestrator
+        .accept_conversation(&convo_id)
+        .await
+        .expect("retry recovery");
+
+    assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
+    assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn still_open_server_recovery_is_throttled_after_local_timer_expires() {
+    let mut world = TestWorld::new();
+    let (convo_id, _) = world_with_leafless_second_device(&mut world).await;
+    let dev2 = world.client("AliceDev2");
+    dev2.orchestrator
+        .accept_conversation(&convo_id)
+        .await
+        .expect("create actual server-owned recovery work");
     dev2.orchestrator
         .recovery_tracker()
         .lock()
@@ -190,10 +309,50 @@ async fn leafless_admin_waits_on_live_peer_leaf_then_escalates_after_ttl() {
         .orchestrator
         .accept_conversation(&convo_id)
         .await
-        .expect("expired wait escalates");
-    assert_eq!(outcome["epoch"], 0, "reset activated here; caller is back in the group");
-    assert_eq!(count(&world, CanonicalOperation::RequestReset), 1);
-    assert_eq!(world.delivery_service().bootstrap_reset_group_call_count(&convo_id), 1);
+        .expect("open is pending, not an error");
+    assert_eq!(outcome["recovery"]["status"], "open");
+    dev2.orchestrator
+        .accept_conversation(&convo_id)
+        .await
+        .expect("continue waiting");
+    assert_eq!(
+        count(&world, CanonicalOperation::RequestLeafRecovery),
+        2,
+        "server-open response must prevent immediate duplicate requests"
+    );
+    assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn known_quarantine_blocks_automatic_sibling_recovery() {
+    let mut world = TestWorld::new();
+    let (convo_id, first_device) = world_with_leafless_second_device(&mut world).await;
+    world.delivery_service().set_conversation_leaves_for_test(
+        &convo_id,
+        vec![leaf(&world.client("Alice").did, &first_device, "active")],
+    );
+    let dev2 = world.client("AliceDev2");
+    dev2.orchestrator
+        .recovery_tracker()
+        .lock()
+        .await
+        .mark_quarantined(
+            &convo_id,
+            QuarantineReason::PeerBadCommit,
+            chrono::Utc::now().timestamp_millis(),
+            vec![],
+        );
+
+    let result = dev2.orchestrator.accept_conversation(&convo_id).await;
+    assert!(
+        matches!(
+            result,
+            Err(catbird_mls::orchestrator::OrchestratorError::ConversationQuarantined { .. })
+        ),
+        "known poisoned state must require explicit recovery: {result:?}"
+    );
+    assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 0);
+    assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

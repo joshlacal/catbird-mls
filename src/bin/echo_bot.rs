@@ -361,6 +361,7 @@ impl MLSStorageBackend for BotStorage {
                 created_at: Some(Utc::now()),
                 updated_at: Some(Utc::now()),
                 sequencer_did: None,
+                canonical_state: None,
             });
         Ok(())
     }
@@ -1029,6 +1030,7 @@ fn parse_convo_view(val: &serde_json::Value) -> Option<ConversationView> {
         // Optional convoView.sequencerDid (ADR-010 D4); absent on
         // pre-rung-2 servers.
         sequencer_did: val["sequencerDid"].as_str().map(|s| s.to_string()),
+        canonical_state: None,
     })
 }
 
@@ -1060,6 +1062,7 @@ fn parse_incoming_envelope(convo_id: &str, val: &serde_json::Value) -> Option<In
         timestamp,
         server_message_id,
         server_epoch,
+        server_sequence: None,
     })
 }
 

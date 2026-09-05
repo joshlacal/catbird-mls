@@ -80,6 +80,23 @@ pub enum MlsDecryptOutcome {
     OwnPendingCommit,
 }
 
+/// A verified incoming Commit either advances usable MLS state or ends this
+/// exact device's membership. Removed devices cannot derive successor secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncomingCommitMergeOutcome {
+    Active { epoch: u64 },
+    Removed { epoch: u64 },
+}
+
+impl IncomingCommitMergeOutcome {
+    /// The accepted Commit's target epoch, including a terminal removal.
+    pub fn epoch(self) -> u64 {
+        match self {
+            Self::Active { epoch } | Self::Removed { epoch } => epoch,
+        }
+    }
+}
+
 /// Conditional bounds for MlsCryptoContext.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait MlsCryptoContextBounds: Send + Sync {}
@@ -298,6 +315,23 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         ))
     }
 
+    /// Atomically remove and add leaves with authenticated transition data.
+    /// Providers must never silently omit supplied AAD from a signed Commit.
+    fn swap_members_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        remove_identities: Vec<Vec<u8>>,
+        add_key_packages: Vec<KeyPackageData>,
+        aad: Option<Vec<u8>>,
+    ) -> Result<AddMembersResult, MLSError> {
+        if aad.is_some() {
+            return Err(MLSError::OperationNotSupported {
+                reason: "swap_members_with_aad not supported on this platform".to_string(),
+            });
+        }
+        self.swap_members(group_id, remove_identities, add_key_packages)
+    }
+
     /// Return the MLS credential identities (`Vec<u8>` each) of every current
     /// member of the group. Used by the Welcome-reissue responder to locate a
     /// recipient's stale leaf so it can be swapped out in a single commit.
@@ -402,6 +436,60 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
 
+    /// Encrypted, durable journal of exact signed control requests. A backend
+    /// must fail closed when it cannot retain the pending MLS/request pair.
+    fn put_prepared_control(&self, _record: &super::control_journal::PreparedControlRecord) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "prepared control journal unavailable".into() })
+    }
+
+    /// Account-scoped authenticated policy, independent of MLS membership.
+    fn get_conversation_departure(&self, _user_did: &str, _conversation_id: &str)
+        -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "get_conversation_departure is required".into() })
+    }
+    fn put_conversation_departure(&self, _user_did: &str,
+        _coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "put_conversation_departure is required".into() })
+    }
+
+    fn get_conversation_policy(&self, _user_did: &str, _conversation_id: &str)
+        -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "get_conversation_policy is required".into() })
+    }
+
+    fn put_conversation_policy(&self, _user_did: &str,
+        _state: &catbird_atproto::blue_catbird::chat::ConversationState) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "put_conversation_policy is required".into() })
+    }
+
+    fn list_account_exits(&self) -> Result<Vec<super::account_exit::AccountExitRecord>, MLSError> {
+        Ok(Vec::new())
+    }
+
+    fn put_account_exit(&self, _record: &super::account_exit::AccountExitRecord) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "account exit journal unavailable".into() })
+    }
+
+    fn get_prepared_control(&self, _group_id: &str) -> Result<Option<super::control_journal::PreparedControlRecord>, MLSError> {
+        // The default put cannot create a journal. Providers supporting put
+        // must override both reads and surface their storage failures.
+        Ok(None)
+    }
+
+    /// Includes completed proof records so own-Commit authority can be restored
+    /// before processing server echoes after a process restart.
+    fn list_prepared_controls(&self) -> Result<Vec<super::control_journal::PreparedControlRecord>, MLSError> {
+        // The default put always fails, so this provider cannot have a journal.
+        // Implementations that support put MUST override this and surface errors.
+        Ok(Vec::new())
+    }
+
+    /// Delete only the exact journal row carrying a durable definitive rejection,
+    /// after clearing its pending MLS state and passing the durability barrier.
+    fn remove_prepared_control(&self, _group_id: &str, _transition_id: &str) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "prepared control journal unavailable".into() })
+    }
+
     /// Merge an incoming `StagedCommit` that was previously staged by
     /// `decrypt_message` (task #33 receiver-side three-phase commit).
     ///
@@ -418,6 +506,34 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         target_epoch: u64,
     ) -> Result<u64, MLSError> {
         Ok(target_epoch)
+    }
+
+    /// Native providers preserve the verified staged self-removal signal.
+    /// Legacy providers keep their existing merge semantics and never infer
+    /// removal merely from an epoch mismatch or unavailable local group.
+    fn merge_incoming_commit_with_outcome(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<IncomingCommitMergeOutcome, MLSError> {
+        self.merge_incoming_commit(group_id, target_epoch)
+            .map(|epoch| IncomingCommitMergeOutcome::Active { epoch })
+    }
+
+    fn group_is_active(&self, _group_id: Vec<u8>) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "group_is_active not supported on this platform".into(),
+        })
+    }
+
+    /// An exact authenticated removal receipt can finish an interrupted outer
+    /// projection after crypto became inactive. Inactivity alone is not proof.
+    fn verified_incoming_removal(
+        &self,
+        _group_id: Vec<u8>,
+        _message: Vec<u8>,
+    ) -> Result<Option<u64>, MLSError> {
+        Ok(None)
     }
 
     /// Discard an incoming `StagedCommit` that was previously staged by
@@ -552,6 +668,20 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         identity: Vec<u8>,
         config: Option<GroupConfig>,
     ) -> Result<WelcomeResult, MLSError>;
+
+    /// Verify/import an exact canonical delivery atomically with its receipt.
+    /// Unsupported providers must never substitute membership for acceptance.
+    fn process_welcome_delivery(&self, _delivery: &super::welcome_ack::WelcomeDelivery,
+        _identity: Vec<u8>, _config: Option<GroupConfig>) -> Result<WelcomeResult, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "atomic Welcome acceptance unavailable".into() })
+    }
+    fn list_welcome_acceptances(&self) -> Result<Vec<super::welcome_ack::WelcomeAcceptance>, MLSError> {
+        Ok(Vec::new())
+    }
+    /// Update only an existing native receipt; this method cannot mint one.
+    fn update_welcome_acceptance(&self, _record: &super::welcome_ack::WelcomeAcceptance) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "Welcome acknowledgement journal unavailable".into() })
+    }
 
     /// Clean up epoch secrets older than the retention window for a group.
     ///

@@ -372,7 +372,7 @@ async fn setup_alice_bob_group(label: &str) -> (TestWorld, String) {
         .expect("Bob fork fixture key package");
     world
         .delivery_service()
-        .add_leaf_recovery_inbox_item(serde_json::json!({
+        .add_pending_leaf_recovery_request(serde_json::json!({
             "recovery": {
                 "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
                 "conversationId": created.conversation_id,
@@ -558,6 +558,7 @@ async fn trigger_fork_detection<A>(
             timestamp: Utc::now(),
             server_message_id: Some(format!("bad-fork-frame-{i}")),
             server_epoch: None,
+            server_sequence: None,
         };
         let result = orchestrator.process_incoming(&envelope).await;
         assert!(
@@ -750,10 +751,20 @@ async fn recovery_vote_authenticator_ignores_stale_legacy_group_state() {
             .expect("active epoch authenticator"),
     );
 
-    orchestrator
+    // This fixture tests the authenticator submitted in the reset request.
+    // Canonical manual reset also attempts activation; explicitly fail that
+    // later step and require its exact error instead of assuming report-only
+    // success or allowing an earlier authentication failure to pass.
+    world.api_service.set_bootstrap_reset_group_success(false);
+    let error = orchestrator
         .user_confirmed_manual_reset(&stable_conversation_id)
         .await
-        .expect("manual reset report");
+        .expect_err("configured activation failure must propagate");
+    let OrchestratorError::ServerError { status: 500, body } = error else {
+        panic!("unexpected reset failure: {error:?}");
+    };
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["error"], "bootstrap_reset_group failed");
 
     assert_eq!(
         api_probe.recovery_reports(),
@@ -855,6 +866,7 @@ async fn fork_readd_falls_back_to_needs_rejoin_when_crypto_unsupported() {
             timestamp: Utc::now(),
             server_message_id: Some(format!("unsupported-fork-{i}")),
             server_epoch: None,
+            server_sequence: None,
         };
         let result = orchestrator.process_incoming(&envelope).await;
         assert!(result.is_err(), "fake crypto always fails decryption");

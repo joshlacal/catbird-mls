@@ -1,5 +1,4 @@
 use crate::error::MLSError;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -9,7 +8,9 @@ use super::canonical_transport::CleanChatSigningContext;
 use super::constants;
 use super::credentials::{CleanChatSigningAuthority, CredentialStore};
 use super::error::{OrchestratorError, Result};
-use super::mls_provider::{MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof};
+use super::mls_provider::{
+    IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof,
+};
 use super::orchestrator::MLSOrchestrator;
 use super::storage::MLSStorageBackend;
 use super::types::*;
@@ -307,6 +308,9 @@ where
     }
 
     async fn reject_send_if_reset_pending(&self, conversation_id: &str) -> Result<()> {
+        if self.pending_conversation_admission(conversation_id).await? {
+            return Err(OrchestratorError::InvalidInput("Accept this invitation before sending messages.".into()));
+        }
         if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
             return Err(OrchestratorError::ResetCompletionNotCommitted {
                 convo_id: conversation_id.to_string(),
@@ -349,6 +353,10 @@ where
             return Ok(ConversationRecoveryState::ResetPending);
         }
 
+        if self.is_local_conversation_terminal(conversation_id).await? {
+            return Ok(ConversationRecoveryState::UnrecoverableLocal);
+        }
+
         let state = self
             .conversation_states()
             .lock()
@@ -361,9 +369,10 @@ where
             Some(ConversationState::ForkDetected) => ConversationRecoveryState::EpochBehind,
             Some(ConversationState::NeedsRejoin) => ConversationRecoveryState::NeedsRejoin,
             Some(ConversationState::ResetPending { .. }) => ConversationRecoveryState::ResetPending,
-            Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
-                ConversationRecoveryState::UnrecoverableLocal
-            }
+            Some(ConversationState::Quarantined { .. })
+            | Some(ConversationState::Failed)
+            | Some(ConversationState::DeviceRemoved)
+            | Some(ConversationState::Closed) => ConversationRecoveryState::UnrecoverableLocal,
         };
 
         if projected != ConversationRecoveryState::Healthy {
@@ -390,6 +399,9 @@ where
     ) -> Result<ConversationReadyResult> {
         self.check_shutdown().await?;
         self.require_user_did().await?;
+        if self.pending_conversation_admission(convo_id).await? {
+            return Ok(Self::ready_result(ConversationRecoveryState::Recovering, None));
+        }
 
         let had_in_memory_reset_authority = matches!(
             self.conversation_states().lock().await.get(convo_id),
@@ -579,6 +591,17 @@ where
         let user_did = self.require_user_did().await?;
 
         self.reject_send_if_reset_pending(conversation_id).await?;
+        if self.is_local_conversation_closed(conversation_id).await? {
+            return Err(OrchestratorError::InvalidInput(
+                "conversation_closed: This chat has ended. You can start a new conversation."
+                    .into(),
+            ));
+        }
+        if self.is_local_device_removed(conversation_id).await? {
+            return Err(OrchestratorError::InvalidInput(
+                "conversation_device_removed: This device is no longer in this chat.".into(),
+            ));
+        }
 
         tracing::debug!(conversation_id, "Sending message");
 
@@ -883,6 +906,7 @@ where
     pub async fn process_incoming(&self, envelope: &IncomingEnvelope) -> Result<Option<Message>> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
+        envelope.validate_server_metadata()?;
 
         crate::message_limits::validate_inbound_mls_message_len(
             envelope.ciphertext.len(),
@@ -949,6 +973,38 @@ where
                 tracing::debug!(message_id = %msg_id, "Duplicate message, skipping");
                 return Ok(None);
             }
+        }
+
+        // Native MLS can become inactive before this platform's state write
+        // succeeds. An exact durable receipt of the authenticated Remove lets
+        // redelivery finish that write after failure or restart. Inactivity or
+        // a server tombstone alone is never enough to acknowledge ciphertext.
+        if let Some(terminal_epoch) = self
+            .mls_context()
+            .verified_incoming_removal(group_id_bytes.clone(), envelope.ciphertext.clone())?
+        {
+            self.mls_context().ensure_storage_durable()?;
+            self.record_local_device_removal(
+                &resolved.conversation_id,
+                &resolved.group_id,
+                terminal_epoch,
+            )
+            .await?;
+            return Ok(None);
+        }
+
+        // A retained outbound Commit must be reconciled before decrypting
+        // its echo or a competing Commit. Pending own MLS state is not local
+        // corruption; an unavailable confirmation leaves the journal intact.
+        if self
+            .mls_context()
+            .get_prepared_control(&resolved.group_id)?
+            .is_some()
+        {
+            let transition_lock = self.rejoin_lock(&resolved.conversation_id).await;
+            let _transition_guard = transition_lock.lock().await;
+            self.replay_prepared_control_locked(&resolved.group_id)
+                .await?;
         }
 
         // Check if this is our own commit (self-commit detection)
@@ -1102,6 +1158,21 @@ where
                 return Err(OrchestratorError::NotJoined {
                     convo_id: envelope.conversation_id.clone(),
                 });
+            }
+            Err(error)
+                if self
+                    .mls_context()
+                    .group_is_active(group_id_bytes.clone())
+                    .ok()
+                    == Some(false)
+                    || self
+                        .is_local_conversation_terminal(&resolved.conversation_id)
+                        .await? =>
+            {
+                // Inactive membership is terminal for this local leaf. A
+                // stale delivery must not reclassify it as a broken group,
+                // advance the cached epoch, or start automatic re-admission.
+                return Err(OrchestratorError::from(error));
             }
             Err(e) if e.is_wrong_group_id() => {
                 tracing::debug!(
@@ -1396,61 +1467,42 @@ where
                 "Processed commit message (epoch staged — merging)"
             );
 
-            // Task #58: `decrypt_message` stages the incoming commit in
-            // `pending_incoming_merges` but does NOT merge it into the local
-            // MLS group. The orchestrator's HTTP-sync path (this function,
-            // reached from `fetch_messages` and `sync_with_server`) must
-            // explicitly call `merge_incoming_commit` to advance the local
-            // epoch; otherwise subsequent sends/decrypts see stale epoch and
-            // trigger cascading 409/WrongEpoch errors.
-            //
-            // Platforms consuming WebSocket push (iOS) already perform the
-            // merge themselves; this closes the gap for orchestrator-driven
-            // sync (catmos Tauri, catmos-cli, catbird-mls-web, Android).
-            let merged_epoch = match self
+            // A Remove can terminate this device's membership. Persist that
+            // authenticated outcome without asking the inactive group for
+            // successor secrets or treating removal as a recovery failure.
+            let merge_outcome = match self
                 .mls_context()
-                .merge_incoming_commit(group_id_bytes.clone(), decrypt_result.epoch)
+                .merge_incoming_commit_with_outcome(group_id_bytes.clone(), decrypt_result.epoch)
             {
-                Ok(merged_epoch) => {
-                    tracing::info!(
-                        conversation_id = %envelope.conversation_id,
-                        target_epoch = decrypt_result.epoch,
-                        merged_epoch,
-                        "Merged incoming staged commit"
-                    );
-                    merged_epoch
-                }
-                Err(e) => {
-                    // Merge failure: the staged commit was popped from
-                    // `pending_incoming_merges` by the FFI layer (see
-                    // `merge_incoming_commit` in api.rs). The local MLS state
-                    // is now behind the commit we just saw on the wire — mark
-                    // the conversation for rejoin so the next sync cycle
-                    // recovers via the deferred External Commit path.
-                    //
-                    // NOTE: we do NOT call `discard_incoming_commit` here —
-                    // `merge_incoming_commit` already consumed the staged
-                    // entry on its way to the failure, and double-discarding
-                    // is a no-op anyway.
-                    tracing::error!(
-                        error = %e,
-                        conversation_id = %envelope.conversation_id,
-                        target_epoch = decrypt_result.epoch,
-                        "Failed to merge incoming staged commit — marking for rejoin"
-                    );
-                    // WS-5.2: this flag is the sole recovery driver after a
-                    // merge failure — escalate a dropped write instead of
-                    // warn-and-forget.
-                    self.mark_needs_rejoin_critical(&envelope.conversation_id)
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.mark_needs_rejoin_critical(&resolved.conversation_id)
                         .await;
-                    // Fail this page before cached epoch advancement,
-                    // persistence, secret pruning, or cursor return. The DS
-                    // can redeliver after recovery has restored a mergeable
-                    // state; acknowledging this envelope would create a
-                    // durable gap between MLS state and the sync cursor.
-                    return Err(OrchestratorError::from(e));
+                    return Err(OrchestratorError::from(error));
                 }
             };
+            let merged_epoch = merge_outcome.epoch();
+            if matches!(merge_outcome, IncomingCommitMergeOutcome::Removed { .. }) {
+                if merged_epoch != decrypt_result.epoch {
+                    return Err(OrchestratorError::EpochMismatch {
+                        local: merged_epoch,
+                        remote: decrypt_result.epoch,
+                    });
+                }
+                self.mls_context().ensure_storage_durable()?;
+                self.record_local_device_removal(
+                    &resolved.conversation_id,
+                    &resolved.group_id,
+                    merged_epoch,
+                )
+                .await?;
+                tracing::info!(
+                    conversation_id = %resolved.conversation_id,
+                    terminal_epoch = merged_epoch,
+                    "Durably consumed commit removing this device"
+                );
+                return Ok(None);
+            }
 
             if merged_epoch != decrypt_result.epoch {
                 let error = OrchestratorError::EpochMismatch {
@@ -1712,7 +1764,7 @@ where
             text: plaintext,
             timestamp: envelope.timestamp,
             epoch: decrypt_result.epoch,
-            sequence_number: decrypt_result.sequence_number,
+            sequence_number: envelope.server_sequence.unwrap_or(decrypt_result.sequence_number),
             is_own,
             delivery_status: None,
             payload_json,
@@ -1728,6 +1780,7 @@ where
         &self,
         envelope: &IncomingEnvelope,
     ) -> Result<MessageProcessingResult> {
+        envelope.validate_server_metadata()?;
         if let Some(server_epoch) = envelope.server_epoch {
             let local_epoch = self
                 .local_group_epoch_result(&envelope.conversation_id)
@@ -1795,6 +1848,9 @@ where
         to_epoch: Option<u32>,
     ) -> Result<(Vec<Message>, Option<String>)> {
         self.check_shutdown().await?;
+        if self.pending_conversation_admission(conversation_id).await? {
+            return Ok((Vec::new(), None));
+        }
 
         let (envelopes, new_cursor) = self
             .api_client()
@@ -1973,8 +2029,14 @@ where
                         let coords = state.get("coordinates")?;
                         let cid = coords.get("conversationId").and_then(|c| c.as_str())?;
                         if cid == convo_id {
-                            let g = coords.get("generation").and_then(|g| g.as_i64()).unwrap_or(0);
-                            let sv = coords.get("stateVersion").and_then(|sv| sv.as_i64()).unwrap_or(0);
+                            let g = coords
+                                .get("generation")
+                                .and_then(|g| g.as_i64())
+                                .unwrap_or(0);
+                            let sv = coords
+                                .get("stateVersion")
+                                .and_then(|sv| sv.as_i64())
+                                .unwrap_or(0);
                             Some((g, sv))
                         } else {
                             None

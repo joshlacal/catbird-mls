@@ -34,9 +34,93 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    async fn prepared_control_targets_current_conversation(
+        &self,
+        record: &super::control_journal::PreparedControlRecord,
+    ) -> Result<bool> {
+        let user_did = self.require_user_did().await?;
+        if record.actor_did != user_did
+            || self.credentials().get_device_uuid(&user_did).await?.as_deref()
+                != Some(record.actor_device_id.as_str())
+            || self.reset_pending_payload_result(&record.conversation_id).await?.is_some()
+        {
+            return Ok(false);
+        }
+        match self.resolve_conversation_context(&record.conversation_id).await {
+            Ok(current) => Ok(current.group_id == record.group_id),
+            // An absent mapping cannot prove that this same-device record was
+            // retired. Keep it fenced until authoritative mapping is restored.
+            Err(super::error::OrchestratorError::ConversationNotFound(_)) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Confirm retained signed control operations before sync can replace or
+    /// recover their local group. Uncertain conversations remain isolated from
+    /// this pass while unrelated conversations continue syncing.
+    async fn resume_prepared_controls(&self) -> Result<HashSet<String>> {
+        let records = self.mls_context().list_prepared_controls()?;
+        let mut blocked = HashSet::new();
+        for record in records {
+            let conversation_id = &record.conversation_id;
+            // Retained evidence is scoped to its exact actor and group. An
+            // explicit reset or device rotation supersedes its authority to
+            // block the stable conversation's current, healthy generation.
+            if !self.prepared_control_targets_current_conversation(&record).await? {
+                continue;
+            }
+            let inbound = self.inbound_processing_lock(conversation_id).await;
+            let Ok(_inbound_guard) = inbound.try_lock() else {
+                blocked.insert(conversation_id.clone());
+                continue;
+            };
+            let transition = self.rejoin_lock(conversation_id).await;
+            let Ok(_transition_guard) = transition.try_lock() else {
+                blocked.insert(conversation_id.clone());
+                continue;
+            };
+            if !self.prepared_control_targets_current_conversation(&record).await? {
+                continue;
+            }
+            if record.completed {
+                // Completed proof from an older, explicitly replaced generation
+                // has no authority over its successor. Keep its durable record,
+                // but do not restore its in-memory own-Commit fence there.
+                let current = self.resolve_conversation_context(conversation_id).await;
+                if current
+                    .as_ref()
+                    .is_ok_and(|current| current.group_id != record.group_id)
+                    || self
+                        .reset_pending_payload_result(conversation_id)
+                        .await?
+                        .is_some()
+                    || self.is_local_conversation_terminal(conversation_id).await?
+                {
+                    continue;
+                }
+                if let Err(error) = self.restore_completed_control_proof(&record).await {
+                    tracing::warn!(%conversation_id, %error, "Could not restore accepted control proof; deferring conversation sync");
+                    blocked.insert(conversation_id.clone());
+                }
+            } else if let Err(error) = self.replay_prepared_control_locked(&record.group_id).await {
+                if self.mls_context().get_prepared_control(&record.group_id)?.is_some() {
+                    tracing::warn!(%conversation_id, %error, "Control confirmation is still pending; preserving local group and deferring conversation sync");
+                    blocked.insert(conversation_id.clone());
+                } else {
+                    tracing::info!(%conversation_id, %error, "Control nonacceptance is proven; resuming normal catch-up");
+                }
+            }
+        }
+        Ok(blocked)
+    }
+
     /// Project persisted conversations into Rust-owned recovery state on startup.
     pub async fn startup_reconcile(&self) -> Result<StartupReconcileReport> {
         let user_did = self.require_user_did().await?;
+        let mut blocked_controls = self.resume_prepared_controls().await?;
+        blocked_controls.extend(self.resume_account_exits(&blocked_controls).await?);
+        self.retry_pending_welcome_acknowledgements().await?;
+        blocked_controls.extend(self.pending_welcome_publications().await?);
         let conversations = self.storage().list_conversations(&user_did).await?;
         let mut report = StartupReconcileReport {
             scanned: conversations.len() as u32,
@@ -44,7 +128,15 @@ where
         };
 
         for convo in conversations {
+            let convo = self.restore_conversation_policy(&user_did, convo)?;
             let convo_id = convo.conversation_id.clone();
+            self.conversations().lock().await.insert(convo_id.clone(), convo);
+            if blocked_controls.contains(&convo_id) {
+                continue;
+            }
+            if self.pending_conversation_admission(&convo_id).await? {
+                continue;
+            }
             let transition_lock = self.rejoin_lock(&convo_id).await;
             let transition_guard = transition_lock.lock().await;
             let persisted_state = self.storage().get_conversation_state(&convo_id).await?;
@@ -67,7 +159,9 @@ where
             }
 
             match persisted_state {
-                Some(state @ ConversationState::Quarantined { .. })
+                Some(state @ ConversationState::Closed)
+                | Some(state @ ConversationState::DeviceRemoved)
+                | Some(state @ ConversationState::Quarantined { .. })
                 | Some(state @ ConversationState::Failed) => {
                     if self
                         .project_non_reset_cache_locked(&convo_id, state)
@@ -276,6 +370,10 @@ where
         }
 
         tracing::info!("Starting server sync");
+        let mut blocked_controls = self.resume_prepared_controls().await?;
+        blocked_controls.extend(self.resume_account_exits(&blocked_controls).await?);
+        self.retry_pending_welcome_acknowledgements().await?;
+        blocked_controls.extend(self.pending_welcome_publications().await?);
 
         // Fence the server listing against local creation start/completion.
         // A changed generation means this pass cannot safely conclude that a
@@ -303,6 +401,13 @@ where
             if cursor.is_none() {
                 break;
             }
+        }
+
+        // Terminal inventory rows are intentionally absent from the legacy
+        // ConversationView adapter. Consume their authenticated final entries
+        // before an omitted roster can strand a pending leave.
+        if let Err(error) = self.reconcile_terminal_conversations().await {
+            tracing::warn!(%error, "Terminal inventory reconciliation will retry on a later sync");
         }
 
         crate::info_log!(
@@ -386,7 +491,17 @@ where
                 break;
             }
 
+            let previous_view = self.conversations().lock().await.get(&convo.conversation_id).cloned();
+            let convo = self.restore_conversation_policy(user_did, convo.clone())?;
+            let convo = super::admission::merge_conversation_view(previous_view.as_ref(), convo)?;
             let conversation_id = convo.conversation_id.as_str();
+            self.conversations().lock().await.insert(conversation_id.to_string(), convo.clone());
+            if blocked_controls.contains(conversation_id) {
+                continue;
+            }
+            if self.is_local_conversation_terminal(conversation_id).await? {
+                continue;
+            }
             let group_id = convo.group_id.as_str();
             // A successful reset recovery may resolve this stale list item to
             // a different, authoritative group before the item finishes. All
@@ -394,18 +509,16 @@ where
             // effective view rather than normalizing the captured page again.
             let mut effective_convo = convo.clone();
 
-            let previous_view = self
-                .conversations()
-                .lock()
-                .await
-                .insert(conversation_id.to_string(), convo.clone());
-
             // Every write and recovery probe below (sequencer mapping, group
             // state, join/accept) resolves through this conversation row, so
             // materialize it before any of them run.
             self.storage()
                 .ensure_conversation_exists(user_did, conversation_id, group_id)
                 .await?;
+
+            if self.pending_conversation_admission(conversation_id).await? {
+                continue;
+            }
 
             // ADR-010 D4: record the conversation→sequencer mapping. Routing
             // does NOT consult this yet (WS-4 rung 3); every sync refresh
@@ -920,6 +1033,10 @@ where
             tracing::warn!(error = %e, "Failed to fulfill pending leaf recoveries during sync");
         }
 
+        if let Err(e) = self.fulfill_pending_group_leaves().await {
+            tracing::warn!(error = %e, "Failed to fulfill pending group leaves during sync");
+        }
+
         tracing::info!(
             conversation_count = all_convos.len(),
             "Server sync complete"
@@ -961,6 +1078,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             sequencer_did: None,
+            canonical_state: None,
         };
 
         assert!(
@@ -983,6 +1101,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             sequencer_did: None,
+            canonical_state: None,
         };
 
         assert!(conversation_contains_user_root_exact(

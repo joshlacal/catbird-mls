@@ -114,6 +114,24 @@ pub struct ConversationView {
     /// (ADR-010 D4). Routing does NOT consult this yet (WS-4 rung 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequencer_did: Option<String>,
+    /// Authenticated canonical policy snapshot. It never proves MLS admission;
+    /// its immutable epoch may precede a verified local native epoch overlay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_state: Option<catbird_atproto::blue_catbird::chat::ConversationState>,
+}
+
+/// Native-fetched authorized inventory snapshot scoped to a single batch execution.
+#[derive(Clone, Debug)]
+pub struct AuthorizedInventorySnapshot {
+    pub owner_instance_id: u64,
+    pub execution_id: u64,
+    pub session_id: String,
+    pub event_cursor: String,
+    pub expires_at: Option<String>,
+    pub items: Vec<serde_json::Value>,
+    pub conversations: HashMap<String, ConversationView>,
+    pub user_did: String,
+    pub device_id: String,
 }
 
 /// A member within a conversation.
@@ -354,6 +372,13 @@ pub enum ConversationState {
     Active,
     ForkDetected,
     NeedsRejoin,
+    /// An authenticated MLS Commit removed this exact device leaf, or this
+    /// device's accepted zero-leaf account exit proved no sending access.
+    /// History and old crypto remain available; automatic rejoin and sends stop.
+    /// This does not imply that the account left the conversation.
+    DeviceRemoved,
+    /// A verified signed close retired this conversation; retained history is read-only.
+    Closed,
     /// The server has reset the group (quorum-based auto-reset, spec §8.6).
     /// The orchestrator must delete local MLS state and join the new group.
     ResetPending {
@@ -398,6 +423,8 @@ impl ConversationState {
             ConversationState::Active => "active",
             ConversationState::ForkDetected => "fork_detected",
             ConversationState::NeedsRejoin => "needs_rejoin",
+            ConversationState::DeviceRemoved => "device_removed",
+            ConversationState::Closed => "closed",
             ConversationState::ResetPending { .. } => "reset_pending",
             ConversationState::Quarantined { .. } => "quarantined",
             ConversationState::Failed => "failed",
@@ -651,6 +678,9 @@ pub struct IncomingEnvelope {
     pub timestamp: DateTime<Utc>,
     /// Server-assigned message ID for deduplication.
     pub server_message_id: Option<String>,
+    /// Canonical append-log position. None is reserved for legacy transports.
+    #[serde(default)]
+    pub server_sequence: Option<u64>,
     /// Server-reported epoch for the message, when available.
     pub server_epoch: Option<u64>,
 }

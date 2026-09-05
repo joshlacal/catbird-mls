@@ -496,6 +496,7 @@ async fn external_join_authorization_rejection_does_not_advance_fork_or_rejoin_s
                 timestamp: chrono::Utc::now(),
                 server_message_id: Some(format!("external-proposal-{index}")),
                 server_epoch: Some(1),
+                server_sequence: None,
             })
             .await
             .expect_err("unauthorized ExternalJoinProposal must fail closed");
@@ -629,8 +630,15 @@ async fn controlled_inbound_fixture(
     conversation_id: &str,
     crypto: Arc<ControlledCommitCrypto>,
 ) -> WrongEpochRepairFixture {
+    controlled_inbound_fixture_with_group(conversation_id, conversation_id, crypto).await
+}
+
+async fn controlled_inbound_fixture_with_group(
+    conversation_id: &str,
+    group_id: &str,
+    crypto: Arc<ControlledCommitCrypto>,
+) -> WrongEpochRepairFixture {
     let did = "did:plc:alice";
-    let group_id = conversation_id;
     let storage = MockStorage::new();
     let api = MockDeliveryService::new(did).clone_as(did);
     let orchestrator = MLSOrchestrator::new(
@@ -718,6 +726,7 @@ fn test_envelope(
         timestamp: chrono::Utc::now(),
         server_message_id: Some(message_id.to_string()),
         server_epoch: Some(1),
+        server_sequence: None,
     }
 }
 
@@ -1981,6 +1990,7 @@ async fn credential_rejection_attempts_staged_commit_cleanup_and_surfaces_failur
             timestamp: chrono::Utc::now(),
             server_message_id: Some("credential-substitution".to_string()),
             server_epoch: Some(7),
+            server_sequence: None,
         })
         .await
         .expect_err("credential mismatch and cleanup failure must fail closed");
@@ -2034,6 +2044,7 @@ async fn credential_rejection_leaves_no_staged_commit_residue_when_cleanup_succe
             timestamp: chrono::Utc::now(),
             server_message_id: Some("credential-substitution".to_string()),
             server_epoch: Some(7),
+            server_sequence: None,
         })
         .await
         .expect_err("credential mismatch must fail closed");
@@ -2300,4 +2311,47 @@ async fn send_message_response_validation_rejects_noncanonical_shapes_and_mutati
     assert!(err
         .to_string()
         .contains("seq must be in range 1..=9007199254740991"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_incoming_sequence_survives_durable_store_and_duplicate_delivery() {
+    let fixture = controlled_inbound_fixture_with_group(
+        "8d85cf39-997f-4861-a45e-a71f944db857",
+        "9192939495969798999a9b9c9d9e9fa09192939495969798999a9b9c9d9e9fa0",
+        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(Duration::ZERO)),
+    ).await;
+    let mut envelope = test_envelope(&fixture.conversation_id, "e94874a0-86ab-49f4-8355-35a5d972b607");
+    envelope.server_sequence = Some(271);
+    envelope.timestamp = "2026-09-05T04:52:13.456Z".parse().unwrap();
+    let message = fixture.orchestrator.process_incoming(&envelope).await.unwrap().unwrap();
+    assert_eq!(message.sequence_number, 271, "server sequence must replace the process-local crypto counter");
+    assert_eq!(message.timestamp, envelope.timestamp);
+    assert_eq!(message.epoch, 1);
+    let before = fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap();
+    assert!(fixture.orchestrator.process_incoming(&envelope).await.unwrap().is_none());
+    let mut unproven_metadata = envelope.clone();
+    unproven_metadata.server_sequence = Some(999);
+    unproven_metadata.timestamp = "2026-09-05T05:52:13.456Z".parse().unwrap();
+    assert!(fixture.orchestrator.process_incoming(&unproven_metadata).await.unwrap().is_none());
+    let after = fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap();
+    assert_eq!(serde_json::to_value(&before).unwrap(), serde_json::to_value(&after).unwrap());
+    assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_invalid_id_is_rejected_before_decrypt_but_legacy_ids_remain_accepted() {
+    let fixture = controlled_inbound_fixture_with_group(
+        "8d85cf39-997f-4861-a45e-a71f944db857",
+        "9192939495969798999a9b9c9d9e9fa09192939495969798999a9b9c9d9e9fa0",
+        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(Duration::ZERO)),
+    ).await;
+    let mut envelope = test_envelope(&fixture.conversation_id, "membership-left:e94874a0-86ab-49f4-8355-35a5d972b607:e94874a0-86ab-49f4-8355-35a5d972b607");
+    envelope.server_sequence = Some(271);
+    assert!(fixture.orchestrator.process_incoming_message(&envelope).await.is_err());
+    assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap().is_empty());
+    envelope.server_sequence = None;
+    envelope.server_message_id = Some("arbitrary-legacy-id".into());
+    assert!(fixture.orchestrator.process_incoming(&envelope).await.unwrap().is_some());
+    assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 1);
 }

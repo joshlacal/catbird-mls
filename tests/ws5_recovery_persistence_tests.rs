@@ -1254,6 +1254,7 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
             timestamp: chrono::Utc::now(),
             server_message_id: Some(format!("00000000-0000-4000-8000-{:012x}", i + 1)),
             server_epoch: None,
+            server_sequence: None,
         };
         if let Err(error) = orchestrator.process_incoming(&envelope).await {
             frame_errors.push(error.to_string());
@@ -1333,6 +1334,7 @@ async fn quarantine_entry_projection_serializes_with_reset_authority() {
                 timestamp: chrono::Utc::now(),
                 server_message_id: Some(format!("entry-race-{i}")),
                 server_epoch: None,
+                server_sequence: None,
             })
             .await;
     }
@@ -1344,6 +1346,7 @@ async fn quarantine_entry_projection_serializes_with_reset_authority() {
         timestamp: chrono::Utc::now(),
         server_message_id: Some("entry-race-2".to_string()),
         server_epoch: None,
+        server_sequence: None,
     };
     let enter = orchestrator.process_incoming(&third_frame);
     let reset = async {
@@ -1379,71 +1382,171 @@ async fn quarantine_entry_projection_serializes_with_reset_authority() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn quarantine_exit_projection_serializes_with_reset_authority() {
-    let did = "did:plc:alice";
-    let convo_id = "00000000-0000-4000-8000-0000000000d2".to_string();
-    let group_id = "d2".repeat(32);
-    let storage = e2e_harness::mock_storage::MockStorage::new();
-    let credentials = e2e_harness::mock_credentials::MockCredentials::new();
-    let ds = e2e_harness::mock_api_client::MockDeliveryService::new(did);
-    let orchestrator = MLSOrchestrator::new(
-        Arc::new(FailingCrypto::peer_bad()),
-        Arc::new(storage.clone()),
-        Arc::new(ds.clone_as(did)),
-        Arc::new(credentials.clone()),
-        OrchestratorConfig::default(),
-    );
-    orchestrator.initialize(did).await.expect("initialize");
-    credentials
-        .store_device_uuid(did, "00000000-0000-4000-8000-000000000001")
-        .await
-        .unwrap();
-    credentials
-        .store_mls_did(did, &format!("{did}#00000000-0000-4000-8000-000000000001"))
-        .await
-        .unwrap();
-    configure_test_signing_authority(&credentials, did).await;
-    storage
-        .ensure_conversation_exists(did, &convo_id, &group_id)
-        .await
-        .expect("seed conversation");
-    let mut frame_errors = Vec::new();
-    for i in 0..3 {
-        let envelope = IncomingEnvelope {
-            conversation_id: convo_id.clone(),
-            sender_did: "did:plc:mallory".to_string(),
-            ciphertext: format!("exit-race-{i}").into_bytes(),
-            timestamp: chrono::Utc::now(),
-            server_message_id: Some(format!("00000000-0000-4000-8001-{:012x}", i + 1)),
-            server_epoch: None,
-        };
-        if let Err(error) = orchestrator.process_incoming(&envelope).await {
-            frame_errors.push(error.to_string());
-        }
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use catbird_mls::orchestrator::{GroupState, MlsCryptoContext, QuarantineReason};
+    let mut world = TestWorld::new();
+    for (name, did) in [
+        ("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
+        ("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"),
+        ("Charlie", "did:plc:cccccccccccccccccccccccc"),
+    ] {
+        world.add_client_with_did(name, did).await;
+        world.register_device(name).await.unwrap();
     }
-    assert!(
-        orchestrator
-            .get_conversation_quarantine_state(&convo_id)
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let charlie = world.client("Charlie");
+    let created = alice
+        .orchestrator
+        .create_group(
+            "quarantine exit race",
+            Some(&[bob.did.clone(), charlie.did.clone()]),
+            None,
+        )
+        .await
+        .unwrap();
+    let convo_id = created.conversation_id;
+    let group = hex::decode(created.group_id).unwrap();
+    let identity =
+        |client: &e2e_harness::TestClient, device: String| format!("{}#{device}", client.did);
+    let bob_identity = identity(
+        bob,
+        bob.orchestrator.require_actor_device_id().await.unwrap(),
+    );
+    let charlie_identity = identity(
+        charlie,
+        charlie
+            .orchestrator
+            .require_actor_device_id()
             .await
-            .is_some(),
-        "three peer-bad frames must enter Layer-3 quarantine (test precondition): {frame_errors:?}"
+            .unwrap(),
     );
-    assert!(
-        storage.get_persisted_reset_pending(&convo_id).is_none(),
-        "quarantine entry unexpectedly installed reset authority: {:?}",
-        storage.get_current_state(&convo_id)
-    );
+    let mut packages = Vec::new();
+    for (client, scoped) in [(bob, &bob_identity), (charlie, &charlie_identity)] {
+        packages.push(catbird_mls::KeyPackageData {
+            data: client
+                .orchestrator
+                .mls_context()
+                .create_key_package(scoped.as_bytes().to_vec())
+                .unwrap()
+                .key_package_data,
+        });
+    }
+    let added = alice
+        .orchestrator
+        .mls_context()
+        .add_members(group.clone(), packages)
+        .unwrap();
+    alice
+        .orchestrator
+        .mls_context()
+        .merge_pending_commit(group.clone())
+        .unwrap();
+    bob.orchestrator
+        .mls_context()
+        .process_welcome(added.welcome_data, bob_identity.into_bytes(), None)
+        .unwrap();
+    let projection = GroupState {
+        conversation_id: convo_id.clone(),
+        group_id: hex::encode(&group),
+        epoch: 1,
+        members: alice
+            .orchestrator
+            .mls_context()
+            .group_member_identities(group.clone())
+            .unwrap()
+            .into_iter()
+            .map(|id| String::from_utf8(id).unwrap())
+            .collect(),
+    };
+    alice.storage.set_group_state(&projection).await.unwrap();
+    alice.storage.set_epoch_pair_for_test(&convo_id, 1, 1);
+    let since = now_ms();
+    alice
+        .storage
+        .mark_quarantined(
+            &convo_id,
+            QuarantineReason::RepeatedFramingFailures.tag(),
+            since,
+        )
+        .await
+        .unwrap();
+    alice
+        .storage
+        .set_conversation_state(
+            &convo_id,
+            ConversationState::Quarantined {
+                reason: QuarantineReason::RepeatedFramingFailures,
+                since_ms: since,
+            },
+        )
+        .await
+        .unwrap();
+    // Entry is covered separately above. Rehydrate real crypto plus durable
+    // quarantine so this race isolates the reachable healthy-peer exit path.
+    world.restart_client("Alice").await;
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let orchestrator = &alice.orchestrator;
+    let storage = &alice.storage;
+    assert!(orchestrator
+        .get_conversation_quarantine_state(&convo_id)
+        .await
+        .is_some());
+    let aad = serde_json::json!({
+        "conversationId":STANDARD.encode(uuid::Uuid::parse_str(&convo_id).unwrap().as_bytes()),
+        "generation":0,"protocolVersion":"1","transitionId":STANDARD.encode(uuid::Uuid::new_v4().as_bytes()),
+        "prior":{"conversationId":STANDARD.encode(uuid::Uuid::parse_str(&convo_id).unwrap().as_bytes()),
+            "generation":0,"stateVersion":1,"epoch":1,"lifecycle":"active","groupId":STANDARD.encode(&group),
+            "confirmationTag":STANDARD.encode(bob.orchestrator.mls_context().get_confirmation_tag(group.clone()).unwrap()),
+            "groupContextHash":STANDARD.encode(bob.orchestrator.mls_context().get_group_context_hash(group.clone()).unwrap())},
+    });
+    let commit = bob
+        .orchestrator
+        .mls_context()
+        .remove_members_with_aad(
+            group.clone(),
+            vec![charlie_identity.into_bytes()],
+            Some(catbird_mls::orchestrator::canonical_commit_aad_bytes(&aad).unwrap()),
+        )
+        .unwrap()
+        .commit_data;
+    bob.orchestrator
+        .mls_context()
+        .merge_pending_commit(group.clone())
+        .unwrap();
+    let envelope = IncomingEnvelope {
+        conversation_id: convo_id.clone(),
+        sender_did: bob.did.clone(),
+        ciphertext: commit,
+        timestamp: chrono::Utc::now(),
+        server_message_id: Some(uuid::Uuid::new_v4().to_string()),
+        server_epoch: Some(2),
+        server_sequence: Some(2),
+    };
     let state_barrier =
         storage.pause_next_conversation_state_write(&convo_id, ConversationState::Active);
-    let exit = orchestrator.user_confirmed_manual_reset(&convo_id);
+    let exit = orchestrator.process_incoming(&envelope);
     let reset = async {
         state_barrier.wait_until_entered().await;
         let mut recording =
             Box::pin(orchestrator.record_group_reset_with_outcome(&convo_id, vec![0x7d; 32], 21));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording)
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), &mut recording).await.is_err(),
+            "reset must wait while the durable healthy-peer quarantine exit owns the transition gate");
+        assert_eq!(
+            orchestrator.mls_context().get_epoch(group.clone()).unwrap(),
+            2,
+            "the healthy peer Commit is already native-durable while exit owns the gate"
+        );
+        assert_eq!(
+            storage
+                .get_group_state(&hex::encode(&group))
                 .await
-                .is_err(),
-            "reset must wait while quarantine exit owns the transition gate"
+                .unwrap()
+                .unwrap()
+                .epoch,
+            2,
+            "the app epoch projection precedes quarantine exit"
         );
         state_barrier.release();
         recording.await
@@ -1454,7 +1557,7 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
         })
         .await
         .expect("quarantine exit race timed out");
-    exit_result.expect("exit quarantine");
+    exit_result.expect("process durable healthy peer Commit and exit quarantine");
     assert_eq!(
         reset_result.expect("record reset"),
         ResetRecordOutcome::Recorded
@@ -1466,6 +1569,13 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
             .reset_generation,
         21
     );
+    assert!(matches!(
+        storage.get_conversation_state(&convo_id).await.unwrap(),
+        Some(ConversationState::ResetPending {
+            reset_generation: 21,
+            ..
+        })
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1501,6 +1611,7 @@ async fn decrypt_failure_projection_preserves_reset_authority() {
                 timestamp: chrono::Utc::now(),
                 server_message_id: Some(format!("self-bad-{i}")),
                 server_epoch: None,
+                server_sequence: None,
             })
             .await;
     }
@@ -1568,6 +1679,7 @@ async fn failing_quarantine_persists_escalate() {
         timestamp: chrono::Utc::now(),
         server_message_id: Some(format!("00000000-0000-4000-8002-{:012x}", i + 1)),
         server_epoch: None,
+        server_sequence: None,
     };
 
     // Two peer-bad frames arm Layer 3; inject the enter-side persist
@@ -1669,6 +1781,7 @@ async fn server_reset_exits_quarantine_even_when_the_backstop_clear_fails() {
             timestamp: chrono::Utc::now(),
             server_message_id: Some(format!("bad-frame-{i}")),
             server_epoch: None,
+            server_sequence: None,
         };
         let _ = orchestrator.process_incoming(&envelope).await;
     }
