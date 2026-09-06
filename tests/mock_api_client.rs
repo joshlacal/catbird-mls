@@ -84,8 +84,26 @@ fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Val
         "metadataSnapshot": metadata_snapshot,
         "snapshotSeq": 1
     });
+    if let Some(coordinate) = state.pointer("/metadataSnapshot/coordinate").cloned() {
+        for key in ["groupContextHash", "confirmationTag", "generation"] {
+            if let Some(value) = coordinate.get(key) {
+                state["coordinates"][key] = value.clone();
+            }
+        }
+    }
     if let Some(leaves) = &conversation.leaves {
         state["leaves"] = serde_json::Value::Array(leaves.clone());
+    }
+    if state["metadataSnapshot"].get("authorProof").is_some() && state.get("leaves").is_some() {
+        // Canonical signed creation/recovery fixtures retain the actual
+        // cryptographic snapshot and exact device roster.
+        state["cipherSuite"] = serde_json::json!("MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519");
+        let leaves = state["leaves"].as_array().unwrap().clone();
+        if let Some(participants) = state["participants"].as_array_mut() {
+            for participant in participants {
+                participant["leafCount"] = serde_json::json!(leaves.iter().filter(|leaf| leaf["userDid"] == participant["userDid"]).count());
+            }
+        }
     }
     state
 }
@@ -108,6 +126,7 @@ struct FailureFlags {
     fail_next_send: bool,
     fail_next_create: bool,
     fail_next_get_messages: bool,
+    fail_next_get_entries: bool,
     fail_next_get_group_info: bool,
     /// When true, next get_welcome fails with a generic (non-404) error.
     /// Drives `join_or_rejoin` straight to the External Commit fallback,
@@ -117,6 +136,10 @@ struct FailureFlags {
     fail_next_get_key_packages: bool,
     fail_next_add_members: bool,
     fail_next_remove_members: bool,
+    fail_next_policy_removal: bool,
+    lose_next_account_removal_response: bool,
+    lose_next_leave_fulfillment_response: usize,
+    fail_leave_fulfillment_submissions: usize,
     fail_next_publish_key_package: bool,
     fail_next_register_device: bool,
     fail_next_get_conversations: bool,
@@ -149,6 +172,16 @@ struct MockState {
     /// Custom raw GatewayResponse for the next sendMessage call.
     next_send_custom_response:
         Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    device_directory_responses:
+        Vec<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    lifecycle_state_overrides: HashMap<String, serde_json::Value>,
+    pending_leave_requests: HashMap<String, Vec<serde_json::Value>>,
+    removal_tombstones: Vec<serde_json::Value>,
+    closed_conversation_tombstones: HashMap<String, serde_json::Value>,
+    leave_request_ttl_seconds: Option<i64>,
+    next_leave_custom_response:
+        Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    leave_custom_responses: Vec<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
     /// Conversations temporarily omitted from get_conversations, modeling the
     /// visibility gap between createConvo acceptance and list projection.
     hidden_conversation_ids: HashSet<String>,
@@ -211,6 +244,28 @@ struct MockState {
 
     /// Leaf recovery inbox items served to GetLeafRecoveryInbox.
     leaf_recovery_inbox_items: Vec<serde_json::Value>,
+    /// Queued page responses; once drained, reads use the retained inbox items.
+    leaf_recovery_inbox_responses:
+        Vec<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    recovery_transition_responses: HashMap<String, Vec<u8>>,
+    drop_recovery_fulfillment_responses: usize,
+    fail_recovery_requests_before_acceptance: usize,
+    recovery_custom_rejections: Vec<(u16, String)>,
+    reject_next_recovery_fulfillment: bool,
+    recovery_transition_requests: HashMap<String, Vec<u8>>,
+    /// One server response for exercising recovery expiry and already-open handling.
+    next_leaf_recovery_response:
+        Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    terminal_inventory_extra_items: Vec<serde_json::Value>,
+    welcome_deliveries: Vec<serde_json::Value>,
+    welcome_ack_responses: HashMap<String, (Vec<u8>, Vec<u8>)>,
+    lose_welcome_ack_responses: usize,
+    account_exit_responses: HashMap<String, (Vec<u8>, serde_json::Value)>,
+    /// Per-conversation point-read response, optionally gated on an accepted exit.
+    account_exit_state_responses: HashMap<String, (bool, u16, Vec<u8>)>,
+    lose_account_exit_responses: usize,
+    tamper_account_exit_entry: bool,
+    roundtrip_account_exit_response: bool,
     /// Conversation control entries served to GetEntries.
     entries: Vec<serde_json::Value>,
     /// Cached `add_members_with_idempotency` results keyed by idempotency key.
@@ -302,6 +357,138 @@ impl MockDeliveryService {
     pub fn set_next_create_conversation_id(&self, conversation_id: &str) {
         self.state.lock().unwrap().next_create_conversation_id = Some(conversation_id.to_string());
     }
+    pub fn queue_device_directory_response(&self, status: u16, body: serde_json::Value) {
+        self.state.lock().unwrap().device_directory_responses.push(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&body).unwrap(),
+            },
+        );
+    }
+    pub fn set_welcome_delivery_for_test(&self, delivery: serde_json::Value) {
+        let mut guard = self.state.lock().unwrap();
+        guard
+            .welcome_deliveries
+            .retain(|old| old["welcomeId"] != delivery["welcomeId"]);
+        guard.welcome_deliveries.push(delivery);
+    }
+
+    pub fn lose_next_welcome_ack_responses(&self, count: usize) {
+        self.state.lock().unwrap().lose_welcome_ack_responses = count;
+    }
+
+    pub fn lose_next_account_exit_responses(&self, count: usize) {
+        self.state.lock().unwrap().lose_account_exit_responses = count;
+    }
+    pub fn set_account_exit_state_response_for_test(
+        &self,
+        conversation_id: &str,
+        after_acceptance: bool,
+        status: u16,
+        body: Vec<u8>,
+    ) {
+        self.state.lock().unwrap().account_exit_state_responses.insert(
+            conversation_id.into(),
+            (after_acceptance, status, body),
+        );
+    }
+    pub fn tamper_next_account_exit_entry_for_test(&self) {
+        self.state.lock().unwrap().tamper_account_exit_entry = true;
+    }
+    pub fn roundtrip_next_account_exit_response_for_test(&self) {
+        self.state.lock().unwrap().roundtrip_account_exit_response = true;
+    }
+    fn account_exit_response(
+        &self,
+        raw: &[u8],
+        accepted: serde_json::Value,
+    ) -> Result<catbird_mls::orchestrator::GatewayResponse> {
+        let wrapper: serde_json::Value = serde_json::from_slice(raw).unwrap();
+        let id = wrapper["signedRequest"]["body"]["transitionId"]
+            .as_str()
+            .unwrap();
+        let mut guard = self.state.lock().unwrap();
+        let accepted = if guard.roundtrip_account_exit_response {
+            guard.roundtrip_account_exit_response = false;
+            fn lexicon_bytes(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::Object(fields) => for (key, value) in fields {
+                        if matches!(key.as_str(), "signature" | "groupId" | "confirmationTag" | "groupContextHash") && value.is_string() {
+                            *value = serde_json::json!({"$bytes":value.as_str().unwrap()});
+                        } else { lexicon_bytes(value); }
+                    },
+                    serde_json::Value::Array(values) => for value in values { lexicon_bytes(value); },
+                    _ => {},
+                }
+            }
+            let mut accepted = accepted;
+            lexicon_bytes(&mut accepted);
+            if wrapper["signedRequest"]["body"]["$type"]
+                == "blue.catbird.chat.defs#conversationCloseBody"
+            {
+                let mut output: catbird_atproto::blue_catbird::chat::close_conversation::CloseConversationOutput = serde_json::from_value(accepted).unwrap();
+                output.result.entry.extra_data = None;
+                output.result.entry.signed_request.extra_data = None;
+                output.result.entry.signed_request.body.extra_data = None;
+                output.result.entry.tombstone.extra_data = None;
+                output.result.tombstone.extra_data = None;
+                serde_json::to_value(output).unwrap()
+            } else {
+                let mut output: catbird_atproto::blue_catbird::chat::request_leave::RequestLeaveOutput = serde_json::from_value(accepted).unwrap();
+                let catbird_atproto::blue_catbird::chat::LeaveOperationResult::ZeroLeafLeaveResult(
+                    result,
+                ) = &mut output.result
+                else {
+                    panic!("expected zero-leaf result")
+                };
+                result.entry.extra_data = None;
+                result.entry.signed_request.extra_data = None;
+                result.entry.signed_request.body.extra_data = None;
+                serde_json::to_value(output).unwrap()
+            }
+        } else {
+            accepted
+        };
+        if let Some((saved, _)) = guard.account_exit_responses.get(id) {
+            assert_eq!(
+                saved, raw,
+                "account exit retry preserves exact signed bytes"
+            );
+        } else {
+            guard
+                .account_exit_responses
+                .insert(id.into(), (raw.to_vec(), accepted.clone()));
+        }
+        if guard.lose_account_exit_responses > 0 {
+            guard.lose_account_exit_responses -= 1;
+            return Err(OrchestratorError::Api(
+                "injected lost account exit response after acceptance".into(),
+            ));
+        }
+        let mut output = accepted;
+        if guard.tamper_account_exit_entry {
+            guard.tamper_account_exit_entry = false;
+            output["result"]["entry"]["signedRequest"]["body"]["actorDeviceId"] =
+                serde_json::json!(uuid::Uuid::new_v4().to_string());
+        }
+        Ok(catbird_mls::orchestrator::GatewayResponse {
+            status: 200,
+            content_type: Some("application/json".into()),
+            body: serde_json::to_vec(&output).unwrap(),
+        })
+    }
+
+    pub fn set_welcome_ack_status_for_test(&self, id: &str, status: &str) {
+        let mut guard = self.state.lock().unwrap();
+        let delivery = guard
+            .welcome_deliveries
+            .iter_mut()
+            .find(|delivery| delivery["welcomeId"] == id)
+            .unwrap();
+        delivery["status"] = serde_json::json!(status);
+    }
+
     pub fn set_next_create_custom_response(&self, status: u16, body: serde_json::Value) {
         self.state.lock().unwrap().next_create_custom_response = Some(
             catbird_mls::orchestrator::canonical_transport::GatewayResponse {
@@ -320,6 +507,102 @@ impl MockDeliveryService {
             },
         );
     }
+    pub fn set_lifecycle_state_for_test(&self, conversation_id: &str, state: serde_json::Value) {
+        self.state
+            .lock()
+            .unwrap()
+            .lifecycle_state_overrides
+            .insert(conversation_id.into(), state);
+    }
+    pub fn set_next_leave_custom_response(&self, status: u16, body: serde_json::Value) {
+        self.state.lock().unwrap().next_leave_custom_response = Some(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&body).unwrap(),
+            },
+        );
+    }
+    pub fn set_terminal_inventory_extra_items_for_test(&self, items: Vec<serde_json::Value>) {
+        self.state.lock().unwrap().terminal_inventory_extra_items = items;
+    }
+
+    pub fn set_terminal_entries_for_test(&self, entries: Vec<serde_json::Value>) {
+        self.state.lock().unwrap().entries = entries;
+    }
+
+    pub fn terminal_entries_for_test(&self) -> Vec<serde_json::Value> {
+        self.state.lock().unwrap().entries.clone()
+    }
+
+    pub fn set_leave_request_ttl_for_test(&self, seconds: i64) {
+        self.state.lock().unwrap().leave_request_ttl_seconds = Some(seconds);
+    }
+    /// Seed persisted recovery work for both authorized fulfiller discovery and
+    /// the independent exact target inbox. No invented conversation entry.
+    pub fn reject_next_recovery_fulfillment(&self) {
+        self.state.lock().unwrap().reject_next_recovery_fulfillment = true;
+    }
+
+    pub fn drop_recovery_fulfillment_responses(&self, count: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .drop_recovery_fulfillment_responses = count;
+    }
+
+    pub fn fail_recovery_requests_before_acceptance(&self, count: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .fail_recovery_requests_before_acceptance = count;
+    }
+
+    pub fn reject_recovery_requests(&self, status: u16, error: &str, count: usize) {
+        self.state.lock().unwrap().recovery_custom_rejections = vec![(status, error.into()); count];
+    }
+
+    pub fn drop_next_recovery_fulfillment_response(&self) {
+        self.drop_recovery_fulfillment_responses(1);
+    }
+
+    pub fn add_pending_leaf_recovery_request(&self, item: serde_json::Value) {
+        let mut guard = self.state.lock().unwrap();
+        let mut recovery = item.get("recovery").cloned().unwrap_or(item);
+        let cid = recovery["conversationId"].as_str().unwrap().to_owned();
+        let state = guard
+            .lifecycle_state_overrides
+            .get(&cid)
+            .cloned()
+            .or_else(|| guard.conversations.get(&cid).map(conversation_state_json))
+            .unwrap();
+        if recovery.get("boundCoordinate").is_none() {
+            recovery["boundCoordinate"] = state["coordinates"].clone();
+        }
+        if recovery.get("expiresAt").is_none() {
+            recovery["expiresAt"] =
+                serde_json::json!((chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339());
+        }
+        if recovery.pointer("/reservation/requesterKeyId").is_none() {
+            let encoded = recovery.pointer("/reservation/keyPackage/bytes").unwrap();
+            let encoded = encoded
+                .as_str()
+                .or_else(|| encoded["$bytes"].as_str())
+                .unwrap();
+            let package = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            let binding =
+                catbird_mls::orchestrator::credential_binding::extract_key_package_binding(
+                    &package,
+                )
+                .unwrap();
+            recovery["reservation"]["requesterKeyId"] =
+                serde_json::json!(URL_SAFE_NO_PAD.encode(Sha256::digest(&binding.signature_key)));
+        }
+        guard.leaf_recovery_inbox_items.push(recovery);
+    }
+
     pub fn add_leaf_recovery_inbox_item(&self, item: serde_json::Value) {
         self.state
             .lock()
@@ -404,6 +687,10 @@ impl MockDeliveryService {
         self.state.lock().unwrap().failures.fail_next_get_messages = true;
     }
 
+    pub fn fail_next_get_entries(&self) {
+        self.state.lock().unwrap().failures.fail_next_get_entries = true;
+    }
+
     pub fn fail_next_get_group_info(&self) {
         self.state.lock().unwrap().failures.fail_next_get_group_info = true;
     }
@@ -422,6 +709,59 @@ impl MockDeliveryService {
 
     pub fn fail_next_add_members(&self) {
         self.state.lock().unwrap().failures.fail_next_add_members = true;
+    }
+
+    pub fn lose_next_leave_fulfillment_response(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .lose_next_leave_fulfillment_response = 1;
+    }
+
+    pub fn set_leave_fulfillment_responses(
+        &self,
+        count: usize,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        self.state.lock().unwrap().leave_custom_responses = (0..count)
+            .map(
+                |_| catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&body).unwrap(),
+                },
+            )
+            .collect();
+    }
+
+    pub fn fail_leave_fulfillment_submissions(&self, count: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .fail_leave_fulfillment_submissions = count;
+    }
+
+    pub fn lose_leave_fulfillment_responses(&self, count: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .lose_next_leave_fulfillment_response = count;
+    }
+
+    pub fn lose_next_account_removal_response(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .lose_next_account_removal_response = true;
+    }
+
+    pub fn fail_next_policy_removal(&self) {
+        self.state.lock().unwrap().failures.fail_next_policy_removal = true;
     }
 
     pub fn fail_next_remove_members(&self) {
@@ -589,6 +929,15 @@ impl MockDeliveryService {
         stored.view.group_id = group_id.to_string();
     }
 
+    /// Seed a full list projection without changing point-read authority or membership.
+    pub fn set_conversation_view_for_test(&self, conversation_id: &str, view: ConversationView) {
+        let mut guard = self.state.lock().unwrap();
+        let record = guard.conversations.get_mut(conversation_id).expect("existing conversation");
+        assert_eq!(view.conversation_id, conversation_id);
+        assert_eq!(view.group_id, record.view.group_id);
+        record.view = view;
+    }
+
     // -- introspection --------------------------------------------------------
 
     /// Number of messages stored for a conversation.
@@ -727,7 +1076,11 @@ impl MockDeliveryService {
 
     /// Report these `participantView`s in `state.participants` for a conversation.
     #[allow(dead_code)]
-    pub fn set_conversation_participants_for_test(&self, convo_id: &str, participants: Vec<serde_json::Value>) {
+    pub fn set_conversation_participants_for_test(
+        &self,
+        convo_id: &str,
+        participants: Vec<serde_json::Value>,
+    ) {
         let mut guard = self.state.lock().unwrap();
         if let Some(c) = guard.conversations.get_mut(convo_id) {
             c.participants = Some(participants);
@@ -891,6 +1244,20 @@ impl MockDeliveryService {
             spoofed_sender_did.to_string(),
         );
     }
+    pub fn set_next_leaf_recovery_response(
+        &self,
+        response: catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+    ) {
+        self.state.lock().unwrap().next_leaf_recovery_response = Some(response);
+    }
+
+    pub fn set_leaf_recovery_inbox_responses(
+        &self,
+        responses: Vec<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    ) {
+        self.state.lock().unwrap().leaf_recovery_inbox_responses = responses;
+    }
+
     pub fn submitted_prepared_requests(
         &self,
     ) -> Vec<catbird_mls::orchestrator::canonical_transport::PreparedRequest> {
@@ -981,6 +1348,7 @@ impl MockDeliveryService {
             created_at: Some(now),
             updated_at: Some(now),
             sequencer_did: None,
+            canonical_state: None,
         };
 
         let conversation_kind = "group".to_string();
@@ -1672,7 +2040,35 @@ impl MLSAPIClient for MockDeliveryService {
             .and_then(|s| s.get("body"))
             .unwrap_or(&body_val);
 
+        if matches!(
+            inner_body["$type"].as_str(),
+            Some(
+                "blue.catbird.chat.defs#conversationCloseBody"
+                    | "blue.catbird.chat.defs#zeroLeafLeaveBody"
+            )
+        ) {
+            let saved = self
+                .state
+                .lock()
+                .unwrap()
+                .account_exit_responses
+                .get(inner_body["transitionId"].as_str().unwrap())
+                .cloned();
+            if let Some((_, response)) = saved {
+                return self.account_exit_response(body_bytes, response);
+            }
+        }
+
         match request.operation {
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetDevices => {
+                let mut guard = self.state.lock().unwrap();
+                if !guard.device_directory_responses.is_empty() {
+                    return Ok(guard.device_directory_responses.remove(0));
+                }
+                return Err(OrchestratorError::Api(
+                    "authorized-device-key resolution is required but unsupported by this test directory".into(),
+                ));
+            }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation => {
                 if let Some(resp) = self.state.lock().unwrap().next_create_custom_response.take() {
                     return Ok(resp);
@@ -1754,6 +2150,13 @@ impl MLSAPIClient for MockDeliveryService {
                     stored.conversation_kind = kind.to_string();
                     stored.metadata_snapshot = inner_body.get("metadataSnapshot").cloned();
                     stored.participants = manifest_participants;
+                    if inner_body["metadataSnapshot"].get("authorProof").is_some()
+                        && inner_body["actorDid"].is_string() && inner_body["actorDeviceId"].is_string() && inner_body["keyId"].is_string() {
+                        stored.leaves = Some(vec![serde_json::json!({
+                            "userDid":inner_body["actorDid"],"deviceId":inner_body["actorDeviceId"],
+                            "keyId":inner_body["keyId"],"deviceStatus":"active","leafOrigin":"genesis"
+                        })]);
+                    }
                 }
                 let participants: Vec<serde_json::Value> = res
                     .conversation
@@ -2044,6 +2447,210 @@ impl MLSAPIClient for MockDeliveryService {
                     body: serde_json::to_vec(&output).unwrap(),
                 })
             }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
+                if inner_body["$type"] == "blue.catbird.chat.defs#leaveCommitFulfillmentBody" => {
+                use base64::engine::general_purpose::STANDARD;
+                let mut guard = self.state.lock().unwrap();
+                check_fail(&mut guard.failures.fail_next_remove_members, "injected remove_members failure")?;
+                if guard.failures.fail_leave_fulfillment_submissions > 0 {
+                    guard.failures.fail_leave_fulfillment_submissions -= 1;
+                    return Err(OrchestratorError::Api("leave Commit transport unavailable".into()));
+                }
+                if !guard.leave_custom_responses.is_empty() { return Ok(guard.leave_custom_responses.remove(0)); }
+                if let Some(response) = guard.next_leave_custom_response.take() { return Ok(response); }
+                let cid = inner_body["prior"]["conversationId"].as_str().unwrap().to_owned();
+                let request_id = inner_body["leaveRequestId"].as_str().unwrap();
+                if let Some(entry) = guard.entries.iter().find(|entry| entry["entryId"] == inner_body["transitionId"] && entry["$type"] == "blue.catbird.chat.defs#leaveCommitFulfillmentEntry").cloned() {
+                    assert_eq!(entry["signedRequest"], body_val["signedRequest"], "idempotent retry preserves exact signed request");
+                    if guard.failures.lose_next_leave_fulfillment_response > 0 {
+                        guard.failures.lose_next_leave_fulfillment_response -= 1;
+                        return Err(OrchestratorError::Api("response lost after replayed leave Commit".into()));
+                    }
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {status:200,content_type:Some("application/json".into()),body:serde_json::to_vec(&serde_json::json!({"coordinates":inner_body["next"],"entry":entry,"welcomes":[]})).unwrap()});
+                }
+                let mut current = guard.lifecycle_state_overrides.get(&cid).cloned()
+                    .unwrap_or_else(|| conversation_state_json(&guard.conversations[&cid]));
+                if inner_body["prior"] != current["coordinates"] {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {status:409,content_type:Some("application/json".into()),body:serde_json::to_vec(&serde_json::json!({"error":"StaleConversationState"})).unwrap()});
+                }
+                let entry_seq = current["snapshotSeq"].as_u64().expect("authoritative snapshotSeq") + 1;
+                let request = guard.pending_leave_requests.get(&cid).and_then(|requests| requests.iter().find(|r| r["leaveRequestId"] == request_id && r["status"] == "pending")).cloned().expect("leave fulfillment requires durable consent");
+                assert_eq!(request["prior"], current["coordinates"], "leave consent must match current state");
+                assert_eq!(inner_body["prior"], current["coordinates"], "leave CAS must match current state");
+                assert_ne!(inner_body["actorDid"], request["requesterDid"], "another account must fulfill");
+                let requester = request["requesterDid"].as_str().unwrap();
+                let leaves = current["leaves"].as_array_mut().unwrap();
+                let expected: HashSet<_> = leaves.iter().filter(|leaf| leaf["userDid"] == requester).map(|leaf| leaf["deviceId"].as_str().unwrap().to_string()).collect();
+                let changes = inner_body["manifest"]["leafChanges"].as_array().unwrap();
+                let actual: HashSet<_> = changes.iter().map(|leaf| {
+                    assert_eq!(leaf["$type"], "blue.catbird.chat.defs#removeLeaf");
+                    assert_eq!(leaf["userDid"], requester);
+                    leaf["deviceId"].as_str().unwrap().to_string()
+                }).collect();
+                assert_eq!(actual, expected, "every requester device must be removed");
+                assert_eq!(actual.len(), changes.len());
+                assert_eq!(inner_body["manifest"]["participantChanges"], serde_json::json!([{"$type":"blue.catbird.chat.defs#removeParticipant","userDid":requester}]));
+                assert!(inner_body["manifest"].get("welcomeBundle").is_none());
+                leaves.retain(|leaf| leaf["userDid"] != requester);
+                current["participants"].as_array_mut().unwrap().retain(|participant| participant["userDid"] != requester);
+                current["coordinates"] = inner_body["next"].clone();
+                current["snapshotSeq"] = serde_json::json!(entry_seq);
+                current["metadataSnapshot"] = inner_body["metadataSnapshot"].clone();
+                let stored = guard.conversations.get_mut(&cid).unwrap();
+                stored.view.epoch = inner_body["next"]["epoch"].as_u64().unwrap();
+                stored.members.retain(|m| m != requester && !m.starts_with(&format!("{requester}#")));
+                stored.view.members.retain(|m| m.did != requester && !m.did.starts_with(&format!("{requester}#")));
+                stored.leaves = current["leaves"].as_array().cloned();
+                stored.participants = current["participants"].as_array().cloned();
+                stored.metadata_snapshot = Some(current["metadataSnapshot"].clone());
+                guard.lifecycle_state_overrides.insert(cid.clone(), current);
+                let request = guard.pending_leave_requests.get_mut(&cid).unwrap().iter_mut().find(|r| r["leaveRequestId"] == request_id).unwrap();
+                request["status"] = serde_json::json!("fulfilled");
+                let commit = STANDARD.decode(inner_body["commit"]["bytes"].as_str().unwrap()).unwrap();
+                assert!(!commit.is_empty(), "fulfillment must carry real MLS Commit bytes");
+                guard.messages.entry(cid.clone()).or_default().push(StoredMessage {
+                    id: inner_body["transitionId"].as_str().unwrap().into(), conversation_id: cid.clone(),
+                    sender_did: inner_body["actorDid"].as_str().unwrap().into(), ciphertext: commit,
+                    timestamp: Utc::now(), is_commit: true, epoch: inner_body["prior"]["epoch"].as_u64(),
+                });
+                let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#leaveCommitFulfillmentEntry", "entryId":inner_body["transitionId"], "conversationId":cid, "seq":entry_seq, "signedRequest":body_val["signedRequest"], "receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                guard.entries.push(entry.clone());
+                for removed_device in expected {
+                    guard.removal_tombstones.push(serde_json::json!({
+                        "$type":"blue.catbird.chat.defs#conversationRemovalTombstone",
+                        "conversationId":cid,"membershipIntervalId":uuid::Uuid::new_v4().to_string(),
+                        "userDid":requester,"deviceId":removed_device,
+                        "terminalSeq":entry["seq"],"removedAt":entry["receivedAt"]
+                    }));
+                }
+                if guard.failures.lose_next_leave_fulfillment_response > 0 {
+                    guard.failures.lose_next_leave_fulfillment_response -= 1;
+                    return Err(OrchestratorError::Api("response lost after accepted leave Commit".into()));
+                }
+                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {status:200,content_type:Some("application/json".into()),body:serde_json::to_vec(&serde_json::json!({"coordinates":inner_body["next"],"entry":entry,"welcomes":[]})).unwrap()})
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
+                if inner_body["$type"] == "blue.catbird.chat.defs#policyTransitionBody" => {
+                let cid = inner_body["prior"]["conversationId"].as_str().unwrap();
+                let mut guard = self.state.lock().unwrap();
+                let reply = |status, value: serde_json::Value| catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status, content_type: Some("application/json".into()), body:serde_json::to_vec(&value).unwrap()
+                };
+                if let Some(entry) = guard.entries.iter().find(|entry| entry["entryId"] == inner_body["transitionId"] && entry["conversationId"] == cid) {
+                    assert_eq!(entry["signedRequest"], body_val["signedRequest"]);
+                    return Ok(reply(200, serde_json::json!({"coordinates":inner_body["next"],"entry":entry})));
+                }
+                let mut current = guard.lifecycle_state_overrides.get(cid).cloned()
+                    .unwrap_or_else(|| conversation_state_json(&guard.conversations[cid]));
+                let normalize = |value: &serde_json::Value| {
+                    let mut value = value.clone();
+                    for key in ["groupId", "confirmationTag", "groupContextHash"] {
+                        if let Some(bytes) = value[key]["$bytes"].as_str() { value[key] = serde_json::json!(bytes); }
+                    }
+                    value
+                };
+                if normalize(&inner_body["prior"]) != normalize(&current["coordinates"]) {
+                    return Ok(reply(409, serde_json::json!({"error":"StaleCoordinate"})));
+                }
+                if current["conversationKind"] != "group" || !current["participants"].as_array().unwrap().iter().any(|p| p["userDid"] == inner_body["actorDid"] && p["status"] == "active" && p["role"] == "admin") {
+                    return Ok(reply(403, serde_json::json!({"error":"NotAuthorized"})));
+                }
+                let changes = inner_body["participantChanges"].as_array().unwrap();
+                if changes.iter().any(|change| change["$type"] == "blue.catbird.chat.defs#removeParticipant") && std::mem::take(&mut guard.failures.fail_next_policy_removal) {
+                    return Ok(reply(503, serde_json::json!({"error":"TemporarilyUnavailable"})));
+                }
+                let mut expected = normalize(&inner_body["prior"]);
+                expected["stateVersion"] = serde_json::json!(expected["stateVersion"].as_u64().unwrap() + 1);
+                assert_eq!(normalize(&inner_body["next"]), expected, "policy must preserve MLS coordinates");
+                for change in changes {
+                    let target = change["userDid"].as_str().unwrap();
+                    if change["$type"] == "blue.catbird.chat.defs#removeParticipant" {
+                        if target == inner_body["actorDid"] || current["leaves"].as_array().is_some_and(|leaves| leaves.iter().any(|leaf| leaf["userDid"] == target)) {
+                            return Ok(reply(409, serde_json::json!({"error":"ParticipantStillHasLeaves"})));
+                        }
+                        current["participants"].as_array_mut().unwrap().retain(|p| p["userDid"] != target);
+                    } else if change["$type"] == "blue.catbird.chat.defs#addParticipant" {
+                        let participants = current["participants"].as_array_mut().unwrap();
+                        assert!(!participants.iter().any(|p| p["userDid"] == target));
+                        participants.push(serde_json::json!({"userDid":target,"role":change["role"],"status":"pending","leafCount":0,"invitationProvenance":change["invitationProvenance"]}));
+                    } else { panic!("unsupported test policy change"); }
+                }
+                current["coordinates"] = normalize(&inner_body["next"]);
+                let seq = current["snapshotSeq"].as_u64().unwrap() + 1;
+                current["snapshotSeq"] = serde_json::json!(seq);
+                let stored = guard.conversations.get_mut(cid).unwrap();
+                let participants = current["participants"].as_array().unwrap();
+                stored.participants = Some(participants.clone());
+                stored.members = participants.iter().map(|p| p["userDid"].as_str().unwrap().to_string()).collect();
+                stored.view.members = participants.iter().map(|p| MemberView { did:p["userDid"].as_str().unwrap().into(), role:if p["role"] == "admin" { MemberRole::Admin } else { MemberRole::Member } }).collect();
+                guard.lifecycle_state_overrides.insert(cid.to_string(), current);
+                let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#policyTransitionEntry","entryId":inner_body["transitionId"],"conversationId":cid,"seq":seq,"signedRequest":body_val["signedRequest"],"receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                guard.entries.push(entry.clone());
+                Ok(reply(200, serde_json::json!({"coordinates":inner_body["next"],"entry":entry})))
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition
+                if inner_body["$type"] == "blue.catbird.chat.defs#commitTransitionBody"
+                    && inner_body["manifest"]["participantChanges"].as_array().is_some_and(Vec::is_empty)
+                    && inner_body["manifest"].get("welcomeBundle").is_none()
+                    && inner_body["manifest"]["leafChanges"].as_array().is_some_and(|changes| !changes.is_empty() && changes.iter().all(|change| change["$type"] == "blue.catbird.chat.defs#removeLeaf")) => {
+                let cid = inner_body["prior"]["conversationId"].as_str().unwrap();
+                let mut guard = self.state.lock().unwrap();
+                let reply = |status, value: serde_json::Value| catbird_mls::orchestrator::canonical_transport::GatewayResponse { status,content_type:Some("application/json".into()),body:serde_json::to_vec(&value).unwrap() };
+                if let Some(entry) = guard.entries.iter().find(|entry| entry["entryId"] == inner_body["transitionId"] && entry["conversationId"] == cid) {
+                    assert_eq!(entry["signedRequest"],body_val["signedRequest"],"signed retries must remain exact");
+                    return Ok(reply(200,serde_json::json!({"coordinates":inner_body["next"],"entry":entry,"welcomes":[]})));
+                }
+                check_fail(&mut guard.failures.fail_next_remove_members,"injected remove_members failure")?;
+                if !guard.conversations.contains_key(cid) {
+                    return Ok(reply(404,serde_json::json!({"error":"ConversationNotFound"})));
+                }
+                let mut current = guard.lifecycle_state_overrides.get(cid).cloned().unwrap_or_else(|| conversation_state_json(&guard.conversations[cid]));
+                let normalize = |value:&serde_json::Value| {
+                    let mut value=value.clone();
+                    for key in ["groupId","confirmationTag","groupContextHash"] { if let Some(bytes)=value[key]["$bytes"].as_str() { value[key]=serde_json::json!(bytes); } }
+                    value
+                };
+                if normalize(&inner_body["prior"]) != normalize(&current["coordinates"]) { return Ok(reply(409,serde_json::json!({"error":"StaleCoordinate"}))); }
+                if inner_body["next"]["epoch"].as_u64() != inner_body["prior"]["epoch"].as_u64().and_then(|n|n.checked_add(1))
+                    || inner_body["next"]["stateVersion"].as_u64() != inner_body["prior"]["stateVersion"].as_u64().and_then(|n|n.checked_add(1)) {
+                    return Ok(reply(409,serde_json::json!({"error":"InvalidSuccessorCoordinate"})));
+                }
+                let changes=inner_body["manifest"]["leafChanges"].as_array().unwrap();
+                // Legacy fixtures may override coordinates without copying an
+                // explicitly seeded device roster. Reuse only that stored
+                // roster; the incoming Remove manifest cannot invent members.
+                if current.get("leaves").is_none() {
+                    if let Some(leaves) = &guard.conversations[cid].leaves {
+                        current["leaves"] = serde_json::json!(leaves);
+                    }
+                }
+                let Some(leaves)=current["leaves"].as_array_mut() else {
+                    return Ok(reply(409,serde_json::json!({"error":"InvalidDeviceRoster"})));
+                };
+                for change in changes {
+                    assert!(leaves.iter().any(|leaf| leaf["userDid"]==change["userDid"] && leaf["deviceId"]==change["deviceId"]));
+                    leaves.retain(|leaf| !(leaf["userDid"]==change["userDid"] && leaf["deviceId"]==change["deviceId"]));
+                }
+                let leaves=leaves.clone();
+                for participant in current["participants"].as_array_mut().unwrap() { participant["leafCount"]=serde_json::json!(leaves.iter().filter(|leaf| leaf["userDid"]==participant["userDid"]).count()); }
+                let seq=current["snapshotSeq"].as_u64().unwrap()+1;
+                current["snapshotSeq"]=serde_json::json!(seq);
+                current["coordinates"]=normalize(&inner_body["next"]);
+                current["metadataSnapshot"]=inner_body["metadataSnapshot"].clone();
+                let stored=guard.conversations.get_mut(cid).unwrap();
+                stored.view.epoch=inner_body["next"]["epoch"].as_u64().unwrap();
+                stored.leaves=Some(leaves);
+                stored.participants=current["participants"].as_array().cloned();
+                stored.metadata_snapshot=Some(current["metadataSnapshot"].clone());
+                guard.lifecycle_state_overrides.insert(cid.to_string(),current);
+                let commit=base64::engine::general_purpose::STANDARD.decode(inner_body["commit"]["bytes"].as_str().unwrap()).unwrap();
+                guard.messages.entry(cid.to_string()).or_default().push(StoredMessage{id:inner_body["transitionId"].as_str().unwrap().into(),conversation_id:cid.into(),sender_did:inner_body["actorDid"].as_str().unwrap().into(),ciphertext:commit,timestamp:Utc::now(),is_commit:true,epoch:inner_body["prior"]["epoch"].as_u64()});
+                let entry=serde_json::json!({"$type":"blue.catbird.chat.defs#commitEntry","conversationId":cid,"entryId":inner_body["transitionId"],"seq":seq,"signedRequest":body_val["signedRequest"],"receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                guard.entries.push(entry.clone());
+                for change in changes { guard.removal_tombstones.push(serde_json::json!({"$type":"blue.catbird.chat.defs#conversationRemovalTombstone","conversationId":cid,"membershipIntervalId":uuid::Uuid::new_v4().to_string(),"userDid":change["userDid"],"deviceId":change["deviceId"],"terminalSeq":seq,"removedAt":entry["receivedAt"]})); }
+                if std::mem::take(&mut guard.failures.lose_next_account_removal_response) { return Err(OrchestratorError::Api("injected response loss after accepted account device removal".into())); }
+                Ok(reply(200,serde_json::json!({"coordinates":inner_body["next"],"entry":entry,"welcomes":[]})))
+            }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SubmitTransition => {
                 let convo_id = inner_body
                     .get("prior")
@@ -2073,6 +2680,40 @@ impl MLSAPIClient for MockDeliveryService {
                     .get("recoveryRequestId")
                     .and_then(|r| r.as_str())
                     .map(|s| s.to_string());
+                if recovery_request_id.is_some() && guard.fail_recovery_requests_before_acceptance > 0 {
+                    guard.fail_recovery_requests_before_acceptance -= 1;
+                    return Err(OrchestratorError::Api("injected recovery request loss before acceptance".into()));
+                }
+                if recovery_request_id.is_some() && std::mem::take(&mut guard.reject_next_recovery_fulfillment) {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse { status:409, content_type:Some("application/json".into()), body:br#"{"error":"StaleCoordinate"}"#.to_vec() });
+                }
+                if let Some(response) = idempotency_key.as_ref().and_then(|id| guard.recovery_transition_responses.get(id)) {
+                    assert_eq!(guard.recovery_transition_requests[idempotency_key.as_ref().unwrap()].as_slice(), body_bytes, "retries must preserve exact signed request bytes");
+                    let response = response.clone();
+                    if guard.drop_recovery_fulfillment_responses > 0 {
+                        guard.drop_recovery_fulfillment_responses -= 1;
+                        return Err(OrchestratorError::Api("injected lost cached recovery response".into()));
+                    }
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse { status:200, content_type:Some("application/json".into()), body:response });
+                }
+                if recovery_request_id.is_some() {
+                    if !guard.recovery_custom_rejections.is_empty() {
+                        let (status, error) = guard.recovery_custom_rejections.remove(0);
+                        if error == "LeafRecoveryExpired" {
+                            for recovery in &mut guard.leaf_recovery_inbox_items {
+                                if recovery["recoveryRequestId"].as_str() == recovery_request_id.as_deref() {
+                                    recovery["status"] = serde_json::json!("expired");
+                                }
+                            }
+                        }
+                        return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse { status, content_type:Some("application/json".into()), body:serde_json::to_vec(&serde_json::json!({"error":error})).unwrap() });
+                    }
+                    let current = guard.lifecycle_state_overrides.get(&convo_id).cloned()
+                        .unwrap_or_else(|| conversation_state_json(&guard.conversations[&convo_id]));
+                    if inner_body["prior"] != current["coordinates"] {
+                        return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse { status:409, content_type:Some("application/json".into()), body:br#"{"error":"StaleCoordinate"}"#.to_vec() });
+                    }
+                }
                 if let Some(idem) = &idempotency_key {
                     guard.add_members_idempotency_keys.push(idem.clone());
                 }
@@ -2104,6 +2745,10 @@ impl MLSAPIClient for MockDeliveryService {
                 check_fail(&mut guard.failures.fail_next_commit_group_change, "injected commit_group_change failure")?;
                 check_fail(&mut guard.failures.fail_next_add_members, "injected add_members failure")?;
                 check_fail(&mut guard.failures.fail_next_remove_members, "injected remove_members failure")?;
+                if guard.failures.fail_leave_fulfillment_submissions > 0 {
+                    guard.failures.fail_leave_fulfillment_submissions -= 1;
+                    return Err(OrchestratorError::Api("leave Commit transport unavailable".into()));
+                }
                 if guard.failures.reject_next_add_members {
                     guard.failures.reject_next_add_members = false;
                     let output = serde_json::json!({
@@ -2162,8 +2807,18 @@ impl MLSAPIClient for MockDeliveryService {
                         if let Some(changes) = leaf_changes.filter(|c| !c.is_empty()) {
                             for change in changes {
                                 if let Some(user_did) = change.get("userDid").and_then(|u| u.as_str()) {
-                                    stored.members.retain(|m| m != user_did && !m.starts_with(&format!("{user_did}#")));
-                                    stored.view.members.retain(|m| m.did != user_did && !m.did.starts_with(&format!("{user_did}#")));
+                                    let device_id = change["deviceId"].as_str().unwrap_or_default();
+                                    let is_remove = change["$type"].as_str() == Some("blue.catbird.chat.defs#removeLeaf");
+                                    if let Some(leaves) = &mut stored.leaves {
+                                        leaves.retain(|leaf| !(leaf["userDid"] == user_did && leaf["deviceId"] == device_id));
+                                        if !is_remove {
+                                            leaves.push(serde_json::json!({"userDid": user_did, "deviceId": device_id}));
+                                        }
+                                    }
+                                    if !is_remove && !stored.members.contains(&user_did.to_string()) {
+                                        stored.members.push(user_did.to_string());
+                                        stored.view.members.push(MemberView { did: user_did.to_string(), role: MemberRole::Member });
+                                    }
                                 }
                             }
                         } else {
@@ -2236,8 +2891,15 @@ impl MLSAPIClient for MockDeliveryService {
                     });
                 if let Some(w_bytes) = welcome_bytes_opt {
                     let group_id_opt = guard.conversations.get(&convo_id).map(|c| c.view.group_id.clone());
+                    let recovery_target = recovery_request_id.as_ref().and_then(|_| {
+                        inner_body.pointer("/manifest/welcomeBundle/deliveries/0/recipientDid")
+                            .and_then(|v| v.as_str())
+                    });
                     for (k, _) in guard.key_packages.clone() {
-                        if k != did {
+                        // Recovery targets one exact device and may add a
+                        // sibling of the author. Account equality does not
+                        // make its Welcome an already-consumed sender echo.
+                        if recovery_target.map_or(k != did, |target| target == k) {
                             guard
                                 .welcomes
                                  .entry((convo_id.to_string(), k.clone()))
@@ -2267,13 +2929,66 @@ impl MLSAPIClient for MockDeliveryService {
                 } else {
                     None
                 };
-                let output = serde_json::json!({
-                    "result": {
-                        "applied": true,
-                        "epoch": new_epoch,
-                        "receipt": receipt
+                let output = if recovery_request_id.is_some() {
+                    let next_seq = guard.lifecycle_state_overrides.get(&convo_id)
+                        .and_then(|state| state["snapshotSeq"].as_u64()).unwrap_or(1) + 1;
+                    // Canonical admission reads the full device-addressed
+                    // envelope. Preserve the signed delivery provenance and
+                    // the consumed package's actual MLS lifetime.
+                    let bundle = &inner_body["manifest"]["welcomeBundle"];
+                    let delivery = &bundle["deliveries"][0];
+                    let recovery = guard.leaf_recovery_inbox_items.iter()
+                        .find(|request| request["recoveryRequestId"].as_str() == recovery_request_id.as_deref())
+                        .expect("accepted recovery has its exact package reservation");
+                    use openmls::prelude::{tls_codec::DeserializeBytes as _, MlsMessageIn, MlsMessageBodyIn, ProtocolVersion};
+                    use openmls_traits::OpenMlsProvider as _;
+                    use chrono::TimeZone as _;
+                    let package_bytes = base64::engine::general_purpose::STANDARD
+                        .decode(recovery["reservation"]["keyPackage"]["bytes"].as_str().unwrap()).unwrap();
+                    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+                    let MlsMessageBodyIn::KeyPackage(package) = MlsMessageIn::tls_deserialize_exact_bytes(&package_bytes).unwrap().extract()
+                        else { panic!("recovery reservation must retain the exact MLS package") };
+                    let package = package.validate(provider.crypto(), ProtocolVersion::default()).unwrap();
+                    let requester_key_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        <sha2::Sha256 as sha2::Digest>::digest(package.leaf_node().signature_key().as_slice()));
+                    let recipient_did = delivery["recipientDid"].clone();
+                    let recipient_device = delivery["recipientDeviceId"].clone();
+                    let package_ref = recovery["reservation"]["keyPackageRef"].clone();
+                    let expires_at = Utc.timestamp_opt(package.life_time().not_after() as i64, 0).single().unwrap()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                    let welcome = serde_json::json!({
+                        "$type":"blue.catbird.chat.defs#welcomeView", "welcomeId":bundle["welcomeId"],
+                        "conversationId":convo_id,"transitionSeq":next_seq,"coordinates":inner_body["next"],
+                        "recipientDid":delivery["recipientDid"],"recipientDeviceId":delivery["recipientDeviceId"],
+                        "opaqueWelcome":bundle["opaqueWelcome"],"sha256":bundle["sha256"],
+                        "provenance":delivery["provenance"],"expiresAt":expires_at,"status":"pending"
+                    });
+                    guard.welcome_deliveries.push(welcome.clone());
+                    let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#leafRecoveryFulfillmentEntry", "conversationId":convo_id,"entryId":inner_body["transitionId"],"seq":next_seq,"receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true),"signedRequest":body_val["signedRequest"]});
+                    guard.entries.push(entry.clone());
+                    for request in &mut guard.leaf_recovery_inbox_items {
+                        if request["recoveryRequestId"].as_str() == recovery_request_id.as_deref() {
+                            request["status"] = serde_json::json!("fulfilled");
+                        }
                     }
-                });
+                    if let Some(stored) = guard.conversations.get_mut(&convo_id) {
+                        if let Some(leaves) = &mut stored.leaves {
+                            if let Some(leaf) = leaves.iter_mut().find(|leaf| leaf["userDid"] == recipient_did && leaf["deviceId"] == recipient_device) {
+                                *leaf = serde_json::json!({"userDid":recipient_did,"deviceId":recipient_device,
+                                    "keyId":requester_key_id,"deviceStatus":"active","leafOrigin":"keyPackage","joinKeyPackageRef":package_ref});
+                            }
+                        }
+                    }
+                    if let Some(stored) = guard.conversations.get(&convo_id) {
+                        let mut state = conversation_state_json(stored);
+                        state["coordinates"] = inner_body["next"].clone();
+                        state["snapshotSeq"] = serde_json::json!(next_seq);
+                        guard.lifecycle_state_overrides.insert(convo_id.clone(), state);
+                    }
+                    serde_json::json!({"coordinates":inner_body["next"],"entry":entry,"welcomes":[welcome]})
+                } else {
+                    serde_json::json!({"result":{"applied":true,"epoch":new_epoch,"receipt":receipt}})
+                };
                 if let Some(idem) = &idempotency_key {
                     guard.idempotent_add_results.insert(idem.clone(), AddMembersServerResult {
                         success: true,
@@ -2288,6 +3003,15 @@ impl MLSAPIClient for MockDeliveryService {
                         receipt: receipt.clone(),
                     });
                 }
+                if recovery_request_id.is_some() {
+                    let transition_id = idempotency_key.as_ref().unwrap();
+                    guard.recovery_transition_responses.insert(transition_id.clone(), serde_json::to_vec(&output).unwrap());
+                    guard.recovery_transition_requests.insert(transition_id.clone(), body_bytes.to_vec());
+                    if guard.drop_recovery_fulfillment_responses > 0 {
+                        guard.drop_recovery_fulfillment_responses -= 1;
+                        return Err(OrchestratorError::Api("injected lost recovery response after server acceptance".into()));
+                    }
+                }
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
@@ -2295,23 +3019,93 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeave => {
+                if let Some(response) = self.state.lock().unwrap().next_leave_custom_response.take() {
+                    return Ok(response);
+                }
                 let convo_id = inner_body
                     .get("prior")
                     .and_then(|p| p.get("conversationId"))
                     .or_else(|| inner_body.get("conversationId"))
                     .and_then(|c| c.as_str())
                     .unwrap_or_default();
-                self.leave_conversation(convo_id).await?;
-                let output = serde_json::json!({
-                    "result": {
-                        "left": true
-                    }
-                });
+                let output = if inner_body["$type"] == "blue.catbird.chat.defs#zeroLeafLeaveBody" {
+                    self.leave_conversation(convo_id).await?;
+                    let mut guard = self.state.lock().unwrap();
+                    let mut snapshot = guard.lifecycle_state_overrides.get(convo_id).cloned()
+                        .unwrap_or_else(|| conversation_state_json(&guard.conversations[convo_id]));
+                    let seq = snapshot["snapshotSeq"].as_u64().unwrap_or(1) + 1;
+                    snapshot["snapshotSeq"] = serde_json::json!(seq);
+                    snapshot["coordinates"] = inner_body["next"].clone();
+                    snapshot["participants"].as_array_mut().unwrap().retain(|p| p["userDid"] != inner_body["actorDid"]);
+                    guard.lifecycle_state_overrides.insert(convo_id.into(), snapshot);
+                    let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#zeroLeafLeaveEntry", "entryId":uuid::Uuid::new_v4().to_string(),"conversationId":convo_id,"seq":seq,"signedRequest":body_val["signedRequest"],"receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                    guard.entries.push(entry.clone());
+                    serde_json::json!({"result": {
+                        "$type": "blue.catbird.chat.defs#zeroLeafLeaveResult",
+                        "coordinates": inner_body["next"], "entry": entry
+                    }})
+                } else {
+                    let ttl = self.state.lock().unwrap().leave_request_ttl_seconds.unwrap_or(24 * 60 * 60);
+                    let request = serde_json::json!({
+                        "leaveRequestId": inner_body["leaveRequestId"],
+                        "conversationId": convo_id,
+                        "requesterDid": inner_body["actorDid"],
+                        "requesterDeviceId": inner_body["actorDeviceId"],
+                        "prior": inner_body["prior"],
+                        "status": "pending",
+                        "requestedAt": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        "expiresAt": (Utc::now() + chrono::Duration::seconds(ttl)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                    });
+                    let mut guard = self.state.lock().unwrap();
+                    guard.pending_leave_requests.entry(convo_id.into()).or_default().push(request.clone());
+                    let mut snapshot = guard.lifecycle_state_overrides.get(convo_id).cloned()
+                        .unwrap_or_else(|| conversation_state_json(&guard.conversations[convo_id]));
+                    let seq = snapshot["snapshotSeq"].as_u64().unwrap_or(1) + 1;
+                    snapshot["snapshotSeq"] = serde_json::json!(seq);
+                    guard.lifecycle_state_overrides.insert(convo_id.into(), snapshot);
+                    let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#leaveRequestEntry", "conversationId":convo_id, "entryId":inner_body["leaveRequestId"], "seq":seq,"receivedAt":request["requestedAt"],"signedRequest":body_val["signedRequest"]});
+                    guard.entries.push(entry.clone());
+                    serde_json::json!({"result": {
+                        "$type": "blue.catbird.chat.defs#durableLeaveRequestResult",
+                        "leaveRequest": request, "entry": entry
+                    }})
+                };
+                if inner_body["$type"] == "blue.catbird.chat.defs#zeroLeafLeaveBody" {
+                    return self.account_exit_response(body_bytes, output);
+                }
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
                     body: serde_json::to_vec(&output).unwrap(),
                 })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CloseConversation => {
+                let mut guard = self.state.lock().unwrap();
+                if let Some(response) = guard.next_leave_custom_response.take() {
+                    return Ok(response);
+                }
+                let convo_id = inner_body["prior"]["conversationId"].as_str().unwrap();
+                let conversation = guard.conversations.get_mut(convo_id).unwrap();
+                conversation.members.clear();
+                conversation.view.members.clear();
+                conversation.participants = Some(Vec::new());
+                guard.pending_leave_requests.remove(convo_id);
+                let tombstone = serde_json::json!({
+                    "$type": "blue.catbird.chat.defs#conversationCloseTombstone",
+                    "conversationId": convo_id, "conversationKind": inner_body["conversationKind"],
+                    "retired": inner_body["retired"], "closedByDid": inner_body["actorDid"],
+                    "closedByDeviceId": inner_body["actorDeviceId"], "terminalSeq": 20,
+                    "closedAt": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                });
+                guard.closed_conversation_tombstones.insert(convo_id.into(), tombstone.clone());
+                let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#conversationCloseEntry", "entryId":uuid::Uuid::new_v4().to_string(), "conversationId":convo_id, "seq":20, "signedRequest":body_val["signedRequest"], "receivedAt":tombstone["closedAt"],"tombstone":tombstone});
+                guard.entries.push(entry.clone());
+                let output = serde_json::json!({"result": {
+                    "tombstone": tombstone,
+                    "entry": entry
+                }});
+                drop(guard);
+                self.account_exit_response(body_bytes, output)
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::PrepareBlobUpload => {
                 let output = serde_json::json!({
@@ -2333,41 +3127,48 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::AcceptConversation => {
-                let convo_id = inner_body
-                    .get("prior")
-                    .and_then(|p| p.get("conversationId"))
-                    .or_else(|| inner_body.get("conversationId"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or_default();
-                let actor_did = inner_body
-                    .get("actorDid")
-                    .and_then(|d| d.as_str())
-                    .unwrap_or_default();
+                use base64::engine::general_purpose::STANDARD;
+                use openmls::prelude::{tls_codec::DeserializeBytes as _, MlsMessageIn, MlsMessageBodyIn, ProtocolVersion};
+                use openmls_traits::OpenMlsProvider as _;
+                let cid = inner_body["prior"]["conversationId"].as_str().unwrap();
+                let actor = inner_body["actorDid"].as_str().unwrap();
+                let device = inner_body["actorDeviceId"].as_str().unwrap();
                 let mut guard = self.state.lock().unwrap();
-                let mut new_epoch = 1;
-                if let Some(stored) = guard.conversations.get_mut(convo_id) {
-                    stored.view.epoch += 1;
-                    new_epoch = stored.view.epoch;
-                    if let Some(ref mut parts) = stored.participants {
-                        for p in parts.iter_mut() {
-                            if p.get("userDid").and_then(|u| u.as_str()) == Some(actor_did) {
-                                if let Some(obj) = p.as_object_mut() {
-                                    obj.insert("status".to_string(), serde_json::json!("active"));
-                                }
-                            }
-                        }
-                    }
-                }
-                let output = serde_json::json!({
-                    "result": {
-                        "accepted": true,
-                        "epoch": new_epoch
-                    }
+                let mut current = guard.lifecycle_state_overrides.get(cid).cloned()
+                    .unwrap_or_else(|| conversation_state_json(&guard.conversations[cid]));
+                assert_eq!(inner_body["prior"], current["coordinates"], "acceptance requires current policy coordinate");
+                let participant = current["participants"].as_array_mut().unwrap().iter_mut().find(|participant| participant["userDid"] == actor).unwrap();
+                assert_eq!(participant["status"], "pending", "acceptance requires pending consent");
+                assert_eq!(participant["invitationProvenance"], inner_body["invitationProvenance"], "acceptance binds the exact invitation");
+                participant["status"] = serde_json::json!("active");
+                let package = guard.key_packages.get_mut(actor).and_then(|packages| {
+                    packages.iter().position(|package| package.device_id.as_deref() == Some(device)).map(|index| packages.remove(index))
+                }).expect("acceptance atomically reserves the accepting device's published package");
+                let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+                let MlsMessageBodyIn::KeyPackage(key_package) = MlsMessageIn::tls_deserialize_exact_bytes(&package.data).unwrap().extract() else { panic!("expected fixture KeyPackage") };
+                let key_package = key_package.validate(provider.crypto(), ProtocolVersion::default()).unwrap();
+                let reference = key_package.hash_ref(provider.crypto()).unwrap();
+                let binding = catbird_mls::orchestrator::credential_binding::extract_key_package_binding(&package.data).unwrap();
+                let recovery = serde_json::json!({
+                    "$type":"blue.catbird.chat.defs#leafRecoveryView", "conversationId":cid,
+                    "recoveryRequestId":inner_body["recoveryRequestId"],"requesterDid":actor,"requesterDeviceId":device,
+                    "recoveryKind":"add","boundCoordinate":inner_body["next"],"status":"open",
+                    "expiresAt":(Utc::now()+chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
+                    "reservation":{"keyPackageRef":STANDARD.encode(reference.as_slice()),"requesterKeyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&binding.signature_key)),"keyPackage":{"bytes":STANDARD.encode(package.data)}}
                 });
+                let seq = current["snapshotSeq"].as_u64().unwrap_or(1)+1;
+                current["coordinates"] = inner_body["next"].clone();
+                current["snapshotSeq"] = serde_json::json!(seq);
+                let stored = guard.conversations.get_mut(cid).unwrap();
+                stored.view.epoch = inner_body["next"]["epoch"].as_u64().unwrap();
+                stored.participants = current["participants"].as_array().cloned();
+                guard.lifecycle_state_overrides.insert(cid.into(), current);
+                guard.leaf_recovery_inbox_items.push(recovery.clone());
+                let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#participantAcceptanceEntry","entryId":inner_body["transitionId"],"conversationId":cid,"seq":seq,"signedRequest":body_val["signedRequest"],"recovery":recovery,"receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
+                guard.entries.push(entry.clone());
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
-                    status: 200,
-                    content_type: Some("application/json".into()),
-                    body: serde_json::to_vec(&output).unwrap(),
+                    status:200,content_type:Some("application/json".into()),
+                    body:serde_json::to_vec(&serde_json::json!({"coordinates":inner_body["next"],"entry":entry,"recovery":recovery})).unwrap(),
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestReset => {
@@ -2440,6 +3241,48 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestLeafRecovery => {
+                if let Some(response) = self.state.lock().unwrap().next_leaf_recovery_response.take() {
+                    return Ok(response);
+                }
+                let did = inner_body["actorDid"].as_str().unwrap_or_default();
+                let device = inner_body["actorDeviceId"].as_str().unwrap_or_default();
+                let cid = inner_body["prior"]["conversationId"].as_str().unwrap_or_default();
+                let mut guard = self.state.lock().unwrap();
+                if guard.leaf_recovery_inbox_items.iter().any(|request| {
+                    request["conversationId"] == cid && request["requesterDid"] == did
+                        && request["requesterDeviceId"] == device && request["status"] == "open"
+                        && request["boundCoordinate"] == inner_body["prior"]
+                        && request["expiresAt"].as_str().and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok()).is_some_and(|expires| expires > Utc::now())
+                }) {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status:400, content_type:Some("application/json".into()),
+                        body:br#"{"error":"LeafRecoveryAlreadyOpen"}"#.to_vec(),
+                    });
+                }
+                let package = guard.key_packages.get_mut(did).and_then(|packages| {
+                    packages.iter().position(|package| package.device_id.as_deref() == Some(device))
+                        .map(|index| packages.remove(index))
+                });
+                if let Some(package) = package {
+                    use openmls::prelude::{tls_codec::DeserializeBytes as _, MlsMessageIn, MlsMessageBodyIn, ProtocolVersion};
+                    use openmls_traits::OpenMlsProvider as _;
+                    let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+                    let MlsMessageBodyIn::KeyPackage(key_package) = MlsMessageIn::tls_deserialize_exact_bytes(&package.data).unwrap().extract() else { panic!("expected fixture KeyPackage") };
+                    let key_package = key_package.validate(provider.crypto(), ProtocolVersion::default()).unwrap();
+                    let reference = key_package.hash_ref(provider.crypto()).unwrap();
+                    let binding = catbird_mls::orchestrator::credential_binding::extract_key_package_binding(&package.data).unwrap();
+                    let request = serde_json::json!({
+                        "$type":"blue.catbird.chat.defs#leafRecoveryView",
+                        "conversationId":cid,"recoveryRequestId":inner_body["recoveryRequestId"],
+                        "requesterDid":did,"requesterDeviceId":device,"recoveryKind":inner_body["recoveryKind"],
+                        "boundCoordinate":inner_body["prior"],"status":"open",
+                        "expiresAt":(Utc::now()+chrono::Duration::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Millis,true),
+                        "reservation":{"keyPackageRef":base64::engine::general_purpose::STANDARD.encode(reference.as_slice()),
+                            "requesterKeyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&binding.signature_key)),
+                            "keyPackage":{"bytes":base64::engine::general_purpose::STANDARD.encode(package.data)}}
+                    });
+                    guard.leaf_recovery_inbox_items.push(request);
+                }
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
@@ -2457,6 +3300,33 @@ impl MLSAPIClient for MockDeliveryService {
                         )
                     })?;
                 let guard = self.state.lock().unwrap();
+                if let Some((after_acceptance, status, body)) =
+                    guard.account_exit_state_responses.get(conversation_id)
+                {
+                    let accepted = guard.account_exit_responses.values().any(|(raw, _)| {
+                        serde_json::from_slice::<serde_json::Value>(raw)
+                            .ok()
+                            .is_some_and(|request| {
+                                request["signedRequest"]["body"]["prior"]["conversationId"]
+                                    .as_str()
+                                    == Some(conversation_id)
+                            })
+                    });
+                    if !after_acceptance || accepted {
+                        return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                            status: *status,
+                            content_type: Some("application/json".into()),
+                            body: body.clone(),
+                        });
+                    }
+                }
+                if guard.closed_conversation_tombstones.contains_key(conversation_id) {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 403,
+                        content_type: Some("application/json".into()),
+                        body: br#"{"error":"AccessOutsideMembershipInterval"}"#.to_vec(),
+                    });
+                }
                 let Some(conversation) = guard.conversations.get(conversation_id) else {
                     return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                         status: 404,
@@ -2468,9 +3338,19 @@ impl MLSAPIClient for MockDeliveryService {
                     });
                 };
                 let output = serde_json::json!({
-                    "state": conversation_state_json(conversation),
+                    "state": guard.lifecycle_state_overrides.get(conversation_id).cloned().unwrap_or_else(|| conversation_state_json(conversation)),
                     "pendingResetRequests": [],
-                    "pendingLeaveRequests": []
+                    "pendingLeaveRequests": guard.pending_leave_requests.get(conversation_id).cloned().unwrap_or_default(),
+                    "pendingLeafRecoveryRequests": guard.leaf_recovery_inbox_items.iter()
+                        .map(|item| item.get("recovery").unwrap_or(item))
+                        .filter(|recovery| recovery["conversationId"].as_str() == Some(conversation_id))
+                        .filter(|recovery| recovery["status"].as_str() == Some("open"))
+                        .filter(|recovery| {
+                            let actor_device_id = query.split('&').find_map(|pair| pair.strip_prefix("actorDeviceId="));
+                            !(recovery["requesterDeviceId"].as_str() == actor_device_id
+                                && recovery["requesterDid"].as_str() == self.effective_did_from_guard(&guard).as_deref())
+                        })
+                        .cloned().collect::<Vec<_>>()
                 });
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
@@ -2480,7 +3360,13 @@ impl MLSAPIClient for MockDeliveryService {
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversations => {
                 let guard = self.state.lock().unwrap();
-                let items: Vec<serde_json::Value> = guard
+                let own_did = self.effective_did_from_guard(&guard);
+                let actor_device_id = request.path.split_once('?').map(|(_,query)| query)
+                    .and_then(|query| query.split('&').find_map(|pair| pair.strip_prefix("actorDeviceId=")));
+                let removal_tombstones: Vec<_> = guard.removal_tombstones.iter().filter(|tombstone|
+                    tombstone["userDid"].as_str() == own_did.as_deref() && tombstone["deviceId"].as_str() == actor_device_id
+                ).cloned().collect();
+                let mut items: Vec<serde_json::Value> = guard
                     .conversations
                     .values()
                     .filter(|conversation| {
@@ -2488,10 +3374,14 @@ impl MLSAPIClient for MockDeliveryService {
                             .hidden_conversation_ids
                             .contains(&conversation.view.conversation_id)
                     })
+                    .filter(|conversation| !removal_tombstones.iter().any(|t| t["conversationId"] == conversation.view.conversation_id))
                     .map(|conversation| {
-                        serde_json::json!({"state": conversation_state_json(conversation)})
+                        guard.closed_conversation_tombstones.get(&conversation.view.conversation_id).cloned()
+                            .unwrap_or_else(|| serde_json::json!({"state": conversation_state_json(conversation)}))
                     })
                     .collect();
+                items.extend(removal_tombstones);
+                items.extend(guard.terminal_inventory_extra_items.iter().cloned());
                 let output = serde_json::json!({
                     "items": items,
                     "inventorySessionId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
@@ -2505,10 +3395,65 @@ impl MLSAPIClient for MockDeliveryService {
                     body: serde_json::to_vec(&output).unwrap(),
                 })
             }
-            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox => {
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetPendingWelcomes => {
                 let guard = self.state.lock().unwrap();
+                let actor_device_id = request.path.split_once('?').map(|(_, query)| query)
+                    .and_then(|query| query.split('&').find_map(|part| part.strip_prefix("actorDeviceId=")));
                 let output = serde_json::json!({
-                    "items": guard.leaf_recovery_inbox_items.clone(),
+                    "items": guard.welcome_deliveries.iter().filter(|delivery|
+                        delivery["status"] == "pending" && delivery["recipientDid"].as_str() == self.effective_did_from_guard(&guard).as_deref()
+                            && delivery["recipientDeviceId"].as_str() == actor_device_id
+                    ).cloned().collect::<Vec<_>>(),
+                    "inventorySessionId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+                    "snapshotEventCursor": "018f3f6a-7b2c-4d91-8a5e-0f123456789a", "hasMore":false,
+                });
+                Ok(catbird_mls::orchestrator::GatewayResponse { status:200, content_type:Some("application/json".into()), body:serde_json::to_vec(&output).unwrap() })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::AcknowledgeWelcome => {
+                let raw = request.body.as_ref().unwrap();
+                let wrapper: serde_json::Value = serde_json::from_slice(raw).unwrap();
+                let body = &wrapper["signedRequest"]["body"];
+                let id = body["welcomeId"].as_str().unwrap();
+                let mut guard = self.state.lock().unwrap();
+                let response = |status, body: serde_json::Value| catbird_mls::orchestrator::GatewayResponse {
+                    status, content_type:Some("application/json".into()), body:serde_json::to_vec(&body).unwrap(),
+                };
+                let saved = guard.welcome_ack_responses.get(id).cloned();
+                let result = if let Some((saved_request, saved_response)) = saved {
+                    if saved_request != *raw { return Ok(response(400, serde_json::json!({"error":"AcknowledgementConflict"}))); }
+                    saved_response
+                } else {
+                    let own = self.effective_did_from_guard(&guard);
+                    let Some(delivery) = guard.welcome_deliveries.iter_mut().find(|delivery| delivery["welcomeId"] == id) else {
+                        return Ok(response(400, serde_json::json!({"error":"WelcomeNotFound"})));
+                    };
+                    if body["actorDid"] != delivery["recipientDid"] || body["actorDid"].as_str() != own.as_deref()
+                        || body["actorDeviceId"] != delivery["recipientDeviceId"] || body["transitionSeq"] != delivery["transitionSeq"]
+                        || body["coordinates"] != delivery["coordinates"]
+                    { return Ok(response(400, serde_json::json!({"error":"DeviceBindingMismatch"}))); }
+                    if delivery["status"] == "superseded" { return Ok(response(400, serde_json::json!({"error":"WelcomeSuperseded"}))); }
+                    if delivery["status"] == "expired" { return Ok(response(400, serde_json::json!({"error":"WelcomeExpired"}))); }
+                    delivery["status"] = serde_json::json!("acknowledged");
+                    let result = serde_json::to_vec(&serde_json::json!({"status":"acknowledged", "acknowledgedAt":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)})).unwrap();
+                    guard.welcome_ack_responses.insert(id.into(), (raw.clone(), result.clone()));
+                    result
+                };
+                if guard.lose_welcome_ack_responses > 0 { guard.lose_welcome_ack_responses -= 1; return Err(OrchestratorError::Api("injected lost Welcome ACK response".into())); }
+                Ok(catbird_mls::orchestrator::GatewayResponse { status:200, content_type:Some("application/json".into()), body:result })
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox => {
+                let mut guard = self.state.lock().unwrap();
+                if !guard.leaf_recovery_inbox_responses.is_empty() {
+                    return Ok(guard.leaf_recovery_inbox_responses.remove(0));
+                }
+                let output = serde_json::json!({
+                    "items": guard.leaf_recovery_inbox_items.iter().filter(|item| {
+                        let recovery = item.get("recovery").unwrap_or(item);
+                        let actor_device_id = request.path.split_once('?').map(|(_,query)| query)
+                            .and_then(|query| query.split('&').find_map(|pair| pair.strip_prefix("actorDeviceId=")));
+                        recovery["requesterDeviceId"].as_str() == actor_device_id
+                            && recovery["requesterDid"].as_str() == self.effective_did_from_guard(&guard).as_deref()
+                    }).cloned().collect::<Vec<_>>(),
                     "inventorySessionId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
                     "snapshotEventCursor": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
                     "hasMore": false,
@@ -2521,9 +3466,20 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetEntries => {
-                let output = serde_json::json!({
-                    "entries": self.state.lock().unwrap().entries.clone()
-                });
+                check_fail(&mut self.state.lock().unwrap().failures.fail_next_get_entries, "injected unavailable entry proof")?;
+                let query: HashMap<_, _> = request.path.split_once('?').map(|(_,query)| query)
+                    .unwrap_or("").split('&').filter_map(|part| part.split_once('=')).collect();
+                let cid = query.get("conversationId").copied().unwrap_or("");
+                let after: u64 = query.get("afterSeq").and_then(|s| s.parse().ok()).unwrap_or(0);
+                let limit: usize = query.get("limit").and_then(|s| s.parse().ok()).unwrap_or(100);
+                let mut entries: Vec<_> = self.state.lock().unwrap().entries.iter()
+                    .filter(|entry| entry["conversationId"].as_str() == Some(cid) && entry["seq"].as_u64().is_some_and(|seq| seq > after))
+                    .cloned().collect();
+                entries.sort_by_key(|entry| entry["seq"].as_u64());
+                let has_more = entries.len() > limit;
+                entries.truncate(limit);
+                let next = entries.last().and_then(|e| e["seq"].as_u64()).unwrap_or(after);
+                let output = serde_json::json!({"entries": entries, "nextAfterSeq": next, "hasMore":has_more});
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
@@ -2677,6 +3633,7 @@ impl MLSAPIClient for MockDeliveryService {
                 ciphertext: m.ciphertext.clone(),
                 timestamp: m.timestamp,
                 server_epoch: m.epoch,
+                server_sequence: None,
                 server_message_id: Some(m.id.clone()),
             })
             .collect();

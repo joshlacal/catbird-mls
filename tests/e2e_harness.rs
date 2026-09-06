@@ -180,6 +180,41 @@ impl TestWorld {
         self.clients.get(name).unwrap()
     }
 
+    /// Reopen the same native encrypted SQLite database and app projection
+    /// with a fresh orchestrator; retain account/device credentials and keys.
+    pub async fn restart_client(&mut self, name: &str) {
+        let client = self.clients.get_mut(name).expect("client to restart");
+        client.orchestrator.shutdown().await;
+        client
+            .orchestrator
+            .mls_context()
+            .flush_and_prepare_close()
+            .expect("close native database");
+        let native = MLSContext::new(
+            client
+                ._temp_dir
+                .join("mls.db")
+                .to_string_lossy()
+                .to_string(),
+            format!("test-key-{name}"),
+            Box::new(client.keychain.clone()),
+        )
+        .expect("reopen native encrypted database");
+        epoch_secret_test_support::install(&native);
+        client.orchestrator = MLSOrchestrator::new(
+            native,
+            Arc::new(client.storage.clone()),
+            Arc::new(self.api_service.clone_as(&client.did)),
+            Arc::new(client.credentials.clone()),
+            OrchestratorConfig::default(),
+        );
+        client
+            .orchestrator
+            .initialize(&client.did)
+            .await
+            .expect("initialize reopened orchestrator");
+    }
+
     /// Get a client by name.
     pub fn client(&self, name: &str) -> &TestClient {
         self.clients
@@ -224,21 +259,22 @@ impl TestWorld {
             )
             .await?;
 
-        self.authorized_device_keys
-            .lock()
-            .unwrap()
-            .insert(scoped_did.clone(), vec![signing_key.clone()]);
-        self.authorized_device_keys
-            .lock()
-            .unwrap()
-            .insert(client.did.clone(), vec![signing_key.clone()]);
+        let account_keys = {
+            let mut authority = self.authorized_device_keys.lock().unwrap();
+            authority.insert(scoped_did.clone(), vec![signing_key.clone()]);
+            let account_keys = authority.entry(client.did.clone()).or_default();
+            if !account_keys.contains(&signing_key) {
+                account_keys.push(signing_key.clone());
+            }
+            account_keys.clone()
+        };
         for fixture_client in self.clients.values() {
             fixture_client
                 .credentials
                 .set_authorized_device_keys(&scoped_did, vec![signing_key.clone()]);
             fixture_client
                 .credentials
-                .set_authorized_device_keys(&client.did, vec![signing_key.clone()]);
+                .set_authorized_device_keys(&client.did, account_keys.clone());
         }
 
         Ok(client.did.clone())

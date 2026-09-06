@@ -1,0 +1,101 @@
+{
+  "$type" : "blue.catbird.chat.defs#conversationState",
+  "cipherSuite" : "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+  "conversationKind" : "group",
+  "coordinates" : {
+    "$type" : "blue.catbird.chat.defs#conversationCoordinates",
+    "confirmationTag" : {
+      "$bytes" : "7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+8="
+    },
+    "conversationId" : "550e8400-e29b-41d4-a716-446655440000",
+    "epoch" : 0,
+    "generation" : 0,
+    "groupContextHash" : {
+      "$bytes" : "zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0="
+    },
+    "groupId" : {
+      "$bytes" : "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="
+    },
+    "lifecycle" : "active",
+    "stateVersion" : 1
+  },
+  "leaves" : [
+    {
+      "$type" : "blue.catbird.chat.defs#deviceLeafView",
+      "deviceId" : "750e8400-e29b-41d4-a716-446655440000",
+      "deviceStatus" : "active",
+      "keyId" : "NHUPmL1Z_PyUbaRaqr6TO-FUpLUJThxKv0KGZQXzyX4",
+      "leafOrigin" : "genesis",
+      "userDid" : "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  ],
+  "metadataSnapshot" : {
+    "$type" : "blue.catbird.chat.defs#metadataSnapshot",
+    "authorProof" : {
+      "$type" : "blue.catbird.chat.defs#metadataAuthorProof",
+      "authGenerationAtOrigin" : 1,
+      "authorDeviceId" : "750e8400-e29b-41d4-a716-446655440000",
+      "authorDid" : "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+      "authorKeyId" : "NHUPmL1Z_PyUbaRaqr6TO-FUpLUJThxKv0KGZQXzyX4",
+      "deviceStatusAtOrigin" : "active",
+      "originSeq" : 1,
+      "originTransitionId" : "650e8400-e29b-41d4-a716-446655440000",
+      "roleAtOrigin" : "admin",
+      "signaturePublicKey" : {
+        "$bytes" : "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w="
+      }
+    },
+    "ciphertext" : {
+      "$bytes" : "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
+    },
+    "ciphertextSha256" : {
+      "$bytes" : "Ql7U5KNrMOohuQ4hxxLGSeghTCm36vaAidEDnG5VOEw="
+    },
+    "ciphertextSize" : 32,
+    "coordinate" : {
+      "$type" : "blue.catbird.chat.defs#metadataCryptoContext",
+      "confirmationTag" : {
+        "$bytes" : "7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+\/v7+8="
+      },
+      "conversationId" : {
+        "$bytes" : "VQ6EAOKbQdSnFkRmVUQAAA=="
+      },
+      "epoch" : 0,
+      "generation" : 0,
+      "groupContextHash" : {
+        "$bytes" : "zc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc0="
+      },
+      "groupId" : {
+        "$bytes" : "q6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6s="
+      }
+    },
+    "metadataVersion" : 1,
+    "nonce" : {
+      "$bytes" : "BwcHBwcHBwcHBwcH"
+    },
+    "originTransitionId" : "650e8400-e29b-41d4-a716-446655440000"
+  },
+  "participants" : [
+    {
+      "$type" : "blue.catbird.chat.defs#participantView",
+      "leafCount" : 1,
+      "role" : "admin",
+      "status" : "active",
+      "userDid" : "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "$type" : "blue.catbird.chat.defs#participantView",
+      "invitationProvenance" : {
+        "$type" : "blue.catbird.chat.defs#invitationProvenance",
+        "invitationTransitionId" : "650e8400-e29b-41d4-a716-446655440000",
+        "invitedByDeviceId" : "750e8400-e29b-41d4-a716-446655440000",
+        "invitedByDid" : "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "leafCount" : 0,
+      "role" : "member",
+      "status" : "pending",
+      "userDid" : "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "snapshotSeq" : 1
+}

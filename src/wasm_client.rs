@@ -472,6 +472,7 @@ mod stable_identity_tests {
             created_at: None,
             updated_at: None,
             sequencer_did: None,
+            canonical_state: None,
         };
 
         let projected = convo_view_to_wasm_conversation(&view);

@@ -68,7 +68,10 @@ where
                 ))
             })?;
             let root_did = credential_root_did(&binding.identity);
-            match self.lookup_authorized_device_keys(root_did).await? {
+            match self
+                .lookup_candidate_device_key(root_did, &binding.signature_key)
+                .await?
+            {
                 DeviceKeyLookup::Unsupported => {
                     return Err(OrchestratorError::InvalidInput(format!(
                         "staged outbound key package {index} cannot be authorized because device-key resolution is unsupported for {root_did}"

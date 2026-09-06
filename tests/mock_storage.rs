@@ -58,6 +58,8 @@ struct Inner {
     /// conversation_id -> persisted RESET_PENDING payload (mirrors real
     /// platform storage's reset-pending lifecycle columns).
     reset_pending: HashMap<String, PersistedResetPending>,
+    account_exit_reset_high_water: HashMap<String, i32>,
+    lose_account_exit_projection_response: bool,
     /// Number of times `mark_reset_pending` has been called per conversation.
     /// Used by idempotency tests to assert duplicate calls collapse.
     mark_reset_pending_calls: HashMap<String, u32>,
@@ -237,6 +239,15 @@ impl MockStorage {
             .unwrap_or_else(|| panic!("conversation {conversation_id} not found"));
         record.group_id = group_id.to_string();
         record.view.group_id = group_id.to_string();
+    }
+
+    /// Seed a full host inventory projection without changing lifecycle or history.
+    pub fn set_conversation_view_for_test(&self, conversation_id: &str, view: ConversationView) {
+        let mut inner = self.inner.lock().unwrap();
+        let record = inner.conversations.get_mut(conversation_id).expect("existing conversation");
+        assert_eq!(view.conversation_id, conversation_id);
+        assert_eq!(view.group_id, record.group_id);
+        record.view = view;
     }
 
     pub fn omit_pending_delete_capabilities(&self) {
@@ -524,6 +535,13 @@ impl MockStorage {
     #[allow(dead_code)]
     pub fn fail_next_set_conversation_state(&self) {
         self.inner.lock().unwrap().fail_next_set_conversation_state = true;
+    }
+
+    pub fn lose_next_account_exit_projection_response(&self) {
+        self.inner
+            .lock()
+            .unwrap()
+            .lose_account_exit_projection_response = true;
     }
 
     pub fn fail_next_set_group_state(&self) {
@@ -873,6 +891,7 @@ impl MLSStorageBackend for MockStorage {
                         created_at: Some(chrono::Utc::now()),
                         updated_at: Some(chrono::Utc::now()),
                         sequencer_did: None,
+                        canonical_state: None,
                     },
                 },
             );
@@ -1143,6 +1162,11 @@ impl MLSStorageBackend for MockStorage {
                     notified_at_ms,
                 },
             );
+            inner
+                .account_exit_reset_high_water
+                .entry(conversation_id.into())
+                .and_modify(|high| *high = (*high).max(reset_generation))
+                .or_insert(reset_generation);
             // Ruling 2a: the authority commit is also the quarantine exit, so
             // the persisted quarantine row goes away in this same critical
             // section. A backend that waits for the orchestrator's separate
@@ -1396,6 +1420,87 @@ impl MLSStorageBackend for MockStorage {
                 .forget();
         }
         Ok(cleared)
+    }
+
+    async fn complete_account_exit(
+        &self,
+        conversation_id: &str,
+        expected_group_id_hex: &str,
+        expected_reset_generation: Option<i32>,
+        terminal_epoch: u64,
+        terminal_state: ConversationState,
+    ) -> Result<bool> {
+        if !matches!(
+            terminal_state,
+            ConversationState::Closed | ConversationState::DeviceRemoved
+        ) || expected_group_id_hex.len() != 64
+            || !expected_group_id_hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || terminal_epoch > 9_007_199_254_740_991
+            || expected_reset_generation.is_some_and(|g| g <= 0)
+        {
+            return Err(OrchestratorError::Storage(
+                "invalid account exit tuple".into(),
+            ));
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if inner.fail_next_set_conversation_state {
+            inner.fail_next_set_conversation_state = false;
+            return Err(OrchestratorError::Storage(
+                "injected account exit projection failure".into(),
+            ));
+        }
+        let Some(record) = inner.conversations.get(conversation_id) else {
+            return Ok(false);
+        };
+        let pending = inner.reset_pending.get(conversation_id);
+        let same_terminal = record.state == terminal_state
+            && record.group_id == expected_group_id_hex
+            && record.view.epoch == terminal_epoch;
+        if record.state == ConversationState::Closed && (!same_terminal || pending.is_some())
+        {
+            return Ok(false);
+        }
+        let allowed = match (expected_reset_generation, pending) {
+            (Some(expected), Some(pending)) => {
+                expected == pending.reset_generation
+                    && pending.new_group_id_hex == expected_group_id_hex
+            }
+            (Some(expected), None) => {
+                same_terminal
+                    && inner.account_exit_reset_high_water.get(conversation_id) == Some(&expected)
+            }
+            (None, None) => {
+                !matches!(record.state, ConversationState::ResetPending { .. })
+                    && record.group_id == expected_group_id_hex
+            }
+            (None, Some(_)) => false,
+        };
+        if !allowed
+            || (record.group_id == expected_group_id_hex && record.view.epoch > terminal_epoch)
+        {
+            return Ok(false);
+        }
+        if let Some(generation) = expected_reset_generation {
+            inner
+                .account_exit_reset_high_water
+                .insert(conversation_id.into(), generation);
+        }
+        inner.reset_pending.remove(conversation_id);
+        let record = inner.conversations.get_mut(conversation_id).unwrap();
+        record.group_id = expected_group_id_hex.into();
+        record.view.group_id = expected_group_id_hex.into();
+        record.view.epoch = terminal_epoch;
+        record.state = terminal_state;
+        record.needs_rejoin = false;
+        if inner.lose_account_exit_projection_response {
+            inner.lose_account_exit_projection_response = false;
+            return Err(OrchestratorError::Storage(
+                "injected lost account exit CAS response after commit".into(),
+            ));
+        }
+        Ok(true)
     }
 
     async fn clear_reset_pending_for_delete(
@@ -1854,6 +1959,7 @@ impl MLSStorageBackend for MockStorage {
             "mark_reset_pending",
             "adopt_reset_pending_target",
             "complete_reset_pending",
+            "complete_account_exit",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
             "mark_quarantined",
@@ -1875,6 +1981,7 @@ impl MLSStorageBackend for MockStorage {
             "mark_reset_pending",
             "adopt_reset_pending_target",
             "complete_reset_pending",
+            "complete_account_exit",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
             "mark_quarantined",

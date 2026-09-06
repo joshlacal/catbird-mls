@@ -19,9 +19,9 @@
 //!
 //! Every failed check is logged through the platform logging facility and
 //! escalated through `OrchestratorEventObserver`, then returned as an error.
-//! Delivery-service labels are never treated as credential authority, and an
-//! unavailable authorized-device resolver is a hard failure rather than a
-//! structural-only compatibility mode.
+//! A candidate MLS key must match a repository-authorized key resolved by
+//! the platform for the credential DID. The delivery service is never a key
+//! authority. Missing or malformed repository authority is a hard failure.
 //!
 //! ## Verification depth (stage 1 vs stage 2)
 //!
@@ -31,13 +31,12 @@
 //!
 //! Stage 2 adds the **device-key** half on the fetch path: the leaf signature
 //! public key must be an authorized MLS device key for the credential's root
-//! DID (ADR-009 D1 part 2). The orchestrator has no DID-resolution surface of
-//! its own (`MLSAPIClient` only reaches the DS), so platforms must implement
-//! `CredentialStore::get_authorized_device_keys`; the default unsupported
-//! result fails closed. Results are cached per root DID for
-//! `constants::DEVICE_KEY_CACHE_TTL` (ADR-009 D6); positive, negative, and
-//! unsupported outcomes share the TTL so revocation propagates and repeated
-//! misconfigured operations do not call the platform seam once per package.
+//! DID (ADR-009 D1 part 2). The platform `CredentialStore` must resolve the
+//! repository-published device records and return their authorized raw keys.
+//! A missing callback or an empty repository set cannot fall back to the DS.
+//! Positive and negative results share `constants::DEVICE_KEY_CACHE_TTL`;
+//! repository failures are never cached. A cached key miss refreshes once so
+//! a newly published sibling does not wait for the positive-cache TTL.
 //!
 //! The device-key half does NOT yet run on the inbound path:
 //! `DecryptResult.sender_credential` (`CredentialData`) carries only the
@@ -323,20 +322,14 @@ pub(crate) fn enforce_outbound_key_package_did_bindings(
     Ok(())
 }
 
-/// Cached outcome of an authorized-device-key resolution (ADR-009 D6).
-///
-/// All three variants share the same `constants::DEVICE_KEY_CACHE_TTL` bound:
-/// positive (`Keys`), negative (`Keys(empty)`), and capability-missing
-/// (`Unsupported`). Caching `Unsupported` keeps a misconfigured platform from
-/// repeatedly invoking the seam once per package; every consuming operation
-/// still rejects.
+/// Cached outcome of repository-authorized device-key resolution (ADR-009 D6).
+/// Positive and negative results share a bounded TTL; errors are uncached.
 #[derive(Debug, Clone)]
 pub enum DeviceKeyLookup {
-    /// `CredentialStore::get_authorized_device_keys` returned `None`: this
-    /// platform has no DID-resolution surface wired in.
+    /// The platform cannot resolve repository-published device keys.
     Unsupported,
-    /// Resolution succeeded; the authorized signing keys for the root DID
-    /// (possibly empty — "resolved, zero authorized keys").
+    /// The repository-authorized signing keys for this exact root DID.
+    /// An empty set is an explicit denial, not an unavailable capability.
     Keys(std::sync::Arc<Vec<Vec<u8>>>),
 }
 
@@ -496,19 +489,37 @@ where
     ///
     /// Cache semantics: positive, negative, and `Unsupported` outcomes are
     /// all cached for `constants::DEVICE_KEY_CACHE_TTL`; seam **errors are
-    /// not cached** (the next check retries). Keyed by ASCII-lowercased root
-    /// DID exactly; method-specific identifiers may be case-sensitive and
-    /// must not share authorization cache entries.
+    /// not cached** (the next check retries). Cache keys preserve exact root
+    /// DID bytes, including case-sensitive method-specific identifiers.
     pub(crate) async fn lookup_authorized_device_keys(
         &self,
         root_did: &str,
     ) -> super::error::Result<DeviceKeyLookup> {
+        self.lookup_authorized_device_keys_with_origin(root_did, false)
+            .await
+            .map(|(lookup, _)| lookup)
+    }
+
+    pub(crate) async fn refresh_authorized_device_keys(
+        &self,
+        root_did: &str,
+    ) -> super::error::Result<DeviceKeyLookup> {
+        self.lookup_authorized_device_keys_with_origin(root_did, true)
+            .await
+            .map(|(lookup, _)| lookup)
+    }
+
+    pub(crate) async fn lookup_authorized_device_keys_with_origin(
+        &self,
+        root_did: &str,
+        force_refresh: bool,
+    ) -> super::error::Result<(DeviceKeyLookup, bool)> {
         let cache_key = root_did.to_string();
-        {
+        if !force_refresh {
             let cache = self.device_key_cache().lock().await;
             if let Some(entry) = cache.get(&cache_key) {
                 if entry.resolved_at.elapsed() < constants::DEVICE_KEY_CACHE_TTL {
-                    return Ok(entry.lookup.clone());
+                    return Ok((entry.lookup.clone(), true));
                 }
             }
         }
@@ -530,6 +541,26 @@ where
                 lookup: lookup.clone(),
             },
         );
+        Ok((lookup, false))
+    }
+
+    /// A newly enrolled sibling must not wait for the positive-cache TTL.
+    /// Refresh a cached repository-key miss once; a fresh miss still rejects.
+    /// Every returned key still comes solely from the repository callback.
+    pub(crate) async fn lookup_candidate_device_key(
+        &self,
+        root_did: &str,
+        candidate_key: &[u8],
+    ) -> super::error::Result<DeviceKeyLookup> {
+        let (lookup, cached) = self
+            .lookup_authorized_device_keys_with_origin(root_did, false)
+            .await?;
+        if cached
+            && matches!(&lookup, DeviceKeyLookup::Keys(keys)
+            if !keys.iter().any(|key| key.as_slice() == candidate_key))
+        {
+            return self.refresh_authorized_device_keys(root_did).await;
+        }
         Ok(lookup)
     }
 
@@ -554,7 +585,10 @@ where
         leaf_signature_key: &[u8],
         kp_hash_prefix: &str,
     ) -> super::error::Result<()> {
-        match self.lookup_authorized_device_keys(root_did).await {
+        match self
+            .lookup_candidate_device_key(root_did, leaf_signature_key)
+            .await
+        {
             Ok(DeviceKeyLookup::Unsupported) => {
                 let reason = "authorized-device-key resolution is required but unsupported";
                 Err(self

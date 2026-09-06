@@ -17,9 +17,6 @@ use super::orchestrator::{MLSOrchestrator, OwnCommitExpectation};
 use super::pagination::PaginationGuard;
 use super::storage::MLSStorageBackend;
 use super::types::*;
-use super::welcome_recovery::{
-    classify_server_error, classify_welcome_processing_error, LastRecoveryError,
-};
 
 pub(crate) enum DeferredRecoveryOutcome {
     ClearedStale,
@@ -1511,6 +1508,9 @@ where
     }
 
     pub(crate) async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
+        if self.is_local_conversation_terminal(convo_id).await.unwrap_or(true) {
+            return false;
+        }
         // Layer 3: quarantined conversations never participate in sync-driven
         // rejoins. This must run before the rejoin_lock check so that a
         // background task holding the lock for a quarantine bookkeeping op
@@ -1600,6 +1600,12 @@ where
         server_epoch: Option<u64>,
         server_group_id: Option<&str>,
     ) -> Result<DeferredRecoveryOutcome> {
+        if self.is_local_conversation_terminal(convo_id).await? {
+            return Ok(DeferredRecoveryOutcome::Skipped);
+        }
+        if self.pending_conversation_admission(convo_id).await? {
+            return Ok(DeferredRecoveryOutcome::Skipped);
+        }
         {
             // Serialize the authority check, context/epoch decision, and flag
             // clear with reset recording. Otherwise an SSE reset can commit
@@ -1933,6 +1939,12 @@ where
         state: ConversationState,
     ) -> Result<bool> {
         debug_assert!(!matches!(state, ConversationState::ResetPending { .. }));
+        if (self.is_local_conversation_closed(convo_id).await? && state != ConversationState::Closed)
+            || (self.is_local_device_removed(convo_id).await?
+                && !matches!(state, ConversationState::DeviceRemoved | ConversationState::Closed))
+        {
+            return Ok(false);
+        }
         if self
             .reset_blocks_non_reset_transition_locked(convo_id)
             .await?
@@ -1955,6 +1967,12 @@ where
         state: ConversationState,
     ) -> Result<bool> {
         debug_assert!(!matches!(state, ConversationState::ResetPending { .. }));
+        if (self.is_local_conversation_closed(convo_id).await? && state != ConversationState::Closed)
+            || (self.is_local_device_removed(convo_id).await?
+                && !matches!(state, ConversationState::DeviceRemoved | ConversationState::Closed))
+        {
+            return Ok(false);
+        }
         if self
             .reset_blocks_non_reset_transition_locked(convo_id)
             .await?
@@ -3401,10 +3419,14 @@ where
     /// client-observed unrecoverable state.
     #[doc(hidden)]
     pub async fn force_rejoin(&self, convo_id: &str) -> Result<()> {
+        self.reject_automatic_rejoin_after_device_removal(convo_id).await?;
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
         let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
         let convo_id = &resolved.conversation_id;
+        if self.pending_conversation_admission(convo_id).await? {
+            return Err(OrchestratorError::InvalidInput("Accept this invitation before recovering the conversation.".into()));
+        }
         let rejoin_lock = self.rejoin_lock(convo_id).await;
         let _rejoin_guard = match rejoin_lock.try_lock() {
             Ok(guard) => guard,
@@ -3496,8 +3518,44 @@ where
     /// MLS group id; server calls and recovery gates are keyed by this stable
     /// id, while local MLS context calls resolve the current group id first.
     pub async fn join_or_rejoin(&self, convo_id: &str) -> Result<u64> {
+        self.reject_automatic_rejoin_after_device_removal(convo_id).await?;
         self.check_shutdown().await?;
+        if self.pending_conversation_admission(convo_id).await? {
+            return Err(OrchestratorError::InvalidInput("Accept this invitation before joining the conversation.".into()));
+        }
         let user_did = self.require_user_did().await?;
+        // Canonical Welcome adoption owns the complete envelope and its
+        // native acceptance receipt. It runs outside the fallback's lock so
+        // delayed Welcome catch-up can acquire the inbound transition lock.
+        let identity = self.require_scoped_identity().await?;
+        for receipt in self.mls_context().list_welcome_acceptances()? {
+            if receipt.delivery.conversation_id() == convo_id
+                && receipt.delivery.recipient_identity() == identity
+                && !receipt.projection_completed
+            {
+                let current = self.fetch_conversation_lifecycle(convo_id).await?;
+                if super::welcome_ack::bytes(&current["state"]["coordinates"]["groupId"])?
+                    == receipt.delivery.group_id()?
+                {
+                    return self.join_or_rejoin_from_delivery(receipt.delivery).await;
+                }
+            }
+        }
+        let locally_healthy = self.reset_pending_payload_result(convo_id).await?.is_none()
+            && self.resolve_conversation_context(convo_id).await.ok()
+                .and_then(|context| hex::decode(context.group_id).ok())
+                .is_some_and(|group| self.mls_context().group_is_active(group.clone()).unwrap_or(false)
+                    && self.mls_context().group_member_identities(group).ok()
+                        .is_some_and(|members| members.iter().any(|member| member.as_slice() == identity.as_bytes())));
+        if !locally_healthy {
+            match self.fetch_welcome_delivery(convo_id).await {
+                Ok(delivery) => return self.join_or_rejoin_from_delivery(delivery).await,
+                Err(OrchestratorError::ServerError { status: 404 | 410, .. }) => {},
+                Err(error) => return Err(error),
+            }
+        } else {
+            self.retry_welcome_acknowledgements_for_conversation(convo_id).await?;
+        }
         let rejoin_lock = self.rejoin_lock(convo_id).await;
         let _rejoin_guard = match rejoin_lock.try_lock() {
             Ok(guard) => guard,
@@ -3534,6 +3592,233 @@ where
             }
         }
         Ok(epoch)
+    }
+
+    /// Adopt a Welcome already obtained for this exact conversation. Unlike
+    /// automatic recovery, this may restore a removed device after fresh
+    /// authorized membership and native Welcome verification. Exact delivery
+    /// metadata comes from a retained receipt or canonical inventory; failures
+    /// never fall back to a new membership/reset mutation.
+    pub async fn join_or_rejoin_from_available_welcome(
+        &self,
+        convo_id: &str,
+        welcome: Vec<u8>,
+    ) -> Result<u64> {
+        self.check_shutdown().await?;
+        let delivery = self.delivery_for_welcome_bytes(convo_id, &welcome).await?;
+        self.join_or_rejoin_from_delivery(delivery).await
+    }
+
+    pub(crate) async fn join_or_rejoin_from_delivery(
+        &self,
+        delivery: super::welcome_ack::WelcomeDelivery,
+    ) -> Result<u64> {
+        let convo_id = delivery.conversation_id();
+        self.check_shutdown().await?;
+        let user = self.require_user_did().await?;
+        let identity = self.require_scoped_identity().await?;
+        let lock = self.rejoin_lock(convo_id).await;
+        {
+            let _guard = lock.lock().await;
+            if self.is_local_conversation_closed(convo_id).await? {
+                return Err(OrchestratorError::InvalidInput(
+                    "This conversation is closed.".into(),
+                ));
+            }
+            let response = self.fetch_conversation_lifecycle(convo_id).await?;
+            let state = &response["state"];
+            let coordinate =
+                super::lifecycle::lifecycle_coordinates(&state["coordinates"], convo_id)?;
+            let group = base64::engine::general_purpose::STANDARD
+                .decode(coordinate["groupId"].as_str().unwrap())
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+            let group_hex = hex::encode(&group);
+            self.require_current_welcome_membership(convo_id, state)
+                .await?;
+            if self
+                .mls_context()
+                .get_prepared_control(&group_hex)?
+                .is_some()
+            {
+                return Err(OrchestratorError::RecoveryFailed(
+                    "A pending local Commit must finish before Welcome adoption.".into(),
+                ));
+            }
+            let original = super::lifecycle::lifecycle_coordinates(
+                &delivery.envelope["coordinates"], convo_id,
+            )?;
+            if delivery.group_id()? != group
+                || original["generation"] != coordinate["generation"]
+                || original["stateVersion"].as_u64() > coordinate["stateVersion"].as_u64()
+                || original["epoch"].as_u64() > coordinate["epoch"].as_u64()
+            {
+                return Err(OrchestratorError::InvalidInput(
+                    "The Welcome belongs to another conversation generation.".into(),
+                ));
+            }
+            // Only an exact native receipt can reuse an already imported
+            // group. Membership alone never acknowledges another envelope.
+            let result = self.mls_context().process_welcome_delivery(
+                &delivery, identity.as_bytes().to_vec(),
+                Some(self.config().group_config.clone()),
+            )?;
+            if result.group_id != group {
+                return Err(OrchestratorError::InvalidInput(
+                    "The Welcome belongs to another conversation generation.".into(),
+                ));
+            }
+            let epoch = self.mls_context().get_epoch(group.clone())?;
+            if epoch > coordinate["epoch"].as_u64().unwrap()
+                || !self.mls_context().group_is_active(group.clone())?
+                || !self
+                    .mls_context()
+                    .group_member_identities(group.clone())?
+                    .iter()
+                    .any(|member| member.as_slice() == identity.as_bytes())
+            {
+                return Err(OrchestratorError::InvalidInput(
+                    "The Welcome did not admit this exact device to the current conversation."
+                        .into(),
+                ));
+            }
+            self.mls_context().ensure_storage_durable()?;
+            self.storage()
+                .ensure_conversation_exists(&user, convo_id, &group_hex)
+                .await?;
+            let projection = GroupState {
+                conversation_id: convo_id.into(),
+                group_id: group_hex.clone(),
+                epoch,
+                members: self
+                    .mls_context()
+                    .group_member_identities(group)?
+                    .into_iter()
+                    .filter_map(|id| String::from_utf8(id).ok())
+                    .collect(),
+            };
+            self.storage().set_group_state(&projection).await?;
+            self.storage()
+                .update_join_info(convo_id, &user, JoinMethod::Welcome, epoch)
+                .await?;
+            {
+                let mut states = self.group_states().lock().await;
+                normalize_group_state(&mut states, projection);
+            }
+            if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
+                if view.group_id != group_hex { view.canonical_state = None; }
+                view.group_id = group_hex;
+                view.epoch = epoch;
+            }
+            // A preserved DeviceRemoved or ResetPending state continues to
+            // block sends. New devices stay Recovering during catch-up.
+            self.project_non_reset_state_locked(convo_id, ConversationState::Initializing)
+                .await?;
+        }
+        self.finish_available_welcome_adoption(convo_id).await
+    }
+
+    async fn require_current_welcome_membership(
+        &self,
+        convo_id: &str,
+        state: &serde_json::Value,
+    ) -> Result<()> {
+        let did = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let coordinate = super::lifecycle::lifecycle_coordinates(&state["coordinates"], convo_id)?;
+        if coordinate["lifecycle"] != "active"
+            || !state["participants"].as_array().is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|p| p["userDid"].as_str() == Some(&did) && p["status"] == "active")
+            })
+            || !state["leaves"].as_array().is_some_and(|items| {
+                items.iter().any(|p| {
+                    p["userDid"].as_str() == Some(&did)
+                        && p["deviceId"].as_str() == Some(&device)
+                        && p["deviceStatus"].as_str() != Some("revoked")
+                })
+            })
+        {
+            return Err(OrchestratorError::InvalidInput(
+                "This device has no current authorized membership for this Welcome.".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn finish_available_welcome_adoption(&self, convo_id: &str) -> Result<u64> {
+        // Network reads and process_incoming execute outside the transition
+        // lock. Catch-up can itself need that lock for terminal/reset commits.
+        for _ in 0..3 {
+            let response = self.fetch_conversation_lifecycle(convo_id).await?;
+            let state = &response["state"];
+            self.require_current_welcome_membership(convo_id, state)
+                .await?;
+            let target_epoch = state["coordinates"]["epoch"].as_u64().unwrap();
+            self.catch_up_available_welcome(convo_id, target_epoch)
+                .await?;
+            let lock = self.rejoin_lock(convo_id).await;
+            let _guard = lock.lock().await;
+            if self.is_local_conversation_closed(convo_id).await? {
+                return Err(OrchestratorError::InvalidInput(
+                    "This conversation is closed.".into(),
+                ));
+            }
+            let latest = self.fetch_conversation_lifecycle(convo_id).await?;
+            let current = &latest["state"];
+            self.require_current_welcome_membership(convo_id, current)
+                .await?;
+            if !self
+                .device_group_matches_current_state(convo_id, current)
+                .await?
+            {
+                continue;
+            }
+            let group = base64::engine::general_purpose::STANDARD
+                .decode(
+                    current["coordinates"]["groupId"]
+                        .as_str()
+                        .or_else(|| current["coordinates"]["groupId"]["$bytes"].as_str())
+                        .unwrap(),
+                )
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+            if self.resolve_conversation_context(convo_id).await?.group_id != hex::encode(&group) {
+                return Err(OrchestratorError::RecoveryFailed(
+                    "The conversation generation changed during Welcome catch-up.".into(),
+                ));
+            }
+            if let Some(payload) = self.reset_pending_payload_result(convo_id).await? {
+                if hex::encode(&group) != payload.new_group_id {
+                    let adopted = self
+                        .adopt_verified_welcome_reset_target(
+                            convo_id,
+                            &payload,
+                            &hex::encode(&group),
+                        )
+                        .await?;
+                    self.complete_reset_recovery(convo_id, &adopted, group.clone(), false)
+                        .await?;
+                } else {
+                    self.complete_reset_recovery(convo_id, &payload, group.clone(), true)
+                        .await?;
+                }
+            }
+            self.mls_context().ensure_storage_durable()?;
+            self.storage()
+                .clear_device_removal_after_verified_welcome(convo_id)
+                .await?;
+            self.conversation_states()
+                .lock()
+                .await
+                .insert(convo_id.into(), ConversationState::Active);
+            self.storage().clear_rejoin_flag(convo_id).await?;
+            self.complete_welcome_acknowledgements_locked(convo_id).await?;
+            if let Err(error) = self.retain_conversation_policy_json(convo_id, current).await {
+                tracing::warn!(convo_id, %error, "Verified Welcome retained; admission policy refresh will retry");
+            }
+            return Ok(self.mls_context().get_epoch(group)?);
+        }
+        Err(OrchestratorError::RecoveryFailed("Welcome accepted; conversation Commits are still synchronizing. Try again to continue from saved progress.".into()))
     }
 
     /// Recovery body for callers that already own the transition lock.
@@ -3583,298 +3868,10 @@ where
             convo_id
         );
 
-        // Step 1: Try Welcome.
-        //
-        // Track the outcome so the next steps can decide whether to attempt
-        // first-responder bootstrap. We only try bootstrap when Welcome was
-        // unavailable in an "expected" way (404/410/processing-fail) — a
-        // real network error means we can't trust that the welcome isn't
-        // sitting on the server, and we shouldn't race-bootstrap blind.
-        let mut welcome_recovery_error: Option<LastRecoveryError> = None;
-        let welcome_unavailable_expected: bool = match self.api_client().get_welcome(convo_id).await
-        {
-            Ok(welcome_data) => {
-                tracing::info!(
-                    convo_id,
-                    welcome_len = welcome_data.len(),
-                    "Welcome message found, joining via Welcome"
-                );
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} Welcome FOUND len={} — calling process_welcome",
-                    convo_id,
-                    welcome_data.len()
-                );
-
-                let scoped_identity = self.require_scoped_identity().await?;
-                let identity_bytes = scoped_identity.into_bytes();
-                let welcome_result = self.mls_context().process_welcome(
-                    welcome_data,
-                    identity_bytes,
-                    Some(self.config().group_config.clone()),
-                ).map_err(|e| {
-                    tracing::warn!(convo_id, error = %e, "Welcome processing failed, will try first-responder bootstrap or External Commit");
-                    e
-                });
-
-                match welcome_result {
-                    Ok(result) => {
-                        let current_reset_authority =
-                            self.reset_pending_payload_result(convo_id).await?;
-                        let epoch = if let Some(payload) = current_reset_authority.as_ref() {
-                            let expected_group =
-                                hex::decode(&payload.new_group_id).map_err(|e| {
-                                    OrchestratorError::InvalidInput(format!(
-                                        "ResetPending target is invalid hex: {e}"
-                                    ))
-                                })?;
-                            if result.group_id != expected_group {
-                                let welcome_group_id = hex::encode(&result.group_id);
-                                let authoritative =
-                                    self.fetch_conversation_for_convo(convo_id).await;
-                                match authoritative {
-                                    Ok(conversation)
-                                        if conversation.conversation_id == convo_id
-                                            && conversation.group_id == welcome_group_id => {}
-                                    Ok(conversation) => {
-                                        let _ = self
-                                            .mls_context()
-                                            .delete_group(result.group_id.clone());
-                                        return Err(
-                                            OrchestratorError::ResetCompletionNotCommitted {
-                                                convo_id: convo_id.to_string(),
-                                                reset_generation: payload.reset_generation,
-                                                reason: format!(
-                                                    "processed Welcome group {welcome_group_id} does not match authoritative server mapping {}",
-                                                    conversation.group_id
-                                                ),
-                                            },
-                                        );
-                                    }
-                                    Err(error) => {
-                                        let _ = self
-                                            .mls_context()
-                                            .delete_group(result.group_id.clone());
-                                        return Err(
-                                            OrchestratorError::ResetCompletionNotCommitted {
-                                                convo_id: convo_id.to_string(),
-                                                reset_generation: payload.reset_generation,
-                                                reason: format!(
-                                                    "processed Welcome winner could not be verified against the server mapping: {error}"
-                                                ),
-                                            },
-                                        );
-                                    }
-                                }
-                                let adopted_payload = self
-                                    .adopt_verified_welcome_reset_target(
-                                        convo_id,
-                                        payload,
-                                        &welcome_group_id,
-                                    )
-                                    .await?;
-                                self.complete_reset_recovery(
-                                    convo_id,
-                                    &adopted_payload,
-                                    result.group_id.clone(),
-                                    false,
-                                )
-                                .await?
-                            } else {
-                                self.complete_reset_recovery(
-                                    convo_id,
-                                    payload,
-                                    result.group_id.clone(),
-                                    true,
-                                )
-                                .await?
-                            }
-                        } else {
-                            // A processed Welcome without a readable epoch is
-                            // not a usable recovery result. Epoch zero fallback
-                            // used to publish a half-joined group and clear its
-                            // recovery flag.
-                            self.mls_context()
-                                .get_epoch(result.group_id.clone())
-                                .map_err(|error| {
-                                    OrchestratorError::RecoveryFailed(format!(
-                                        "processed Welcome epoch is unavailable for {convo_id}: {error}"
-                                    ))
-                                })?
-                        };
-
-                        // The durable stable-conversation projection is the
-                        // application-level commit point. Construct it without
-                        // mutating the cache, persist it first, and publish it
-                        // only after the write succeeds.
-                        let welcome_group_id_hex = hex::encode(&result.group_id);
-                        let mut state = {
-                            let states = self.group_states().lock().await;
-                            states
-                                .get(&welcome_group_id_hex)
-                                .cloned()
-                                .or_else(|| {
-                                    states
-                                        .values()
-                                        .find(|state| state.conversation_id == convo_id)
-                                        .cloned()
-                                })
-                                .unwrap_or_else(|| GroupState {
-                                    group_id: welcome_group_id_hex.clone(),
-                                    conversation_id: convo_id.to_string(),
-                                    epoch: 0,
-                                    members: vec![],
-                                })
-                        };
-                        state.group_id = welcome_group_id_hex.clone();
-                        state.conversation_id = convo_id.to_string();
-                        state.epoch = epoch;
-                        // Materialize the stable conversation row before the
-                        // GroupState projection. Apart from binding the stable
-                        // conversation id to the mutable MLS group, this gives
-                        // recovery-flag storage a durable row to update if a
-                        // later commit-point write fails.
-                        if let Err(error) = self
-                            .storage()
-                            .ensure_conversation_exists(&user_did, convo_id, &welcome_group_id_hex)
-                            .await
-                        {
-                            self.report_recovery_storage_failure(
-                                convo_id,
-                                "ensure_conversation_exists:welcome_recovery",
-                                &error,
-                            )
-                            .await;
-                            return Err(error);
-                        }
-                        if let Err(error) = self.storage().set_group_state(&state).await {
-                            self.mark_needs_rejoin_critical(convo_id).await;
-                            return Err(error);
-                        }
-                        if let Err(error) = self
-                            .storage()
-                            .update_join_info(convo_id, &user_did, JoinMethod::Welcome, epoch)
-                            .await
-                        {
-                            self.mark_needs_rejoin_critical(convo_id).await;
-                            return Err(error);
-                        }
-
-                        // Outside reset recovery there is no generation-bound
-                        // completion transaction, so retain the legacy clear.
-                        if let Err(error) = self.clear_rejoin_failures(convo_id).await {
-                            self.mark_needs_rejoin_critical(convo_id).await;
-                            return Err(error);
-                        }
-                        if current_reset_authority.is_none() {
-                            if let Err(error) = self.storage().clear_rejoin_flag(convo_id).await {
-                                self.mark_needs_rejoin_critical(convo_id).await;
-                                return Err(error);
-                            }
-                        }
-                        {
-                            let mut states = self.group_states().lock().await;
-                            normalize_group_state(&mut states, state);
-                        }
-
-                        self.cleanup_epoch_secrets_if_needed(
-                            convo_id,
-                            &welcome_group_id_hex,
-                            epoch,
-                        )
-                        .await;
-
-                        // Insert history boundary marker for Welcome join.
-                        // On iOS, Swift inserts first — message_exists prevents duplicates.
-                        let marker_id = format!("hb-{}-{}", convo_id, epoch);
-                        if !self
-                            .storage()
-                            .message_exists(&marker_id)
-                            .await
-                            .unwrap_or(true)
-                        {
-                            let user_did_ref = &user_did;
-                            let payload = MLSMessagePayload::system("history_boundary.new_member");
-                            let marker = Message {
-                                id: marker_id,
-                                conversation_id: convo_id.to_string(),
-                                sender_did: user_did_ref.clone(),
-                                text: "history_boundary.new_member".to_string(),
-                                timestamp: chrono::Utc::now(),
-                                epoch,
-                                sequence_number: 0,
-                                is_own: true,
-                                delivery_status: None,
-                                payload_json: serde_json::to_string(&payload).ok(),
-                            };
-                            if let Err(e) = self.storage().store_message(&marker).await {
-                                tracing::warn!(error = %e, convo_id, "Failed to store history boundary marker");
-                            }
-                        }
-
-                        tracing::info!(convo_id, epoch, "Successfully joined via Welcome");
-                        crate::warn_log!(
-                            "[REJOIN-DIAG] convo={} Welcome JOIN OK epoch={}",
-                            convo_id,
-                            epoch
-                        );
-                        // Newly-joined members can't derive a past epoch's
-                        // exporter, so fetch + decrypt the encrypted metadata
-                        // blob now to surface the group name/description. The
-                        // enclosing sync builds its snapshot from the cache this
-                        // populates. Best-effort — never fails the join.
-                        self.hydrate_conversation_metadata(convo_id).await;
-                        return Ok(epoch);
-                    }
-                    Err(err) => {
-                        crate::warn_log!(
-                            "[REJOIN-DIAG] convo={} Welcome process_welcome FAILED: {}",
-                            convo_id,
-                            err
-                        );
-                        welcome_recovery_error = classify_welcome_processing_error(&err);
-                        // Welcome bytes returned but processing failed — treat
-                        // as "expected" for bootstrap eligibility (the welcome
-                        // is malformed for us; bootstrapping into a fresh
-                        // group is the right next step if state is ResetPending).
-                        tracing::info!(
-                            convo_id,
-                            "Welcome processing failed, will try first-responder bootstrap (if ResetPending) before External Commit"
-                        );
-                        true
-                    }
-                }
-            }
-            Err(e) => {
-                // Check if this is a 404/410 (Welcome not available) vs a real error.
-                let is_expected = match &e {
-                    OrchestratorError::ServerError { status, .. } => {
-                        *status == 404 || *status == 410
-                    }
-                    _ => false,
-                };
-                if is_expected {
-                    welcome_recovery_error = Some(classify_server_error(&e));
-                    tracing::info!(
-                        convo_id,
-                        "No Welcome available — will try first-responder bootstrap (if ResetPending) before External Commit"
-                    );
-                    crate::warn_log!(
-                        "[REJOIN-DIAG] convo={} Welcome fetch 404/410 (unavailable/expired): {}",
-                        convo_id,
-                        e
-                    );
-                    true
-                } else {
-                    tracing::warn!(convo_id, error = %e, "Welcome fetch failed with non-404/410 error; skipping bootstrap, falling back to External Commit");
-                    crate::warn_log!(
-                        "[REJOIN-DIAG] convo={} Welcome fetch FAILED (non-404/410, skipping bootstrap): {}",
-                        convo_id,
-                        e
-                    );
-                    false
-                }
-            }
-        };
+        // The caller already tried the full canonical Welcome envelope.
+        // Only an explicit 404/410 reaches this fallback; storage, transport,
+        // or post-import errors preserve the durable native receipt instead.
+        let welcome_unavailable_expected = true;
 
         // Step 2: First-responder bootstrap (spec §8.5 Phase 1) — try BEFORE
         // External Commit when state is `ResetPending` and Welcome was
@@ -3973,10 +3970,9 @@ where
             }
         }
 
-        // Step 3: External Commit fallback (gated by enforce_rejoin_backoff).
-        // Re-read immediately before authorizing EC: a non-404 Welcome error
-        // skips bootstrap, and another process may also have published reset
-        // authority since the entry snapshot. Either case must fail closed.
+        // Step 3: canonical device recovery. A missing or unusable Welcome
+        // never authorizes an automatic External Commit under chat v2.
+        // Re-read durable reset authority before requesting membership work.
         if let Some(pending) = self.reset_pending_payload_result(convo_id).await? {
             return Err(OrchestratorError::ResetCompletionNotCommitted {
                 convo_id: convo_id.to_string(),
@@ -3984,63 +3980,29 @@ where
                 reason: "ResetPending authority prohibits External Commit fallback".to_string(),
             });
         }
-        //
-        // Bootstrap was tried above when applicable; this path is for:
-        //   - never-joined convos (state != ResetPending)
-        //   - convos where bootstrap failed for a non-409 reason
-        //   - convos where Welcome failed with a non-404/410 error and we
-        //     skipped bootstrap defensively
-        if welcome_recovery_error.is_some() {
-            // Clean-chat exposes no GroupInfo, so External Commit can never
-            // succeed here. A live leaf of another participant must re-add
-            // us, or an admin resets; both bind the server's coordinate.
-            let state = self.fetch_server_conversation_state(convo_id).await?;
-            let outcome = self.recover_leaf_or_reset(&state, &user_did).await?;
-            if let Some(epoch) = outcome.get("epoch").and_then(|v| v.as_u64()) {
-                self.clear_rejoin_failures(convo_id).await?;
-                crate::warn_log!("[REJOIN-DIAG] convo={} reset activated epoch={}", convo_id, epoch);
-                return Ok(epoch);
-            }
-            self.storage().mark_needs_rejoin(convo_id).await?;
-            crate::warn_log!("[REJOIN-DIAG] convo={} leaf recovery pending: {}", convo_id, outcome);
-            return Err(OrchestratorError::RecoveryFailed(format!(
-                "leaf recovery pending for {convo_id}: {outcome}"
-            )));
+        let state = self.fetch_server_conversation_state(convo_id).await?;
+        let outcome = self.recover_leaf_or_reset(&state, &user_did).await?;
+        if let Some(epoch) = outcome.get("epoch").and_then(|v| v.as_u64()) {
+            self.clear_rejoin_failures(convo_id).await?;
+            return Ok(epoch);
         }
-        if let Err(err) = self.enforce_rejoin_backoff(convo_id).await {
-            crate::warn_log!(
-                "[REJOIN-DIAG] convo={} External Commit BLOCKED by rejoin backoff/circuit-breaker — staying NeedsRejoin: {}",
-                convo_id,
-                err
-            );
-            return Err(err);
-        }
-        crate::warn_log!(
-            "[REJOIN-DIAG] convo={} attempting External Commit (force_rejoin)",
-            convo_id
-        );
-        let rejoin_result = self.force_rejoin_unlocked(convo_id, &user_did).await;
-        match rejoin_result {
-            Ok(()) => {
-                self.clear_rejoin_failures(convo_id).await?;
-                let epoch = self.local_group_epoch(convo_id).await.unwrap_or(0);
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} External Commit OK epoch={}",
-                    convo_id,
-                    epoch
-                );
-                Ok(epoch)
-            }
-            Err(err) => {
-                self.record_rejoin_failure(convo_id).await?;
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} External Commit FAILED: {}",
-                    convo_id,
-                    err
-                );
-                Err(err)
-            }
-        }
+        self.storage().mark_needs_rejoin(convo_id).await?;
+        // This reaches platform error UI. Retain the stable classification
+        // prefix, but never embed signed control data or reserved KeyPackages.
+        let request_id = outcome.pointer("/recovery/recoveryRequestId")
+            .or_else(|| outcome.pointer("/result/recovery/recoveryRequestId"))
+            .or_else(|| outcome.get("recoveryRequestId"))
+            .and_then(|value| value.as_str())
+            .filter(|id| crate::chat_v2::ids::RecoveryRequestId::parse(id).is_ok());
+        let request_label = request_id.map(|id| format!(" Request: {id}.")).unwrap_or_default();
+        let guidance = if outcome["reset"] == "requested" {
+            "Waiting for an administrator to complete conversation recovery."
+        } else {
+            "Keep another current device online to finish adding this device."
+        };
+        Err(OrchestratorError::RecoveryFailed(format!(
+            "leaf recovery pending for {convo_id}. {guidance}{request_label}"
+        )))
     }
 
     /// Perform full silent recovery for a user.
@@ -4602,7 +4564,8 @@ where
             .await
             .insert(convo_id.to_string(), durable_state);
         if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
-            view.group_id = new_group_id_hex.to_string();
+            if view.group_id != new_group_id_hex { view.canonical_state = None; }
+                view.group_id = new_group_id_hex.to_string();
             view.epoch = 0;
         }
 
@@ -4874,7 +4837,8 @@ where
             };
             if project_completed_target {
                 if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
-                    view.group_id = payload.new_group_id.clone();
+                    if view.group_id != payload.new_group_id { view.canonical_state = None; }
+                view.group_id = payload.new_group_id.clone();
                     view.epoch = landed_epoch;
                 }
             }
@@ -5276,7 +5240,7 @@ where
             pagination.observe_page(page.conversations.len(), page.cursor.as_deref())?;
             for cv in &page.conversations {
                 if cv.conversation_id == convo_id {
-                    return Ok(cv.clone());
+                    return self.restore_conversation_policy(&self.require_user_did().await?, cv.clone());
                 }
             }
             cursor = page.cursor;
@@ -6070,6 +6034,7 @@ where
                 created_at: Some(chrono::Utc::now()),
                 updated_at: Some(chrono::Utc::now()),
                 sequencer_did: None,
+                canonical_state: None,
             },
             commit_data: None,
             welcome_data: None,
@@ -6152,7 +6117,7 @@ mod tests {
             .expect("create Bob fork fixture key package");
         world
             .delivery_service()
-            .add_leaf_recovery_inbox_item(serde_json::json!({
+            .add_pending_leaf_recovery_request(serde_json::json!({
                 "recovery": {
                     "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
                     "conversationId": group.conversation_id,

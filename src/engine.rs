@@ -13,6 +13,8 @@ use crate::platform_lifecycle::{PlatformLifecycle, SuspendResult};
 use crate::{StorageLifecycleState, StorageLifecycleStatus};
 use serde::Deserialize;
 
+mod server_events;
+
 pub use crate::orchestrator::MessageProcessingResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +297,8 @@ where
         })
     }
 
+    /// Invite accounts and return the refreshed participant roster. Device
+    /// leaves and the MLS epoch change only after acceptance and fulfillment.
     pub fn add_members(
         &self,
         convo_id: &str,
@@ -303,9 +307,8 @@ where
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
         if !member_dids.is_empty() {
-            crate::async_runtime::block_on(self.orchestrator.swap_members(
+            crate::async_runtime::block_on(self.orchestrator.add_members(
                 convo_id,
-                &[],
                 member_dids,
             ))?;
         }
@@ -320,7 +323,7 @@ where
     ) -> Result<GroupMutationResult> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
-        crate::async_runtime::block_on(self.orchestrator.remove_members(convo_id, member_dids))?;
+        crate::async_runtime::block_on(self.orchestrator.remove_accounts(convo_id, member_dids))?;
         let conversation = self.refresh_conversation_snapshot(convo_id)?;
         Ok(GroupMutationResult { conversation })
     }
@@ -328,7 +331,12 @@ where
     pub fn leave_conversation(&self, convo_id: &str) -> Result<LeaveResult> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
-        let group_id = self.current_conversation_group_id(convo_id)?;
+        // This is advisory result metadata. Leaving is authorized by fresh
+        // server state, even when this device has no readable local snapshot.
+        let group_id = self.current_conversation_group_id(convo_id).unwrap_or_else(|error| {
+            tracing::warn!(conversation_id = convo_id, %error, "Cannot read advisory local group ID before leave");
+            None
+        });
         crate::async_runtime::block_on(self.orchestrator.leave_group(convo_id))?;
         Ok(LeaveResult {
             conversation_id: convo_id.to_string(),
@@ -339,6 +347,13 @@ where
     pub fn process_server_event(&self, event_json: &str) -> Result<Vec<EngineEvent>> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
+        let value: serde_json::Value = serde_json::from_str(event_json).map_err(|err| {
+            OrchestratorError::InvalidInput(format!("Failed to decode server event JSON: {err}"))
+        })?;
+        if value.get("$type").is_some() || value.get("payload").is_some() {
+            let hint = server_events::CanonicalHint::parse(value)?;
+            return crate::async_runtime::block_on(self.process_canonical_hint(hint));
+        }
         let event: ServerEventEnvelope = serde_json::from_str(event_json).map_err(|err| {
             OrchestratorError::InvalidInput(format!("Failed to decode server event JSON: {err}"))
         })?;

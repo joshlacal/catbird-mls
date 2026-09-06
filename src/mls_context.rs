@@ -216,6 +216,10 @@ pub(crate) struct ManifestStorage {
 }
 
 impl ManifestStorage {
+    /// The Welcome-only provider borrows this connection so its KeyPackage,
+    /// group and receipt writes share one transaction. Never use the ordinary
+    /// provider's separate connection while that transaction is open.
+    pub(crate) fn welcome_ack_connection(&self) -> &Connection { &self.conn }
     fn open_connection(
         db_path: &std::path::Path,
         encryption_key: &str,
@@ -522,6 +526,26 @@ impl ManifestStorage {
         self.maybe_truncate_checkpoint();
 
         Ok(())
+    }
+
+    /// Atomic journal update across native contexts sharing this encrypted DB.
+    /// Callers retain old JSON exactly and retry a failed comparison; a returned
+    /// write error remains ambiguous until the row is reread.
+    pub(crate) fn compare_exchange_manifest<T: Serialize>(
+        &self, key: &str, expected: Option<&str>, value: &T,
+    ) -> Result<bool, MLSError> {
+        let next = serde_json::to_string(value).map_err(|_| MLSError::SerializationError)?;
+        let changed = match expected {
+            Some(old) => self.conn.execute(
+                "UPDATE mls_manifests SET value=?3 WHERE key=?1 AND value=?2",
+                rusqlite::params![key, old, next],
+            ),
+            None => self.conn.execute(
+                "INSERT OR IGNORE INTO mls_manifests(key,value) VALUES(?1,?2)",
+                rusqlite::params![key, next],
+            ),
+        }.map_err(|e| map_sqlite_error("compare_exchange_manifest", &e))?;
+        Ok(changed == 1)
     }
 
     /// Read a manifest (deserialize from JSON)
@@ -882,6 +906,8 @@ struct PendingExternalJoin {
 
 pub struct GroupState {
     pub group: MlsGroup,
+    /// Empty for a retained inactive group: removal revokes local signing
+    /// authority even though its public state and historical keys remain.
     pub signer_public_key: Vec<u8>,
     /// Present until the locally finalized External Commit is accepted by the
     /// server. The nested identity exists only when this candidate minted its
@@ -2224,6 +2250,17 @@ fn validate_existing_sqlite_storage(
                 "Authoritative group {hex_id} missing from storage on load"
             )));
         };
+        if !loaded_group.is_active() {
+            if pending_joins_map.contains_key(hex_id) {
+                return Err(MLSError::invalid_input(format!(
+                    "Inactive group {hex_id} cannot have a pending external join"
+                )));
+            }
+            // A verified Remove Commit can erase our own leaf. The persisted
+            // inactive state remains readable, but must not acquire a signer
+            // from another remaining leaf or device during startup.
+            continue;
+        }
         let own_leaf = loaded_group.own_leaf_node().ok_or_else(|| {
             MLSError::invalid_input(format!("Group {hex_id} has no own leaf node"))
         })?;
@@ -2450,7 +2487,12 @@ impl MLSContext {
                                 crate::info_log!("[MLS-CONTEXT]   Group ID: {}", hex_id);
                                 crate::info_log!("[MLS-CONTEXT]   Epoch: {}", loaded_epoch);
                                 crate::info_log!("[MLS-CONTEXT]   Members: {}", loaded_members);
-                                let signer_public_key = if let Some(own_leaf) =
+                                let signer_public_key = if !group.is_active() {
+                                    if pending_external_joins.contains_key(hex_id) {
+                                        return Err(MLSError::StorageFailed);
+                                    }
+                                    Vec::new()
+                                } else if let Some(own_leaf) =
                                     group.own_leaf_node()
                                 {
                                     let own_credential = own_leaf.credential().serialized_content();
@@ -3690,6 +3732,14 @@ impl MLSContext {
         }
     }
 
+    /// Publication after the canonical Welcome transaction has committed.
+    /// This cannot roll back or delete a group paired with a durable receipt.
+    pub(crate) fn publish_welcome_group(&mut self, group: MlsGroup, signer_public_key: Vec<u8>) {
+        self.groups.insert(group.group_id().as_slice().to_vec(), GroupState {
+            group, signer_public_key, pending_external_join: None,
+        });
+    }
+
     /// Register a signer public key for an identity
     /// This must be called when creating key packages so the signer can be found when processing Welcome messages
     pub fn register_signer(
@@ -3819,6 +3869,11 @@ impl MLSContext {
             Some(s) => s,
             None => return Err(MLSError::group_not_found(hex::encode(group_id.as_slice()))),
         };
+        if !state.group.is_active() {
+            return Err(MLSError::invalid_input(
+                "This device is no longer an active member of the group",
+            ));
+        }
 
         // 🔍 DIAGNOSTIC: Log secret tree state at entry
         let epoch_at_entry = state.group.epoch().as_u64();

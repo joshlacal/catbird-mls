@@ -3,7 +3,8 @@
 //! A device that lost its MLS group (reinstall, storage reset) cannot use
 //! External Commit under `blue.catbird.chat.*` — no endpoint returns
 //! GroupInfo — and can only be re-added by a *live* MLS leaf of another
-//! participant fulfilling its leaf-recovery request. When no such leaf exists
+//! device fulfilling its leaf-recovery request, including a sibling device on
+//! the same account. When no such leaf exists
 //! the conversation is dead for everyone. The server's answer is
 //! `requestReset` + `activateReset`: any active admin device may call both
 //! without holding a leaf, becomes the sole genesis leaf of the successor
@@ -32,8 +33,9 @@ use super::storage::MLSStorageBackend;
 use super::types::*;
 
 /// Server `RECOVERY_RESERVATION_TTL_MILLIS`: an open leaf-recovery request
-/// nobody fulfils within this window expires. Once it has, waiting longer
-/// cannot help — escalate to a reset.
+/// nobody fulfils within this window expires. Retry the request after this
+/// interval; the server decides whether the reservation expired or is still
+/// open. An offline device is not evidence that its MLS state was lost.
 pub(crate) const LEAF_RECOVERY_TTL: Duration = Duration::from_secs(300);
 
 /// Outcome of [`MLSOrchestrator::reset_conversation`].
@@ -109,15 +111,22 @@ impl ServerConversationState {
         Ok((field("role"), field("status")))
     }
 
-    /// True only when the server told us the leaf set and no *other*
-    /// participant holds an unrevoked MLS leaf — i.e. nobody but our own
-    /// (possibly dead) devices could fulfil an `add` leaf recovery for us.
-    /// Unknown leaves never count as "nobody".
-    pub(crate) fn nobody_else_can_add(&self, user_did: &str) -> bool {
+    /// True only when the server proves that every leaf belongs to this
+    /// exact device or is unable to fulfil recovery. A sibling on the same
+    /// account may fulfil both ordinary add and lost-state replace requests.
+    /// Missing or unrecognized fields never authorize an automatic reset.
+    pub(crate) fn nobody_else_can_add(&self, user_did: &str, device_id: &str) -> bool {
         self.leaves.as_ref().is_some_and(|leaves| {
-            !leaves.iter().any(|leaf| {
-                leaf.get("userDid").and_then(|v| v.as_str()) != Some(user_did)
-                    && leaf.get("deviceStatus").and_then(|v| v.as_str()) != Some("revoked")
+            leaves.iter().all(|leaf| {
+                let leaf_did = leaf.get("userDid").and_then(|v| v.as_str());
+                let leaf_device = leaf.get("deviceId").and_then(|v| v.as_str());
+                (leaf_did == Some(user_did) && leaf_device == Some(device_id))
+                    || leaf.get("deviceStatus").and_then(|v| v.as_str()) == Some("revoked")
+                    || leaf_did
+                        .and_then(|did| self.participant(did))
+                        .and_then(|participant| participant.get("status"))
+                        .and_then(|status| status.as_str())
+                        == Some("pending")
             })
         })
     }
@@ -319,14 +328,14 @@ where
             .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))
     }
 
-    /// Re-admit this leafless device: ask a live leaf of another participant
+    /// Re-admit this leafless device: ask a live leaf of another device
     /// to add (or replace) our leaf, or reset when that can never succeed.
     ///
-    /// Only a live leaf of *another* participant can fulfil our request. When
-    /// no such leaf exists, or our open request already outlived the server
-    /// TTL unfulfilled, waiting cannot help — an admin device resets the
-    /// conversation instead. Every coordinate comes from `state`, never from
-    /// local MLS state, so this works from a blank device.
+    /// Sibling devices can fulfil recovery without replacing the whole
+    /// conversation. Reset automatically only when server state proves no
+    /// other leaf can help; expiry alone does not prove that an offline
+    /// device lost its state. Every coordinate comes from `state`, never
+    /// from local MLS state, so this works from a blank device.
     ///
     /// Returns `{"epoch": n}` when a reset was activated here, otherwise the
     /// server's leaf-recovery output or `{"leafRecovery": "open"}`.
@@ -336,11 +345,25 @@ where
         user_did: &str,
     ) -> Result<serde_json::Value> {
         let convo_id = state.conversation_id.as_str();
+        // Known peer-poisoned state requires the existing explicit recovery
+        // path. Another device on our account is not evidence that poison
+        // containment can be bypassed.
+        if let Some(quarantine) = self
+            .recovery_tracker()
+            .lock()
+            .await
+            .quarantine_snapshot(convo_id)
+        {
+            return Err(OrchestratorError::ConversationQuarantined {
+                convo_id: convo_id.to_string(),
+                reason: quarantine.reason.tag().to_string(),
+            });
+        }
+        let actor_device_id = self.require_actor_device_id().await?;
         let (role, _) = state.own_role_status(user_did)?;
         let waited = self.recovery_tracker().lock().await.leaf_recovery_wait(convo_id);
-        let nobody_can_add_us = state.nobody_else_can_add(user_did);
-        let waited_out = waited.is_some_and(|w| w >= LEAF_RECOVERY_TTL);
-        if role == "admin" && (nobody_can_add_us || waited_out) {
+        let nobody_can_add_us = state.nobody_else_can_add(user_did, &actor_device_id);
+        if role == "admin" && nobody_can_add_us {
             crate::warn_log!(
                 "[RESET] convo={} leaf recovery cannot succeed (nobody_else_can_add={}, waited={:?}); resetting",
                 convo_id,
@@ -357,7 +380,6 @@ where
             // earns LeafRecoveryAlreadyOpen.
             return Ok(serde_json::json!({ "leafRecovery": "open" }));
         }
-        let actor_device_id = self.require_actor_device_id().await?;
         let kind = if state.own_device_holds_leaf(user_did, &actor_device_id) {
             "replace"
         } else {
@@ -367,14 +389,6 @@ where
         let mut tracker = self.recovery_tracker().lock().await;
         match &result {
             Ok(_) => tracker.note_leaf_recovery_requested(convo_id),
-            Err(err) if err.to_string().contains("LeafRecoveryAlreadyOpen") => {
-                // Opened by an earlier process of ours; start the clock now so
-                // an unfulfilled request still escalates.
-                if tracker.leaf_recovery_wait(convo_id).is_none() {
-                    tracker.note_leaf_recovery_requested(convo_id);
-                }
-                return Ok(serde_json::json!({ "leafRecovery": "open" }));
-            }
             Err(_) => {}
         }
         result
@@ -783,8 +797,10 @@ where
                     created_at: None,
                     updated_at: Some(chrono::Utc::now()),
                     sequencer_did: None,
+                    canonical_state: None,
                 });
-            view.group_id = group_id_hex;
+            if view.group_id != group_id_hex { view.canonical_state = None; }
+                view.group_id = group_id_hex;
             view.epoch = 0;
             view.members = state
                 .participants
@@ -893,20 +909,34 @@ mod tests {
         let own_only = state(serde_json::json!([
             { "userDid": "did:plc:alice", "deviceId": "dead", "leafOrigin": "genesis", "keyId": "k", "deviceStatus": "active" }
         ]));
-        assert!(own_only.nobody_else_can_add("did:plc:alice"));
+        assert!(own_only.nobody_else_can_add("did:plc:alice", "dead"));
+        assert!(!own_only.nobody_else_can_add("did:plc:alice", "new-device"));
         let revoked_peer = state(serde_json::json!([
             { "userDid": "did:plc:bob", "deviceId": "x", "leafOrigin": "keyPackage", "keyId": "k", "deviceStatus": "revoked" }
         ]));
-        assert!(revoked_peer.nobody_else_can_add("did:plc:alice"));
-        let live_peer = state(serde_json::json!([
+        assert!(revoked_peer.nobody_else_can_add("did:plc:alice", "new-device"));
+        let mut live_peer = state(serde_json::json!([
             { "userDid": "did:plc:bob", "deviceId": "x", "leafOrigin": "keyPackage", "keyId": "k", "deviceStatus": "active" }
         ]));
-        assert!(!live_peer.nobody_else_can_add("did:plc:alice"));
+        // Pending roster membership grants no fulfillment authority.
+        assert!(live_peer.nobody_else_can_add("did:plc:alice", "new-device"));
         assert_eq!(live_peer.own_role_status("did:plc:bob").unwrap(), ("admin".into(), "pending".into()));
+        live_peer.participants[1]["status"] = serde_json::json!("active");
+        assert!(!live_peer.nobody_else_can_add("did:plc:alice", "new-device"));
+        // Device identity is the whole (DID, device ID) pair.
+        assert!(!live_peer.nobody_else_can_add("did:plc:alice", "x"));
 
         // A response without `leaves` says nothing; never assume nobody can help.
         let mut unknown = state(serde_json::json!([]));
         unknown.leaves = None;
-        assert!(!unknown.nobody_else_can_add("did:plc:alice"));
+        assert!(!unknown.nobody_else_can_add("did:plc:alice", "new-device"));
+        for leaf in [
+            serde_json::json!({}),
+            serde_json::json!({ "userDid": "did:plc:alice", "deviceStatus": "active" }),
+            serde_json::json!({ "userDid": "did:plc:alice", "deviceId": "sibling" }),
+            serde_json::json!({ "userDid": "did:plc:alice", "deviceId": "sibling", "deviceStatus": "unknown" }),
+        ] {
+            assert!(!state(serde_json::json!([leaf])).nobody_else_can_add("did:plc:alice", "new-device"));
+        }
     }
 }
