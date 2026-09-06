@@ -64,10 +64,12 @@ pub(crate) struct ServerConversationState {
 }
 
 impl ServerConversationState {
-    pub(crate) fn from_state_json(conversation_id: &str, state: &serde_json::Value) -> Result<Self> {
-        let missing = |field: &str| {
-            OrchestratorError::Api(format!("conversation state missing {field}"))
-        };
+    pub(crate) fn from_state_json(
+        conversation_id: &str,
+        state: &serde_json::Value,
+    ) -> Result<Self> {
+        let missing =
+            |field: &str| OrchestratorError::Api(format!("conversation state missing {field}"));
         Ok(Self {
             conversation_id: conversation_id.to_string(),
             kind: state
@@ -75,16 +77,16 @@ impl ServerConversationState {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| missing("conversationKind"))?
                 .to_string(),
-            coordinates: state.get("coordinates").cloned().ok_or_else(|| missing("coordinates"))?,
+            coordinates: state
+                .get("coordinates")
+                .cloned()
+                .ok_or_else(|| missing("coordinates"))?,
             participants: state
                 .get("participants")
                 .and_then(|v| v.as_array())
                 .cloned()
                 .ok_or_else(|| missing("participants"))?,
-            leaves: state
-                .get("leaves")
-                .and_then(|v| v.as_array())
-                .cloned(),
+            leaves: state.get("leaves").and_then(|v| v.as_array()).cloned(),
             metadata_version: state
                 .get("metadataSnapshot")
                 .and_then(|m| m.get("metadataVersion"))
@@ -107,7 +109,12 @@ impl ServerConversationState {
                 self.conversation_id
             ))
         })?;
-        let field = |name: &str| me.get(name).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let field = |name: &str| {
+            me.get(name)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         Ok((field("role"), field("status")))
     }
 
@@ -254,7 +261,11 @@ where
             }
             let page: serde_json::Value = serde_json::from_slice(&response.body)
                 .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
-            let items = page.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let items = page
+                .get("items")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             let next = page
                 .get("nextPageCursor")
                 .and_then(|v| v.as_str())
@@ -314,7 +325,11 @@ where
         let epoch = self
             .activate_reset(&user_did, &state, &reset_request_id, origin_seq)
             .await?;
-        crate::info_log!("[RESET] convo={} activated successor generation ({})", convo_id, reason);
+        crate::info_log!(
+            "[RESET] convo={} activated successor generation ({})",
+            convo_id,
+            reason
+        );
         Ok(ResetOutcome::Activated { epoch })
     }
 
@@ -322,7 +337,9 @@ where
         if uuid::Uuid::parse_str(conversation_id).is_ok() {
             return Ok(conversation_id.to_string());
         }
-        let resolved = self.resolve_legacy_group_identifier(conversation_id).await?;
+        let resolved = self
+            .resolve_legacy_group_identifier(conversation_id)
+            .await?;
         uuid::Uuid::parse_str(&resolved.conversation_id)
             .map(|u| u.to_string())
             .map_err(|e| OrchestratorError::InvalidInput(e.to_string()))
@@ -361,7 +378,11 @@ where
         }
         let actor_device_id = self.require_actor_device_id().await?;
         let (role, _) = state.own_role_status(user_did)?;
-        let waited = self.recovery_tracker().lock().await.leaf_recovery_wait(convo_id);
+        let waited = self
+            .recovery_tracker()
+            .lock()
+            .await
+            .leaf_recovery_wait(convo_id);
         let nobody_can_add_us = state.nobody_else_can_add(user_did, &actor_device_id);
         if role == "admin" && nobody_can_add_us {
             crate::warn_log!(
@@ -397,7 +418,11 @@ where
     /// Submit `requestReset` bound to the server's current coordinate and
     /// return the pending request id; adopt an existing pending request when
     /// the server reports `ResetAlreadyPending`.
-    pub(crate) async fn ensure_reset_request(&self, state: &ServerConversationState, reason: &str) -> Result<String> {
+    pub(crate) async fn ensure_reset_request(
+        &self,
+        state: &ServerConversationState,
+        reason: &str,
+    ) -> Result<String> {
         let reason = match reason {
             "localStateLost" | "poisonedState" | "epochDivergence" | "manualRecovery" => reason,
             _ => "manualRecovery",
@@ -450,7 +475,10 @@ where
 
     /// The id of an unexpired pending reset request bound to the server's
     /// current coordinate, from `getConversationState`.
-    async fn pending_reset_request_id(&self, state: &ServerConversationState) -> Result<Option<String>> {
+    async fn pending_reset_request_id(
+        &self,
+        state: &ServerConversationState,
+    ) -> Result<Option<String>> {
         let actor_device_id = self.require_actor_device_id().await?;
         let response = self
             .api_client()
@@ -483,9 +511,16 @@ where
             .find(|request| {
                 let prior = request.get("prior");
                 request.get("status").and_then(|v| v.as_str()) == Some("pending")
-                    && prior.and_then(|p| p.get("generation")).and_then(|v| v.as_i64()) == Some(current_generation)
-                    && prior.and_then(|p| p.get("stateVersion")).and_then(|v| v.as_i64()) == Some(current_state_version)
-                    && json_bytes(prior.and_then(|p| p.get("groupId"))).as_deref() == Some(current_group.as_slice())
+                    && prior
+                        .and_then(|p| p.get("generation"))
+                        .and_then(|v| v.as_i64())
+                        == Some(current_generation)
+                    && prior
+                        .and_then(|p| p.get("stateVersion"))
+                        .and_then(|v| v.as_i64())
+                        == Some(current_state_version)
+                    && json_bytes(prior.and_then(|p| p.get("groupId"))).as_deref()
+                        == Some(current_group.as_slice())
             })
             .and_then(|request| request.get("resetRequestId").and_then(|v| v.as_str()))
             .map(str::to_string))
@@ -516,9 +551,16 @@ where
             }
             let page: serde_json::Value = serde_json::from_slice(&response.body)
                 .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
-            let entries = page.get("entries").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let entries = page
+                .get("entries")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             let next = page.get("nextAfterSeq").and_then(|v| v.as_u64());
-            let has_more = page.get("hasMore").and_then(|v| v.as_bool()).unwrap_or(false);
+            let has_more = page
+                .get("hasMore")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let next_cursor = next.map(|n| n.to_string());
             pagination.observe_page(entries.len(), next_cursor.as_deref())?;
             after_seq = entries
@@ -563,7 +605,18 @@ where
         )?;
 
         match self
-            .submit_reset_activation(user_did, &actor_device_id, auth_generation, &key_id, &public_key, &identity_bytes, state, reset_request_id, &new_group_id, origin_seq)
+            .submit_reset_activation(
+                user_did,
+                &actor_device_id,
+                auth_generation,
+                &key_id,
+                &public_key,
+                &identity_bytes,
+                state,
+                reset_request_id,
+                &new_group_id,
+                origin_seq,
+            )
             .await
         {
             Ok(()) => {}
@@ -579,7 +632,8 @@ where
             }
         }
 
-        self.adopt_reset_successor(user_did, state, &new_group_id).await
+        self.adopt_reset_successor(user_did, state, &new_group_id)
+            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -600,13 +654,21 @@ where
             .mls_context()
             .export_group_info(new_group_id.to_vec(), identity_bytes.to_vec())?;
         if super::recovery::advertised_group_id_from_group_info(&group_info)? != new_group_id {
-            return Err(OrchestratorError::InvalidInput("exported GroupInfo group ID mismatch".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "exported GroupInfo group ID mismatch".into(),
+            ));
         }
         if self.mls_context().get_epoch(new_group_id.to_vec())? != 0 {
-            return Err(OrchestratorError::InvalidInput("genesis GroupInfo epoch must be zero".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "genesis GroupInfo epoch must be zero".into(),
+            ));
         }
-        let confirmation_tag = self.mls_context().get_confirmation_tag(new_group_id.to_vec())?;
-        let group_context_hash = self.mls_context().get_group_context_hash(new_group_id.to_vec())?;
+        let confirmation_tag = self
+            .mls_context()
+            .get_confirmation_tag(new_group_id.to_vec())?;
+        let group_context_hash = self
+            .mls_context()
+            .get_group_context_hash(new_group_id.to_vec())?;
 
         // Fresh empty metadata at version prior+1, keyed by the successor
         // group's epoch-0 exporter — the shape the server accepts from an
@@ -619,7 +681,9 @@ where
             .export_metadata_key(new_group_id.to_vec(), 0)?
             .as_slice()
             .try_into()
-            .map_err(|_| OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into())))?;
+            .map_err(|_| {
+                OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
+            })?;
         let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
             &metadata_key,
             new_group_id,
@@ -634,10 +698,15 @@ where
                 avatar_content_type: None,
             },
         )
-        .map_err(|e| OrchestratorError::Mls(MLSError::Internal(format!("encrypt metadata snapshot: {e:?}"))))?;
+        .map_err(|e| {
+            OrchestratorError::Mls(MLSError::Internal(format!(
+                "encrypt metadata snapshot: {e:?}"
+            )))
+        })?;
 
-        let convo_uuid = uuid::Uuid::parse_str(&state.conversation_id)
-            .map_err(|e| OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}")))?;
+        let convo_uuid = uuid::Uuid::parse_str(&state.conversation_id).map_err(|e| {
+            OrchestratorError::InvalidInput(format!("invalid conversation UUID: {e}"))
+        })?;
         let generation = state.coordinate_i64("generation")? + 1;
         let transition_id = uuid::Uuid::new_v4().to_string();
         let successor = serde_json::json!({
@@ -736,7 +805,11 @@ where
         let members: Vec<String> = state
             .participants
             .iter()
-            .filter_map(|p| p.get("userDid").and_then(|v| v.as_str()).map(str::to_string))
+            .filter_map(|p| {
+                p.get("userDid")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .collect();
 
         // `ensure_conversation_exists` never rebinds an existing row's group
@@ -799,8 +872,10 @@ where
                     sequencer_did: None,
                     canonical_state: None,
                 });
-            if view.group_id != group_id_hex { view.canonical_state = None; }
-                view.group_id = group_id_hex;
+            if view.group_id != group_id_hex {
+                view.canonical_state = None;
+            }
+            view.group_id = group_id_hex;
             view.epoch = 0;
             view.members = state
                 .participants
@@ -831,7 +906,9 @@ where
             .await?
             .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
         if auth_generation < 1 {
-            return Err(OrchestratorError::Credential("auth_generation must be >= 1".into()));
+            return Err(OrchestratorError::Credential(
+                "auth_generation must be >= 1".into(),
+            ));
         }
         Ok(auth_generation)
     }
@@ -886,7 +963,10 @@ mod tests {
         assert_eq!(prior["epoch"], 5);
         assert_eq!(prior["lifecycle"], "active");
         assert_eq!(prior["groupId"]["$bytes"], STANDARD.encode([7u8; 32]));
-        assert_eq!(prior["groupContextHash"]["$bytes"], STANDARD.encode([8u8; 32]));
+        assert_eq!(
+            prior["groupContextHash"]["$bytes"],
+            STANDARD.encode([8u8; 32])
+        );
         let retired = s.retired_json().unwrap();
         assert_eq!(retired["stateVersion"], 4);
         assert_eq!(retired["lifecycle"], "superseded");
@@ -900,7 +980,10 @@ mod tests {
         assert_eq!(manifest.len(), 2);
         assert!(manifest[0].get("invitationProvenance").is_none());
         assert_eq!(manifest[1]["status"], "pending");
-        assert_eq!(manifest[1]["invitationProvenance"]["invitationTransitionId"], "t1");
+        assert_eq!(
+            manifest[1]["invitationProvenance"]["invitationTransitionId"],
+            "t1"
+        );
         assert!(manifest[0].get("leafCount").is_none());
     }
 
@@ -920,7 +1003,10 @@ mod tests {
         ]));
         // Pending roster membership grants no fulfillment authority.
         assert!(live_peer.nobody_else_can_add("did:plc:alice", "new-device"));
-        assert_eq!(live_peer.own_role_status("did:plc:bob").unwrap(), ("admin".into(), "pending".into()));
+        assert_eq!(
+            live_peer.own_role_status("did:plc:bob").unwrap(),
+            ("admin".into(), "pending".into())
+        );
         live_peer.participants[1]["status"] = serde_json::json!("active");
         assert!(!live_peer.nobody_else_can_add("did:plc:alice", "new-device"));
         // Device identity is the whole (DID, device ID) pair.
@@ -936,7 +1022,8 @@ mod tests {
             serde_json::json!({ "userDid": "did:plc:alice", "deviceId": "sibling" }),
             serde_json::json!({ "userDid": "did:plc:alice", "deviceId": "sibling", "deviceStatus": "unknown" }),
         ] {
-            assert!(!state(serde_json::json!([leaf])).nobody_else_can_add("did:plc:alice", "new-device"));
+            assert!(!state(serde_json::json!([leaf]))
+                .nobody_else_can_add("did:plc:alice", "new-device"));
         }
     }
 }

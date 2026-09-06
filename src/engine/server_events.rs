@@ -213,7 +213,8 @@ where
         let orch = &self.orchestrator;
         let user_did = orch.require_user_did().await?;
         let device = orch.require_actor_device_id().await?;
-        orch.retry_welcome_acknowledgements_for_conversation(conversation_id).await?;
+        orch.retry_welcome_acknowledgements_for_conversation(conversation_id)
+            .await?;
         let terminal_confirmed = match hint.kind {
             HintKind::Closed | HintKind::AccessEnded => {
                 orch.reconcile_terminal_conversation_hint(
@@ -297,7 +298,8 @@ where
 
         // Events are hints; the full authenticated point-read supplies the
         // current consent policy even when a retained inventory page is old.
-        orch.retain_conversation_policy_json(conversation_id, &fresh["state"]).await?;
+        orch.retain_conversation_policy_json(conversation_id, &fresh["state"])
+            .await?;
         if orch.pending_conversation_admission(conversation_id).await? {
             return Ok(refresh_events(conversation_id));
         }
@@ -321,8 +323,7 @@ where
         if !has_local_leaf {
             match orch.fetch_welcome_delivery(conversation_id).await {
                 Ok(delivery) => {
-                    orch.join_or_rejoin_from_delivery(delivery)
-                        .await?;
+                    orch.join_or_rejoin_from_delivery(delivery).await?;
                     events.push(EngineEvent::RecoveryStateChanged {
                         convo_id: conversation_id.into(),
                         state: ConversationRecoveryState::Healthy,
@@ -487,8 +488,6 @@ where
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,7 +619,9 @@ mod tests {
     fn reset_request_and_stale_access_hint_preserve_a_healthy_device() {
         crate::async_runtime::block_on(async {
             let mut world = TestWorld::new();
-            world.add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
             world.register_device("Alice").await.unwrap();
             let alice = world.client("Alice");
             let group = alice
@@ -682,8 +683,12 @@ mod tests {
                 }
             }
             assert_eq!(
-                world.delivery_service().submitted_prepared_requests().iter().filter(|request|
-                    request.operation == CanonicalOperation::GetPendingWelcomes).count(),
+                world
+                    .delivery_service()
+                    .submitted_prepared_requests()
+                    .iter()
+                    .filter(|request| request.operation == CanonicalOperation::GetPendingWelcomes)
+                    .count(),
                 0
             );
         });
@@ -693,7 +698,9 @@ mod tests {
     fn no_cid_notifications_do_not_read_or_repair_any_conversation() {
         crate::async_runtime::block_on(async {
             let mut world = TestWorld::new();
-            world.add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
             world.register_device("Alice").await.unwrap();
             let engine = engine_for(&world, "Alice").await;
             let start = world.delivery_service().submitted_prepared_requests().len();
@@ -729,17 +736,58 @@ mod tests {
             world.add_client_with_did("Bob", bob_did).await;
             world.register_device("Alice").await.unwrap();
             world.register_device("Bob").await.unwrap();
-            let group = world.client("Alice").orchestrator.create_group("pending event", Some(&[bob_did.into()]), None).await.unwrap();
+            let group = world
+                .client("Alice")
+                .orchestrator
+                .create_group("pending event", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
             let engine = engine_for(&world, "Bob").await;
             let start = world.delivery_service().submitted_prepared_requests().len();
             world.delivery_service().fail_next_get_messages();
-            engine.process_server_event(&event("conversationChangedEvent", json!({"conversationId":group.conversation_id})).to_string()).unwrap();
-            let policy = engine.orchestrator.mls_context().get_conversation_policy(bob_did, &group.conversation_id).unwrap().unwrap();
-            assert!(policy.participants.iter().any(|participant| participant.user_did.as_str() == bob_did && participant.status.as_str() == "pending"));
-            assert!(world.delivery_service().submitted_prepared_requests()[start..].iter().all(|request|
-                request.method == "GET" && request.operation != CanonicalOperation::GetPendingWelcomes));
-            assert!(!engine.orchestrator.ensure_conversation_ready(&group.conversation_id).await.unwrap().send_allowed);
-            assert!(world.delivery_service().clone_as(bob_did).get_messages(&group.conversation_id, None, 10, None, None, None).await.is_err(), "pending event must leave the message-fetch fault unconsumed");
+            engine
+                .process_server_event(
+                    &event(
+                        "conversationChangedEvent",
+                        json!({"conversationId":group.conversation_id}),
+                    )
+                    .to_string(),
+                )
+                .unwrap();
+            let policy = engine
+                .orchestrator
+                .mls_context()
+                .get_conversation_policy(bob_did, &group.conversation_id)
+                .unwrap()
+                .unwrap();
+            assert!(policy
+                .participants
+                .iter()
+                .any(|participant| participant.user_did.as_str() == bob_did
+                    && participant.status.as_str() == "pending"));
+            assert!(
+                world.delivery_service().submitted_prepared_requests()[start..]
+                    .iter()
+                    .all(|request| request.method == "GET"
+                        && request.operation != CanonicalOperation::GetPendingWelcomes)
+            );
+            assert!(
+                !engine
+                    .orchestrator
+                    .ensure_conversation_ready(&group.conversation_id)
+                    .await
+                    .unwrap()
+                    .send_allowed
+            );
+            assert!(
+                world
+                    .delivery_service()
+                    .clone_as(bob_did)
+                    .get_messages(&group.conversation_id, None, 10, None, None, None)
+                    .await
+                    .is_err(),
+                "pending event must leave the message-fetch fault unconsumed"
+            );
         });
     }
 
@@ -747,7 +795,9 @@ mod tests {
     fn sibling_recovery_event_adds_only_target_then_welcome_and_message_events_decrypt() {
         crate::async_runtime::block_on(async {
             let mut world = TestWorld::new();
-            world.add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
             let did = world.client("Alice").did.clone();
             world.add_client_with_did("Phone", &did).await;
             world.register_device("Alice").await.unwrap();
@@ -812,8 +862,12 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                world.delivery_service().submitted_prepared_requests().iter().filter(|request|
-                    request.operation == CanonicalOperation::GetPendingWelcomes).count(),
+                world
+                    .delivery_service()
+                    .submitted_prepared_requests()
+                    .iter()
+                    .filter(|request| request.operation == CanonicalOperation::GetPendingWelcomes)
+                    .count(),
                 1,
                 "prefetched Welcome must not be fetched twice"
             );
@@ -881,7 +935,9 @@ mod tests {
     fn new_sibling_inventory_requests_add_once_and_reuses_server_work_after_restart() {
         crate::async_runtime::block_on(async {
             let mut world = TestWorld::new();
-            world.add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
             let did = world.client("Alice").did.clone();
             world.add_client_with_did("Phone", &did).await;
             world.register_device("Alice").await.unwrap();
@@ -967,8 +1023,12 @@ mod tests {
     fn close_notifications_preserve_retained_history_and_reject_unrelated_proof() {
         crate::async_runtime::block_on(async {
             let mut world = TestWorld::new();
-            world.add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
-            world.add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").await;
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world
+                .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+                .await;
             world.register_device("Alice").await.unwrap();
             world.register_device("Bob").await.unwrap();
             let alice = world.client("Alice");
@@ -985,7 +1045,14 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some());
-            assert_eq!(alice.storage.get_conversation_state(&group.conversation_id).await.unwrap(), Some(ConversationState::Closed));
+            assert_eq!(
+                alice
+                    .storage
+                    .get_conversation_state(&group.conversation_id)
+                    .await
+                    .unwrap(),
+                Some(ConversationState::Closed)
+            );
             let before = world.delivery_service().submitted_prepared_requests().len();
             let closed = event(
                 "conversationClosedEvent",
@@ -1001,10 +1068,16 @@ mod tests {
             wrong_terminal["terminalSeq"] = json!(21);
             // A stale sequence is only a hint; the retained row is reconciled
             // against the independently authenticated actual terminal entry.
-            engine.process_server_event(&wrong_terminal.to_string()).unwrap();
+            engine
+                .process_server_event(&wrong_terminal.to_string())
+                .unwrap();
             wrong_terminal["conversationId"] = json!(uuid::Uuid::new_v4().to_string());
-            assert!(engine.process_server_event(&wrong_terminal.to_string()).is_err(),
-                "another CID cannot borrow this conversation's accepted close proof");
+            assert!(
+                engine
+                    .process_server_event(&wrong_terminal.to_string())
+                    .is_err(),
+                "another CID cannot borrow this conversation's accepted close proof"
+            );
             assert!(alice
                 .storage
                 .get_conversation(&alice.did, &group.conversation_id)
@@ -1018,7 +1091,9 @@ mod tests {
     fn failed_entries_read_returns_error_and_does_not_request_recovery() {
         crate::async_runtime::block_on(async {
             let mut world = TestWorld::new();
-            world.add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
             world.register_device("Alice").await.unwrap();
             let group = world
                 .client("Alice")
@@ -1045,8 +1120,12 @@ mod tests {
                     .all(|request| request.method == "GET")
             );
             assert_eq!(
-                world.delivery_service().submitted_prepared_requests().iter().filter(|request|
-                    request.operation == CanonicalOperation::GetPendingWelcomes).count(),
+                world
+                    .delivery_service()
+                    .submitted_prepared_requests()
+                    .iter()
+                    .filter(|request| request.operation == CanonicalOperation::GetPendingWelcomes)
+                    .count(),
                 0
             );
         });

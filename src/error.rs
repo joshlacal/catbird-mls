@@ -363,10 +363,14 @@ mod decrypt_class_tests {
 
     #[test]
     fn wrong_group_id_classifier_matches_openmls_form() {
-        assert!(MLSError::OpenMLS("process_message failed: ValidationError(WrongGroupId)".into()).is_wrong_group_id());
+        assert!(
+            MLSError::OpenMLS("process_message failed: ValidationError(WrongGroupId)".into())
+                .is_wrong_group_id()
+        );
         assert!(MLSError::CommitProcessingFailed {
             message: "process_message failed: ValidationError(WrongGroupId)".into(),
-        }.is_wrong_group_id());
+        }
+        .is_wrong_group_id());
         assert!(!MLSError::OpenMLS(WRONG_EPOCH.into()).is_wrong_group_id());
     }
 

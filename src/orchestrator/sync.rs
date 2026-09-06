@@ -40,13 +40,23 @@ where
     ) -> Result<bool> {
         let user_did = self.require_user_did().await?;
         if record.actor_did != user_did
-            || self.credentials().get_device_uuid(&user_did).await?.as_deref()
+            || self
+                .credentials()
+                .get_device_uuid(&user_did)
+                .await?
+                .as_deref()
                 != Some(record.actor_device_id.as_str())
-            || self.reset_pending_payload_result(&record.conversation_id).await?.is_some()
+            || self
+                .reset_pending_payload_result(&record.conversation_id)
+                .await?
+                .is_some()
         {
             return Ok(false);
         }
-        match self.resolve_conversation_context(&record.conversation_id).await {
+        match self
+            .resolve_conversation_context(&record.conversation_id)
+            .await
+        {
             Ok(current) => Ok(current.group_id == record.group_id),
             // An absent mapping cannot prove that this same-device record was
             // retired. Keep it fenced until authoritative mapping is restored.
@@ -66,7 +76,10 @@ where
             // Retained evidence is scoped to its exact actor and group. An
             // explicit reset or device rotation supersedes its authority to
             // block the stable conversation's current, healthy generation.
-            if !self.prepared_control_targets_current_conversation(&record).await? {
+            if !self
+                .prepared_control_targets_current_conversation(&record)
+                .await?
+            {
                 continue;
             }
             let inbound = self.inbound_processing_lock(conversation_id).await;
@@ -79,7 +92,10 @@ where
                 blocked.insert(conversation_id.clone());
                 continue;
             };
-            if !self.prepared_control_targets_current_conversation(&record).await? {
+            if !self
+                .prepared_control_targets_current_conversation(&record)
+                .await?
+            {
                 continue;
             }
             if record.completed {
@@ -103,7 +119,11 @@ where
                     blocked.insert(conversation_id.clone());
                 }
             } else if let Err(error) = self.replay_prepared_control_locked(&record.group_id).await {
-                if self.mls_context().get_prepared_control(&record.group_id)?.is_some() {
+                if self
+                    .mls_context()
+                    .get_prepared_control(&record.group_id)?
+                    .is_some()
+                {
                     tracing::warn!(%conversation_id, %error, "Control confirmation is still pending; preserving local group and deferring conversation sync");
                     blocked.insert(conversation_id.clone());
                 } else {
@@ -130,7 +150,10 @@ where
         for convo in conversations {
             let convo = self.restore_conversation_policy(&user_did, convo)?;
             let convo_id = convo.conversation_id.clone();
-            self.conversations().lock().await.insert(convo_id.clone(), convo);
+            self.conversations()
+                .lock()
+                .await
+                .insert(convo_id.clone(), convo);
             if blocked_controls.contains(&convo_id) {
                 continue;
             }
@@ -491,11 +514,19 @@ where
                 break;
             }
 
-            let previous_view = self.conversations().lock().await.get(&convo.conversation_id).cloned();
+            let previous_view = self
+                .conversations()
+                .lock()
+                .await
+                .get(&convo.conversation_id)
+                .cloned();
             let convo = self.restore_conversation_policy(user_did, convo.clone())?;
             let convo = super::admission::merge_conversation_view(previous_view.as_ref(), convo)?;
             let conversation_id = convo.conversation_id.as_str();
-            self.conversations().lock().await.insert(conversation_id.to_string(), convo.clone());
+            self.conversations()
+                .lock()
+                .await
+                .insert(conversation_id.to_string(), convo.clone());
             if blocked_controls.contains(conversation_id) {
                 continue;
             }
@@ -563,7 +594,10 @@ where
                 crate::info_log!(
                     "[sync] convo={} server group changed {} -> {}; clearing recovery backoff",
                     conversation_id,
-                    previous_view.as_ref().map(|p| p.group_id.as_str()).unwrap_or(""),
+                    previous_view
+                        .as_ref()
+                        .map(|p| p.group_id.as_str())
+                        .unwrap_or(""),
                     convo.group_id
                 );
                 let mut tracker = self.recovery_tracker().lock().await;

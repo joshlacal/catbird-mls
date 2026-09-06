@@ -276,7 +276,11 @@ where
             record.validate()?;
             self.mls_context().put_account_exit(&record)?;
         }
-        self.retain_verified_departure_coordinate(cid, &body[if close { "retired" } else { "next" }]).await?;
+        self.retain_verified_departure_coordinate(
+            cid,
+            &body[if close { "retired" } else { "next" }],
+        )
+        .await?;
         let prior_group = super::welcome_ack::bytes(&body["prior"]["groupId"])?;
         let newer_native = match self.mls_context().group_is_active(prior_group.clone()) {
             Ok(true) => {

@@ -23,7 +23,10 @@ use e2e_harness::TestWorld;
 /// device id of the dead genesis leaf.
 async fn world_with_leafless_second_device(world: &mut TestWorld) -> (String, String) {
     world.add_client("Alice").await;
-    world.register_device("Alice").await.expect("register alice device 1");
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice device 1");
     let alice = world.client("Alice");
     let created = alice
         .orchestrator
@@ -38,8 +41,13 @@ async fn world_with_leafless_second_device(world: &mut TestWorld) -> (String, St
     let alice_did = alice.did.clone();
 
     world.add_client_with_did("AliceDev2", &alice_did).await;
-    world.register_device("AliceDev2").await.expect("register alice device 2");
-    world.delivery_service().set_bootstrap_reset_group_success(true);
+    world
+        .register_device("AliceDev2")
+        .await
+        .expect("register alice device 2");
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
     (created.conversation_id, dev1)
 }
 
@@ -67,9 +75,10 @@ async fn leafless_admin_with_only_revoked_sibling_leaf_resets_instead_of_waiting
     let mut world = TestWorld::new();
     let (convo_id, dead_device) = world_with_leafless_second_device(&mut world).await;
     let alice_did = world.client("Alice").did.clone();
-    world
-        .delivery_service()
-        .set_conversation_leaves_for_test(&convo_id, vec![leaf(&alice_did, &dead_device, "revoked")]);
+    world.delivery_service().set_conversation_leaves_for_test(
+        &convo_id,
+        vec![leaf(&alice_did, &dead_device, "revoked")],
+    );
     let dev2 = world.client("AliceDev2");
     let before = world.delivery_service().conversation_ids();
     assert_eq!(before, vec![convo_id.clone()]);
@@ -79,11 +88,23 @@ async fn leafless_admin_with_only_revoked_sibling_leaf_resets_instead_of_waiting
         .accept_conversation(&convo_id)
         .await
         .expect("accept_conversation escalates to reset");
-    assert_eq!(outcome["epoch"], 0, "reset activated here; caller is back in the group");
+    assert_eq!(
+        outcome["epoch"], 0,
+        "reset activated here; caller is back in the group"
+    );
 
-    assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 0, "no doomed leaf recovery");
+    assert_eq!(
+        count(&world, CanonicalOperation::RequestLeafRecovery),
+        0,
+        "no doomed leaf recovery"
+    );
     assert_eq!(count(&world, CanonicalOperation::RequestReset), 1);
-    assert_eq!(world.delivery_service().bootstrap_reset_group_call_count(&convo_id), 1);
+    assert_eq!(
+        world
+            .delivery_service()
+            .bootstrap_reset_group_call_count(&convo_id),
+        1
+    );
 
     // The activation body is what the server validates byte-for-byte.
     let bodies = world.delivery_service().activate_reset_bodies();
@@ -104,7 +125,10 @@ async fn leafless_admin_with_only_revoked_sibling_leaf_resets_instead_of_waiting
     assert_eq!(body["manifest"]["participants"][0]["userDid"], alice_did);
     assert_eq!(body["manifest"]["participants"][0]["status"], "active");
     assert_eq!(body["metadataSnapshot"]["metadataVersion"], 2);
-    assert_eq!(body["metadataSnapshot"]["originTransitionId"], body["transitionId"]);
+    assert_eq!(
+        body["metadataSnapshot"]["originTransitionId"],
+        body["transitionId"]
+    );
     let request_bodies: Vec<serde_json::Value> = world
         .delivery_service()
         .submitted_prepared_requests()
@@ -158,9 +182,10 @@ async fn leafless_admin_with_only_revoked_sibling_leaf_resets_instead_of_waiting
 async fn leafless_admin_renews_recovery_with_live_peer_after_ttl_without_reset() {
     let mut world = TestWorld::new();
     let (convo_id, _dead_device) = world_with_leafless_second_device(&mut world).await;
-    world
-        .delivery_service()
-        .set_conversation_leaves_for_test(&convo_id, vec![leaf("did:plc:bob", "bob-device", "active")]);
+    world.delivery_service().set_conversation_leaves_for_test(
+        &convo_id,
+        vec![leaf("did:plc:bob", "bob-device", "active")],
+    );
     let dev2 = world.client("AliceDev2");
 
     // Bob's live leaf can add us: request leaf recovery, do not reset.
@@ -187,14 +212,18 @@ async fn leafless_admin_renews_recovery_with_live_peer_after_ttl_without_reset()
         .lock()
         .await
         .note_leaf_recovery_requested_at(&convo_id, Instant::now() - Duration::from_secs(301));
-    dev2
-        .orchestrator
+    dev2.orchestrator
         .accept_conversation(&convo_id)
         .await
         .expect("expired reservation can be renewed");
     assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 2);
     assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
-    assert_eq!(world.delivery_service().bootstrap_reset_group_call_count(&convo_id), 0);
+    assert_eq!(
+        world
+            .delivery_service()
+            .bootstrap_reset_group_call_count(&convo_id),
+        0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -382,7 +411,12 @@ async fn manual_reset_works_without_local_group() {
         .expect("manual reset from a blank device");
 
     assert_eq!(count(&world, CanonicalOperation::RequestReset), 1);
-    assert_eq!(world.delivery_service().bootstrap_reset_group_call_count(&convo_id), 1);
+    assert_eq!(
+        world
+            .delivery_service()
+            .bootstrap_reset_group_call_count(&convo_id),
+        1
+    );
     let bodies = world.delivery_service().activate_reset_bodies();
     assert_eq!(bodies.len(), 1);
     let request_reason = world
@@ -408,9 +442,10 @@ async fn non_admin_member_only_requests_reset() {
             serde_json::json!({ "userDid": "did:plc:zed", "role": "admin", "status": "active", "leafCount": 0 }),
         ],
     );
-    world
-        .delivery_service()
-        .set_conversation_leaves_for_test(&convo_id, vec![leaf(&alice_did, &dead_device, "active")]);
+    world.delivery_service().set_conversation_leaves_for_test(
+        &convo_id,
+        vec![leaf(&alice_did, &dead_device, "active")],
+    );
     let dev2 = world.client("AliceDev2");
 
     let outcome = dev2
@@ -420,5 +455,10 @@ async fn non_admin_member_only_requests_reset() {
         .expect("member can request");
     assert_eq!(outcome, ResetOutcome::Requested);
     assert_eq!(count(&world, CanonicalOperation::RequestReset), 1);
-    assert_eq!(world.delivery_service().bootstrap_reset_group_call_count(&convo_id), 0);
+    assert_eq!(
+        world
+            .delivery_service()
+            .bootstrap_reset_group_call_count(&convo_id),
+        0
+    );
 }

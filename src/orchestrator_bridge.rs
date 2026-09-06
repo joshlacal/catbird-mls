@@ -1178,7 +1178,10 @@ struct CredentialAdapter(
 
 impl CredentialAdapter {
     fn new(callback: Arc<dyn OrchestratorCredentialCallback>) -> Self {
-        Self(callback, Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())))
+        Self(
+            callback,
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        )
     }
 }
 
@@ -1186,11 +1189,17 @@ impl CredentialAdapter {
 
 fn convo_view_to_ffi(cv: &ConversationView) -> crate::orchestrator::Result<FFIConversationView> {
     crate::orchestrator::admission::validate_conversation_view(cv)?;
-    let canonical_state_json = cv.canonical_state.as_ref().map(|state| {
-        crate::orchestrator::canonical_transport::encode_conversation_state(state)
-            .map(|bytes| String::from_utf8(bytes).expect("JSON is UTF-8"))
-            .map_err(|error| crate::orchestrator::OrchestratorError::InvalidInput(error.to_string()))
-    }).transpose()?;
+    let canonical_state_json = cv
+        .canonical_state
+        .as_ref()
+        .map(|state| {
+            crate::orchestrator::canonical_transport::encode_conversation_state(state)
+                .map(|bytes| String::from_utf8(bytes).expect("JSON is UTF-8"))
+                .map_err(|error| {
+                    crate::orchestrator::OrchestratorError::InvalidInput(error.to_string())
+                })
+        })
+        .transpose()?;
     Ok(FFIConversationView {
         canonical_state_json,
         group_id: cv.group_id.clone(),
@@ -1216,10 +1225,16 @@ fn convo_view_to_ffi(cv: &ConversationView) -> crate::orchestrator::Result<FFICo
 }
 
 fn ffi_to_convo_view(ffi: &FFIConversationView) -> crate::orchestrator::Result<ConversationView> {
-    let canonical_state = ffi.canonical_state_json.as_ref().map(|json|
-        crate::orchestrator::canonical_transport::decode_conversation_state(json.as_bytes())
-            .map_err(|error| crate::orchestrator::OrchestratorError::InvalidInput(error.to_string()))
-    ).transpose()?;
+    let canonical_state = ffi
+        .canonical_state_json
+        .as_ref()
+        .map(|json| {
+            crate::orchestrator::canonical_transport::decode_conversation_state(json.as_bytes())
+                .map_err(|error| {
+                    crate::orchestrator::OrchestratorError::InvalidInput(error.to_string())
+                })
+        })
+        .transpose()?;
     let view = ConversationView {
         canonical_state,
         group_id: ffi.group_id.clone(),
@@ -1302,15 +1317,30 @@ pub(crate) fn ffi_incoming_envelope_to_internal(
     envelope: FFIIncomingEnvelope,
     server_epoch: Option<u64>,
 ) -> crate::orchestrator::Result<IncomingEnvelope> {
-    if envelope.server_epoch.zip(server_epoch).is_some_and(|(field, argument)| field != argument) {
-        return Err(crate::orchestrator::OrchestratorError::InvalidInput("Conflicting incoming message epochs".into()));
+    if envelope
+        .server_epoch
+        .zip(server_epoch)
+        .is_some_and(|(field, argument)| field != argument)
+    {
+        return Err(crate::orchestrator::OrchestratorError::InvalidInput(
+            "Conflicting incoming message epochs".into(),
+        ));
     }
     if envelope.server_sequence.is_some() {
-        crate::chat_v2::ids::CanonicalTimestamp::parse(&envelope.timestamp)
-            .map_err(|_| crate::orchestrator::OrchestratorError::InvalidInput("Invalid canonical message timestamp".into()))?;
+        crate::chat_v2::ids::CanonicalTimestamp::parse(&envelope.timestamp).map_err(|_| {
+            crate::orchestrator::OrchestratorError::InvalidInput(
+                "Invalid canonical message timestamp".into(),
+            )
+        })?;
     }
-    let timestamp = envelope.timestamp.parse::<chrono::DateTime<chrono::Utc>>()
-        .map_err(|_| crate::orchestrator::OrchestratorError::InvalidInput("Invalid incoming message timestamp".into()))?;
+    let timestamp = envelope
+        .timestamp
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .map_err(|_| {
+            crate::orchestrator::OrchestratorError::InvalidInput(
+                "Invalid incoming message timestamp".into(),
+            )
+        })?;
     let result = IncomingEnvelope {
         conversation_id: envelope.conversation_id,
         sender_did: envelope.sender_did,
@@ -1523,7 +1553,9 @@ impl MLSStorageBackend for StorageAdapter {
         self.0
             .get_conversation(user_did.to_string(), conversation_id.to_string())
             .map_err(bridge_err)?
-            .as_ref().map(ffi_to_convo_view).transpose()
+            .as_ref()
+            .map(ffi_to_convo_view)
+            .transpose()
     }
 
     async fn list_conversations(
@@ -1533,7 +1565,9 @@ impl MLSStorageBackend for StorageAdapter {
         self.0
             .list_conversations(user_did.to_string())
             .map_err(bridge_err)?
-            .iter().map(ffi_to_convo_view).collect()
+            .iter()
+            .map(ffi_to_convo_view)
+            .collect()
     }
 
     async fn delete_conversations(
@@ -1562,17 +1596,43 @@ impl MLSStorageBackend for StorageAdapter {
             .map_err(bridge_err)
     }
 
-    async fn clear_device_removal_after_verified_welcome(&self, conversation_id: &str) -> crate::orchestrator::Result<()> {
-        self.0.set_conversation_state(conversation_id.to_string(), "active_after_welcome".to_string()).map_err(bridge_err)
+    async fn clear_device_removal_after_verified_welcome(
+        &self,
+        conversation_id: &str,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .set_conversation_state(
+                conversation_id.to_string(),
+                "active_after_welcome".to_string(),
+            )
+            .map_err(bridge_err)
     }
 
-    async fn complete_account_exit(&self, conversation_id: &str, expected_group_id_hex: &str,
-        expected_reset_generation: Option<i32>, terminal_epoch: u64, terminal_state: ConversationState) -> crate::orchestrator::Result<bool> {
-        if !matches!(terminal_state, ConversationState::Closed | ConversationState::DeviceRemoved) {
-            return Err(crate::orchestrator::OrchestratorError::Storage("invalid account exit state".into()));
+    async fn complete_account_exit(
+        &self,
+        conversation_id: &str,
+        expected_group_id_hex: &str,
+        expected_reset_generation: Option<i32>,
+        terminal_epoch: u64,
+        terminal_state: ConversationState,
+    ) -> crate::orchestrator::Result<bool> {
+        if !matches!(
+            terminal_state,
+            ConversationState::Closed | ConversationState::DeviceRemoved
+        ) {
+            return Err(crate::orchestrator::OrchestratorError::Storage(
+                "invalid account exit state".into(),
+            ));
         }
-        self.0.complete_account_exit(conversation_id.into(), expected_group_id_hex.into(),
-            expected_reset_generation, terminal_epoch, terminal_state.tag().into()).map_err(bridge_err)
+        self.0
+            .complete_account_exit(
+                conversation_id.into(),
+                expected_group_id_hex.into(),
+                expected_reset_generation,
+                terminal_epoch,
+                terminal_state.tag().into(),
+            )
+            .map_err(bridge_err)
     }
 
     async fn get_conversation_state(
@@ -1991,9 +2051,16 @@ impl MLSAPIClient for APIAdapter {
         limit: u32,
         cursor: Option<&str>,
     ) -> crate::orchestrator::Result<ConversationListPage> {
-        let ffi = self.0.get_conversations(limit, cursor.map(str::to_string)).map_err(bridge_err)?;
+        let ffi = self
+            .0
+            .get_conversations(limit, cursor.map(str::to_string))
+            .map_err(bridge_err)?;
         Ok(ConversationListPage {
-            conversations: ffi.conversations.iter().map(ffi_to_convo_view).collect::<crate::orchestrator::Result<Vec<_>>>()?,
+            conversations: ffi
+                .conversations
+                .iter()
+                .map(ffi_to_convo_view)
+                .collect::<crate::orchestrator::Result<Vec<_>>>()?,
             cursor: ffi.cursor,
         })
     }
@@ -2018,7 +2085,9 @@ impl MLSAPIClient for APIAdapter {
             )
             .map_err(bridge_err)
             .and_then(|ffi| {
-                let envelopes = ffi.envelopes.into_iter()
+                let envelopes = ffi
+                    .envelopes
+                    .into_iter()
                     .map(|m| ffi_incoming_envelope_to_internal(m, None))
                     .collect::<crate::orchestrator::Result<Vec<_>>>()?;
                 Ok((envelopes, ffi.cursor))
@@ -2195,7 +2264,10 @@ impl CredentialStore for CredentialAdapter {
         Ok(authority)
     }
 
-    async fn get_auth_generation(&self, user_did: &str) -> crate::orchestrator::Result<Option<i64>> {
+    async fn get_auth_generation(
+        &self,
+        user_did: &str,
+    ) -> crate::orchestrator::Result<Option<i64>> {
         if let Ok(lock) = self.1.read() {
             if let Some(&gen) = lock.get(user_did) {
                 return Ok(Some(gen));
@@ -3032,10 +3104,12 @@ impl OrchestratorBridge {
         &self,
         user_did: String,
     ) -> Result<Vec<FFIConversationView>, OrchestratorBridgeError> {
-        let conversations = crate::async_runtime::block_on(
-            self.inner.conversation_display_snapshot(&user_did),
-        )?;
-        Ok(conversations.iter().map(convo_view_to_ffi).collect::<crate::orchestrator::Result<Vec<_>>>()?)
+        let conversations =
+            crate::async_runtime::block_on(self.inner.conversation_display_snapshot(&user_did))?;
+        Ok(conversations
+            .iter()
+            .map(convo_view_to_ffi)
+            .collect::<crate::orchestrator::Result<Vec<_>>>()?)
     }
 
     pub fn startup_reconcile(&self) -> Result<FFIStartupReconcileReport, OrchestratorBridgeError> {
@@ -3798,17 +3872,62 @@ mod tests {
         let callback = Arc::new(RecordingStorageCallback::default());
         let adapter = StorageAdapter(callback.clone());
         let group = "ab".repeat(32);
-        assert!(!adapter.complete_account_exit("conversation", &group, Some(7), 42, ConversationState::Closed).await.unwrap());
+        assert!(!adapter
+            .complete_account_exit(
+                "conversation",
+                &group,
+                Some(7),
+                42,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
         callback.reset_clear_applied.store(true, Ordering::SeqCst);
-        assert!(adapter.complete_account_exit("conversation", &group, Some(7), 42, ConversationState::Closed).await.unwrap());
-        assert_eq!(callback.account_exit_requests.lock().unwrap().as_slice(), &[
-            ("conversation".into(), group.clone(), Some(7), 42, "closed".into()),
-            ("conversation".into(), group.clone(), Some(7), 42, "closed".into()),
-        ]);
-        assert!(adapter.complete_account_exit("conversation", &group, None, 42, ConversationState::Active).await.is_err());
+        assert!(adapter
+            .complete_account_exit(
+                "conversation",
+                &group,
+                Some(7),
+                42,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            callback.account_exit_requests.lock().unwrap().as_slice(),
+            &[
+                (
+                    "conversation".into(),
+                    group.clone(),
+                    Some(7),
+                    42,
+                    "closed".into()
+                ),
+                (
+                    "conversation".into(),
+                    group.clone(),
+                    Some(7),
+                    42,
+                    "closed".into()
+                ),
+            ]
+        );
+        assert!(adapter
+            .complete_account_exit("conversation", &group, None, 42, ConversationState::Active)
+            .await
+            .is_err());
         assert_eq!(callback.account_exit_requests.lock().unwrap().len(), 2);
         callback.fail_security_writes.store(true, Ordering::SeqCst);
-        assert!(adapter.complete_account_exit("conversation", &group, Some(7), 42, ConversationState::Closed).await.is_err());
+        assert!(adapter
+            .complete_account_exit(
+                "conversation",
+                &group,
+                Some(7),
+                42,
+                ConversationState::Closed
+            )
+            .await
+            .is_err());
     }
 
     impl OrchestratorStorageCallback for RecordingStorageCallback {
@@ -3856,10 +3975,22 @@ mod tests {
         ) -> Result<(), OrchestratorBridgeError> {
             Ok(())
         }
-        fn complete_account_exit(&self, conversation_id: String, expected_group_id_hex: String,
-            expected_reset_generation: Option<i32>, terminal_epoch: u64, terminal_state: String) -> Result<bool, OrchestratorBridgeError> {
+        fn complete_account_exit(
+            &self,
+            conversation_id: String,
+            expected_group_id_hex: String,
+            expected_reset_generation: Option<i32>,
+            terminal_epoch: u64,
+            terminal_state: String,
+        ) -> Result<bool, OrchestratorBridgeError> {
             self.reject_injected_security_failure()?;
-            self.account_exit_requests.lock().unwrap().push((conversation_id, expected_group_id_hex, expected_reset_generation, terminal_epoch, terminal_state));
+            self.account_exit_requests.lock().unwrap().push((
+                conversation_id,
+                expected_group_id_hex,
+                expected_reset_generation,
+                terminal_epoch,
+                terminal_state,
+            ));
             Ok(self.reset_clear_applied.load(Ordering::SeqCst))
         }
         fn get_conversation_state(
@@ -4270,7 +4401,11 @@ mod tests {
             }
             if nsid == "blue.catbird.chat.getPendingWelcomes" {
                 self.welcome_calls.fetch_add(1, Ordering::SeqCst);
-                return Ok(FFIGatewayResponse { status: 503, content_type: Some("application/json".into()), body: br#"{"error":"Unavailable"}"#.to_vec() });
+                return Ok(FFIGatewayResponse {
+                    status: 503,
+                    content_type: Some("application/json".into()),
+                    body: br#"{"error":"Unavailable"}"#.to_vec(),
+                });
             }
             let resp_body = if nsid == "blue.catbird.chat.enrollDevice" {
                 let inner = body
@@ -4567,7 +4702,8 @@ mod tests {
             *credential_callback.authorized_device_keys.lock().unwrap() =
                 Some(vec![vec![9, 8], vec![7, 6]]);
             let normal = CredentialAdapter::new(credential_callback.clone());
-            let client = crate::client_bridge::ClientCredentialAdapter::new(credential_callback.clone());
+            let client =
+                crate::client_bridge::ClientCredentialAdapter::new(credential_callback.clone());
             for adapter in [
                 &normal as &dyn CredentialStore,
                 &client as &dyn CredentialStore,
@@ -5125,10 +5261,15 @@ mod tests {
         bridge
             .initialize("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string())
             .expect("bridge initialize");
-        bridge.ensure_device_registered().expect("registered test device");
+        bridge
+            .ensure_device_registered()
+            .expect("registered test device");
         let result = bridge.join_or_rejoin("convo-bridge-probe".to_string());
 
-        assert!(result.is_err(), "stubbed canonical Welcome response should stop recovery");
+        assert!(
+            result.is_err(),
+            "stubbed canonical Welcome response should stop recovery"
+        );
         assert_eq!(
             welcome_calls.load(Ordering::SeqCst),
             1,
@@ -5400,7 +5541,9 @@ mod tests {
         bridge
             .initialize("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string())
             .expect("bridge initialize");
-        bridge.ensure_device_registered().expect("registered test device");
+        bridge
+            .ensure_device_registered()
+            .expect("registered test device");
         bridge.shutdown();
         bridge
             .initialize("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string())
@@ -5699,7 +5842,8 @@ mod tests {
                 }
                 Some(ConversationState::Closed)
                 | Some(ConversationState::DeviceRemoved)
-                | Some(ConversationState::Quarantined { .. }) | Some(ConversationState::Failed) => {
+                | Some(ConversationState::Quarantined { .. })
+                | Some(ConversationState::Failed) => {
                     crate::orchestrator::ConversationRecoveryState::UnrecoverableLocal
                 }
             };

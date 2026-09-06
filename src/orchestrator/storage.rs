@@ -134,13 +134,21 @@ pub trait MLSStorageBackend: MLSStorageBackendBounds {
 
     /// Only a freshly verified exact Welcome may retire a local device removal.
     /// Platforms persist this separately from generic Active projection.
-    async fn clear_device_removal_after_verified_welcome(&self, conversation_id: &str) -> Result<()> {
-        if matches!(self.get_conversation_state(conversation_id).await?, Some(ConversationState::Closed)) {
-            return Err(super::error::OrchestratorError::InvalidInput("This conversation is closed.".into()));
+    async fn clear_device_removal_after_verified_welcome(
+        &self,
+        conversation_id: &str,
+    ) -> Result<()> {
+        if matches!(
+            self.get_conversation_state(conversation_id).await?,
+            Some(ConversationState::Closed)
+        ) {
+            return Err(super::error::OrchestratorError::InvalidInput(
+                "This conversation is closed.".into(),
+            ));
         }
-        self.set_conversation_state(conversation_id, ConversationState::Active).await
+        self.set_conversation_state(conversation_id, ConversationState::Active)
+            .await
     }
-
 
     /// Read the persisted conversation state, if any.
     ///

@@ -1,3 +1,4 @@
+pub mod account_exit;
 mod account_removal;
 pub mod admission;
 pub mod api_client;
@@ -12,11 +13,11 @@ mod direct_adoption;
 pub mod error;
 pub mod event_observer;
 pub mod groups;
+mod incoming;
 pub mod key_packages;
 mod leaf_recovery;
 pub mod leave_fulfillment;
 pub mod lifecycle;
-mod incoming;
 pub mod messaging;
 pub mod mls_provider;
 pub mod orchestrator;
@@ -29,9 +30,8 @@ pub mod storage;
 pub mod sync;
 pub mod terminal_lifecycle;
 pub mod types;
-pub mod welcome_recovery;
 pub mod welcome_ack;
-pub mod account_exit;
+pub mod welcome_recovery;
 
 #[cfg(test)]
 mod canonical_transport_tests;

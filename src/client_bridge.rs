@@ -4,9 +4,9 @@
 // Uses the same callback-based pattern as orchestrator_bridge.rs:
 // Swift/Kotlin provides storage, API, and credential backends via callbacks.
 
-use std::sync::Arc;
-use std::collections::HashMap;
 use crate::orchestrator::credentials::CleanChatSigningAuthority;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::api::MLSContext;
 use crate::client::{CatbirdClient, ChatMessage, Conversation};
@@ -52,11 +52,19 @@ fn bridge_err(e: OrchestratorBridgeError) -> crate::orchestrator::error::Orchest
     crate::orchestrator_bridge::bridge_mappers::bridge_error_to_internal(e)
 }
 
-fn ffi_to_convo_view(ffi: &crate::orchestrator_bridge::FFIConversationView) -> crate::orchestrator::Result<ConversationView> {
-    let canonical_state = ffi.canonical_state_json.as_ref().map(|json|
-        crate::orchestrator::canonical_transport::decode_conversation_state(json.as_bytes())
-            .map_err(|error| crate::orchestrator::OrchestratorError::InvalidInput(error.to_string()))
-    ).transpose()?;
+fn ffi_to_convo_view(
+    ffi: &crate::orchestrator_bridge::FFIConversationView,
+) -> crate::orchestrator::Result<ConversationView> {
+    let canonical_state = ffi
+        .canonical_state_json
+        .as_ref()
+        .map(|json| {
+            crate::orchestrator::canonical_transport::decode_conversation_state(json.as_bytes())
+                .map_err(|error| {
+                    crate::orchestrator::OrchestratorError::InvalidInput(error.to_string())
+                })
+        })
+        .transpose()?;
     let view = ConversationView {
         canonical_state,
         group_id: ffi.group_id.clone(),
@@ -215,7 +223,9 @@ impl MLSStorageBackend for ClientStorageAdapter {
         self.0
             .get_conversation(user_did.to_string(), conversation_id.to_string())
             .map_err(bridge_err)?
-            .as_ref().map(ffi_to_convo_view).transpose()
+            .as_ref()
+            .map(ffi_to_convo_view)
+            .transpose()
     }
 
     async fn list_conversations(
@@ -225,7 +235,9 @@ impl MLSStorageBackend for ClientStorageAdapter {
         self.0
             .list_conversations(user_did.to_string())
             .map_err(bridge_err)?
-            .iter().map(ffi_to_convo_view).collect()
+            .iter()
+            .map(ffi_to_convo_view)
+            .collect()
     }
 
     async fn delete_conversations(
@@ -315,13 +327,31 @@ impl MLSStorageBackend for ClientStorageAdapter {
             .map_err(bridge_err)
     }
 
-    async fn complete_account_exit(&self, conversation_id: &str, expected_group_id_hex: &str,
-        expected_reset_generation: Option<i32>, terminal_epoch: u64, terminal_state: ConversationState) -> crate::orchestrator::Result<bool> {
-        if !matches!(terminal_state, ConversationState::Closed | ConversationState::DeviceRemoved) {
-            return Err(crate::orchestrator::OrchestratorError::Storage("invalid account exit state".into()));
+    async fn complete_account_exit(
+        &self,
+        conversation_id: &str,
+        expected_group_id_hex: &str,
+        expected_reset_generation: Option<i32>,
+        terminal_epoch: u64,
+        terminal_state: ConversationState,
+    ) -> crate::orchestrator::Result<bool> {
+        if !matches!(
+            terminal_state,
+            ConversationState::Closed | ConversationState::DeviceRemoved
+        ) {
+            return Err(crate::orchestrator::OrchestratorError::Storage(
+                "invalid account exit state".into(),
+            ));
         }
-        self.0.complete_account_exit(conversation_id.into(), expected_group_id_hex.into(),
-            expected_reset_generation, terminal_epoch, terminal_state.tag().into()).map_err(bridge_err)
+        self.0
+            .complete_account_exit(
+                conversation_id.into(),
+                expected_group_id_hex.into(),
+                expected_reset_generation,
+                terminal_epoch,
+                terminal_state.tag().into(),
+            )
+            .map_err(bridge_err)
     }
 
     async fn clear_reset_pending_for_delete(
@@ -674,9 +704,16 @@ impl MLSAPIClient for ClientAPIAdapter {
         limit: u32,
         cursor: Option<&str>,
     ) -> crate::orchestrator::Result<ConversationListPage> {
-        let ffi = self.0.get_conversations(limit, cursor.map(str::to_string)).map_err(bridge_err)?;
+        let ffi = self
+            .0
+            .get_conversations(limit, cursor.map(str::to_string))
+            .map_err(bridge_err)?;
         Ok(ConversationListPage {
-            conversations: ffi.conversations.iter().map(ffi_to_convo_view).collect::<crate::orchestrator::Result<Vec<_>>>()?,
+            conversations: ffi
+                .conversations
+                .iter()
+                .map(ffi_to_convo_view)
+                .collect::<crate::orchestrator::Result<Vec<_>>>()?,
             cursor: ffi.cursor,
         })
     }
@@ -701,7 +738,9 @@ impl MLSAPIClient for ClientAPIAdapter {
             )
             .map_err(bridge_err)
             .and_then(|ffi| {
-                let envelopes = ffi.envelopes.into_iter()
+                let envelopes = ffi
+                    .envelopes
+                    .into_iter()
                     .map(|m| crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(m, None))
                     .collect::<crate::orchestrator::Result<Vec<_>>>()?;
                 Ok((envelopes, ffi.cursor))
@@ -953,7 +992,10 @@ impl CredentialStore for ClientCredentialAdapter {
         Ok(authority)
     }
 
-    async fn get_auth_generation(&self, user_did: &str) -> crate::orchestrator::Result<Option<i64>> {
+    async fn get_auth_generation(
+        &self,
+        user_did: &str,
+    ) -> crate::orchestrator::Result<Option<i64>> {
         if let Ok(lock) = self.1.read() {
             if let Some(&gen) = lock.get(user_did) {
                 return Ok(Some(gen));

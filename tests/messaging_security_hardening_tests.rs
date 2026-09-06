@@ -2318,23 +2318,58 @@ async fn canonical_incoming_sequence_survives_durable_store_and_duplicate_delive
     let fixture = controlled_inbound_fixture_with_group(
         "8d85cf39-997f-4861-a45e-a71f944db857",
         "9192939495969798999a9b9c9d9e9fa09192939495969798999a9b9c9d9e9fa0",
-        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(Duration::ZERO)),
-    ).await;
-    let mut envelope = test_envelope(&fixture.conversation_id, "e94874a0-86ab-49f4-8355-35a5d972b607");
+        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(
+            Duration::ZERO,
+        )),
+    )
+    .await;
+    let mut envelope = test_envelope(
+        &fixture.conversation_id,
+        "e94874a0-86ab-49f4-8355-35a5d972b607",
+    );
     envelope.server_sequence = Some(271);
     envelope.timestamp = "2026-09-05T04:52:13.456Z".parse().unwrap();
-    let message = fixture.orchestrator.process_incoming(&envelope).await.unwrap().unwrap();
-    assert_eq!(message.sequence_number, 271, "server sequence must replace the process-local crypto counter");
+    let message = fixture
+        .orchestrator
+        .process_incoming(&envelope)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        message.sequence_number, 271,
+        "server sequence must replace the process-local crypto counter"
+    );
     assert_eq!(message.timestamp, envelope.timestamp);
     assert_eq!(message.epoch, 1);
-    let before = fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap();
-    assert!(fixture.orchestrator.process_incoming(&envelope).await.unwrap().is_none());
+    let before = fixture
+        .storage
+        .get_messages(&fixture.conversation_id, 10, None)
+        .await
+        .unwrap();
+    assert!(fixture
+        .orchestrator
+        .process_incoming(&envelope)
+        .await
+        .unwrap()
+        .is_none());
     let mut unproven_metadata = envelope.clone();
     unproven_metadata.server_sequence = Some(999);
     unproven_metadata.timestamp = "2026-09-05T05:52:13.456Z".parse().unwrap();
-    assert!(fixture.orchestrator.process_incoming(&unproven_metadata).await.unwrap().is_none());
-    let after = fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap();
-    assert_eq!(serde_json::to_value(&before).unwrap(), serde_json::to_value(&after).unwrap());
+    assert!(fixture
+        .orchestrator
+        .process_incoming(&unproven_metadata)
+        .await
+        .unwrap()
+        .is_none());
+    let after = fixture
+        .storage
+        .get_messages(&fixture.conversation_id, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
     assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -2343,15 +2378,35 @@ async fn canonical_invalid_id_is_rejected_before_decrypt_but_legacy_ids_remain_a
     let fixture = controlled_inbound_fixture_with_group(
         "8d85cf39-997f-4861-a45e-a71f944db857",
         "9192939495969798999a9b9c9d9e9fa09192939495969798999a9b9c9d9e9fa0",
-        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(Duration::ZERO)),
-    ).await;
-    let mut envelope = test_envelope(&fixture.conversation_id, "membership-left:e94874a0-86ab-49f4-8355-35a5d972b607:e94874a0-86ab-49f4-8355-35a5d972b607");
+        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(
+            Duration::ZERO,
+        )),
+    )
+    .await;
+    let mut envelope = test_envelope(
+        &fixture.conversation_id,
+        "membership-left:e94874a0-86ab-49f4-8355-35a5d972b607:e94874a0-86ab-49f4-8355-35a5d972b607",
+    );
     envelope.server_sequence = Some(271);
-    assert!(fixture.orchestrator.process_incoming_message(&envelope).await.is_err());
+    assert!(fixture
+        .orchestrator
+        .process_incoming_message(&envelope)
+        .await
+        .is_err());
     assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 0);
-    assert!(fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap().is_empty());
+    assert!(fixture
+        .storage
+        .get_messages(&fixture.conversation_id, 10, None)
+        .await
+        .unwrap()
+        .is_empty());
     envelope.server_sequence = None;
     envelope.server_message_id = Some("arbitrary-legacy-id".into());
-    assert!(fixture.orchestrator.process_incoming(&envelope).await.unwrap().is_some());
+    assert!(fixture
+        .orchestrator
+        .process_incoming(&envelope)
+        .await
+        .unwrap()
+        .is_some());
     assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 1);
 }

@@ -721,7 +721,9 @@ async fn test_concurrent_join_or_rejoin_deduped() {
     world
         .delivery_service()
         .set_conversation_leaves_for_test(&convo.conversation_id, vec![]);
-    world.delivery_service().set_bootstrap_reset_group_success(true);
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
 
     let join1 = alice.orchestrator.join_or_rejoin(&convo.conversation_id);
     let join2 = alice.orchestrator.join_or_rejoin(&convo.conversation_id);
@@ -881,7 +883,9 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
     world
         .delivery_service()
         .set_conversation_leaves_for_test(&conversation_id, vec![]);
-    world.delivery_service().set_bootstrap_reset_group_success(true);
+    world
+        .delivery_service()
+        .set_bootstrap_reset_group_success(true);
 
     let result = alice.orchestrator.sync_with_server(false).await;
     assert!(result.is_ok(), "sync failed: {:?}", result.err());
@@ -894,7 +898,9 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
         "sync rejoin should reset by stable conversation ID"
     );
     assert_eq!(
-        world.delivery_service().bootstrap_reset_group_call_count(&group_id),
+        world
+            .delivery_service()
+            .bootstrap_reset_group_call_count(&group_id),
         0,
         "sync rejoin must not key recovery by mutable MLS group ID"
     );
@@ -908,7 +914,10 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
         .find(|state| state.conversation_id == conversation_id)
         .map(|state| state.group_id.clone())
         .expect("rejoined conversation has a current group state");
-    assert_ne!(group_id, old_group_id, "reset must activate a successor group");
+    assert_ne!(
+        group_id, old_group_id,
+        "reset must activate a successor group"
+    );
     assert!(
         alice
             .orchestrator
@@ -1064,16 +1073,29 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
 
     // The server reports no leaf set, so a reset is never assumed safe: the
     // device asks a live leaf to re-add it and waits.
-    let first = alice.orchestrator.join_or_rejoin(&convo.conversation_id).await;
+    let first = alice
+        .orchestrator
+        .join_or_rejoin(&convo.conversation_id)
+        .await;
     assert!(first.is_err(), "leafless device must not be joined yet");
-    assert_eq!(leaf_recovery_requests(), 1, "first attempt opens a leaf recovery request");
-    let original_request = world.delivery_service().submitted_prepared_requests().into_iter()
+    assert_eq!(
+        leaf_recovery_requests(),
+        1,
+        "first attempt opens a leaf recovery request"
+    );
+    let original_request = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
         .find(|request| request.operation == CanonicalOperation::RequestLeafRecovery)
         .expect("first request remains recorded");
 
     // Immediate retry: the request is still open server-side; re-requesting
     // only earns LeafRecoveryAlreadyOpen, so it must not hit the server.
-    let second = alice.orchestrator.join_or_rejoin(&convo.conversation_id).await;
+    let second = alice
+        .orchestrator
+        .join_or_rejoin(&convo.conversation_id)
+        .await;
     match second {
         Err(OrchestratorError::RecoveryFailed(msg)) => assert!(
             msg.starts_with("leaf recovery pending for ") && msg.contains(&convo.conversation_id),
@@ -1081,15 +1103,29 @@ async fn test_join_or_rejoin_cooldown_suppresses_immediate_retry() {
         ),
         other => panic!("Expected RecoveryFailed open-request error, got: {other:?}"),
     }
-    assert_eq!(leaf_recovery_requests(), 1, "retry must not re-request leaf recovery");
-    let retained_request = world.delivery_service().submitted_prepared_requests().into_iter()
+    assert_eq!(
+        leaf_recovery_requests(),
+        1,
+        "retry must not re-request leaf recovery"
+    );
+    let retained_request = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
         .find(|request| request.operation == CanonicalOperation::RequestLeafRecovery)
         .expect("open request remains recorded");
-    assert_eq!(retained_request.body, original_request.body,
-        "retry must preserve the exact signed recovery request");
-    assert!(!world.delivery_service().submitted_prepared_requests().iter()
-        .any(|request| request.operation == CanonicalOperation::RequestReset),
-        "waiting for a current leaf must not open a destructive reset");
+    assert_eq!(
+        retained_request.body, original_request.body,
+        "retry must preserve the exact signed recovery request"
+    );
+    assert!(
+        !world
+            .delivery_service()
+            .submitted_prepared_requests()
+            .iter()
+            .any(|request| request.operation == CanonicalOperation::RequestReset),
+        "waiting for a current leaf must not open a destructive reset"
+    );
     assert_eq!(
         world
             .delivery_service()

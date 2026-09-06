@@ -101,7 +101,10 @@ fn conversation_state_json(conversation: &StoredConversation) -> serde_json::Val
         let leaves = state["leaves"].as_array().unwrap().clone();
         if let Some(participants) = state["participants"].as_array_mut() {
             for participant in participants {
-                participant["leafCount"] = serde_json::json!(leaves.iter().filter(|leaf| leaf["userDid"] == participant["userDid"]).count());
+                participant["leafCount"] = serde_json::json!(leaves
+                    .iter()
+                    .filter(|leaf| leaf["userDid"] == participant["userDid"])
+                    .count());
             }
         }
     }
@@ -388,10 +391,11 @@ impl MockDeliveryService {
         status: u16,
         body: Vec<u8>,
     ) {
-        self.state.lock().unwrap().account_exit_state_responses.insert(
-            conversation_id.into(),
-            (after_acceptance, status, body),
-        );
+        self.state
+            .lock()
+            .unwrap()
+            .account_exit_state_responses
+            .insert(conversation_id.into(), (after_acceptance, status, body));
     }
     pub fn tamper_next_account_exit_entry_for_test(&self) {
         self.state.lock().unwrap().tamper_account_exit_entry = true;
@@ -413,13 +417,25 @@ impl MockDeliveryService {
             guard.roundtrip_account_exit_response = false;
             fn lexicon_bytes(value: &mut serde_json::Value) {
                 match value {
-                    serde_json::Value::Object(fields) => for (key, value) in fields {
-                        if matches!(key.as_str(), "signature" | "groupId" | "confirmationTag" | "groupContextHash") && value.is_string() {
-                            *value = serde_json::json!({"$bytes":value.as_str().unwrap()});
-                        } else { lexicon_bytes(value); }
-                    },
-                    serde_json::Value::Array(values) => for value in values { lexicon_bytes(value); },
-                    _ => {},
+                    serde_json::Value::Object(fields) => {
+                        for (key, value) in fields {
+                            if matches!(
+                                key.as_str(),
+                                "signature" | "groupId" | "confirmationTag" | "groupContextHash"
+                            ) && value.is_string()
+                            {
+                                *value = serde_json::json!({"$bytes":value.as_str().unwrap()});
+                            } else {
+                                lexicon_bytes(value);
+                            }
+                        }
+                    }
+                    serde_json::Value::Array(values) => {
+                        for value in values {
+                            lexicon_bytes(value);
+                        }
+                    }
+                    _ => {}
                 }
             }
             let mut accepted = accepted;
@@ -932,7 +948,10 @@ impl MockDeliveryService {
     /// Seed a full list projection without changing point-read authority or membership.
     pub fn set_conversation_view_for_test(&self, conversation_id: &str, view: ConversationView) {
         let mut guard = self.state.lock().unwrap();
-        let record = guard.conversations.get_mut(conversation_id).expect("existing conversation");
+        let record = guard
+            .conversations
+            .get_mut(conversation_id)
+            .expect("existing conversation");
         assert_eq!(view.conversation_id, conversation_id);
         assert_eq!(view.group_id, record.view.group_id);
         record.view = view;

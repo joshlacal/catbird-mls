@@ -244,7 +244,10 @@ impl MockStorage {
     /// Seed a full host inventory projection without changing lifecycle or history.
     pub fn set_conversation_view_for_test(&self, conversation_id: &str, view: ConversationView) {
         let mut inner = self.inner.lock().unwrap();
-        let record = inner.conversations.get_mut(conversation_id).expect("existing conversation");
+        let record = inner
+            .conversations
+            .get_mut(conversation_id)
+            .expect("existing conversation");
         assert_eq!(view.conversation_id, conversation_id);
         assert_eq!(view.group_id, record.group_id);
         record.view = view;
@@ -1458,8 +1461,7 @@ impl MLSStorageBackend for MockStorage {
         let same_terminal = record.state == terminal_state
             && record.group_id == expected_group_id_hex
             && record.view.epoch == terminal_epoch;
-        if record.state == ConversationState::Closed && (!same_terminal || pending.is_some())
-        {
+        if record.state == ConversationState::Closed && (!same_terminal || pending.is_some()) {
             return Ok(false);
         }
         let allowed = match (expected_reset_generation, pending) {

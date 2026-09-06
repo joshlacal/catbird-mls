@@ -1508,7 +1508,11 @@ where
     }
 
     pub(crate) async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
-        if self.is_local_conversation_terminal(convo_id).await.unwrap_or(true) {
+        if self
+            .is_local_conversation_terminal(convo_id)
+            .await
+            .unwrap_or(true)
+        {
             return false;
         }
         // Layer 3: quarantined conversations never participate in sync-driven
@@ -1939,9 +1943,13 @@ where
         state: ConversationState,
     ) -> Result<bool> {
         debug_assert!(!matches!(state, ConversationState::ResetPending { .. }));
-        if (self.is_local_conversation_closed(convo_id).await? && state != ConversationState::Closed)
+        if (self.is_local_conversation_closed(convo_id).await?
+            && state != ConversationState::Closed)
             || (self.is_local_device_removed(convo_id).await?
-                && !matches!(state, ConversationState::DeviceRemoved | ConversationState::Closed))
+                && !matches!(
+                    state,
+                    ConversationState::DeviceRemoved | ConversationState::Closed
+                ))
         {
             return Ok(false);
         }
@@ -1967,9 +1975,13 @@ where
         state: ConversationState,
     ) -> Result<bool> {
         debug_assert!(!matches!(state, ConversationState::ResetPending { .. }));
-        if (self.is_local_conversation_closed(convo_id).await? && state != ConversationState::Closed)
+        if (self.is_local_conversation_closed(convo_id).await?
+            && state != ConversationState::Closed)
             || (self.is_local_device_removed(convo_id).await?
-                && !matches!(state, ConversationState::DeviceRemoved | ConversationState::Closed))
+                && !matches!(
+                    state,
+                    ConversationState::DeviceRemoved | ConversationState::Closed
+                ))
         {
             return Ok(false);
         }
@@ -3419,13 +3431,16 @@ where
     /// client-observed unrecoverable state.
     #[doc(hidden)]
     pub async fn force_rejoin(&self, convo_id: &str) -> Result<()> {
-        self.reject_automatic_rejoin_after_device_removal(convo_id).await?;
+        self.reject_automatic_rejoin_after_device_removal(convo_id)
+            .await?;
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
         let resolved = self.resolve_legacy_group_identifier(convo_id).await?;
         let convo_id = &resolved.conversation_id;
         if self.pending_conversation_admission(convo_id).await? {
-            return Err(OrchestratorError::InvalidInput("Accept this invitation before recovering the conversation.".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "Accept this invitation before recovering the conversation.".into(),
+            ));
         }
         let rejoin_lock = self.rejoin_lock(convo_id).await;
         let _rejoin_guard = match rejoin_lock.try_lock() {
@@ -3518,10 +3533,13 @@ where
     /// MLS group id; server calls and recovery gates are keyed by this stable
     /// id, while local MLS context calls resolve the current group id first.
     pub async fn join_or_rejoin(&self, convo_id: &str) -> Result<u64> {
-        self.reject_automatic_rejoin_after_device_removal(convo_id).await?;
+        self.reject_automatic_rejoin_after_device_removal(convo_id)
+            .await?;
         self.check_shutdown().await?;
         if self.pending_conversation_admission(convo_id).await? {
-            return Err(OrchestratorError::InvalidInput("Accept this invitation before joining the conversation.".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "Accept this invitation before joining the conversation.".into(),
+            ));
         }
         let user_did = self.require_user_did().await?;
         // Canonical Welcome adoption owns the complete envelope and its
@@ -3542,19 +3560,36 @@ where
             }
         }
         let locally_healthy = self.reset_pending_payload_result(convo_id).await?.is_none()
-            && self.resolve_conversation_context(convo_id).await.ok()
+            && self
+                .resolve_conversation_context(convo_id)
+                .await
+                .ok()
                 .and_then(|context| hex::decode(context.group_id).ok())
-                .is_some_and(|group| self.mls_context().group_is_active(group.clone()).unwrap_or(false)
-                    && self.mls_context().group_member_identities(group).ok()
-                        .is_some_and(|members| members.iter().any(|member| member.as_slice() == identity.as_bytes())));
+                .is_some_and(|group| {
+                    self.mls_context()
+                        .group_is_active(group.clone())
+                        .unwrap_or(false)
+                        && self
+                            .mls_context()
+                            .group_member_identities(group)
+                            .ok()
+                            .is_some_and(|members| {
+                                members
+                                    .iter()
+                                    .any(|member| member.as_slice() == identity.as_bytes())
+                            })
+                });
         if !locally_healthy {
             match self.fetch_welcome_delivery(convo_id).await {
                 Ok(delivery) => return self.join_or_rejoin_from_delivery(delivery).await,
-                Err(OrchestratorError::ServerError { status: 404 | 410, .. }) => {},
+                Err(OrchestratorError::ServerError {
+                    status: 404 | 410, ..
+                }) => {}
                 Err(error) => return Err(error),
             }
         } else {
-            self.retry_welcome_acknowledgements_for_conversation(convo_id).await?;
+            self.retry_welcome_acknowledgements_for_conversation(convo_id)
+                .await?;
         }
         let rejoin_lock = self.rejoin_lock(convo_id).await;
         let _rejoin_guard = match rejoin_lock.try_lock() {
@@ -3645,7 +3680,8 @@ where
                 ));
             }
             let original = super::lifecycle::lifecycle_coordinates(
-                &delivery.envelope["coordinates"], convo_id,
+                &delivery.envelope["coordinates"],
+                convo_id,
             )?;
             if delivery.group_id()? != group
                 || original["generation"] != coordinate["generation"]
@@ -3659,7 +3695,8 @@ where
             // Only an exact native receipt can reuse an already imported
             // group. Membership alone never acknowledges another envelope.
             let result = self.mls_context().process_welcome_delivery(
-                &delivery, identity.as_bytes().to_vec(),
+                &delivery,
+                identity.as_bytes().to_vec(),
                 Some(self.config().group_config.clone()),
             )?;
             if result.group_id != group {
@@ -3705,7 +3742,9 @@ where
                 normalize_group_state(&mut states, projection);
             }
             if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
-                if view.group_id != group_hex { view.canonical_state = None; }
+                if view.group_id != group_hex {
+                    view.canonical_state = None;
+                }
                 view.group_id = group_hex;
                 view.epoch = epoch;
             }
@@ -3812,8 +3851,12 @@ where
                 .await
                 .insert(convo_id.into(), ConversationState::Active);
             self.storage().clear_rejoin_flag(convo_id).await?;
-            self.complete_welcome_acknowledgements_locked(convo_id).await?;
-            if let Err(error) = self.retain_conversation_policy_json(convo_id, current).await {
+            self.complete_welcome_acknowledgements_locked(convo_id)
+                .await?;
+            if let Err(error) = self
+                .retain_conversation_policy_json(convo_id, current)
+                .await
+            {
                 tracing::warn!(convo_id, %error, "Verified Welcome retained; admission policy refresh will retry");
             }
             return Ok(self.mls_context().get_epoch(group)?);
@@ -3989,12 +4032,15 @@ where
         self.storage().mark_needs_rejoin(convo_id).await?;
         // This reaches platform error UI. Retain the stable classification
         // prefix, but never embed signed control data or reserved KeyPackages.
-        let request_id = outcome.pointer("/recovery/recoveryRequestId")
+        let request_id = outcome
+            .pointer("/recovery/recoveryRequestId")
             .or_else(|| outcome.pointer("/result/recovery/recoveryRequestId"))
             .or_else(|| outcome.get("recoveryRequestId"))
             .and_then(|value| value.as_str())
             .filter(|id| crate::chat_v2::ids::RecoveryRequestId::parse(id).is_ok());
-        let request_label = request_id.map(|id| format!(" Request: {id}.")).unwrap_or_default();
+        let request_label = request_id
+            .map(|id| format!(" Request: {id}."))
+            .unwrap_or_default();
         let guidance = if outcome["reset"] == "requested" {
             "Waiting for an administrator to complete conversation recovery."
         } else {
@@ -4564,8 +4610,10 @@ where
             .await
             .insert(convo_id.to_string(), durable_state);
         if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
-            if view.group_id != new_group_id_hex { view.canonical_state = None; }
-                view.group_id = new_group_id_hex.to_string();
+            if view.group_id != new_group_id_hex {
+                view.canonical_state = None;
+            }
+            view.group_id = new_group_id_hex.to_string();
             view.epoch = 0;
         }
 
@@ -4837,8 +4885,10 @@ where
             };
             if project_completed_target {
                 if let Some(view) = self.conversations().lock().await.get_mut(convo_id) {
-                    if view.group_id != payload.new_group_id { view.canonical_state = None; }
-                view.group_id = payload.new_group_id.clone();
+                    if view.group_id != payload.new_group_id {
+                        view.canonical_state = None;
+                    }
+                    view.group_id = payload.new_group_id.clone();
                     view.epoch = landed_epoch;
                 }
             }
@@ -5240,7 +5290,8 @@ where
             pagination.observe_page(page.conversations.len(), page.cursor.as_deref())?;
             for cv in &page.conversations {
                 if cv.conversation_id == convo_id {
-                    return self.restore_conversation_policy(&self.require_user_did().await?, cv.clone());
+                    return self
+                        .restore_conversation_policy(&self.require_user_did().await?, cv.clone());
                 }
             }
             cursor = page.cursor;
@@ -5506,7 +5557,11 @@ where
         let auth = self.epoch_authenticator_hex(convo_id).await;
         tracing::info!(convo_id, auth = ?auth, "user_confirmed_manual_reset: manual reset confirmed by user");
         let outcome = self.reset_conversation(convo_id, "manualRecovery").await?;
-        tracing::info!(convo_id, ?outcome, "user_confirmed_manual_reset: reset outcome");
+        tracing::info!(
+            convo_id,
+            ?outcome,
+            "user_confirmed_manual_reset: reset outcome"
+        );
         self.exit_quarantine(
             convo_id,
             crate::orchestrator::types::QuarantineExitReason::UserConfirmedReset,

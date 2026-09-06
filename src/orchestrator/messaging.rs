@@ -309,7 +309,9 @@ where
 
     async fn reject_send_if_reset_pending(&self, conversation_id: &str) -> Result<()> {
         if self.pending_conversation_admission(conversation_id).await? {
-            return Err(OrchestratorError::InvalidInput("Accept this invitation before sending messages.".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "Accept this invitation before sending messages.".into(),
+            ));
         }
         if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
             return Err(OrchestratorError::ResetCompletionNotCommitted {
@@ -400,7 +402,10 @@ where
         self.check_shutdown().await?;
         self.require_user_did().await?;
         if self.pending_conversation_admission(convo_id).await? {
-            return Ok(Self::ready_result(ConversationRecoveryState::Recovering, None));
+            return Ok(Self::ready_result(
+                ConversationRecoveryState::Recovering,
+                None,
+            ));
         }
 
         let had_in_memory_reset_authority = matches!(
@@ -1764,7 +1769,9 @@ where
             text: plaintext,
             timestamp: envelope.timestamp,
             epoch: decrypt_result.epoch,
-            sequence_number: envelope.server_sequence.unwrap_or(decrypt_result.sequence_number),
+            sequence_number: envelope
+                .server_sequence
+                .unwrap_or(decrypt_result.sequence_number),
             is_own,
             delivery_status: None,
             payload_json,

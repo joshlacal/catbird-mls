@@ -219,7 +219,9 @@ impl ManifestStorage {
     /// The Welcome-only provider borrows this connection so its KeyPackage,
     /// group and receipt writes share one transaction. Never use the ordinary
     /// provider's separate connection while that transaction is open.
-    pub(crate) fn welcome_ack_connection(&self) -> &Connection { &self.conn }
+    pub(crate) fn welcome_ack_connection(&self) -> &Connection {
+        &self.conn
+    }
     fn open_connection(
         db_path: &std::path::Path,
         encryption_key: &str,
@@ -532,7 +534,10 @@ impl ManifestStorage {
     /// Callers retain old JSON exactly and retry a failed comparison; a returned
     /// write error remains ambiguous until the row is reread.
     pub(crate) fn compare_exchange_manifest<T: Serialize>(
-        &self, key: &str, expected: Option<&str>, value: &T,
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &T,
     ) -> Result<bool, MLSError> {
         let next = serde_json::to_string(value).map_err(|_| MLSError::SerializationError)?;
         let changed = match expected {
@@ -544,7 +549,8 @@ impl ManifestStorage {
                 "INSERT OR IGNORE INTO mls_manifests(key,value) VALUES(?1,?2)",
                 rusqlite::params![key, next],
             ),
-        }.map_err(|e| map_sqlite_error("compare_exchange_manifest", &e))?;
+        }
+        .map_err(|e| map_sqlite_error("compare_exchange_manifest", &e))?;
         Ok(changed == 1)
     }
 
@@ -2492,9 +2498,7 @@ impl MLSContext {
                                         return Err(MLSError::StorageFailed);
                                     }
                                     Vec::new()
-                                } else if let Some(own_leaf) =
-                                    group.own_leaf_node()
-                                {
+                                } else if let Some(own_leaf) = group.own_leaf_node() {
                                     let own_credential = own_leaf.credential().serialized_content();
                                     let leaf_signature_key =
                                         own_leaf.signature_key().as_slice().to_vec();
@@ -3735,9 +3739,14 @@ impl MLSContext {
     /// Publication after the canonical Welcome transaction has committed.
     /// This cannot roll back or delete a group paired with a durable receipt.
     pub(crate) fn publish_welcome_group(&mut self, group: MlsGroup, signer_public_key: Vec<u8>) {
-        self.groups.insert(group.group_id().as_slice().to_vec(), GroupState {
-            group, signer_public_key, pending_external_join: None,
-        });
+        self.groups.insert(
+            group.group_id().as_slice().to_vec(),
+            GroupState {
+                group,
+                signer_public_key,
+                pending_external_join: None,
+            },
+        );
     }
 
     /// Register a signer public key for an identity

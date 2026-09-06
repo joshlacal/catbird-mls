@@ -26,7 +26,7 @@ fi
 
 echo "🔧 Step 1: Build host library for metadata extraction"
 echo "Target: $HOST_TARGET"
-cargo build --release --target "$HOST_TARGET"
+cargo build --locked --release --target "$HOST_TARGET"
 
 echo ""
 echo "🧠 Step 2: Generate Swift bindings from compiled library"
@@ -36,7 +36,7 @@ mkdir -p build/bindings
 LIBRARY_PATH="target/$HOST_TARGET/release/libcatbird_mls.dylib"
 
 # Use the in-workspace uniffi-bindgen binary
-cargo run --bin uniffi-bindgen generate \
+cargo run --locked --bin uniffi-bindgen generate \
     --library "$LIBRARY_PATH" \
     --language swift \
     --out-dir build/bindings \
@@ -49,25 +49,25 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch
 echo ""
 echo "🏗️  Step 4: Build static libraries"
 echo "Building for iOS Device (ARM64)..."
-cargo build --release --target aarch64-apple-ios
+cargo build --locked --release --target aarch64-apple-ios
 
 echo "Building for iOS Simulator (ARM64)..."
-cargo build --release --target aarch64-apple-ios-sim
+cargo build --locked --release --target aarch64-apple-ios-sim
 
 echo "Building for iOS Simulator (x86_64)..."
-cargo build --release --target x86_64-apple-ios
+cargo build --locked --release --target x86_64-apple-ios
 
 echo "Building for Mac Catalyst (arm64)..."
-cargo build --release --target aarch64-apple-ios-macabi
+cargo build --locked --release --target aarch64-apple-ios-macabi
 
 echo "Building for Mac Catalyst (x86_64)..."
-cargo build --release --target x86_64-apple-ios-macabi
+cargo build --locked --release --target x86_64-apple-ios-macabi
 
 echo "Building for macOS (arm64)..."
-cargo build --release --target aarch64-apple-darwin
+cargo build --locked --release --target aarch64-apple-darwin
 
 echo "Building for macOS (x86_64)..."
-cargo build --release --target x86_64-apple-darwin
+cargo build --locked --release --target x86_64-apple-darwin
 
 echo ""
 echo "📦 Step 5: Create XCFramework structure"

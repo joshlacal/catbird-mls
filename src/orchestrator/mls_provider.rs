@@ -438,39 +438,73 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     /// Encrypted, durable journal of exact signed control requests. A backend
     /// must fail closed when it cannot retain the pending MLS/request pair.
-    fn put_prepared_control(&self, _record: &super::control_journal::PreparedControlRecord) -> Result<(), MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "prepared control journal unavailable".into() })
+    fn put_prepared_control(
+        &self,
+        _record: &super::control_journal::PreparedControlRecord,
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "prepared control journal unavailable".into(),
+        })
     }
 
     /// Account-scoped authenticated policy, independent of MLS membership.
-    fn get_conversation_departure(&self, _user_did: &str, _conversation_id: &str)
-        -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "get_conversation_departure is required".into() })
+    fn get_conversation_departure(
+        &self,
+        _user_did: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError>
+    {
+        Err(MLSError::OperationNotSupported {
+            reason: "get_conversation_departure is required".into(),
+        })
     }
-    fn put_conversation_departure(&self, _user_did: &str,
-        _coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates) -> Result<bool, MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "put_conversation_departure is required".into() })
+    fn put_conversation_departure(
+        &self,
+        _user_did: &str,
+        _coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "put_conversation_departure is required".into(),
+        })
     }
 
-    fn get_conversation_policy(&self, _user_did: &str, _conversation_id: &str)
-        -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "get_conversation_policy is required".into() })
+    fn get_conversation_policy(
+        &self,
+        _user_did: &str,
+        _conversation_id: &str,
+    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "get_conversation_policy is required".into(),
+        })
     }
 
-    fn put_conversation_policy(&self, _user_did: &str,
-        _state: &catbird_atproto::blue_catbird::chat::ConversationState) -> Result<bool, MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "put_conversation_policy is required".into() })
+    fn put_conversation_policy(
+        &self,
+        _user_did: &str,
+        _state: &catbird_atproto::blue_catbird::chat::ConversationState,
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "put_conversation_policy is required".into(),
+        })
     }
 
     fn list_account_exits(&self) -> Result<Vec<super::account_exit::AccountExitRecord>, MLSError> {
         Ok(Vec::new())
     }
 
-    fn put_account_exit(&self, _record: &super::account_exit::AccountExitRecord) -> Result<(), MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "account exit journal unavailable".into() })
+    fn put_account_exit(
+        &self,
+        _record: &super::account_exit::AccountExitRecord,
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "account exit journal unavailable".into(),
+        })
     }
 
-    fn get_prepared_control(&self, _group_id: &str) -> Result<Option<super::control_journal::PreparedControlRecord>, MLSError> {
+    fn get_prepared_control(
+        &self,
+        _group_id: &str,
+    ) -> Result<Option<super::control_journal::PreparedControlRecord>, MLSError> {
         // The default put cannot create a journal. Providers supporting put
         // must override both reads and surface their storage failures.
         Ok(None)
@@ -478,7 +512,9 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     /// Includes completed proof records so own-Commit authority can be restored
     /// before processing server echoes after a process restart.
-    fn list_prepared_controls(&self) -> Result<Vec<super::control_journal::PreparedControlRecord>, MLSError> {
+    fn list_prepared_controls(
+        &self,
+    ) -> Result<Vec<super::control_journal::PreparedControlRecord>, MLSError> {
         // The default put always fails, so this provider cannot have a journal.
         // Implementations that support put MUST override this and surface errors.
         Ok(Vec::new())
@@ -486,8 +522,14 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     /// Delete only the exact journal row carrying a durable definitive rejection,
     /// after clearing its pending MLS state and passing the durability barrier.
-    fn remove_prepared_control(&self, _group_id: &str, _transition_id: &str) -> Result<(), MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "prepared control journal unavailable".into() })
+    fn remove_prepared_control(
+        &self,
+        _group_id: &str,
+        _transition_id: &str,
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "prepared control journal unavailable".into(),
+        })
     }
 
     /// Merge an incoming `StagedCommit` that was previously staged by
@@ -671,16 +713,29 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     /// Verify/import an exact canonical delivery atomically with its receipt.
     /// Unsupported providers must never substitute membership for acceptance.
-    fn process_welcome_delivery(&self, _delivery: &super::welcome_ack::WelcomeDelivery,
-        _identity: Vec<u8>, _config: Option<GroupConfig>) -> Result<WelcomeResult, MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "atomic Welcome acceptance unavailable".into() })
+    fn process_welcome_delivery(
+        &self,
+        _delivery: &super::welcome_ack::WelcomeDelivery,
+        _identity: Vec<u8>,
+        _config: Option<GroupConfig>,
+    ) -> Result<WelcomeResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "atomic Welcome acceptance unavailable".into(),
+        })
     }
-    fn list_welcome_acceptances(&self) -> Result<Vec<super::welcome_ack::WelcomeAcceptance>, MLSError> {
+    fn list_welcome_acceptances(
+        &self,
+    ) -> Result<Vec<super::welcome_ack::WelcomeAcceptance>, MLSError> {
         Ok(Vec::new())
     }
     /// Update only an existing native receipt; this method cannot mint one.
-    fn update_welcome_acceptance(&self, _record: &super::welcome_ack::WelcomeAcceptance) -> Result<(), MLSError> {
-        Err(MLSError::OperationNotSupported { reason: "Welcome acknowledgement journal unavailable".into() })
+    fn update_welcome_acceptance(
+        &self,
+        _record: &super::welcome_ack::WelcomeAcceptance,
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "Welcome acknowledgement journal unavailable".into(),
+        })
     }
 
     /// Clean up epoch secrets older than the retention window for a group.

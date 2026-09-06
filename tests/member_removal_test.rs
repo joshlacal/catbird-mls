@@ -162,10 +162,17 @@ fn open_test_manifest(path: &std::path::Path) -> rusqlite::Connection {
     use sha2::{Digest, Sha256};
     let key = "test-key-1234567890123456";
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.pragma_update(None, "cipher_memory_security", "OFF").unwrap();
+    conn.pragma_update(None, "cipher_memory_security", "OFF")
+        .unwrap();
     conn.pragma_update(None, "key", key).unwrap();
-    conn.pragma_update(None, "cipher_plaintext_header_size", 32).unwrap();
-    conn.pragma_update(None, "cipher_salt", format!("x'{}'", hex::encode(&Sha256::digest(key)[..16]))).unwrap();
+    conn.pragma_update(None, "cipher_plaintext_header_size", 32)
+        .unwrap();
+    conn.pragma_update(
+        None,
+        "cipher_salt",
+        format!("x'{}'", hex::encode(&Sha256::digest(key)[..16])),
+    )
+    .unwrap();
     conn
 }
 
@@ -421,10 +428,15 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
     let phone_keychain = TestKeychain::new();
     let phone_dir = tempfile::tempdir().unwrap();
     let phone = MLSContext::new(
-        phone_dir.path().join("mls.db").to_string_lossy().to_string(),
+        phone_dir
+            .path()
+            .join("mls.db")
+            .to_string_lossy()
+            .to_string(),
         "test-key-1234567890123456".to_string(),
         Box::new(phone_keychain.clone()),
-    ).unwrap();
+    )
+    .unwrap();
     epoch_secret_test_support::install(&phone);
     let (laptop, _laptop_dir) = new_context();
     let phone_identity = b"did:plc:bob#phone";
@@ -460,7 +472,9 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
         ProcessedContent::StagedCommit { new_epoch: 2, .. }
     ));
     assert!(matches!(
-        laptop.process_message(group.clone(), remove.clone()).unwrap(),
+        laptop
+            .process_message(group.clone(), remove.clone())
+            .unwrap(),
         ProcessedContent::StagedCommit { new_epoch: 2, .. }
     ));
 
@@ -540,7 +554,12 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
         "terminal membership must remain inactive after reopening storage"
     );
     assert_eq!(
-        MlsCryptoContext::verified_incoming_removal(reopened.as_ref(), group.clone(), remove.clone()).unwrap(),
+        MlsCryptoContext::verified_incoming_removal(
+            reopened.as_ref(),
+            group.clone(),
+            remove.clone()
+        )
+        .unwrap(),
         Some(2),
         "exact removal proof survives restart before outer projection completes"
     );
@@ -553,12 +572,19 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
     let path = phone_dir.path().join("mls.db");
     let mut receipt: serde_json::Value = {
         let db = open_test_manifest(&path);
-        let encoded: String = db.query_row(
-            "SELECT value FROM mls_manifests WHERE key = ?1", [&receipt_key], |row| row.get(0),
-        ).unwrap();
+        let encoded: String = db
+            .query_row(
+                "SELECT value FROM mls_manifests WHERE key = ?1",
+                [&receipt_key],
+                |row| row.get(0),
+            )
+            .unwrap();
         serde_json::from_str(&encoded).unwrap()
     };
-    assert_eq!(receipt["target_credential_identity"], serde_json::json!(phone_identity.as_slice()));
+    assert_eq!(
+        receipt["target_credential_identity"],
+        serde_json::json!(phone_identity.as_slice())
+    );
     assert!(receipt["confirmed_context_hash"].is_array());
     receipt["confirmed_context_hash"] = serde_json::Value::Null;
     let expected_hash = receipt["expected_context_hash"].clone();
@@ -566,16 +592,28 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
     for expected in [None, Some(2)] {
         {
             let db = open_test_manifest(&path);
-            db.execute("UPDATE mls_manifests SET value = ?1 WHERE key = ?2",
-                [serde_json::to_string(&receipt).unwrap(), receipt_key.clone()]).unwrap();
+            db.execute(
+                "UPDATE mls_manifests SET value = ?1 WHERE key = ?2",
+                [
+                    serde_json::to_string(&receipt).unwrap(),
+                    receipt_key.clone(),
+                ],
+            )
+            .unwrap();
         }
         let resumed = MLSContext::new(
             path.to_string_lossy().to_string(),
             "test-key-1234567890123456".to_string(),
             Box::new(phone_keychain.clone()),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(
-            MlsCryptoContext::verified_incoming_removal(resumed.as_ref(), group.clone(), remove.clone()).unwrap(),
+            MlsCryptoContext::verified_incoming_removal(
+                resumed.as_ref(),
+                group.clone(),
+                remove.clone()
+            )
+            .unwrap(),
             expected,
             "unconfirmed removal intent requires the exact authenticated successor context"
         );
@@ -583,10 +621,17 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
         receipt["expected_context_hash"] = expected_hash.clone();
     }
     let db = open_test_manifest(&path);
-    let encoded: String = db.query_row(
-        "SELECT value FROM mls_manifests WHERE key = ?1", [&receipt_key], |row| row.get(0),
-    ).unwrap();
-    assert!(serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["confirmed_context_hash"].is_array());
+    let encoded: String = db
+        .query_row(
+            "SELECT value FROM mls_manifests WHERE key = ?1",
+            [&receipt_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["confirmed_context_hash"]
+            .is_array()
+    );
 }
 
 #[test]

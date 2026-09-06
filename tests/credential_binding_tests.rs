@@ -559,7 +559,7 @@ async fn read_pure_removal_server_state(world: &TestWorld, cid: &str) -> serde_j
         operation:CanonicalOperation::GetConversationState,method:"GET".into(),
         path:format!("/xrpc/blue.catbird.chat.getConversationState?conversationId={cid}&actorDeviceId={device}"),body:None,
     }).await.expect("read canonical device membership");
-    assert_eq!(response.status,200);
+    assert_eq!(response.status, 200);
     serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["state"].clone()
 }
 
@@ -574,18 +574,33 @@ async fn seed_pure_removal_device_roster(world: &TestWorld, cid: &str, group: &s
             uuid::Uuid::parse_str(device).expect("real fixture device UUID");
             serde_json::json!({"userDid":did,"deviceId":device,"deviceStatus":"active","leafIndex":index})
         }).collect::<Vec<_>>();
-    let page=alice.orchestrator.api_client().get_conversations(100,None).await.unwrap();
-    let conversation=page.conversations.iter().find(|c|c.conversation_id==cid).unwrap();
+    let page = alice
+        .orchestrator
+        .api_client()
+        .get_conversations(100, None)
+        .await
+        .unwrap();
+    let conversation = page
+        .conversations
+        .iter()
+        .find(|c| c.conversation_id == cid)
+        .unwrap();
     let participants=conversation.members.iter().map(|member| serde_json::json!({
         "userDid":member.did,"role":if member.did==alice.did {"admin"} else {"member"},"status":"active",
         "leafCount":leaves.iter().filter(|leaf|leaf["userDid"]==member.did).count()
     })).collect::<Vec<_>>();
-    let mut state=read_pure_removal_server_state(world,cid).await;
-    state["leaves"]=serde_json::json!(&leaves);
-    state["participants"]=serde_json::json!(&participants);
-    world.delivery_service().set_conversation_leaves_for_test(cid,leaves);
-    world.delivery_service().set_conversation_participants_for_test(cid,participants);
-    world.delivery_service().set_lifecycle_state_for_test(cid,state);
+    let mut state = read_pure_removal_server_state(world, cid).await;
+    state["leaves"] = serde_json::json!(&leaves);
+    state["participants"] = serde_json::json!(&participants);
+    world
+        .delivery_service()
+        .set_conversation_leaves_for_test(cid, leaves);
+    world
+        .delivery_service()
+        .set_conversation_participants_for_test(cid, participants);
+    world
+        .delivery_service()
+        .set_lifecycle_state_for_test(cid, state);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -607,8 +622,10 @@ async fn public_pure_remove_server_failure_discards_then_retry_succeeds() {
         .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
-    seed_pure_removal_device_roster(&world,&convo.conversation_id,&convo.group_id).await;
-    alice.credentials.set_authorized_device_key_resolution_failure(&bob_did,true);
+    seed_pure_removal_device_roster(&world, &convo.conversation_id, &convo.group_id).await;
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&bob_did, true);
     let group_bytes = hex::decode(&convo.group_id).unwrap();
     let epoch_before = alice
         .orchestrator
@@ -651,10 +668,16 @@ async fn public_pure_remove_server_failure_discards_then_retry_succeeds() {
         .members
         .iter()
         .any(|member| member.did == bob_did));
-    let failed_state=read_pure_removal_server_state(&world,&convo.conversation_id).await;
-    assert_eq!(failed_state["coordinates"]["epoch"],epoch_before);
-    assert!(failed_state["leaves"].as_array().unwrap().iter().any(|leaf|leaf["userDid"]==bob_did),
-        "failed removal preserves Bob's exact device on the server");
+    let failed_state = read_pure_removal_server_state(&world, &convo.conversation_id).await;
+    assert_eq!(failed_state["coordinates"]["epoch"], epoch_before);
+    assert!(
+        failed_state["leaves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|leaf| leaf["userDid"] == bob_did),
+        "failed removal preserves Bob's exact device on the server"
+    );
 
     alice
         .orchestrator
@@ -681,12 +704,27 @@ async fn public_pure_remove_server_failure_discards_then_retry_succeeds() {
         .iter()
         .find(|conversation| conversation.conversation_id == convo.conversation_id)
         .expect("conversation remains visible to Alice");
-    assert!(server_conversation.members.iter().any(|member| member.did == bob_did),
-        "device removal preserves account policy membership");
-    let state=read_pure_removal_server_state(&world,&convo.conversation_id).await;
-    assert!(!state["leaves"].as_array().unwrap().iter().any(|leaf|leaf["userDid"]==bob_did),
-        "successful retry removes Bob's exact device from the server roster");
-    assert!(state["participants"].as_array().unwrap().iter().any(|p|p["userDid"]==bob_did && p["leafCount"]==0));
+    assert!(
+        server_conversation
+            .members
+            .iter()
+            .any(|member| member.did == bob_did),
+        "device removal preserves account policy membership"
+    );
+    let state = read_pure_removal_server_state(&world, &convo.conversation_id).await;
+    assert!(
+        !state["leaves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|leaf| leaf["userDid"] == bob_did),
+        "successful retry removes Bob's exact device from the server roster"
+    );
+    assert!(state["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["userDid"] == bob_did && p["leafCount"] == 0));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -786,8 +824,10 @@ async fn public_swap_preserves_pure_removal_compatibility() {
         .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
         .await
         .expect("add Bob");
-    seed_pure_removal_device_roster(&world,&convo.conversation_id,&convo.group_id).await;
-    alice.credentials.set_authorized_device_key_resolution_failure(&bob_did,true);
+    seed_pure_removal_device_roster(&world, &convo.conversation_id, &convo.group_id).await;
+    alice
+        .credentials
+        .set_authorized_device_key_resolution_failure(&bob_did, true);
     let group_bytes = hex::decode(&convo.group_id).unwrap();
     let epoch_before = alice
         .orchestrator
@@ -808,7 +848,10 @@ async fn public_swap_preserves_pure_removal_compatibility() {
         .expect("members after pure removal");
     assert!(!members_after
         .iter()
-        .any(|identity| std::str::from_utf8(identity).unwrap().split('#').next() == Some(bob_did.as_str())));
+        .any(
+            |identity| std::str::from_utf8(identity).unwrap().split('#').next()
+                == Some(bob_did.as_str())
+        ));
     assert!(
         alice
             .orchestrator
@@ -828,12 +871,27 @@ async fn public_swap_preserves_pure_removal_compatibility() {
         .iter()
         .find(|conversation| conversation.conversation_id == convo.conversation_id)
         .expect("conversation remains visible to Alice");
-    assert!(server_conversation.members.iter().any(|member| member.did == bob_did),
-        "pure-removal Swap changes device leaves without removing the account");
-    let state=read_pure_removal_server_state(&world,&convo.conversation_id).await;
-    assert!(!state["leaves"].as_array().unwrap().iter().any(|leaf|leaf["userDid"]==bob_did),
-        "pure-removal Swap removes Bob's exact device from the server roster");
-    assert!(state["participants"].as_array().unwrap().iter().any(|p|p["userDid"]==bob_did && p["leafCount"]==0));
+    assert!(
+        server_conversation
+            .members
+            .iter()
+            .any(|member| member.did == bob_did),
+        "pure-removal Swap changes device leaves without removing the account"
+    );
+    let state = read_pure_removal_server_state(&world, &convo.conversation_id).await;
+    assert!(
+        !state["leaves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|leaf| leaf["userDid"] == bob_did),
+        "pure-removal Swap removes Bob's exact device from the server roster"
+    );
+    assert!(state["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["userDid"] == bob_did && p["leafCount"] == 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,8 +1546,12 @@ async fn device_key_mismatch_rejects_add_without_epoch_change() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unsupported_device_key_resolution_rejects_before_staging() {
     let mut world = TestWorld::new();
-    world.add_client_with_did("Alice", "did:plc:z72i7hdynmk6r22z27h6tvur").await;
-    world.add_client_with_did("Bob", "did:plc:ewvi7nxzyoun6zhxrhs64oiz").await;
+    world
+        .add_client_with_did("Alice", "did:plc:z72i7hdynmk6r22z27h6tvur")
+        .await;
+    world
+        .add_client_with_did("Bob", "did:plc:ewvi7nxzyoun6zhxrhs64oiz")
+        .await;
     world.register_device("Alice").await.unwrap();
     let bob_did = world.register_device("Bob").await.unwrap();
 

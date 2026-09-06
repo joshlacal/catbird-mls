@@ -18,8 +18,7 @@ impl IncomingEnvelope {
     /// no append sequence and retain their historical arbitrary message IDs.
     pub fn validate_server_metadata(&self) -> Result<()> {
         if let Some(sequence) = self.server_sequence {
-            CanonicalUuid::parse(&self.conversation_id)
-                .map_err(|_| invalid("conversationId"))?;
+            CanonicalUuid::parse(&self.conversation_id).map_err(|_| invalid("conversationId"))?;
             if sequence == 0 || sequence > MAX_SAFE_INTEGER as u64 {
                 return Err(invalid("sequence"));
             }
@@ -233,9 +232,10 @@ mod tests {
         assert_eq!(mapped.server_epoch, Some(7));
         let mut wrong_conversation = envelope.clone();
         wrong_conversation.conversation_id = "not-a-canonical-conversation".into();
-        assert!(crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(
-            wrong_conversation, None
-        ).is_err());
+        assert!(
+            crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(wrong_conversation, None)
+                .is_err()
+        );
         assert!(
             crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(
                 envelope.clone(),

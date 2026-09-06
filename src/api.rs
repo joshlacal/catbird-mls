@@ -23,7 +23,9 @@ use crate::message_limits::{
 };
 use crate::mls_context::MLSContext as MLSContextInner;
 use crate::orchestrator::mls_provider::OwnEchoProof;
-use crate::orchestrator::mls_provider::{IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome};
+use crate::orchestrator::mls_provider::{
+    IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome,
+};
 use crate::types::*;
 
 use crate::keychain::KeychainAccess;
@@ -482,7 +484,11 @@ fn incoming_removal_snapshot(
             .group_context()
             .tls_serialize_detached()
             .map_err(|_| MLSError::SerializationError)?;
-        Ok((group.epoch().as_u64(), group.is_active(), Sha256::digest(bytes).into()))
+        Ok((
+            group.epoch().as_u64(),
+            group.is_active(),
+            Sha256::digest(bytes).into(),
+        ))
     })
 }
 
@@ -493,7 +499,9 @@ fn confirm_incoming_removal_receipt(
     wire_fingerprint: [u8; 32],
 ) -> Result<(), MLSError> {
     let key = incoming_removal_receipt_key(group_id);
-    let mut receipt = inner.manifest_storage.read_manifest::<IncomingRemovalReceipt>(&key)?
+    let mut receipt = inner
+        .manifest_storage
+        .read_manifest::<IncomingRemovalReceipt>(&key)?
         .ok_or(MLSError::MergeFailed)?;
     let (epoch, active, context_hash) = incoming_removal_snapshot(inner, group_id)?;
     if receipt.group_id != group_id
@@ -5364,13 +5372,17 @@ impl MLSContext {
             return Err(MLSError::MergeFailed);
         }
         if self_removed {
-            let staged = pending.get(&pending_key)
+            let staged = pending
+                .get(&pending_key)
                 .and_then(|entry| entry.staged.as_ref())
                 .ok_or(MLSError::MergeFailed)?;
-            let expected_context = staged.group_context().tls_serialize_detached()
+            let expected_context = staged
+                .group_context()
+                .tls_serialize_detached()
                 .map_err(|_| MLSError::SerializationError)?;
             let target_credential_identity = inner.with_group_ref(&gid, |group, _| {
-                group.own_leaf_node()
+                group
+                    .own_leaf_node()
                     .map(|leaf| leaf.credential().serialized_content().to_vec())
                     .ok_or(MLSError::MergeFailed)
             })?;
@@ -5384,9 +5396,9 @@ impl MLSContext {
                 expected_context_hash: Sha256::digest(expected_context).into(),
                 confirmed_context_hash: None,
             };
-            inner.manifest_storage.write_manifest(
-                &incoming_removal_receipt_key(&group_id), &receipt,
-            )?;
+            inner
+                .manifest_storage
+                .write_manifest(&incoming_removal_receipt_key(&group_id), &receipt)?;
             // Install the exact verified intent durably before OpenMLS can
             // erase the local leaf. A crash cannot leave an unexplained
             // inactive group that would require guessing which Commit won.
@@ -5513,13 +5525,18 @@ impl MLSContext {
     ) -> Result<Option<u64>, MLSError> {
         self.check_suspended()?;
         validate_inbound_mls_message_len(message.len(), "ciphertext")?;
-        let mut guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
         let key = incoming_removal_receipt_key(&group_id);
-        let Some(mut receipt) = inner.manifest_storage
-            .read_manifest::<IncomingRemovalReceipt>(&key)? else {
-                return Ok(None);
-            };
+        let Some(mut receipt) = inner
+            .manifest_storage
+            .read_manifest::<IncomingRemovalReceipt>(&key)?
+        else {
+            return Ok(None);
+        };
         let fingerprint = incoming_commit_wire_fingerprint(&message);
         // Check the exact wire binding before consulting any terminal group
         // state. A different envelope gains no receipt merely by arriving
@@ -7898,32 +7915,56 @@ impl MlsCryptoContext for MLSContext {
         MLSContext::flush_storage(self)
     }
 
-    fn put_prepared_control(&self, record: &crate::orchestrator::control_journal::PreparedControlRecord) -> Result<(), MLSError> {
+    fn put_prepared_control(
+        &self,
+        record: &crate::orchestrator::control_journal::PreparedControlRecord,
+    ) -> Result<(), MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::control_journal::native::put(&inner.manifest_storage, record)
     }
 
-    fn get_prepared_control(&self, group: &str) -> Result<Option<crate::orchestrator::control_journal::PreparedControlRecord>, MLSError> {
+    fn get_prepared_control(
+        &self,
+        group: &str,
+    ) -> Result<Option<crate::orchestrator::control_journal::PreparedControlRecord>, MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::control_journal::native::get(&inner.manifest_storage, group)
     }
 
-    fn list_prepared_controls(&self) -> Result<Vec<crate::orchestrator::control_journal::PreparedControlRecord>, MLSError> {
+    fn list_prepared_controls(
+        &self,
+    ) -> Result<Vec<crate::orchestrator::control_journal::PreparedControlRecord>, MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::control_journal::native::list(&inner.manifest_storage)
     }
 
     fn remove_prepared_control(&self, group: &str, transition: &str) -> Result<(), MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
-        crate::orchestrator::control_journal::native::remove_rejected(&inner.manifest_storage, group, transition)
+        crate::orchestrator::control_journal::native::remove_rejected(
+            &inner.manifest_storage,
+            group,
+            transition,
+        )
     }
 
     fn storage_lifecycle_status(&self) -> StorageLifecycleStatus {
@@ -8205,71 +8246,136 @@ impl MlsCryptoContext for MLSContext {
         self.process_welcome(welcome_data, identity, config)
     }
 
-    fn process_welcome_delivery(&self, delivery: &crate::orchestrator::welcome_ack::WelcomeDelivery,
-        identity: Vec<u8>, config: Option<GroupConfig>) -> Result<WelcomeResult, MLSError> {
+    fn process_welcome_delivery(
+        &self,
+        delivery: &crate::orchestrator::welcome_ack::WelcomeDelivery,
+        identity: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<WelcomeResult, MLSError> {
         self.check_suspended()?;
-        let mut guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::welcome_ack::native::adopt(inner, delivery, &identity, config)
     }
 
-    fn get_conversation_policy(&self, user_did: &str, conversation_id: &str)
-        -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
+    fn get_conversation_policy(
+        &self,
+        user_did: &str,
+        conversation_id: &str,
+    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationState>, MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
-        crate::orchestrator::admission::native::get(&inner.manifest_storage, user_did, conversation_id)
+        crate::orchestrator::admission::native::get(
+            &inner.manifest_storage,
+            user_did,
+            conversation_id,
+        )
     }
 
-    fn get_conversation_departure(&self, user_did: &str, conversation_id: &str)
-        -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError> {
+    fn get_conversation_departure(
+        &self,
+        user_did: &str,
+        conversation_id: &str,
+    ) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>, MLSError>
+    {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
-        crate::orchestrator::admission::native::get_departure(&inner.manifest_storage, user_did, conversation_id)
+        crate::orchestrator::admission::native::get_departure(
+            &inner.manifest_storage,
+            user_did,
+            conversation_id,
+        )
     }
 
-
-    fn put_conversation_departure(&self, user_did: &str,
-        coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates) -> Result<bool, MLSError> {
+    fn put_conversation_departure(
+        &self,
+        user_did: &str,
+        coordinate: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+    ) -> Result<bool, MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
-        crate::orchestrator::admission::native::put_departure(&inner.manifest_storage, user_did, coordinate)
+        crate::orchestrator::admission::native::put_departure(
+            &inner.manifest_storage,
+            user_did,
+            coordinate,
+        )
     }
 
-    fn put_conversation_policy(&self, user_did: &str,
-        state: &catbird_atproto::blue_catbird::chat::ConversationState) -> Result<bool, MLSError> {
+    fn put_conversation_policy(
+        &self,
+        user_did: &str,
+        state: &catbird_atproto::blue_catbird::chat::ConversationState,
+    ) -> Result<bool, MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::admission::native::put(&inner.manifest_storage, user_did, state)
     }
 
-    fn list_account_exits(&self) -> Result<Vec<crate::orchestrator::account_exit::AccountExitRecord>, MLSError> {
+    fn list_account_exits(
+        &self,
+    ) -> Result<Vec<crate::orchestrator::account_exit::AccountExitRecord>, MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::account_exit::native::list(&inner.manifest_storage)
     }
 
-    fn put_account_exit(&self, record: &crate::orchestrator::account_exit::AccountExitRecord) -> Result<(), MLSError> {
+    fn put_account_exit(
+        &self,
+        record: &crate::orchestrator::account_exit::AccountExitRecord,
+    ) -> Result<(), MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::account_exit::native::put(&inner.manifest_storage, record)
     }
 
-    fn list_welcome_acceptances(&self) -> Result<Vec<crate::orchestrator::welcome_ack::WelcomeAcceptance>, MLSError> {
+    fn list_welcome_acceptances(
+        &self,
+    ) -> Result<Vec<crate::orchestrator::welcome_ack::WelcomeAcceptance>, MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::welcome_ack::native::list(&inner.manifest_storage)
     }
 
-    fn update_welcome_acceptance(&self, record: &crate::orchestrator::welcome_ack::WelcomeAcceptance) -> Result<(), MLSError> {
+    fn update_welcome_acceptance(
+        &self,
+        record: &crate::orchestrator::welcome_ack::WelcomeAcceptance,
+    ) -> Result<(), MLSError> {
         self.check_suspended()?;
-        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::welcome_ack::native::update(&inner.manifest_storage, record)
     }

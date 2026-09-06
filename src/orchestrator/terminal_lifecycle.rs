@@ -905,7 +905,8 @@ where
                         || !self.mls_context().group_is_active(group.clone())?)
                 {
                     let did = self.require_user_did().await?;
-                    self.retain_verified_departure_coordinate(conversation_id, &next).await?;
+                    self.retain_verified_departure_coordinate(conversation_id, &next)
+                        .await?;
                     let account_left = seq == terminal_seq
                         && entry["$type"] == "blue.catbird.chat.defs#leaveCommitFulfillmentEntry"
                         && body["$type"] == "blue.catbird.chat.defs#leaveCommitFulfillmentBody"
