@@ -250,6 +250,9 @@ static NEXT_BATCH_EXECUTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic
 tokio::task_local! {
     pub(crate) static BATCH_INVENTORY_CONTEXT: Arc<AuthorizedInventorySnapshot>;
 }
+tokio::task_local! {
+    pub(crate) static BATCH_RECOVERY_INBOX_CONTEXT: Arc<AuthorizedRecoveryInboxSnapshot>;
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn with_batch_inventory_scope<F, R>(
@@ -260,6 +263,16 @@ where
     F: Future<Output = R>,
 {
     BATCH_INVENTORY_CONTEXT.scope(snapshot, f).await
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn with_batch_recovery_inbox_scope<F, R>(
+    snapshot: Arc<AuthorizedRecoveryInboxSnapshot>,
+    f: F,
+) -> R
+where
+    F: Future<Output = R>,
+{
+    BATCH_RECOVERY_INBOX_CONTEXT.scope(snapshot, f).await
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -360,6 +373,36 @@ where
     /// On WASM targets, batch inventory execution contexts are not available.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn batch_inventory_snapshot(&self) -> Option<Arc<AuthorizedInventorySnapshot>> {
+        None
+    }
+
+    /// Return the currently scoped batch recovery inbox snapshot, if any.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn batch_recovery_inbox_snapshot(&self) -> Option<Arc<AuthorizedRecoveryInboxSnapshot>> {
+        BATCH_RECOVERY_INBOX_CONTEXT
+            .try_with(|snapshot| {
+                if snapshot.owner_instance_id != self.instance_id {
+                    return None;
+                }
+                let Ok(state) = self.lifecycle_state.try_lock() else {
+                    return None;
+                };
+                match &*state {
+                    OrchestratorLifecycleState::Ready { user_did } => {
+                        if user_did != &snapshot.user_did {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                Some(snapshot.clone())
+            })
+            .ok()
+            .flatten()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn batch_recovery_inbox_snapshot(&self) -> Option<Arc<AuthorizedRecoveryInboxSnapshot>> {
         None
     }
 
@@ -495,6 +538,112 @@ where
             expires_at,
             items: inventory_items,
             conversations,
+            user_did: did,
+            device_id: device,
+        })
+    }
+
+    /// Fetch an authorized recovery inbox snapshot across all pages for the current device.
+    pub(crate) async fn fetch_authorized_recovery_inbox_snapshot(
+        &self,
+    ) -> Result<AuthorizedRecoveryInboxSnapshot> {
+        let (session, fence, expires_at) = if let Some(inv) = self.batch_inventory_snapshot() {
+            (inv.session_id.clone(), inv.event_cursor.clone(), inv.expires_at.clone())
+        } else {
+            let inv = self.fetch_authorized_inventory_snapshot().await?;
+            (inv.session_id, inv.event_cursor, inv.expires_at)
+        };
+        self.fetch_authorized_recovery_inbox_snapshot_with_session(
+            &session,
+            &fence,
+            expires_at.as_deref(),
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_authorized_recovery_inbox_snapshot_with_session(
+        &self,
+        session_id: &str,
+        event_cursor: &str,
+        expires_at: Option<&str>,
+    ) -> Result<AuthorizedRecoveryInboxSnapshot> {
+        self.check_shutdown().await?;
+        let did = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let mut page_cursor: Option<String> = None;
+        let mut pagination =
+            super::pagination::PaginationGuard::for_conversations("authorized recovery inbox batch");
+        let mut inbox_items = Vec::new();
+
+        loop {
+            let mut path = format!(
+                "/xrpc/blue.catbird.chat.getLeafRecoveryInbox?actorDeviceId={}&inventorySessionId={}&limit=100",
+                super::canonical_transport::encode_query(&device),
+                super::canonical_transport::encode_query(session_id)
+            );
+            if let Some(cursor) = &page_cursor {
+                path.push_str("&pageCursor=");
+                path.push_str(&super::canonical_transport::encode_query(cursor));
+            }
+            let response = self
+                .api_client()
+                .submit_prepared_request(super::canonical_transport::PreparedRequest {
+                    operation: super::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox,
+                    path,
+                    method: "GET".into(),
+                    body: None,
+                })
+                .await?;
+            if response.status != 200 {
+                return Err(OrchestratorError::ServerError {
+                    status: response.status,
+                    body: String::from_utf8_lossy(&response.body).into_owned(),
+                });
+            }
+            let page: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+
+            if page["inventorySessionId"].as_str() != Some(session_id)
+                || page["snapshotEventCursor"].as_str() != Some(event_cursor)
+                || (expires_at.is_some()
+                    && page["snapshotExpiresAt"].as_str() != expires_at)
+            {
+                return Err(OrchestratorError::InvalidInput(
+                    "recovery inbox session mismatch during pagination".into(),
+                ));
+            }
+
+            let items = page["items"].as_array().ok_or_else(|| {
+                OrchestratorError::InvalidInput("recovery inbox missing items".into())
+            })?;
+
+            let next = match page.get("nextPageCursor") {
+                Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            };
+            pagination.observe_page(items.len(), next.as_deref())?;
+            inbox_items.extend(items.iter().cloned());
+
+            if page.get("hasMore").and_then(|v| v.as_bool()) == Some(true) && next.is_none() {
+                return Err(OrchestratorError::InvalidInput(
+                    "recovery inbox missing continuation".into(),
+                ));
+            }
+
+            page_cursor = next;
+            if page_cursor.is_none() {
+                break;
+            }
+        }
+
+        let execution_id = NEXT_BATCH_EXECUTION_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(AuthorizedRecoveryInboxSnapshot {
+            owner_instance_id: self.instance_id,
+            execution_id,
+            session_id: session_id.to_string(),
+            event_cursor: event_cursor.to_string(),
+            expires_at: expires_at.map(str::to_string),
+            items: inbox_items,
             user_did: did,
             device_id: device,
         })

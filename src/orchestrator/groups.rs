@@ -4323,6 +4323,29 @@ where
         let key_id = super::canonical_transport::derive_key_id(&public_key);
         let prior_coord = state.prior_json()?;
 
+        // Before minting a new recovery request, consult the recovery inbox
+        // the pass already holds and reuse any live, unexpired request.
+        if let Some(inbox) = self.batch_recovery_inbox_snapshot() {
+            if let Some(existing) = inbox.find_open_request(
+                &state.conversation_id,
+                &user_did,
+                &actor_device_id,
+                recovery_kind,
+                None,
+            ) {
+                let req_id = existing
+                    .get("recoveryRequestId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                crate::info_log!(
+                    "[rejoin] reused convo={} outcome=liveRequestReused request={}",
+                    &state.conversation_id[..state.conversation_id.len().min(8)],
+                    &req_id[..req_id.len().min(8)]
+                );
+                return Ok(serde_json::json!({ "recovery": existing }));
+            }
+        }
+
         let recovery_request_id = uuid::Uuid::new_v4().to_string();
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
@@ -4364,6 +4387,11 @@ where
 
         let output: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+        crate::info_log!(
+            "[rejoin] requested convo={} outcome=leafRecoveryRequested request={}",
+            &state.conversation_id[..state.conversation_id.len().min(8)],
+            &recovery_request_id[..recovery_request_id.len().min(8)]
+        );
         Ok(output)
     }
     pub async fn fulfill_leaf_recovery(&self, conversation_id: &str) -> Result<serde_json::Value> {

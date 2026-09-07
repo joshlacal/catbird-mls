@@ -151,6 +151,57 @@ impl AuthorizedInventorySnapshot {
     }
 }
 
+/// Native-fetched authorized recovery inbox snapshot scoped to a single batch execution.
+#[derive(Clone, Debug)]
+pub struct AuthorizedRecoveryInboxSnapshot {
+    pub owner_instance_id: u64,
+    pub execution_id: u64,
+    pub session_id: String,
+    pub event_cursor: String,
+    pub expires_at: Option<String>,
+    pub items: Vec<serde_json::Value>,
+    pub user_did: String,
+    pub device_id: String,
+}
+
+impl AuthorizedRecoveryInboxSnapshot {
+    pub fn find_open_request(
+        &self,
+        convo_id: &str,
+        user_did: &str,
+        device_id: &str,
+        recovery_kind: &str,
+        coordinate: Option<&serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        for item in &self.items {
+            let request = item.get("recovery").unwrap_or(item);
+            if request["conversationId"].as_str() == Some(convo_id)
+                && request["requesterDid"].as_str() == Some(user_did)
+                && request["requesterDeviceId"].as_str() == Some(device_id)
+                && request["recoveryKind"].as_str() == Some(recovery_kind)
+                && request["status"] == "open"
+                && request["recoveryRequestId"]
+                    .as_str()
+                    .is_some_and(|id| crate::chat_v2::ids::uuid::CanonicalUuid::parse(id).is_ok())
+                && request["expiresAt"]
+                    .as_str()
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .is_some_and(|expires| expires > chrono::Utc::now())
+            {
+                if let Some(coord) = coordinate {
+                    if let Ok(req_coord) = super::lifecycle::lifecycle_coordinates(&request["boundCoordinate"], convo_id) {
+                        if &req_coord != coord {
+                            continue;
+                        }
+                    }
+                }
+                return Some(request.clone());
+            }
+        }
+        None
+    }
+}
+
 /// A member within a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -308,6 +359,8 @@ pub struct DeferredRecoveryReport {
     pub recovered: u32,
     pub skipped: u32,
     pub failed: u32,
+    #[serde(default)]
+    pub waiting: u32,
 }
 
 /// Projection of orchestrator/local-group health into the client recovery vocabulary.

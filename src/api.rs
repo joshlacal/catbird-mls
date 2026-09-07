@@ -4191,8 +4191,7 @@ impl MLSContext {
     }
 
     pub fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
-        crate::debug_log!("[MLS-FFI] get_epoch: Starting");
-        crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
+        tracing::trace!("[MLS-FFI] get_epoch: Starting, Group ID: {}", hex::encode(&group_id));
 
         let _storage_operation = self.begin_storage_operation("get_epoch");
         let guard = self.inner.lock().map_err(|e| {
@@ -4205,7 +4204,7 @@ impl MLSContext {
 
         inner.with_group_ref(&gid, |group, _provider| {
             let epoch = group.epoch().as_u64();
-            crate::debug_log!("[MLS-FFI] Current epoch: {}", epoch);
+            tracing::trace!("[MLS-FFI] Current epoch: {}", epoch);
             Ok(epoch)
         })
     }

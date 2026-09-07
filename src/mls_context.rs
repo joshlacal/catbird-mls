@@ -3847,8 +3847,8 @@ impl MLSContext {
         let thread_id = std::thread::current().id();
         let entry_time = std::time::SystemTime::now();
 
-        crate::debug_log!(
-            "[WITH-GROUP] 🧵 Thread {:?} entering with_group for {}",
+        tracing::trace!(
+            "[WITH-GROUP] Thread {:?} entering with_group for {}",
             thread_id,
             hex::encode(group_id.as_slice())
         );
@@ -3879,17 +3879,16 @@ impl MLSContext {
         let epoch_at_entry = state.group.epoch().as_u64();
         let members_at_entry = state.group.members().count();
 
-        crate::info_log!("[WITH-GROUP] 📊 ENTRY STATE:");
-        crate::info_log!("[WITH-GROUP]   Group: {}", hex::encode(group_id.as_slice()));
-        crate::info_log!("[WITH-GROUP]   Epoch: {}", epoch_at_entry);
-        crate::info_log!("[WITH-GROUP]   Members: {}", members_at_entry);
-        crate::info_log!("[WITH-GROUP]   Thread: {:?}", thread_id);
-        crate::info_log!("[WITH-GROUP]   Timestamp: {:?}", entry_time);
+        tracing::trace!(
+            "[WITH-GROUP] ENTRY STATE: Group: {} Epoch: {} Members: {}",
+            hex::encode(group_id.as_slice()),
+            epoch_at_entry,
+            members_at_entry
+        );
 
         // Load signer from storage
-        crate::debug_log!("[WITH-GROUP] Loading signer from storage...");
-        crate::debug_log!(
-            "[WITH-GROUP]   Signer public key (hex): {}",
+        tracing::trace!(
+            "[WITH-GROUP] Loading signer public key (hex): {}",
             hex::encode(&state.signer_public_key)
         );
         let signer = SignatureKeyPair::read(
@@ -3915,7 +3914,7 @@ impl MLSContext {
                 epoch_at_entry
             ))
         })?;
-        crate::debug_log!("[WITH-GROUP] Signer loaded successfully");
+        tracing::trace!("[WITH-GROUP] Signer loaded successfully");
 
         // Execute the closure
         let closure_start = std::time::SystemTime::now();
@@ -3927,12 +3926,13 @@ impl MLSContext {
         let members_at_exit = state.group.members().count();
         let total_duration = entry_time.elapsed().unwrap_or_default();
 
-        crate::info_log!("[WITH-GROUP] 📊 EXIT STATE:");
-        crate::info_log!("[WITH-GROUP]   Epoch: {}", epoch_at_exit);
-        crate::info_log!("[WITH-GROUP]   Members: {}", members_at_exit);
-        crate::info_log!("[WITH-GROUP]   Closure duration: {:?}", closure_duration);
-        crate::info_log!("[WITH-GROUP]   Total duration: {:?}", total_duration);
-
+        tracing::trace!(
+            "[WITH-GROUP] EXIT STATE: Epoch: {} Members: {} Closure duration: {:?} Total duration: {:?}",
+            epoch_at_exit,
+            members_at_exit,
+            closure_duration,
+            total_duration
+        );
         if epoch_at_exit != epoch_at_entry {
             crate::warn_log!(
                 "[WITH-GROUP] ⚠️ EPOCH CHANGED: {} -> {}",
