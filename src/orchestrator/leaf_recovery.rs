@@ -73,6 +73,17 @@ where
             return Err(invalid("leaf recovery requires active account membership"));
         }
         let coordinate = lifecycle_coordinates(&state.coordinates, &state.conversation_id)?;
+        if let Some(inbox) = self.batch_recovery_inbox_snapshot() {
+            if inbox.user_did == did && inbox.device_id == device {
+                return Ok(inbox.find_open_request(
+                    &state.conversation_id,
+                    &did,
+                    &device,
+                    kind,
+                    Some(&coordinate),
+                ));
+            }
+        }
         for attempt in 0..2 {
             match self
                 .own_open_leaf_recovery_attempt(

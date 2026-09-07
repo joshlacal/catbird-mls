@@ -69,8 +69,9 @@ pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
 pub use mls_provider::{MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof};
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use orchestrator::with_batch_inventory_scope;
+pub(crate) use orchestrator::{with_batch_inventory_scope, with_batch_recovery_inbox_scope};
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
+pub use recovery::DeferredRecoveryOutcome;
 pub use storage::MLSStorageBackend;
 pub use types::*;
 pub use welcome_recovery::*;

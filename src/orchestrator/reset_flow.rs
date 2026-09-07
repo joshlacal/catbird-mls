@@ -428,7 +428,19 @@ where
         let result = self.request_leaf_recovery(state, kind).await;
         let mut tracker = self.recovery_tracker().lock().await;
         match &result {
-            Ok(_) => tracker.note_leaf_recovery_requested(convo_id),
+            Ok(output) => {
+                let ttl = output
+                    .pointer("/recovery/expiresAt")
+                    .or_else(|| output.get("expiresAt"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .and_then(|expires| {
+                        let remaining = expires.signed_duration_since(chrono::Utc::now());
+                        remaining.to_std().ok()
+                    })
+                    .unwrap_or(LEAF_RECOVERY_TTL);
+                tracker.note_leaf_recovery_requested_with_ttl(convo_id, ttl);
+            }
             Err(_) => {}
         }
         result

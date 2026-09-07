@@ -442,10 +442,10 @@ where
         let projected = self
             .project_conversation_recovery_state_result(convo_id)
             .await?;
-        crate::warn_log!(
-            "[REJOIN-DIAG] convo={} ensure_conversation_ready ENTRY projected={:?}",
+        tracing::debug!(
             convo_id,
-            projected
+            ?projected,
+            "ensure_conversation_ready: checking readiness"
         );
 
         if matches!(
@@ -454,20 +454,20 @@ where
         ) || (projected == ConversationRecoveryState::ResetPending
             && !had_in_memory_reset_authority)
         {
-            crate::warn_log!(
-                "[REJOIN-DIAG] convo={} ensure_conversation_ready EARLY-RETURN {:?} (Recovering/UnrecoverableLocal) — NOT calling join_or_rejoin",
+            tracing::debug!(
                 convo_id,
-                projected
+                ?projected,
+                "ensure_conversation_ready: early-return without join_or_rejoin"
             );
             return Ok(Self::ready_result(projected, None));
         }
 
         let local_epoch = match self.local_group_epoch_result(convo_id).await {
             Ok(epoch) => {
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} ensure_conversation_ready local_group_epoch_result Ok(epoch={:?})",
+                tracing::debug!(
                     convo_id,
-                    epoch
+                    ?epoch,
+                    "ensure_conversation_ready: local_group_epoch_result Ok"
                 );
                 epoch
             }
@@ -479,11 +479,11 @@ where
                         | ConversationRecoveryState::EpochBehind
                 ) =>
             {
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} ensure_conversation_ready BAILING to {:?} WITHOUT join_or_rejoin — local_group_epoch_result Err: {:?}",
+                tracing::debug!(
                     convo_id,
-                    projected,
-                    err
+                    ?projected,
+                    ?err,
+                    "ensure_conversation_ready: bailing without join_or_rejoin"
                 );
                 return Ok(Self::ready_result(projected, None));
             }
@@ -514,10 +514,10 @@ where
                 .local_group_epoch_result(convo_id)
                 .await?
                 .or(local_epoch);
-            crate::warn_log!(
-                "[REJOIN-DIAG] convo={} stale NeedsRejoin on locally-healthy group — cleared, returning {:?} (NO force_rejoin)",
+            tracing::debug!(
                 convo_id,
-                projected
+                ?projected,
+                "ensure_conversation_ready: stale NeedsRejoin cleared on locally-healthy group"
             );
             return Ok(Self::ready_result(projected, epoch));
         }
@@ -527,10 +527,10 @@ where
                 // join_or_rejoin owns the transition gate through its final
                 // fail-closed Active projection. Never repeat that write after
                 // the gate is released: a newer reset may already own authority.
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} rejoin succeeded — cleared NeedsRejoin -> Active (epoch={})",
+                tracing::debug!(
                     convo_id,
-                    epoch
+                    epoch,
+                    "ensure_conversation_ready: rejoin succeeded"
                 );
                 let projected = self
                     .project_conversation_recovery_state_result(convo_id)

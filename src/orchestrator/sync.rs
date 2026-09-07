@@ -483,11 +483,66 @@ where
             }
         }
 
-        // Update local state from server
+        let any_needs_recovery = {
+            let mut needed = false;
+            for c in &all_convos {
+                if self.storage().needs_rejoin(&c.conversation_id).await.unwrap_or(false) {
+                    needed = true;
+                    break;
+                }
+                if let Ok(gid_bytes) = hex::decode(&c.group_id) {
+                    if self.mls_context().get_epoch(gid_bytes).is_err() {
+                        needed = true;
+                        break;
+                    }
+                }
+            }
+            needed
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if any_needs_recovery {
+            if self.batch_inventory_snapshot().is_none() {
+                if let Ok(inv) = self.fetch_authorized_inventory_snapshot().await {
+                    let inv = std::sync::Arc::new(inv);
+                    if let Ok(inbox) = self.fetch_authorized_recovery_inbox_snapshot_with_session(
+                        &inv.session_id,
+                        &inv.event_cursor,
+                        inv.expires_at.as_deref(),
+                    ).await {
+                        let inbox = std::sync::Arc::new(inbox);
+                        return super::with_batch_inventory_scope(
+                            inv,
+                            super::with_batch_recovery_inbox_scope(
+                                inbox,
+                                self.reconcile_server_conversations_batch(user_did, all_convos, blocked_controls),
+                            ),
+                        ).await;
+                    }
+                }
+            } else if self.batch_recovery_inbox_snapshot().is_none() {
+                if let Ok(inbox) = self.fetch_authorized_recovery_inbox_snapshot().await {
+                    let inbox = std::sync::Arc::new(inbox);
+                    return super::with_batch_recovery_inbox_scope(
+                        inbox,
+                        self.reconcile_server_conversations_batch(user_did, all_convos, blocked_controls),
+                    ).await;
+                }
+            }
+        }
+
+        self.reconcile_server_conversations_batch(user_did, all_convos, blocked_controls).await
+    }
+
+    async fn reconcile_server_conversations_batch(
+        &self,
+        user_did: &str,
+        all_convos: Vec<ConversationView>,
+        blocked_controls: HashSet<String>,
+    ) -> Result<()> {
         let mut sync_rejoin_attempted = HashSet::new();
         for convo in &all_convos {
             if !*self.sync_in_progress().lock().await {
-                // Check if shutdown happened during processing
                 break;
             }
 
@@ -503,15 +558,8 @@ where
                 continue;
             }
             let group_id = convo.group_id.as_str();
-            // A successful reset recovery may resolve this stale list item to
-            // a different, authoritative group before the item finishes. All
-            // post-recovery projections in this iteration must use that
-            // effective view rather than normalizing the captured page again.
             let mut effective_convo = convo.clone();
 
-            // Every write and recovery probe below (sequencer mapping, group
-            // state, join/accept) resolves through this conversation row, so
-            // materialize it before any of them run.
             self.storage()
                 .ensure_conversation_exists(user_did, conversation_id, group_id)
                 .await?;
@@ -520,20 +568,11 @@ where
                 continue;
             }
 
-            // ADR-010 D4: record the conversation→sequencer mapping. Routing
-            // does NOT consult this yet (WS-4 rung 3); every sync refresh
-            // overwrites the mapping, which trivially satisfies the D4 rule-4
-            // invalidation requirement for rung 2.
             let sequencer_changed = previous_view
                 .as_ref()
                 .map(|prev| prev.sequencer_did != convo.sequencer_did)
                 .unwrap_or(convo.sequencer_did.is_some());
-            crate::info_log!(
-                "[sync] convo={} sequencer_did={:?}{}",
-                conversation_id,
-                convo.sequencer_did,
-                if sequencer_changed { " (CHANGED)" } else { "" }
-            );
+            tracing::trace!(conversation_id, ?convo.sequencer_did, sequencer_changed, "reconcile: conversation sequencer");
             if sequencer_changed {
                 if let Some(sequencer_did) = convo.sequencer_did.as_deref() {
                     if let Err(e) = self
@@ -541,8 +580,6 @@ where
                         .set_conversation_sequencer(conversation_id, sequencer_did)
                         .await
                     {
-                        // Log-and-continue: recovery-critical-write escalation
-                        // is WS-5 territory, but never silently drop the error.
                         crate::warn_log!(
                             "[sync] convo={} failed to persist sequencer mapping: {}",
                             conversation_id,
@@ -597,10 +634,10 @@ where
                 Ok(gid_bytes) => match self.mls_context().get_epoch(gid_bytes) {
                     Ok(_) => true,
                     Err(crate::MLSError::ContextClosed) => {
-                        crate::info_log!(
-                            "[sync] convo={} group={} SKIP: MLS context closed (transient iOS suspension) — not stale, not rejoining",
+                        tracing::debug!(
                             conversation_id,
-                            group_id
+                            group_id,
+                            "SKIP: MLS context closed (transient iOS suspension) — not stale, not rejoining"
                         );
                         continue;
                     }
@@ -618,12 +655,12 @@ where
                 .is_some()
             };
 
-            crate::info_log!(
-                "[sync] convo={} group={} has_state_record={} ffi_has_group={}",
+            tracing::trace!(
                 conversation_id,
                 group_id,
                 has_state_record,
-                ffi_has_group
+                ffi_has_group,
+                "reconcile: state record check"
             );
 
             if has_state_record && !ffi_has_group {
@@ -633,34 +670,34 @@ where
                     "Persisted GroupState exists but MLS context has no group — \
                      stale state, falling through to join_or_rejoin"
                 );
-                crate::info_log!(
-                    "[sync] convo={} group={} stale state detected, entering init path",
+                tracing::debug!(
                     conversation_id,
-                    group_id
+                    group_id,
+                    "stale state detected, entering init path"
                 );
             }
 
             // Initialize group state if missing OR if the persisted record is stale.
             if !has_state_record || !ffi_has_group {
-                crate::info_log!(
-                    "[sync] convo={} group={} entering init block",
+                tracing::trace!(
                     conversation_id,
-                    group_id
+                    group_id,
+                    "entering init block"
                 );
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
                 let epoch = if let Ok(gid_bytes) = hex::decode(group_id) {
-                    crate::info_log!(
-                        "[sync] convo={} group={} pre-get_epoch call",
+                    tracing::trace!(
                         conversation_id,
-                        group_id
+                        group_id,
+                        "pre-get_epoch call"
                     );
                     match self.mls_context().get_epoch(gid_bytes) {
                         Ok(e) => {
-                            crate::info_log!(
-                                "[sync] convo={} group={} FFI get_epoch Ok: {} (surprising — skipping join_or_rejoin)",
+                            tracing::trace!(
                                 conversation_id,
                                 group_id,
-                                e
+                                epoch = e,
+                                "FFI get_epoch Ok (skipping join_or_rejoin)"
                             );
                             e
                         }
@@ -668,24 +705,24 @@ where
                         // (race with a concurrent suspension). Transient — keep the
                         // server epoch and DON'T engage the rejoin gate.
                         Err(crate::MLSError::ContextClosed) => {
-                            crate::info_log!(
-                                "[sync] convo={} group={} SKIP: MLS context closed mid-init (transient) — keeping epoch, not rejoining",
+                            tracing::debug!(
                                 conversation_id,
-                                group_id
+                                group_id,
+                                "SKIP: MLS context closed mid-init (transient)"
                             );
                             convo.epoch
                         }
                         Err(e) => {
-                            crate::info_log!(
-                                "[sync] convo={} group={} FFI get_epoch Err: {}",
+                            tracing::trace!(
                                 conversation_id,
                                 group_id,
-                                e
+                                error = %e,
+                                "FFI get_epoch Err"
                             );
                             if !sync_rejoin_attempted.insert(conversation_id.to_string()) {
-                                crate::info_log!(
-                                    "[sync] convo={} SKIP: duplicate in cycle",
-                                    conversation_id
+                                tracing::debug!(
+                                    conversation_id,
+                                    "SKIP: duplicate in cycle"
                                 );
                                 tracing::debug!(
                                     conversation_id = %conversation_id,
@@ -694,10 +731,6 @@ where
                                 );
                                 convo.epoch
                             } else if !self.should_attempt_sync_rejoin(conversation_id).await {
-                                crate::info_log!(
-                                    "[sync] convo={} SKIP: eligibility gate rejected",
-                                    conversation_id
-                                );
                                 tracing::debug!(
                                     conversation_id = %conversation_id,
                                     group_id = %group_id,
@@ -705,10 +738,10 @@ where
                                 );
                                 convo.epoch
                             } else {
-                                crate::info_log!(
-                                    "[sync] convo={} group={} CALLING join_or_rejoin",
+                                tracing::debug!(
                                     conversation_id,
-                                    group_id
+                                    group_id,
+                                    "CALLING join_or_rejoin"
                                 );
                                 // Group not in FFI — try Welcome first, fall back to External Commit
                                 tracing::info!(
@@ -741,21 +774,26 @@ where
                                         epoch
                                     }
                                     Err(e) => {
-                                        tracing::warn!(
-                                            conversation_id = %conversation_id,
-                                            group_id = %group_id,
-                                            error = %e,
-                                            "Failed to join group via join_or_rejoin; falling back to requesting leaf recovery"
-                                        );
-                                        if let Err(rec_err) =
-                                            self.accept_conversation(conversation_id).await
-                                        {
+                                        let msg = e.to_string();
+                                        if msg.contains("leaf recovery pending") {
+                                            tracing::debug!(
+                                                conversation_id = %conversation_id,
+                                                group_id = %group_id,
+                                                "Leaf recovery pending for conversation; awaiting peer fulfillment"
+                                            );
+                                        } else {
                                             tracing::warn!(
                                                 conversation_id = %conversation_id,
                                                 group_id = %group_id,
-                                                error = %rec_err,
-                                                "Failed to request leaf recovery/accept after join_or_rejoin failure"
+                                                error = %e,
+                                                "Failed to join group via join_or_rejoin"
                                             );
+                                            let _ = self.record_rejoin_failure(conversation_id).await;
+                                            if let Ok(Some(convo_state)) = self.storage().get_conversation_state(conversation_id).await {
+                                                if convo_state == ConversationState::Initializing {
+                                                    let _ = self.accept_conversation(conversation_id).await;
+                                                }
+                                            }
                                         }
                                         convo.epoch
                                     }
@@ -1005,6 +1043,15 @@ where
                     {
                         Ok(super::recovery::DeferredRecoveryOutcome::ClearedStale) => continue,
                         Ok(super::recovery::DeferredRecoveryOutcome::Skipped) => {}
+                        Ok(super::recovery::DeferredRecoveryOutcome::Waiting { retry_after }) => {
+                            sync_rejoin_attempted.insert(conversation_id.to_string());
+                            tracing::info!(
+                                conversation_id = %conversation_id,
+                                group_id = %group_id,
+                                retry_after_secs = retry_after.as_secs(),
+                                "Sync rejoin waiting for recovery / peer fulfillment"
+                            );
+                        }
                         Ok(super::recovery::DeferredRecoveryOutcome::Recovered(epoch)) => {
                             sync_rejoin_attempted.insert(conversation_id.to_string());
                             tracing::info!(
