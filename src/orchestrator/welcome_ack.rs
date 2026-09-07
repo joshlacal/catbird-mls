@@ -213,7 +213,10 @@ where
         let did = self.require_user_did().await?;
         let device = self.require_actor_device_id().await?;
         let (session, fence) = if let Some(snapshot) = self.batch_inventory_snapshot() {
-            if snapshot.user_did == did && snapshot.device_id == device {
+            if snapshot.user_did == did
+                && snapshot.device_id == device
+                && snapshot.contains_conversation(cid)
+            {
                 (snapshot.session_id.clone(), snapshot.event_cursor.clone())
             } else {
                 let inventory = self

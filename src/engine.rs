@@ -358,6 +358,12 @@ where
         {
             return crate::async_runtime::block_on(self.process_inventory_hint_batch(value));
         }
+        if let Some(events_arr) = value.as_array() {
+            let batch = serde_json::json!({
+                "events": events_arr,
+            });
+            return crate::async_runtime::block_on(self.process_inventory_hint_batch(batch));
+        }
         if value.get("$type").is_some() || value.get("payload").is_some() {
             let hint = server_events::CanonicalHint::parse(value)?;
             return crate::async_runtime::block_on(self.process_canonical_hint(hint));

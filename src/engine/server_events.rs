@@ -205,11 +205,34 @@ where
         &self,
         hint: CanonicalHint,
     ) -> Result<Vec<EngineEvent>> {
-        let Some(conversation_id) = hint.conversation_id.as_deref() else {
+        if hint.conversation_id.is_none() {
             // Transport owns cursor continuity. Disposition has no CID, so it
             // cannot authorize conversation lookup, joining, or a global sweep.
             return Ok(Vec::new());
-        };
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.orchestrator.batch_inventory_snapshot().is_none() {
+            let snapshot = std::sync::Arc::new(
+                self.orchestrator
+                    .fetch_authorized_inventory_snapshot()
+                    .await?,
+            );
+            return crate::orchestrator::with_batch_inventory_scope(
+                snapshot,
+                self.process_canonical_hint_inner(hint),
+            )
+            .await;
+        }
+
+        self.process_canonical_hint_inner(hint).await
+    }
+
+    async fn process_canonical_hint_inner(
+        &self,
+        hint: CanonicalHint,
+    ) -> Result<Vec<EngineEvent>> {
+        let conversation_id = hint.conversation_id.as_deref().unwrap();
         let orch = &self.orchestrator;
         let user_did = orch.require_user_did().await?;
         let device = orch.require_actor_device_id().await?;
@@ -498,6 +521,7 @@ mod tests {
         mock_storage::MockStorage, TestWorld,
     };
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     const ID: &str = "00000000-0000-4000-8000-000000000001";
     const DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
@@ -2076,6 +2100,407 @@ mod tests {
             assert_eq!(
                 world.delivery_service().submitted_prepared_requests().len(),
                 start
+            );
+        });
+    }
+
+    #[test]
+    fn reconciliation_pass_over_multiple_hints_allocates_single_inventory_snapshot() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("recon pass 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("recon pass 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g3 = alice
+                .orchestrator
+                .create_group("recon pass 3", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+            let start = world.delivery_service().submitted_prepared_requests().len();
+
+            // Send batch as bare JSON array [hint1, hint2, hint3]
+            let batch = json!([
+                event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                event("conversationChangedEvent", json!({"conversationId": g2.conversation_id})),
+                event("conversationChangedEvent", json!({"conversationId": g3.conversation_id})),
+            ]);
+
+            let events = bob_engine.process_server_event(&batch.to_string()).unwrap();
+            assert!(!events.is_empty(), "batch should emit engine events");
+
+            let allocations = world.delivery_service().inventory_allocations_since(start);
+            assert_eq!(
+                allocations, 1,
+                "reconciliation pass over 3 hints must allocate exactly ONE inventory snapshot (was {allocations})"
+            );
+        });
+    }
+
+    #[test]
+    fn single_hint_allocates_single_snapshot_for_all_its_phases() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g = alice
+                .orchestrator
+                .create_group("single hint group", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+            let start = world.delivery_service().submitted_prepared_requests().len();
+
+            let single = event(
+                "conversationChangedEvent",
+                json!({"conversationId": g.conversation_id}),
+            );
+            let events = bob_engine.process_server_event(&single.to_string()).unwrap();
+            assert!(!events.is_empty());
+
+            let allocations = world.delivery_service().inventory_allocations_since(start);
+            assert_eq!(
+                allocations, 1,
+                "single hint with terminal recon + lookup + welcome delivery must allocate exactly ONE snapshot (was {allocations})"
+            );
+        });
+    }
+
+    #[test]
+    fn failure_mid_pass_discards_shared_state_and_subsequent_allocates_fresh() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("fail discard 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("fail discard 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+
+            // 1. Pass with an invalid hint that fails mid-pass
+            let bad_batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                    // Malformed hint: unexpected field causes parse error
+                    json!({
+                        "$type": "blue.catbird.chat.defs#conversationChangedEvent",
+                        "conversationId": g2.conversation_id,
+                        "untrustedExtraField": "malicious"
+                    }),
+                ]
+            });
+            let err = bob_engine.process_server_event(&bad_batch.to_string()).unwrap_err();
+            assert!(matches!(err, OrchestratorError::InvalidInput(_)));
+
+            // Shared state MUST be discarded after failure
+            assert!(bob_engine.orchestrator.batch_inventory_snapshot().is_none());
+
+            // 2. Subsequent valid pass MUST allocate its own fresh snapshot
+            let start2 = world.delivery_service().submitted_prepared_requests().len();
+            let good_batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                ]
+            });
+            bob_engine.process_server_event(&good_batch.to_string()).unwrap();
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start2),
+                1,
+                "subsequent pass allocates its own fresh snapshot"
+            );
+            assert!(bob_engine.orchestrator.batch_inventory_snapshot().is_none());
+        });
+    }
+
+    #[test]
+    fn malformed_pagination_and_fence_data_fails_closed() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.register_device("Alice").await.unwrap();
+            let engine = engine_for(&world, "Alice").await;
+
+            // 1. Session ID changes during pagination
+            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&json!({
+                    "items": [],
+                    "inventorySessionId": "session-1",
+                    "snapshotEventCursor": "fence-1",
+                    "hasMore": true,
+                    "nextPageCursor": "cursor-2"
+                })).unwrap(),
+            }));
+            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&json!({
+                    "items": [],
+                    "inventorySessionId": "session-MUTATED",
+                    "snapshotEventCursor": "fence-1",
+                    "hasMore": false
+                })).unwrap(),
+            }));
+
+            let err = engine.orchestrator.fetch_authorized_inventory_snapshot().await.unwrap_err();
+            assert!(matches!(err, OrchestratorError::InvalidInput(_)), "mutated session ID must fail closed: {err:?}");
+
+            // 2. Fence changes during pagination
+            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&json!({
+                    "items": [],
+                    "inventorySessionId": "session-2",
+                    "snapshotEventCursor": "fence-original",
+                    "hasMore": true,
+                    "nextPageCursor": "cursor-2"
+                })).unwrap(),
+            }));
+            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&json!({
+                    "items": [],
+                    "inventorySessionId": "session-2",
+                    "snapshotEventCursor": "fence-CHANGED",
+                    "hasMore": false
+                })).unwrap(),
+            }));
+
+            let err2 = engine.orchestrator.fetch_authorized_inventory_snapshot().await.unwrap_err();
+            assert!(matches!(err2, OrchestratorError::InvalidInput(_)), "mutated fence must fail closed: {err2:?}");
+
+            // 3. hasMore == true but nextPageCursor is missing/empty
+            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&json!({
+                    "items": [],
+                    "inventorySessionId": "session-3",
+                    "snapshotEventCursor": "fence-3",
+                    "hasMore": true,
+                    "nextPageCursor": null
+                })).unwrap(),
+            }));
+
+            let err3 = engine.orchestrator.fetch_authorized_inventory_snapshot().await.unwrap_err();
+            assert!(matches!(err3, OrchestratorError::InvalidInput(_)), "inconsistent hasMore must fail closed: {err3:?}");
+
+            // 4. Missing items field
+            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&json!({
+                    "inventorySessionId": "session-4",
+                    "snapshotEventCursor": "fence-4",
+                    "hasMore": false
+                })).unwrap(),
+            }));
+
+            let err4 = engine.orchestrator.fetch_authorized_inventory_snapshot().await.unwrap_err();
+            assert!(matches!(err4, OrchestratorError::InvalidInput(_)), "missing items field must fail closed: {err4:?}");
+        });
+    }
+
+    #[test]
+    fn welcome_delivery_satisfies_from_snapshot_when_present_and_falls_back_when_absent() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("welcome snapshot group 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+
+            // Fetch snapshot that includes g1
+            let snapshot = std::sync::Arc::new(
+                bob_engine
+                    .orchestrator
+                    .fetch_authorized_inventory_snapshot()
+                    .await
+                    .unwrap(),
+            );
+            let bob_device = bob_engine.orchestrator.require_actor_device_id().await.unwrap();
+            let dummy_welcome = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+            let coords_g1 = json!({
+                "conversationId": g1.conversation_id,
+                "groupId": STANDARD.encode(hex::decode(&g1.group_id).unwrap()),
+                "epoch": 0, "generation": 0, "stateVersion": 0, "lifecycle": "active",
+                "groupContextHash": STANDARD.encode([0u8; 32]),
+                "confirmationTag": STANDARD.encode([0u8; 32])
+            });
+            world.delivery_service().set_welcome_delivery_for_test(json!({
+                "welcomeId": uuid::Uuid::new_v4().to_string(),
+                "conversationId": g1.conversation_id,
+                "transitionSeq": 1,
+                "coordinates": coords_g1,
+                "status": "pending",
+                "opaqueWelcome": STANDARD.encode(&dummy_welcome),
+                "sha256": STANDARD.encode(Sha256::digest(&dummy_welcome)),
+                "recipientDid": bob_did,
+                "recipientDeviceId": bob_device,
+                "provenance": {"recoveryRequestId": uuid::Uuid::new_v4().to_string(), "keyPackageRef": STANDARD.encode([0u8; 32])},
+                "expiresAt": "2099-01-01T00:00:00.000Z",
+            }));
+
+            // Alice creates g2 AFTER Bob's snapshot was taken, so g2 is absent from snapshot
+            let g2 = alice
+                .orchestrator
+                .create_group("welcome snapshot group 2 (post-snapshot)", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            assert!(!snapshot.contains_conversation(&g2.conversation_id));
+
+            let coords_g2 = json!({
+                "conversationId": g2.conversation_id,
+                "groupId": STANDARD.encode(hex::decode(&g2.group_id).unwrap()),
+                "epoch": 0, "generation": 0, "stateVersion": 0, "lifecycle": "active",
+                "groupContextHash": STANDARD.encode([0u8; 32]),
+                "confirmationTag": STANDARD.encode([0u8; 32])
+            });
+            world.delivery_service().set_welcome_delivery_for_test(json!({
+                "welcomeId": uuid::Uuid::new_v4().to_string(),
+                "conversationId": g2.conversation_id,
+                "transitionSeq": 1,
+                "coordinates": coords_g2,
+                "status": "pending",
+                "opaqueWelcome": STANDARD.encode(&dummy_welcome),
+                "sha256": STANDARD.encode(Sha256::digest(&dummy_welcome)),
+                "recipientDid": bob_did,
+                "recipientDeviceId": bob_device,
+                "provenance": {"recoveryRequestId": uuid::Uuid::new_v4().to_string(), "keyPackageRef": STANDARD.encode([0u8; 32])},
+                "expiresAt": "2099-01-01T00:00:00.000Z",
+            }));
+
+            crate::orchestrator::with_batch_inventory_scope(snapshot, async {
+                // g1 is in snapshot: fetch_welcome_delivery satisfies from snapshot (0 fresh GetConversations allocations!)
+                let start_g1 = world.delivery_service().submitted_prepared_requests().len();
+                let delivery_g1 = bob_engine
+                    .orchestrator
+                    .fetch_welcome_delivery(&g1.conversation_id)
+                    .await
+                    .unwrap();
+                assert_eq!(delivery_g1.conversation_id(), g1.conversation_id);
+                assert_eq!(
+                    world.delivery_service().inventory_allocations_since(start_g1),
+                    0,
+                    "present conversation must satisfy Welcome delivery from shared snapshot with 0 allocations"
+                );
+
+                // g2 is NOT in snapshot: fetch_welcome_delivery falls back to fresh authorized GetConversations?limit=1
+                let start_g2 = world.delivery_service().submitted_prepared_requests().len();
+                let delivery_g2 = bob_engine
+                    .orchestrator
+                    .fetch_welcome_delivery(&g2.conversation_id)
+                    .await
+                    .unwrap();
+                assert_eq!(delivery_g2.conversation_id(), g2.conversation_id);
+                assert_eq!(
+                    world.delivery_service().inventory_allocations_since(start_g2),
+                    1,
+                    "absent conversation must fall back to fresh authorized limit=1 allocation"
+                );
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    fn deferred_recovery_allocates_single_snapshot_for_multiple_conversations() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("recovery group 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("recovery group 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g3 = alice
+                .orchestrator
+                .create_group("recovery group 3", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+
+            // Ensure all 3 conversations are in Bob's storage with needs_rejoin = true
+            for gid in [&g1.conversation_id, &g2.conversation_id, &g3.conversation_id] {
+                bob_engine.orchestrator.storage().ensure_conversation_exists(bob_did, gid, "00").await.unwrap();
+                bob_engine.orchestrator.storage().mark_needs_rejoin(gid).await.unwrap();
+            }
+
+            let start = world.delivery_service().submitted_prepared_requests().len();
+            let report = bob_engine.orchestrator.run_deferred_recovery("test_multi_recon").await.unwrap();
+            assert!(report.attempted >= 3, "should attempt recovery on all 3 conversations");
+
+            let allocations = world.delivery_service().inventory_allocations_since(start);
+            assert_eq!(
+                allocations, 1,
+                "deferred recovery over multiple conversations must allocate exactly ONE inventory snapshot (was {allocations})"
             );
         });
     }

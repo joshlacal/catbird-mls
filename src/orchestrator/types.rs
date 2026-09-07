@@ -134,6 +134,23 @@ pub struct AuthorizedInventorySnapshot {
     pub device_id: String,
 }
 
+impl AuthorizedInventorySnapshot {
+    pub fn contains_conversation(&self, convo_id: &str) -> bool {
+        if self.conversations.contains_key(convo_id) {
+            return true;
+        }
+        self.items.iter().any(|item| {
+            let state = item.get("state").unwrap_or(item);
+            let cid = state
+                .get("coordinates")
+                .and_then(|c| c.get("conversationId"))
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("conversationId").and_then(|v| v.as_str()));
+            cid == Some(convo_id)
+        })
+    }
+}
+
 /// A member within a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
