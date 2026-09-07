@@ -1668,7 +1668,7 @@ where
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
         let conversations = self.storage().list_conversations(&user_did).await?;
-        let mut report = DeferredRecoveryReport {
+        let report = DeferredRecoveryReport {
             scanned: conversations.len() as u32,
             ..DeferredRecoveryReport::default()
         };
@@ -1678,7 +1678,44 @@ where
             scanned = report.scanned,
             "Starting Rust-owned deferred recovery sweep"
         );
+        let mut any_needs_recovery = false;
+        for convo in &conversations {
+            let convo_id = &convo.conversation_id;
+            let persisted_state = self.storage().get_conversation_state(convo_id).await.ok().flatten();
+            let needs_rejoin = self.storage().needs_rejoin(convo_id).await.unwrap_or(false);
+            let in_memory_state = if persisted_state.is_none() {
+                self.conversation_states().lock().await.get(convo_id).cloned()
+            } else {
+                None
+            };
+            if needs_rejoin
+                || persisted_state.as_ref().is_some_and(Self::state_requires_deferred_recovery)
+                || in_memory_state.as_ref().is_some_and(Self::state_requires_deferred_recovery)
+            {
+                any_needs_recovery = true;
+                break;
+            }
+        }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        if any_needs_recovery && self.batch_inventory_snapshot().is_none() {
+            let snapshot = std::sync::Arc::new(self.fetch_authorized_inventory_snapshot().await?);
+            return super::with_batch_inventory_scope(
+                snapshot,
+                self.run_deferred_recovery_inner(reason, conversations, report),
+            )
+            .await;
+        }
+
+        self.run_deferred_recovery_inner(reason, conversations, report).await
+    }
+
+    async fn run_deferred_recovery_inner(
+        &self,
+        reason: &str,
+        conversations: Vec<ConversationView>,
+        mut report: DeferredRecoveryReport,
+    ) -> Result<DeferredRecoveryReport> {
         for convo in conversations {
             let convo_id = convo.conversation_id;
             let persisted_state = match self.storage().get_conversation_state(&convo_id).await {
