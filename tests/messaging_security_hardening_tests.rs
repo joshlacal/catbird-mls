@@ -2515,3 +2515,228 @@ async fn canonical_invalid_id_is_rejected_before_decrypt_but_legacy_ids_remain_a
     assert!(fixture.orchestrator.process_incoming(&envelope).await.unwrap().is_some());
     assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_message_binds_authoritative_coordinates_from_point_read() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("coord-test-group", None, None)
+        .await
+        .expect("create_group");
+    let group_id = &convo.group_id;
+    let convo_id = &convo.conversation_id;
+
+    // Set authoritative lifecycle coordinates with non-zero values (gen 0, stateVersion 2)
+    // so defaulting to (0, 0) would fail this test.
+    let mut state = world
+        .delivery_service()
+        .lifecycle_state(convo_id)
+        .expect("lifecycle state");
+    state["coordinates"]["generation"] = serde_json::json!(0);
+    state["coordinates"]["stateVersion"] = serde_json::json!(2);
+    world
+        .delivery_service()
+        .set_lifecycle_state_for_test(convo_id, state);
+
+    let prior_send_count = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .count();
+
+    alice
+        .orchestrator
+        .send_message(group_id, "hello coordinates")
+        .await
+        .expect("send_message must succeed");
+
+    let sends: Vec<_> = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .collect();
+    assert_eq!(sends.len(), prior_send_count + 1, "exactly one SendMessage request must be emitted");
+
+    let last_send = sends.last().unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(last_send.body.as_deref().unwrap()).unwrap();
+    let inner_body = wire
+        .get("signedRequest")
+        .and_then(|s| s.get("body"))
+        .unwrap_or(&wire);
+
+    // Assert outgoing aad.prior.generation and aad.prior.stateVersion equal point read's values
+    assert_eq!(
+        inner_body["aad"]["prior"]["generation"],
+        serde_json::json!(0),
+        "aad.prior.generation must equal point read generation"
+    );
+    assert_eq!(
+        inner_body["aad"]["prior"]["stateVersion"],
+        serde_json::json!(2),
+        "aad.prior.stateVersion must equal point read stateVersion (2, not 0)"
+    );
+    assert_eq!(
+        inner_body["prior"]["generation"],
+        serde_json::json!(0),
+        "body.prior.generation must equal point read generation"
+    );
+    assert_eq!(
+        inner_body["prior"]["stateVersion"],
+        serde_json::json!(2),
+        "body.prior.stateVersion must equal point read stateVersion (2, not 0)"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_message_fails_closed_without_sending_when_point_read_fails_or_lacks_coordinates() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("coord-fail-group", None, None)
+        .await
+        .expect("create_group");
+    let group_id = &convo.group_id;
+    let convo_id = &convo.conversation_id;
+
+    let send_count_before = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .count();
+
+    // 1. Point read fails (non-200 / error)
+    world.delivery_service().fail_next_get_conversation_state();
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "fail on 500")
+        .await
+        .expect_err("send must fail when point read fails");
+    assert!(
+        err.to_string().contains("injected getConversationState failure")
+            || matches!(err, catbird_mls::orchestrator::OrchestratorError::ServerError { .. })
+            || matches!(err, catbird_mls::orchestrator::OrchestratorError::Api(_)),
+        "unexpected error: {err}"
+    );
+    let send_count_after_500 = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .count();
+    assert_eq!(send_count_after_500, send_count_before, "zero send attempts when point read fails");
+
+    // 2. Point read returns non-200 status (e.g. 404 ConversationNotFound)
+    world.delivery_service().set_next_get_conversation_state_custom_response(
+        404,
+        serde_json::json!({ "error": "ConversationNotFound" }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "fail on 404")
+        .await
+        .expect_err("send must fail when point read returns 404");
+    assert!(
+        matches!(err, catbird_mls::orchestrator::OrchestratorError::ServerError { status: 404, .. }),
+        "unexpected error: {err}"
+    );
+    let send_count_after_404 = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .count();
+    assert_eq!(send_count_after_404, send_count_before, "zero send attempts when point read returns 404");
+
+    // 3. Point read returns body without state.coordinates
+    world.delivery_service().set_next_get_conversation_state_custom_response(
+        200,
+        serde_json::json!({
+            "state": {
+                "conversationKind": "group"
+                // missing coordinates!
+            }
+        }),
+    );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "fail on missing coords")
+        .await
+        .expect_err("send must fail when point read lacks state.coordinates");
+    assert!(
+        err.to_string().contains("carries no coordinates"),
+        "error must mention missing coordinates: {err}"
+    );
+    let send_count_after_missing_coords = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .count();
+    assert_eq!(
+        send_count_after_missing_coords, send_count_before,
+        "zero send attempts when state.coordinates is missing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_message_fails_closed_without_sending_when_coordinates_identify_different_conversation() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("coord-diff-group", None, None)
+        .await
+        .expect("create_group");
+    let group_id = &convo.group_id;
+    let convo_id = &convo.conversation_id;
+
+    let send_count_before = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .count();
+
+    let mut state = world
+        .delivery_service()
+        .lifecycle_state(convo_id)
+        .expect("lifecycle state");
+    // Point read returns coordinates for a different conversationId
+    state["coordinates"]["conversationId"] = serde_json::json!("different-conversation-uuid");
+    world
+        .delivery_service()
+        .set_lifecycle_state_for_test(convo_id, state);
+
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "should fail on convo id mismatch")
+        .await
+        .expect_err("send must fail when coordinates identify different conversation");
+    assert!(
+        err.to_string().contains("coordinates identify a different conversation"),
+        "error must mention conversation mismatch: {err}"
+    );
+
+    let send_count_after = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .count();
+    assert_eq!(
+        send_count_after, send_count_before,
+        "zero send attempts when conversationId is mismatched"
+    );
+}

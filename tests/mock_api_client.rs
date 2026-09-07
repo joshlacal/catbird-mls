@@ -149,6 +149,7 @@ struct FailureFlags {
     fail_next_commit_group_change: bool,
     /// When > 0, fail the next N get_conversations calls.
     fail_get_conversations_count: u32,
+    fail_next_get_conversation_state: bool,
     /// When true, next add_members returns success=false (server rejection).
     reject_next_add_members: bool,
     /// When true, next add_members reports success with a stale zero epoch
@@ -185,6 +186,8 @@ struct MockState {
     >,
     /// Custom raw GatewayResponse for the next sendMessage call.
     next_send_custom_response:
+        Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    next_get_conversation_state_custom_response:
         Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
     device_directory_responses:
         Vec<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
@@ -558,12 +561,29 @@ impl MockDeliveryService {
             },
         );
     }
+    pub fn set_next_get_conversation_state_custom_response(&self, status: u16, body: serde_json::Value) {
+        self.state.lock().unwrap().next_get_conversation_state_custom_response = Some(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&body).unwrap(),
+            },
+        );
+    }
     pub fn set_lifecycle_state_for_test(&self, conversation_id: &str, state: serde_json::Value) {
         self.state
             .lock()
             .unwrap()
             .lifecycle_state_overrides
             .insert(conversation_id.into(), state);
+    }
+    pub fn lifecycle_state(&self, conversation_id: &str) -> Option<serde_json::Value> {
+        let guard = self.state.lock().unwrap();
+        guard
+            .lifecycle_state_overrides
+            .get(conversation_id)
+            .cloned()
+            .or_else(|| guard.conversations.get(conversation_id).map(conversation_state_json))
     }
     pub fn set_next_leave_custom_response(&self, status: u16, body: serde_json::Value) {
         self.state.lock().unwrap().next_leave_custom_response = Some(
@@ -741,6 +761,9 @@ impl MockDeliveryService {
 
     pub fn fail_next_get_messages(&self) {
         self.state.lock().unwrap().failures.fail_next_get_messages = true;
+    }
+    pub fn fail_next_get_conversation_state(&self) {
+        self.state.lock().unwrap().failures.fail_next_get_conversation_state = true;
     }
 
     pub fn fail_next_get_entries(&self) {
@@ -3395,6 +3418,10 @@ impl MLSAPIClient for MockDeliveryService {
                     gate.reached.notify_one();
                     gate.release.notified().await;
                 }
+                if let Some(resp) = self.state.lock().unwrap().next_get_conversation_state_custom_response.take() {
+                    return Ok(resp);
+                }
+                check_fail(&mut self.state.lock().unwrap().failures.fail_next_get_conversation_state, "injected getConversationState failure")?;
                 let query = request.path.split_once('?').map_or("", |(_, query)| query);
                 let conversation_id = query
                     .split('&')
