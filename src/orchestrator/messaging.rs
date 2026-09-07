@@ -2141,46 +2141,43 @@ where
                 group_context_hash.len()
             ))));
         }
+        // Bind the send to the authoritative point read for this conversation.
+        // A listing lookup that silently defaulted to (0, 0) made the server
+        // reject the send as StaleCoordinates whenever the listing failed,
+        // was rate limited, or paginated the conversation out of range, and
+        // the client then retried the same doomed coordinates forever.
         let (generation, state_version) = {
-            let convos_req = super::canonical_transport::PreparedRequest {
-                operation: super::canonical_transport::CanonicalOperation::GetConversations,
-                path: format!(
-                    "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
-                    actor_device_id
-                ),
-                method: "GET".to_string(),
-                body: None,
-            };
-            let convos_val: Option<serde_json::Value> =
-                if let Ok(resp) = self.api_client().submit_prepared_request(convos_req).await {
-                    serde_json::from_slice(&resp.body).ok()
-                } else {
-                    None
-                };
-            convos_val
-                .as_ref()
-                .and_then(|v| v.get("items").and_then(|i| i.as_array()))
-                .and_then(|items| {
-                    items.iter().find_map(|item| {
-                        let state = item.get("state").unwrap_or(item);
-                        let coords = state.get("coordinates")?;
-                        let cid = coords.get("conversationId").and_then(|c| c.as_str())?;
-                        if cid == convo_id {
-                            let g = coords
-                                .get("generation")
-                                .and_then(|g| g.as_i64())
-                                .unwrap_or(0);
-                            let sv = coords
-                                .get("stateVersion")
-                                .and_then(|sv| sv.as_i64())
-                                .unwrap_or(0);
-                            Some((g, sv))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or((0, 0))
+            let state = self.fetch_conversation_lifecycle(convo_id).await?;
+            let coords = state
+                .get("state")
+                .and_then(|s| s.get("coordinates"))
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput(format!(
+                        "conversation {convo_id} state carries no coordinates"
+                    ))
+                })?;
+            if coords.get("conversationId").and_then(|c| c.as_str()) != Some(convo_id.as_str()) {
+                return Err(OrchestratorError::InvalidInput(format!(
+                    "conversation {convo_id} coordinates identify a different conversation"
+                )));
+            }
+            let generation = coords
+                .get("generation")
+                .and_then(|g| g.as_i64())
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput(format!(
+                        "conversation {convo_id} coordinates carry no generation"
+                    ))
+                })?;
+            let state_version = coords
+                .get("stateVersion")
+                .and_then(|sv| sv.as_i64())
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput(format!(
+                        "conversation {convo_id} coordinates carry no state version"
+                    ))
+                })?;
+            (generation, state_version)
         };
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#applicationSendBody",
