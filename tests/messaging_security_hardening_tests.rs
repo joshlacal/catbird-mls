@@ -839,6 +839,166 @@ async fn secret_reuse_without_durable_envelope_evidence_fails_closed_without_rej
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn secret_reuse_own_sent_message_with_durable_evidence_skips_and_advances_cursor() {
+    let conversation_id = "8182838485868788898a8b8c8d8e8f91";
+    let client_msg_id = "c1c2c3c4-d5d6-47d8-99da-dbdcdddedfe0";
+    let server_entry_id = "f763fcb5-e3e2-4727-9380-f9d54820ac03";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::secret_reuse()),
+    )
+    .await;
+
+    // Simulate own sent message: stored locally with client UUID,
+    // server entryId tracked as pending outbox evidence.
+    fixture
+        .storage
+        .store_message(&Message {
+            id: client_msg_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sender_did: "did:plc:alice".to_string(),
+            text: "own sent message".to_string(),
+            timestamp: chrono::Utc::now(),
+            epoch: 1,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        })
+        .await
+        .expect("store own sent message");
+    fixture
+        .storage
+        .store_pending_message(conversation_id, server_entry_id)
+        .await
+        .expect("store server entryId as pending");
+
+    // Server echoes back the envelope with its assigned entryId
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"echoed-ciphertext", 1, server_entry_id)
+        .await
+        .expect("seed server echo envelope");
+
+    // Also seed a second message so we can verify cursor advances past the echo
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"continuation", 1, "next-server-entry")
+        .await
+        .expect("seed continuation frame");
+
+    // Fetch messages: SecretReuse for own echo is recognized via durable pending evidence,
+    // skipped with Ok(None), and cursor advances!
+    let (messages, cursor) = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect("locally accounted SecretReuse must advance the cursor");
+    assert!(messages.is_empty(), "own echo is skipped");
+    assert_eq!(cursor.as_deref(), Some("1"), "cursor must advance past the skipped echo");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_reuse_aad_message_id_base64_matches_stored_uuid_and_advances_cursor() {
+    let conversation_id = "8182838485868788898a8b8c8d8e8f92";
+    let client_msg_uuid = "f763fcb5-e3e2-4727-9380-f9d54820ac03";
+    let base64_aad_msg_id = "92P8tePiRyeTgPnVSCCsAw==";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::secret_reuse()),
+    )
+    .await;
+
+    // Stored message row has the hyphenated client UUID
+    fixture
+        .storage
+        .store_message(&Message {
+            id: client_msg_uuid.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sender_did: "did:plc:alice".to_string(),
+            text: "own sent message".to_string(),
+            timestamp: chrono::Utc::now(),
+            epoch: 1,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        })
+        .await
+        .expect("store own sent message with UUID");
+
+    // Incoming envelope carries the base64 AAD message ID representation
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"echoed-ciphertext", 1, base64_aad_msg_id)
+        .await
+        .expect("seed server echo envelope with base64 AAD id");
+
+    // Seed continuation frame so mock API client returns a continuation cursor
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"continuation", 1, "next-server-entry")
+        .await
+        .expect("seed continuation frame");
+
+    let (messages, cursor) = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect("base64 AAD message ID matching stored UUID must advance the cursor");
+    assert!(messages.is_empty(), "own echo is skipped");
+    assert_eq!(cursor.as_deref(), Some("1"), "cursor must advance");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_reuse_with_own_echo_proof_skips_and_advances_cursor() {
+    let conversation_id = "8182838485868788898a8b8c8d8e8f93";
+    let server_entry_id = "server-entry-with-echo-proof";
+    let ciphertext = b"ciphertext-with-echo-proof";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::secret_reuse()),
+    )
+    .await;
+    let group_bytes = hex::decode(conversation_id).unwrap_or_default();
+    let req_hash: [u8; 32] = Sha256::digest(b"test-req").into();
+    let aad_hash: [u8; 32] = Sha256::digest(b"").into();
+    let ct_hash: [u8; 32] = Sha256::digest(ciphertext).into();
+
+    let proof = OwnEchoProof::new(
+        req_hash,
+        conversation_id.to_string(),
+        group_bytes,
+        server_entry_id.to_string(),
+        1,
+        aad_hash,
+        ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+
+    fixture
+        .api
+        .send_message_with_id(conversation_id, ciphertext, 1, server_entry_id)
+        .await
+        .expect("seed server echo envelope");
+
+    // Seed continuation frame so mock API client returns a continuation cursor
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"continuation", 1, "next-server-entry")
+        .await
+        .expect("seed continuation frame");
+
+    let (messages, cursor) = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect("OwnEchoProof must allow SecretReuse envelope to advance cursor");
+    assert!(messages.is_empty(), "echo message is skipped");
+    assert_eq!(cursor.as_deref(), Some("1"), "cursor advances");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn own_private_message_missing_proof_withholds_cursor_and_marks_rejoin() {
     let conversation_id = "7172737475767778797a7b7c7d7e7f80";
     let message_id = "unproven-own-echo";

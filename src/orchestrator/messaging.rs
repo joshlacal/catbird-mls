@@ -56,6 +56,26 @@ fn next_send_sync_cursor(
     Ok(SendSyncCursorProgress::Continue(next_cursor))
 }
 
+/// Convert between hyphenated UUID string and base64-encoded 16-byte UUID representation.
+///
+/// In the clean chat protocol, messageId is a UUIDv4 on the application body, but its
+/// representation in AAD is a base64-encoded 16-byte buffer (e.g. `92P8tePiRyeTgPnVSCCsAw==`).
+/// This helper produces the alternate representation so lookup can match either form.
+fn alternate_uuid_representation(id: &str) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    if let Ok(u) = uuid::Uuid::parse_str(id) {
+        return Some(STANDARD.encode(u.as_bytes()));
+    }
+    if let Ok(bytes) = STANDARD.decode(id) {
+        if bytes.len() == 16 {
+            if let Ok(u) = uuid::Uuid::from_slice(&bytes) {
+                return Some(u.to_string());
+            }
+        }
+    }
+    None
+}
+
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -71,15 +91,27 @@ where
         conversation_id: &str,
         message_id: &str,
     ) -> Result<bool> {
-        if !self.storage().message_exists(message_id).await? {
-            return Ok(false);
+        if self.storage().message_exists(message_id).await? {
+            let messages = self
+                .storage()
+                .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
+                .await?;
+            if messages.iter().any(|message| message.id == message_id) {
+                return Ok(true);
+            }
         }
-        Ok(self
-            .storage()
-            .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
-            .await?
-            .iter()
-            .any(|message| message.id == message_id))
+        if let Some(alternate_id) = alternate_uuid_representation(message_id) {
+            if self.storage().message_exists(&alternate_id).await? {
+                let messages = self
+                    .storage()
+                    .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
+                    .await?;
+                if messages.iter().any(|message| message.id == alternate_id) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     async fn catch_up_pending_commits_for_send(
@@ -873,6 +905,29 @@ where
             );
         }
 
+        // When the server assigned an entryId distinct from the client messageId,
+        // also persist the server-assigned message ID as pending so future echoes
+        // carrying server_message_id are recognized immediately.
+        if let Some(ref resp) = send_response {
+            if resp.message_id != message_id {
+                self.pending_messages()
+                    .lock()
+                    .await
+                    .insert(resp.message_id.clone());
+                if let Err(e) = self
+                    .storage()
+                    .store_pending_message(conversation_id, &resp.message_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        server_message_id = %resp.message_id,
+                        "Failed to persist server message id for pending dedup"
+                    );
+                }
+            }
+        }
+
         let mut message = Message {
             id: message_id,
             conversation_id: conversation_id.to_string(),
@@ -1227,11 +1282,93 @@ where
             Err(e) if e.is_secret_reuse() => {
                 let has_durable_evidence = match envelope.server_message_id.as_deref() {
                     Some(server_id) => {
-                        self.durable_message_exists_in_conversation(
-                            &resolved.conversation_id,
-                            server_id,
-                        )
-                        .await?
+                        // 1. Direct or alternate-UUID durable message existence
+                        if self
+                            .durable_message_exists_in_conversation(
+                                &resolved.conversation_id,
+                                server_id,
+                            )
+                            .await?
+                        {
+                            true
+                        } else {
+                            // 2. Pending message evidence (in-memory fast path and durable outbox)
+                            let alternate = alternate_uuid_representation(server_id);
+                            let mut pending = self.pending_messages().lock().await;
+                            let in_memory_pending = pending.remove(server_id)
+                                || alternate
+                                    .as_ref()
+                                    .is_some_and(|alt| pending.remove(alt));
+                            drop(pending);
+                            let in_storage_pending = if in_memory_pending {
+                                let _ = self.storage().remove_pending_message(server_id).await;
+                                if let Some(alt) = &alternate {
+                                    let _ = self.storage().remove_pending_message(alt).await;
+                                }
+                                true
+                            } else {
+                                let direct = self
+                                    .storage()
+                                    .remove_pending_message(server_id)
+                                    .await
+                                    .unwrap_or(false);
+                                let alt = match &alternate {
+                                    Some(alt) => self
+                                        .storage()
+                                        .remove_pending_message(alt)
+                                        .await
+                                        .unwrap_or(false),
+                                    None => false,
+                                };
+                                direct || alt
+                            };
+
+                            if in_storage_pending {
+                                true
+                            } else {
+                                // 3. OwnEchoProof in encrypted MLS storage
+                                let aad_sha256: [u8; 32] = sha2::Sha256::digest(b"").into();
+                                let ciphertext_sha256: [u8; 32] =
+                                    sha2::Sha256::digest(&envelope.ciphertext).into();
+                                let epoch = match envelope.server_epoch {
+                                    Some(e) => e,
+                                    None => {
+                                        let states = self.group_states().lock().await;
+                                        resolved
+                                            .group_state(&states)
+                                            .map(|s| s.epoch)
+                                            .unwrap_or(0)
+                                    }
+                                };
+                                let direct_proof = self
+                                    .mls_context()
+                                    .has_own_echo_proof(
+                                        &resolved.conversation_id,
+                                        &group_id_bytes,
+                                        server_id,
+                                        epoch,
+                                        &aad_sha256,
+                                        &ciphertext_sha256,
+                                    )
+                                    .unwrap_or(false);
+                                if direct_proof {
+                                    true
+                                } else if let Some(alt) = &alternate {
+                                    self.mls_context()
+                                        .has_own_echo_proof(
+                                            &resolved.conversation_id,
+                                            &group_id_bytes,
+                                            alt,
+                                            epoch,
+                                            &aad_sha256,
+                                            &ciphertext_sha256,
+                                        )
+                                        .unwrap_or(false)
+                                } else {
+                                    false
+                                }
+                            }
+                        }
                     }
                     None => false,
                 };
