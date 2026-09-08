@@ -50,7 +50,7 @@ pub enum MLSError {
     #[error("Context not initialized")]
     ContextNotInitialized,
 
-    #[error("Context closed - database connections have been released for iOS suspension")]
+    #[error("Context closed - database connections were released (app suspension or account switch); reopen the context for the active account")]
     ContextClosed,
 
     #[error("Wire format policy violation: {message}")]
