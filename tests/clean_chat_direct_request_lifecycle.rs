@@ -1,7 +1,7 @@
 //! Native sender preflight checks. These are not delivery-service publication tests.
 #![allow(dead_code)]
 mod e2e_harness;
-use catbird_mls::orchestrator::{MlsCryptoContext, OrchestratorError};
+use catbird_mls::orchestrator::{MLSStorageBackend, MlsCryptoContext, OrchestratorError};
 use catbird_mls::{DirectRequestInput, MLSError};
 use e2e_harness::TestWorld;
 
@@ -403,6 +403,20 @@ async fn sender_fixture(legacy: bool) {
     let view = bob.orchestrator.refresh_request_preview(cid).await.unwrap();
     assert_eq!(view.consent, RequestConsent::IncomingPending);
     assert_eq!(view.crypto, RequestCrypto::Ready);
+    let group_id = hex::encode(
+        STANDARD
+            .decode(p["next"]["groupId"].as_str().unwrap())
+            .unwrap(),
+    );
+    let durable_group = bob
+        .storage
+        .get_group_state(&group_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable_group.conversation_id, cid);
+    assert_eq!(durable_group.epoch, p["next"]["epoch"].as_u64().unwrap());
+
     assert_eq!(
         view.preview,
         Some(RequestPreview::Ready {
@@ -731,7 +745,6 @@ async fn sender_fixture(legacy: bool) {
         .unwrap()
         .acceptance_proof
         .is_some());
-    use catbird_mls::orchestrator::MLSStorageBackend;
     assert_eq!(
         world
             .client("Alice")

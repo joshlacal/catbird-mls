@@ -598,7 +598,7 @@ where
 
     /// Commit canonical presentation and exact raw-group alias retirement before
     /// exposing a newly authenticated inventory mapping to readers.
-    async fn persist_sync_conversation_projection(
+    pub(crate) async fn persist_sync_conversation_projection(
         &self,
         user_did: &str,
         canonical: &ConversationView,

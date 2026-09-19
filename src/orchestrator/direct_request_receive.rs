@@ -377,6 +377,27 @@ where
         self.storage()
             .ensure_conversation_exists(&owner, cid, &group)
             .await?;
+        // A successful import is native custody, independently of introduction
+        // decoding or account consent. Persist its actual epoch before exposing
+        // a ready projection so terminal cleanup can fence that same group.
+        if let Ok(epoch) = self
+            .mls_context()
+            .get_epoch(bytes(&publication["body"]["next"]["groupId"])?)
+        {
+            self.storage()
+                .set_group_state(&GroupState {
+                    group_id: group.clone(),
+                    conversation_id: cid.into(),
+                    epoch,
+                    members: self
+                        .mls_context()
+                        .group_member_identities(hex::decode(&group).map_err(|_| invalid())?)?
+                        .into_iter()
+                        .map(|identity| String::from_utf8(identity).map_err(|_| invalid()))
+                        .collect::<Result<Vec<_>>>()?,
+                })
+                .await?;
+        }
         Ok(view)
     }
     async fn refresh_request_acceptance(
@@ -448,12 +469,22 @@ where
             {
                 if view.canonical_state.is_some() {
                     super::super::admission::validate_conversation_view(&view)?;
-                    self.storage()
-                        .ensure_conversation_exists(owner, cid, &view.group_id)
+                    let mut view = view;
+                    if let Ok(group) = hex::decode(&view.group_id) {
+                        if let Ok(epoch) = self.mls_context().get_epoch(group) {
+                            view.epoch = view.epoch.max(epoch);
+                        }
+                    }
+                    let aliases = self
+                        .persist_sync_conversation_projection(owner, &view)
                         .await?;
-                    self.conversations().lock().await.insert(cid.into(), view);
                     self.retain_conversation_policy_json(cid, &state["state"])
                         .await?;
+                    let mut conversations = self.conversations().lock().await;
+                    for alias in aliases {
+                        conversations.remove(&alias);
+                    }
+                    conversations.insert(cid.into(), view);
                 }
             }
         }
