@@ -1063,3 +1063,378 @@ mod preparation_publication_binding_tests {
         ));
     }
 }
+
+fn read_definition(name: &str) -> Result<&'static Value> {
+    super::contract::definition(name).map_err(error)
+}
+
+/// Normalize only schema-declared bytes in a received read presentation. This is
+/// not mutation admission: the strict signing and ingress APIs remain unchanged.
+/// Duplicate raw fields are rejected before JSON values can discard evidence.
+/// The returned value still passes the complete closed contract projection.
+pub fn normalize_direct_request_read_presentation(
+    raw: &[u8],
+    name: &str,
+    tagged: bool,
+) -> Result<Value> {
+    if raw.len() > MAX_PUBLISH_HTTP_BODY_BYTES {
+        return Err(error("JSON body cap"));
+    }
+    strict_document(raw)?;
+    let mut value: Value = serde_json::from_slice(raw).map_err(error)?;
+    normalize_read_schema(read_definition(name)?, &mut value, 0)?;
+    project(&serde_json::to_vec(&value).map_err(error)?, name, tagged)?;
+    Ok(value)
+}
+
+fn normalize_read_schema(schema: &Value, value: &mut Value, depth: usize) -> Result<()> {
+    if depth > 128 {
+        return Err(error("read presentation nesting cap"));
+    }
+    match schema["type"].as_str() {
+        Some("ref") => {
+            let name = schema["ref"]
+                .as_str()
+                .and_then(|s| s.strip_prefix('#'))
+                .ok_or_else(|| error("unsupported read schema reference"))?;
+            normalize_read_schema(read_definition(name)?, value, depth + 1)?;
+        }
+        Some("bytes") => {
+            if let Some(object) = value.as_object() {
+                if object.len() != 1 {
+                    return Err(error("bytes presentation must contain only $bytes"));
+                }
+                let encoded = object
+                    .get("$bytes")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| error("invalid bytes presentation"))?;
+                let bytes = STANDARD.decode(encoded).map_err(error)?;
+                if STANDARD.encode(&bytes) != encoded {
+                    return Err(error("noncanonical bytes presentation"));
+                }
+                *value = Value::String(encoded.to_owned());
+            }
+        }
+        Some("object") => {
+            if let Some(object) = value.as_object_mut() {
+                let properties = schema["properties"]
+                    .as_object()
+                    .ok_or_else(|| error("invalid object schema"))?;
+                for (field, value) in object {
+                    // Preserve undeclared fields for the strict projector to
+                    // reject. Never guess byte semantics from a field's name.
+                    if let Some(property) = properties.get(field) {
+                        normalize_read_schema(property, value, depth + 1)?;
+                    }
+                }
+            }
+        }
+        Some("array") => {
+            if let Some(values) = value.as_array_mut() {
+                for value in values {
+                    normalize_read_schema(&schema["items"], value, depth + 1)?;
+                }
+            }
+        }
+        Some("union") => {
+            let name = value["$type"]
+                .as_str()
+                .and_then(|s| s.strip_prefix("blue.catbird.chat.defs#"))
+                .ok_or_else(|| error("invalid read union tag"))?;
+            let allowed = schema["refs"]
+                .as_array()
+                .ok_or_else(|| error("invalid union schema"))?
+                .iter()
+                .any(|r| r.as_str().and_then(|s| s.strip_prefix('#')) == Some(name));
+            if !allowed {
+                return Err(error("unknown read union tag"));
+            }
+            normalize_read_schema(read_definition(name)?, value, depth + 1)?;
+        }
+        Some("string" | "integer" | "boolean") => {}
+        _ => return Err(error("unsupported read schema type")),
+    }
+    Ok(())
+}
+
+/// Verify a received read representation through the unchanged strict verifier.
+/// Body values use bare canonical base64 for downstream identity comparisons;
+/// provenance retains the exact received wrapper bytes, never rewritten bytes.
+pub fn verify_received_signed_request(
+    kind: DirectRequestKind,
+    raw_wrapper: &[u8],
+    public_key: &[u8],
+) -> Result<VerifiedDirectRequest> {
+    strict_document(raw_wrapper)?;
+    let wrapper: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
+    let tagged = kind == DirectRequestKind::Outcome && wrapper.get("$type").is_some();
+    let normalized =
+        normalize_direct_request_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
+    let mut verified = verify_signed_request(
+        kind,
+        &serde_json::to_vec(&normalized).map_err(error)?,
+        public_key,
+    )?;
+    verified.accepted_wrapper = raw_wrapper.to_vec();
+    Ok(verified)
+}
+
+/// Read-side counterpart: normalize nested byte presentations before strict
+/// signature verification and acceptance-entry/receipt equality checks.
+pub fn verify_received_direct_request_acceptance_proof(
+    raw_proof: &[u8],
+    trusted_authority_key: &[u8],
+    recipient_device_key: &[u8],
+) -> Result<Value> {
+    let proof = normalize_direct_request_read_presentation(
+        raw_proof,
+        "directRequestAcceptanceProof",
+        false,
+    )?;
+    verify_direct_request_acceptance_proof(
+        &serde_json::to_vec(&proof).map_err(error)?,
+        trusted_authority_key,
+        recipient_device_key,
+    )
+}
+
+#[cfg(test)]
+mod read_presentation_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn vectors() -> Value {
+        serde_json::from_str(include_str!("vectors/direct_request_vectors.json")).unwrap()
+    }
+    fn body(kind: DirectRequestKind) -> Value {
+        vectors()["signed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == format!("{kind:?}"))
+            .unwrap()["body"]
+            .clone()
+    }
+    // Test producer traverses the schema independently of the normalization
+    // routine; arbitrary base64-looking text is never a bytes field.
+    fn present(schema: &Value, value: &mut Value) {
+        match schema["type"].as_str().unwrap() {
+            "bytes" => *value = json!({"$bytes":value.clone()}),
+            "ref" => present(
+                read_definition(schema["ref"].as_str().unwrap().strip_prefix('#').unwrap())
+                    .unwrap(),
+                value,
+            ),
+            "union" => {
+                let name = value["$type"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("blue.catbird.chat.defs#")
+                    .unwrap();
+                present(read_definition(name).unwrap(), value);
+            }
+            "array" => {
+                for item in value.as_array_mut().unwrap() {
+                    present(&schema["items"], item)
+                }
+            }
+            "object" => {
+                for (key, item) in value.as_object_mut().unwrap() {
+                    if let Some(schema) = schema["properties"].get(key) {
+                        present(schema, item)
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    fn signed(kind: DirectRequestKind, mut body: Value) -> (Value, Vec<u8>) {
+        let device = SigningKey::from_bytes(&[7; 32]);
+        let authority = p256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
+        let is_receipt = matches!(
+            kind,
+            DirectRequestKind::Outcome | DirectRequestKind::AcceptanceCommit
+        );
+        let public = if is_receipt {
+            authority
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .to_vec()
+        } else {
+            device.verifying_key().as_bytes().to_vec()
+        };
+        body["keyId"] = json!(if is_receipt {
+            direct_request_receipt_key_id(&public).unwrap()
+        } else {
+            URL_SAFE_NO_PAD.encode(Sha256::digest(&public))
+        });
+        let bytes =
+            direct_request_signing_bytes(kind, &serde_json::to_vec(&body).unwrap()).unwrap();
+        let signature = if is_receipt {
+            let signature: p256::ecdsa::Signature = authority.sign(&bytes);
+            STANDARD.encode(signature.normalize_s().unwrap_or(signature).to_bytes())
+        } else {
+            STANDARD.encode(device.sign(&bytes).to_bytes())
+        };
+        (json!({"body":body,"signature":signature}), public)
+    }
+    #[test]
+    fn all_operations_read_bytes_keep_golden_transcripts_signatures_and_provenance() {
+        for row in vectors()["signed"].as_array().unwrap() {
+            let kind = *DirectRequestKind::ALL
+                .iter()
+                .find(|k| row["kind"] == format!("{k:?}"))
+                .unwrap();
+            let mut read_body = row["body"].clone();
+            present(read_definition(kind.body_name()).unwrap(), &mut read_body);
+            let normalized = normalize_direct_request_read_presentation(
+                &serde_json::to_vec(&read_body).unwrap(),
+                kind.body_name(),
+                true,
+            )
+            .unwrap();
+            assert_eq!(normalized, row["body"]);
+            let transcript =
+                direct_request_signing_bytes(kind, &serde_json::to_vec(&normalized).unwrap())
+                    .unwrap();
+            assert_eq!(hex::encode(&transcript), row["transcriptHex"]);
+            assert_eq!(hex::encode(Sha256::digest(&transcript)), row["digestHex"]);
+            let (bare, key) = signed(kind, row["body"].clone());
+            let strict =
+                verify_signed_request(kind, &serde_json::to_vec(&bare).unwrap(), &key).unwrap();
+            let mut received = bare.clone();
+            present(read_definition(kind.wrapper_name()).unwrap(), &mut received);
+            let raw = serde_json::to_vec(&received).unwrap();
+            assert!(
+                verify_signed_request(kind, &raw, &key).is_err(),
+                "mutation boundary must remain bare"
+            );
+            let verified = verify_received_signed_request(kind, &raw, &key).unwrap();
+            assert_eq!(verified.body(), strict.body());
+            assert_eq!(verified.transcript_bytes(), strict.transcript_bytes());
+            assert_eq!(verified.signature(), strict.signature());
+            assert_eq!(verified.request_digest(), strict.request_digest());
+            assert_eq!(verified.accepted_wrapper_bytes(), raw);
+            if kind == DirectRequestKind::Outcome {
+                received["$type"] = json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+                verify_received_signed_request(kind, &serde_json::to_vec(&received).unwrap(), &key)
+                    .unwrap();
+            }
+        }
+    }
+    #[test]
+    fn read_bytes_reject_ambiguity_tags_unknowns_arrays_and_malformed_objects() {
+        let kind = DirectRequestKind::Publish;
+        let (mut value, key) = signed(kind, body(kind));
+        present(read_definition(kind.wrapper_name()).unwrap(), &mut value);
+        for malformed in [
+            json!({"$bytes":1}),
+            json!({"$bytes":"AA==","extra":true}),
+            json!({"$bytes":"AB=="}),
+            json!({"$bytes":"AA"}),
+            json!({"$bytes":null}),
+            json!([0, 1]),
+            json!({"bytes":"AA=="}),
+        ] {
+            let mut altered = value.clone();
+            altered["signature"] = malformed;
+            assert!(verify_received_signed_request(
+                kind,
+                &serde_json::to_vec(&altered).unwrap(),
+                &key
+            )
+            .is_err());
+        }
+        let raw = serde_json::to_string(&value).unwrap();
+        let duplicate = raw.replacen("\"$bytes\":", "\"$bytes\":\"AA==\",\"$bytes\":", 1);
+        assert!(verify_received_signed_request(kind, duplicate.as_bytes(), &key).is_err());
+        for field in ["unknown", "$type"] {
+            let mut altered = value.clone();
+            altered["body"]["artifacts"][field] = json!({"$bytes":"AA=="});
+            assert!(verify_received_signed_request(
+                kind,
+                &serde_json::to_vec(&altered).unwrap(),
+                &key
+            )
+            .is_err());
+        }
+        let mut altered = value.clone();
+        altered["body"]["origin"]["$type"] =
+            json!("blue.catbird.chat.defs#signedDirectRequestReceipt");
+        assert!(
+            verify_received_signed_request(kind, &serde_json::to_vec(&altered).unwrap(), &key)
+                .is_err()
+        );
+        let text = json!({"text":"YWJjZA=="});
+        assert_eq!(
+            normalize_direct_request_read_presentation(
+                &serde_json::to_vec(&text).unwrap(),
+                "directRequestIntroduction",
+                false
+            )
+            .unwrap(),
+            text
+        );
+        assert!(normalize_direct_request_read_presentation(
+            br#"{"text":{"$bytes":"YWJjZA=="}}"#,
+            "directRequestIntroduction",
+            false
+        )
+        .is_err());
+    }
+    #[test]
+    fn nested_mixed_acceptance_proof_normalizes_before_digest_and_coordinate_comparison() {
+        let mut consent = body(DirectRequestKind::Accept);
+        consent["next"]["stateVersion"] =
+            json!(consent["prior"]["stateVersion"].as_u64().unwrap() + 1);
+        let (acceptance, recipient) = signed(DirectRequestKind::Accept, consent);
+        let checked = verify_signed_request(
+            DirectRequestKind::Accept,
+            &serde_json::to_vec(&acceptance).unwrap(),
+            &recipient,
+        )
+        .unwrap();
+        let entry = json!({"entryId":"12345678-1234-4234-8234-123456789abc","conversationId":checked.body()["prior"]["conversationId"],"seq":1,"signedRequest":acceptance,"receivedAt":"2026-09-19T12:00:00.000Z"});
+        let mut receipt = body(DirectRequestKind::AcceptanceCommit);
+        for field in ["requestId", "prior", "next"] {
+            receipt[field] = checked.body()[field].clone();
+        }
+        receipt["acceptanceDigest"] = json!(STANDARD.encode(checked.request_digest()));
+        receipt["entryHash"] = json!(STANDARD.encode(
+            direct_request_acceptance_entry_hash(&serde_json::to_vec(&entry).unwrap()).unwrap()
+        ));
+        let (receipt, authority) = signed(DirectRequestKind::AcceptanceCommit, receipt);
+        let bare = json!({"entry":entry,"receipt":receipt});
+        let expected = verify_direct_request_acceptance_proof(
+            &serde_json::to_vec(&bare).unwrap(),
+            &authority,
+            &recipient,
+        )
+        .unwrap();
+        let mut read = bare.clone();
+        present(
+            read_definition("directRequestAcceptanceProof").unwrap(),
+            &mut read,
+        );
+        read["entry"]["signedRequest"]["signature"] =
+            bare["entry"]["signedRequest"]["signature"].clone();
+        read["receipt"]["body"]["next"]["groupId"] =
+            bare["receipt"]["body"]["next"]["groupId"].clone();
+        assert!(verify_direct_request_acceptance_proof(
+            &serde_json::to_vec(&read).unwrap(),
+            &authority,
+            &recipient
+        )
+        .is_err());
+        assert_eq!(
+            verify_received_direct_request_acceptance_proof(
+                &serde_json::to_vec(&read).unwrap(),
+                &authority,
+                &recipient
+            )
+            .unwrap(),
+            expected
+        );
+    }
+}

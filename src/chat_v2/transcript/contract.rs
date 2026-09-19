@@ -75,7 +75,7 @@ fn contract() -> &'static Schema {
     })
 }
 
-fn definition(name: &str) -> Result<&'static Schema, ProjectionError> {
+pub(super) fn definition(name: &str) -> Result<&'static Schema, ProjectionError> {
     contract()["defs"]
         .get(name)
         .ok_or_else(|| ProjectionError::UnknownDefinition {
