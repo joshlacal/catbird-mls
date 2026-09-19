@@ -1,7 +1,8 @@
 //! Protected request projection backed by signed publication and consent proof.
 use super::super::direct_request_types::*;
 use crate::chat_v2::transcript::direct_request::{
-    resolve_direct_request_receipt_key, verify_signed_request, DirectRequestKind,
+    resolve_direct_request_receipt_key, verify_received_signed_request as verify_signed_request,
+    DirectRequestKind,
 };
 use crate::orchestrator::{OrchestratorError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -95,7 +96,7 @@ impl DirectRequestProjection {
                 let key =
                     resolve_direct_request_receipt_key(&self.trusted_authority_document, method)
                         .map_err(|_| invalid())?;
-                let verified=crate::chat_v2::transcript::direct_request::verify_direct_request_acceptance_proof(proof,&key,recipient_key).map_err(|_|invalid())?;
+                let verified=crate::chat_v2::transcript::direct_request::verify_received_direct_request_acceptance_proof(proof,&key,recipient_key).map_err(|_|invalid())?;
                 let accepted = &verified["entry"]["signedRequest"]["body"];
                 if accepted["prior"] != coordinate
                     || accepted["requestId"] != body["requestId"]
@@ -316,6 +317,18 @@ impl DirectRequestCloseProof {
 
 /// Normalize only transport byte wrappers and the known outer entry tag.
 pub(crate) fn request_control_entry(mut entry: Value) -> Result<Value> {
+    // Request controls have a schema-bound read adapter. It converts only
+    // declared bytes and retains every other field for closed-schema validation.
+    if let Some(name) = entry["$type"].as_str().and_then(|tag| {
+        tag.strip_prefix("blue.catbird.chat.defs#").filter(|name| {
+            matches!(*name, "directRequestEntry" | "directRequestAcceptanceEntry")
+        })
+    }) {
+        let raw = serde_json::to_vec(&entry).map_err(|_| invalid())?;
+        let mut canonical = crate::chat_v2::transcript::direct_request::normalize_direct_request_read_presentation(&raw, name, true).map_err(|_| invalid())?;
+        canonical.as_object_mut().ok_or_else(invalid)?.remove("$type");
+        return Ok(canonical);
+    }
     fn bytes(value: &mut Value) {
         match value {
             Value::Object(map)

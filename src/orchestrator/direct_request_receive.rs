@@ -212,7 +212,7 @@ where
             if requests.len() != 1 {
                 return Err(OrchestratorError::ConversationNotFound(cid.into()));
             }
-            let entry = requests[0];
+            let entry = super::projection::request_control_entry(requests[0].clone())?;
             let publication = &entry["signedRequest"];
             let p = &publication["body"];
             if entry["conversationId"] != cid
@@ -224,7 +224,7 @@ where
             let candidate_key =
                 bytes(&p["artifacts"]["metadataSnapshot"]["authorProof"]["signaturePublicKey"])?;
             let publication = serde_json::to_vec(publication).map_err(|_| invalid())?;
-            let verified = transcript::verify_signed_request(
+            let verified = transcript::verify_received_signed_request(
                 DirectRequestKind::Publish,
                 &publication,
                 &candidate_key,
@@ -256,7 +256,7 @@ where
                 device_id: device.clone(),
                 trusted_authority_document: document,
                 publication,
-                publication_entry: Some(super::projection::request_control_entry(entry.clone())?),
+                publication_entry: Some(entry.clone()),
                 sender_public_key: candidate_key,
                 publication_receipt: serde_json::to_vec(&receipt).map_err(|_| invalid())?,
                 crypto: RequestCrypto::WelcomeAvailable,
@@ -454,7 +454,12 @@ where
                     &doc,
                 )?;
             }
-            candidate.acceptance_proof = Some(serde_json::to_vec(proof).map_err(|_| invalid())?);
+            let canonical = transcript::verify_received_direct_request_acceptance_proof(
+                &serde_json::to_vec(proof).map_err(|_| invalid())?,
+                &transcript::resolve_direct_request_receipt_key(&candidate.trusted_authority_document, method).map_err(|_| invalid())?,
+                &key,
+            ).map_err(|_| invalid())?;
+            candidate.acceptance_proof = Some(serde_json::to_vec(&canonical).map_err(|_| invalid())?);
             candidate.recipient_public_key = Some(key);
             candidate.view(&owner, &device)?;
             candidate.pending_acceptance = None;
@@ -560,7 +565,7 @@ where
             }
             return Ok(());
         }
-        let publication = transcript::verify_signed_request(
+        let publication = transcript::verify_received_signed_request(
             DirectRequestKind::Publish,
             &projection.publication,
             &projection.sender_public_key,

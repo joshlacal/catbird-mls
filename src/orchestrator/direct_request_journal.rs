@@ -113,7 +113,7 @@ impl DirectRequestJournal {
         }
         if let (Some(receipt), Some(key)) = (&self.terminal_receipt, &self.terminal_authority_key) {
             use crate::chat_v2::transcript::direct_request::{
-                verify_signed_request, DirectRequestKind,
+                verify_received_signed_request as verify_signed_request, DirectRequestKind,
             };
             use base64::{engine::general_purpose::STANDARD, Engine as _};
             let verified = verify_signed_request(DirectRequestKind::Outcome, receipt, key)

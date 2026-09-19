@@ -7,7 +7,8 @@ use super::direct_request_journal::{DirectRequestJournal, DirectRequestJournalPh
 use super::direct_request_keys::{DirectRequestKeyPublication, DirectRequestKeyPublicationInput};
 use crate::{
     chat_v2::transcript::direct_request::{
-        self as transcript, verify_signed_request, DirectRequestKind,
+        self as transcript, verify_received_signed_request as verify_signed_request,
+        DirectRequestKind,
     },
     MLSError,
 };

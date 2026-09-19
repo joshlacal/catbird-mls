@@ -450,7 +450,7 @@ where
             if binding.identity != format!("{did}#{device_id}") {
                 return Err(invalid());
             }
-            let grant = transcript::verify_signed_request(
+            let grant = transcript::verify_received_signed_request(
                 DirectRequestKind::Grant,
                 &serde_json::to_vec(&device["grant"]).map_err(|_| invalid())?,
                 &binding.signature_key,
@@ -621,7 +621,7 @@ where
                 key
             }
         };
-        let verified = transcript::verify_signed_request(DirectRequestKind::Outcome, receipt, &key)
+        let verified = transcript::verify_received_signed_request(DirectRequestKind::Outcome, receipt, &key)
             .map_err(|_| invalid())?;
         let prepare = transcript::verify_signed_request(
             DirectRequestKind::Prepare,
@@ -883,7 +883,7 @@ where
             return Err(invalid());
         }
         if projection.pending_acceptance.is_none() {
-            let publication = transcript::verify_signed_request(
+            let publication = transcript::verify_received_signed_request(
                 DirectRequestKind::Publish,
                 &projection.publication,
                 &projection.sender_public_key,
@@ -922,12 +922,13 @@ where
         let pending =
             transcript::verify_signed_request(DirectRequestKind::Accept, wrapper, &signer)
                 .map_err(|_| invalid())?;
-        let publication: Value =
-            serde_json::from_slice(&projection.publication).map_err(|_| invalid())?;
+        let publication = transcript::verify_received_signed_request(
+            DirectRequestKind::Publish, &projection.publication, &projection.sender_public_key,
+        ).map_err(|_| invalid())?;
         if pending.actor_did() != Some(owner.as_str())
             || pending.actor_device_id() != Some(device.as_str())
-            || pending.body()["prior"] != publication["body"]["next"]
-            || pending.body()["requestId"] != publication["body"]["requestId"]
+            || pending.body()["prior"] != publication.body()["next"]
+            || pending.body()["requestId"] != publication.body()["requestId"]
         {
             return Err(invalid());
         }
