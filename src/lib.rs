@@ -46,7 +46,7 @@ pub use engine::*;
 pub use error::*;
 pub use orchestrator::direct_request_types::{
     DirectRequestInput, DirectRequestOutcome, DirectRequestView, GroupInvitationReference,
-    RequestCapabilities, RequestConsent, RequestCrypto, RequestPreview,
+    RequestCapabilities, RequestConsent, RequestCrypto, RequestPreview, RequestIntroductionMetadata,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use keychain::*;

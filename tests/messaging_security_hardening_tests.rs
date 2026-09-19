@@ -490,6 +490,7 @@ async fn external_join_authorization_rejection_does_not_advance_fork_or_rejoin_s
     for index in 0..3 {
         let error = orchestrator
             .process_incoming(&catbird_mls::orchestrator::IncomingEnvelope {
+                canonical_entry_json: None,
                 conversation_id: conversation_id.to_string(),
                 sender_did: "did:plc:outsider".to_string(),
                 ciphertext: format!("external-proposal-{index}").into_bytes(),
@@ -720,6 +721,7 @@ fn test_envelope(
     message_id: &str,
 ) -> catbird_mls::orchestrator::IncomingEnvelope {
     catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: conversation_id.to_string(),
         sender_did: "did:plc:alice".to_string(),
         ciphertext: format!("ciphertext-{message_id}").into_bytes(),
@@ -2144,6 +2146,7 @@ async fn credential_rejection_attempts_staged_commit_cleanup_and_surfaces_failur
 
     let error = orchestrator
         .process_incoming(&catbird_mls::orchestrator::IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: conversation_id.to_string(),
             sender_did: "did:plc:mallory".to_string(),
             ciphertext: b"staged-commit".to_vec(),
@@ -2198,6 +2201,7 @@ async fn credential_rejection_leaves_no_staged_commit_residue_when_cleanup_succe
 
     let error = orchestrator
         .process_incoming(&catbird_mls::orchestrator::IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: conversation_id.to_string(),
             sender_did: "did:plc:mallory".to_string(),
             ciphertext: b"staged-commit".to_vec(),

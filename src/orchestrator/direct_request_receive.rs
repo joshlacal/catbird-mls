@@ -138,7 +138,11 @@ where
             .iter()
             .any(|p| p["userDid"] == owner && p["status"] != "active"))
     }
-    pub(crate) async fn request_query(&self, operation: CanonicalOperation, query: String) -> Result<Value> {
+    pub(crate) async fn request_query(
+        &self,
+        operation: CanonicalOperation,
+        query: String,
+    ) -> Result<Value> {
         let response = self
             .api_client()
             .submit_prepared_request(PreparedRequest {
@@ -162,6 +166,25 @@ where
         let device = self.require_actor_device_id().await?;
         let lock = self.direct_request_operation_lock(cid).await;
         let _guard = lock.lock().await;
+        if let Some(raw) = self.mls_context().read_direct_request_projection(cid)? {
+            let view =
+                DirectRequestProjection::decode(&raw, &owner, &device)?.view(&owner, &device)?;
+            if view.consent == RequestConsent::Closed {
+                return Ok(view);
+            }
+        }
+        if self
+            .mls_context()
+            .list_direct_request_journal()?
+            .iter()
+            .any(|journal| {
+                journal.conversation_id == cid
+                    && journal.phase
+                        == direct_request_journal::DirectRequestJournalPhase::RetiredPublished
+            })
+        {
+            return Err(OrchestratorError::InvalidInput("RequestRetired".into()));
+        }
         let mut raw = self.mls_context().read_direct_request_projection(cid)?;
         let mut projection = if let Some(raw) = &raw {
             DirectRequestProjection::decode(raw, &owner, &device)?
@@ -224,6 +247,7 @@ where
                 device_id: device.clone(),
                 trusted_authority_document: document,
                 publication,
+                publication_entry: Some(super::projection::request_control_entry(entry.clone())?),
                 sender_public_key: candidate_key,
                 publication_receipt: serde_json::to_vec(&receipt).map_err(|_| invalid())?,
                 crypto: RequestCrypto::WelcomeAvailable,
@@ -231,6 +255,7 @@ where
                 acceptance_proof: None,
                 recipient_public_key: None,
                 pending_acceptance: None,
+                close_proof: None,
             };
             // This verifies the authority's exact publication digest, actor and
             // immutable key fingerprint before any local MLS mutation.
@@ -374,47 +399,37 @@ where
             let body = &proof["entry"]["signedRequest"]["body"];
             let recipient = body["actorDid"].as_str().ok_or_else(invalid)?;
             let key_id = body["keyId"].as_str().ok_or_else(invalid)?;
-            if let Some(keys) = self
-                .credentials()
-                .get_authorized_device_keys(recipient)
-                .await?
+            let recipient_device = body["actorDeviceId"].as_str().ok_or_else(invalid)?;
+            let key = self
+                .request_historical_device_key(recipient, recipient_device, key_id)
+                .await?;
+            let method = proof["receipt"]["body"]["keyId"]
+                .as_str()
+                .ok_or_else(invalid)?;
+            if transcript::resolve_direct_request_receipt_key(
+                &candidate.trusted_authority_document,
+                method,
+            )
+            .is_err()
             {
-                let keys = keys
-                    .into_iter()
-                    .filter(|key| canonical_transport::derive_key_id(key) == key_id)
-                    .collect::<Vec<_>>();
-                if keys.len() == 1 {
-                    let method = proof["receipt"]["body"]["keyId"]
-                        .as_str()
-                        .ok_or_else(invalid)?;
-                    if transcript::resolve_direct_request_receipt_key(
-                        &candidate.trusted_authority_document,
-                        method,
-                    )
-                    .is_err()
-                    {
-                        let doc = self
-                            .credentials()
-                            .direct_request_receipt_authority_document()
-                            .await?
-                            .ok_or_else(invalid)?;
-                        transcript::resolve_direct_request_receipt_key(&doc, method)
-                            .map_err(|_| invalid())?;
-                        candidate.trusted_authority_document =
-                            super::intent::merge_trusted_documents(
-                                &candidate.trusted_authority_document,
-                                &doc,
-                            )?;
-                    }
-                    candidate.acceptance_proof =
-                        Some(serde_json::to_vec(proof).map_err(|_| invalid())?);
-                    candidate.recipient_public_key = Some(keys[0].clone());
-                    candidate.view(&owner, &device)?;
-                    candidate.pending_acceptance = None;
-                    self.save_received_request(cid, &candidate, raw)?;
-                    *projection = candidate;
-                }
+                let doc = self
+                    .credentials()
+                    .direct_request_receipt_authority_document()
+                    .await?
+                    .ok_or_else(invalid)?;
+                transcript::resolve_direct_request_receipt_key(&doc, method)
+                    .map_err(|_| invalid())?;
+                candidate.trusted_authority_document = super::intent::merge_trusted_documents(
+                    &candidate.trusted_authority_document,
+                    &doc,
+                )?;
             }
+            candidate.acceptance_proof = Some(serde_json::to_vec(proof).map_err(|_| invalid())?);
+            candidate.recipient_public_key = Some(key);
+            candidate.view(&owner, &device)?;
+            candidate.pending_acceptance = None;
+            self.save_received_request(cid, &candidate, raw)?;
+            *projection = candidate;
         }
         let expected = if let Some(accepted) = &projection.acceptance_proof {
             let value: Value = serde_json::from_slice(accepted).map_err(|_| invalid())?;
@@ -461,5 +476,123 @@ where
         }
         *raw = Some(next);
         Ok(())
+    }
+}
+
+impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
+where
+    S: MLSStorageBackend + 'static,
+    A: MLSAPIClient + 'static,
+    C: CredentialStore + 'static,
+    M: MlsCryptoContext + 'static,
+{
+    /// Invoked only after the existing canonical terminal verifier has accepted
+    /// the server entry and authorized historical actor key.
+    pub(crate) async fn retain_verified_request_close(
+        &self,
+        cid: &str,
+        entry: &Value,
+        key: &[u8],
+    ) -> Result<()> {
+        if !self.mls_context().supports_direct_request_bootstrap() {
+            return Ok(());
+        }
+        let owner = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let lock = self.direct_request_operation_lock(cid).await;
+        let _guard = lock.lock().await;
+        let Some(raw) = self.mls_context().read_direct_request_projection(cid)? else {
+            return Ok(());
+        };
+        let mut projection = DirectRequestProjection::decode(&raw, &owner, &device)?;
+        let entry = super::projection::normalized_close_entry(entry.clone());
+        let hash = super::projection::DirectRequestCloseProof::hash(&entry)?;
+        if let Some(old) = &projection.close_proof {
+            if old.entry_sha256 != hash {
+                return Err(invalid());
+            }
+            if !self
+                .mls_context()
+                .commit_closed_direct_request_projection(cid, &raw, &raw)?
+            {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
+        let publication = transcript::verify_signed_request(
+            DirectRequestKind::Publish,
+            &projection.publication,
+            &projection.sender_public_key,
+        )
+        .map_err(|_| invalid())?;
+        projection.close_proof = Some(super::projection::DirectRequestCloseProof {
+            verified_prior: entry["signedRequest"]["body"]["prior"].clone(),
+            entry,
+            actor_public_key: key.to_vec(),
+            entry_sha256: hash,
+            publication_digest: *publication.request_digest(),
+        });
+        projection.pending_acceptance = None;
+        let next = projection.encode()?;
+        if !self
+            .mls_context()
+            .commit_closed_direct_request_projection(cid, &raw, &next)?
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    pub(crate) async fn replay_verified_request_close(
+        &self,
+        cid: &str,
+        entry: &Value,
+    ) -> Result<bool> {
+        if !self.mls_context().supports_direct_request_bootstrap() {
+            return Ok(false);
+        }
+        let owner = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let Some(raw) = self.mls_context().read_direct_request_projection(cid)? else {
+            return Ok(false);
+        };
+        let projection = DirectRequestProjection::decode(&raw, &owner, &device)?;
+        let Some(proof) = &projection.close_proof else {
+            return Ok(false);
+        };
+        if proof.entry_sha256 != super::projection::DirectRequestCloseProof::hash(entry)? {
+            return Err(invalid());
+        }
+        if !self
+            .mls_context()
+            .commit_closed_direct_request_projection(cid, &raw, &raw)?
+        {
+            return Err(invalid());
+        }
+        Ok(true)
+    }
+    pub async fn close_direct_request(&self, cid: &str) -> Result<DirectRequestView> {
+        self.require_direct_request_support()?;
+        let existing = self.retained_direct_request_view(cid).await?;
+        if existing
+            .as_ref()
+            .is_some_and(|v| v.consent == RequestConsent::Closed)
+        {
+            // Replay the canonical account-exit completion before returning;
+            // its host tombstone may lag the atomic protected close commit.
+            Box::pin(self.resume_account_exits(&std::collections::HashSet::new())).await?;
+            return existing.ok_or_else(invalid);
+        }
+        if existing.is_none() {
+            Box::pin(self.refresh_request_preview(cid)).await?;
+        }
+        Box::pin(self.leave_conversation(cid)).await?;
+        let closed = self
+            .retained_direct_request_view(cid)
+            .await?
+            .ok_or_else(invalid)?;
+        if closed.consent != RequestConsent::Closed {
+            return Err(invalid());
+        }
+        Ok(closed)
     }
 }

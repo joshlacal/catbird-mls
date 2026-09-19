@@ -57,6 +57,7 @@ fn intent() -> DirectRequestIntent {
     let wrapper =
         json!({"body":body,"signature":STANDARD.encode(key.sign(&transcript).to_bytes())});
     DirectRequestIntent {
+        legacy_origin_snapshot: None,
         input: DirectRequestInput {
             draft_id: "11111111-1111-4111-8111-111111111111".into(),
             recipient_did: body["recipientDid"].as_str().unwrap().into(),

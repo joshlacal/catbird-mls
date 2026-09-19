@@ -106,7 +106,7 @@ impl DirectRequestJournal {
                 DirectRequestJournalPhase::OutcomeUnknown
                     | DirectRequestJournalPhase::PublishedAwaitingProjection
                     | DirectRequestJournalPhase::RequestSent
-                | DirectRequestJournalPhase::RetiredPublished
+                    | DirectRequestJournalPhase::RetiredPublished
             ) && self.publish_request.is_none())
         {
             return Err(MLSError::StorageFailed);
@@ -123,7 +123,7 @@ impl DirectRequestJournal {
                 self.phase,
                 DirectRequestJournalPhase::PublishedAwaitingProjection
                     | DirectRequestJournalPhase::RequestSent
-                | DirectRequestJournalPhase::RetiredPublished
+                    | DirectRequestJournalPhase::RetiredPublished
             );
             if proof["requestId"] != self.request_id
                 || proof["preparationRequestDigest"].as_str()
@@ -239,37 +239,86 @@ pub(crate) fn retire_published_group(
     use rusqlite::OptionalExtension;
     let mut owned = None;
     for record in list(&inner.manifest_storage)? {
-        let id = STANDARD.decode(record.bootstrap.coordinates["groupId"].as_str().ok_or(MLSError::StorageFailed)?).map_err(error)?;
+        let id = STANDARD
+            .decode(
+                record.bootstrap.coordinates["groupId"]
+                    .as_str()
+                    .ok_or(MLSError::StorageFailed)?,
+            )
+            .map_err(error)?;
         if id == group_id {
-            if owned.is_some() { return Err(MLSError::StorageFailed); }
+            if owned.is_some() {
+                return Err(MLSError::StorageFailed);
+            }
             owned = Some(record);
         }
     }
-    let Some(mut record) = owned else { return Ok(None); };
+    let Some(mut record) = owned else {
+        return Ok(None);
+    };
     if record.phase == DirectRequestJournalPhase::RetiredPublished {
         // A durability barrier can fail after commit; repeat it before the
         // caller releases any remaining in-memory copy.
         inner.manifest_storage.flush_database()?;
         return Ok(Some(false));
     }
-    if !matches!(record.phase, DirectRequestJournalPhase::PublishedAwaitingProjection | DirectRequestJournalPhase::RequestSent) {
-        return Err(MLSError::InvalidState("Cannot delete an unpublished request-owned group".into()));
+    if !matches!(
+        record.phase,
+        DirectRequestJournalPhase::PublishedAwaitingProjection
+            | DirectRequestJournalPhase::RequestSent
+    ) {
+        return Err(MLSError::InvalidState(
+            "Cannot delete an unpublished request-owned group".into(),
+        ));
     }
-    let tx = inner.manifest_storage.welcome_ack_connection().unchecked_transaction().map_err(error)?;
-    let provider = Provider { storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx), crypto: inner.provider.crypto() };
-    let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(group_id)).map_err(error)?.ok_or(MLSError::StorageFailed)?;
+    let tx = inner
+        .manifest_storage
+        .welcome_ack_connection()
+        .unchecked_transaction()
+        .map_err(error)?;
+    let provider = Provider {
+        storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
+        crypto: inner.provider.crypto(),
+    };
+    let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(group_id))
+        .map_err(error)?
+        .ok_or(MLSError::StorageFailed)?;
     group.delete(provider.storage()).map_err(error)?;
     let encoded = hex::encode(group_id);
-    let raw: String = tx.query_row("SELECT value FROM mls_manifests WHERE key='group_ids'", [], |row| row.get(0)).map_err(error)?;
+    let raw: String = tx
+        .query_row(
+            "SELECT value FROM mls_manifests WHERE key='group_ids'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(error)?;
     let mut ids: Vec<String> = serde_json::from_str(&raw).map_err(error)?;
-    if !ids.contains(&encoded) { return Err(MLSError::StorageFailed); }
+    if !ids.contains(&encoded) {
+        return Err(MLSError::StorageFailed);
+    }
     ids.retain(|id| id != &encoded);
-    tx.execute("UPDATE mls_manifests SET value=?1 WHERE key='group_ids'", [serde_json::to_string(&ids).map_err(error)?]).map_err(error)?;
-    let pending: Option<String> = tx.query_row("SELECT value FROM mls_manifests WHERE key='pending_external_joins'", [], |row| row.get(0)).optional().map_err(error)?;
+    tx.execute(
+        "UPDATE mls_manifests SET value=?1 WHERE key='group_ids'",
+        [serde_json::to_string(&ids).map_err(error)?],
+    )
+    .map_err(error)?;
+    let pending: Option<String> = tx
+        .query_row(
+            "SELECT value FROM mls_manifests WHERE key='pending_external_joins'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(error)?;
     if let Some(raw) = pending {
-        let mut pending: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw).map_err(error)?;
+        let mut pending: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&raw).map_err(error)?;
         pending.remove(&encoded);
-        tx.execute("UPDATE mls_manifests SET value=?1 WHERE key='pending_external_joins'", [serde_json::to_string(&pending).map_err(error)?]).map_err(error)?;
+        tx.execute(
+            "UPDATE mls_manifests SET value=?1 WHERE key='pending_external_joins'",
+            [serde_json::to_string(&pending).map_err(error)?],
+        )
+        .map_err(error)?;
     }
     record.phase = DirectRequestJournalPhase::RetiredPublished;
     write(&tx, &record)?;
@@ -392,67 +441,9 @@ pub(crate) fn resolve(
     use native::*;
     use openmls::prelude::*;
     use openmls_traits::OpenMlsProvider;
-    let verified =
-        verify_signed_request(DirectRequestKind::Outcome, receipt, authority_key).map_err(error)?;
-    let proof = &verified.body()["receipt"];
-    let tx = inner
-        .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
+    let tx = inner.manifest_storage.welcome_ack_connection().unchecked_transaction().map_err(error)?;
     let mut record = read(&tx, id)?.ok_or(MLSError::StorageFailed)?;
-    let digest = proof["requestDigest"]
-        .as_str()
-        .or_else(|| proof["requestDigest"]["$bytes"].as_str())
-        .and_then(|s| STANDARD.decode(s).ok())
-        .ok_or(MLSError::StorageFailed)?;
-    let preparation_digest = proof["preparationRequestDigest"]
-        .as_str()
-        .or_else(|| proof["preparationRequestDigest"]["$bytes"].as_str())
-        .and_then(|s| STANDARD.decode(s).ok())
-        .ok_or(MLSError::StorageFailed)?;
-    if proof["requestId"] != id
-        || preparation_digest != record.preparation_request_digest
-        || (published
-            && (proof["requestKind"] != "publish"
-                || Some(digest.as_slice())
-                    != record.publication_digest.as_ref().map(|v| v.as_slice())))
-    {
-        return Err(MLSError::invalid_input(
-            "Receipt does not fence exact request attempt",
-        ));
-    }
-    let (ctx, _) = super::direct_request_bootstrap::context(&record.bootstrap.context_json)?;
-    for field in ["actorDid", "actorDeviceId", "actorKeyId"] {
-        if proof[field] != ctx[field] {
-            return Err(MLSError::invalid_input(
-                "Receipt actor differs from prepared request",
-            ));
-        }
-    }
-    let kind = proof["$type"].as_str().ok_or(MLSError::StorageFailed)?;
-    if published {
-        if kind != "blue.catbird.chat.defs#directRequestPublishedReceipt"
-            || proof["coordinates"] != record.bootstrap.coordinates
-            || proof["conversationId"] != record.conversation_id
-            || proof["firstMessageId"] != record.first_message_id
-        {
-            return Err(MLSError::invalid_input(
-                "Published receipt coordinate mismatch",
-            ));
-        }
-    } else if ![
-        "blue.catbird.chat.defs#directRequestCancelledReceipt",
-        "blue.catbird.chat.defs#directRequestExpiredReceipt",
-        "blue.catbird.chat.defs#directRequestRejectedReceipt",
-        "blue.catbird.chat.defs#directRequestExistingDirectReceipt",
-    ]
-    .contains(&kind)
-    {
-        return Err(MLSError::invalid_input(
-            "Receipt is not terminal nonpublication",
-        ));
-    }
+    record.verify_terminal_receipt(receipt, authority_key, published)?;
     if let Some(old) = &record.terminal_receipt {
         if old != receipt {
             return Err(MLSError::invalid_input("Terminal receipt is immutable"));
@@ -877,4 +868,107 @@ impl DirectRequestJournal {
         }
         Ok(*verified.request_digest())
     }
+}
+
+/// Commit verified Closed preview custody and retire the exact native group in
+/// one transaction. Host tombstones follow this barrier and can be replayed.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn commit_closed_projection(
+    inner: &mut crate::mls_context::MLSContext,
+    cid: &str,
+    expected: &[u8],
+    next: &[u8],
+) -> Result<bool, MLSError> {
+    use native::*;
+    use openmls::prelude::*;
+    use openmls_traits::OpenMlsProvider;
+    use rusqlite::OptionalExtension;
+    let gid = super::direct_requests::validate_closed_request_projection(cid, expected, next)?;
+    let group_id = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &gid);
+    let mut journal = None;
+    for candidate in list(&inner.manifest_storage)? {
+        if candidate.conversation_id == cid {
+            if journal.is_some()
+                || candidate.bootstrap.coordinates["groupId"]
+                    != group_id
+                || !matches!(
+                    candidate.phase,
+                    DirectRequestJournalPhase::PublishedAwaitingProjection
+                        | DirectRequestJournalPhase::RequestSent
+                        | DirectRequestJournalPhase::RetiredPublished
+                )
+            {
+                return Err(MLSError::StorageFailed);
+            }
+            journal = Some(candidate);
+        }
+    }
+    let key = projection_key(cid)?;
+    let tx = inner
+        .manifest_storage
+        .welcome_ack_connection()
+        .unchecked_transaction()
+        .map_err(error)?;
+    let current: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
+            [&key],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(error)?;
+    if current.as_deref() == Some(next) {
+        drop(tx);
+        inner.manifest_storage.flush_database()?;
+        inner.groups.remove(&gid);
+        return Ok(true);
+    }
+    if current.as_deref() != Some(expected) {
+        return Ok(false);
+    }
+    let provider = Provider {
+        storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
+        crypto: inner.provider.crypto(),
+    };
+    let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&gid)).map_err(error)?;
+    let was_loaded = group.is_some();
+    if let Some(mut group) = group {
+        group.delete(provider.storage()).map_err(error)?;
+    }
+    let encoded = hex::encode(&gid);
+    let ids: Option<String> = tx
+        .query_row(
+            "SELECT value FROM mls_manifests WHERE key='group_ids'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(error)?;
+    let mut ids: Vec<String> = ids
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()
+        .map_err(error)?
+        .unwrap_or_default();
+    if was_loaded != ids.contains(&encoded) {
+        return Err(MLSError::StorageFailed);
+    }
+    ids.retain(|id| id != &encoded);
+    tx.execute(
+        "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES('group_ids',?1)",
+        [serde_json::to_string(&ids).map_err(error)?],
+    )
+    .map_err(error)?;
+    if let Some(mut journal) = journal {
+        journal.phase = DirectRequestJournalPhase::RetiredPublished;
+        write(&tx, &journal)?;
+    }
+    tx.execute(
+        "UPDATE mls_manifests SET value=?1 WHERE key=?2",
+        rusqlite::params![next, key],
+    )
+    .map_err(error)?;
+    tx.commit().map_err(error)?;
+    inner.manifest_storage.flush_database()?;
+    inner.groups.remove(&gid);
+    Ok(true)
 }

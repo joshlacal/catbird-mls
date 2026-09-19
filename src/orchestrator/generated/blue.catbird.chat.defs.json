@@ -8106,6 +8106,129 @@
           "ref": "#canonicalDatetime"
         }
       }
+    },
+    "pushRegistrationBody": {
+      "type": "object",
+      "description": "Device-signed push binding for the canonical authority. Transcript is the literal UTF8 signatureDomain, then protocolVersion, authorityDid, actorDid as u32-big-endian length-prefixed UTF8, actorDeviceId as16 raw UUID bytes, keyId as length-prefixed UTF8, authGeneration u64 big-endian, registrationId as16 UUID bytes, provider and appId as length-prefixed UTF8, tokenGeneration u64 big-endian, tokenSha256 as32 bytes, enabled as one byte0or1, signedAt as length-prefixed UTF8. First execution checks current immutable key and authentication generation, signature, five-minute freshness and monotonic token generation. Exact current binding retry retains the same signature and receipt. Top-level token must hash to tokenSha256 when enabled; disable omits token and uses SHA256(empty). New registrations start at tokenGeneration1; rotation/rebind increments it. Devices never share registrations.",
+      "required": [
+        "protocolVersion",
+        "signatureDomain",
+        "authorityDid",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "registrationId",
+        "provider",
+        "appId",
+        "tokenGeneration",
+        "tokenSha256",
+        "enabled",
+        "signedAt"
+      ],
+      "properties": {
+        "protocolVersion": {
+          "type": "string",
+          "enum": [
+            "2"
+          ]
+        },
+        "signatureDomain": {
+          "type": "string",
+          "const": "CATBIRD-CHAT-PUSH-BINDING\u0000"
+        },
+        "authorityDid": {
+          "type": "string",
+          "const": "did:web:chat.catbird.blue"
+        },
+        "actorDid": {
+          "type": "ref",
+          "ref": "#bareDid"
+        },
+        "actorDeviceId": {
+          "type": "ref",
+          "ref": "#deviceId"
+        },
+        "keyId": {
+          "type": "ref",
+          "ref": "#keyId"
+        },
+        "authGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "registrationId": {
+          "type": "ref",
+          "ref": "#operationId"
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "apns",
+            "fcm"
+          ]
+        },
+        "appId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "tokenGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "tokenSha256": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "signedAt": {
+          "type": "ref",
+          "ref": "#canonicalDatetime"
+        }
+      }
+    },
+    "signedPushRegistration": {
+      "type": "object",
+      "required": [
+        "body",
+        "signature"
+      ],
+      "properties": {
+        "body": {
+          "type": "ref",
+          "ref": "#pushRegistrationBody"
+        },
+        "signature": {
+          "type": "bytes",
+          "minLength": 64,
+          "maxLength": 64
+        }
+      }
+    },
+    "pushRegistrationBinding": {
+      "type": "object",
+      "description": "The canonical service acknowledged this exact signed device binding. The gateway commits its token registry only after matching this digest and body to the authenticated request; this is not a client-supplied authorization flag.",
+      "required": [
+        "body",
+        "bindingDigest"
+      ],
+      "properties": {
+        "body": {
+          "type": "ref",
+          "ref": "#pushRegistrationBody"
+        },
+        "bindingDigest": {
+          "type": "bytes",
+          "minLength": 32,
+          "maxLength": 32
+        }
+      }
     }
   }
 }

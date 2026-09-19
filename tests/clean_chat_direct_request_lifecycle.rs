@@ -122,6 +122,47 @@ fn last_request(world: &TestWorld, op: Op) -> Value {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_acceptance() {
+    sender_fixture(false).await;
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_pending_direct_retains_exact_prior_and_builds_successor_generation() {
+    sender_fixture(true).await;
+}
+async fn seed_pending_origin(world: &TestWorld, group: bool) -> (Value, Value) {
+    let alice = world.client("Alice");
+    let mut members = vec![world.client("Bob").did.clone()];
+    if group {
+        members.push("did:plc:cccccccccccccccccccccccc".into());
+    }
+    let mut view = alice
+        .orchestrator
+        .create_group("Pending", Some(&members), None)
+        .await
+        .unwrap();
+    let wrapper = last_request(world, Op::CreateConversation);
+    let b = &wrapper["signedRequest"]["body"];
+    let mut participants = b["manifest"]["participants"].clone();
+    for p in participants.as_array_mut().unwrap() {
+        p["leafCount"] = json!(if p["status"] == "active" { 1 } else { 0 });
+    }
+    let state = json!({"conversationKind":b["conversationKind"],"coordinates":b["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":participants,"leaves":[{"userDid":b["actorDid"],"deviceId":b["actorDeviceId"],"deviceStatus":"active","leafOrigin":"genesis","keyId":b["keyId"]}],"metadataSnapshot":b["metadataSnapshot"],"snapshotSeq":1});
+    view.canonical_state = Some(
+        catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+            &serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap(),
+    );
+    let cid = view.conversation_id.clone();
+    world
+        .delivery_service()
+        .set_conversation_view_for_test(&cid, view);
+    world
+        .delivery_service()
+        .set_lifecycle_state_for_test(&cid, state.clone());
+    let entry = json!({"$type":"blue.catbird.chat.defs#creationEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":wrapper["signedRequest"],"receivedAt":utc(0)});
+    (state, entry)
+}
+async fn sender_fixture(legacy: bool) {
     let mut world = TestWorld::new();
     for (name, did) in [
         ("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -137,14 +178,38 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
             .credentials
             .set_request_authority_document(doc.clone());
     }
+    let (invitation_state, invitation_entry) = seed_pending_origin(&world, true).await;
+    let invitation_provenance = invitation_state["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["userDid"] == world.client("Bob").did)
+        .unwrap()["invitationProvenance"]
+        .clone();
+    let legacy_state = if legacy {
+        Some(seed_pending_origin(&world, false).await.0)
+    } else {
+        None
+    };
+    world.delivery_service().queue_request_operation_response(
+        Op::GetEntries,
+        200,
+        json!({"entries":[invitation_entry],"hasMore":false,"nextAfterSeq":1}),
+    );
     let input = DirectRequestInput {
         draft_id: uuid::Uuid::new_v4().to_string(),
         recipient_did: world.client("Bob").did.clone(),
         text: "Real encrypted request".into(),
         invitation: Some(catbird_mls::GroupInvitationReference {
             authority_did: "did:web:chat.catbird.blue".into(),
-            conversation_id: uuid::Uuid::new_v4().to_string(),
-            invitation_transition_id: uuid::Uuid::new_v4().to_string(),
+            conversation_id: invitation_state["coordinates"]["conversationId"]
+                .as_str()
+                .unwrap()
+                .into(),
+            invitation_transition_id: invitation_provenance["invitationTransitionId"]
+                .as_str()
+                .unwrap()
+                .into(),
             invited_by_did: world.client("Alice").did.clone(),
             invited_by_device_id: world
                 .client("Alice")
@@ -246,6 +311,32 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
     assert_eq!(original, last_request(&world, Op::PrepareDirectRequest));
     let publication = last_request(&world, Op::PublishDirectRequest);
     let p = &publication["signedRequest"]["body"];
+    if let Some(legacy) = legacy_state {
+        assert_eq!(p["conversationId"], legacy["coordinates"]["conversationId"]);
+        assert_eq!(p["origin"]["exactPrior"], legacy["coordinates"]);
+        assert_eq!(
+            p["next"]["generation"].as_u64(),
+            Some(legacy["coordinates"]["generation"].as_u64().unwrap() + 1)
+        );
+        assert_eq!(
+            p["artifacts"]["metadataSnapshot"]["authorProof"]["originSeq"],
+            json!(2)
+        );
+        let raw = world
+            .client("Alice")
+            .orchestrator
+            .mls_context()
+            .read_direct_request_intent(&input.draft_id)
+            .unwrap()
+            .unwrap();
+        catbird_mls::orchestrator::direct_requests::DirectRequestIntent::decode(
+            &raw,
+            &world.client("Alice").did,
+            &device,
+        )
+        .unwrap();
+        return;
+    }
     let verified_publish = protocol::verify_signed_request(
         protocol::DirectRequestKind::Publish,
         &serde_json::to_vec(&publication["signedRequest"]).unwrap(),
@@ -293,7 +384,12 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
         .mls_context()
         .compare_exchange_direct_request_projection(cid, Some(&corrupted), &saved)
         .unwrap());
-    world.delivery_service().queue_request_operation_response(Op::GetEntries,200,json!({"entries":[{"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":publication["signedRequest"],"receivedAt":utc(0)}],"nextAfterSeq":1,"hasMore":false}));
+    let publication_entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":publication["signedRequest"],"receivedAt":receipt["body"]["receipt"]["recordedAt"]});
+    world.delivery_service().queue_request_operation_response(
+        Op::GetEntries,
+        200,
+        json!({"entries":[publication_entry],"nextAfterSeq":1,"hasMore":false}),
+    );
     world.delivery_service().queue_request_operation_response(
         Op::GetDirectRequestOutcome,
         200,
@@ -320,6 +416,43 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
             && !view.capabilities.can_administer
     );
     assert!(bob.storage.get_conversation_messages(cid).is_empty());
+    let intro_meta = view.introduction.as_ref().unwrap();
+    assert_eq!(intro_meta.sender_did, p["actorDid"]);
+    assert_eq!(intro_meta.sender_device_id, p["actorDeviceId"]);
+    assert_eq!(
+        intro_meta.received_at,
+        receipt["body"]["receipt"]["recordedAt"]
+    );
+    let request_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&publication_entry, cid)
+            .unwrap()
+            .unwrap();
+    world
+        .delivery_service()
+        .queue_incoming_page(vec![request_envelope.clone()], Some("1".into()));
+    let (messages, cursor) = bob
+        .orchestrator
+        .fetch_messages(cid, None, 100, None, None, None)
+        .await
+        .unwrap();
+    assert!(messages.is_empty());
+    assert_eq!(cursor.as_deref(), Some("1"));
+    assert!(bob.storage.get_conversation_messages(cid).is_empty());
+    let mut forged_entry = publication_entry.clone();
+    forged_entry["entryId"] = json!(uuid::Uuid::new_v4().to_string());
+    let forged =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&forged_entry, cid)
+            .unwrap()
+            .unwrap();
+    world
+        .delivery_service()
+        .queue_incoming_page(vec![forged], Some("2".into()));
+    assert!(bob
+        .orchestrator
+        .fetch_messages(cid, Some("1"), 100, None, None, None)
+        .await
+        .is_err());
+    assert!(bob.storage.get_conversation_messages(cid).is_empty());
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
@@ -335,6 +468,7 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
     );
     for name in ["Alice", "Bob"] {
         let ordinary = catbird_mls::orchestrator::IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: cid.into(),
             sender_did: world.client("Alice").did.clone(),
             ciphertext: vec![0; 32],
@@ -439,6 +573,27 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
         200,
         json!({"state":state}),
     );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetDeviceKey, 200,
+        json!({"ownerDid":p["recipientDid"],"deviceId":bob_device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"signaturePublicKey":STANDARD.encode([0u8;32])}),
+    );
+    let unverified = world
+        .client("Alice")
+        .orchestrator
+        .refresh_request_preview(&cid)
+        .await
+        .unwrap();
+    assert_eq!(unverified.consent, RequestConsent::OutgoingPending);
+    assert!(!unverified.capabilities.can_send);
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        json!({"state":state}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetDeviceKey, 200,
+        json!({"ownerDid":p["recipientDid"],"deviceId":bob_device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"signaturePublicKey":STANDARD.encode(&bob_public)}),
+    );
     let sender = world
         .client("Alice")
         .orchestrator
@@ -446,6 +601,123 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
         .await
         .unwrap();
     assert_eq!(sender.consent, RequestConsent::Accepted);
+    // The group-note lookup consumes a separate authenticated canonical state
+    // and exact signed policy invitation. It never reuses request consent.
+    let invitation_id = uuid::Uuid::new_v4().to_string();
+    let mut group_state = state.clone();
+    group_state.as_object_mut().unwrap().remove("directRequest");
+    group_state["conversationKind"] = json!("group");
+    group_state["coordinates"]["stateVersion"] = json!(3);
+    group_state["snapshotSeq"] = json!(3);
+    let provenance = json!({"invitationTransitionId":invitation_id,"invitedByDid":p["actorDid"],"invitedByDeviceId":p["actorDeviceId"]});
+    group_state["participants"][1]["status"] = json!("pending");
+    group_state["participants"][1]["leafCount"] = json!(0);
+    group_state["leaves"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|leaf| leaf["userDid"] != p["recipientDid"]);
+    group_state["participants"][1]["invitationProvenance"] = provenance.clone();
+    let invitation_body = json!({"$type":"blue.catbird.chat.defs#policyTransitionBody","signatureDomain":"CATBIRD-CHAT-POLICY\0","transitionId":invitation_id,"idempotencyKey":invitation_id,"actorDid":p["actorDid"],"actorDeviceId":p["actorDeviceId"],"keyId":p["keyId"],"authGeneration":1,"prior":state["coordinates"],"next":group_state["coordinates"],"participantChanges":[{"$type":"blue.catbird.chat.defs#addParticipant","userDid":p["recipientDid"],"role":"member","status":"pending","invitationProvenance":provenance}],"signedAt":utc(0)});
+    use catbird_mls::chat_v2::transcript::{
+        decode_strict_json, project_signed_body, SignedMutationKind, SigningTranscript,
+    };
+    let strict = decode_strict_json(&serde_json::to_vec(&invitation_body).unwrap()).unwrap();
+    let transcript = SigningTranscript::build_for(
+        SignedMutationKind::PolicyTransition,
+        &project_signed_body(SignedMutationKind::PolicyTransition, &strict).unwrap(),
+    )
+    .unwrap();
+    let author = world.client("Alice");
+    let signature = author
+        .orchestrator
+        .mls_context()
+        .sign_with_identity_key(
+            format!("{}#{}", author.did, p["actorDeviceId"].as_str().unwrap()),
+            transcript.bytes().to_vec(),
+        )
+        .unwrap();
+    author
+        .credentials
+        .set_authorized_device_keys(&author.did, vec![pubkey.clone()]);
+    let invitation_entry = json!({"$type":"blue.catbird.chat.defs#policyEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":3,"signedRequest":{"body":invitation_body,"signature":STANDARD.encode(signature)},"receivedAt":utc(0)});
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        json!({"state":group_state}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetEntries,
+        200,
+        json!({"entries":[invitation_entry],"hasMore":false,"nextAfterSeq":3}),
+    );
+    let link = author
+        .orchestrator
+        .get_group_invitation_reference(&cid, p["recipientDid"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.invitation_transition_id, invitation_id);
+    assert_eq!(link.recipient_did, p["recipientDid"]);
+    let mut forged_invitation = invitation_entry.clone();
+    forged_invitation["signedRequest"]["body"]["participantChanges"][0]["userDid"] =
+        json!("did:plc:cccccccccccccccccccccccc");
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        json!({"state":group_state}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetEntries,
+        200,
+        json!({"entries":[forged_invitation],"hasMore":false,"nextAfterSeq":3}),
+    );
+    assert!(author
+        .orchestrator
+        .get_group_invitation_reference(&cid, p["recipientDid"].as_str().unwrap())
+        .await
+        .is_err());
+    group_state["participants"][1]["status"] = json!("active");
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        json!({"state":group_state}),
+    );
+    assert!(author
+        .orchestrator
+        .get_group_invitation_reference(&cid, p["recipientDid"].as_str().unwrap())
+        .await
+        .unwrap()
+        .is_none());
+    let mut acceptance_entry = proof["entry"].clone();
+    acceptance_entry["$type"] = json!("blue.catbird.chat.defs#directRequestAcceptanceEntry");
+    let acceptance_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&acceptance_entry, &cid)
+            .unwrap()
+            .unwrap();
+    world
+        .delivery_service()
+        .queue_incoming_page(vec![acceptance_envelope.clone()], Some("2".into()));
+    let (introduced, cursor) = world
+        .client("Alice")
+        .orchestrator
+        .fetch_messages(&cid, None, 100, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(cursor.as_deref(), Some("2"));
+    assert_eq!(introduced.len(), 1);
+    assert_eq!(introduced[0].id, p["firstMessageId"]);
+    assert_eq!(introduced[0].sender_did, p["actorDid"]);
+    assert_eq!(introduced[0].text, input.text);
+    world
+        .delivery_service()
+        .queue_incoming_page(vec![acceptance_envelope], Some("2".into()));
+    let (duplicate, _) = world
+        .client("Alice")
+        .orchestrator
+        .fetch_messages(&cid, None, 100, None, None, None)
+        .await
+        .unwrap();
+    assert!(duplicate.is_empty());
     let native_policy = world
         .client("Alice")
         .orchestrator
@@ -459,6 +731,139 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
         .unwrap()
         .acceptance_proof
         .is_some());
+    use catbird_mls::orchestrator::MLSStorageBackend;
+    assert_eq!(
+        world
+            .client("Alice")
+            .orchestrator
+            .list_direct_request_views()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let alice = world.client("Alice");
+    let actor_public = alice
+        .orchestrator
+        .mls_context()
+        .identity_public_key(format!(
+            "{}#{}",
+            alice.did,
+            alice.orchestrator.require_actor_device_id().await.unwrap()
+        ))
+        .unwrap();
+    alice
+        .credentials
+        .set_authorized_device_keys(&alice.did, vec![actor_public]);
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        json!({"state":state}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::CloseConversation,
+        503,
+        json!({"error":"lost"}),
+    );
+    assert!(alice.orchestrator.close_direct_request(&cid).await.is_err());
+    assert_ne!(
+        alice
+            .orchestrator
+            .list_direct_request_views()
+            .await
+            .unwrap()[0]
+            .consent,
+        RequestConsent::Closed
+    );
+    let close = last_request(&world, Op::CloseConversation);
+    let body = &close["signedRequest"]["body"];
+    let tombstone = json!({"$type":"blue.catbird.chat.defs#conversationCloseTombstone","conversationId":cid,"conversationKind":"direct","retired":body["retired"],"closedByDid":body["actorDid"],"closedByDeviceId":body["actorDeviceId"],"terminalSeq":3,"closedAt":utc(0)});
+    let entry = json!({"$type":"blue.catbird.chat.defs#conversationCloseEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":3,"signedRequest":close["signedRequest"],"receivedAt":tombstone["closedAt"],"tombstone":tombstone});
+    world.delivery_service().queue_request_operation_response(
+        Op::CloseConversation,
+        200,
+        json!({"result":{"entry":entry,"tombstone":tombstone}}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        404,
+        json!({"error":"ConversationNotFound"}),
+    );
+    let closed = alice.orchestrator.close_direct_request(&cid).await.unwrap();
+    assert_eq!(closed.consent, RequestConsent::Closed);
+    assert!(!closed.capabilities.can_send);
+    let closed_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&entry, &cid)
+            .unwrap()
+            .unwrap();
+    assert!(alice
+        .orchestrator
+        .process_incoming_message(&closed_envelope)
+        .await
+        .is_ok());
+    assert!(alice
+        .orchestrator
+        .process_incoming_message(&closed_envelope)
+        .await
+        .is_ok());
+    assert_eq!(close, last_request(&world, Op::CloseConversation));
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .get_epoch(
+            STANDARD
+                .decode(p["next"]["groupId"].as_str().unwrap())
+                .unwrap()
+        )
+        .is_err());
+    assert_eq!(alice.orchestrator.mls_context().list_direct_request_journal().unwrap()[0].phase,catbird_mls::orchestrator::direct_request_journal::DirectRequestJournalPhase::RetiredPublished);
+    let projection = alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_projection(&cid)
+        .unwrap();
+    alice
+        .storage
+        .delete_conversations(&alice.did, &[&cid])
+        .await
+        .unwrap();
+    assert!(
+        matches!(alice.orchestrator.resume_direct_request(&input.draft_id).await,Err(OrchestratorError::InvalidInput(code)) if code=="RequestRetired")
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .refresh_request_preview(&cid)
+            .await
+            .unwrap()
+            .consent,
+        RequestConsent::Closed
+    );
+    assert!(alice
+        .storage
+        .get_conversation(&alice.did, &cid)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .read_direct_request_projection(&cid)
+            .unwrap(),
+        projection
+    );
+    world.restart_client("Alice").await;
+    assert_eq!(
+        world
+            .client("Alice")
+            .orchestrator
+            .list_direct_request_views()
+            .await
+            .unwrap()[0]
+            .consent,
+        RequestConsent::Closed
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -597,5 +1002,366 @@ async fn cancellation_proof_fences_edits_and_retains_exact_prior_attempt_across_
             .unwrap()
             .unwrap(),
         raw
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_key_pool_retries_exact_durable_batch_and_counts_reserved_custody() {
+    use catbird_mls::orchestrator::direct_request_keys::DirectRequestKeyPublication;
+    let mut world = TestWorld::new();
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let device = alice.orchestrator.require_actor_device_id().await.unwrap();
+    let public = alice
+        .orchestrator
+        .mls_context()
+        .identity_public_key(format!("{}#{device}", alice.did))
+        .unwrap();
+    let generation = alice
+        .credentials
+        .get_auth_generation(&alice.did)
+        .await
+        .unwrap()
+        .unwrap();
+    let stats = |usable, reserved, revision, enabled| json!({"items":[{"device":{"deviceId":device,"status":"active","keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&public)),"signaturePublicKey":STANDARD.encode(&public),"authGeneration":generation},"directRequestKeyPool":{"enabled":enabled,"revision":revision,"usableCount":usable,"reservedCount":reserved,"asOf":utc(0),"usableUntil":utc(605400)}}],"hasMore":false});
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(0, 0, 1, false),
+    );
+    alice
+        .orchestrator
+        .replenish_direct_request_keys_if_needed()
+        .await
+        .unwrap();
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_key_publication(&device)
+        .unwrap()
+        .is_none());
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(0, 64, 1, true),
+    );
+    alice
+        .orchestrator
+        .replenish_direct_request_keys_if_needed()
+        .await
+        .unwrap();
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_key_publication(&device)
+        .unwrap()
+        .is_none());
+    let before = alice
+        .orchestrator
+        .mls_context()
+        .list_key_package_hashes()
+        .unwrap()
+        .len();
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(0, 62, 1, true),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequestKeys,
+        503,
+        json!({"error":"temporary"}),
+    );
+    assert!(alice
+        .orchestrator
+        .replenish_direct_request_keys_if_needed()
+        .await
+        .is_err());
+    let raw = alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_key_publication(&device)
+        .unwrap()
+        .unwrap();
+    let record = DirectRequestKeyPublication::decode(&raw, &alice.did, &device).unwrap();
+    assert!(!record.acknowledged);
+    assert_eq!(record.body().unwrap()["keys"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_key_package_hashes()
+            .unwrap()
+            .len(),
+        before + 2
+    );
+    world.restart_client("Alice").await;
+    let alice = world.client("Alice");
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .read_direct_request_key_publication(&device)
+            .unwrap()
+            .unwrap(),
+        raw
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(0, 64, 1, true),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequestKeys,
+        200,
+        json!({"revision":2,"enabled":true}),
+    );
+    alice
+        .orchestrator
+        .replenish_direct_request_keys_if_needed()
+        .await
+        .unwrap();
+    let sent: Vec<_> = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .filter(|r| r.operation == Op::PublishDirectRequestKeys)
+        .collect();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].body.as_ref().unwrap(), &record.exact_request);
+    assert_eq!(sent[0].body, sent[1].body);
+    let acknowledged = alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_key_publication(&device)
+        .unwrap()
+        .unwrap();
+    assert!(
+        DirectRequestKeyPublication::decode(&acknowledged, &alice.did, &device)
+            .unwrap()
+            .acknowledged
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_key_package_hashes()
+            .unwrap()
+            .len(),
+        before + 2
+    );
+    // Explicit revocation is a zero-key signed next revision. A lost reply
+    // is retained byte-for-byte on ordinary retry, never reported confirmed.
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(2, 62, 2, true),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequestKeys,
+        503,
+        json!({"error":"temporary"}),
+    );
+    assert!(alice
+        .orchestrator
+        .set_direct_request_delivery_enabled(false)
+        .await
+        .is_err());
+    let revocation = alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_key_publication(&device)
+        .unwrap()
+        .unwrap();
+    let pending = DirectRequestKeyPublication::decode(&revocation, &alice.did, &device).unwrap();
+    assert_eq!(pending.body().unwrap()["enabled"], false);
+    assert!(pending.body().unwrap()["keys"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!pending.acknowledged);
+    assert_eq!(
+        alice
+            .orchestrator
+            .get_direct_request_delivery_enabled()
+            .await
+            .unwrap(),
+        None
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(0, 0, 3, false),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequestKeys,
+        200,
+        json!({"revision":3,"enabled":false}),
+    );
+    alice
+        .orchestrator
+        .replenish_direct_request_keys_if_needed()
+        .await
+        .unwrap();
+    let latest = last_request(&world, Op::PublishDirectRequestKeys);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&pending.exact_request).unwrap(),
+        latest
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_key_package_hashes()
+            .unwrap()
+            .len(),
+        before + 2
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .get_direct_request_delivery_enabled()
+            .await
+            .unwrap(),
+        Some(false)
+    );
+    // Only an explicit enable creates the initial full request-purpose pool.
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(0, 0, 3, false),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequestKeys,
+        200,
+        json!({"revision":4,"enabled":true}),
+    );
+    alice
+        .orchestrator
+        .set_direct_request_delivery_enabled(true)
+        .await
+        .unwrap();
+    assert_eq!(
+        last_request(&world, Op::PublishDirectRequestKeys)["signedRequest"]["body"]["keys"]
+            .as_array()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_key_package_hashes()
+            .unwrap()
+            .len(),
+        before + 66
+    );
+    // A new explicit preference may supersede an unknown older revision. Only
+    // acknowledgment of the higher revision establishes the new preference.
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(64, 0, 4, true),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequestKeys,
+        503,
+        json!({"error":"lost"}),
+    );
+    assert!(alice
+        .orchestrator
+        .set_direct_request_delivery_enabled(false)
+        .await
+        .is_err());
+    let old_unknown = alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_key_publication(&device)
+        .unwrap()
+        .unwrap();
+    world.delivery_service().queue_request_operation_response(
+        Op::GetOwnDevices,
+        200,
+        stats(64, 0, 4, true),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequestKeys,
+        200,
+        json!({"revision":6,"enabled":true}),
+    );
+    alice
+        .orchestrator
+        .set_direct_request_delivery_enabled(true)
+        .await
+        .unwrap();
+    assert_eq!(
+        alice
+            .orchestrator
+            .get_direct_request_delivery_enabled()
+            .await
+            .unwrap(),
+        Some(true)
+    );
+    let mut late = DirectRequestKeyPublication::decode(&old_unknown, &alice.did, &device).unwrap();
+    late.acknowledged = true;
+    assert!(!alice
+        .orchestrator
+        .mls_context()
+        .acknowledge_direct_request_key_publication(
+            &device,
+            &old_unknown,
+            &serde_json::to_vec(&late).unwrap()
+        )
+        .unwrap());
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_key_package_hashes()
+            .unwrap()
+            .len(),
+        before + 66
+    );
+    let retained = alice
+        .orchestrator
+        .mls_context()
+        .read_direct_request_key_publication(&device)
+        .unwrap()
+        .unwrap();
+    let too_many =
+        catbird_mls::orchestrator::direct_request_keys::DirectRequestKeyPublicationInput {
+            actor_did: alice.did.clone(),
+            actor_device_id: device.clone(),
+            auth_generation: 1,
+            revision: 7,
+            count: 64,
+            enabled: true,
+        };
+    assert!(alice
+        .orchestrator
+        .mls_context()
+        .prepare_direct_request_key_publication(&too_many, Some(&retained))
+        .is_err());
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .read_direct_request_key_publication(&device)
+            .unwrap()
+            .unwrap(),
+        retained
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_key_package_hashes()
+            .unwrap()
+            .len(),
+        before + 66
     );
 }

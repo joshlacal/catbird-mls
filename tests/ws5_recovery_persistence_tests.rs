@@ -1248,6 +1248,7 @@ async fn quarantine_entry_clears_persisted_backoff_no_ghost_lockout() {
     let mut frame_errors = Vec::new();
     for i in 0..3 {
         let envelope = IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: convo_id.clone(),
             sender_did: "did:plc:mallory".to_string(),
             ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
@@ -1328,6 +1329,7 @@ async fn quarantine_entry_projection_serializes_with_reset_authority() {
     for i in 0..2 {
         let _ = orchestrator
             .process_incoming(&IncomingEnvelope {
+                canonical_entry_json: None,
                 conversation_id: convo_id.clone(),
                 sender_did: "did:plc:mallory".to_string(),
                 ciphertext: format!("entry-race-{i}").into_bytes(),
@@ -1340,6 +1342,7 @@ async fn quarantine_entry_projection_serializes_with_reset_authority() {
     }
     let state_barrier = storage.pause_next_conversation_state_write_any(&convo_id);
     let third_frame = IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: convo_id.clone(),
         sender_did: "did:plc:mallory".to_string(),
         ciphertext: b"entry-race-2".to_vec(),
@@ -1516,6 +1519,7 @@ async fn quarantine_exit_projection_serializes_with_reset_authority() {
         .merge_pending_commit(group.clone())
         .unwrap();
     let envelope = IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: convo_id.clone(),
         sender_did: bob.did.clone(),
         ciphertext: commit,
@@ -1605,6 +1609,7 @@ async fn decrypt_failure_projection_preserves_reset_authority() {
     for i in 0..3 {
         let _ = orchestrator
             .process_incoming(&IncomingEnvelope {
+                canonical_entry_json: None,
                 conversation_id: convo_id.clone(),
                 sender_did: "did:plc:mallory".to_string(),
                 ciphertext: format!("self-bad-{i}").into_bytes(),
@@ -1673,6 +1678,7 @@ async fn failing_quarantine_persists_escalate() {
         .await;
 
     let frame = |i: usize| IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: convo_id.clone(),
         sender_did: "did:plc:mallory".to_string(),
         ciphertext: format!("peer-bad-frame-{i}").into_bytes(),
@@ -1775,6 +1781,7 @@ async fn server_reset_exits_quarantine_even_when_the_backstop_clear_fails() {
     // tracker and the persisted row.
     for i in 0..3 {
         let envelope = IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: convo_id.clone(),
             sender_did: "did:plc:mallory".to_string(),
             ciphertext: format!("peer-bad-frame-{i}").into_bytes(),

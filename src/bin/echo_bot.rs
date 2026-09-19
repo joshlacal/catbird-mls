@@ -1056,6 +1056,7 @@ fn parse_incoming_envelope(convo_id: &str, val: &serde_json::Value) -> Option<In
         .or_else(|| val["epoch"].as_u64());
 
     Some(IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: convo_id.to_string(),
         sender_did,
         ciphertext,

@@ -233,6 +233,7 @@ fn recovery_request_count(world: &TestWorld) -> usize {
 async fn assert_remaining_members_converge(world: &TestWorld, cid: &str, group: &[u8]) {
     let body = removal_body(world);
     let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: cid.into(),
         sender_did: world.client("Alice").did.clone(),
         ciphertext: STANDARD

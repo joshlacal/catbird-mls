@@ -585,6 +585,7 @@ pub struct FFIMessagesPage {
 
 #[derive(uniffi::Record, Clone)]
 pub struct FFIIncomingEnvelope {
+    pub canonical_entry_json: Option<String>,
     pub conversation_id: String,
     pub sender_did: String,
     pub ciphertext: Vec<u8>,
@@ -1319,6 +1320,7 @@ pub(crate) fn ffi_incoming_envelope_to_internal(
     let timestamp = envelope.timestamp.parse::<chrono::DateTime<chrono::Utc>>()
         .map_err(|_| crate::orchestrator::OrchestratorError::InvalidInput("Invalid incoming message timestamp".into()))?;
     let result = IncomingEnvelope {
+        canonical_entry_json: envelope.canonical_entry_json,
         conversation_id: envelope.conversation_id,
         sender_did: envelope.sender_did,
         ciphertext: envelope.ciphertext,
@@ -3055,6 +3057,18 @@ impl OrchestratorBridge {
         Ok(conversations.iter().map(convo_view_to_ffi).collect::<crate::orchestrator::Result<Vec<_>>>()?)
     }
 
+    pub fn get_group_invitation_reference(&self, conversation_id:String, recipient_did:String) -> Result<Option<crate::GroupInvitationReference>, OrchestratorBridgeError> {
+        Ok(self.engine.get_group_invitation_reference(&conversation_id,&recipient_did)?)
+    }
+    pub fn get_direct_request_delivery_enabled(&self) -> Result<Option<bool>, OrchestratorBridgeError> {
+        Ok(self.engine.get_direct_request_delivery_enabled()?)
+    }
+    pub fn close_direct_request(&self, conversation_id: String) -> Result<crate::DirectRequestView, OrchestratorBridgeError> {
+        Ok(self.engine.close_direct_request(&conversation_id)?)
+    }
+    pub fn set_direct_request_delivery_enabled(&self, enabled: bool) -> Result<(), OrchestratorBridgeError> {
+        Ok(self.engine.set_direct_request_delivery_enabled(enabled)?)
+    }
     pub fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>, OrchestratorBridgeError> {
         Ok(self.engine.list_direct_request_views()?)
     }

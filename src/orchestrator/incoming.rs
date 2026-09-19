@@ -45,6 +45,26 @@ impl IncomingEnvelope {
         entry: &Value,
         expected_conversation_id: &str,
     ) -> Result<Option<Self>> {
+        if matches!(entry["$type"].as_str(), Some("blue.catbird.chat.defs#directRequestEntry" | "blue.catbird.chat.defs#directRequestAcceptanceEntry" | "blue.catbird.chat.defs#conversationCloseEntry")) {
+            let body = &entry["signedRequest"]["body"];
+            let coordinate = if entry["$type"] == "blue.catbird.chat.defs#conversationCloseEntry" { &body["prior"] } else { &body["next"] };
+            let cid = entry["conversationId"].as_str().ok_or_else(|| invalid("conversationId"))?;
+            if cid != expected_conversation_id || coordinate["conversationId"] != cid { return Err(invalid("control conversation binding")); }
+            let received_at = entry["receivedAt"].as_str().ok_or_else(|| invalid("receivedAt"))?;
+            CanonicalTimestamp::parse(received_at).map_err(|_| invalid("receivedAt"))?;
+            let envelope = Self {
+                canonical_entry_json: Some(serde_json::to_string(entry).map_err(|_| invalid("control JSON"))?),
+                conversation_id: cid.into(),
+                sender_did: body["actorDid"].as_str().ok_or_else(|| invalid("actorDid"))?.into(),
+                ciphertext: Vec::new(),
+                timestamp: received_at.parse().map_err(|_| invalid("receivedAt"))?,
+                server_message_id: Some(entry["entryId"].as_str().ok_or_else(|| invalid("entryId"))?.into()),
+                server_sequence: Some(entry["seq"].as_u64().ok_or_else(|| invalid("seq"))?),
+                server_epoch: Some(coordinate["epoch"].as_u64().ok_or_else(|| invalid("epoch"))?),
+            };
+            envelope.validate_server_metadata()?;
+            return Ok(Some(envelope));
+        }
         let application = match entry["$type"].as_str() {
             Some(APPLICATION_ENTRY_KIND) => true,
             Some(
@@ -107,6 +127,7 @@ impl IncomingEnvelope {
             "canonical entry ciphertext",
         )?;
         let envelope = Self {
+            canonical_entry_json: None,
             conversation_id: conversation_id.into(),
             sender_did: actor.into(),
             ciphertext,
@@ -216,6 +237,7 @@ mod tests {
     #[test]
     fn ffi_projection_preserves_metadata_and_rejects_conflicting_epochs_or_invalid_time() {
         let envelope = crate::orchestrator_bridge::FFIIncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: CID.into(),
             sender_did: "did:plc:alice".into(),
             ciphertext: vec![1, 2, 3],

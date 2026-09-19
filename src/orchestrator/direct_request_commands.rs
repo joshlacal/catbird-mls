@@ -127,6 +127,22 @@ where
             previous_attempts = previous.previous_attempts;
             previous_attempts.push(terminal);
         }
+        if let Some(reference) = &input.invitation {
+            if reference.invited_by_did != owner
+                || self
+                    .get_group_invitation_reference(
+                        &reference.conversation_id,
+                        &reference.recipient_did,
+                    )
+                    .await?
+                    .as_ref()
+                    != Some(reference)
+            {
+                return Err(OrchestratorError::InvalidInput(
+                    "Group invitation is no longer eligible for a note".into(),
+                ));
+            }
+        }
         let document = self
             .credentials()
             .direct_request_receipt_authority_document()
@@ -145,8 +161,21 @@ where
             .get_auth_generation(&owner)
             .await?
             .ok_or_else(invalid)?;
+        let legacy_origin_snapshot = self
+            .discover_direct_request_origin(&owner, &input.recipient_did)
+            .await?;
+        let origin = match &legacy_origin_snapshot {
+            Some(state) => super::origin::legacy_origin(state, &owner, &input.recipient_did)?
+                .ok_or_else(invalid)?,
+            None => json!({"$type":"blue.catbird.chat.defs#freshDirectOrigin"}),
+        };
+        let conversation_id = legacy_origin_snapshot
+            .as_ref()
+            .and_then(|s| s["coordinates"]["conversationId"].as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let request_id = Uuid::new_v4().to_string();
-        let body = json!({"$type":"blue.catbird.chat.defs#directRequestPreparationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PREPARE\0","protocolVersion":"2","actorDid":owner,"actorDeviceId":device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&public)),"authGeneration":generation,"requestId":request_id,"firstMessageId":Uuid::new_v4().to_string(),"conversationId":Uuid::new_v4().to_string(),"recipientDid":input.recipient_did,"origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},"profile":"encryptedIntroduction1","idempotencyKey":request_id,"signedAt":now()});
+        let body = json!({"$type":"blue.catbird.chat.defs#directRequestPreparationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PREPARE\0","protocolVersion":"2","actorDid":owner,"actorDeviceId":device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&public)),"authGeneration":generation,"requestId":request_id,"firstMessageId":Uuid::new_v4().to_string(),"conversationId":conversation_id,"recipientDid":input.recipient_did,"origin":origin,"profile":"encryptedIntroduction1","idempotencyKey":request_id,"signedAt":now()});
         let wrapper = self
             .sign_direct_request_body(DirectRequestKind::Prepare, body)
             .await?;
@@ -156,6 +185,7 @@ where
             actor_device_id: device,
             actor_public_key: public,
             prepare_wrapper: wrapper,
+            legacy_origin_snapshot,
             trusted_authority_document: document,
             preparation_response: None,
             cancel_wrapper: None,
@@ -191,7 +221,7 @@ where
         let intent = DirectRequestIntent::decode(&raw, &owner, &device)?;
         self.resume_direct_request_locked(intent, raw).await
     }
-    pub(super) fn require_direct_request_support(&self) -> Result<()> {
+    pub(crate) fn require_direct_request_support(&self) -> Result<()> {
         if !self.mls_context().supports_direct_request_bootstrap() {
             return Err(OrchestratorError::Mls(
                 crate::MLSError::OperationNotSupported {
@@ -456,7 +486,13 @@ where
                     draft_id: intent.input.draft_id.clone(),
                     context_json: serde_json::to_vec(&context).map_err(|_| invalid())?,
                     group_id: rand::random::<[u8; 32]>().to_vec(),
-                    generation: 0,
+                    generation: match &intent.legacy_origin_snapshot {
+                        Some(s) => s["coordinates"]["generation"]
+                            .as_u64()
+                            .and_then(|g| g.checked_add(1))
+                            .ok_or_else(invalid)?,
+                        None => 0,
+                    },
                     state_version: 1,
                     key_packages: packages,
                     expected_package_refs: refs,
@@ -501,7 +537,7 @@ where
         body["importUntil"] = json!(import_until);
         let artifact = |data: &[u8], content_type: &str| json!({"framing":"mlsMessage","contentType":content_type,"bytes":STANDARD.encode(data),"sha256":STANDARD.encode(Sha256::digest(data))});
         let deliveries=preparation["selectedDevices"].as_array().ok_or_else(invalid)?.iter().map(|d|json!({"recipientDid":d["actorDid"],"recipientDeviceId":d["actorDeviceId"],"provenance":{"requestId":journal.request_id,"preparationDigest":preparation["preparationDigest"],"contextHash":STANDARD.encode(b.context_hash),"grantId":d["grant"]["body"]["grantId"],"grantRevision":d["grant"]["body"]["grantRevision"],"keyPackageRef":d["keyPackage"]["keyPackageRef"],"importUntil":import_until}})).collect::<Vec<_>>();
-        let author = json!({"authorDid":body["actorDid"],"authorDeviceId":body["actorDeviceId"],"authorKeyId":body["keyId"],"signaturePublicKey":STANDARD.encode(&intent.actor_public_key),"authGenerationAtOrigin":body["authGeneration"],"originTransitionId":journal.request_id,"originSeq":1,"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"});
+        let author = json!({"authorDid":body["actorDid"],"authorDeviceId":body["actorDeviceId"],"authorKeyId":body["keyId"],"signaturePublicKey":STANDARD.encode(&intent.actor_public_key),"authGenerationAtOrigin":body["authGeneration"],"originTransitionId":journal.request_id,"originSeq":match &intent.legacy_origin_snapshot { Some(s) => s["snapshotSeq"].as_u64().and_then(|n| n.checked_add(1)).ok_or_else(invalid)?, None => 1 },"roleAtOrigin":"admin","deviceStatusAtOrigin":"active"});
         body["artifacts"] = json!({"genesisGroupInfo":artifact(&b.genesis_group_info,"groupInfo"),"addCommit":artifact(&b.add_commit,"publicMessageCommit"),"finalGroupInfo":artifact(&b.final_group_info,"groupInfo"),"welcome":{"opaqueWelcome":STANDARD.encode(&b.welcome),"sha256":STANDARD.encode(Sha256::digest(&b.welcome)),"deliveries":deliveries},"initialCiphertext":STANDARD.encode(&b.initial_ciphertext),"metadataSnapshot":{"coordinate":direct_request_bootstrap::metadata_coordinate(&b.coordinates)?,"originTransitionId":journal.request_id,"metadataVersion":1,"nonce":STANDARD.encode(&b.metadata_nonce),"ciphertext":STANDARD.encode(&b.metadata_ciphertext),"ciphertextSha256":STANDARD.encode(Sha256::digest(&b.metadata_ciphertext)),"ciphertextSize":b.metadata_ciphertext.len(),"authorProof":author}});
         self.sign_direct_request_body(DirectRequestKind::Publish, body)
             .await
@@ -651,7 +687,8 @@ where
         let kind = proof["$type"].as_str().ok_or_else(invalid)?;
         if kind == "blue.catbird.chat.defs#directRequestPublishedReceipt" {
             let journal = journal.ok_or_else(invalid)?;
-            if journal.phase == direct_request_journal::DirectRequestJournalPhase::RetiredPublished {
+            if journal.phase == direct_request_journal::DirectRequestJournalPhase::RetiredPublished
+            {
                 return Err(OrchestratorError::InvalidInput("RequestRetired".into()));
             }
             let adopted = self
@@ -668,6 +705,7 @@ where
                 owner_did: intent.actor_did.clone(),
                 device_id: intent.actor_device_id.clone(),
                 trusted_authority_document: intent.trusted_authority_document.clone(),
+                publication_entry: None,
                 publication: serde_json::to_vec(wrapper).map_err(|_| invalid())?,
                 sender_public_key: intent.actor_public_key.clone(),
                 publication_receipt: receipt.to_vec(),
@@ -679,6 +717,7 @@ where
                 acceptance_proof: None,
                 recipient_public_key: None,
                 pending_acceptance: None,
+                close_proof: None,
             };
             let current = self
                 .mls_context()

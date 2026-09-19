@@ -13,6 +13,8 @@ pub struct DirectRequestIntent {
     pub actor_public_key: Vec<u8>,
     /// Immutable signed wrapper, persisted BEFORE the prepare RPC is invoked.
     pub prepare_wrapper: Vec<u8>,
+    #[serde(default)]
+    pub legacy_origin_snapshot: Option<serde_json::Value>,
     /// Authenticated authority document retained before reservation, permitting
     /// exact receipt verification across offline restart and key rotation.
     pub trusted_authority_document: Vec<u8>,
@@ -55,6 +57,28 @@ impl DirectRequestIntent {
             || prepare.body()["recipientDid"] != self.input.recipient_did
         {
             return Err(invalid());
+        }
+        match &self.legacy_origin_snapshot {
+            Some(snapshot) => {
+                crate::orchestrator::canonical_transport::decode_conversation_state(
+                    &serde_json::to_vec(snapshot).map_err(|_| invalid())?,
+                )
+                .map_err(|_| invalid())?;
+                let origin =
+                    super::origin::legacy_origin(snapshot, owner, &self.input.recipient_did)?
+                        .ok_or_else(invalid)?;
+                if prepare.body()["origin"] != origin
+                    || prepare.body()["conversationId"] != snapshot["coordinates"]["conversationId"]
+                {
+                    return Err(invalid());
+                }
+            }
+            None if prepare.body()["origin"]["$type"]
+                != "blue.catbird.chat.defs#freshDirectOrigin" =>
+            {
+                return Err(invalid())
+            }
+            None => {}
         }
         if let Some(wrapper) = &self.cancel_wrapper {
             let cancel =
@@ -128,6 +152,19 @@ impl DirectRequestIntent {
                 serde_json::from_slice(self.preparation_response.as_ref().ok_or_else(invalid)?)
                     .map_err(|_| invalid())?;
             if publication.body()["preparationDigest"] != snapshot["preparationDigest"] {
+                return Err(invalid());
+            }
+            let expected_seq = match &self.legacy_origin_snapshot {
+                Some(state) => state["snapshotSeq"]
+                    .as_u64()
+                    .and_then(|s| s.checked_add(1))
+                    .ok_or_else(invalid)?,
+                None => 1,
+            };
+            if publication.body()["artifacts"]["metadataSnapshot"]["authorProof"]["originSeq"]
+                .as_u64()
+                != Some(expected_seq)
+            {
                 return Err(invalid());
             }
             for field in [

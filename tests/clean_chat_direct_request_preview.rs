@@ -7,6 +7,7 @@ use catbird_mls::{
 
 fn pending(consent: RequestConsent) -> DirectRequestView {
     DirectRequestView {
+        introduction: None,
         conversation_id: "11111111-1111-4111-8111-111111111111".into(),
         first_message_id: Some("22222222-2222-4222-8222-222222222222".into()),
         consent,

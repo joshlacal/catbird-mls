@@ -24,6 +24,7 @@ use crate::atproto::blue_catbird::chat::{
     get_conversation_state::GetConversationStateRequest,
     get_conversations::{GetConversations, GetConversationsRequest},
     get_devices::GetDevicesRequest,
+    get_device_key::GetDeviceKeyRequest,
     get_entries::{GetEntries, GetEntriesRequest},
     get_leaf_recovery_inbox::GetLeafRecoveryInboxRequest,
     get_own_devices::GetOwnDevicesRequest,
@@ -219,6 +220,7 @@ pub enum CleanChatRequest {
     GetBlobUsage(GetBlobUsageRequestBody),
     GetConversationState(GetConversationStateRequestBody),
     GetDevices(GetDevicesRequestBody),
+    GetDeviceKey(GetDeviceKeyRequestBody),
     GetEntries(GetEntries<String>),
     GetLeafRecoveryInbox(GetLeafRecoveryInboxRequestBody),
     GetOwnDevices(GetOwnDevicesRequestBody),
@@ -262,6 +264,8 @@ pub type GetConversationStateRequestBody =
     crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationState<String>;
 pub type GetDevicesRequestBody =
     crate::atproto::blue_catbird::chat::get_devices::GetDevices<String>;
+pub type GetDeviceKeyRequestBody =
+    crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKey<String>;
 pub type GetLeafRecoveryInboxRequestBody =
     crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInbox<String>;
 pub type GetOwnDevicesRequestBody =
@@ -333,6 +337,7 @@ pub enum CleanChatResponse {
         >,
     ),
     GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>),
+    GetDeviceKey(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyOutput<String>),
     GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>),
     GetLeafRecoveryInbox(
         crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxOutput<
@@ -410,6 +415,7 @@ pub enum CleanChatError {
         crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError,
     ),
     GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError),
+    GetDeviceKey(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyError),
     GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesError),
     GetLeafRecoveryInbox(
         crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxError,
@@ -463,6 +469,7 @@ pub enum CleanChatOperationFfi {
     GetBlobUsage,
     GetConversationState,
     GetDevices,
+    GetDeviceKey,
     GetEntries,
     GetLeafRecoveryInbox,
     GetOwnDevices,
@@ -505,6 +512,7 @@ impl From<CleanChatOperationFfi> for CanonicalOperation {
             CleanChatOperationFfi::GetBlobUsage => Self::GetBlobUsage,
             CleanChatOperationFfi::GetConversationState => Self::GetConversationState,
             CleanChatOperationFfi::GetDevices => Self::GetDevices,
+            CleanChatOperationFfi::GetDeviceKey => Self::GetDeviceKey,
             CleanChatOperationFfi::GetEntries => Self::GetEntries,
             CleanChatOperationFfi::GetLeafRecoveryInbox => Self::GetLeafRecoveryInbox,
             CleanChatOperationFfi::GetOwnDevices => Self::GetOwnDevices,
@@ -549,6 +557,7 @@ impl From<CanonicalOperation> for CleanChatOperationFfi {
             CanonicalOperation::GetBlobUsage => Self::GetBlobUsage,
             CanonicalOperation::GetConversationState => Self::GetConversationState,
             CanonicalOperation::GetDevices => Self::GetDevices,
+            CanonicalOperation::GetDeviceKey => Self::GetDeviceKey,
             CanonicalOperation::GetEntries => Self::GetEntries,
             CanonicalOperation::GetLeafRecoveryInbox => Self::GetLeafRecoveryInbox,
             CanonicalOperation::GetOwnDevices => Self::GetOwnDevices,
@@ -678,6 +687,7 @@ fn parse_ffi_request(
             parse_json_req(body, CleanChatRequest::GetConversationState)
         }
         CanonicalOperation::GetDevices => parse_json_req(body, CleanChatRequest::GetDevices),
+        CanonicalOperation::GetDeviceKey => parse_json_req(body, CleanChatRequest::GetDeviceKey),
         CanonicalOperation::GetEntries => parse_json_req(body, CleanChatRequest::GetEntries),
         CanonicalOperation::GetLeafRecoveryInbox => {
             parse_json_req(body, CleanChatRequest::GetLeafRecoveryInbox)
@@ -800,6 +810,7 @@ pub fn decode_clean_chat_response(
             serde_json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::GetDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetDeviceKey(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::GetLeafRecoveryInbox(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
@@ -863,6 +874,7 @@ pub fn decode_clean_chat_error(
             serde_json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatError::GetDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetDeviceKey(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::GetLeafRecoveryInbox(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
@@ -911,6 +923,7 @@ impl CleanChatRequest {
             Self::GetBlobUsage(_) => CanonicalOperation::GetBlobUsage,
             Self::GetConversationState(_) => CanonicalOperation::GetConversationState,
             Self::GetDevices(_) => CanonicalOperation::GetDevices,
+            Self::GetDeviceKey(_) => CanonicalOperation::GetDeviceKey,
             Self::GetEntries(_) => CanonicalOperation::GetEntries,
             Self::GetLeafRecoveryInbox(_) => CanonicalOperation::GetLeafRecoveryInbox,
             Self::GetOwnDevices(_) => CanonicalOperation::GetOwnDevices,
@@ -946,6 +959,7 @@ impl CleanChatRequest {
             Self::GetBlobUsage(request) => query_request(&internal, self.operation(), request),
             Self::GetConversationState(request) => query_request(&internal, self.operation(), request),
             Self::GetDevices(request) => query_request(&internal, self.operation(), request),
+            Self::GetDeviceKey(request) => query_request(&internal, self.operation(), request),
             Self::GetEntries(request) => query_request(&internal, self.operation(), request),
             Self::GetLeafRecoveryInbox(request) => query_request(&internal, self.operation(), request),
             Self::GetOwnDevices(request) => query_request(&internal, self.operation(), request),
@@ -1036,6 +1050,7 @@ impl CleanChatResponse {
             CanonicalOperation::GetBlobUsage => decode!(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageOutput<String>, GetBlobUsage),
             CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>, GetConversationState),
             CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>, GetDevices),
+            CanonicalOperation::GetDeviceKey => decode!(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyOutput<String>, GetDeviceKey),
             CanonicalOperation::GetEntries => decode!(
                 crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>,
                 GetEntries
@@ -1115,6 +1130,7 @@ impl CleanChatError {
             CanonicalOperation::GetBlobUsage => decode!(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageError, GetBlobUsage),
             CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError, GetConversationState),
             CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError, GetDevices),
+            CanonicalOperation::GetDeviceKey => decode!(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyError, GetDeviceKey),
             CanonicalOperation::GetEntries => decode!(
                 crate::atproto::blue_catbird::chat::get_entries::GetEntriesError,
                 GetEntries
@@ -1283,13 +1299,13 @@ pub fn prepare_replenishment(
     replenish_key_packages(&auth.as_internal(), signer, input)
 }
 
-pub(crate) fn derive_key_id(public_key: &[u8]) -> String {
+pub fn derive_key_id(public_key: &[u8]) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use sha2::{Digest, Sha256};
     URL_SAFE_NO_PAD.encode(Sha256::digest(public_key))
 }
 
-pub(crate) const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
+pub const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
 const DEVICE_REVOKE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REVOKE\0";
 const CREATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CREATE\0";
 const COMMIT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-COMMIT\0";
@@ -2491,7 +2507,7 @@ pub fn decode_conversation_state(
     Ok(state)
 }
 
-pub(crate) fn decode_conversation_coordinates(raw: &[u8]) -> Result<catbird_atproto::blue_catbird::chat::ConversationCoordinates, TransportError> {
+pub fn decode_conversation_coordinates(raw: &[u8]) -> Result<catbird_atproto::blue_catbird::chat::ConversationCoordinates, TransportError> {
     let mut input = parse_strict_signed_json(raw)?;
     normalize_read_type_tags(chat_definition("conversationCoordinates")?, &mut input, Some("conversationCoordinates"), false)?;
     let projected = project_schema_ref("conversationCoordinates", &input, false)?;
@@ -2563,6 +2579,12 @@ pub fn decode_conversations_inventory(
     };
     let mut output: serde_json::Value = serde_json::from_slice(raw)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    if let Some(scope)=fields.get("inventoryScope") {
+        let mut scope=scope.clone();
+        normalize_read_type_tags(chat_definition("directRequestInventoryScope")?,&mut scope,Some("directRequestInventoryScope"),false)?;
+        let projected=project_schema_ref("directRequestInventoryScope",&scope,false)?;
+        output["inventoryScope"]=generated_json_ref("directRequestInventoryScope",&projected,false)?;
+    }
     output["items"] = serde_json::Value::Array(items.iter().map(|item| {
         let mut item = item.clone();
         normalize_read_type_tags(chat_definition("conversationInventoryItem")?, &mut item, Some("conversationInventoryItem"), true)?;
@@ -2578,6 +2600,29 @@ pub fn decode_conversations_inventory(
         }
     }
     Ok(output)
+}
+
+/// Strict schema-aware inventory decoder, including byte aliases in scoped
+/// reader fences and Welcome/recovery variants. Raw bytes remain host custody.
+pub fn validate_authenticated_inventory_page(operation:CanonicalOperation,raw:&[u8])->Result<(),TransportError>{
+    if operation==CanonicalOperation::GetConversations {decode_conversations_inventory(raw)?;return Ok(());}
+    if !matches!(operation,CanonicalOperation::GetPendingWelcomes|CanonicalOperation::GetLeafRecoveryInbox){return Err(TransportError::Serialization("not an inventory endpoint".into()));}
+    let input=parse_strict_signed_json(raw)?;
+    let StrictSignedJson::Object(fields)=input else{return Err(TransportError::Serialization("inventory must be an object".into()))};
+    let Some(StrictSignedJson::Array(items))=fields.get("items") else{return Err(TransportError::Serialization("inventory items must be an array".into()))};
+    let mut output:serde_json::Value=serde_json::from_slice(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;
+    if let Some(scope)=fields.get("inventoryScope") {
+        let mut scope=scope.clone();normalize_read_type_tags(chat_definition("directRequestInventoryScope")?,&mut scope,Some("directRequestInventoryScope"),false)?;
+        output["inventoryScope"]=generated_json_ref("directRequestInventoryScope",&project_schema_ref("directRequestInventoryScope",&scope,false)?,false)?;
+    }
+    output["items"]=serde_json::Value::Array(items.iter().enumerate().map(|(index,item)|{
+        let name=if operation==CanonicalOperation::GetLeafRecoveryInbox {"leafRecoveryInboxItem"}else{
+            match output["items"][index]["$type"].as_str(){Some("blue.catbird.chat.defs#welcomeView")=>"welcomeView",Some("blue.catbird.chat.defs#directRequestWelcomeView")=>"directRequestWelcomeView",_=>return Err(TransportError::Serialization("unknown Welcome inventory item".into()))}
+        };
+        let mut item=item.clone();normalize_read_type_tags(chat_definition(name)?,&mut item,Some(name),true)?;
+        generated_json_ref(name,&project_schema_ref(name,&item,true)?,true)
+    }).collect::<Result<Vec<_>,TransportError>>()?);
+    CleanChatResponse::decode(operation,&serde_json::to_vec(&output).map_err(|e|TransportError::Serialization(e.to_string()))?)?;Ok(())
 }
 
 fn generated_json_ref(
@@ -3580,7 +3625,7 @@ pub(crate) fn get_conversations(
         actor_device_id: auth.device_id.clone(),
         limit,
         page_cursor: page_cursor.map(ToOwned::to_owned),
-        supported_protocol_versions: None,
+        supported_protocol_versions: Some(vec![crate::atproto::blue_catbird::chat::get_conversations::GetConversationsSupportedProtocolVersions::_1, crate::atproto::blue_catbird::chat::get_conversations::GetConversationsSupportedProtocolVersions::_2]),
     };
     let value = serde_json::to_value(request)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
@@ -3592,6 +3637,10 @@ pub(crate) fn get_conversations(
     if let Some(cursor) = value["pageCursor"].as_str() {
         query.push_str("&pageCursor=");
         query.push_str(&encode_query(cursor));
+    }
+    for version in value["supportedProtocolVersions"].as_array().into_iter().flatten() {
+        query.push_str("&supportedProtocolVersions=");
+        query.push_str(&encode_query(version.as_str().unwrap_or_default()));
     }
     read_request(auth, CanonicalOperation::GetConversations, query)
 }
@@ -3671,6 +3720,7 @@ pub enum CanonicalOperation {
     GetBlobUsage,
     GetConversationState,
     GetDevices,
+    GetDeviceKey,
     GetEntries,
     GetLeafRecoveryInbox,
     GetOwnDevices,
@@ -3712,6 +3762,7 @@ impl CanonicalOperation {
         Self::GetBlobUsage,
         Self::GetConversationState,
         Self::GetDevices,
+        Self::GetDeviceKey,
         Self::GetEntries,
         Self::GetLeafRecoveryInbox,
         Self::GetOwnDevices,
@@ -3780,6 +3831,7 @@ pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
         CanonicalOperation::GetBlobUsage => route(GetBlobUsageRequest::PATH),
         CanonicalOperation::GetConversationState => route(GetConversationStateRequest::PATH),
         CanonicalOperation::GetDevices => route(GetDevicesRequest::PATH),
+        CanonicalOperation::GetDeviceKey => route(GetDeviceKeyRequest::PATH),
         CanonicalOperation::GetEntries => route(GetEntriesRequest::PATH),
         CanonicalOperation::GetLeafRecoveryInbox => route(GetLeafRecoveryInboxRequest::PATH),
         CanonicalOperation::GetOwnDevices => route(GetOwnDevicesRequest::PATH),

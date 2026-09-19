@@ -610,52 +610,7 @@ pub(crate) fn adopt_request_welcome(
     let signer = inner
         .get_signer_for_identity(local)
         .ok_or(MLSError::StorageFailed)?;
-    let record = DirectRequestJournal {
-        request_id: request_id.into(),
-        draft_id: request_id.into(),
-        actor_did: ctx["actorDid"].as_str().unwrap().into(),
-        actor_device_id: ctx["actorDeviceId"].as_str().unwrap().into(),
-        first_message_id: ctx["firstMessageId"].as_str().unwrap().into(),
-        conversation_id: ctx["conversationId"].as_str().unwrap().into(),
-        input_sha256: [0; 32],
-        preparation_request_digest: input.preparation_request_digest,
-        receipt_authority_key: input.receipt_authority_key.clone(),
-        bootstrap: input.bootstrap.clone(),
-        phase: DirectRequestJournalPhase::PreparedCrypto,
-        publish_request: None,
-        publish_request_sha256: None,
-        publication_digest: None,
-        terminal_receipt: None,
-        terminal_authority_key: None,
-    };
-    let digest = record.verify_publication(
-        &input.publication_request,
-        &input.actor_signature_public_key,
-    )?;
-    let verified = verify_signed_request(
-        DirectRequestKind::Outcome,
-        &input.published_receipt,
-        &input.receipt_authority_key,
-    )
-    .map_err(crypto_error)?;
-    let receipt = &verified.body()["receipt"];
-    if receipt["$type"] != "blue.catbird.chat.defs#directRequestPublishedReceipt"
-        || receipt["requestId"] != request_id
-        || receipt["requestKind"] != "publish"
-        || receipt["coordinates"] != input.bootstrap.coordinates
-        || receipt["conversationId"] != record.conversation_id
-        || receipt["firstMessageId"] != record.first_message_id
-        || receipt["requestDigest"].as_str() != Some(STANDARD.encode(digest).as_str())
-        || receipt["preparationRequestDigest"].as_str()
-            != Some(STANDARD.encode(input.preparation_request_digest).as_str())
-    {
-        return Err(invalid("Request Welcome publication receipt mismatch"));
-    }
-    for field in ["actorDid", "actorDeviceId", "actorKeyId"] {
-        if receipt[field] != ctx[field] {
-            return Err(invalid("Request Welcome receipt actor mismatch"));
-        }
-    }
+    super::direct_request_shared_crypto::validate_request_welcome_receipt(input)?;
     let group_id = STANDARD
         .decode(
             input.bootstrap.coordinates["groupId"]
@@ -842,64 +797,7 @@ pub(crate) fn decrypt_introduction(
         .signature_key()
         .as_slice()
         .to_vec();
-    let aad = crate::chat_v2::transcript::direct_request::direct_request_application_aad(
-        &hash,
-        &serde_json::to_vec(&input.bootstrap.coordinates).map_err(error)?,
-        ctx["firstMessageId"].as_str().unwrap(),
-    )
-    .map_err(crypto_error)?;
-    let expected_sender = format!(
-        "{}#{}",
-        ctx["actorDid"].as_str().unwrap(),
-        ctx["actorDeviceId"].as_str().unwrap()
-    );
-    let mut process = || -> Result<Vec<u8>, MLSError> {
-        let protocol = MlsMessageIn::tls_deserialize_exact(&input.bootstrap.initial_ciphertext)
-            .map_err(crypto_error)?
-            .try_into_protocol_message()
-            .map_err(crypto_error)?;
-        if protocol.content_type() != ContentType::Application {
-            return Err(invalid("Introduction must be an application ciphertext"));
-        }
-        let processed = group
-            .process_message(&provider, protocol)
-            .map_err(|e| match e {
-                ProcessMessageError::StorageError(_)
-                | ProcessMessageError::GroupStateError(_)
-                | ProcessMessageError::LibraryError(_) => MLSError::StorageFailed,
-                other => crypto_error(other),
-            })?;
-        if processed.aad() != aad
-            || processed.credential().serialized_content() != expected_sender.as_bytes()
-        {
-            return Err(invalid("Introduction sender or AAD mismatch"));
-        }
-        let ProcessedMessageContent::ApplicationMessage(application) = processed.into_content()
-        else {
-            return Err(invalid("Introduction is not an application message"));
-        };
-        let plaintext = application.into_bytes();
-        let value = crate::chat_v2::transcript::direct_request::decode_direct_request_introduction(
-            &plaintext,
-        )
-        .map_err(crypto_error)?;
-        if value
-            .get("invitation")
-            .is_some_and(|i| i["recipientDid"] != ctx["recipientDid"])
-        {
-            return Err(invalid("Introduction invitation recipient mismatch"));
-        }
-        Ok(plaintext)
-    };
-    // This classified result is persisted with the ratchet write. An invalid
-    // intro never rolls back its successful Welcome import or implies consent.
-    let outcome = match process() {
-        Ok(plaintext) => DirectRequestIntroductionResult::Ready { plaintext },
-        Err(MLSError::StorageFailed) => return Err(MLSError::StorageFailed),
-        Err(_) => DirectRequestIntroductionResult::Unavailable {
-            code: "InvalidIntroduction".into(),
-        },
-    };
+    let outcome=super::direct_request_shared_crypto::decrypt_introduction_with_provider(&provider,&mut group,input)?;
     tx.execute(
         "INSERT INTO mls_manifests(key,value) VALUES(?1,?2)",
         [cache_key, serde_json::to_string(&outcome).map_err(error)?],

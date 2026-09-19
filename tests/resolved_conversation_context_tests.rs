@@ -2122,6 +2122,7 @@ async fn commit_self_remove_proposals_uses_active_group_for_rotated_stable_conve
     alice
         .orchestrator
         .process_incoming_message(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: STABLE_CONVERSATION_ID.to_string(),
             sender_did: bob.did.clone(),
             ciphertext: proposal,
@@ -2213,6 +2214,7 @@ async fn pending_proposal_commit_merges_only_after_server_acceptance() {
     alice
         .orchestrator
         .process_incoming_message(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: STABLE_CONVERSATION_ID.to_string(),
             sender_did: bob.did.clone(),
             ciphertext: proposal,
@@ -2324,6 +2326,7 @@ async fn empty_application_message_is_not_treated_as_an_epoch_commit() {
     let result = bob
         .orchestrator
         .process_incoming_message(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: STABLE_CONVERSATION_ID.to_string(),
             sender_did: alice.did.clone(),
             ciphertext,
@@ -2399,6 +2402,7 @@ async fn sender_binding_rejection_discards_staged_proposal_before_commit() {
     alice
         .orchestrator
         .process_incoming_message(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: STABLE_CONVERSATION_ID.to_string(),
             sender_did: "did:plc:mallory".to_string(),
             ciphertext: proposal,
@@ -2748,6 +2752,7 @@ async fn unknown_conversation_fails_closed_before_consuming_own_commit_state() {
     let error = alice
         .orchestrator
         .process_incoming_message(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: STABLE_CONVERSATION_ID.to_string(),
             sender_did: "did:plc:attacker".to_string(),
             ciphertext,

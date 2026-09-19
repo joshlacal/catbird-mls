@@ -553,6 +553,7 @@ async fn authenticated_departure_reopens_as_pending_only_after_new_invitation_th
         .find(|body| body["$type"] == "blue.catbird.chat.defs#leaveCommitFulfillmentBody")
         .unwrap();
     let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: f.cid.clone(),
         sender_did: ALICE.into(),
         ciphertext: STANDARD
@@ -902,6 +903,7 @@ async fn real_reinvitation_requires_signed_departure_anchor_after_raw_removal_re
         .find(|body| body["$type"] == "blue.catbird.chat.defs#leaveCommitFulfillmentBody")
         .unwrap();
     let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: f.cid.clone(),
         sender_did: ALICE.into(),
         ciphertext: STANDARD

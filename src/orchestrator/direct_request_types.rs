@@ -102,6 +102,8 @@ pub enum RequestPreview {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct DirectRequestView {
+    /// Authenticated publication metadata, available independently of consent.
+    pub introduction: Option<RequestIntroductionMetadata>,
     pub conversation_id: String,
     pub first_message_id: Option<String>,
     pub consent: RequestConsent,
@@ -128,4 +130,17 @@ impl RequestCapabilities {
             can_administer: ordinary,
         }
     }
+}
+
+/// Immutable first-message attribution from the signed publication and its
+/// authority receipt. It does not grant ordinary message effects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct RequestIntroductionMetadata {
+    pub sender_did: String,
+    pub sender_device_id: String,
+    pub received_at: String,
+    pub epoch: u64,
+    pub sequence_number: u64,
 }

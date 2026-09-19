@@ -8,7 +8,7 @@ const DEVICE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
 
 #[test]
 fn route_inventory_is_closed_and_contains_no_rebind_endpoint() {
-    assert_eq!(CanonicalOperation::ALL.len(), 31);
+    assert_eq!(CanonicalOperation::ALL.len(), 37);
 
     for operation in CanonicalOperation::ALL {
         let route = operation.route();
@@ -112,7 +112,7 @@ fn all_canonical_operations_map_to_valid_unique_xrpc_paths() {
         assert!(seen_paths.insert(route.path), "duplicate path for {:?}", op);
         assert!(seen_nsids.insert(route.nsid), "duplicate nsid for {:?}", op);
     }
-    assert_eq!(seen_paths.len(), 31);
+    assert_eq!(seen_paths.len(), 37);
 }
 
 #[test]

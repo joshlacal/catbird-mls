@@ -8020,6 +8020,13 @@ impl MlsCryptoContext for MLSContext {
         )
     }
 
+    fn commit_closed_direct_request_projection(&self, cid: &str, expected: &[u8], next: &[u8]) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("commit_closed_direct_request_projection");
+        let mut guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::commit_closed_projection(inner,cid,expected,next)
+    }
     fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> {
         self.check_suspended()?;
         let _operation = self.begin_storage_operation("list_direct_request_projections");

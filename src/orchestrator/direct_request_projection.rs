@@ -15,6 +15,8 @@ pub(crate) struct DirectRequestProjection {
     pub device_id: String,
     pub trusted_authority_document: Vec<u8>,
     pub publication: Vec<u8>,
+    #[serde(default)]
+    pub publication_entry: Option<Value>,
     pub sender_public_key: Vec<u8>,
     pub publication_receipt: Vec<u8>,
     pub crypto: RequestCrypto,
@@ -22,6 +24,8 @@ pub(crate) struct DirectRequestProjection {
     pub acceptance_proof: Option<Vec<u8>>,
     pub recipient_public_key: Option<Vec<u8>>,
     pub pending_acceptance: Option<Vec<u8>>,
+    #[serde(default)]
+    pub close_proof: Option<DirectRequestCloseProof>,
 }
 fn invalid() -> OrchestratorError {
     OrchestratorError::Storage("Invalid request projection proof".into())
@@ -105,7 +109,30 @@ impl DirectRequestProjection {
             (None, None) => {}
             _ => return Err(invalid()),
         }
+        if let Some(proof) = &self.close_proof {
+            coordinate = proof.verify(&publication, &coordinate)?;
+            consent = RequestConsent::Closed;
+        }
+        if let Some(entry) = &self.publication_entry {
+            verify_request_publication_entry(
+                entry,
+                &self.publication,
+                &self.sender_public_key,
+                receipt,
+            )?;
+        }
+        let introduction = RequestIntroductionMetadata {
+            sender_did: body["actorDid"].as_str().ok_or_else(invalid)?.into(),
+            sender_device_id: body["actorDeviceId"].as_str().ok_or_else(invalid)?.into(),
+            received_at: receipt["recordedAt"].as_str().ok_or_else(invalid)?.into(),
+            epoch: body["next"]["epoch"].as_u64().ok_or_else(invalid)?,
+            sequence_number: body["artifacts"]["metadataSnapshot"]["authorProof"]["originSeq"]
+                .as_u64()
+                .filter(|s| *s > 0)
+                .ok_or_else(invalid)?,
+        };
         Ok(DirectRequestView {
+            introduction: Some(introduction),
             conversation_id: body["conversationId"].as_str().ok_or_else(invalid)?.into(),
             first_message_id: Some(body["firstMessageId"].as_str().ok_or_else(invalid)?.into()),
             consent,
@@ -120,4 +147,215 @@ impl DirectRequestProjection {
             generation: coordinate["generation"].as_u64().ok_or_else(invalid)?,
         })
     }
+}
+
+/// Historical authorized key snapshot from the existing canonical close
+/// verifier. This is v1 terminal-entry authority, not an ES256 request receipt.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DirectRequestCloseProof {
+    pub entry: Value,
+    pub actor_public_key: Vec<u8>,
+    pub entry_sha256: [u8; 32],
+    pub publication_digest: [u8; 32],
+    pub verified_prior: Value,
+}
+pub(crate) fn normalized_close_entry(mut entry: Value) -> Value {
+    fn normalize(value: &mut Value) {
+        match value {
+            Value::Object(map)
+                if map.len() == 1 && map.get("$bytes").is_some_and(Value::is_string) =>
+            {
+                *value = map["$bytes"].clone();
+            }
+            Value::Object(map) => map.values_mut().for_each(normalize),
+            Value::Array(items) => items.iter_mut().for_each(normalize),
+            _ => {}
+        }
+    }
+    normalize(&mut entry);
+    entry["$type"] = Value::String("blue.catbird.chat.defs#conversationCloseEntry".into());
+    entry["signedRequest"]["body"]["$type"] =
+        Value::String("blue.catbird.chat.defs#conversationCloseBody".into());
+    entry
+}
+impl DirectRequestCloseProof {
+    pub(crate) fn hash(entry: &Value) -> Result<[u8; 32]> {
+        use crate::chat_v2::transcript::{
+            control_entry_fingerprint, decode_strict_json, project_ref, project_signed_body,
+            ControlEntryKind, ControlServerFields, EntryRow, SignedMutationKind, SigningTranscript,
+        };
+        // The stored row has explicit entry/body tags for verification. Plain
+        // schema references are untagged; validate each optional tag before
+        // removing it for the canonical outer-entry projection.
+        let mut plain = entry.clone();
+        for (pointer, expected) in [
+            ("", "conversationCloseEntry"),
+            ("/signedRequest", "signedConversationClose"),
+            ("/tombstone", "conversationCloseTombstone"),
+        ] {
+            let object = plain
+                .pointer_mut(pointer)
+                .and_then(Value::as_object_mut)
+                .ok_or_else(invalid)?;
+            if let Some(tag) = object.remove("$type") {
+                if tag != format!("blue.catbird.chat.defs#{expected}") {
+                    return Err(invalid());
+                }
+            }
+        }
+        let strict = decode_strict_json(&serde_json::to_vec(&plain).map_err(|_| invalid())?)
+            .map_err(|_| invalid())?;
+        project_ref("conversationCloseEntry", &strict, false).map_err(|_| invalid())?;
+        let body = decode_strict_json(
+            &serde_json::to_vec(&entry["signedRequest"]["body"]).map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())?;
+        let transcript = SigningTranscript::build_for(
+            SignedMutationKind::ConversationClose,
+            &project_signed_body(SignedMutationKind::ConversationClose, &body)
+                .map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())?;
+        let tombstone =
+            decode_strict_json(&serde_json::to_vec(&plain["tombstone"]).map_err(|_| invalid())?)
+                .map_err(|_| invalid())?;
+        let fields = ControlServerFields::single(
+            ControlEntryKind::ConversationClose,
+            "tombstone",
+            project_ref("conversationCloseTombstone", &tombstone, false).map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())?;
+        let row = EntryRow {
+            entry_id: *uuid::Uuid::parse_str(entry["entryId"].as_str().ok_or_else(invalid)?)
+                .map_err(|_| invalid())?
+                .as_bytes(),
+            conversation_id: *uuid::Uuid::parse_str(
+                entry["conversationId"].as_str().ok_or_else(invalid)?,
+            )
+            .map_err(|_| invalid())?
+            .as_bytes(),
+            seq: entry["seq"].as_u64().ok_or_else(invalid)?,
+            request_digest: *transcript.request_digest(),
+            signature: STANDARD
+                .decode(
+                    entry["signedRequest"]["signature"]
+                        .as_str()
+                        .ok_or_else(invalid)?,
+                )
+                .map_err(|_| invalid())?
+                .try_into()
+                .map_err(|_| invalid())?,
+            received_at: entry["receivedAt"].as_str().ok_or_else(invalid)?.to_owned(),
+        };
+        Ok(
+            *control_entry_fingerprint(ControlEntryKind::ConversationClose, &row, &fields)
+                .map_err(|_| invalid())?
+                .fingerprint()
+                .as_bytes(),
+        )
+    }
+    fn verify(
+        &self,
+        publication: &crate::chat_v2::transcript::direct_request::VerifiedDirectRequest,
+        current: &Value,
+    ) -> Result<Value> {
+        use crate::chat_v2::transcript::{
+            decode_strict_json, project_signed_body, SignedMutationKind, VerifiedMutation,
+        };
+        if self.publication_digest != *publication.request_digest()
+            || Self::hash(&self.entry)? != self.entry_sha256
+        {
+            return Err(invalid());
+        }
+        let body = &self.entry["signedRequest"]["body"];
+        let origin = publication.body();
+        if body["conversationKind"] != "direct"
+            || (body["actorDid"] != origin["actorDid"]
+                && body["actorDid"] != origin["recipientDid"])
+            || body["prior"] != self.verified_prior
+            || self.verified_prior["conversationId"] != origin["conversationId"]
+            || self.verified_prior["groupId"] != origin["next"]["groupId"]
+            || self.verified_prior["generation"] != origin["next"]["generation"]
+            || self.verified_prior["stateVersion"].as_u64() < current["stateVersion"].as_u64()
+            || self.verified_prior["epoch"].as_u64() < current["epoch"].as_u64()
+        {
+            return Err(invalid());
+        }
+        let record = crate::orchestrator::account_exit::AccountExitRecord {
+            request_body: serde_json::to_vec(
+                &serde_json::json!({"signedRequest":self.entry["signedRequest"]}),
+            )
+            .map_err(|_| invalid())?,
+            accepted_response: Some(
+                serde_json::json!({"result":{"entry":self.entry,"tombstone":self.entry["tombstone"]}}),
+            ),
+            local_completion: true,
+            replaces_operation: None,
+            reset_evidence: None,
+        };
+        record.validate()?;
+        let strict = decode_strict_json(&serde_json::to_vec(body).map_err(|_| invalid())?)
+            .map_err(|_| invalid())?;
+        let canonical = project_signed_body(SignedMutationKind::ConversationClose, &strict)
+            .map_err(|_| invalid())?;
+        let signature: [u8; 64] = STANDARD
+            .decode(
+                self.entry["signedRequest"]["signature"]
+                    .as_str()
+                    .ok_or_else(invalid)?,
+            )
+            .map_err(|_| invalid())?
+            .try_into()
+            .map_err(|_| invalid())?;
+        VerifiedMutation::verify(canonical, signature, &self.actor_public_key)
+            .map_err(|_| invalid())?;
+        Ok(body["retired"].clone())
+    }
+}
+
+/// Normalize only transport byte wrappers and the known outer entry tag.
+pub(crate) fn request_control_entry(mut entry: Value) -> Result<Value> {
+    fn bytes(value: &mut Value) {
+        match value {
+            Value::Object(map)
+                if map.len() == 1 && map.get("$bytes").is_some_and(Value::is_string) =>
+            {
+                *value = map["$bytes"].clone()
+            }
+            Value::Object(map) => map.values_mut().for_each(bytes),
+            Value::Array(values) => values.iter_mut().for_each(bytes),
+            _ => {}
+        }
+    }
+    bytes(&mut entry);
+    entry.as_object_mut().ok_or_else(invalid)?.remove("$type");
+    Ok(entry)
+}
+pub(crate) fn verify_request_publication_entry(
+    entry: &Value,
+    publication: &[u8],
+    key: &[u8],
+    receipt: &Value,
+) -> Result<[u8; 32]> {
+    let raw = serde_json::to_vec(entry).map_err(|_| invalid())?;
+    let hash = crate::chat_v2::transcript::direct_request::direct_request_entry_hash(&raw)
+        .map_err(|_| invalid())?;
+    let expected = verify_signed_request(DirectRequestKind::Publish, publication, key)
+        .map_err(|_| invalid())?;
+    let actual = verify_signed_request(
+        DirectRequestKind::Publish,
+        &serde_json::to_vec(&entry["signedRequest"]).map_err(|_| invalid())?,
+        key,
+    )
+    .map_err(|_| invalid())?;
+    if actual.request_digest() != expected.request_digest()
+        || entry["conversationId"] != expected.body()["conversationId"]
+        || entry["seq"]
+            != expected.body()["artifacts"]["metadataSnapshot"]["authorProof"]["originSeq"]
+        || entry["receivedAt"] != receipt["recordedAt"]
+    {
+        return Err(invalid());
+    }
+    Ok(hash)
 }

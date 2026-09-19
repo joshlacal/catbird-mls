@@ -333,6 +333,7 @@ async fn verify_resume(reattach: bool, ambiguous: bool) {
             )
             .unwrap();
         let echo = IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: cid.clone(),
             sender_did: alice.did.clone(),
             ciphertext,
@@ -413,6 +414,7 @@ async fn verify_resume(reattach: bool, ambiguous: bool) {
         .unwrap();
     restored
         .process_incoming(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: cid.clone(),
             sender_did: alice.did.clone(),
             ciphertext,

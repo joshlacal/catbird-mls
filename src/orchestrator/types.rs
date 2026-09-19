@@ -194,7 +194,10 @@ impl AuthorizedRecoveryInboxSnapshot {
                     .is_some_and(|expires| expires > chrono::Utc::now())
             {
                 if let Some(coord) = coordinate {
-                    if let Ok(req_coord) = super::lifecycle::lifecycle_coordinates(&request["boundCoordinate"], convo_id) {
+                    if let Ok(req_coord) = super::lifecycle::lifecycle_coordinates(
+                        &request["boundCoordinate"],
+                        convo_id,
+                    ) {
                         if &req_coord != coord {
                             continue;
                         }
@@ -747,6 +750,9 @@ pub enum DesyncSeverity {
 /// Incoming message envelope from the delivery service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingEnvelope {
+    /// Exact canonical control row; consumed by shared verification before cursor advancement.
+    #[serde(default)]
+    pub canonical_entry_json: Option<String>,
     pub conversation_id: ConversationId,
     pub sender_did: DID,
     pub ciphertext: Vec<u8>,
@@ -848,6 +854,41 @@ pub struct MLSEmbedData {
 }
 
 impl MLSEmbedData {
+    /// A navigation reference only; sending revalidates its signed invitation.
+    pub fn group_invitation(
+        reference: super::GroupInvitationReference,
+    ) -> Result<Self, serde_json::Error> {
+        let embed = Self {
+            kind: "groupInvitation".into(),
+            data: serde_json::to_value(reference)?,
+        };
+        embed.checked_group_invitation()?;
+        Ok(embed)
+    }
+
+    pub fn checked_group_invitation(
+        &self,
+    ) -> Result<Option<super::GroupInvitationReference>, serde_json::Error> {
+        if self.kind != "groupInvitation" {
+            return Ok(None);
+        }
+        let reference: super::GroupInvitationReference = serde_json::from_value(self.data.clone())?;
+        use crate::chat_v2::ids::{BareDid, CanonicalUuid};
+        if reference.authority_did != "did:web:chat.catbird.blue"
+            || CanonicalUuid::parse(&reference.conversation_id).is_err()
+            || CanonicalUuid::parse(&reference.invitation_transition_id).is_err()
+            || CanonicalUuid::parse(&reference.invited_by_device_id).is_err()
+            || BareDid::parse(&reference.invited_by_did).is_err()
+            || BareDid::parse(&reference.recipient_did).is_err()
+            || reference.invited_by_did == reference.recipient_did
+        {
+            return Err(serde::de::Error::custom(
+                "Invalid group invitation reference",
+            ));
+        }
+        Ok(Some(reference))
+    }
+
     pub fn image(image: MLSImageEmbed) -> Result<Self, serde_json::Error> {
         Ok(Self {
             kind: "image".to_string(),
@@ -974,12 +1015,49 @@ impl MLSMessagePayload {
 
     /// Encode to JSON bytes for MLS encryption.
     pub fn encode(&self) -> Result<Vec<u8>, serde_json::Error> {
+        self.checked_group_invitation()?;
         serde_json::to_vec(self)
     }
 
-    /// Decode from JSON bytes after MLS decryption.
+    /// Decode from JSON bytes after MLS decryption. Invitation references are
+    /// preserved as typed navigation data and never execute an acceptance.
     pub fn decode(data: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(data)
+        let payload: Self = serde_json::from_slice(data)?;
+        if payload.checked_group_invitation()?.is_some() {
+            crate::chat_v2::transcript::decode_strict_json(data).map_err(|_| {
+                <serde_json::Error as serde::de::Error>::custom(
+                    "Ambiguous group invitation envelope",
+                )
+            })?;
+        }
+        Ok(payload)
+    }
+
+    pub fn checked_group_invitation(
+        &self,
+    ) -> Result<Option<super::GroupInvitationReference>, serde_json::Error> {
+        let reference = self
+            .embed
+            .as_ref()
+            .map(MLSEmbedData::checked_group_invitation)
+            .transpose()?
+            .flatten();
+        if reference.is_some()
+            && (self.version != 1
+                || self.message_type != MLSMessageType::Text
+                || self
+                    .text
+                    .as_ref()
+                    .is_none_or(|text| text.trim().is_empty() || text.len() > crate::chat_v2::transcript::direct_request::MAX_REQUEST_TEXT_UTF8_BYTES)
+                || self.reaction.is_some()
+                || self.delivery_ack.is_some()
+                || self.recovery_request.is_some())
+        {
+            return Err(serde::de::Error::custom(
+                "Group invitation notes require a text-only message envelope",
+            ));
+        }
+        Ok(reference)
     }
 
     pub fn image_embed(&self) -> Option<MLSImageEmbed> {
@@ -1450,5 +1528,62 @@ mod tests {
         assert!(states.contains_key("other-group"));
         assert!(!states.contains_key("old-group"));
         assert!(!states.contains_key("stable-conversation"));
+    }
+}
+
+#[cfg(test)]
+mod group_invitation_note_payload_tests {
+    use super::*;
+    fn note() -> MLSMessagePayload {
+        let reference = super::super::GroupInvitationReference {
+            authority_did: "did:web:chat.catbird.blue".into(),
+            conversation_id: "11111111-1111-4111-9111-111111111111".into(),
+            invitation_transition_id: "22222222-2222-4222-9222-222222222222".into(),
+            invited_by_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            invited_by_device_id: "33333333-3333-4333-9333-333333333333".into(),
+            recipient_did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        };
+        MLSMessagePayload::text_with_embed(
+            "A literal <b>invitation</b> https://example.invalid",
+            MLSEmbedData::group_invitation(reference).unwrap(),
+        )
+    }
+    #[test]
+    fn group_invitation_note_roundtrip_preserves_literal_text_and_exact_reference() {
+        let original = note();
+        let decoded = MLSMessagePayload::decode(&original.encode().unwrap()).unwrap();
+        assert_eq!(decoded.display_text(), original.text.unwrap());
+        assert_eq!(
+            decoded
+                .checked_group_invitation()
+                .unwrap()
+                .unwrap()
+                .recipient_did,
+            "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(decoded.image_embed().is_none());
+        assert!(decoded.audio_embed().is_none());
+    }
+    #[test]
+    fn group_invitation_note_rejects_extra_fields_unknown_authority_and_control_envelopes() {
+        let mut n = note();
+        n.embed.as_mut().unwrap().data["accept"] = serde_json::json!(true);
+        assert!(n.encode().is_err());
+        let mut n = note();
+        n.embed.as_mut().unwrap().data["authorityDid"] =
+            serde_json::json!("did:web:untrusted.invalid");
+        assert!(n.encode().is_err());
+        let mut n = note();
+        n.message_type = MLSMessageType::AdminAction;
+        assert!(n.encode().is_err());
+        let mut n = note();
+        n.text = Some(
+            "x".repeat(crate::chat_v2::transcript::direct_request::MAX_REQUEST_TEXT_UTF8_BYTES + 1),
+        );
+        assert!(n.encode().is_err());
+        let raw = String::from_utf8(note().encode().unwrap())
+            .unwrap()
+            .replacen("{", "{\"version\":1,", 1);
+        assert!(MLSMessagePayload::decode(raw.as_bytes()).is_err());
     }
 }

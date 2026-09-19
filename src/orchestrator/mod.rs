@@ -12,6 +12,7 @@ pub mod devices;
 mod direct_adoption;
 pub mod direct_request_types;
 pub mod direct_requests;
+pub mod direct_request_shared_crypto;
 pub mod direct_request_bootstrap;
 pub mod direct_request_journal;
 pub mod direct_request_keys;
@@ -75,10 +76,11 @@ pub use credentials::{CleanChatSigningAuthority, CredentialStore};
 pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
 pub use mls_provider::{MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof};
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) use orchestrator::{with_batch_inventory_scope, with_batch_recovery_inbox_scope};
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
 pub use recovery::DeferredRecoveryOutcome;
 pub use storage::MLSStorageBackend;
 pub use types::*;
 pub use welcome_recovery::*;
+
+pub mod authenticated_inventory;

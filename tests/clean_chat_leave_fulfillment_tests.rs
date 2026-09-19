@@ -240,6 +240,7 @@ async fn leave_removes_both_devices_preserves_generation_and_converges_remaining
         .unwrap();
     let alice = world.client("Alice");
     let own_echo = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: cid.clone(),
         sender_did: alice.did.clone(),
         ciphertext: commit.clone(),
@@ -622,6 +623,7 @@ async fn accepted_leave_with_lost_response_retries_identically_then_processes_ow
     );
     let body = fulfillment(&world);
     let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: cid.clone(),
         sender_did: alice.did.clone(),
         ciphertext: STANDARD
@@ -694,6 +696,7 @@ async fn requester_devices_consume_authenticated_removal_and_preserve_history() 
             .await
             .unwrap();
         let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: cid.clone(),
             sender_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
             ciphertext: ciphertext.clone(),
@@ -849,6 +852,7 @@ async fn requester_removal_receipt_retries_projection_after_failure_and_native_r
         .decode(body["commit"]["bytes"].as_str().unwrap())
         .unwrap();
     let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: cid.clone(),
         sender_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
         ciphertext: ciphertext.clone(),
@@ -1111,6 +1115,7 @@ async fn losing_fulfiller_proves_competing_commit_after_restart_then_catches_up(
         .find(|v| v["actorDid"] == "did:plc:cccccccccccccccccccccccc")
         .unwrap();
     let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: cid.clone(),
         sender_did: "did:plc:cccccccccccccccccccccccc".into(),
         ciphertext: STANDARD

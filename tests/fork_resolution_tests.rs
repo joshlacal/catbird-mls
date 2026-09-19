@@ -552,6 +552,7 @@ async fn trigger_fork_detection<A>(
 {
     for i in 0..2 {
         let envelope = IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: group_id.to_string(),
             sender_did: sender_did.to_string(),
             ciphertext: format!("not-an-mls-message-{i}").into_bytes(),
@@ -860,6 +861,7 @@ async fn fork_readd_falls_back_to_needs_rejoin_when_crypto_unsupported() {
 
     for i in 0..2 {
         let envelope = IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: group_id.clone(),
             sender_did: "did:plc:bob".to_string(),
             ciphertext: format!("unsupported-fork-{i}").into_bytes(),

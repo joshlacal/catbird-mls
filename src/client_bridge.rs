@@ -1042,6 +1042,18 @@ impl CatbirdClientBridge {
             .map_err(OrchestratorBridgeError::from)
     }
 
+    pub fn get_group_invitation_reference(&self, conversation_id:String, recipient_did:String) -> Result<Option<crate::GroupInvitationReference>, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.get_group_invitation_reference(&conversation_id,&recipient_did)).map_err(OrchestratorBridgeError::from)
+    }
+    pub fn get_direct_request_delivery_enabled(&self) -> Result<Option<bool>, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.get_direct_request_delivery_enabled()).map_err(OrchestratorBridgeError::from)
+    }
+    pub fn close_direct_request(&self, conversation_id: String) -> Result<crate::DirectRequestView, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.close_direct_request(&conversation_id)).map_err(OrchestratorBridgeError::from)
+    }
+    pub fn set_direct_request_delivery_enabled(&self, enabled: bool) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.set_direct_request_delivery_enabled(enabled)).map_err(OrchestratorBridgeError::from)
+    }
     pub fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>, OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.list_direct_request_views()).map_err(OrchestratorBridgeError::from)
     }

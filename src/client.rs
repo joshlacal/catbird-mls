@@ -221,6 +221,18 @@ where
         Ok(convos.iter().map(convo_view_to_conversation).collect())
     }
 
+    pub async fn get_group_invitation_reference(&self, conversation_id:&str, recipient_did:&str) -> Result<Option<crate::GroupInvitationReference>, OrchestratorError> {
+        self.orchestrator.get_group_invitation_reference(conversation_id, recipient_did).await
+    }
+    pub async fn get_direct_request_delivery_enabled(&self) -> Result<Option<bool>, OrchestratorError> {
+        self.orchestrator.get_direct_request_delivery_enabled().await
+    }
+    pub async fn close_direct_request(&self, conversation_id: &str) -> Result<crate::DirectRequestView, OrchestratorError> {
+        self.orchestrator.close_direct_request(conversation_id).await
+    }
+    pub async fn set_direct_request_delivery_enabled(&self, enabled: bool) -> Result<(), OrchestratorError> {
+        self.orchestrator.set_direct_request_delivery_enabled(enabled).await
+    }
     pub async fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>, OrchestratorError> {
         self.orchestrator.list_direct_request_views().await
     }

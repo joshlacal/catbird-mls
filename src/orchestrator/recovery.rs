@@ -3234,6 +3234,12 @@ where
             )));
         }
 
+        if self.mls_context().supports_direct_request_bootstrap()
+            && self.mls_context().list_direct_request_journal()?.iter().any(|journal| journal.conversation_id == convo_id)
+        {
+            return Err(OrchestratorError::RecoveryFailed("Legacy force rejoin cannot replace request-owned custody".into()));
+        }
+
         // GroupInfo fetched successfully — now delete old local group state.
         // Prefer a locally materialized group bound to this stable conversation;
         // the authoritative mapping may already name an as-yet-unjoined reset

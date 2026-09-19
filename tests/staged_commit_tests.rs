@@ -202,6 +202,7 @@ async fn own_commit_echo_requires_durable_local_confirmation() {
     let error = alice
         .orchestrator
         .process_incoming(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: convo.conversation_id.clone(),
             sender_did: alice.did.clone(),
             ciphertext: plan.commit_bytes.clone(),
@@ -1437,6 +1438,7 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     let restart_error = alice
         .orchestrator
         .process_incoming(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: convo.conversation_id.clone(),
             sender_did: alice.did.clone(),
             ciphertext: plan.commit_bytes.clone(),
@@ -1504,6 +1506,7 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     let tracking_error = alice
         .orchestrator
         .process_incoming(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: convo.conversation_id.clone(),
             sender_did: alice.did.clone(),
             ciphertext: plan2.commit_bytes.clone(),
@@ -1546,6 +1549,7 @@ async fn test_resolver_success_unaccepted_appdata_commit_withholds_merge_and_cur
     let result = alice
         .orchestrator
         .process_incoming(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: convo.conversation_id.clone(),
             sender_did: alice.did.clone(),
             ciphertext: plan2.commit_bytes.clone(),
@@ -1638,6 +1642,7 @@ async fn test_stage_commit_mismatched_identity_withholds_cursor() {
     let error = alice
         .orchestrator
         .process_incoming(&IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: convo2.conversation_id.clone(),
             sender_did: alice.did.clone(),
             ciphertext: plan.commit_bytes.clone(),

@@ -1,0 +1,92 @@
+{
+  "conversationKind": "direct",
+  "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+  "coordinates": {
+    "conversationId": "11111111-1111-4111-9111-111111111111",
+    "generation": 3,
+    "stateVersion": 41,
+    "groupId": {
+      "$bytes": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    },
+    "epoch": 7,
+    "groupContextHash": {
+      "$bytes": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+    },
+    "confirmationTag": {
+      "$bytes": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ="
+    },
+    "lifecycle": "active"
+  },
+  "participants": [
+    {
+      "userDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+      "role": "admin",
+      "status": "active",
+      "leafCount": 1
+    },
+    {
+      "userDid": "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
+      "role": "member",
+      "status": "active",
+      "leafCount": 1,
+      "invitationProvenance": {
+        "invitationTransitionId": "33333333-3333-4333-9333-333333333333",
+        "invitedByDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+        "invitedByDeviceId": "22222222-2222-4222-9222-222222222222"
+      }
+    }
+  ],
+  "leaves": [
+    {
+      "userDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+      "deviceId": "22222222-2222-4222-9222-222222222222",
+      "leafOrigin": "genesis",
+      "keyId": "-EnWcyX6zwQXe8ZjstxUQFGDHFie9YHUEvLrpEg053w",
+      "deviceStatus": "active"
+    }
+  ],
+  "metadataSnapshot": {
+    "coordinate": {
+      "conversationId": {
+        "$bytes": "ERERERERQRGREREREREREQ=="
+      },
+      "generation": 3,
+      "groupId": {
+        "$bytes": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+      },
+      "epoch": 7,
+      "groupContextHash": {
+        "$bytes": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+      },
+      "confirmationTag": {
+        "$bytes": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ="
+      }
+    },
+    "originTransitionId": "33333333-3333-4333-9333-333333333333",
+    "metadataVersion": 2,
+    "nonce": {
+      "$bytes": "BwcHBwcHBwcHBwcH"
+    },
+    "ciphertext": {
+      "$bytes": "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY="
+    },
+    "ciphertextSha256": {
+      "$bytes": "6AIIatah4Wt4NSrXKW0qq9g1sbFtvpUeETW5fGjinYE="
+    },
+    "ciphertextSize": 32,
+    "authorProof": {
+      "authGenerationAtOrigin": 1,
+      "authorDeviceId": "22222222-2222-4222-9222-222222222222",
+      "authorDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+      "authorKeyId": "-EnWcyX6zwQXe8ZjstxUQFGDHFie9YHUEvLrpEg053w",
+      "deviceStatusAtOrigin": "active",
+      "originSeq": 3,
+      "originTransitionId": "33333333-3333-4333-9333-333333333333",
+      "roleAtOrigin": "admin",
+      "signaturePublicKey": {
+        "$bytes": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU="
+      }
+    }
+  },
+  "snapshotSeq": 45
+}

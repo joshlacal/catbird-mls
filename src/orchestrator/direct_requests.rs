@@ -4,13 +4,22 @@
 //! account consent; imports and decryptions change exact-device crypto state.
 #[path = "direct_request_commands.rs"]
 mod commands;
+#[path = "direct_request_controls.rs"]
+mod controls;
 #[path = "direct_request_intent.rs"]
 mod intent;
+#[path = "group_invitation_reference.rs"]
+mod invitation;
+#[path = "direct_request_origin.rs"]
+mod origin;
+#[path = "direct_request_peer_keys.rs"]
+mod peer_keys;
 #[path = "direct_request_projection.rs"]
 mod projection;
 #[path = "direct_request_receive.rs"]
 mod receive;
 pub use intent::DirectRequestIntent;
+pub(crate) use projection::{normalized_close_entry, DirectRequestProjection};
 
 use super::direct_request_types::*;
 use super::{OrchestratorError, Result};
@@ -136,6 +145,16 @@ where
         if !self.mls_context().supports_direct_request_bootstrap() {
             return Ok(());
         }
+        if let Some(device) = self.credentials().get_device_uuid(owner).await? {
+            if let Some(raw) = self
+                .mls_context()
+                .read_direct_request_key_publication(&device)?
+            {
+                super::direct_request_keys::DirectRequestKeyPublication::decode(
+                    &raw, owner, &device,
+                )?;
+            }
+        }
         let intents = self.mls_context().list_direct_request_intents()?;
         let journals = self.mls_context().list_direct_request_journal()?;
         if intents.is_empty()
@@ -237,18 +256,29 @@ where
         let device = self.require_actor_device_id().await?;
         let mut views = Vec::new();
         let mut ids = std::collections::HashSet::new();
-        let retired: std::collections::HashSet<String> = self.mls_context().list_direct_request_journal()?.into_iter()
-            .filter(|j| j.phase == super::direct_request_journal::DirectRequestJournalPhase::RetiredPublished)
-            .map(|j| j.conversation_id).collect();
+        let retired: std::collections::HashSet<String> = self
+            .mls_context()
+            .list_direct_request_journal()?
+            .into_iter()
+            .filter(|j| {
+                j.phase
+                    == super::direct_request_journal::DirectRequestJournalPhase::RetiredPublished
+            })
+            .map(|j| j.conversation_id)
+            .collect();
         for raw in self.mls_context().list_direct_request_projections()? {
             let projection = projection::DirectRequestProjection::decode(&raw, &owner, &device)?;
             let view = projection.view(&owner, &device)?;
             if !ids.insert(view.conversation_id.clone()) {
-                return Err(OrchestratorError::Storage("Duplicate protected request projection".into()));
+                return Err(OrchestratorError::Storage(
+                    "Duplicate protected request projection".into(),
+                ));
             }
-            if !retired.contains(&view.conversation_id) { views.push(view); }
+            if view.consent == RequestConsent::Closed || !retired.contains(&view.conversation_id) {
+                views.push(view);
+            }
         }
-        views.sort_by(|a,b| a.conversation_id.cmp(&b.conversation_id));
+        views.sort_by(|a, b| a.conversation_id.cmp(&b.conversation_id));
         Ok(views)
     }
 
@@ -355,4 +385,44 @@ where
             }
         }
     }
+}
+
+/// Validate the protected close transition before a provider atomically retires
+/// its group and stores the next projection. No network authority is inferred.
+pub fn validate_closed_request_projection(
+    cid: &str,
+    expected: &[u8],
+    next: &[u8],
+) -> std::result::Result<Vec<u8>, crate::MLSError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    fn failed<E>(_: E) -> crate::MLSError {
+        crate::MLSError::StorageFailed
+    }
+    let parsed: DirectRequestProjection = serde_json::from_slice(next).map_err(failed)?;
+    let closed = DirectRequestProjection::decode(next, &parsed.owner_did, &parsed.device_id)
+        .map_err(failed)?;
+    let view = closed
+        .view(&parsed.owner_did, &parsed.device_id)
+        .map_err(failed)?;
+    let old = DirectRequestProjection::decode(expected, &parsed.owner_did, &parsed.device_id)
+        .map_err(failed)?;
+    if view.conversation_id != cid
+        || view.consent != RequestConsent::Closed
+        || closed.close_proof.is_none()
+        || old.publication != closed.publication
+        || old.publication_receipt != closed.publication_receipt
+        || old.sender_public_key != closed.sender_public_key
+        || (old.close_proof.is_some() && expected != next)
+    {
+        return Err(crate::MLSError::StorageFailed);
+    }
+    let publication: serde_json::Value =
+        serde_json::from_slice(&closed.publication).map_err(failed)?;
+    STANDARD
+        .decode(
+            publication["body"]["next"]["groupId"]
+                .as_str()
+                .ok_or(crate::MLSError::StorageFailed)?,
+        )
+        .map_err(failed)
 }

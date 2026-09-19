@@ -222,6 +222,9 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
             reason: "durable request projection unavailable".into(),
         })
     }
+    fn commit_closed_direct_request_projection(&self, _cid: &str, _expected: &[u8], _next: &[u8]) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "atomic request close custody unavailable".into() })
+    }
     fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "durable request projection unavailable".into(),

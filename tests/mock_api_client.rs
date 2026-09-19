@@ -159,6 +159,7 @@ struct FailureFlags {
 
 #[derive(Debug, Default)]
 struct MockState {
+    incoming_pages: Vec<(Vec<IncomingEnvelope>, Option<String>)>,
     request_operation_responses: Vec<(
         catbird_mls::orchestrator::canonical_transport::CanonicalOperation,
         catbird_mls::orchestrator::canonical_transport::GatewayResponse,
@@ -349,6 +350,10 @@ impl PublishGroupInfoGate {
 }
 
 impl MockDeliveryService {
+    pub fn queue_incoming_page(&self, envelopes: Vec<IncomingEnvelope>, cursor: Option<String>) {
+        self.state.lock().unwrap().incoming_pages.push((envelopes, cursor));
+    }
+
     pub fn queue_request_operation_response(
         &self,
         operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation,
@@ -3794,6 +3799,9 @@ impl MLSAPIClient for MockDeliveryService {
         if message_type == Some("app") {
             guard.app_message_epoch_ranges.push((from_epoch, to_epoch));
         }
+        if !guard.incoming_pages.is_empty() {
+            return Ok(guard.incoming_pages.remove(0));
+        }
 
         let all_messages = guard
             .messages
@@ -3844,6 +3852,7 @@ impl MLSAPIClient for MockDeliveryService {
         let page: Vec<IncomingEnvelope> = filtered_messages[start..end]
             .iter()
             .map(|m| IncomingEnvelope {
+                canonical_entry_json: None,
                 conversation_id: m.conversation_id.clone(),
                 sender_did: guard
                     .envelope_sender_relabels
