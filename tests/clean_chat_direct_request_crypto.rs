@@ -720,6 +720,17 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
     let mut wrong = welcome_input.clone();
     wrong.bootstrap.coordinates["confirmationTag"] = serde_json::json!(STANDARD.encode([99; 32]));
     assert!(bob.process_direct_request_welcome(&wrong).is_err());
+    let mut extra = welcome_input.clone();
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&extra.publication_request).unwrap();
+    envelope["unexpected"] = serde_json::json!(true);
+    extra.publication_request = serde_json::to_vec(&envelope).unwrap();
+    assert!(bob.process_direct_request_welcome(&extra).is_err());
+    let mut duplicate = welcome_input.clone();
+    let signed = serde_json::to_string(&envelope["signedRequest"]).unwrap();
+    duplicate.publication_request =
+        format!("{{\"signedRequest\":{signed},\"signedRequest\":{signed}}}").into_bytes();
+    assert!(bob.process_direct_request_welcome(&duplicate).is_err());
     bob.process_direct_request_welcome(&welcome_input).unwrap();
     drop(bob);
     let bob = open(&bob_path, &bob_keys);

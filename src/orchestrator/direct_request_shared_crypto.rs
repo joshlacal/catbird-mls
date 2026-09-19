@@ -124,8 +124,20 @@ pub fn validate_request_welcome_receipt(input: &DirectRequestWelcomeInput) -> Re
     // Received read DTOs can represent schema bytes as DAG-JSON objects. Keep
     // the locally journaled mutation verifier strict, and normalize only this
     // independently verified incoming presentation.
+    if input.publication_request.len() > transcript::MAX_PUBLISH_HTTP_BODY_BYTES {
+        return Err(invalid("Request Welcome publication byte cap"));
+    }
+    crate::chat_v2::transcript::decode_strict_json(&input.publication_request)
+        .map_err(crypto_error)?;
+    let received: Value = serde_json::from_slice(&input.publication_request).map_err(error)?;
+    if received.get("signedRequest").is_some()
+        && received.as_object().is_none_or(|fields| fields.len() != 1)
+    {
+        return Err(invalid("Unexpected publication wrapper fields"));
+    }
+    let wrapper = received.get("signedRequest").unwrap_or(&received);
     let publication = transcript::normalize_direct_request_read_presentation(
-        &input.publication_request,
+        &serde_json::to_vec(wrapper).map_err(error)?,
         "signedDirectRequestPublication",
         false,
     )
