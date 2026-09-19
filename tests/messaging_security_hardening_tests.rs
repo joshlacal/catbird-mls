@@ -960,7 +960,26 @@ async fn secret_reuse_aad_message_id_base64_matches_stored_uuid_and_advances_cur
 async fn secret_reuse_with_own_echo_proof_skips_and_advances_cursor() {
     let conversation_id = "8182838485868788898a8b8c8d8e8f93";
     let server_entry_id = "server-entry-with-echo-proof";
-    let ciphertext = b"ciphertext-with-echo-proof";
+    // This controlled decrypt fixture tests proof lookup, not crypto acceptance.
+    // Its public TLS header must carry the actual nonempty AAD of the proof.
+    use tls_codec::Serialize as _;
+    let aad = b"canonical application metadata";
+    let group_bytes = hex::decode(conversation_id).unwrap();
+    let mut ciphertext = vec![0, 1, 0, 2]; // MLS 1.0, PrivateMessage
+    ciphertext.extend(
+        tls_codec::VLBytes::from(group_bytes.clone())
+            .tls_serialize_detached()
+            .unwrap(),
+    );
+    ciphertext.extend(1_u64.to_be_bytes());
+    ciphertext.push(1); // application content
+    for bytes in [aad.as_slice(), &[0_u8; 32], &[0_u8; 32]] {
+        ciphertext.extend(
+            tls_codec::VLBytes::from(bytes)
+                .tls_serialize_detached()
+                .unwrap(),
+        );
+    }
     let fixture = controlled_inbound_fixture(
         conversation_id,
         Arc::new(ControlledCommitCrypto::secret_reuse()),
@@ -968,8 +987,8 @@ async fn secret_reuse_with_own_echo_proof_skips_and_advances_cursor() {
     .await;
     let group_bytes = hex::decode(conversation_id).unwrap_or_default();
     let req_hash: [u8; 32] = Sha256::digest(b"test-req").into();
-    let aad_hash: [u8; 32] = Sha256::digest(b"").into();
-    let ct_hash: [u8; 32] = Sha256::digest(ciphertext).into();
+    let aad_hash: [u8; 32] = Sha256::digest(aad).into();
+    let ct_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
 
     let proof = OwnEchoProof::new(
         req_hash,
@@ -984,7 +1003,7 @@ async fn secret_reuse_with_own_echo_proof_skips_and_advances_cursor() {
 
     fixture
         .api
-        .send_message_with_id(conversation_id, ciphertext, 1, server_entry_id)
+        .send_message_with_id(conversation_id, &ciphertext, 1, server_entry_id)
         .await
         .expect("seed server echo envelope");
 
@@ -1598,8 +1617,8 @@ async fn post_set_aad_failure_restores_aad_and_echo_matches_exact_proof() {
         add_res.is_err(),
         "add_members_with_aad with invalid key package must fail"
     );
-    // Now Alice sends an application message. The group AAD must have been restored to empty,
-    // so the proof's empty AAD matches the encryption and the subsequent echo.
+    // A failed Add must not contaminate the canonical application AAD chosen by
+    // the next send. The protected proof and echoed wire header must match it.
     let sent = alice
         .orchestrator
         .send_message(group_id, "hello with restored AAD")
@@ -2664,6 +2683,141 @@ async fn send_message_binds_authoritative_coordinates_from_point_read() {
         inner_body["prior"]["stateVersion"],
         serde_json::json!(2),
         "body.prior.stateVersion must equal point read stateVersion (2, not 0)"
+    );
+    assert_canonical_application_wire(inner_body);
+}
+
+fn assert_canonical_application_wire(body: &serde_json::Value) {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn, ProtocolMessage};
+    use tls_codec::Deserialize as _;
+    let decode = |value: &serde_json::Value| {
+        STANDARD
+            .decode(value.as_str().or_else(|| value["$bytes"].as_str()).unwrap())
+            .unwrap()
+    };
+    let ciphertext = decode(&body["applicationMessage"]["bytes"]);
+    let frame = MlsMessageIn::tls_deserialize_exact(&ciphertext)
+        .expect("production send must emit exact raw MLS TLS framing");
+    let MlsMessageBodyIn::PrivateMessage(private) = frame.extract() else {
+        panic!("expected private application frame");
+    };
+    let expected_aad =
+        catbird_mls::orchestrator::canonical_application_aad_bytes(&body["aad"]).unwrap();
+    assert!(!expected_aad.is_empty());
+    assert_eq!(private.aad(), expected_aad);
+    let protocol = ProtocolMessage::from(private);
+    assert_eq!(
+        protocol.epoch().as_u64(),
+        body["prior"]["epoch"].as_u64().unwrap()
+    );
+    assert_eq!(
+        protocol.group_id().as_slice(),
+        decode(&body["prior"]["groupId"])
+    );
+    assert_eq!(
+        Sha256::digest(&ciphertext).as_slice(),
+        decode(&body["applicationMessage"]["sha256"])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_retries_only_explicit_stale_coordinates_with_exact_bound_aad() {
+    use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+    for (status, error, expected_sends) in [
+        (400, "StaleCoordinates", 2),
+        (409, "IdempotencyConflict", 1),
+        (409, "UnspecifiedConflict", 1),
+    ] {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world.register_device("Alice").await.unwrap();
+        let alice = world.client("Alice");
+        let convo = alice
+            .orchestrator
+            .create_group("send-retry", None, None)
+            .await
+            .unwrap();
+        world
+            .api_service
+            .set_next_send_custom_response(status, serde_json::json!({"error": error}));
+        let result = alice
+            .orchestrator
+            .send_message(&convo.group_id, "bounded retry")
+            .await;
+        assert_eq!(result.is_ok(), expected_sends == 2, "{error}: {result:?}");
+        let sends: Vec<serde_json::Value> = world
+            .delivery_service()
+            .submitted_prepared_requests()
+            .into_iter()
+            .filter(|request| request.operation == CanonicalOperation::SendMessage)
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(request.body.as_deref().unwrap())
+                    .unwrap()["signedRequest"]["body"]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(sends.len(), expected_sends, "{error}");
+        for body in &sends {
+            assert_canonical_application_wire(body);
+        }
+        if sends.len() == 2 {
+            assert_eq!(sends[0]["messageId"], sends[1]["messageId"]);
+            assert_eq!(sends[0]["aad"], sends[1]["aad"]);
+            assert_ne!(
+                sends[0]["applicationMessage"]["bytes"],
+                sends[1]["applicationMessage"]["bytes"]
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_encrypt_rejects_epoch_race_and_restores_group_aad() {
+    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+    use tls_codec::Deserialize as _;
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("epoch-aad", None, None)
+        .await
+        .unwrap();
+    let group = hex::decode(&convo.group_id).unwrap();
+    let context = alice.orchestrator.mls_context();
+    let epoch = context.get_epoch(group.clone()).unwrap();
+    let aad = b"bound application AAD".to_vec();
+    assert!(context
+        .encrypt_message_with_aad(group.clone(), b"test".to_vec(), aad.clone(), epoch + 1)
+        .is_err());
+    assert!(context
+        .encrypt_message_with_aad(group.clone(), b"test".to_vec(), vec![], epoch)
+        .is_err());
+    let accepted = context
+        .encrypt_message_with_aad(group.clone(), b"test".to_vec(), aad.clone(), epoch)
+        .unwrap();
+    let MlsMessageBodyIn::PrivateMessage(private) =
+        MlsMessageIn::tls_deserialize_exact(&accepted.ciphertext)
+            .unwrap()
+            .extract()
+    else {
+        panic!("private application")
+    };
+    assert_eq!(private.aad(), aad);
+    let legacy = context.encrypt_message(group, b"later".to_vec()).unwrap();
+    let length = u32::from_be_bytes(legacy.ciphertext[..4].try_into().unwrap()) as usize;
+    let MlsMessageBodyIn::PrivateMessage(private) =
+        MlsMessageIn::tls_deserialize_exact(&legacy.ciphertext[4..4 + length])
+            .unwrap()
+            .extract()
+    else {
+        panic!("private application")
+    };
+    assert!(
+        private.aad().is_empty(),
+        "canonical encryption must restore transient group AAD"
     );
 }
 

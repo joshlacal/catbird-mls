@@ -21,7 +21,10 @@ pub(crate) fn private_application_echo_metadata(
             let length = u32::from_be_bytes(length.try_into().unwrap()) as usize;
             let end = length.checked_add(4).ok_or(MLSError::SerializationError)?;
             let raw = ciphertext.get(4..end).ok_or(MLSError::SerializationError)?;
-            if ciphertext.get(end..).is_none_or(|tail| tail.iter().any(|byte| *byte != 0)) {
+            if ciphertext
+                .get(end..)
+                .is_none_or(|tail| tail.iter().any(|byte| *byte != 0))
+            {
                 return Err(MLSError::SerializationError);
             }
             parse(raw).map_err(|_| MLSError::SerializationError)?
@@ -35,7 +38,11 @@ pub(crate) fn private_application_echo_metadata(
     if protocol.content_type() != ContentType::Application {
         return Err(MLSError::SerializationError);
     }
-    Ok((protocol.group_id().as_slice().to_vec(), protocol.epoch().as_u64(), aad_sha256))
+    Ok((
+        protocol.group_id().as_slice().to_vec(),
+        protocol.epoch().as_u64(),
+        aad_sha256,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

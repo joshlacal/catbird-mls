@@ -108,6 +108,8 @@ where
     lifecycle_state: Mutex<OrchestratorLifecycleState>,
     /// Owns one complete initialize/resume/shutdown transition.
     lifecycle_operation: Mutex<()>,
+    /// Invalidates work across suspension, shutdown and same-account reinitialization.
+    lifecycle_generation: AtomicU64,
     /// In-memory conversation cache.
     conversations: Mutex<HashMap<ConversationId, ConversationView>>,
     /// In-memory group state cache.
@@ -299,6 +301,7 @@ where
             config,
             lifecycle_state: Mutex::new(OrchestratorLifecycleState::Uninitialized),
             lifecycle_operation: Mutex::new(()),
+            lifecycle_generation: AtomicU64::new(0),
             conversations: Mutex::new(HashMap::new()),
             group_states: Mutex::new(HashMap::new()),
             conversation_states: Mutex::new(HashMap::new()),
@@ -645,6 +648,7 @@ where
     /// Initialize the orchestrator for a user.
     pub async fn initialize(&self, user_did: &str) -> Result<()> {
         let _lifecycle_owner = self.lifecycle_operation.lock().await;
+        self.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
         tracing::info!(user_did, "Initializing MLS orchestrator");
 
         // Recovery backoff is a security boundary, not a best-effort cache.
@@ -856,6 +860,7 @@ where
                 }
                 _ => return Err(OrchestratorError::NotAuthenticated),
             };
+            self.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
             *lifecycle = OrchestratorLifecycleState::Suspended {
                 user_did: user_did.clone(),
             };
@@ -890,6 +895,7 @@ where
     /// Shut down the orchestrator, releasing resources.
     pub async fn shutdown(&self) {
         let _lifecycle_owner = self.lifecycle_operation.lock().await;
+        self.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
         tracing::info!("Shutting down MLS orchestrator");
         *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Shutdown;
         self.clear_runtime_state().await;
@@ -916,6 +922,10 @@ where
             OrchestratorLifecycleState::Ready { user_did } => Ok(user_did.clone()),
             _ => Err(OrchestratorError::NotAuthenticated),
         }
+    }
+
+    pub(crate) fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation.load(Ordering::SeqCst)
     }
 
     /// Resolve the durable client-generated device ID used to scope every

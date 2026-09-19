@@ -2008,49 +2008,62 @@ async fn reset_completion_requires_the_stable_conversation_row() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn leave_via_self_remove_uses_active_group_for_rotated_stable_conversation() {
+async fn leave_via_self_remove_uses_canonical_exit_and_preserves_native_history() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
+    world
+        .add_client_with_did("Alice", "did:plc:abcdefghijklmnopqrstuvwx")
+        .await;
     world
         .register_device("Alice")
         .await
         .expect("register alice");
+    world
+        .delivery_service()
+        .set_next_create_conversation_id(STABLE_CONVERSATION_ID);
     let alice = world.client("Alice");
     let conversation = alice
         .orchestrator
-        .create_group("rotated self remove", None, None)
+        .create_group("canonical leave compatibility", None, None)
         .await
         .expect("create group");
     let group_id = conversation.group_id.clone();
 
-    world
-        .delivery_service()
-        .rekey_conversation_for_test(&conversation.conversation_id, STABLE_CONVERSATION_ID);
-    migrate_stable_conversation_id_for_test(
-        alice,
-        &conversation.conversation_id,
-        STABLE_CONVERSATION_ID,
-    )
-    .await;
-    alice
-        .orchestrator
-        .sync_with_server(false)
-        .await
-        .expect("refresh rotated mapping");
+    assert_eq!(conversation.conversation_id, STABLE_CONVERSATION_ID);
+    assert_ne!(group_id, STABLE_CONVERSATION_ID);
 
     alice
         .orchestrator
         .leave_via_self_remove(STABLE_CONVERSATION_ID)
         .await
-        .expect("self-remove must use active mutable group");
+        .expect("compatibility leave must complete the canonical account exit");
 
     assert!(
         alice
             .orchestrator
             .mls_context()
             .get_epoch(hex::decode(group_id).expect("active group id"))
-            .is_err(),
-        "successful leave must delete the active local group"
+            .is_ok(),
+        "canonical close retains native state for read-only history"
+    );
+    assert_eq!(
+        alice
+            .storage
+            .get_conversation_state(STABLE_CONVERSATION_ID)
+            .await
+            .unwrap(),
+        Some(ConversationState::Closed)
+    );
+    let operations: Vec<_> = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .map(|request| request.operation)
+        .collect();
+    use catbird_mls::orchestrator::CanonicalOperation;
+    assert!(operations.contains(&CanonicalOperation::CloseConversation));
+    assert!(
+        !operations.contains(&CanonicalOperation::SendMessage),
+        "an MLS proposal is never an application message"
     );
 }
 

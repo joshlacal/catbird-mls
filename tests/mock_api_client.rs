@@ -329,6 +329,7 @@ pub struct MockDeliveryService {
     get_conversations_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     get_conversation_state_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     get_messages_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
+    send_ack_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     /// Per-instance DID override (allows multiple clients to share one mock server).
     instance_did: Option<String>,
 }
@@ -390,6 +391,7 @@ impl MockDeliveryService {
             get_conversations_gate: Arc::new(Mutex::new(None)),
             get_conversation_state_gate: Arc::new(Mutex::new(None)),
             get_messages_gate: Arc::new(Mutex::new(None)),
+            send_ack_gate: Arc::new(Mutex::new(None)),
             instance_did: None,
         }
     }
@@ -403,6 +405,7 @@ impl MockDeliveryService {
             get_conversations_gate: Arc::clone(&self.get_conversations_gate),
             get_conversation_state_gate: Arc::clone(&self.get_conversation_state_gate),
             get_messages_gate: Arc::clone(&self.get_messages_gate),
+            send_ack_gate: Arc::clone(&self.send_ack_gate),
             instance_did: Some(did.to_string()),
         }
     }
@@ -776,6 +779,13 @@ impl MockDeliveryService {
     pub fn pause_next_get_conversation_state(&self) -> Arc<PublishGroupInfoGate> {
         let gate = Arc::new(PublishGroupInfoGate::default());
         *self.get_conversation_state_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Pause after the mock server persists a send and before returning its ACK.
+    pub fn pause_next_send_ack(&self) -> Arc<PublishGroupInfoGate> {
+        let gate = Arc::new(PublishGroupInfoGate::default());
+        *self.send_ack_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -2426,6 +2436,7 @@ impl MLSAPIClient for MockDeliveryService {
                     .and_then(|m| m.as_str())
                     .unwrap_or_default();
 
+                let response = {
                 let mut guard = self.state.lock().unwrap();
                 check_fail(&mut guard.failures.fail_next_send, "injected send failure")?;
                 let did = self
@@ -2470,11 +2481,18 @@ impl MLSAPIClient for MockDeliveryService {
                         }
                     }
                 });
-                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
                     body: serde_json::to_vec(&output).unwrap(),
-                })
+                }
+                };
+                let gate = self.send_ack_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.reached.notify_one();
+                    gate.release.notified().await;
+                }
+                Ok(response)
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages => {
                 let packages = inner_body

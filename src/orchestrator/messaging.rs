@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use super::api_client::MLSAPIClient;
 use super::canonical_transport::CleanChatSigningContext;
 use super::constants;
-use super::credentials::{CleanChatSigningAuthority, CredentialStore};
+use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::mls_provider::{
     IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof,
@@ -19,6 +19,28 @@ use super::types::*;
 enum SendSyncCursorProgress {
     Complete,
     Continue(String),
+}
+
+struct SendActor {
+    did: String,
+    device_id: String,
+    auth_generation: i64,
+    lifecycle_generation: u64,
+}
+
+/// Only this explicit refusal is known to precede durable message publication.
+/// A conflict or unknown transport outcome cannot authorize new ciphertext.
+fn is_stale_send_coordinates(error: &OrchestratorError) -> bool {
+    let OrchestratorError::ServerError {
+        status: 400 | 409,
+        body,
+    } = error
+    else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| value["error"].as_str() == Some("StaleCoordinates"))
 }
 
 /// Bound duplicate-proof reads so an attacker-controlled server ID cannot
@@ -625,7 +647,8 @@ where
         payload: MLSMessagePayload,
     ) -> Result<Message> {
         self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
+        let actor = self.capture_send_actor().await?;
+        let user_did = actor.did.clone();
 
         if let Some(reference) = payload
             .checked_group_invitation()
@@ -719,7 +742,16 @@ where
 
         // Bind metadata and message identity before encryption. The provider
         // checks this epoch under its mutation lock and emits raw MLS framing.
-        let epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
+        self.validate_send_actor(&actor).await?;
+        let epoch = self
+            .mls_context()
+            .get_epoch(group_id_bytes.clone())
+            .map_err(|error| match error {
+                MLSError::GroupNotFound { .. } => OrchestratorError::NotJoined {
+                    convo_id: conversation_id.to_string(),
+                },
+                other => OrchestratorError::Mls(other),
+            })?;
         let message_id = uuid::Uuid::new_v4().to_string();
         let send_result = self
             .encrypt_and_send_message_prepared(
@@ -727,6 +759,7 @@ where
                 &payload_bytes,
                 epoch,
                 &message_id,
+                &actor,
             )
             .await;
         drop(transition_guard);
@@ -753,12 +786,13 @@ where
                 }
                 return Err(send_result.unwrap_err());
             }
-            Err(OrchestratorError::ServerError {
-                status: 409,
-                ref body,
-            }) => {
-                // Approach B: lightweight sync + single retry on 409 (epoch mismatch).
-                // NO External Commit — only catch up on pending commits and re-encrypt.
+            Err(ref error) if is_stale_send_coordinates(error) => {
+                self.validate_send_actor(&actor).await?;
+                let OrchestratorError::ServerError { body, .. } = error else {
+                    unreachable!()
+                };
+                // The canonical server explicitly refused stale coordinates before
+                // publication. Catch up and re-encrypt once with the same message ID.
                 let remote = serde_json::from_str::<serde_json::Value>(body)
                     .ok()
                     .and_then(|v| v["serverEpoch"].as_u64())
@@ -767,7 +801,7 @@ where
                     conversation_id,
                     local_epoch = epoch,
                     remote_epoch = remote,
-                    "Epoch mismatch (409) — attempting Approach B lightweight sync"
+                    "Stale send coordinates; attempting one lightweight sync"
                 );
 
                 // Lightweight sync: fetch pending commits to advance local epoch.
@@ -775,13 +809,16 @@ where
                 // messages, so cursor progression is handled independently of
                 // the returned message vector.
                 if let Err(error) = self
-                    .catch_up_pending_commits_for_send(conversation_id, "retry_after_409")
+                    .catch_up_pending_commits_for_send(
+                        conversation_id,
+                        "retry_after_stale_coordinates",
+                    )
                     .await
                 {
                     tracing::error!(
                         conversation_id,
                         error = %error,
-                        "409 recovery: commit catch-up failed — flagging NEEDS_REJOIN"
+                        "Stale-coordinate recovery: commit catch-up failed"
                     );
                     self.mark_needs_rejoin_critical(conversation_id).await;
                     return Err(error);
@@ -802,13 +839,15 @@ where
                 let retry_transition_lock = self.rejoin_lock(conversation_id).await;
                 let retry_transition_guard = retry_transition_lock.lock().await;
                 self.reject_send_if_reset_pending(conversation_id).await?;
+                self.validate_send_actor(&actor).await?;
 
                 let retry_send_result = self
                     .encrypt_and_send_message_prepared(
-                        conversation_id,
+                        &resolved.conversation_id,
                         &payload_bytes,
                         retry_epoch,
                         &message_id,
+                        &actor,
                     )
                     .await;
                 drop(retry_transition_guard);
@@ -822,15 +861,14 @@ where
                         tracing::info!(
                             conversation_id,
                             retry_epoch,
-                            "409 recovery: retry succeeded after lightweight sync"
+                            "Stale-coordinate retry succeeded after lightweight sync"
                         );
                         Some(resp)
                     }
-                    Err(OrchestratorError::ServerError { status: 409, .. }) => {
-                        // Second 409: flag conversation NEEDS_REJOIN, return error
+                    Err(ref error) if is_stale_send_coordinates(error) => {
                         tracing::error!(
                             conversation_id,
-                            "409 recovery: second 409 after sync — flagging NEEDS_REJOIN"
+                            "Send coordinates remain stale after bounded sync"
                         );
                         self.mark_needs_rejoin_critical(conversation_id).await;
                         return Err(OrchestratorError::EpochMismatch {
@@ -849,6 +887,7 @@ where
             }
         };
 
+        self.validate_send_actor(&actor).await?;
         // Use server values when available, fall back to local
         let (msg_epoch, msg_seq) = match &send_response {
             Some(resp) => (resp.epoch, resp.seq),
@@ -862,6 +901,7 @@ where
             .insert(message_id.clone());
 
         // Persist pending message for dedup across app restarts
+        self.validate_send_actor(&actor).await?;
         if let Err(e) = self
             .storage()
             .store_pending_message(conversation_id, &message_id)
@@ -879,6 +919,7 @@ where
         // carrying server_message_id are recognized immediately.
         if let Some(ref resp) = send_response {
             if resp.message_id != message_id {
+                self.validate_send_actor(&actor).await?;
                 self.pending_messages()
                     .lock()
                     .await
@@ -915,7 +956,9 @@ where
             .await;
 
         // Store locally
+        self.validate_send_actor(&actor).await?;
         self.storage().store_message(&message).await?;
+        self.validate_send_actor(&actor).await?;
 
         tracing::debug!(conversation_id, "Message sent successfully");
         Ok(message)
@@ -1306,21 +1349,35 @@ where
                             } else {
                                 // 3. Match the actual public MLS framing against
                                 // independently retained protected evidence.
-                                match super::mls_provider::private_application_echo_metadata(&envelope.ciphertext) {
+                                match super::mls_provider::private_application_echo_metadata(
+                                    &envelope.ciphertext,
+                                ) {
                                     Ok((wire_group, epoch, aad_sha256))
                                         if wire_group == group_id_bytes
-                                            && envelope.server_epoch.is_none_or(|expected| expected == epoch) => {
-                                        let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(&envelope.ciphertext).into();
+                                            && envelope
+                                                .server_epoch
+                                                .is_none_or(|expected| expected == epoch) =>
+                                    {
+                                        let ciphertext_sha256: [u8; 32] =
+                                            sha2::Sha256::digest(&envelope.ciphertext).into();
                                         let direct = self.mls_context().has_own_echo_proof(
-                                            &resolved.conversation_id, &group_id_bytes, server_id,
-                                            epoch, &aad_sha256, &ciphertext_sha256,
+                                            &resolved.conversation_id,
+                                            &group_id_bytes,
+                                            server_id,
+                                            epoch,
+                                            &aad_sha256,
+                                            &ciphertext_sha256,
                                         )?;
                                         if direct {
                                             true
                                         } else if let Some(alt) = &alternate {
                                             self.mls_context().has_own_echo_proof(
-                                                &resolved.conversation_id, &group_id_bytes, alt,
-                                                epoch, &aad_sha256, &ciphertext_sha256,
+                                                &resolved.conversation_id,
+                                                &group_id_bytes,
+                                                alt,
+                                                epoch,
+                                                &aad_sha256,
+                                                &ciphertext_sha256,
                                             )?
                                         } else {
                                             false
@@ -2090,27 +2147,65 @@ where
         changed
     }
 
+    async fn capture_send_actor(&self) -> Result<SendActor> {
+        let lifecycle_generation = self.lifecycle_generation();
+        let did = self.require_user_did().await?;
+        let device_id = self
+            .credentials()
+            .get_device_uuid(&did)
+            .await?
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| OrchestratorError::Credential("device not registered".into()))?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&did)
+            .await?
+            .filter(|value| *value >= 1)
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        let actor = SendActor {
+            did,
+            device_id,
+            auth_generation,
+            lifecycle_generation,
+        };
+        self.validate_send_actor(&actor).await?;
+        Ok(actor)
+    }
+
+    async fn validate_send_actor(&self, actor: &SendActor) -> Result<()> {
+        if self.lifecycle_generation() != actor.lifecycle_generation
+            || self.require_user_did().await? != actor.did
+            || self
+                .credentials()
+                .get_device_uuid(&actor.did)
+                .await?
+                .as_deref()
+                != Some(&actor.device_id)
+            || self.credentials().get_auth_generation(&actor.did).await?
+                != Some(actor.auth_generation)
+            || !self.api_client().is_authenticated_as(&actor.did).await
+            || self.lifecycle_generation() != actor.lifecycle_generation
+            || self.require_user_did().await? != actor.did
+        {
+            return Err(OrchestratorError::NotAuthenticated);
+        }
+        Ok(())
+    }
+
     async fn encrypt_and_send_message_prepared(
         &self,
         conversation_id: &str,
         plaintext: &[u8],
         epoch: u64,
         message_id: &str,
+        actor: &SendActor,
     ) -> Result<SendMessageResponse> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::Sha256;
-        let user_did = self.require_user_did().await?;
-        let actor_device_id = self.require_actor_device_id().await?;
-        let auth_generation = self
-            .credentials()
-            .get_auth_generation(&user_did)
-            .await?
-            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
-        if auth_generation < 1 {
-            return Err(OrchestratorError::Credential(
-                "auth_generation must be >= 1".into(),
-            ));
-        }
+        self.validate_send_actor(actor).await?;
+        let user_did = &actor.did;
+        let actor_device_id = &actor.device_id;
+        let auth_generation = actor.auth_generation;
         let key_id = {
             let identity_bytes = format!("{user_did}#{actor_device_id}").into_bytes();
             let pk = self.mls_context().identity_public_key(identity_bytes)?;
@@ -2214,7 +2309,7 @@ where
             "messageId": message_id,
             "prior": {
                 "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
-                "conversationId": conversation_id,
+                "conversationId": convo_id,
                 "epoch": epoch,
                 "generation": generation,
                 "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
@@ -2228,6 +2323,7 @@ where
 
         let aad_bytes = super::canonical_transport::canonical_application_aad_bytes(&body["aad"])
             .map_err(|error| OrchestratorError::Serialization(error.to_string()))?;
+        self.validate_send_actor(actor).await?;
         // The signed body below carries this exact AAD. No state fetch or
         // coordinate regeneration may occur between encryption and submission.
         let encrypted = self.mls_context().encrypt_message_with_aad(
@@ -2256,6 +2352,7 @@ where
             )
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        self.validate_send_actor(actor).await?;
 
         let submitted_bytes = prepared_request.body.as_deref().unwrap_or_default();
         let submitted_val: serde_json::Value =
@@ -2269,18 +2366,14 @@ where
             .await?;
 
         if response.status != 200 {
-            if response.status == 409 {
-                return Err(OrchestratorError::ServerError {
-                    status: 409,
-                    body: String::from_utf8_lossy(&response.body).to_string(),
-                });
-            }
-            return Err(OrchestratorError::Api(format!(
-                "send_message failed with status {}: {}",
-                response.status,
-                String::from_utf8_lossy(&response.body)
-            )));
+            return Err(OrchestratorError::ServerError {
+                status: response.status,
+                body: String::from_utf8_lossy(&response.body).to_string(),
+            });
         }
+        // An account transition after submission is an uncertain delivery for
+        // the original actor. Never apply its acknowledgment to a new session.
+        self.validate_send_actor(actor).await?;
 
         let resp_json: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|e| OrchestratorError::Serialization(format!("send_message response: {e}")))?;
@@ -2391,6 +2484,7 @@ where
             aad_sha256,
             ciphertext_sha256,
         );
+        self.validate_send_actor(actor).await?;
         self.mls_context().store_own_echo_proof(&proof)?;
 
         Ok(SendMessageResponse {
