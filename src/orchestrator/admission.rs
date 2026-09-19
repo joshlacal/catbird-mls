@@ -135,10 +135,18 @@ pub(crate) fn conversation_view_from_state_json(
     use base64::Engine as _;
     let coordinates = state.get("coordinates")?;
     let convo_id = coordinates.get("conversationId")?.as_str()?;
-    let group_b64 = coordinates.get("groupId")?.as_str()?;
+    let group_value = coordinates.get("groupId")?;
+    let group_b64 = match group_value {
+        serde_json::Value::String(encoded) => encoded.as_str(),
+        serde_json::Value::Object(fields) if fields.len() == 1 => fields.get("$bytes")?.as_str()?,
+        _ => return None,
+    };
     let group_bytes = base64::engine::general_purpose::STANDARD
         .decode(group_b64)
         .ok()?;
+    if base64::engine::general_purpose::STANDARD.encode(&group_bytes) != group_b64 {
+        return None;
+    }
     let group_id = hex::encode(group_bytes);
     let epoch = coordinates
         .get("epoch")

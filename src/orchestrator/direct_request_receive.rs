@@ -456,10 +456,16 @@ where
             }
             let canonical = transcript::verify_received_direct_request_acceptance_proof(
                 &serde_json::to_vec(proof).map_err(|_| invalid())?,
-                &transcript::resolve_direct_request_receipt_key(&candidate.trusted_authority_document, method).map_err(|_| invalid())?,
+                &transcript::resolve_direct_request_receipt_key(
+                    &candidate.trusted_authority_document,
+                    method,
+                )
+                .map_err(|_| invalid())?,
                 &key,
-            ).map_err(|_| invalid())?;
-            candidate.acceptance_proof = Some(serde_json::to_vec(&canonical).map_err(|_| invalid())?);
+            )
+            .map_err(|_| invalid())?;
+            candidate.acceptance_proof =
+                Some(serde_json::to_vec(&canonical).map_err(|_| invalid())?);
             candidate.recipient_public_key = Some(key);
             candidate.view(&owner, &device)?;
             candidate.pending_acceptance = None;

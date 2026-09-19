@@ -122,12 +122,94 @@ fn last_request(world: &TestWorld, op: Op) -> Value {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_acceptance() {
-    sender_fixture(false).await;
+    sender_fixture(false, false).await;
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_pending_direct_retains_exact_prior_and_builds_successor_generation() {
-    sender_fixture(true).await;
+    sender_fixture(true, false).await;
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn native_dag_json_read_preview_acceptance_and_exact_retry_survive_restart() {
+    sender_fixture(false, true).await;
+}
+
+fn last_request_bytes(world: &TestWorld, op: Op) -> Vec<u8> {
+    world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .rev()
+        .find(|r| r.operation == op)
+        .unwrap()
+        .body
+        .clone()
+        .unwrap()
+}
+
+/// Independent read fixture producer follows the exact embedded lexicon bytes
+/// declarations. It never guesses from field names or base64-looking strings.
+fn read_bytes(mode: bool, name: &str, tagged: bool, value: &Value) -> Value {
+    if !mode {
+        return value.clone();
+    }
+    let contract: Value = serde_json::from_str(include_str!(
+        "../src/chat_v2/transcript/vectors/blue.catbird.chat.defs.json"
+    ))
+    .unwrap();
+    fn convert(defs: &Value, schema: &Value, value: &mut Value) {
+        match schema["type"].as_str().unwrap() {
+            "bytes" => {
+                assert!(value.is_string());
+                *value = json!({"$bytes":value.clone()});
+            }
+            "ref" => convert(
+                defs,
+                &defs[schema["ref"].as_str().unwrap().strip_prefix('#').unwrap()],
+                value,
+            ),
+            "union" => {
+                let name = value["$type"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("blue.catbird.chat.defs#")
+                    .unwrap();
+                assert!(schema["refs"].as_array().unwrap().iter().any(|r| r
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix('#')
+                    == Some(name)));
+                convert(defs, &defs[name], value);
+            }
+            "object" => {
+                for (field, item) in value.as_object_mut().unwrap() {
+                    if field != "$type" {
+                        convert(defs, &schema["properties"][field], item);
+                    }
+                }
+            }
+            "array" => {
+                for item in value.as_array_mut().unwrap() {
+                    convert(defs, &schema["items"], item)
+                }
+            }
+            "string" | "integer" | "boolean" => {}
+            other => panic!("unsupported read fixture schema {other}"),
+        }
+    }
+    let mut presented = value.clone();
+    convert(&contract["defs"], &contract["defs"][name], &mut presented);
+    assert_eq!(
+        protocol::normalize_direct_request_read_presentation(
+            &serde_json::to_vec(&presented).unwrap(),
+            name,
+            tagged
+        )
+        .unwrap(),
+        *value
+    );
+    presented
+}
+
 async fn seed_pending_origin(world: &TestWorld, group: bool) -> (Value, Value) {
     let alice = world.client("Alice");
     let mut members = vec![world.client("Bob").did.clone()];
@@ -162,7 +244,7 @@ async fn seed_pending_origin(world: &TestWorld, group: bool) -> (Value, Value) {
     let entry = json!({"$type":"blue.catbird.chat.defs#creationEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":wrapper["signedRequest"],"receivedAt":utc(0)});
     (state, entry)
 }
-async fn sender_fixture(legacy: bool) {
+async fn sender_fixture(legacy: bool, dag_json: bool) {
     let mut world = TestWorld::new();
     for (name, did) in [
         ("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -237,6 +319,7 @@ async fn sender_fixture(legacy: bool) {
         DirectRequestOutcome::OutcomeUnknown { .. }
     ));
     let original = last_request(&world, Op::PrepareDirectRequest);
+    let original_bytes = last_request_bytes(&world, Op::PrepareDirectRequest);
     let prepare = &original["signedRequest"]["body"];
     let alice = world.client("Alice");
     let device = alice
@@ -296,7 +379,18 @@ async fn sender_fixture(legacy: bool) {
     .unwrap();
     preparation["preparationDigest"] = json!(STANDARD.encode(Sha256::digest(&signing)));
     preparation["preparationSignature"] = json!(es256(&authority, &signing));
-    world.delivery_service().queue_request_operation_response(Op::PrepareDirectRequest,200,json!({"outcome":{"$type":"blue.catbird.chat.defs#directRequestPreparedOutcome","preparation":preparation}}));
+    let read_preparation = read_bytes(
+        dag_json,
+        "directRequestPreparationView",
+        false,
+        &preparation,
+    );
+    if dag_json {
+        assert!(read_preparation["selectedDevices"][0]["grant"]["signature"]
+            .get("$bytes")
+            .is_some());
+    }
+    world.delivery_service().queue_request_operation_response(Op::PrepareDirectRequest,200,json!({"outcome":{"$type":"blue.catbird.chat.defs#directRequestPreparedOutcome","preparation":read_preparation}}));
     world.delivery_service().queue_request_operation_response(
         Op::PublishDirectRequest,
         503,
@@ -309,7 +403,12 @@ async fn sender_fixture(legacy: bool) {
         .unwrap();
     assert!(matches!(retry, DirectRequestOutcome::OutcomeUnknown { .. }));
     assert_eq!(original, last_request(&world, Op::PrepareDirectRequest));
+    assert_eq!(
+        original_bytes,
+        last_request_bytes(&world, Op::PrepareDirectRequest)
+    );
     let publication = last_request(&world, Op::PublishDirectRequest);
+    let publication_bytes = last_request_bytes(&world, Op::PublishDirectRequest);
     let p = &publication["signedRequest"]["body"];
     if let Some(legacy) = legacy_state {
         assert_eq!(p["conversationId"], legacy["coordinates"]["conversationId"]);
@@ -348,7 +447,7 @@ async fn sender_fixture(legacy: bool) {
     world.delivery_service().queue_request_operation_response(
         Op::PublishDirectRequest,
         200,
-        json!({"outcome":receipt}),
+        json!({"outcome":read_bytes(dag_json, "signedDirectRequestReceipt", true, &receipt)}),
     );
     let sent = alice
         .orchestrator
@@ -357,6 +456,10 @@ async fn sender_fixture(legacy: bool) {
         .unwrap();
     assert!(matches!(sent, DirectRequestOutcome::RequestSent { .. }));
     assert_eq!(publication, last_request(&world, Op::PublishDirectRequest));
+    assert_eq!(
+        publication_bytes,
+        last_request_bytes(&world, Op::PublishDirectRequest)
+    );
     let cid = p["conversationId"].as_str().unwrap();
     // Replaying a published outcome must validate an existing encrypted
     // projection instead of treating mere presence as completed adoption.
@@ -385,6 +488,7 @@ async fn sender_fixture(legacy: bool) {
         .compare_exchange_direct_request_projection(cid, Some(&corrupted), &saved)
         .unwrap());
     let publication_entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":publication["signedRequest"],"receivedAt":receipt["body"]["receipt"]["recordedAt"]});
+    let publication_entry = read_bytes(dag_json, "directRequestEntry", true, &publication_entry);
     world.delivery_service().queue_request_operation_response(
         Op::GetEntries,
         200,
@@ -393,7 +497,7 @@ async fn sender_fixture(legacy: bool) {
     world.delivery_service().queue_request_operation_response(
         Op::GetDirectRequestOutcome,
         200,
-        json!({"outcome":receipt}),
+        json!({"outcome":read_bytes(dag_json, "signedDirectRequestReceipt", true, &receipt)}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
@@ -534,6 +638,7 @@ async fn sender_fixture(legacy: bool) {
         .await
         .is_err());
     let pending_accept = last_request(&world, Op::AcceptConversation);
+    let pending_accept_bytes = last_request_bytes(&world, Op::AcceptConversation);
     let accepted = &pending_accept["directRequest"]["body"];
     let acceptance = protocol::verify_signed_request(
         protocol::DirectRequestKind::Accept,
@@ -547,7 +652,7 @@ async fn sender_fixture(legacy: bool) {
     world.delivery_service().queue_request_operation_response(
         Op::AcceptConversation,
         200,
-        json!({"coordinates":accepted["next"],"acceptanceProof":proof}),
+        json!({"coordinates":read_bytes(dag_json, "conversationCoordinates", false, &accepted["next"]),"acceptanceProof":read_bytes(dag_json, "directRequestAcceptanceProof", false, &proof)}),
     );
     world
         .client("Bob")
@@ -556,6 +661,10 @@ async fn sender_fixture(legacy: bool) {
         .await
         .unwrap();
     assert_eq!(pending_accept, last_request(&world, Op::AcceptConversation));
+    assert_eq!(
+        pending_accept_bytes,
+        last_request_bytes(&world, Op::AcceptConversation)
+    );
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         503,
@@ -569,6 +678,24 @@ async fn sender_fixture(legacy: bool) {
         .unwrap();
     assert_eq!(accepted_view.consent, RequestConsent::Accepted);
     assert!(accepted_view.capabilities.can_send);
+    if dag_json {
+        world.restart_client("Bob").await;
+        world.delivery_service().queue_request_operation_response(
+            Op::GetConversationState,
+            503,
+            json!({"error":"offline after accepted read proof"}),
+        );
+        let reopened = world
+            .client("Bob")
+            .orchestrator
+            .refresh_request_preview(&cid)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened, accepted_view,
+            "accepted read proof and decrypted preview must survive reopen"
+        );
+    }
     assert_eq!(accepted["prior"]["epoch"], accepted["next"]["epoch"]);
     let state = json!({"conversationKind":"direct","coordinates":accepted["next"],"cipherSuite":"MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519","participants":[{"userDid":p["actorDid"],"role":"admin","status":"active","leafCount":1},{"userDid":p["recipientDid"],"role":"admin","status":"active","leafCount":1,"invitationProvenance":{"invitationTransitionId":p["requestId"],"invitedByDid":p["actorDid"],"invitedByDeviceId":p["actorDeviceId"]}}],"leaves":[{"userDid":p["actorDid"],"deviceId":p["actorDeviceId"],"leafOrigin":"genesis","keyId":p["keyId"],"deviceStatus":"active"},{"userDid":p["recipientDid"],"deviceId":bob_device,"leafOrigin":"keyPackage","joinKeyPackageRef":STANDARD.encode(&package.hash_ref),"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"deviceStatus":"active"}],"metadataSnapshot":p["artifacts"]["metadataSnapshot"],"snapshotSeq":2,"directRequest":{"requestId":p["requestId"],"firstMessageId":p["firstMessageId"],"senderDid":p["actorDid"],"recipientDid":p["recipientDid"],"consent":"accepted","importUntil":p["importUntil"],"contextHash":p["contextHash"],"preparationDigest":p["preparationDigest"],"acceptanceProof":proof}});
     let typed = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
@@ -585,7 +712,7 @@ async fn sender_fixture(legacy: bool) {
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
-        json!({"state":state}),
+        json!({"state":read_bytes(dag_json, "conversationState", false, &state)}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetDeviceKey, 200,
@@ -602,7 +729,7 @@ async fn sender_fixture(legacy: bool) {
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
-        json!({"state":state}),
+        json!({"state":read_bytes(dag_json, "conversationState", false, &state)}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::GetDeviceKey, 200,
@@ -704,6 +831,12 @@ async fn sender_fixture(legacy: bool) {
         .is_none());
     let mut acceptance_entry = proof["entry"].clone();
     acceptance_entry["$type"] = json!("blue.catbird.chat.defs#directRequestAcceptanceEntry");
+    let acceptance_entry = read_bytes(
+        dag_json,
+        "directRequestAcceptanceEntry",
+        true,
+        &acceptance_entry,
+    );
     let acceptance_envelope =
         catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&acceptance_entry, &cid)
             .unwrap()
@@ -771,7 +904,7 @@ async fn sender_fixture(legacy: bool) {
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
-        json!({"state":state}),
+        json!({"state":read_bytes(dag_json, "conversationState", false, &state)}),
     );
     world.delivery_service().queue_request_operation_response(
         Op::CloseConversation,

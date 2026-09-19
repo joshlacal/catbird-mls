@@ -290,8 +290,12 @@ impl DirectRequestTerminalAttempt {
         let method = value["body"]["keyId"].as_str().ok_or_else(invalid)?;
         let key = resolve_direct_request_receipt_key(&self.trusted_authority_document, method)
             .map_err(|_| invalid())?;
-        let receipt = crate::chat_v2::transcript::direct_request::verify_received_signed_request(DirectRequestKind::Outcome, &self.receipt, &key)
-            .map_err(|_| invalid())?;
+        let receipt = crate::chat_v2::transcript::direct_request::verify_received_signed_request(
+            DirectRequestKind::Outcome,
+            &self.receipt,
+            &key,
+        )
+        .map_err(|_| invalid())?;
         let proof = &receipt.body()["receipt"];
         if !(allow_published
             && proof["$type"] == "blue.catbird.chat.defs#directRequestPublishedReceipt")

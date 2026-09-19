@@ -121,8 +121,17 @@ pub fn validate_request_welcome_receipt(input: &DirectRequestWelcomeInput) -> Re
         terminal_receipt: None,
         terminal_authority_key: None,
     };
-    let digest = record.verify_publication(
+    // Received read DTOs can represent schema bytes as DAG-JSON objects. Keep
+    // the locally journaled mutation verifier strict, and normalize only this
+    // independently verified incoming presentation.
+    let publication = transcript::normalize_direct_request_read_presentation(
         &input.publication_request,
+        "signedDirectRequestPublication",
+        false,
+    )
+    .map_err(crypto_error)?;
+    let digest = record.verify_publication(
+        &serde_json::to_vec(&publication).map_err(error)?,
         &input.actor_signature_public_key,
     )?;
     let verified = verify_signed_request(

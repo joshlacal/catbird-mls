@@ -201,10 +201,13 @@ where
                         "Invalid pending request acceptance signature".into(),
                     )
                 })?;
-                let publication = crate::chat_v2::transcript::direct_request::verify_received_signed_request(
-                    crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish,
-                    &projection.publication, &projection.sender_public_key,
-                ).map_err(|_| OrchestratorError::Storage("Invalid publication".into()))?;
+                let publication =
+                    crate::chat_v2::transcript::direct_request::verify_received_signed_request(
+                        crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish,
+                        &projection.publication,
+                        &projection.sender_public_key,
+                    )
+                    .map_err(|_| OrchestratorError::Storage("Invalid publication".into()))?;
                 if accepted.actor_did() != Some(owner)
                     || accepted.actor_device_id() != Some(device.as_str())
                     || accepted.body()["requestId"] != publication.body()["requestId"]

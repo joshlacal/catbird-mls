@@ -314,8 +314,9 @@ where
             }
             let preparation =
                 serde_json::to_vec(&value["outcome"]["preparation"]).map_err(|_| invalid())?;
-            self.validate_direct_request_preparation(&intent, &preparation)?;
-            intent.preparation_response = Some(preparation);
+            let canonical = self.validate_direct_request_preparation(&intent, &preparation)?;
+            intent.preparation_response =
+                Some(serde_json::to_vec(&canonical).map_err(|_| invalid())?);
             self.save_direct_request_intent(&intent, &mut raw)?;
         }
         let preparation = self.validate_direct_request_preparation(
@@ -363,15 +364,26 @@ where
         intent: &DirectRequestIntent,
         raw: &[u8],
     ) -> Result<Value> {
-        let value: Value = serde_json::from_slice(raw).map_err(|_| invalid())?;
+        if raw.len() > transcript::MAX_PREPARE_HTTP_RESPONSE_BYTES {
+            return Err(invalid());
+        }
+        let value = transcript::normalize_direct_request_read_presentation(
+            raw,
+            "directRequestPreparationView",
+            false,
+        )
+        .map_err(|_| invalid())?;
         let method = value["receiptKeyId"].as_str().ok_or_else(invalid)?;
         let key = transcript::resolve_direct_request_receipt_key(
             &intent.trusted_authority_document,
             method,
         )
         .map_err(|_| invalid())?;
-        let preparation =
-            transcript::verify_direct_request_preparation(raw, &key).map_err(|_| invalid())?;
+        let preparation = transcript::verify_direct_request_preparation(
+            &serde_json::to_vec(&value).map_err(|_| invalid())?,
+            &key,
+        )
+        .map_err(|_| invalid())?;
         let prepare = transcript::verify_signed_request(
             DirectRequestKind::Prepare,
             &intent.prepare_wrapper,
@@ -621,8 +633,9 @@ where
                 key
             }
         };
-        let verified = transcript::verify_received_signed_request(DirectRequestKind::Outcome, receipt, &key)
-            .map_err(|_| invalid())?;
+        let verified =
+            transcript::verify_received_signed_request(DirectRequestKind::Outcome, receipt, &key)
+                .map_err(|_| invalid())?;
         let prepare = transcript::verify_signed_request(
             DirectRequestKind::Prepare,
             &intent.prepare_wrapper,
@@ -923,8 +936,11 @@ where
             transcript::verify_signed_request(DirectRequestKind::Accept, wrapper, &signer)
                 .map_err(|_| invalid())?;
         let publication = transcript::verify_received_signed_request(
-            DirectRequestKind::Publish, &projection.publication, &projection.sender_public_key,
-        ).map_err(|_| invalid())?;
+            DirectRequestKind::Publish,
+            &projection.publication,
+            &projection.sender_public_key,
+        )
+        .map_err(|_| invalid())?;
         if pending.actor_did() != Some(owner.as_str())
             || pending.actor_device_id() != Some(device.as_str())
             || pending.body()["prior"] != publication.body()["next"]
@@ -975,7 +991,19 @@ where
             projection.trusted_authority_document =
                 intent::merge_trusted_documents(&projection.trusted_authority_document, &doc)?;
         }
-        projection.acceptance_proof = Some(proof);
+        let authority_key = transcript::resolve_direct_request_receipt_key(
+            &projection.trusted_authority_document,
+            method,
+        )
+        .map_err(|_| invalid())?;
+        let canonical_proof = transcript::verify_received_direct_request_acceptance_proof(
+            &proof,
+            &authority_key,
+            &public,
+        )
+        .map_err(|_| invalid())?;
+        projection.acceptance_proof =
+            Some(serde_json::to_vec(&canonical_proof).map_err(|_| invalid())?);
         projection.recipient_public_key = Some(public);
         let accepted = projection.view(&owner, &device)?;
         if accepted.consent != RequestConsent::Accepted {

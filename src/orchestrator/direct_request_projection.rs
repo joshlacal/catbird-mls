@@ -320,13 +320,19 @@ pub(crate) fn request_control_entry(mut entry: Value) -> Result<Value> {
     // Request controls have a schema-bound read adapter. It converts only
     // declared bytes and retains every other field for closed-schema validation.
     if let Some(name) = entry["$type"].as_str().and_then(|tag| {
-        tag.strip_prefix("blue.catbird.chat.defs#").filter(|name| {
-            matches!(*name, "directRequestEntry" | "directRequestAcceptanceEntry")
-        })
+        tag.strip_prefix("blue.catbird.chat.defs#")
+            .filter(|name| matches!(*name, "directRequestEntry" | "directRequestAcceptanceEntry"))
     }) {
         let raw = serde_json::to_vec(&entry).map_err(|_| invalid())?;
-        let mut canonical = crate::chat_v2::transcript::direct_request::normalize_direct_request_read_presentation(&raw, name, true).map_err(|_| invalid())?;
-        canonical.as_object_mut().ok_or_else(invalid)?.remove("$type");
+        let mut canonical =
+            crate::chat_v2::transcript::direct_request::normalize_direct_request_read_presentation(
+                &raw, name, true,
+            )
+            .map_err(|_| invalid())?;
+        canonical
+            .as_object_mut()
+            .ok_or_else(invalid)?
+            .remove("$type");
         return Ok(canonical);
     }
     fn bytes(value: &mut Value) {
