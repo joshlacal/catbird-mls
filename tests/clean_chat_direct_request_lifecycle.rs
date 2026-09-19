@@ -170,7 +170,7 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
     let pubkey = alice
         .orchestrator
         .mls_context()
-        .identity_public_key(format!("{}#{device}", alice.did).into_bytes())
+        .identity_public_key(format!("{}#{device}", alice.did))
         .unwrap();
     let verified = protocol::verify_signed_request(
         protocol::DirectRequestKind::Prepare,
@@ -194,7 +194,7 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
     let bob_public = bob
         .orchestrator
         .mls_context()
-        .identity_public_key(identity.clone())
+        .identity_public_key(String::from_utf8(identity.clone()).unwrap())
         .unwrap();
     let grant_id = uuid::Uuid::new_v4().to_string();
     let grant = json!({"$type":"blue.catbird.chat.defs#directRequestGrantBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-GRANT\0","protocolVersion":"2","actorDid":bob.did,"actorDeviceId":bob_device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"authGeneration":1,"grantId":grant_id,"grantRevision":1,"purpose":"direct-request-bootstrap","profile":"encryptedIntroduction1","keyPackageRef":STANDARD.encode(&package.hash_ref),"keyPackageSha256":STANDARD.encode(Sha256::digest(&package.key_package_data)),"expiresAt":utc(29*86400),"idempotencyKey":grant_id,"signedAt":utc(0)});
@@ -202,7 +202,7 @@ async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_
         .orchestrator
         .mls_context()
         .sign_with_identity_key(
-            identity,
+            String::from_utf8(identity).unwrap(),
             protocol::direct_request_signing_bytes(
                 protocol::DirectRequestKind::Grant,
                 &serde_json::to_vec(&grant).unwrap(),

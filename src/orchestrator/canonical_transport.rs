@@ -643,6 +643,7 @@ fn parse_ffi_request(
     operation: CanonicalOperation,
     body: &[u8],
 ) -> Result<CleanChatRequest, CleanChatTransportFfiError> {
+    validate_direct_endpoint_raw(operation,body).map_err(ffi_error)?;
     match operation {
         CanonicalOperation::PrepareDirectRequest => parse_json_req(body, CleanChatRequest::PrepareDirectRequest),
         CanonicalOperation::PublishDirectRequest => parse_json_req(body, CleanChatRequest::PublishDirectRequest),
@@ -957,7 +958,11 @@ impl CleanChatRequest {
                 operation: self.operation(),
                 reason: "subscribeEvents is a WebSocket subscription; use the platform streaming adapter",
             }),
-            Self::AcceptConversation(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::AcceptConversation(request) => {
+                let raw=serialize_json(request)?;
+                let v2=crate::chat_v2::transcript::direct_request::direct_request_acceptance_endpoint_is_v2(&raw).map_err(|e|TransportError::Serialization(e.to_string()))?;
+                if v2 {prepare_direct_request_json(&internal,auth.auth_generation,self.operation(),request)} else {prepare_json_request(&internal, auth.auth_generation, self.operation(), request)}
+            },
             Self::AcknowledgeWelcome(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::ActivateReset(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::CancelLeafRecovery(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
@@ -4003,8 +4008,11 @@ fn prepare_direct_request_json<T: Serialize>(auth: &TransportAuth, generation: O
     auth.validate()?;
     let body = serialize_json(request)?;
     let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| TransportError::Serialization(e.to_string()))?;
-    let signed = &value["signedRequest"]["body"];
+    validate_direct_endpoint_raw(operation,&body)?;
+    let field=if operation==CanonicalOperation::AcceptConversation {"directRequest"} else {"signedRequest"};
+    let signed = &value[field]["body"];
     let kind = match operation {
+        CanonicalOperation::AcceptConversation => crate::chat_v2::transcript::direct_request::DirectRequestKind::Accept,
         CanonicalOperation::PrepareDirectRequest => crate::chat_v2::transcript::direct_request::DirectRequestKind::Prepare,
         CanonicalOperation::PublishDirectRequest => crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish,
         CanonicalOperation::CancelDirectRequestPreparation => crate::chat_v2::transcript::direct_request::DirectRequestKind::Cancel,
@@ -4019,4 +4027,23 @@ fn prepare_direct_request_json<T: Serialize>(auth: &TransportAuth, generation: O
     let actual=signed["authGeneration"].as_i64().ok_or(TransportError::MissingAuthGeneration)?;
     if actual!=expected { return Err(TransportError::AuthGenerationMismatch{expected,actual}); }
     Ok(PreparedRequest{operation,method:"POST".into(),path:operation.path().into(),body:Some(body)})
+}
+
+fn validate_direct_endpoint_raw(operation:CanonicalOperation,raw:&[u8])->Result<(),TransportError> {
+    use crate::chat_v2::transcript::{decode_strict_json,project_ref,direct_request};
+    let schema=match operation {
+        CanonicalOperation::PrepareDirectRequest=>"signedDirectRequestPreparation",
+        CanonicalOperation::PublishDirectRequest=>"signedDirectRequestPublication",
+        CanonicalOperation::CancelDirectRequestPreparation=>"signedDirectRequestCancellation",
+        CanonicalOperation::PublishDirectRequestKeys=>"signedDirectRequestKeyPublication",
+        CanonicalOperation::AcceptConversation=>{direct_request::direct_request_acceptance_endpoint_is_v2(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;return Ok(());},
+        _=>return Ok(()),
+    };
+    if raw.len()>direct_request::MAX_PUBLISH_HTTP_BODY_BYTES {return Err(TransportError::Serialization("direct request HTTP byte cap".into()));}
+    decode_strict_json(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;
+    let value:serde_json::Value=serde_json::from_slice(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;
+    if value.as_object().is_none_or(|o|o.len()!=1||!o.contains_key("signedRequest")) {return Err(TransportError::Serialization("direct request requires exactly signedRequest".into()));}
+    let strict=decode_strict_json(&serde_json::to_vec(&value["signedRequest"]).map_err(|e|TransportError::Serialization(e.to_string()))?).map_err(|e|TransportError::Serialization(e.to_string()))?;
+    project_ref(schema,&strict,false).map_err(|e|TransportError::Serialization(e.to_string()))?;
+    Ok(())
 }

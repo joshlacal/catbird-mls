@@ -243,7 +243,7 @@ where
                         {
                             DirectRequestIntroductionResult::Ready { plaintext } => {
                                 let intro =
-                                    transcript::validate_direct_request_introduction(&plaintext)
+                                    transcript::decode_direct_request_introduction(&plaintext)
                                         .map_err(|_| invalid())?;
                                 if intro
                                     .get("invitation")

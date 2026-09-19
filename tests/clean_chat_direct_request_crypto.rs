@@ -205,7 +205,7 @@ fn corpus_variant(count: usize, legacy: bool) {
         &provider,
         ctx["conversationId"].as_str().unwrap(),
         if legacy { 1 } else { 0 },
-        if legacy { 2 } else { 1 },
+        1,
     )
     .unwrap();
     let aad = catbird_mls::chat_v2::transcript::direct_request::direct_request_application_aad(
