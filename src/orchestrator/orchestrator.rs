@@ -586,7 +586,11 @@ where
                 .api_client()
                 .submit_prepared_request(super::canonical_transport::PreparedRequest {
                     operation: super::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox,
-                    path,
+                    path: super::canonical_transport::scope_inventory_read_path(
+                        super::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox,
+                        path,
+                        self.mls_context().supports_direct_request_bootstrap(),
+                    ),
                     method: "GET".into(),
                     body: None,
                 })

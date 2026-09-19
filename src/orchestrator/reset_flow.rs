@@ -267,7 +267,11 @@ where
                 .api_client()
                 .submit_prepared_request(PreparedRequest {
                     operation: CanonicalOperation::GetConversations,
-                    path,
+                    path: super::canonical_transport::scope_inventory_read_path(
+                        CanonicalOperation::GetConversations,
+                        path,
+                        self.mls_context().supports_direct_request_bootstrap(),
+                    ),
                     method: "GET".to_string(),
                     body: None,
                 })

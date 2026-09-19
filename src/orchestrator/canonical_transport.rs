@@ -3729,6 +3729,28 @@ pub(crate) fn validate_signed_request_context(
     Ok(())
 }
 
+/// Scope every raw inventory domain/page consistently with provider capability.
+/// Session capabilities do not replace the explicit supported-version query.
+/// Other reads retain their exact query bytes.
+pub(crate) fn scope_inventory_read_path(
+    operation: CanonicalOperation,
+    mut path: String,
+    requests_supported: bool,
+) -> String {
+    if matches!(
+        operation,
+        CanonicalOperation::GetConversations
+            | CanonicalOperation::GetPendingWelcomes
+            | CanonicalOperation::GetLeafRecoveryInbox
+    ) {
+        path.push_str("&supportedProtocolVersions=1");
+        if requests_supported {
+            path.push_str("&supportedProtocolVersions=2");
+        }
+    }
+    path
+}
+
 pub(crate) fn encode_query(value: &str) -> String {
     value
         .bytes()
@@ -4412,4 +4434,35 @@ fn validate_direct_endpoint_raw(
     project_ref(schema, &strict, false)
         .map_err(|e| TransportError::Serialization(e.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod raw_inventory_scope_tests {
+    use super::*;
+    #[test]
+    fn raw_inventory_scope_preserves_domains_sessions_and_continuations() {
+        for operation in [
+            CanonicalOperation::GetConversations,
+            CanonicalOperation::GetPendingWelcomes,
+            CanonicalOperation::GetLeafRecoveryInbox,
+        ] {
+            for supported in [false, true] {
+                for continuation in ["", "&pageCursor=opaque%2Bcursor%2F%3D"] {
+                    let path=format!("{}?actorDeviceId=device&inventorySessionId=exact%2Bsession&limit=100{continuation}",operation.path());
+                    let scoped = scope_inventory_read_path(operation, path.clone(), supported);
+                    assert!(scoped.starts_with(&path));
+                    assert_eq!(scoped.matches("supportedProtocolVersions=1").count(), 1);
+                    assert_eq!(
+                        scoped.matches("supportedProtocolVersions=2").count(),
+                        usize::from(supported)
+                    );
+                }
+            }
+        }
+        let raw = "/xrpc/blue.catbird.chat.getEntries?exact=bytes".to_owned();
+        assert_eq!(
+            scope_inventory_read_path(CanonicalOperation::GetEntries, raw.clone(), true),
+            raw
+        );
+    }
 }

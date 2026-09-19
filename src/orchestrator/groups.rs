@@ -7721,9 +7721,10 @@ where
         let actor_device_id = self.require_actor_device_id().await?;
         let request = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={actor_device_id}&limit=50"
-            ),
+            path: super::canonical_transport::scope_inventory_read_path(
+                super::canonical_transport::CanonicalOperation::GetConversations,
+                format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={actor_device_id}&limit=50"),
+                self.mls_context().supports_direct_request_bootstrap()),
             method: "GET".to_string(),
             body: None,
         };
@@ -7847,9 +7848,13 @@ where
         let actor_device_id = self.require_actor_device_id().await?;
         let convos_req = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
-                actor_device_id
+            path: super::canonical_transport::scope_inventory_read_path(
+                super::canonical_transport::CanonicalOperation::GetConversations,
+                format!(
+                    "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
+                    actor_device_id
+                ),
+                self.mls_context().supports_direct_request_bootstrap(),
             ),
             method: "GET".to_string(),
             body: None,

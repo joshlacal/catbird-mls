@@ -242,6 +242,31 @@ async fn verified_durable_welcome_is_acknowledged_with_exact_delivery_binding() 
             .unwrap(),
         EPOCH
     );
+    let reads = fixture
+        .world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .filter(|request| {
+            matches!(
+                request.operation,
+                CanonicalOperation::GetConversations | CanonicalOperation::GetPendingWelcomes
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(reads
+        .iter()
+        .any(|r| r.operation == CanonicalOperation::GetPendingWelcomes));
+    for request in reads {
+        assert_eq!(
+            request.path.matches("supportedProtocolVersions=1").count(),
+            1
+        );
+        assert_eq!(
+            request.path.matches("supportedProtocolVersions=2").count(),
+            1
+        );
+    }
     let requests = acknowledgements(&fixture);
     assert_eq!(
         requests.len(),

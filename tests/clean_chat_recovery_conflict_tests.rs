@@ -524,6 +524,17 @@ async fn exact_request_on_the_third_inbox_page_is_returned_without_resubmission(
         .filter(|request| request.operation == CanonicalOperation::GetLeafRecoveryInbox)
         .skip(inbox_before)
         .collect();
+    for request in &reads {
+        assert_eq!(
+            request.path.matches("supportedProtocolVersions=1").count(),
+            1
+        );
+        assert_eq!(
+            request.path.matches("supportedProtocolVersions=2").count(),
+            1
+        );
+        assert!(request.path.contains("inventorySessionId="));
+    }
     assert!(reads[1].path.contains("pageCursor=page-two"));
     assert!(reads[2].path.contains("pageCursor=page-three"));
     assert_no_replacement(&fixture, packages_before);
