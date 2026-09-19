@@ -38,6 +38,7 @@ tls_codec = "=0.5.0"
 thiserror = "1.0"
 zeroize = { version = "1.7", features = ["derive"] }
 base64 = "0.22"
+multibase = "0.9"
 hex = "0.4"
 sha2 = "0.10"
 # Promoted from transitive to direct for the clean-chat (`chat_v2`) signing

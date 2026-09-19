@@ -422,6 +422,12 @@ where
     }
 
     async fn catch_up_event_conversation(&self, conversation_id: &str) -> Result<Vec<EngineEvent>> {
+        if self.orchestrator.known_direct_request(conversation_id).await? {
+            let request=Box::pin(self.orchestrator.refresh_request_preview(conversation_id)).await?;
+            if request.consent!=crate::orchestrator::RequestConsent::Accepted {
+                return Ok(vec![EngineEvent::RequestReceived {convo_id:conversation_id.into(),message_id:request.first_message_id}]);
+            }
+        }
         let mut cursor = None;
         let mut pagination = PaginationGuard::for_messages("canonical event entries");
         let mut events = Vec::new();
@@ -1214,6 +1220,7 @@ mod tests {
                 match e {
                     EngineEvent::ConversationUpdated { convo_id }
                     | EngineEvent::MessageInserted { convo_id, .. }
+                    | EngineEvent::RequestReceived { convo_id, .. }
                     | EngineEvent::RecoveryStateChanged { convo_id, .. }
                     | EngineEvent::NeedsUiRefresh { convo_id } => convo_id.as_str(),
                 }

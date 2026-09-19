@@ -344,6 +344,12 @@ pub trait OrchestratorAPICallback: Send + Sync {
 /// Credential store callback interface for Swift/Kotlin.
 #[uniffi::export(callback_interface)]
 pub trait OrchestratorCredentialCallback: Send + Sync {
+    /// Authenticated resolution of did:web:chat.catbird.blue only. Rust checks
+    /// the receipt method and persists the trusted historical method.
+    fn direct_request_receipt_authority_document(
+        &self,
+    ) -> Result<Option<Vec<u8>>, OrchestratorBridgeError> { Ok(None) }
+
     fn store_signing_key(
         &self,
         user_did: String,
@@ -590,6 +596,7 @@ pub struct FFIIncomingEnvelope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FFIEngineEventKind {
+    RequestReceived,
     ConversationUpdated,
     MessageInserted,
     RecoveryStateChanged,
@@ -1326,6 +1333,12 @@ pub(crate) fn ffi_incoming_envelope_to_internal(
 
 fn engine_event_to_ffi(event: &EngineEvent) -> FFIEngineEvent {
     match event {
+        EngineEvent::RequestReceived { convo_id, message_id } => FFIEngineEvent {
+            kind: FFIEngineEventKind::RequestReceived,
+            conversation_id: convo_id.clone(),
+            message_id: message_id.clone(),
+            recovery_state: None,
+        },
         EngineEvent::ConversationUpdated { convo_id } => FFIEngineEvent {
             kind: FFIEngineEventKind::ConversationUpdated,
             conversation_id: convo_id.clone(),
@@ -2146,6 +2159,10 @@ impl MLSAPIClient for APIAdapter {
 
 #[async_trait::async_trait]
 impl CredentialStore for CredentialAdapter {
+    async fn direct_request_receipt_authority_document(&self) -> crate::orchestrator::Result<Option<Vec<u8>>> {
+        self.0.direct_request_receipt_authority_document().map_err(bridge_err)
+    }
+
     async fn store_signing_key(
         &self,
         user_did: &str,
@@ -3036,6 +3053,22 @@ impl OrchestratorBridge {
             self.inner.conversation_display_snapshot(&user_did),
         )?;
         Ok(conversations.iter().map(convo_view_to_ffi).collect::<crate::orchestrator::Result<Vec<_>>>()?)
+    }
+
+    pub fn start_direct_request(&self, input: crate::DirectRequestInput) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        Ok(self.engine.start_direct_request(input)?)
+    }
+
+    pub fn resume_direct_request(&self, draft_id: String) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        Ok(self.engine.resume_direct_request(&draft_id)?)
+    }
+
+    pub fn cancel_direct_request(&self, draft_id: String) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        Ok(self.engine.cancel_direct_request(&draft_id)?)
+    }
+
+    pub fn refresh_request_preview(&self, conversation_id: String) -> Result<crate::DirectRequestView, OrchestratorBridgeError> {
+        Ok(self.engine.refresh_request_preview(&conversation_id)?)
     }
 
     pub fn startup_reconcile(&self) -> Result<FFIStartupReconcileReport, OrchestratorBridgeError> {

@@ -116,6 +116,118 @@ impl<T> MlsCryptoContextBounds for T {}
 ///
 /// All methods are synchronous since the underlying crypto is CPU-bound.
 pub trait MlsCryptoContext: MlsCryptoContextBounds {
+    fn decrypt_direct_request_introduction(
+        &self,
+        _input: &super::direct_request_bootstrap::DirectRequestWelcomeInput,
+    ) -> Result<super::direct_request_bootstrap::DirectRequestIntroductionResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request introduction unavailable".into(),
+        })
+    }
+    fn process_direct_request_welcome(
+        &self,
+        _input: &super::direct_request_bootstrap::DirectRequestWelcomeInput,
+    ) -> Result<WelcomeResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request Welcome unavailable".into(),
+        })
+    }
+    fn supports_direct_request_bootstrap(&self) -> bool {
+        false
+    }
+    fn prepare_direct_request_bootstrap(
+        &self,
+        _input: &super::direct_request_bootstrap::DirectRequestBootstrapInput,
+    ) -> Result<super::direct_request_journal::DirectRequestJournal, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request bootstrap unavailable".into(),
+        })
+    }
+    fn list_direct_request_journal(
+        &self,
+    ) -> Result<Vec<super::direct_request_journal::DirectRequestJournal>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request journal unavailable".into(),
+        })
+    }
+    fn persist_direct_request_publish(
+        &self,
+        _request_id: &str,
+        _exact_signed_bytes: &[u8],
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request publication unavailable".into(),
+        })
+    }
+    fn confirm_published_bootstrap(
+        &self,
+        _request_id: &str,
+        _receipt: &[u8],
+        _pinned_authority_key: &[u8],
+    ) -> Result<super::direct_request_journal::DirectRequestJournal, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request adoption unavailable".into(),
+        })
+    }
+    fn abandon_rejected_bootstrap(
+        &self,
+        _request_id: &str,
+        _receipt: &[u8],
+        _pinned_authority_key: &[u8],
+    ) -> Result<super::direct_request_journal::DirectRequestJournal, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request rejection unavailable".into(),
+        })
+    }
+    fn mark_direct_request_projected(&self, _request_id: &str) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request projection unavailable".into(),
+        })
+    }
+    fn read_direct_request_intent(&self, _draft_id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request intent unavailable".into(),
+        })
+    }
+    fn compare_exchange_direct_request_intent(
+        &self,
+        _draft_id: &str,
+        _expected: Option<&[u8]>,
+        _next: &[u8],
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request intent unavailable".into(),
+        })
+    }
+    fn list_direct_request_intents(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request intent unavailable".into(),
+        })
+    }
+    fn read_direct_request_projection(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request projection unavailable".into(),
+        })
+    }
+    fn compare_exchange_direct_request_projection(
+        &self,
+        _conversation_id: &str,
+        _expected: Option<&[u8]>,
+        _next: &[u8],
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request projection unavailable".into(),
+        })
+    }
+    fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request projection unavailable".into(),
+        })
+    }
+
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError>;
 
     fn create_last_resort_key_package(

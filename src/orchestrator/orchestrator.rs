@@ -137,6 +137,7 @@ where
     creation_generation: AtomicU64,
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
+    direct_request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Per-stable-conversation inbound locks. These serialize duplicate HTTP,
     /// push, and catch-up deliveries through their final crypto/application
     /// durability barrier without reusing the rejoin transition lock.
@@ -250,6 +251,7 @@ static NEXT_BATCH_EXECUTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic
 tokio::task_local! {
     pub(crate) static BATCH_INVENTORY_CONTEXT: Arc<AuthorizedInventorySnapshot>;
 }
+#[cfg(not(target_arch = "wasm32"))]
 tokio::task_local! {
     pub(crate) static BATCH_RECOVERY_INBOX_CONTEXT: Arc<AuthorizedRecoveryInboxSnapshot>;
 }
@@ -309,6 +311,7 @@ where
             reissue_attempts_mem: Mutex::new(HashMap::new()),
             creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
+            direct_request_locks: Mutex::new(HashMap::new()),
             inbound_processing_locks: Mutex::new(HashMap::new()),
             sync_in_progress: Mutex::new(false),
             consecutive_sync_failures: Mutex::new(0),
@@ -805,6 +808,11 @@ where
         // expectations before inbound streams or send APIs can run. No network
         // or destructive recovery occurs at this boundary.
         if let Err(error) = self.hydrate_prepared_control_journal(user_did).await {
+            *self.lifecycle_state.lock().await = OrchestratorLifecycleState::FailedInitialization;
+            return Err(error);
+        }
+
+        if let Err(error) = self.hydrate_direct_request_ownership(user_did).await {
             *self.lifecycle_state.lock().await = OrchestratorLifecycleState::FailedInitialization;
             return Err(error);
         }
@@ -1308,6 +1316,11 @@ where
 
     pub(crate) fn creation_generation(&self) -> &AtomicU64 {
         &self.creation_generation
+    }
+
+    pub(crate) async fn direct_request_operation_lock(&self, draft_id: &str) -> Arc<Mutex<()>> {
+        self.direct_request_locks.lock().await.entry(draft_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(()))).clone()
     }
 
     /// Acquire the per-conversation join/rejoin lock object.

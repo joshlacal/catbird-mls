@@ -44,6 +44,10 @@ pub use catbird_atproto as atproto;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::*;
 pub use error::*;
+pub use orchestrator::direct_request_types::{
+    DirectRequestInput, DirectRequestOutcome, DirectRequestView, GroupInvitationReference,
+    RequestCapabilities, RequestConsent, RequestCrypto, RequestPreview,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use keychain::*;
 #[cfg(not(target_arch = "wasm32"))]

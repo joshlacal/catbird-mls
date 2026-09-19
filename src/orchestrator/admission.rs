@@ -47,7 +47,7 @@ pub fn validate_conversation_policy(state: &CanonicalState) -> Result<()> {
             return Err(invalid("participant status, role, or duplicate"));
         }
         if participant.status.as_str() == "pending"
-            && (participant.leaf_count != 0 || participant.invitation_provenance.is_none())
+            && ((participant.leaf_count != 0 && state.direct_request.is_none()) || participant.invitation_provenance.is_none())
         {
             return Err(invalid("pending participant lacks invitation provenance"));
         }
@@ -442,6 +442,11 @@ where
         &self,
         conversation_id: &str,
     ) -> Result<bool> {
+        if let Some(request) = self.retained_direct_request_view(conversation_id).await? {
+            // Request consent remains independent from native group membership,
+            // including after a Welcome import or successful intro decryption.
+            return Ok(request.consent != super::RequestConsent::Accepted);
+        }
         let did = self.require_user_did().await?;
         let runtime = self
             .conversations()
@@ -472,6 +477,11 @@ where
         let Some(state) = view.canonical_state.as_ref().or(retained.as_ref()) else {
             return Ok(false);
         };
+        if state.direct_request.is_some() {
+            // An unverified snapshot flag cannot release either account. Only
+            // the independently verified native request projection above can.
+            return Ok(true);
+        }
         let pending = state.participants.iter().any(|participant| {
             participant.user_did.as_str() == did && participant.status.as_str() == "pending"
         });

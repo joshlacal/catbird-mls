@@ -480,6 +480,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "lazy_static",
+ "multibase",
  "ogg",
  "once_cell",
  "openmls",

@@ -2119,9 +2119,29 @@ fn validate_existing_sqlite_storage(
         db_group_ids
     };
 
-    if manifested_group_ids != db_group_ids {
-        let missing: Vec<_> = manifested_group_ids.difference(&db_group_ids).collect();
-        let extra: Vec<_> = db_group_ids.difference(&manifested_group_ids).collect();
+    // Request candidates own durable OpenMLS rows without a live group mapping.
+    // Only a validated journal row grants this exception; unrelated orphan rows
+    // remain a hard preflight error and published rows must use the live index.
+    let mut expected_group_ids=manifested_group_ids.clone();
+    let mut request_query=conn.prepare("SELECT value FROM mls_manifests WHERE key LIKE 'direct_request_v2:%'").map_err(|_|MLSError::StorageFailed)?;
+    let request_rows=request_query.query_map([],|row|row.get::<_,String>(0)).map_err(|_|MLSError::StorageFailed)?;
+    let mut request_group_ids=HashSet::new();
+    for row in request_rows {
+        use crate::orchestrator::direct_request_journal::{DirectRequestJournal,DirectRequestJournalPhase};
+        let record:DirectRequestJournal=serde_json::from_str(&row.map_err(|_|MLSError::StorageFailed)?).map_err(|_|MLSError::StorageFailed)?;
+        record.validate()?;
+        let encoded=record.bootstrap.coordinates["groupId"].as_str().ok_or(MLSError::StorageFailed)?;
+        let gid=base64::Engine::decode(&base64::engine::general_purpose::STANDARD,encoded).map_err(|_|MLSError::StorageFailed)?;
+        let hex_id=hex::encode(gid);
+        if !request_group_ids.insert(hex_id.clone()) {return Err(MLSError::StorageFailed);}
+        let published=matches!(record.phase,DirectRequestJournalPhase::PublishedAwaitingProjection|DirectRequestJournalPhase::RequestSent);
+        if published != manifested_group_ids.contains(&hex_id) {return Err(MLSError::StorageFailed);}
+        expected_group_ids.insert(hex_id);
+    }
+    drop(request_query);
+    if expected_group_ids != db_group_ids {
+        let missing: Vec<_> = expected_group_ids.difference(&db_group_ids).collect();
+        let extra: Vec<_> = db_group_ids.difference(&expected_group_ids).collect();
         return Err(MLSError::invalid_input(format!(
             "Manifest group_ids mismatch with openmls_group_data: missing from DB {:?}, unmanifested in DB {:?}",
             missing, extra
@@ -2459,6 +2479,8 @@ impl MLSContext {
             }
         }
 
+        // Validate request ownership before any live MLS group becomes visible.
+        let request_ownership = crate::orchestrator::direct_request_journal::native::list(&manifest_storage)?;
         // 🔄 GROUP LOADING: Load all persisted groups from storage
         crate::info_log!("[MLS-CONTEXT] 🔄 Loading persisted groups...");
         let mut groups = HashMap::new();
@@ -2474,6 +2496,15 @@ impl MLSContext {
                 );
 
                 for hex_id in &group_id_list {
+                    for request in &request_ownership {
+                        use crate::orchestrator::direct_request_journal::DirectRequestJournalPhase;
+                        let raw_id = request.bootstrap.coordinates["groupId"].as_str().ok_or(MLSError::StorageFailed)?;
+                        let request_group = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, raw_id).map_err(|_| MLSError::StorageFailed)?;
+                        if hex::encode(request_group) == *hex_id && !matches!(request.phase, DirectRequestJournalPhase::PublishedAwaitingProjection | DirectRequestJournalPhase::RequestSent) {
+                            return Err(MLSError::StorageFailed);
+                        }
+                    }
+
                     if let Ok(group_id_bytes) = hex::decode(hex_id) {
                         let group_id = openmls::prelude::GroupId::from_slice(&group_id_bytes);
 

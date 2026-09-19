@@ -159,6 +159,10 @@ struct FailureFlags {
 
 #[derive(Debug, Default)]
 struct MockState {
+    request_operation_responses: Vec<(
+        catbird_mls::orchestrator::canonical_transport::CanonicalOperation,
+        catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+    )>,
     /// The DID this client is authenticated as.
     authenticated_did: Option<String>,
 
@@ -345,6 +349,26 @@ impl PublishGroupInfoGate {
 }
 
 impl MockDeliveryService {
+    pub fn queue_request_operation_response(
+        &self,
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .request_operation_responses
+            .push((
+                operation,
+                catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&body).unwrap(),
+                },
+            ));
+    }
+
     /// Create a new mock service with the given DID pre-authenticated.
     pub fn new(authenticated_did: &str) -> Self {
         let state = MockState {
@@ -561,8 +585,15 @@ impl MockDeliveryService {
             },
         );
     }
-    pub fn set_next_get_conversation_state_custom_response(&self, status: u16, body: serde_json::Value) {
-        self.state.lock().unwrap().next_get_conversation_state_custom_response = Some(
+    pub fn set_next_get_conversation_state_custom_response(
+        &self,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .next_get_conversation_state_custom_response = Some(
             catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                 status,
                 content_type: Some("application/json".into()),
@@ -583,7 +614,12 @@ impl MockDeliveryService {
             .lifecycle_state_overrides
             .get(conversation_id)
             .cloned()
-            .or_else(|| guard.conversations.get(conversation_id).map(conversation_state_json))
+            .or_else(|| {
+                guard
+                    .conversations
+                    .get(conversation_id)
+                    .map(conversation_state_json)
+            })
     }
     pub fn set_next_leave_custom_response(&self, status: u16, body: serde_json::Value) {
         self.state.lock().unwrap().next_leave_custom_response = Some(
@@ -763,7 +799,11 @@ impl MockDeliveryService {
         self.state.lock().unwrap().failures.fail_next_get_messages = true;
     }
     pub fn fail_next_get_conversation_state(&self) {
-        self.state.lock().unwrap().failures.fail_next_get_conversation_state = true;
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .fail_next_get_conversation_state = true;
     }
 
     pub fn fail_next_get_entries(&self) {
@@ -1482,7 +1522,11 @@ impl MockDeliveryService {
             leaves: None,
         };
         let state_val = conversation_state_json(&stored);
-        stored.view.canonical_state = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(&serde_json::to_vec(&state_val).unwrap()).ok();
+        stored.view.canonical_state =
+            catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+                &serde_json::to_vec(&state_val).unwrap(),
+            )
+            .ok();
         guard.conversations.insert(conversation_id.clone(), stored);
         guard.messages.entry(conversation_id.clone()).or_default();
         // Fan out the Welcome (if provided) to each initial member so they can
@@ -2148,6 +2192,16 @@ impl MLSAPIClient for MockDeliveryService {
             .unwrap()
             .submitted_prepared_requests
             .push(request.clone());
+        {
+            let mut state = self.state.lock().unwrap();
+            if let Some(index) = state
+                .request_operation_responses
+                .iter()
+                .position(|(operation, _)| *operation == request.operation)
+            {
+                return Ok(state.request_operation_responses.remove(index).1);
+            }
+        }
         let body_bytes = request.body.as_deref().unwrap_or(&[]);
         let body_val: serde_json::Value = if !body_bytes.is_empty()
             && request.operation

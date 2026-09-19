@@ -22,6 +22,8 @@ use catbird_atproto::jacquard_common::BosStr;
 macro_rules! with_entry {
     ($value:expr, |$entry:ident| $body:expr) => {
         match $value {
+            ConversationEntry::DirectRequestEntry($entry) => $body,
+            ConversationEntry::DirectRequestAcceptanceEntry($entry) => $body,
             ConversationEntry::ApplicationEntry($entry) => $body,
             ConversationEntry::CommitEntry($entry) => $body,
             ConversationEntry::PolicyEntry($entry) => $body,
@@ -124,6 +126,8 @@ pub trait WireEntry {
 impl<S: BosStr> WireEntry for ConversationEntry<S> {
     fn entry_kind(&self) -> &'static str {
         match self {
+            Self::DirectRequestEntry(_) => "blue.catbird.chat.defs#directRequestEntry",
+            Self::DirectRequestAcceptanceEntry(_) => "blue.catbird.chat.defs#directRequestAcceptanceEntry",
             Self::ApplicationEntry(_) => APPLICATION_ENTRY_KIND,
             Self::CommitEntry(_) => COMMIT_ENTRY_KIND,
             Self::PolicyEntry(_) => POLICY_ENTRY_KIND,
@@ -148,7 +152,24 @@ impl<S: BosStr> AppendLogEntry for ConversationEntry<S> {
     }
 
     fn raw_conversation_id(&self) -> &str {
-        with_entry!(self, |entry| entry.conversation_id.as_ref())
+        match self {
+            Self::DirectRequestEntry(entry) => entry.signed_request.body.conversation_id.as_ref(),
+            Self::DirectRequestAcceptanceEntry(entry) => entry.signed_request.body.prior.conversation_id.as_ref(),
+            Self::ApplicationEntry(entry) => entry.conversation_id.as_ref(),
+            Self::CommitEntry(entry) => entry.conversation_id.as_ref(),
+            Self::PolicyEntry(entry) => entry.conversation_id.as_ref(),
+            Self::MetadataEntry(entry) => entry.conversation_id.as_ref(),
+            Self::CreationEntry(entry) => entry.conversation_id.as_ref(),
+            Self::ParticipantAcceptanceEntry(entry) => entry.conversation_id.as_ref(),
+            Self::ConversationCloseEntry(entry) => entry.conversation_id.as_ref(),
+            Self::ResetRequestEntry(entry) => entry.conversation_id.as_ref(),
+            Self::ResetActivationEntry(entry) => entry.conversation_id.as_ref(),
+            Self::LeafRecoveryFulfillmentEntry(entry) => entry.conversation_id.as_ref(),
+            Self::LeaveRequestEntry(entry) => entry.conversation_id.as_ref(),
+            Self::ZeroLeafLeaveEntry(entry) => entry.conversation_id.as_ref(),
+            Self::LeaveCancellationEntry(entry) => entry.conversation_id.as_ref(),
+            Self::LeaveCommitFulfillmentEntry(entry) => entry.conversation_id.as_ref(),
+        }
     }
 }
 

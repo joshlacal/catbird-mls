@@ -266,6 +266,12 @@ where
     /// 4. Rejects uncorroborated server roster/listing omissions
     /// 5. Reconciles local state
     pub async fn sync_with_server(&self, full_sync: bool) -> Result<()> {
+        // Generated request entries carry a complete bootstrap. Keep the
+        // deeply nested reconciliation future off callers' thread stacks.
+        Box::pin(self.sync_with_server_inner(full_sync)).await
+    }
+
+    async fn sync_with_server_inner(&self, full_sync: bool) -> Result<()> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
@@ -564,6 +570,11 @@ where
                 .ensure_conversation_exists(user_did, conversation_id, group_id)
                 .await?;
 
+            if convo.canonical_state.as_ref().is_some_and(|state|state.direct_request.is_some()) {
+                if let Err(error)=Box::pin(self.refresh_request_preview(conversation_id)).await {
+                    tracing::warn!(conversation_id,%error,"Request preview refresh deferred");
+                }
+            }
             if self.pending_conversation_admission(conversation_id).await? {
                 continue;
             }

@@ -221,6 +221,19 @@ where
         Ok(convos.iter().map(convo_view_to_conversation).collect())
     }
 
+    pub async fn start_direct_request(&self, input: crate::DirectRequestInput) -> Result<crate::DirectRequestOutcome, OrchestratorError> {
+        self.orchestrator.start_direct_request(input).await
+    }
+    pub async fn resume_direct_request(&self, draft_id: &str) -> Result<crate::DirectRequestOutcome, OrchestratorError> {
+        self.orchestrator.resume_direct_request(draft_id).await
+    }
+    pub async fn cancel_direct_request(&self, draft_id: &str) -> Result<crate::DirectRequestOutcome, OrchestratorError> {
+        self.orchestrator.cancel_direct_request(draft_id).await
+    }
+    pub async fn refresh_request_preview(&self, conversation_id: &str) -> Result<crate::DirectRequestView, OrchestratorError> {
+        self.orchestrator.refresh_request_preview(conversation_id).await
+    }
+
     /// Create a new conversation with the given participants.
     pub async fn create_conversation(
         &self,

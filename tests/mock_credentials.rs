@@ -29,6 +29,7 @@ struct CleanChatBindingSnapshot {
 /// In-memory `CredentialStore` with per-user isolation via `Arc<Mutex<...>>`.
 #[derive(Debug, Clone)]
 pub struct MockCredentials {
+    request_authority_document: Arc<Mutex<Option<Vec<u8>>>>,
     state: Arc<Mutex<HashMap<String, UserCredentials>>>,
     /// WS-3 stage 2: configurable authorized-device-key sets per root DID.
     /// DID absent from the map → `get_authorized_device_keys` returns
@@ -44,8 +45,12 @@ pub struct MockCredentials {
 }
 
 impl MockCredentials {
+    pub fn set_request_authority_document(&self, document: Vec<u8>) {
+        *self.request_authority_document.lock().unwrap() = Some(document);
+    }
     pub fn new() -> Self {
         Self {
+            request_authority_document: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(HashMap::new())),
             authorized_device_keys: Arc::new(Mutex::new(HashMap::new())),
             device_key_lookup_counts: Arc::new(Mutex::new(HashMap::new())),
@@ -129,6 +134,9 @@ impl Default for MockCredentials {
 
 #[async_trait]
 impl CredentialStore for MockCredentials {
+    async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.request_authority_document.lock().unwrap().clone())
+    }
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
         let mut map = self.state.lock().unwrap();
         map.entry(user_did.to_string()).or_default().signing_key = Some(key_data.to_vec());

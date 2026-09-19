@@ -36,6 +36,7 @@
 //!    with the server rather than reimplemented.
 
 pub mod contract;
+pub mod direct_request;
 pub mod entry;
 pub mod fingerprint;
 pub mod signed;

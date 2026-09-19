@@ -200,6 +200,11 @@ pub enum TransportError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum CleanChatRequest {
+    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequest<String>),
+    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequest<String>),
+    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparation<String>),
+    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcome<String>),
+    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeys<String>),
     AcceptConversation(AcceptConversationRequestBody),
     AcknowledgeWelcome(AcknowledgeWelcomeRequestBody),
     ActivateReset(ActivateResetRequestBody),
@@ -293,6 +298,11 @@ pub type UploadBlobRequestBody = crate::atproto::blue_catbird::chat::upload_blob
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum CleanChatResponse {
+    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestOutput<String>),
+    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestOutput<String>),
+    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationOutput<String>),
+    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeOutput<String>),
+    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysOutput<String>),
     AcceptConversation(
         crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>,
     ),
@@ -369,6 +379,11 @@ pub enum CleanChatResponse {
 /// A generated clean-chat error body, selected by the canonical operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanChatError {
+    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestError),
+    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestError),
+    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationError),
+    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeError),
+    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysError),
     AcceptConversation(
         crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError,
     ),
@@ -429,6 +444,11 @@ pub enum CleanChatError {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanChatOperationFfi {
+    PrepareDirectRequest,
+    PublishDirectRequest,
+    CancelDirectRequestPreparation,
+    GetDirectRequestOutcome,
+    PublishDirectRequestKeys,
     AcceptConversation,
     AcknowledgeWelcome,
     ActivateReset,
@@ -466,6 +486,11 @@ pub enum CleanChatOperationFfi {
 impl From<CleanChatOperationFfi> for CanonicalOperation {
     fn from(operation: CleanChatOperationFfi) -> Self {
         match operation {
+            CleanChatOperationFfi::PrepareDirectRequest => Self::PrepareDirectRequest,
+            CleanChatOperationFfi::PublishDirectRequest => Self::PublishDirectRequest,
+            CleanChatOperationFfi::CancelDirectRequestPreparation => Self::CancelDirectRequestPreparation,
+            CleanChatOperationFfi::GetDirectRequestOutcome => Self::GetDirectRequestOutcome,
+            CleanChatOperationFfi::PublishDirectRequestKeys => Self::PublishDirectRequestKeys,
             CleanChatOperationFfi::AcceptConversation => Self::AcceptConversation,
             CleanChatOperationFfi::AcknowledgeWelcome => Self::AcknowledgeWelcome,
             CleanChatOperationFfi::ActivateReset => Self::ActivateReset,
@@ -505,6 +530,11 @@ impl From<CleanChatOperationFfi> for CanonicalOperation {
 impl From<CanonicalOperation> for CleanChatOperationFfi {
     fn from(operation: CanonicalOperation) -> Self {
         match operation {
+            CanonicalOperation::PrepareDirectRequest => Self::PrepareDirectRequest,
+            CanonicalOperation::PublishDirectRequest => Self::PublishDirectRequest,
+            CanonicalOperation::CancelDirectRequestPreparation => Self::CancelDirectRequestPreparation,
+            CanonicalOperation::GetDirectRequestOutcome => Self::GetDirectRequestOutcome,
+            CanonicalOperation::PublishDirectRequestKeys => Self::PublishDirectRequestKeys,
             CanonicalOperation::AcceptConversation => Self::AcceptConversation,
             CanonicalOperation::AcknowledgeWelcome => Self::AcknowledgeWelcome,
             CanonicalOperation::ActivateReset => Self::ActivateReset,
@@ -614,6 +644,11 @@ fn parse_ffi_request(
     body: &[u8],
 ) -> Result<CleanChatRequest, CleanChatTransportFfiError> {
     match operation {
+        CanonicalOperation::PrepareDirectRequest => parse_json_req(body, CleanChatRequest::PrepareDirectRequest),
+        CanonicalOperation::PublishDirectRequest => parse_json_req(body, CleanChatRequest::PublishDirectRequest),
+        CanonicalOperation::CancelDirectRequestPreparation => parse_json_req(body, CleanChatRequest::CancelDirectRequestPreparation),
+        CanonicalOperation::GetDirectRequestOutcome => parse_json_req(body, CleanChatRequest::GetDirectRequestOutcome),
+        CanonicalOperation::PublishDirectRequestKeys => parse_json_req(body, CleanChatRequest::PublishDirectRequestKeys),
         CanonicalOperation::AcceptConversation => {
             parse_json_req(body, CleanChatRequest::AcceptConversation)
         }
@@ -733,6 +768,11 @@ pub fn decode_clean_chat_response(
     let response =
         CleanChatResponse::decode(operation.into(), &response_json).map_err(ffi_error)?;
     match response {
+        CleanChatResponse::PrepareDirectRequest(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::PublishDirectRequest(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::CancelDirectRequestPreparation(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetDirectRequestOutcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::PublishDirectRequestKeys(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::AcceptConversation(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
         }
@@ -801,6 +841,11 @@ pub fn decode_clean_chat_error(
 ) -> Result<Vec<u8>, CleanChatTransportFfiError> {
     let error = CleanChatError::decode(operation.into(), &error_json).map_err(ffi_error)?;
     match error {
+        CleanChatError::PrepareDirectRequest(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::PublishDirectRequest(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::CancelDirectRequestPreparation(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetDirectRequestOutcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::PublishDirectRequestKeys(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::AcceptConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::AcknowledgeWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::ActivateReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
@@ -846,6 +891,11 @@ pub fn decode_clean_chat_error(
 impl CleanChatRequest {
     pub fn operation(&self) -> CanonicalOperation {
         match self {
+            Self::PrepareDirectRequest(_) => CanonicalOperation::PrepareDirectRequest,
+            Self::PublishDirectRequest(_) => CanonicalOperation::PublishDirectRequest,
+            Self::CancelDirectRequestPreparation(_) => CanonicalOperation::CancelDirectRequestPreparation,
+            Self::GetDirectRequestOutcome(_) => CanonicalOperation::GetDirectRequestOutcome,
+            Self::PublishDirectRequestKeys(_) => CanonicalOperation::PublishDirectRequestKeys,
             Self::AcceptConversation(_) => CanonicalOperation::AcceptConversation,
             Self::AcknowledgeWelcome(_) => CanonicalOperation::AcknowledgeWelcome,
             Self::ActivateReset(_) => CanonicalOperation::ActivateReset,
@@ -885,6 +935,11 @@ impl CleanChatRequest {
     pub fn prepare(&self, auth: &CleanChatAuthContext) -> Result<PreparedRequest, TransportError> {
         let internal = auth.as_internal();
         match self {
+            Self::PrepareDirectRequest(request) => prepare_direct_request_json(&internal, auth.auth_generation, self.operation(), request),
+            Self::PublishDirectRequest(request) => prepare_direct_request_json(&internal, auth.auth_generation, self.operation(), request),
+            Self::CancelDirectRequestPreparation(request) => prepare_direct_request_json(&internal, auth.auth_generation, self.operation(), request),
+            Self::GetDirectRequestOutcome(request) => query_request(&internal, self.operation(), request),
+            Self::PublishDirectRequestKeys(request) => prepare_direct_request_json(&internal, auth.auth_generation, self.operation(), request),
             Self::GetConversations(request) => query_request(&internal, self.operation(), request),
             Self::GetBlob(request) => query_request(&internal, self.operation(), request),
             Self::GetBlobUsage(request) => query_request(&internal, self.operation(), request),
@@ -941,6 +996,11 @@ impl CleanChatResponse {
             };
         }
         match operation {
+            CanonicalOperation::PrepareDirectRequest => decode!(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestOutput<String>, PrepareDirectRequest),
+            CanonicalOperation::PublishDirectRequest => decode!(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestOutput<String>, PublishDirectRequest),
+            CanonicalOperation::CancelDirectRequestPreparation => decode!(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationOutput<String>, CancelDirectRequestPreparation),
+            CanonicalOperation::GetDirectRequestOutcome => decode!(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeOutput<String>, GetDirectRequestOutcome),
+            CanonicalOperation::PublishDirectRequestKeys => decode!(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysOutput<String>, PublishDirectRequestKeys),
             CanonicalOperation::AcceptConversation => decode!(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>, AcceptConversation),
             CanonicalOperation::AcknowledgeWelcome => decode!(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeOutput<String>, AcknowledgeWelcome),
             CanonicalOperation::ActivateReset => decode!(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetOutput<String>, ActivateReset),
@@ -1022,6 +1082,11 @@ impl CleanChatError {
             };
         }
         match operation {
+            CanonicalOperation::PrepareDirectRequest => decode!(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestError, PrepareDirectRequest),
+            CanonicalOperation::PublishDirectRequest => decode!(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestError, PublishDirectRequest),
+            CanonicalOperation::CancelDirectRequestPreparation => decode!(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationError, CancelDirectRequestPreparation),
+            CanonicalOperation::GetDirectRequestOutcome => decode!(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeError, GetDirectRequestOutcome),
+            CanonicalOperation::PublishDirectRequestKeys => decode!(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysError, PublishDirectRequestKeys),
             CanonicalOperation::AcceptConversation => decode!(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError, AcceptConversation),
             CanonicalOperation::AcknowledgeWelcome => decode!(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeError, AcknowledgeWelcome),
             CanonicalOperation::ActivateReset => decode!(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetError, ActivateReset),
@@ -3510,6 +3575,7 @@ pub(crate) fn get_conversations(
         actor_device_id: auth.device_id.clone(),
         limit,
         page_cursor: page_cursor.map(ToOwned::to_owned),
+        supported_protocol_versions: None,
     };
     let value = serde_json::to_value(request)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
@@ -3581,6 +3647,11 @@ pub fn prepare_get_entries(
 /// adapters must execute those two media-specific transports themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalOperation {
+    PrepareDirectRequest,
+    PublishDirectRequest,
+    CancelDirectRequestPreparation,
+    GetDirectRequestOutcome,
+    PublishDirectRequestKeys,
     AcceptConversation,
     AcknowledgeWelcome,
     ActivateReset,
@@ -3617,6 +3688,11 @@ pub enum CanonicalOperation {
 impl CanonicalOperation {
     /// Every operation in the route inventory.
     pub const ALL: &'static [Self] = &[
+        Self::PrepareDirectRequest,
+        Self::PublishDirectRequest,
+        Self::CancelDirectRequestPreparation,
+        Self::GetDirectRequestOutcome,
+        Self::PublishDirectRequestKeys,
         Self::AcceptConversation,
         Self::AcknowledgeWelcome,
         Self::ActivateReset,
@@ -3680,6 +3756,11 @@ fn route(path: &'static str) -> CanonicalRoute {
 /// Resolve an operation through the generated canonical endpoint marker.
 pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
     match operation {
+        CanonicalOperation::PrepareDirectRequest => route(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestRequest::PATH),
+        CanonicalOperation::PublishDirectRequest => route(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestRequest::PATH),
+        CanonicalOperation::CancelDirectRequestPreparation => route(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationRequest::PATH),
+        CanonicalOperation::GetDirectRequestOutcome => route(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeRequest::PATH),
+        CanonicalOperation::PublishDirectRequestKeys => route(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysRequest::PATH),
         CanonicalOperation::AcceptConversation => route(AcceptConversationRequest::PATH),
         CanonicalOperation::AcknowledgeWelcome => route(AcknowledgeWelcomeRequest::PATH),
         CanonicalOperation::ActivateReset => route(ActivateResetRequest::PATH),
@@ -3914,4 +3995,28 @@ fn participant_acceptance_transcript_matches_server_exactly() {
     .expect("must prepare signed body");
     let server_hex = "434154424952442d434841542d41434345505400ad646e657874a86565706f6368006767726f757049645820193bb735bc1e20805edec26fef6d0164403a633c0fc584d78d805507eec40763696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e016e636f6e766572736174696f6e496450009ffa924bf94307bf26e7428d53d8006f636f6e6669726d6174696f6e54616758208b1b706fbf188e358427f63df3eff6a4228d8b8aa95f2a3a1551312abb830d1a7067726f7570436f6e7465787448617368582074d6703e5aa2cc90030b597d376555d589daeac4b33675ddbe40a282e2fa07a96524747970657830626c75652e636174626972642e636861742e64656673237061727469636970616e74416363657074616e6365426f6479656b65794964782b4b514c5a6867455232714f5f494f4e6d6746547a6564395542565a41656c6d43685a444b512d5f67616751657072696f72a86565706f6368006767726f757049645820193bb735bc1e20805edec26fef6d0164403a633c0fc584d78d805507eec40763696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450009ffa924bf94307bf26e7428d53d8006f636f6e6669726d6174696f6e54616758208b1b706fbf188e358427f63df3eff6a4228d8b8aa95f2a3a1551312abb830d1a7067726f7570436f6e7465787448617368582074d6703e5aa2cc90030b597d376555d589daeac4b33675ddbe40a282e2fa07a9686163746f7244696478206469643a706c633a7a3372776c6471776f7375656b6477706e34356436756c79687369676e656441747818323032362d30382d32315430383a32313a32332e3534335a6c7472616e736974696f6e49645052f04e1a015f40f9a199302a69150a936d6163746f724465766963654964501ad34b5a3c934201a5c9b0951b7bc92a6e6175746847656e65726174696f6e016e6964656d706f74656e63794b65795052f04e1a015f40f9a199302a69150a936f7369676e6174757265446f6d61696e74434154424952442d434841542d41434345505400717265636f766572795265717565737449645052f04e1a015f40f9a199302a69150a9374696e7669746174696f6e50726f76656e616e6365a36c696e7669746564427944696478206469643a706c633a77366133646e636c637473336d6f78757477626f3368663671696e76697465644279446576696365496450f67f7cf1564b4072a6f995120eb43d6976696e7669746174696f6e5472616e736974696f6e4964506bd96af372b24e5abe1d2109ab171196";
     assert_eq!(hex::encode(prepared.transcript), server_hex);
+}
+
+
+/// Request v2 uses its own strict signing domains while retaining generated DTOs.
+fn prepare_direct_request_json<T: Serialize>(auth: &TransportAuth, generation: Option<i64>, operation: CanonicalOperation, request: &T) -> Result<PreparedRequest, TransportError> {
+    auth.validate()?;
+    let body = serialize_json(request)?;
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let signed = &value["signedRequest"]["body"];
+    let kind = match operation {
+        CanonicalOperation::PrepareDirectRequest => crate::chat_v2::transcript::direct_request::DirectRequestKind::Prepare,
+        CanonicalOperation::PublishDirectRequest => crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish,
+        CanonicalOperation::CancelDirectRequestPreparation => crate::chat_v2::transcript::direct_request::DirectRequestKind::Cancel,
+        CanonicalOperation::PublishDirectRequestKeys => crate::chat_v2::transcript::direct_request::DirectRequestKind::Keys,
+        _ => return Err(TransportError::UnsupportedOperation {operation,reason:"not a signed direct request mutation"}),
+    };
+    crate::chat_v2::transcript::direct_request::direct_request_signing_bytes(kind, &serde_json::to_vec(signed).map_err(|e|TransportError::Serialization(e.to_string()))?).map_err(|e|TransportError::Serialization(e.to_string()))?;
+    if signed["actorDeviceId"].as_str()!=Some(auth.device_id.as_str()) {
+        return Err(TransportError::DeviceBindingMismatch{body:signed["actorDeviceId"].as_str().unwrap_or_default().into(),authenticated:auth.device_id.clone()});
+    }
+    let expected=generation.ok_or(TransportError::MissingAuthGeneration)?;
+    let actual=signed["authGeneration"].as_i64().ok_or(TransportError::MissingAuthGeneration)?;
+    if actual!=expected { return Err(TransportError::AuthGenerationMismatch{expected,actual}); }
+    Ok(PreparedRequest{operation,method:"POST".into(),path:operation.path().into(),body:Some(body)})
 }

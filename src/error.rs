@@ -14,6 +14,9 @@ pub enum MLSError {
     #[error("Group not found: {message}")]
     GroupNotFound { message: String },
 
+    #[error("Direct request Welcome import deadline has passed")]
+    RequestImportExpired,
+
     #[error("Invalid key package")]
     InvalidKeyPackage,
 

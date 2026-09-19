@@ -1042,6 +1042,22 @@ impl CatbirdClientBridge {
             .map_err(OrchestratorBridgeError::from)
     }
 
+    pub fn start_direct_request(&self, input: crate::DirectRequestInput) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.start_direct_request(input)).map_err(OrchestratorBridgeError::from)
+    }
+
+    pub fn resume_direct_request(&self, draft_id: String) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.resume_direct_request(&draft_id)).map_err(OrchestratorBridgeError::from)
+    }
+
+    pub fn cancel_direct_request(&self, draft_id: String) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.cancel_direct_request(&draft_id)).map_err(OrchestratorBridgeError::from)
+    }
+
+    pub fn refresh_request_preview(&self, conversation_id: String) -> Result<crate::DirectRequestView, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.refresh_request_preview(&conversation_id)).map_err(OrchestratorBridgeError::from)
+    }
+
     /// Create a new conversation.
     pub fn create_conversation(
         &self,

@@ -35,6 +35,15 @@ impl<T: ?Sized> CredentialStoreBounds for T {}
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait CredentialStore: CredentialStoreBounds {
+    /// Resolve the configured direct-request authority DID document through the
+    /// platform's authenticated DID resolver. Rust validates method uniqueness,
+    /// controller, P256 Multikey encoding, and immutable fingerprint itself.
+    /// Never resolve a receipt-supplied URL. None is unsupported and prohibits
+    /// new request reservation; retained trusted methods can verify exact replay.
+    async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
     /// Store a signing key for a user DID.
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()>;
 
