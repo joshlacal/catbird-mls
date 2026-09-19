@@ -4035,7 +4035,7 @@ fn validate_direct_endpoint_raw(operation:CanonicalOperation,raw:&[u8])->Result<
         CanonicalOperation::PrepareDirectRequest=>"signedDirectRequestPreparation",
         CanonicalOperation::PublishDirectRequest=>"signedDirectRequestPublication",
         CanonicalOperation::CancelDirectRequestPreparation=>"signedDirectRequestCancellation",
-        CanonicalOperation::PublishDirectRequestKeys=>"signedDirectRequestKeyPublication",
+        CanonicalOperation::PublishDirectRequestKeys=>"signedDirectRequestKeysPublication",
         CanonicalOperation::AcceptConversation=>{direct_request::direct_request_acceptance_endpoint_is_v2(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;return Ok(());},
         _=>return Ok(()),
     };
