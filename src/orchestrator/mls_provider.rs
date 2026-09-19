@@ -1,6 +1,43 @@
 use crate::error::MLSError;
 use crate::types::*;
 
+/// Read only public TLS framing for lookup of an independently retained proof.
+/// Parsing is not authentication; callers must still match the exact ciphertext
+/// digest, owner, conversation and server entry against protected proof storage.
+pub(crate) fn private_application_echo_metadata(
+    ciphertext: &[u8],
+) -> Result<(Vec<u8>, u64, [u8; 32]), MLSError> {
+    use openmls::prelude::{ContentType, MlsMessageBodyIn, MlsMessageIn, ProtocolMessage};
+    use sha2::{Digest, Sha256};
+    use tls_codec::Deserialize as _;
+    crate::message_limits::validate_inbound_mls_message_len(ciphertext.len(), "own echo")?;
+    let parse = |raw: &[u8]| MlsMessageIn::tls_deserialize_exact(raw);
+    let message = match parse(ciphertext) {
+        Ok(message) => message,
+        Err(_) => {
+            // Historical native sends used an exact length prefix and zero
+            // bucket padding. Never infer an empty AAD from a parse failure.
+            let length = ciphertext.get(..4).ok_or(MLSError::SerializationError)?;
+            let length = u32::from_be_bytes(length.try_into().unwrap()) as usize;
+            let end = length.checked_add(4).ok_or(MLSError::SerializationError)?;
+            let raw = ciphertext.get(4..end).ok_or(MLSError::SerializationError)?;
+            if ciphertext.get(end..).is_none_or(|tail| tail.iter().any(|byte| *byte != 0)) {
+                return Err(MLSError::SerializationError);
+            }
+            parse(raw).map_err(|_| MLSError::SerializationError)?
+        }
+    };
+    let MlsMessageBodyIn::PrivateMessage(private) = message.extract() else {
+        return Err(MLSError::SerializationError);
+    };
+    let aad_sha256 = Sha256::digest(private.aad()).into();
+    let protocol = ProtocolMessage::from(private);
+    if protocol.content_type() != ContentType::Application {
+        return Err(MLSError::SerializationError);
+    }
+    Ok((protocol.group_id().as_slice().to_vec(), protocol.epoch().as_u64(), aad_sha256))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnEchoProof {
     pub canonical_entry_sha256: [u8; 32],

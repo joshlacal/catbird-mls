@@ -1,6 +1,6 @@
 use crate::error::MLSError;
 use chrono::Utc;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 
 use super::api_client::MLSAPIClient;
@@ -1304,43 +1304,29 @@ where
                             if in_storage_pending {
                                 true
                             } else {
-                                // 3. OwnEchoProof in encrypted MLS storage
-                                let aad_sha256: [u8; 32] = sha2::Sha256::digest(b"").into();
-                                let ciphertext_sha256: [u8; 32] =
-                                    sha2::Sha256::digest(&envelope.ciphertext).into();
-                                let epoch = match envelope.server_epoch {
-                                    Some(e) => e,
-                                    None => {
-                                        let states = self.group_states().lock().await;
-                                        resolved.group_state(&states).map(|s| s.epoch).unwrap_or(0)
+                                // 3. Match the actual public MLS framing against
+                                // independently retained protected evidence.
+                                match super::mls_provider::private_application_echo_metadata(&envelope.ciphertext) {
+                                    Ok((wire_group, epoch, aad_sha256))
+                                        if wire_group == group_id_bytes
+                                            && envelope.server_epoch.is_none_or(|expected| expected == epoch) => {
+                                        let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(&envelope.ciphertext).into();
+                                        let direct = self.mls_context().has_own_echo_proof(
+                                            &resolved.conversation_id, &group_id_bytes, server_id,
+                                            epoch, &aad_sha256, &ciphertext_sha256,
+                                        )?;
+                                        if direct {
+                                            true
+                                        } else if let Some(alt) = &alternate {
+                                            self.mls_context().has_own_echo_proof(
+                                                &resolved.conversation_id, &group_id_bytes, alt,
+                                                epoch, &aad_sha256, &ciphertext_sha256,
+                                            )?
+                                        } else {
+                                            false
+                                        }
                                     }
-                                };
-                                let direct_proof = self
-                                    .mls_context()
-                                    .has_own_echo_proof(
-                                        &resolved.conversation_id,
-                                        &group_id_bytes,
-                                        server_id,
-                                        epoch,
-                                        &aad_sha256,
-                                        &ciphertext_sha256,
-                                    )
-                                    .unwrap_or(false);
-                                if direct_proof {
-                                    true
-                                } else if let Some(alt) = &alternate {
-                                    self.mls_context()
-                                        .has_own_echo_proof(
-                                            &resolved.conversation_id,
-                                            &group_id_bytes,
-                                            alt,
-                                            epoch,
-                                            &aad_sha256,
-                                            &ciphertext_sha256,
-                                        )
-                                        .unwrap_or(false)
-                                } else {
-                                    false
+                                    _ => false,
                                 }
                             }
                         }
