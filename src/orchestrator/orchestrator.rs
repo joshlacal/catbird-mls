@@ -249,16 +249,13 @@ static NEXT_ORCHESTRATOR_INSTANCE_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 static NEXT_BATCH_EXECUTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-#[cfg(not(target_arch = "wasm32"))]
 tokio::task_local! {
     pub(crate) static BATCH_INVENTORY_CONTEXT: Arc<AuthorizedInventorySnapshot>;
 }
-#[cfg(not(target_arch = "wasm32"))]
 tokio::task_local! {
     pub(crate) static BATCH_RECOVERY_INBOX_CONTEXT: Arc<AuthorizedRecoveryInboxSnapshot>;
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn with_batch_inventory_scope<F, R>(
     snapshot: Arc<AuthorizedInventorySnapshot>,
     f: F,
@@ -268,7 +265,6 @@ where
 {
     BATCH_INVENTORY_CONTEXT.scope(snapshot, f).await
 }
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn with_batch_recovery_inbox_scope<F, R>(
     snapshot: Arc<AuthorizedRecoveryInboxSnapshot>,
     f: F,
@@ -353,7 +349,6 @@ where
     /// Return the currently scoped batch inventory snapshot, if any.
     /// Fails closed if the snapshot belongs to a different orchestrator instance,
     /// or if lifecycle state indicates user_did mismatch.
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn batch_inventory_snapshot(&self) -> Option<Arc<AuthorizedInventorySnapshot>> {
         BATCH_INVENTORY_CONTEXT
             .try_with(|snapshot| {
@@ -377,14 +372,7 @@ where
             .flatten()
     }
 
-    /// On WASM targets, batch inventory execution contexts are not available.
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn batch_inventory_snapshot(&self) -> Option<Arc<AuthorizedInventorySnapshot>> {
-        None
-    }
-
     /// Return the currently scoped batch recovery inbox snapshot, if any.
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn batch_recovery_inbox_snapshot(&self) -> Option<Arc<AuthorizedRecoveryInboxSnapshot>> {
         BATCH_RECOVERY_INBOX_CONTEXT
             .try_with(|snapshot| {
@@ -406,11 +394,6 @@ where
             })
             .ok()
             .flatten()
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn batch_recovery_inbox_snapshot(&self) -> Option<Arc<AuthorizedRecoveryInboxSnapshot>> {
-        None
     }
 
     /// Fetch an authorized inventory snapshot across all pages for the current device.

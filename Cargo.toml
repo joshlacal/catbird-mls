@@ -142,7 +142,7 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 ogg = "0.9"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt"] }
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = ["Window", "Performance", "console"] }
 # WASM-compatible getrandom feature unification across transitive semver lines.

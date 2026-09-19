@@ -4,7 +4,7 @@ use web_time::Instant;
 use super::api_client::MLSAPIClient;
 use super::constants;
 use super::credentials::CredentialStore;
-use super::error::Result;
+use super::error::{OrchestratorError, Result};
 use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::pagination::PaginationGuard;
@@ -58,7 +58,7 @@ where
     /// Confirm retained signed control operations before sync can replace or
     /// recover their local group. Uncertain conversations remain isolated from
     /// this pass while unrelated conversations continue syncing.
-    async fn resume_prepared_controls(&self) -> Result<HashSet<String>> {
+    pub(crate) async fn resume_prepared_controls(&self) -> Result<HashSet<String>> {
         let records = self.mls_context().list_prepared_controls()?;
         let mut blocked = HashSet::new();
         for record in records {
@@ -532,6 +532,7 @@ where
                                     user_did,
                                     all_convos,
                                     blocked_controls,
+                                    false,
                                 )),
                             ),
                         ).await;
@@ -546,6 +547,7 @@ where
                             user_did,
                             all_convos,
                             blocked_controls,
+                            false,
                         )),
                     ).await;
                 }
@@ -556,19 +558,22 @@ where
             user_did,
             all_convos,
             blocked_controls,
+            false,
         ))
         .await
     }
 
-    async fn reconcile_server_conversations_batch(
+    pub(crate) async fn reconcile_server_conversations_batch(
         &self,
         user_did: &str,
         all_convos: Vec<ConversationView>,
         blocked_controls: HashSet<String>,
+        strict: bool,
     ) -> Result<()> {
         let mut sync_rejoin_attempted = HashSet::new();
         for convo in &all_convos {
             if !*self.sync_in_progress().lock().await {
+                if strict{return Err(OrchestratorError::InvalidInput("Inventory application interrupted".into()));}
                 break;
             }
 
@@ -578,6 +583,7 @@ where
             let conversation_id = convo.conversation_id.as_str();
             self.conversations().lock().await.insert(conversation_id.to_string(), convo.clone());
             if blocked_controls.contains(conversation_id) {
+                if strict{return Err(OrchestratorError::InvalidInput("Inventory has unresolved controls".into()));}
                 continue;
             }
             if self.is_local_conversation_terminal(conversation_id).await? {
@@ -592,6 +598,7 @@ where
 
             if convo.canonical_state.as_ref().is_some_and(|state|state.direct_request.is_some()) {
                 if let Err(error)=Box::pin(self.refresh_request_preview(conversation_id)).await {
+                    if strict{return Err(error);}
                     tracing::warn!(conversation_id,%error,"Request preview refresh deferred");
                 }
             }
@@ -665,6 +672,7 @@ where
                 Ok(gid_bytes) => match self.mls_context().get_epoch(gid_bytes) {
                     Ok(_) => true,
                     Err(crate::MLSError::ContextClosed) => {
+                        if strict{return Err(crate::MLSError::ContextClosed.into());}
                         tracing::debug!(
                             conversation_id,
                             group_id,
@@ -736,6 +744,7 @@ where
                         // (race with a concurrent suspension). Transient — keep the
                         // server epoch and DON'T engage the rejoin gate.
                         Err(crate::MLSError::ContextClosed) => {
+                            if strict{return Err(crate::MLSError::ContextClosed.into());}
                             tracing::debug!(
                                 conversation_id,
                                 group_id,
@@ -805,6 +814,7 @@ where
                                         epoch
                                     }
                                     Err(e) => {
+                                        if strict{return Err(e);}
                                         let msg = e.to_string();
                                         if msg.contains("leaf recovery pending") {
                                             tracing::debug!(
@@ -938,6 +948,7 @@ where
                             .unwrap_or(0)
                         };
                         if server_epoch > new_local {
+                            if strict{return Err(OrchestratorError::InvalidInput("Inventory epoch catch-up incomplete".into()));}
                             tracing::warn!(
                                 conversation_id = %conversation_id,
                                 group_id = %group_id,
@@ -950,6 +961,7 @@ where
                         }
                     }
                     Err(e) => {
+                        if strict{return Err(e);}
                         tracing::warn!(
                             conversation_id = %conversation_id,
                             group_id = %group_id,
@@ -987,6 +999,7 @@ where
             {
                 Some(Ok(epoch)) => epoch.min(u32::MAX as u64) as u32,
                 Some(Err(e)) => {
+                    if strict{return Err(e.into());}
                     tracing::debug!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -996,6 +1009,7 @@ where
                     continue;
                 }
                 None => {
+                    if strict{return Err(OrchestratorError::InvalidInput("Inventory group ID malformed".into()));}
                     tracing::debug!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -1019,6 +1033,7 @@ where
                     }
                 }
                 Err(e) => {
+                    if strict{return Err(e);}
                     tracing::warn!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -1093,6 +1108,7 @@ where
                             );
                         }
                         Err(e) => {
+                            if strict{return Err(e);}
                             sync_rejoin_attempted.insert(conversation_id.to_string());
                             tracing::warn!(
                                 conversation_id = %conversation_id,
@@ -1105,6 +1121,8 @@ where
                 }
             }
         }
+
+        if strict { return Ok(()); }
 
         // Fulfill any pending leaf recovery requests for conversations we are active in.
         if let Err(e) = self.fulfill_pending_leaf_recoveries().await {

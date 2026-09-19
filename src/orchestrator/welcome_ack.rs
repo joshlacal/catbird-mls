@@ -212,6 +212,18 @@ where
     pub(crate) async fn fetch_welcome_delivery(&self, cid: &str) -> Result<WelcomeDelivery> {
         let did = self.require_user_did().await?;
         let device = self.require_actor_device_id().await?;
+        if let Some(items)=super::authenticated_inventory::scoped_welcome_items() {
+            let snapshot=self.batch_inventory_snapshot().ok_or_else(||invalid("Welcome inventory has no bound conversation scope"))?;
+            if snapshot.user_did!=did || snapshot.device_id!=device || !snapshot.contains_conversation(cid) {return Err(invalid("Welcome inventory owner changed"));}
+            let mut latest:Option<WelcomeDelivery>=None;
+            for item in items.iter().filter(|item|item["conversationId"]==cid) {
+                if item["$type"]=="blue.catbird.chat.defs#directRequestWelcomeView" {continue;}
+                if item["recipientDid"]!=did || item["recipientDeviceId"]!=device {return Err(invalid("Welcome recipient mismatch"));}
+                let delivery=WelcomeDelivery::from_value(item.clone())?;
+                if latest.as_ref().is_none_or(|old|old.envelope["transitionSeq"].as_u64()<item["transitionSeq"].as_u64()){latest=Some(delivery);}
+            }
+            return latest.ok_or_else(||OrchestratorError::ServerError{status:404,body:"Welcome not found in exact snapshot".into()});
+        }
         let (session, fence) = if let Some(snapshot) = self.batch_inventory_snapshot() {
             if snapshot.user_did == did
                 && snapshot.device_id == device

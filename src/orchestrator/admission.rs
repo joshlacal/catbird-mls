@@ -234,6 +234,43 @@ fn retain_revoked_leaf_status(previous: &CanonicalState, incoming: &mut Canonica
     }
 }
 
+/// Validate and merge an authenticated policy before a platform's atomic
+/// protected write. Native and browser providers use the same monotonic rules.
+pub fn merge_protected_conversation_policy(
+    previous: Option<&CanonicalState>, incoming: &CanonicalState,
+) -> Result<Option<CanonicalState>> {
+    let canonical=super::canonical_transport::encode_conversation_state(incoming)
+        .map_err(|e|invalid(&e.to_string()))?;
+    let mut next=super::canonical_transport::decode_conversation_state(&canonical)
+        .map_err(|e|invalid(&e.to_string()))?;
+    if let Some(previous)=previous {
+        validate_conversation_policy(previous)?;
+        retain_revoked_leaf_status(previous,&mut next);
+        if !incoming_is_newer(previous,&next)? {return Ok(None);}
+    }
+    Ok(Some(next))
+}
+
+/// Compare authenticated departure coordinates without turning inventory
+/// absence into removal authority. Call only after the departure was verified.
+pub fn merge_protected_conversation_departure(
+    previous:Option<&catbird_atproto::blue_catbird::chat::ConversationCoordinates>,
+    incoming:&catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+)->Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>> {
+    let coordinate=super::canonical_transport::decode_conversation_coordinates(
+        &serde_json::to_vec(incoming).map_err(|e|invalid(&e.to_string()))?)
+        .map_err(|e|invalid(&e.to_string()))?;
+    if let Some(old)=previous {
+        if old.conversation_id!=coordinate.conversation_id{return Err(invalid("departure conversation changed"));}
+        let old_version=(old.generation,old.state_version);
+        let new_version=(coordinate.generation,coordinate.state_version);
+        if new_version<old_version{return Ok(None);}
+        if new_version==old_version{return if old==&coordinate{Ok(None)}else{Err(invalid("conflicting departure"))};}
+        if old.lifecycle.as_str()=="superseded" || (old.generation==coordinate.generation && (old.group_id!=coordinate.group_id || coordinate.epoch<old.epoch)) {return Err(invalid("departure coordinate regressed"));}
+    }
+    Ok(Some(coordinate))
+}
+
 /// Merge policy-bearing rows without inventing admission for legacy None.
 pub fn merge_conversation_view(
     previous: Option<&ConversationView>,
@@ -605,12 +642,6 @@ pub(crate) mod native {
         user_did: &str,
         state: &CanonicalState,
     ) -> std::result::Result<bool, MLSError> {
-        let canonical =
-            super::super::canonical_transport::encode_conversation_state(state).map_err(failed)?;
-        let mut normalized =
-            super::super::canonical_transport::decode_conversation_state(&canonical)
-                .map_err(failed)?;
-        let state = &mut normalized;
         let cid = state.coordinates.conversation_id.to_string();
         let key = key(user_did, &cid)?;
         let tx = rusqlite::Transaction::new_unchecked(
@@ -626,13 +657,8 @@ pub(crate) mod native {
             )
             .optional()
             .map_err(failed)?;
-        if let Some(raw) = raw {
-            let previous = decode(&raw, user_did, &cid)?;
-            retain_revoked_leaf_status(&previous, state);
-            if !incoming_is_newer(&previous, state).map_err(failed)? {
-                return Ok(false);
-            }
-        }
+        let previous=raw.map(|raw|decode(&raw,user_did,&cid)).transpose()?;
+        let Some(state)=merge_protected_conversation_policy(previous.as_ref(),state).map_err(failed)? else {return Ok(false)};
         let raw = serde_json::to_string(&PolicyRecord {
             user_did: user_did.into(),
             state: state.clone(),
@@ -713,27 +739,8 @@ pub(crate) mod native {
             )
             .optional()
             .map_err(failed)?;
-        if let Some(old) = old {
-            let old = departure_record(&old, user_did, cid)?;
-            let old_version = (old.generation, old.state_version);
-            let new_version = (coordinate.generation, coordinate.state_version);
-            if new_version < old_version {
-                return Ok(false);
-            }
-            if new_version == old_version {
-                return if old == coordinate {
-                    Ok(false)
-                } else {
-                    Err(MLSError::StorageFailed)
-                };
-            }
-            if old.lifecycle.as_str() == "superseded"
-                || (old.generation == coordinate.generation
-                    && (old.group_id != coordinate.group_id || coordinate.epoch < old.epoch))
-            {
-                return Err(MLSError::StorageFailed);
-            }
-        }
+        let previous=old.map(|raw|departure_record(&raw,user_did,cid)).transpose()?;
+        let Some(coordinate)=merge_protected_conversation_departure(previous.as_ref(),&coordinate).map_err(failed)? else {return Ok(false)};
         let raw = serde_json::to_string(&DepartureRecord {
             user_did: user_did.into(),
             coordinate,
