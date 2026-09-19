@@ -762,11 +762,18 @@ pub fn direct_request_acceptance_endpoint_is_v2(raw_endpoint: &[u8]) -> Result<b
         return Err(error("acceptance requires exactly one versioned request"));
     }
     if object.contains_key("signedRequest") {
-        project(
-            &serde_json::to_vec(&object["signedRequest"]).map_err(error)?,
-            "signedParticipantAcceptance",
-            false,
-        )?;
+        // Version selection precedes the established v1 DTO normalization.
+        // The legacy signed body may be untagged at this host boundary; its
+        // existing canonical decoder remains the signature/schema authority.
+        let wrapper = object["signedRequest"]
+            .as_object()
+            .ok_or_else(|| error("legacy signed wrapper"))?;
+        if wrapper.len() != 2
+            || !wrapper.get("body").is_some_and(Value::is_object)
+            || !wrapper.contains_key("signature")
+        {
+            return Err(error("legacy signed wrapper fields"));
+        }
         Ok(false)
     } else if object.contains_key("directRequest") {
         project(
@@ -799,6 +806,16 @@ mod acceptance_presence_tests {
         let new = json!({"body":new_body,"signature":STANDARD.encode([0;64])});
         let legacy = json!({"signedRequest":old});
         let direct = json!({"directRequest":new});
+        let mut untagged_legacy = legacy.clone();
+        untagged_legacy["signedRequest"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("$type");
+        assert!(!direct_request_acceptance_endpoint_is_v2(
+            &serde_json::to_vec(&untagged_legacy).unwrap()
+        )
+        .unwrap());
+
         assert!(
             !direct_request_acceptance_endpoint_is_v2(&serde_json::to_vec(&legacy).unwrap())
                 .unwrap()
@@ -873,5 +890,176 @@ mod introduction_cbor_tests {
         assert!(
             encode_direct_request_introduction(&serde_json::to_vec(&invalid).unwrap()).is_err()
         );
+    }
+}
+
+/// Compare already signature-verified preparation/publication bodies. This is
+/// a binding check, not a replacement for either signature verification.
+pub fn direct_request_preparation_matches_publication(
+    preparation: &Value,
+    publication: &Value,
+) -> bool {
+    for field in [
+        "requestId",
+        "firstMessageId",
+        "conversationId",
+        "recipientDid",
+        "origin",
+        "profile",
+        "preparationDigest",
+        "preparationRequestDigest",
+    ] {
+        if preparation.get(field).is_none() || preparation[field] != publication[field] {
+            return false;
+        }
+    }
+    for field in ["actorDid", "actorDeviceId", "keyId", "authGeneration"] {
+        if preparation["creator"].get(field).is_none()
+            || preparation["creator"][field] != publication[field]
+        {
+            return false;
+        }
+    }
+    let Some(selected) = preparation["selectedDevices"].as_array() else {
+        return false;
+    };
+    let Some(deliveries) = publication["artifacts"]["welcome"]["deliveries"].as_array() else {
+        return false;
+    };
+    if selected.is_empty() || selected.len() != deliveries.len() {
+        return false;
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    selected.iter().all(|selected| {
+        let (Some(did), Some(device)) = (
+            selected["actorDid"].as_str(),
+            selected["actorDeviceId"].as_str(),
+        ) else {
+            return false;
+        };
+        if !identities.insert((did, device)) {
+            return false;
+        }
+        deliveries
+            .iter()
+            .filter(|delivery| {
+                let provenance = &delivery["provenance"];
+                delivery["recipientDid"] == selected["actorDid"]
+                    && delivery["recipientDeviceId"] == selected["actorDeviceId"]
+                    && selected["keyPackage"].get("keyPackageRef").is_some()
+                    && provenance["keyPackageRef"] == selected["keyPackage"]["keyPackageRef"]
+                    && provenance["grantId"] == selected["grant"]["body"]["grantId"]
+                    && provenance["grantRevision"] == selected["grant"]["body"]["grantRevision"]
+                    && [
+                        "requestId",
+                        "preparationDigest",
+                        "contextHash",
+                        "importUntil",
+                    ]
+                    .iter()
+                    .all(|field| {
+                        publication.get(field).is_some()
+                            && provenance[*field] == publication[*field]
+                    })
+            })
+            .count()
+            == 1
+    })
+}
+
+#[cfg(test)]
+mod preparation_publication_binding_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    #[test]
+    fn signed_preparation_and_publication_require_exact_nested_delivery_provenance() {
+        // Real signatures over strict wire shapes. MLS validity is deliberately
+        // delegated to the retained OpenMLS corpus; this test targets the DB
+        // hydration comparison that formerly looked at a nonexistent flat ref.
+        let fixtures: Value =
+            serde_json::from_str(include_str!("vectors/direct_request_vectors.json")).unwrap();
+        let sample = |kind: &str| {
+            fixtures["signed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["kind"] == kind)
+                .unwrap()["body"]
+                .clone()
+        };
+        let actor = SigningKey::from_bytes(&[7; 32]);
+        let recipient = SigningKey::from_bytes(&[8; 32]);
+        let actor_id = URL_SAFE_NO_PAD.encode(Sha256::digest(actor.verifying_key().as_bytes()));
+        let recipient_id =
+            URL_SAFE_NO_PAD.encode(Sha256::digest(recipient.verifying_key().as_bytes()));
+        let sign = |kind, body: &Value, key: &SigningKey| {
+            let bytes =
+                direct_request_signing_bytes(kind, &serde_json::to_vec(body).unwrap()).unwrap();
+            json!({"body":body,"signature":STANDARD.encode(key.sign(&bytes).to_bytes())})
+        };
+        let mut publication = sample("Publish");
+        publication["keyId"] = json!(actor_id);
+        publication["recipientDid"] = json!("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb");
+        let mut grant = sample("Grant");
+        grant["actorDid"] = publication["recipientDid"].clone();
+        grant["keyId"] = json!(recipient_id);
+        let signed_grant = sign(DirectRequestKind::Grant, &grant, &recipient);
+        verify_signed_request(
+            DirectRequestKind::Grant,
+            &serde_json::to_vec(&signed_grant).unwrap(),
+            recipient.verifying_key().as_bytes(),
+        )
+        .unwrap();
+        let authority = p256::ecdsa::SigningKey::from_slice(&[9; 32]).unwrap();
+        let public = authority.verifying_key().to_encoded_point(true);
+        let mut preparation = json!({"protocolVersion":"2","requestId":publication["requestId"],"firstMessageId":publication["firstMessageId"],"conversationId":publication["conversationId"],"recipientDid":publication["recipientDid"],"origin":publication["origin"],"profile":publication["profile"],"creator":{"actorDid":publication["actorDid"],"actorDeviceId":publication["actorDeviceId"],"keyId":publication["keyId"],"authGeneration":publication["authGeneration"]},"selectedDevices":[{"actorDid":grant["actorDid"],"actorDeviceId":grant["actorDeviceId"],"keyId":grant["keyId"],"authGeneration":grant["authGeneration"],"keyPackage":{"framing":"mlsMessage","contentType":"keyPackage","bytes":STANDARD.encode([1;8]),"sha256":STANDARD.encode(Sha256::digest([1;8])),"keyPackageRef":grant["keyPackageRef"]},"grant":signed_grant}],"preparedAt":"2026-09-19T12:00:00.000Z","leaseExpiresAt":"2026-09-19T12:05:00.000Z","minimumImportUntil":"2026-09-26T12:05:00.000Z","preparationRequestDigest":publication["preparationRequestDigest"],"authorityDid":"did:web:chat.catbird.blue","receiptKeyId":direct_request_receipt_key_id(public.as_bytes()).unwrap()});
+        let bytes =
+            direct_request_preparation_signing_bytes(&serde_json::to_vec(&preparation).unwrap())
+                .unwrap();
+        let signature: p256::ecdsa::Signature = authority.sign(&bytes);
+        let signature = signature.normalize_s().unwrap_or(signature);
+        preparation["preparationDigest"] = json!(STANDARD.encode(Sha256::digest(bytes)));
+        preparation["preparationSignature"] = json!(STANDARD.encode(signature.to_bytes()));
+        let preparation = verify_direct_request_preparation(
+            &serde_json::to_vec(&preparation).unwrap(),
+            public.as_bytes(),
+        )
+        .unwrap();
+        publication["preparationDigest"] = preparation["preparationDigest"].clone();
+        publication["artifacts"]["welcome"]["deliveries"] = json!([{"recipientDid":grant["actorDid"],"recipientDeviceId":grant["actorDeviceId"],"provenance":{"requestId":publication["requestId"],"preparationDigest":publication["preparationDigest"],"contextHash":publication["contextHash"],"grantId":grant["grantId"],"grantRevision":grant["grantRevision"],"keyPackageRef":grant["keyPackageRef"],"importUntil":publication["importUntil"]}}]);
+        let signed = sign(DirectRequestKind::Publish, &publication, &actor);
+        let verified = verify_signed_request(
+            DirectRequestKind::Publish,
+            &serde_json::to_vec(&signed).unwrap(),
+            actor.verifying_key().as_bytes(),
+        )
+        .unwrap();
+        assert!(direct_request_preparation_matches_publication(
+            &preparation,
+            verified.body()
+        ));
+        let mut flat = publication.clone();
+        flat["artifacts"]["welcome"]["deliveries"][0]["keyPackageRef"] =
+            grant["keyPackageRef"].clone();
+        flat["artifacts"]["welcome"]["deliveries"][0]["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("keyPackageRef");
+        assert!(!direct_request_preparation_matches_publication(
+            &preparation,
+            &flat
+        ));
+        let mut wrong = publication.clone();
+        wrong["artifacts"]["welcome"]["deliveries"][0]["provenance"]["grantRevision"] = json!(2);
+        assert!(!direct_request_preparation_matches_publication(
+            &preparation,
+            &wrong
+        ));
+        let mut wrong = preparation.clone();
+        wrong["creator"]["authGeneration"] = json!(2);
+        assert!(!direct_request_preparation_matches_publication(
+            &wrong,
+            &publication
+        ));
     }
 }
