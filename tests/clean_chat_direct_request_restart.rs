@@ -70,6 +70,7 @@ fn intent() -> DirectRequestIntent {
         trusted_authority_document: authority_document(),
         preparation_response: None,
         cancel_wrapper: None,
+        publication_wrapper: None,
         terminal_response: None,
         publication_attempted: false,
         cancellation_requested: false,
@@ -170,4 +171,17 @@ fn authority_document() -> Vec<u8> {
     let mut bytes = vec![0x80, 0x24];
     bytes.extend_from_slice(point.as_bytes());
     serde_json::to_vec(&json!({"id":"did:web:chat.catbird.blue","verificationMethod":[{"id":id,"controller":"did:web:chat.catbird.blue","type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc,bytes)}]})).unwrap()
+}
+
+#[test]
+fn offline_intent_hydration_rejects_unverified_preparation_and_terminal() {
+    let mut record = intent();
+    record.preparation_response =
+        Some(br#"{"receiptKeyId":"did:web:chat.catbird.blue#forged"}"#.to_vec());
+    assert!(record.encode().is_err());
+    let mut record = intent();
+    record.terminal_response = Some(
+        br#"{"body":{"keyId":"did:web:chat.catbird.blue#forged"},"signature":"AAAA"}"#.to_vec(),
+    );
+    assert!(record.encode().is_err());
 }

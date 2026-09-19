@@ -89,8 +89,13 @@ pub struct RequestCapabilities {
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Enum))]
 pub enum RequestPreview {
-    Ready { text: String },
-    Unavailable { code: String },
+    Ready {
+        text: String,
+        invitation: Option<GroupInvitationReference>,
+    },
+    Unavailable {
+        code: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

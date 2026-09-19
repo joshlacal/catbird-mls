@@ -988,6 +988,10 @@ where
             Err(error) => return Err(error),
         };
 
+        if self.pending_conversation_admission(&resolved.conversation_id).await? {
+            return Err(OrchestratorError::InvalidInput("RequestNotAccepted".into()));
+        }
+
         // HTTP polling, push delivery, and send catch-up can all present the
         // same ordered frame concurrently. Serialize by stable conversation
         // through the final crypto/application durability barrier so one
@@ -1918,6 +1922,9 @@ where
         envelope: &IncomingEnvelope,
     ) -> Result<MessageProcessingResult> {
         envelope.validate_server_metadata()?;
+        if self.pending_conversation_admission(&envelope.conversation_id).await? {
+            return Err(OrchestratorError::InvalidInput("RequestNotAccepted".into()));
+        }
         if let Some(server_epoch) = envelope.server_epoch {
             let local_epoch = self
                 .local_group_epoch_result(&envelope.conversation_id)

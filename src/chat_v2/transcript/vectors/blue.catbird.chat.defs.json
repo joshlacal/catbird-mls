@@ -671,6 +671,11 @@
         "device": {
           "type": "ref",
           "ref": "#deviceView"
+        },
+        "directRequestKeyPool": {
+          "type": "ref",
+          "ref": "#directRequestKeyPoolStats",
+          "description": "Present only for the authenticated actorDeviceId when its request capability record exists; absent for all peer/other-device items. Counts include only current authorized request-purpose KeyPackages with valid enabled nonrevoked grants and the full indicated lifetime horizon."
         }
       }
     },
@@ -6636,7 +6641,8 @@
         },
         "minimumImportUntil": {
           "type": "ref",
-          "ref": "#canonicalDatetime"
+          "ref": "#canonicalDatetime",
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated."
         },
         "preparationRequestDigest": {
           "type": "ref",
@@ -6811,7 +6817,8 @@
         },
         "importUntil": {
           "type": "ref",
-          "ref": "#canonicalDatetime"
+          "ref": "#canonicalDatetime",
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated."
         }
       }
     },
@@ -6993,7 +7000,8 @@
         },
         "importUntil": {
           "type": "ref",
-          "ref": "#canonicalDatetime"
+          "ref": "#canonicalDatetime",
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated."
         },
         "artifacts": {
           "type": "ref",
@@ -7705,7 +7713,8 @@
         },
         "importUntil": {
           "type": "ref",
-          "ref": "#canonicalDatetime"
+          "ref": "#canonicalDatetime",
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated."
         },
         "contextHash": {
           "type": "ref",
@@ -7939,7 +7948,8 @@
         },
         "minimumImportUntil": {
           "type": "ref",
-          "ref": "#canonicalDatetime"
+          "ref": "#canonicalDatetime",
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated."
         },
         "preparationRequestDigest": {
           "type": "ref",
@@ -8054,6 +8064,46 @@
         "receipt": {
           "type": "ref",
           "ref": "#signedDirectRequestAcceptanceCommitReceipt"
+        }
+      }
+    },
+    "directRequestKeyPoolStats": {
+      "type": "object",
+      "description": "Replenishment hint for the authenticated actor device only, bound to the enclosing ownDeviceView device identity, keyId and authGeneration. Counts are not publication or preparation authority. usableUntil equals asOf plus seven days, 300 seconds import margin and 300 seconds preparation lease.",
+      "required": [
+        "enabled",
+        "revision",
+        "usableCount",
+        "reservedCount",
+        "asOf",
+        "usableUntil"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "usableCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "reservedCount": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "asOf": {
+          "type": "ref",
+          "ref": "#canonicalDatetime"
+        },
+        "usableUntil": {
+          "type": "ref",
+          "ref": "#canonicalDatetime"
         }
       }
     }

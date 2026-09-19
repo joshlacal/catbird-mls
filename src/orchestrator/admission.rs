@@ -60,6 +60,23 @@ pub fn validate_conversation_policy(state: &CanonicalState) -> Result<()> {
                 .map_err(|_| invalid("inviter DID"))?;
         }
     }
+    if let Some(request)=&state.direct_request {
+        if state.conversation_kind.as_str()!="direct" || participants.len()!=2 || request.sender_did==request.recipient_did || !participants.contains(request.sender_did.as_str()) || !participants.contains(request.recipient_did.as_str()) {
+            return Err(invalid("request must bind exactly its sender and recipient"));
+        }
+        let sender=state.participants.iter().find(|p|p.user_did==request.sender_did).ok_or_else(||invalid("request sender"))?;
+        let recipient=state.participants.iter().find(|p|p.user_did==request.recipient_did).ok_or_else(||invalid("request recipient"))?;
+        if sender.status.as_str()!="active" || sender.role.as_str()!="admin" || recipient.role.as_str()!="admin" {return Err(invalid("request participant authority"));}
+        match request.consent.as_str() {
+            "incomingPending"|"outgoingPending"=>{
+                let provenance=recipient.invitation_provenance.as_ref().ok_or_else(||invalid("request invitation provenance"))?;
+                if recipient.status.as_str()!="pending" || provenance.invitation_transition_id!=request.request_id || provenance.invited_by_did!=request.sender_did {return Err(invalid("request pending consent provenance"));}
+            }
+            "accepted"=>{if recipient.status.as_str()!="active" || request.acceptance_proof.is_none() {return Err(invalid("request acceptance proof missing"));}}
+            "closed"=>{},
+            _=>return Err(invalid("request consent")),
+        }
+    }
     Ok(())
 }
 

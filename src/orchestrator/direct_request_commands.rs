@@ -159,6 +159,7 @@ where
             trusted_authority_document: document,
             preparation_response: None,
             cancel_wrapper: None,
+            publication_wrapper: None,
             terminal_response: None,
             publication_attempted: false,
             cancellation_requested: false,
@@ -307,6 +308,11 @@ where
                 .persist_direct_request_publish(&id, &exact)?;
             exact
         };
+        let exact_value: Value = serde_json::from_slice(&exact).map_err(|_| invalid())?;
+        intent.publication_wrapper = Some(
+            serde_json::to_vec(exact_value.get("signedRequest").unwrap_or(&exact_value))
+                .map_err(|_| invalid())?,
+        );
         intent.publication_attempted = true;
         self.save_direct_request_intent(&intent, &mut raw)?;
         let request = PreparedRequest {
@@ -664,6 +670,7 @@ where
                 crypto: RequestCrypto::Ready,
                 preview: Some(RequestPreview::Ready {
                     text: intent.input.text.clone(),
+                    invitation: intent.input.invitation.clone(),
                 }),
                 acceptance_proof: None,
                 recipient_public_key: None,
@@ -672,6 +679,21 @@ where
             let current = self
                 .mls_context()
                 .read_direct_request_projection(&adopted.conversation_id)?;
+            if let Some(raw) = &current {
+                let retained = DirectRequestProjection::decode(
+                    raw,
+                    &intent.actor_did,
+                    &intent.actor_device_id,
+                )?;
+                if retained.publication != candidate.publication
+                    || retained.publication_receipt != candidate.publication_receipt
+                    || retained.sender_public_key != candidate.sender_public_key
+                {
+                    return Err(OrchestratorError::Storage(
+                        "Conflicting request publication projection".into(),
+                    ));
+                }
+            }
             if current.is_none()
                 && !self
                     .mls_context()
@@ -709,11 +731,14 @@ where
         self.save_direct_request_intent(intent, raw)?;
         match kind {
             "blue.catbird.chat.defs#directRequestExistingDirectReceipt" => {
+                let winner = proof["conversationId"].as_str().ok_or_else(invalid)?;
+                let pending =
+                    Box::pin(self.adopt_request_winner(winner, &intent.input.recipient_did))
+                        .await?;
                 Ok(DirectRequestOutcome::ExistingDirect {
-                    conversation_id: proof["conversationId"].as_str().ok_or_else(invalid)?.into(),
-                    requires_acceptance: proof["requiresAcceptance"]
-                        .as_bool()
-                        .ok_or_else(invalid)?,
+                    conversation_id: winner.into(),
+                    requires_acceptance: pending
+                        || proof["requiresAcceptance"].as_bool().ok_or_else(invalid)?,
                 })
             }
             "blue.catbird.chat.defs#directRequestCancelledReceipt" => {
@@ -848,6 +873,21 @@ where
             raw = bytes;
         }
         let wrapper = projection.pending_acceptance.as_ref().ok_or_else(invalid)?;
+        let signer = self
+            .mls_context()
+            .identity_public_key(format!("{owner}#{device}").into_bytes())?;
+        let pending =
+            transcript::verify_signed_request(DirectRequestKind::Accept, wrapper, &signer)
+                .map_err(|_| invalid())?;
+        let publication: Value =
+            serde_json::from_slice(&projection.publication).map_err(|_| invalid())?;
+        if pending.actor_did() != Some(owner.as_str())
+            || pending.actor_device_id() != Some(device.as_str())
+            || pending.body()["prior"] != publication["body"]["next"]
+            || pending.body()["requestId"] != publication["body"]["requestId"]
+        {
+            return Err(invalid());
+        }
         let mut wire = b"{\"directRequest\":".to_vec();
         wire.extend(wrapper);
         wire.push(b'}');
@@ -872,12 +912,32 @@ where
         let public = self
             .mls_context()
             .identity_public_key(format!("{owner}#{device}").into_bytes())?;
+        let proof_value: Value = serde_json::from_slice(&proof).map_err(|_| invalid())?;
+        let method = proof_value["receipt"]["body"]["keyId"]
+            .as_str()
+            .ok_or_else(invalid)?;
+        if transcript::resolve_direct_request_receipt_key(
+            &projection.trusted_authority_document,
+            method,
+        )
+        .is_err()
+        {
+            let doc = self
+                .credentials()
+                .direct_request_receipt_authority_document()
+                .await?
+                .ok_or_else(invalid)?;
+            transcript::resolve_direct_request_receipt_key(&doc, method).map_err(|_| invalid())?;
+            projection.trusted_authority_document =
+                intent::merge_trusted_documents(&projection.trusted_authority_document, &doc)?;
+        }
         projection.acceptance_proof = Some(proof);
         projection.recipient_public_key = Some(public);
         let accepted = projection.view(&owner, &device)?;
         if accepted.consent != RequestConsent::Accepted {
             return Err(invalid());
         }
+        projection.pending_acceptance = None;
         let bytes = projection.encode()?;
         if !self
             .mls_context()

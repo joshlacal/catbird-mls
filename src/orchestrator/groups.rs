@@ -4093,7 +4093,10 @@ where
     /// creation transition ID and submits it to `blue.catbird.chat.acceptConversation`.
     pub async fn accept_conversation(&self, conversation_id: &str) -> Result<serde_json::Value> {
         self.check_shutdown().await?;
-        if let Some(result)=Box::pin(self.try_accept_direct_request(conversation_id)).await? {return Ok(result);}
+        if Box::pin(self.known_direct_request(conversation_id)).await? {
+            Box::pin(self.refresh_request_preview(conversation_id)).await?;
+            if let Some(result)=Box::pin(self.try_accept_direct_request(conversation_id)).await? {return Ok(result);}
+        }
         let user_did = self.require_user_did().await?;
         let actor_device_id = self.require_actor_device_id().await?;
 
@@ -4133,7 +4136,8 @@ where
             OrchestratorError::Api("getConversationState response missing state".into())
         })?;
         if state_obj.get("directRequest").is_some_and(|value| !value.is_null()) {
-            return Err(OrchestratorError::Mls(crate::MLSError::OperationNotSupported { reason: "Request publication proof must be imported before acceptance".into() }));
+            Box::pin(self.refresh_request_preview(&convo_uuid_str)).await?;
+            return Box::pin(self.try_accept_direct_request(&convo_uuid_str)).await?.ok_or_else(||OrchestratorError::InvalidInput("Request publication proof unavailable".into()));
         }
         let latest_coord = state_obj.get("coordinates").cloned().ok_or_else(|| {
             OrchestratorError::Api("conversation state missing coordinates".into())

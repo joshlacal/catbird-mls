@@ -27,6 +27,7 @@ fn pending_intro_decryption_never_authorizes_ordinary_effects_in_either_directio
         let view = reduce_request_preview(
             &pending(consent),
             RequestPreviewUpdate::Decrypted {
+                invitation: None,
                 text: "Hello".into(),
             },
         );
@@ -71,6 +72,7 @@ fn expired_delivery_cannot_erase_a_decrypted_preview() {
     let ready = reduce_request_preview(
         &pending(RequestConsent::IncomingPending),
         RequestPreviewUpdate::Decrypted {
+            invitation: None,
             text: "Retained".into(),
         },
     );

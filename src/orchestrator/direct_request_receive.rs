@@ -93,6 +93,51 @@ where
                 .is_some_and(|state| state.direct_request.is_some())
         }))
     }
+    /// Adopt the authoritative winner without accepting its invitation or
+    /// transferring the losing candidate's ciphertext or ratchet state.
+    pub(super) async fn adopt_request_winner(&self, cid: &str, peer: &str) -> Result<bool> {
+        crate::chat_v2::ids::CanonicalUuid::parse(cid).map_err(|_| invalid())?;
+        let owner = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let result = self
+            .request_query(
+                CanonicalOperation::GetConversationState,
+                format!("actorDeviceId={device}&conversationId={cid}"),
+            )
+            .await?;
+        let state = &result["state"];
+        let participants = state["participants"].as_array().ok_or_else(invalid)?;
+        if state["conversationKind"] != "direct"
+            || state["coordinates"]["conversationId"] != cid
+            || state["coordinates"]["lifecycle"] != "active"
+            || participants.len() != 2
+            || !participants.iter().any(|p| p["userDid"] == owner)
+            || !participants.iter().any(|p| p["userDid"] == peer)
+        {
+            return Err(invalid());
+        }
+        if state
+            .get("directRequest")
+            .is_some_and(|value| !value.is_null())
+        {
+            let request = Box::pin(self.refresh_direct_request(cid)).await?;
+            return Ok(request.consent != RequestConsent::Accepted);
+        }
+        let view = super::super::admission::conversation_view_from_state_json(state)
+            .ok_or_else(invalid)?;
+        if view.canonical_state.is_none() {
+            return Err(invalid());
+        }
+        super::super::admission::validate_conversation_view(&view)?;
+        self.retain_conversation_policy_json(cid, state).await?;
+        self.storage()
+            .ensure_conversation_exists(&owner, cid, &view.group_id)
+            .await?;
+        self.conversations().lock().await.insert(cid.into(), view);
+        Ok(participants
+            .iter()
+            .any(|p| p["userDid"] == owner && p["status"] != "active"))
+    }
     async fn request_query(&self, operation: CanonicalOperation, query: String) -> Result<Value> {
         let response = self
             .api_client()
@@ -251,7 +296,14 @@ where
                                 {
                                     return Err(invalid());
                                 }
+                                let invitation = intro
+                                    .get("invitation")
+                                    .map(|value| {
+                                        serde_json::from_value(value.clone()).map_err(|_| invalid())
+                                    })
+                                    .transpose()?;
                                 projection.preview = Some(RequestPreview::Ready {
+                                    invitation,
                                     text: intro["text"].as_str().ok_or_else(invalid)?.into(),
                                 });
                             }
@@ -264,6 +316,16 @@ where
                         projection.crypto = RequestCrypto::Unavailable;
                         projection.preview = Some(RequestPreview::Unavailable {
                             code: "ImportExpired".into(),
+                        });
+                    }
+                    Err(
+                        crate::MLSError::InvalidInput { .. }
+                        | crate::MLSError::InvalidKeyPackage
+                        | crate::MLSError::NoMatchingKeyPackage { .. },
+                    ) => {
+                        projection.crypto = RequestCrypto::Unavailable;
+                        projection.preview = Some(RequestPreview::Unavailable {
+                            code: "InvalidBootstrap".into(),
                         });
                     }
                     Err(error) => return Err(error.into()),
@@ -322,12 +384,61 @@ where
                     .filter(|key| canonical_transport::derive_key_id(key) == key_id)
                     .collect::<Vec<_>>();
                 if keys.len() == 1 {
+                    let method = proof["receipt"]["body"]["keyId"]
+                        .as_str()
+                        .ok_or_else(invalid)?;
+                    if transcript::resolve_direct_request_receipt_key(
+                        &candidate.trusted_authority_document,
+                        method,
+                    )
+                    .is_err()
+                    {
+                        let doc = self
+                            .credentials()
+                            .direct_request_receipt_authority_document()
+                            .await?
+                            .ok_or_else(invalid)?;
+                        transcript::resolve_direct_request_receipt_key(&doc, method)
+                            .map_err(|_| invalid())?;
+                        candidate.trusted_authority_document =
+                            super::intent::merge_trusted_documents(
+                                &candidate.trusted_authority_document,
+                                &doc,
+                            )?;
+                    }
                     candidate.acceptance_proof =
                         Some(serde_json::to_vec(proof).map_err(|_| invalid())?);
                     candidate.recipient_public_key = Some(keys[0].clone());
                     candidate.view(&owner, &device)?;
+                    candidate.pending_acceptance = None;
                     self.save_received_request(cid, &candidate, raw)?;
                     *projection = candidate;
+                }
+            }
+        }
+        let expected = if let Some(accepted) = &projection.acceptance_proof {
+            let value: Value = serde_json::from_slice(accepted).map_err(|_| invalid())?;
+            value["receipt"]["body"]["next"].clone()
+        } else {
+            let value: Value =
+                serde_json::from_slice(&projection.publication).map_err(|_| invalid())?;
+            value["body"]["next"].clone()
+        };
+        // Point-read metadata cannot establish acceptance. After the independent
+        // proof reducer succeeds, retain only its exact current coordinate so
+        // normal sends use the accepted policy version at the same MLS epoch.
+        if state["state"]["coordinates"] == expected {
+            if let Some(view) =
+                super::super::admission::conversation_view_from_state_json(&state["state"])
+            {
+                if view.canonical_state.is_some() {
+                    super::super::admission::validate_conversation_view(&view)?;
+                    self.storage()
+                        .ensure_conversation_exists(owner, cid, &view.group_id)
+                        .await?;
+                    self.conversations().lock().await.insert(cid.into(), view);
+                    self.retain_conversation_policy_json(cid, &state["state"])
+                        .await?;
                 }
             }
         }

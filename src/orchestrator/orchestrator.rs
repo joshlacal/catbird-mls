@@ -138,6 +138,8 @@ where
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
     direct_request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) direct_request_reconcile_backoff: Mutex<HashMap<String,(u32,web_time::Instant)>>,
     /// Per-stable-conversation inbound locks. These serialize duplicate HTTP,
     /// push, and catch-up deliveries through their final crypto/application
     /// durability barrier without reusing the rejoin transition lock.
@@ -312,6 +314,8 @@ where
             creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
             direct_request_locks: Mutex::new(HashMap::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            direct_request_reconcile_backoff: Mutex::new(HashMap::new()),
             inbound_processing_locks: Mutex::new(HashMap::new()),
             sync_in_progress: Mutex::new(false),
             consecutive_sync_failures: Mutex::new(0),
