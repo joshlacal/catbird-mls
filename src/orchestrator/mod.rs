@@ -10,6 +10,10 @@ pub mod credentials;
 pub mod crypto_provider;
 pub mod devices;
 mod direct_adoption;
+pub mod direct_request_types;
+pub mod direct_requests;
+pub mod direct_request_bootstrap;
+pub mod direct_request_journal;
 pub mod error;
 pub mod event_observer;
 pub mod groups;
@@ -22,6 +26,7 @@ pub mod messaging;
 pub mod mls_provider;
 pub mod orchestrator;
 pub mod ordering;
+pub mod projection_commit;
 pub(crate) mod pagination;
 pub mod recovery;
 pub mod reset_flow;
@@ -61,6 +66,7 @@ pub use canonical_transport::{
     CleanChatTransportFfiError,
 };
 pub use constants::*;
+pub use direct_request_types::*;
 pub use credential_binding::{
     extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,
 };

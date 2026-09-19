@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use super::event_observer::EngineEvent;
+pub use super::projection_commit::{
+    AliasRetirementAuthority, ConversationProjectionCommitMode,
+    ConversationProjectionCommitOutcome, ConversationProjectionCommitRequest,
+    ProjectionLifecycleFence,
+};
 
 mod base64_bytes {
     use base64::Engine as _;
