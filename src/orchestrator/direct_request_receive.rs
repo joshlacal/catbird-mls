@@ -24,6 +24,15 @@ fn decode(raw: &[u8]) -> Result<Value> {
     crate::chat_v2::transcript::decode_strict_json(raw).map_err(|_| invalid())?;
     serde_json::from_slice(raw).map_err(|_| invalid())
 }
+fn same_request_coordinates(left: &Value, right: &Value) -> Result<bool> {
+    let decode = |value: &Value| {
+        super::super::canonical_transport::decode_conversation_coordinates(
+            &serde_json::to_vec(value).map_err(|_| invalid())?,
+        )
+        .map_err(|_| invalid())
+    };
+    Ok(decode(left)? == decode(right)?)
+}
 fn bootstrap(publication: &Value) -> Result<DirectRequestBootstrap> {
     let p = &publication["body"];
     let context = json!({"protocolVersion":"2","requestId":p["requestId"],"firstMessageId":p["firstMessageId"],"conversationId":p["conversationId"],"origin":p["origin"],"actorDid":p["actorDid"],"actorDeviceId":p["actorDeviceId"],"actorKeyId":p["keyId"],"recipientDid":p["recipientDid"],"preparationDigest":p["preparationDigest"]});
@@ -463,7 +472,7 @@ where
         // Point-read metadata cannot establish acceptance. After the independent
         // proof reducer succeeds, retain only its exact current coordinate so
         // normal sends use the accepted policy version at the same MLS epoch.
-        if state["state"]["coordinates"] == expected {
+        if same_request_coordinates(&state["state"]["coordinates"], &expected)? {
             if let Some(view) =
                 super::super::admission::conversation_view_from_state_json(&state["state"])
             {
@@ -621,6 +630,22 @@ where
         if existing.crypto == RequestCrypto::Unavailable {
             let owner = self.require_user_did().await?;
             let device = self.require_actor_device_id().await?;
+            let lock = self.direct_request_operation_lock(cid).await;
+            let _guard = lock.lock().await;
+            let mut raw = self.mls_context().read_direct_request_projection(cid)?;
+            let mut projection = DirectRequestProjection::decode(
+                raw.as_deref().ok_or_else(invalid)?,
+                &owner,
+                &device,
+            )?;
+            let expected = if let Some(accepted) = &projection.acceptance_proof {
+                let proof: Value = serde_json::from_slice(accepted).map_err(|_| invalid())?;
+                proof["receipt"]["body"]["next"].clone()
+            } else {
+                let publication: Value =
+                    serde_json::from_slice(&projection.publication).map_err(|_| invalid())?;
+                publication["body"]["next"].clone()
+            };
             let accepted_exit = self
                 .mls_context()
                 .list_account_exits()?
@@ -632,20 +657,33 @@ where
                                 && identity.actor_did == owner
                                 && identity.actor_device_id == device
                         })
+                        && record.wrapper().is_ok_and(|wrapper| {
+                            wrapper["signedRequest"]["body"]["$type"]
+                                == "blue.catbird.chat.defs#conversationCloseBody"
+                                && same_request_coordinates(
+                                    &wrapper["signedRequest"]["body"]["prior"],
+                                    &expected,
+                                )
+                                .unwrap_or(false)
+                        })
                 });
-            if !accepted_exit {
+            let projected = self
+                .storage()
+                .get_conversation(&owner, cid)
+                .await?
+                .and_then(|view| view.canonical_state)
+                .is_some_and(|state| {
+                    serde_json::to_value(&state.coordinates)
+                        .ok()
+                        .is_some_and(|coordinate| {
+                            same_request_coordinates(&coordinate, &expected).unwrap_or(false)
+                        })
+                });
+            if !accepted_exit && !projected {
                 // A device omitted from bootstrap has no native epoch. Retain
                 // the independently verified request coordinate before an exit
                 // can be submitted, so terminal host projection has a fence.
-                // Already accepted exit proof remains sufficient for replay.
-                let lock = self.direct_request_operation_lock(cid).await;
-                let _guard = lock.lock().await;
-                let mut raw = self.mls_context().read_direct_request_projection(cid)?;
-                let mut projection = DirectRequestProjection::decode(
-                    raw.as_deref().ok_or_else(invalid)?,
-                    &owner,
-                    &device,
-                )?;
+                // Only this exact incarnation's accepted close bypasses reads.
                 if !self
                     .refresh_request_acceptance(cid, &owner, &device, &mut projection, &mut raw)
                     .await?
@@ -665,5 +703,26 @@ where
             return Err(invalid());
         }
         Ok(closed)
+    }
+}
+
+#[cfg(test)]
+mod coordinate_tests {
+    use super::*;
+    #[test]
+    fn coordinates_accept_exact_schema_byte_aliases_and_reject_different_incarnations() {
+        let coordinate = json!({"conversationId":"00000000-0000-4000-8000-000000000001","groupId":STANDARD.encode([1;32]),"generation":0,"epoch":1,"stateVersion":1,"confirmationTag":STANDARD.encode([2;32]),"groupContextHash":STANDARD.encode([3;32]),"lifecycle":"active"});
+        let mut read = coordinate.clone();
+        for field in ["groupId", "confirmationTag", "groupContextHash"] {
+            read[field] = json!({"$bytes":coordinate[field]});
+        }
+        assert!(same_request_coordinates(&coordinate, &read).unwrap());
+        read["epoch"] = json!(2);
+        assert!(!same_request_coordinates(&coordinate, &read).unwrap());
+        read["epoch"] = json!(1);
+        read["generation"] = json!(1);
+        assert!(!same_request_coordinates(&coordinate, &read).unwrap());
+        read["groupId"]["extra"] = json!(true);
+        assert!(same_request_coordinates(&coordinate, &read).is_err());
     }
 }
