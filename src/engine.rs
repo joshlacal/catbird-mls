@@ -230,6 +230,10 @@ where
         })
     }
 
+    pub fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>> {
+        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.list_direct_request_views())
+    }
     pub fn start_direct_request(&self, input: crate::DirectRequestInput) -> Result<crate::DirectRequestOutcome> {
         self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.start_direct_request(input))

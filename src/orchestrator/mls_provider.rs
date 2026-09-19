@@ -228,6 +228,16 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
 
+    fn read_direct_request_key_publication(&self, _device: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "durable request key publication unavailable".into() })
+    }
+    fn prepare_direct_request_key_publication(&self, _input: &super::direct_request_keys::DirectRequestKeyPublicationInput, _expected: Option<&[u8]>) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "atomic request key custody unavailable".into() })
+    }
+    fn acknowledge_direct_request_key_publication(&self, _device: &str, _expected: &[u8], _next: &[u8]) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported { reason: "durable request key publication unavailable".into() })
+    }
+
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError>;
 
     fn create_last_resort_key_package(

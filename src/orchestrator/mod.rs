@@ -14,6 +14,7 @@ pub mod direct_request_types;
 pub mod direct_requests;
 pub mod direct_request_bootstrap;
 pub mod direct_request_journal;
+pub mod direct_request_keys;
 pub mod error;
 pub mod event_observer;
 pub mod groups;

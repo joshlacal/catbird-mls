@@ -18,6 +18,9 @@ where
     /// Creates a key package locally via FFI, then uploads it.
     pub async fn publish_key_package(&self) -> Result<()> {
         self.check_shutdown().await?;
+        if let Err(error) = Box::pin(self.replenish_direct_request_keys_if_needed()).await {
+            tracing::warn!(%error, "Request key-pool maintenance deferred");
+        }
         let user_did = self.require_user_did().await?;
 
         tracing::debug!("Publishing key package");

@@ -10,6 +10,8 @@ pub enum DirectRequestJournalPhase {
     OutcomeUnknown,
     PublishedAwaitingProjection,
     RequestSent,
+    /// Published proof retained after authorized local group cleanup.
+    RetiredPublished,
     TerminalNotPublished,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,6 +96,7 @@ impl DirectRequestJournal {
             self.phase,
             DirectRequestJournalPhase::PublishedAwaitingProjection
                 | DirectRequestJournalPhase::RequestSent
+                | DirectRequestJournalPhase::RetiredPublished
                 | DirectRequestJournalPhase::TerminalNotPublished
         );
         if terminal != self.terminal_receipt.is_some()
@@ -103,6 +106,7 @@ impl DirectRequestJournal {
                 DirectRequestJournalPhase::OutcomeUnknown
                     | DirectRequestJournalPhase::PublishedAwaitingProjection
                     | DirectRequestJournalPhase::RequestSent
+                | DirectRequestJournalPhase::RetiredPublished
             ) && self.publish_request.is_none())
         {
             return Err(MLSError::StorageFailed);
@@ -119,6 +123,7 @@ impl DirectRequestJournal {
                 self.phase,
                 DirectRequestJournalPhase::PublishedAwaitingProjection
                     | DirectRequestJournalPhase::RequestSent
+                | DirectRequestJournalPhase::RetiredPublished
             );
             if proof["requestId"] != self.request_id
                 || proof["preparationRequestDigest"].as_str()
@@ -220,6 +225,57 @@ pub(crate) mod native {
             self.crypto
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn retire_published_group(
+    inner: &mut crate::mls_context::MLSContext,
+    group_id: &[u8],
+) -> Result<Option<bool>, MLSError> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use native::*;
+    use openmls::prelude::*;
+    use openmls_traits::OpenMlsProvider;
+    use rusqlite::OptionalExtension;
+    let mut owned = None;
+    for record in list(&inner.manifest_storage)? {
+        let id = STANDARD.decode(record.bootstrap.coordinates["groupId"].as_str().ok_or(MLSError::StorageFailed)?).map_err(error)?;
+        if id == group_id {
+            if owned.is_some() { return Err(MLSError::StorageFailed); }
+            owned = Some(record);
+        }
+    }
+    let Some(mut record) = owned else { return Ok(None); };
+    if record.phase == DirectRequestJournalPhase::RetiredPublished {
+        // A durability barrier can fail after commit; repeat it before the
+        // caller releases any remaining in-memory copy.
+        inner.manifest_storage.flush_database()?;
+        return Ok(Some(false));
+    }
+    if !matches!(record.phase, DirectRequestJournalPhase::PublishedAwaitingProjection | DirectRequestJournalPhase::RequestSent) {
+        return Err(MLSError::InvalidState("Cannot delete an unpublished request-owned group".into()));
+    }
+    let tx = inner.manifest_storage.welcome_ack_connection().unchecked_transaction().map_err(error)?;
+    let provider = Provider { storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx), crypto: inner.provider.crypto() };
+    let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(group_id)).map_err(error)?.ok_or(MLSError::StorageFailed)?;
+    group.delete(provider.storage()).map_err(error)?;
+    let encoded = hex::encode(group_id);
+    let raw: String = tx.query_row("SELECT value FROM mls_manifests WHERE key='group_ids'", [], |row| row.get(0)).map_err(error)?;
+    let mut ids: Vec<String> = serde_json::from_str(&raw).map_err(error)?;
+    if !ids.contains(&encoded) { return Err(MLSError::StorageFailed); }
+    ids.retain(|id| id != &encoded);
+    tx.execute("UPDATE mls_manifests SET value=?1 WHERE key='group_ids'", [serde_json::to_string(&ids).map_err(error)?]).map_err(error)?;
+    let pending: Option<String> = tx.query_row("SELECT value FROM mls_manifests WHERE key='pending_external_joins'", [], |row| row.get(0)).optional().map_err(error)?;
+    if let Some(raw) = pending {
+        let mut pending: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw).map_err(error)?;
+        pending.remove(&encoded);
+        tx.execute("UPDATE mls_manifests SET value=?1 WHERE key='pending_external_joins'", [serde_json::to_string(&pending).map_err(error)?]).map_err(error)?;
+    }
+    record.phase = DirectRequestJournalPhase::RetiredPublished;
+    write(&tx, &record)?;
+    tx.commit().map_err(error)?;
+    inner.manifest_storage.flush_database()?;
+    Ok(Some(true))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

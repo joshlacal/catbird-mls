@@ -988,7 +988,8 @@ where
             Err(error) => return Err(error),
         };
 
-        if self.pending_conversation_admission(&resolved.conversation_id).await? {
+        if self.known_direct_request(&resolved.conversation_id).await?
+            && self.pending_conversation_admission(&resolved.conversation_id).await? {
             return Err(OrchestratorError::InvalidInput("RequestNotAccepted".into()));
         }
 
@@ -1922,7 +1923,8 @@ where
         envelope: &IncomingEnvelope,
     ) -> Result<MessageProcessingResult> {
         envelope.validate_server_metadata()?;
-        if self.pending_conversation_admission(&envelope.conversation_id).await? {
+        if self.known_direct_request(&envelope.conversation_id).await?
+            && self.pending_conversation_admission(&envelope.conversation_id).await? {
             return Err(OrchestratorError::InvalidInput("RequestNotAccepted".into()));
         }
         if let Some(server_epoch) = envelope.server_epoch {

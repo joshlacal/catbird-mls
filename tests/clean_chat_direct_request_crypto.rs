@@ -510,6 +510,44 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
     assert!(alice.list_direct_request_journal().unwrap().is_empty());
     let journal = alice.prepare_direct_request_bootstrap(&input).unwrap();
     assert!(alice.get_epoch(input.group_id.clone()).is_err());
+    // Read every logical row, including OpenMLS private material, through a
+    // separate SQLCipher connection. Rejection must precede ALL mutations.
+    let snapshot = || {
+        let connection = Connection::open(&alice_path).unwrap();
+        for (name, value) in [
+            ("cipher_memory_security", "OFF".to_string()),
+            ("key", "request-native-test-key".to_string()),
+            ("cipher_plaintext_header_size", "32".to_string()),
+            ("cipher_salt", format!("x'{}'", hex::encode(&Sha256::digest(b"request-native-test-key")[..16]))),
+            ("cipher_page_size", "4096".to_string()),
+            ("kdf_iter", "256000".to_string()),
+            ("cipher_hmac_algorithm", "HMAC_SHA512".to_string()),
+            ("cipher_kdf_algorithm", "PBKDF2_HMAC_SHA512".to_string()),
+        ] {
+            connection.pragma_update(None, name, value).unwrap();
+        }
+        let tables: Vec<String> = connection.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+        tables.into_iter().map(|table| {
+            let mut query = connection.prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""))).unwrap();
+            let count = query.column_count();
+            let mut rows: Vec<String> = query.query_map([], |row| {
+                (0..count).map(|i| row.get::<_, rusqlite::types::Value>(i)).collect::<std::result::Result<Vec<_>,_>>().map(|v| format!("{v:?}"))
+            }).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+            rows.sort();
+            (table, rows)
+        }).collect::<Vec<_>>()
+    };
+    let before_external_join = snapshot();
+    let attempted_join = alice.create_external_commit(
+        journal.bootstrap.final_group_info.clone(),
+        b"did:plc:cccccccccccccccccccccccc#00000000-0000-4000-8000-000000000003".to_vec(),
+    );
+    assert!(matches!(attempted_join, Err(catbird_mls::MLSError::InvalidState(_))));
+    assert_eq!(snapshot(), before_external_join);
+    assert_eq!(alice.list_direct_request_journal().unwrap(), vec![journal.clone()]);
+    assert!(alice.delete_group(input.group_id.clone()).is_err());
+    assert_eq!(snapshot(), before_external_join);
     drop(alice);
     let alice = open(&alice_path, &alice_keys);
     assert_eq!(
@@ -630,6 +668,14 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
     alice
         .mark_direct_request_projected(&journal.request_id)
         .unwrap();
+    alice.delete_group(input.group_id.clone()).unwrap();
+    assert_eq!(alice.list_direct_request_journal().unwrap()[0].phase, catbird_mls::orchestrator::direct_request_journal::DirectRequestJournalPhase::RetiredPublished);
+    drop(alice);
+    let alice = open(&alice_path, &alice_keys);
+    assert!(alice.get_epoch(input.group_id.clone()).is_err());
+    let retired = alice.confirm_published_bootstrap(&journal.request_id, &receipt, &authority_key).unwrap();
+    assert_eq!(retired.phase, catbird_mls::orchestrator::direct_request_journal::DirectRequestJournalPhase::RetiredPublished);
+    assert!(alice.get_epoch(input.group_id.clone()).is_err());
     let welcome_input = DirectRequestWelcomeInput {
         bootstrap: b.clone(),
         local_identity: recipient.as_bytes().to_vec(),

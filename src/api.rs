@@ -8031,6 +8031,28 @@ impl MlsCryptoContext for MLSContext {
         crate::orchestrator::direct_request_journal::projection_list(&inner.manifest_storage)
     }
 
+    fn read_direct_request_key_publication(&self, device: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("read_direct_request_key_publication");
+        let mut guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_keys::native::read(&inner.manifest_storage, device)
+    }
+    fn prepare_direct_request_key_publication(&self, input: &crate::orchestrator::direct_request_keys::DirectRequestKeyPublicationInput, expected: Option<&[u8]>) -> Result<Option<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("prepare_direct_request_key_publication");
+        let mut guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_keys::native::prepare(inner, input, expected)
+    }
+    fn acknowledge_direct_request_key_publication(&self, device: &str, expected: &[u8], next: &[u8]) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("acknowledge_direct_request_key_publication");
+        let mut guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_keys::native::cas(&inner.manifest_storage, device, expected, next)
+    }
+
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
         self.create_key_package(identity)
     }

@@ -138,7 +138,7 @@ where
             .iter()
             .any(|p| p["userDid"] == owner && p["status"] != "active"))
     }
-    async fn request_query(&self, operation: CanonicalOperation, query: String) -> Result<Value> {
+    pub(crate) async fn request_query(&self, operation: CanonicalOperation, query: String) -> Result<Value> {
         let response = self
             .api_client()
             .submit_prepared_request(PreparedRequest {

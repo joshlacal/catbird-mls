@@ -229,6 +229,29 @@ where
     C: CredentialStore + 'static,
     M: MlsCryptoContext + 'static,
 {
+    /// List only account/device-bound protected projections, validating every
+    /// signature and acceptance proof before exposing decrypted previews.
+    pub async fn list_direct_request_views(&self) -> Result<Vec<DirectRequestView>> {
+        self.require_direct_request_support()?;
+        let owner = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let mut views = Vec::new();
+        let mut ids = std::collections::HashSet::new();
+        let retired: std::collections::HashSet<String> = self.mls_context().list_direct_request_journal()?.into_iter()
+            .filter(|j| j.phase == super::direct_request_journal::DirectRequestJournalPhase::RetiredPublished)
+            .map(|j| j.conversation_id).collect();
+        for raw in self.mls_context().list_direct_request_projections()? {
+            let projection = projection::DirectRequestProjection::decode(&raw, &owner, &device)?;
+            let view = projection.view(&owner, &device)?;
+            if !ids.insert(view.conversation_id.clone()) {
+                return Err(OrchestratorError::Storage("Duplicate protected request projection".into()));
+            }
+            if !retired.contains(&view.conversation_id) { views.push(view); }
+        }
+        views.sort_by(|a,b| a.conversation_id.cmp(&b.conversation_id));
+        Ok(views)
+    }
+
     pub(crate) async fn retained_direct_request_view(
         &self,
         conversation_id: &str,

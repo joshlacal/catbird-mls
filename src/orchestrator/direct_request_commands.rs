@@ -396,7 +396,8 @@ where
             .ok_or_else(invalid)?;
         let mut packages = Vec::new();
         let mut refs = Vec::new();
-        let mut deadline = timestamp(&preparation["minimumImportUntil"])?;
+        let minimum_import_until = timestamp(&preparation["minimumImportUntil"])?;
+        let mut deadline = u64::MAX;
         let mut recipient_count = 0;
         let mut devices = std::collections::HashSet::new();
         for device in selected {
@@ -439,7 +440,7 @@ where
             refs.push(bytes(&device["keyPackage"]["keyPackageRef"])?);
             packages.push(package);
         }
-        if recipient_count == 0 {
+        if recipient_count == 0 || deadline < minimum_import_until {
             return Err(invalid());
         }
         let context = json!({"protocolVersion":"2","requestId":body["requestId"],"firstMessageId":body["firstMessageId"],"conversationId":body["conversationId"],"origin":body["origin"],"actorDid":body["actorDid"],"actorDeviceId":body["actorDeviceId"],"actorKeyId":body["keyId"],"recipientDid":body["recipientDid"],"preparationDigest":preparation["preparationDigest"]});
@@ -650,6 +651,9 @@ where
         let kind = proof["$type"].as_str().ok_or_else(invalid)?;
         if kind == "blue.catbird.chat.defs#directRequestPublishedReceipt" {
             let journal = journal.ok_or_else(invalid)?;
+            if journal.phase == direct_request_journal::DirectRequestJournalPhase::RetiredPublished {
+                return Err(OrchestratorError::InvalidInput("RequestRetired".into()));
+            }
             let adopted = self
                 .mls_context()
                 .confirm_published_bootstrap(&id, receipt, &key)?;

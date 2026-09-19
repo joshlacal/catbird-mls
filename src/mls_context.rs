@@ -2136,7 +2136,9 @@ fn validate_existing_sqlite_storage(
         if !request_group_ids.insert(hex_id.clone()) {return Err(MLSError::StorageFailed);}
         let published=matches!(record.phase,DirectRequestJournalPhase::PublishedAwaitingProjection|DirectRequestJournalPhase::RequestSent);
         if published != manifested_group_ids.contains(&hex_id) {return Err(MLSError::StorageFailed);}
-        expected_group_ids.insert(hex_id);
+        if record.phase != DirectRequestJournalPhase::RetiredPublished {
+            expected_group_ids.insert(hex_id);
+        }
     }
     drop(request_query);
     if expected_group_ids != db_group_ids {
@@ -3060,6 +3062,26 @@ impl MLSContext {
         };
 
         let advertised_group_id = verifiable_group_info.group_id().as_slice().to_vec();
+        // An unpublished request deliberately has no live-map entry. Its
+        // durable journal still owns the OpenMLS rows, including after a
+        // terminal outcome; an external join must never overwrite them.
+        for request in crate::orchestrator::direct_request_journal::native::list(
+            &self.manifest_storage,
+        )? {
+            let encoded = request.bootstrap.coordinates["groupId"]
+                .as_str()
+                .ok_or(MLSError::StorageFailed)?;
+            let owned = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                encoded,
+            )
+            .map_err(|_| MLSError::StorageFailed)?;
+            if owned == advertised_group_id {
+                return Err(MLSError::InvalidState(
+                    "Cannot stage an external join over request-owned group".into(),
+                ));
+            }
+        }
         if self.groups.contains_key(&advertised_group_id) {
             return Err(MLSError::InvalidState(format!(
                 "Cannot stage an external join over live group {}",
@@ -4041,6 +4063,10 @@ impl MLSContext {
     /// the live in-memory group is removed so callers can retain a retryable
     /// pending-delete intent.
     pub fn delete_group(&mut self, group_id: &[u8]) -> Result<bool, MLSError> {
+        if let Some(deleted) = crate::orchestrator::direct_request_journal::retire_published_group(self, group_id)? {
+            self.groups.remove(group_id);
+            return Ok(deleted);
+        }
         if !self.groups.contains_key(group_id) {
             return Ok(false);
         }

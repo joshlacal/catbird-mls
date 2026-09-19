@@ -3055,6 +3055,9 @@ impl OrchestratorBridge {
         Ok(conversations.iter().map(convo_view_to_ffi).collect::<crate::orchestrator::Result<Vec<_>>>()?)
     }
 
+    pub fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>, OrchestratorBridgeError> {
+        Ok(self.engine.list_direct_request_views()?)
+    }
     pub fn start_direct_request(&self, input: crate::DirectRequestInput) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
         Ok(self.engine.start_direct_request(input)?)
     }

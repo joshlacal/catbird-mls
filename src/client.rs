@@ -221,6 +221,9 @@ where
         Ok(convos.iter().map(convo_view_to_conversation).collect())
     }
 
+    pub async fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>, OrchestratorError> {
+        self.orchestrator.list_direct_request_views().await
+    }
     pub async fn start_direct_request(&self, input: crate::DirectRequestInput) -> Result<crate::DirectRequestOutcome, OrchestratorError> {
         self.orchestrator.start_direct_request(input).await
     }

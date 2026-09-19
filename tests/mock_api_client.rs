@@ -3733,7 +3733,15 @@ impl MLSAPIClient for MockDeliveryService {
                             catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
                                 &serde_json::to_vec(&state).unwrap(),
                             )
-                            .ok();
+                            .ok()
+                            .filter(|snapshot| {
+                                // A test may deliberately replace only the
+                                // unverified host group mapping. Do not graft
+                                // a different generation's policy onto it.
+                                snapshot.coordinates.conversation_id.as_str() == view.conversation_id
+                                    && hex::encode(&snapshot.coordinates.group_id) == view.group_id
+                                    && snapshot.coordinates.epoch as u64 <= view.epoch
+                            });
                     }
                     view
                 })

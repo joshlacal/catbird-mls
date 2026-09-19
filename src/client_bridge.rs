@@ -1042,6 +1042,9 @@ impl CatbirdClientBridge {
             .map_err(OrchestratorBridgeError::from)
     }
 
+    pub fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.list_direct_request_views()).map_err(OrchestratorBridgeError::from)
+    }
     pub fn start_direct_request(&self, input: crate::DirectRequestInput) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.start_direct_request(input)).map_err(OrchestratorBridgeError::from)
     }
