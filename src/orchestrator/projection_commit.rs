@@ -5,11 +5,14 @@
 //! identity, incarnation and lifecycle fence in the same transaction as its
 //! writes, preserve message history, and reject unsupported fence dimensions.
 
+use serde::{Deserialize, Serialize};
+
 use super::error::{OrchestratorError, Result};
 use super::types::ConversationView;
 use crate::chat_v2::ids::uuid::CanonicalUuid;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProjectionLifecycleFence {
     /// Canonical protocol generation, never MLS epoch or a reset counter.
     pub generation: Option<i64>,
@@ -40,7 +43,8 @@ impl ProjectionLifecycleFence {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ConversationProjectionCommitMode {
     Live,
     Replay,
@@ -48,15 +52,19 @@ pub enum ConversationProjectionCommitMode {
 
 /// Exact alias-retirement claim. Storage must validate it against durable rows;
 /// constructing this value alone cannot authorize retiring an alias.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AliasRetirementAuthority {
     pub owner_user_did: String,
     pub canonical_conversation_id: String,
     pub canonical_group_id: String,
     pub alias_conversation_id: String,
     pub alias_group_id: String,
-    /// Observed native group incarnation used by the existing browser adapter.
+    /// Verified current native MLS epoch overlay. This is not a cryptographic
+    /// incarnation: group identity plus generation/reset fences prevent retargeting.
     pub canonical_incarnation: u64,
+    /// Exact observed durable alias-row MLS epoch for compare-and-swap. It may
+    /// precede the current native epoch after catch-up, but cannot exceed it.
     pub alias_incarnation: u64,
     pub canonical_lifecycle: ProjectionLifecycleFence,
     pub alias_lifecycle: ProjectionLifecycleFence,
@@ -74,6 +82,7 @@ impl AliasRetirementAuthority {
             || canonical.group_id != alias.group_id
             || alias.conversation_id != alias.group_id
             || canonical.conversation_id == alias.conversation_id
+            || alias.epoch > canonical.epoch
             || CanonicalUuid::parse(&alias.conversation_id).is_ok()
         {
             return Err(OrchestratorError::InvalidInput(
@@ -95,7 +104,8 @@ impl AliasRetirementAuthority {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConversationProjectionCommitRequest {
     pub owner_user_did: String,
     pub mode: ConversationProjectionCommitMode,
@@ -130,7 +140,13 @@ impl ConversationProjectionCommitRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ConversationProjectionCommitOutcome {
     Retired {
         affected_rows: u32,
@@ -163,6 +179,32 @@ mod tests {
             sequencer_did: None,
             canonical_state: None,
         }
+    }
+
+    #[test]
+    fn mobile_projection_json_contract_has_closed_tagged_outcomes() {
+        let request = ConversationProjectionCommitRequest::live("did:plc:owner", view(), vec![]);
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["mode"], "live");
+        assert_eq!(json["ownerUserDid"], "did:plc:owner");
+        let decoded: ConversationProjectionCommitRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            decoded.canonical.unwrap().conversation_id,
+            view().conversation_id
+        );
+        assert_eq!(
+            serde_json::to_value(ConversationProjectionCommitOutcome::FenceMismatch {
+                affected_rows: 0
+            })
+            .unwrap(),
+            serde_json::json!({"type":"fenceMismatch","affectedRows":0})
+        );
+        assert!(
+            serde_json::from_value::<ConversationProjectionCommitOutcome>(
+                serde_json::json!({"type":"alreadyAbsent","affectedRows":1,"consentAccepted":true})
+            )
+            .is_err()
+        );
     }
 
     #[test]

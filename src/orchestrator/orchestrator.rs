@@ -415,14 +415,11 @@ where
         let mut is_first_page = true;
 
         loop {
-            let mut path = format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
-                super::canonical_transport::encode_query(&device)
+            let path = authorized_inventory_query(
+                &device,
+                page_cursor.as_deref(),
+                self.mls_context().supports_direct_request_bootstrap(),
             );
-            if let Some(cursor) = &page_cursor {
-                path.push_str("&pageCursor=");
-                path.push_str(&super::canonical_transport::encode_query(cursor));
-            }
             let response = self
                 .api_client()
                 .submit_prepared_request(super::canonical_transport::PreparedRequest {
@@ -1475,6 +1472,41 @@ where
             cutoff_epoch,
             current_epoch,
         );
+    }
+}
+
+fn authorized_inventory_query(
+    device: &str,
+    cursor: Option<&str>,
+    requests_supported: bool,
+) -> String {
+    let mut path = format!(
+        "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100&supportedProtocolVersions=1",
+        super::canonical_transport::encode_query(device)
+    );
+    if requests_supported {
+        path.push_str("&supportedProtocolVersions=2");
+    }
+    if let Some(cursor) = cursor {
+        path.push_str("&pageCursor=");
+        path.push_str(&super::canonical_transport::encode_query(cursor));
+    }
+    path
+}
+
+#[cfg(test)]
+mod authorized_inventory_query_tests {
+    use super::authorized_inventory_query;
+
+    #[test]
+    fn request_capability_selects_inventory_scope_on_every_page() {
+        let legacy = authorized_inventory_query("device", None, false);
+        assert!(legacy.ends_with("&supportedProtocolVersions=1"));
+        assert!(!legacy.contains("supportedProtocolVersions=2"));
+        let first = authorized_inventory_query("device", None, true);
+        assert!(first.ends_with("&supportedProtocolVersions=1&supportedProtocolVersions=2"));
+        let next = authorized_inventory_query("device", Some("cursor+/="), true);
+        assert_eq!(next, format!("{first}&pageCursor=cursor%2B%2F%3D"));
     }
 }
 

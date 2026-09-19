@@ -555,6 +555,21 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         plaintext: Vec<u8>,
     ) -> Result<EncryptResult, MLSError>;
 
+    /// Encrypt a canonical application artifact with its already-bound metadata.
+    /// Check the expected epoch under the same crypto mutation lock; return raw
+    /// MLS TLS framing, never the legacy length-prefixed padding envelope.
+    fn encrypt_message_with_aad(
+        &self,
+        _group_id: Vec<u8>,
+        _plaintext: Vec<u8>,
+        _aad: Vec<u8>,
+        _expected_epoch: u64,
+    ) -> Result<EncryptResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "canonical application encryption is unavailable".into(),
+        })
+    }
+
     fn decrypt_message(
         &self,
         group_id: Vec<u8>,

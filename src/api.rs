@@ -6440,6 +6440,54 @@ impl MLSContext {
         result
     }
 
+    /// Canonical application encryption used by every shipping orchestrator.
+    /// This Rust provider method is deliberately outside the UniFFI export.
+    pub fn encrypt_message_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+        expected_epoch: u64,
+    ) -> Result<EncryptResult, MLSError> {
+        self.check_suspended()?;
+        if aad.is_empty() || aad.len() > 16 * 1024 {
+            return Err(MLSError::invalid_input(
+                "Invalid canonical application AAD length",
+            ));
+        }
+        let _operation = self.begin_storage_operation("encrypt_message_with_aad");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        let ciphertext = inner.with_group(&gid, |group, provider, signer| {
+            if group.epoch().as_u64() != expected_epoch {
+                return Err(MLSError::invalid_input(
+                    "Canonical application epoch changed before encryption",
+                ));
+            }
+            group.set_aad(aad);
+            let result = group
+                .create_message(provider, signer, &plaintext)
+                .map_err(|_| MLSError::EncryptionFailed)
+                .and_then(|message| {
+                    message
+                        .tls_serialize_detached()
+                        .map_err(|_| MLSError::SerializationError)
+                });
+            group.set_aad(Vec::new());
+            result
+        })?;
+        let padded_size =
+            u32::try_from(ciphertext.len()).map_err(|_| MLSError::SerializationError)?;
+        Ok(EncryptResult {
+            ciphertext,
+            padded_size,
+        })
+    }
+
     #[cfg(any(feature = "test-utils", feature = "e2e-aad"))]
     pub fn encrypt_message_with_aad_for_test(
         &self,
@@ -8407,6 +8455,16 @@ impl MlsCryptoContext for MLSContext {
         plaintext: Vec<u8>,
     ) -> Result<EncryptResult, MLSError> {
         self.encrypt_message(group_id, plaintext)
+    }
+
+    fn encrypt_message_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+        expected_epoch: u64,
+    ) -> Result<EncryptResult, MLSError> {
+        self.encrypt_message_with_aad(group_id, plaintext, aad, expected_epoch)
     }
 
     fn decrypt_message(

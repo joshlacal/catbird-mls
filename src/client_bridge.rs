@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::api::MLSContext;
 use crate::client::{CatbirdClient, ChatMessage, Conversation};
-use crate::orchestrator::OrchestratorConfig;
+use crate::orchestrator::{OrchestratorConfig, OrchestratorError};
 use crate::orchestrator_bridge::{
     FFIOrchestratorConfig, OrchestratorAPICallback, OrchestratorBridgeError,
     OrchestratorCredentialCallback, OrchestratorStorageCallback,
@@ -183,6 +183,26 @@ fn join_method_to_string(jm: JoinMethod) -> String {
 
 #[async_trait::async_trait]
 impl MLSStorageBackend for ClientStorageAdapter {
+    async fn commit_conversation_projection(
+        &self,
+        request: &crate::orchestrator::ConversationProjectionCommitRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::ConversationProjectionCommitOutcome> {
+        let json = serde_json::to_string(request)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        let response = self
+            .0
+            .commit_conversation_projection_json(json)
+            .map_err(bridge_err)?;
+        if response.len() > 65536 {
+            return Err(OrchestratorError::Storage(
+                "Projection callback response exceeds limit".into(),
+            ));
+        }
+        serde_json::from_str(&response).map_err(|e| {
+            OrchestratorError::Storage(format!("Invalid projection callback result: {e}"))
+        })
+    }
+
     async fn ensure_conversation_exists(
         &self,
         user_did: &str,

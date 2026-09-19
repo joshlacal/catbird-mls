@@ -717,56 +717,14 @@ where
         let transition_guard = transition_lock.lock().await;
         self.reject_send_if_reset_pending(conversation_id).await?;
 
-        // Encrypt via MLS.
-        //
-        // Task #43: `send` no longer self-heals via `join_or_rejoin` when the group
-        // is missing locally. Auto-External-Commits on send were a major source of
-        // production epoch inflation (hot path, runs on every send failure). Instead
-        // we surface `NotJoined` to the caller; the platform decides whether to
-        // trigger recovery (Welcome replay, S1 reset request, UI prompt, etc.).
-        let encrypt_result = match self
-            .mls_context()
-            .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())
-        {
-            Ok(r) => r,
-            Err(crate::MLSError::GroupNotFound { .. }) => {
-                tracing::warn!(
-                    conversation_id,
-                    "send_payload_message: group not found locally; NOT auto-rejoining (task #43). Caller must handle."
-                );
-                return Err(OrchestratorError::NotJoined {
-                    convo_id: conversation_id.to_string(),
-                });
-            }
-            Err(e) => return Err(OrchestratorError::from(e)),
-        };
-
-        // Get current epoch from MLS FFI (authoritative source).
-        // The in-memory group_states cache can be stale or missing after
-        // session restore, so always query the FFI layer.
-        let epoch = match self.mls_context().get_epoch(group_id_bytes.clone()) {
-            Ok(e) => {
-                tracing::info!(conversation_id, epoch = e, "FFI epoch for send_message");
-                e
-            }
-            Err(err) => {
-                tracing::warn!(conversation_id, error = %err, "FFI get_epoch failed, using cached group state");
-                let states = self.group_states().lock().await;
-                resolved
-                    .group_state(&states)
-                    .map(|state| state.epoch)
-                    .unwrap_or(0)
-            }
-        };
-
-        // Generate the client message ID before send so local storage and server ACK state
-        // refer to the same identifier.
+        // Bind metadata and message identity before encryption. The provider
+        // checks this epoch under its mutation lock and emits raw MLS framing.
+        let epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
         let message_id = uuid::Uuid::new_v4().to_string();
-
         let send_result = self
-            .send_message_prepared(
+            .encrypt_and_send_message_prepared(
                 &resolved.conversation_id,
-                &encrypt_result.ciphertext,
+                &payload_bytes,
                 epoch,
                 &message_id,
             )
@@ -845,27 +803,10 @@ where
                 let retry_transition_guard = retry_transition_lock.lock().await;
                 self.reject_send_if_reset_pending(conversation_id).await?;
 
-                let retry_encrypt = match self
-                    .mls_context()
-                    .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        drop(retry_transition_guard);
-                        tracing::error!(
-                            conversation_id,
-                            error = %e,
-                            "409 recovery: re-encryption failed — flagging NEEDS_REJOIN"
-                        );
-                        self.mark_needs_rejoin_critical(conversation_id).await;
-                        return Err(OrchestratorError::from(e));
-                    }
-                };
-
                 let retry_send_result = self
-                    .send_message_prepared(
+                    .encrypt_and_send_message_prepared(
                         conversation_id,
-                        &retry_encrypt.ciphertext,
+                        &payload_bytes,
                         retry_epoch,
                         &message_id,
                     )
@@ -2163,10 +2104,10 @@ where
         changed
     }
 
-    pub(crate) async fn send_message_prepared(
+    async fn encrypt_and_send_message_prepared(
         &self,
         conversation_id: &str,
-        ciphertext: &[u8],
+        plaintext: &[u8],
         epoch: u64,
         message_id: &str,
     ) -> Result<SendMessageResponse> {
@@ -2255,7 +2196,7 @@ where
                 })?;
             (generation, state_version)
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#applicationSendBody",
             "aad": {
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
@@ -2276,10 +2217,10 @@ where
             "actorDeviceId": actor_device_id,
             "actorDid": user_did,
             "applicationMessage": {
-                "bytes": { "$bytes": STANDARD.encode(ciphertext) },
+                "bytes": { "$bytes": "" },
                 "contentType": "privateMessageApplication",
                 "framing": "mlsMessage",
-                "sha256": { "$bytes": STANDARD.encode(Sha256::digest(ciphertext)) }
+                "sha256": { "$bytes": "" }
             },
             "authGeneration": auth_generation,
             "blobBindings": [],
@@ -2298,6 +2239,22 @@ where
             "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         });
+
+        let aad_bytes = super::canonical_transport::canonical_application_aad_bytes(&body["aad"])
+            .map_err(|error| OrchestratorError::Serialization(error.to_string()))?;
+        // The signed body below carries this exact AAD. No state fetch or
+        // coordinate regeneration may occur between encryption and submission.
+        let encrypted = self.mls_context().encrypt_message_with_aad(
+            group_id_bytes.clone(),
+            plaintext.to_vec(),
+            aad_bytes.clone(),
+            epoch,
+        )?;
+        let ciphertext = encrypted.ciphertext;
+        body["applicationMessage"]["bytes"]["$bytes"] =
+            serde_json::json!(STANDARD.encode(&ciphertext));
+        body["applicationMessage"]["sha256"]["$bytes"] =
+            serde_json::json!(STANDARD.encode(Sha256::digest(&ciphertext)));
 
         let binding = CleanChatSigningContext {
             actor_did: user_did.clone(),
@@ -2437,8 +2394,8 @@ where
         let accepted_request_sha256: [u8; 32] =
             sha2::Sha256::digest(&accepted_request_bytes).into();
 
-        let aad_sha256: [u8; 32] = sha2::Sha256::digest(b"").into();
-        let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(ciphertext).into();
+        let aad_sha256: [u8; 32] = sha2::Sha256::digest(&aad_bytes).into();
+        let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
         let proof = OwnEchoProof::new(
             accepted_request_sha256,
             resolved.conversation_id.clone(),

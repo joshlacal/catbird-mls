@@ -596,6 +596,87 @@ where
         .await
     }
 
+    /// Commit canonical presentation and exact raw-group alias retirement before
+    /// exposing a newly authenticated inventory mapping to readers.
+    async fn persist_sync_conversation_projection(
+        &self,
+        user_did: &str,
+        canonical: &ConversationView,
+    ) -> Result<Vec<String>> {
+        if self.require_user_did().await? != user_did {
+            return Err(OrchestratorError::NotAuthenticated);
+        }
+        // Legacy noncanonical host records keep their original durable path;
+        // a stable protocol conversation always uses the atomic contract.
+        if crate::chat_v2::ids::CanonicalUuid::parse(&canonical.conversation_id).is_err() {
+            self.storage()
+                .ensure_conversation_exists(
+                    user_did,
+                    &canonical.conversation_id,
+                    &canonical.group_id,
+                )
+                .await?;
+            return Ok(Vec::new());
+        }
+        let aliases = self
+            .storage()
+            .list_conversations(user_did)
+            .await?
+            .into_iter()
+            .filter(|view| {
+                view.conversation_id == canonical.group_id
+                    && view.conversation_id != canonical.conversation_id
+            })
+            .collect::<Vec<_>>();
+        let mut claims = Vec::with_capacity(aliases.len());
+        for alias in &aliases {
+            let group = hex::decode(&canonical.group_id).map_err(|_| {
+                OrchestratorError::InvalidInput("Invalid alias group identity".into())
+            })?;
+            let native_epoch = self.mls_context().get_epoch(group)?;
+            if alias.group_id != canonical.group_id
+                || alias.epoch > native_epoch
+                || canonical.epoch < native_epoch
+            {
+                return Err(OrchestratorError::Storage(
+                    "Alias incarnation differs from authenticated canonical/native state".into(),
+                ));
+            }
+            // A newer server snapshot permits catch-up, but cannot retire the
+            // old local incarnation until its commits have been processed.
+            if canonical.epoch > native_epoch {
+                continue;
+            }
+            claims.push(AliasRetirementAuthority::from_views(
+                user_did, canonical, alias,
+            )?);
+        }
+        let retired = claims
+            .iter()
+            .map(|claim| claim.alias_conversation_id.clone())
+            .collect();
+        let request =
+            ConversationProjectionCommitRequest::live(user_did, canonical.clone(), claims);
+        match self
+            .storage()
+            .commit_conversation_projection(&request)
+            .await?
+        {
+            ConversationProjectionCommitOutcome::Retired { .. }
+            | ConversationProjectionCommitOutcome::AlreadyAbsent { .. } => {}
+            ConversationProjectionCommitOutcome::FenceMismatch { .. }
+            | ConversationProjectionCommitOutcome::Ambiguous { .. } => {
+                return Err(OrchestratorError::Storage(
+                    "Canonical projection transaction rejected its durable fences".into(),
+                ))
+            }
+        }
+        if self.require_user_did().await? != user_did {
+            return Err(OrchestratorError::NotAuthenticated);
+        }
+        Ok(retired)
+    }
+
     pub(crate) async fn reconcile_server_conversations_batch(
         &self,
         user_did: &str,
@@ -621,12 +702,14 @@ where
                 .get(&convo.conversation_id)
                 .cloned();
             let convo = self.restore_conversation_policy(user_did, convo.clone())?;
-            let convo = super::admission::merge_conversation_view(previous_view.as_ref(), convo)?;
+            let mut convo =
+                super::admission::merge_conversation_view(previous_view.as_ref(), convo)?;
+            if let Ok(group) = hex::decode(&convo.group_id) {
+                if let Ok(epoch) = self.mls_context().get_epoch(group) {
+                    convo.epoch = convo.epoch.max(epoch);
+                }
+            }
             let conversation_id = convo.conversation_id.as_str();
-            self.conversations()
-                .lock()
-                .await
-                .insert(conversation_id.to_string(), convo.clone());
             if blocked_controls.contains(conversation_id) {
                 if strict {
                     return Err(OrchestratorError::InvalidInput(
@@ -641,9 +724,16 @@ where
             let group_id = convo.group_id.as_str();
             let mut effective_convo = convo.clone();
 
-            self.storage()
-                .ensure_conversation_exists(user_did, conversation_id, group_id)
+            let retired_aliases = self
+                .persist_sync_conversation_projection(user_did, &convo)
                 .await?;
+            {
+                let mut conversations = self.conversations().lock().await;
+                for alias in retired_aliases {
+                    conversations.remove(&alias);
+                }
+                conversations.insert(conversation_id.to_string(), convo.clone());
+            }
 
             if convo
                 .canonical_state
@@ -1356,6 +1446,269 @@ mod tests {
         assert_eq!(
             diff, 0,
             "saturating_sub should clamp to 0 even with u64::MAX local epoch"
+        );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod projection_ingestion_tests {
+    use super::*;
+    use crate::recovery_e2e_harness::TestWorld;
+    const CID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    async fn fixture() -> (TestWorld, ConversationView) {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        let alice = world.client("Alice");
+        alice.orchestrator.initialize(&alice.did).await.unwrap();
+        let group = "ab".repeat(32);
+        alice
+            .orchestrator
+            .mls_context()
+            .create_group_with_id(
+                alice.did.as_bytes().to_vec(),
+                hex::decode(&group).unwrap(),
+                None,
+            )
+            .unwrap();
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &group, &group)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_group_state(&GroupState {
+                group_id: group.clone(),
+                conversation_id: group.clone(),
+                epoch: 0,
+                members: vec![alice.did.clone()],
+            })
+            .await
+            .unwrap();
+        let mut view = alice
+            .storage
+            .get_conversation(&alice.did, &group)
+            .await
+            .unwrap()
+            .unwrap();
+        view.conversation_id = CID.into();
+        (world, view)
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canonical_projection_retires_only_exact_owned_native_alias() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        let retired = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap();
+        assert_eq!(retired, vec![view.group_id.clone()]);
+        let rows = alice.storage.list_conversations(&alice.did).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_id, CID);
+        assert!(alice
+            .orchestrator
+            .persist_sync_conversation_projection("did:plc:other", &view)
+            .await
+            .is_err());
+        assert_eq!(
+            alice
+                .storage
+                .list_conversations(&alice.did)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_incarnation_failure_never_publishes_canonical_mapping() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        let mut alias = alice
+            .storage
+            .get_conversation(&alice.did, &view.group_id)
+            .await
+            .unwrap()
+            .unwrap();
+        alias.epoch = 1;
+        alice
+            .storage
+            .set_conversation_view_for_test(&view.group_id, alias);
+        assert!(alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, CID)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            alice.storage.list_conversations(&alice.did).await.unwrap()[0].conversation_id,
+            view.group_id
+        );
+        assert!(!alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .contains_key(CID));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn newer_inventory_preserves_alias_until_native_catches_up() {
+        let (world, mut view) = fixture().await;
+        let alice = world.client("Alice");
+        view.epoch = 1;
+        let retired = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap();
+        assert!(retired.is_empty());
+        assert_eq!(
+            alice
+                .storage
+                .list_conversations(&alice.did)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, &view.group_id)
+            .await
+            .unwrap()
+            .is_some());
+        let history = Message {
+            id: "preserved-alias-history".into(),
+            conversation_id: view.group_id.clone(),
+            sender_did: alice.did.clone(),
+            text: "protected history".into(),
+            timestamp: chrono::Utc::now(),
+            epoch: 0,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        };
+        alice.storage.store_message(&history).await.unwrap();
+        // Advance real native MLS state; do not rewrite the durable alias row.
+        let group = hex::decode(&view.group_id).unwrap();
+        alice
+            .orchestrator
+            .mls_context()
+            .self_update(group.clone())
+            .unwrap();
+        alice
+            .orchestrator
+            .mls_context()
+            .merge_pending_commit(group)
+            .unwrap();
+        alice
+            .storage
+            .set_group_state(&GroupState {
+                group_id: view.group_id.clone(),
+                conversation_id: CID.into(),
+                epoch: 1,
+                members: vec![alice.did.clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            alice
+                .storage
+                .get_conversation(&alice.did, &view.group_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            0
+        );
+        let retired = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap();
+        assert_eq!(retired, vec![view.group_id.clone()]);
+        assert_eq!(
+            alice.storage.get_conversation_messages(&view.group_id)[0].id,
+            history.id
+        );
+        assert_eq!(
+            alice
+                .storage
+                .list_conversations(&alice.did)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_pending_alias_rejects_transaction_without_projection() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        alice
+            .storage
+            .set_conversation_state(
+                &view.group_id,
+                ConversationState::ResetPending {
+                    new_group_id: "cd".repeat(32),
+                    reset_generation: 2,
+                    notified_at_ms: 123,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, CID)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, &view.group_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_rejects_mismatched_alias_group_without_retirement() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        alice
+            .storage
+            .set_conversation_group_id_for_test(&view.group_id, &"cd".repeat(32));
+        assert!(alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, CID)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            alice
+                .storage
+                .list_conversations(&alice.did)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

@@ -42,6 +42,19 @@ pub(crate) mod bridge_mappers;
 /// can use actors/dispatch internally.
 #[uniffi::export(callback_interface)]
 pub trait OrchestratorStorageCallback: Send + Sync {
+    /// Commit an account-scoped canonical projection and exact alias retirement
+    /// in one durable host transaction. See ConversationProjectionCommitRequest
+    /// and ConversationProjectionCommitOutcome for the strict JSON contract.
+    fn commit_conversation_projection_json(
+        &self,
+        request_json: String,
+    ) -> Result<String, OrchestratorBridgeError> {
+        let _ = request_json;
+        Err(OrchestratorBridgeError::Storage {
+            message: "Atomic conversation projection callback is unavailable".into(),
+        })
+    }
+
     fn ensure_conversation_exists(
         &self,
         user_did: String,
@@ -1533,6 +1546,26 @@ fn bridge_err(e: OrchestratorBridgeError) -> OrchestratorError {
 
 #[async_trait::async_trait]
 impl MLSStorageBackend for StorageAdapter {
+    async fn commit_conversation_projection(
+        &self,
+        request: &crate::orchestrator::ConversationProjectionCommitRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::ConversationProjectionCommitOutcome> {
+        let json = serde_json::to_string(request)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        let response = self
+            .0
+            .commit_conversation_projection_json(json)
+            .map_err(bridge_err)?;
+        if response.len() > 65536 {
+            return Err(OrchestratorError::Storage(
+                "Projection callback response exceeds limit".into(),
+            ));
+        }
+        serde_json::from_str(&response).map_err(|e| {
+            OrchestratorError::Storage(format!("Invalid projection callback result: {e}"))
+        })
+    }
+
     async fn ensure_conversation_exists(
         &self,
         user_did: &str,

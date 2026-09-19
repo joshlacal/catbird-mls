@@ -3058,7 +3058,6 @@ pub fn canonical_commit_aad_bytes(aad_json: &serde_json::Value) -> Result<Vec<u8
     canonical_aad_with_domain(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0", "commitAad", aad_json)
 }
 
-#[cfg(any(test, feature = "test-utils", feature = "e2e-aad"))]
 pub fn canonical_application_aad_bytes(
     aad_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {

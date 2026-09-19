@@ -5939,34 +5939,10 @@ where
         self.leave_group(convo_id).await
     }
 
-    /// Leave a group via self-remove: propose own removal, send to group, then
-    /// notify the server and clean up locally.
+    /// Compatibility entrypoint for the canonical authenticated leave flow.
+    /// A private MLS proposal is not an application message and must never be
+    /// wrapped in the signed application-send endpoint.
     pub async fn leave_via_self_remove(&self, convo_id: &str) -> Result<()> {
-        self.check_shutdown().await?;
-        let _user_did = self.require_user_did().await?;
-
-        tracing::info!(convo_id, "Leaving group via self-remove proposal");
-
-        let resolved = self.resolve_conversation_context(convo_id).await?;
-        let group_id_bytes = resolved.group_id_bytes()?;
-
-        let proposal_bytes = self
-            .mls_context()
-            .propose_self_remove(group_id_bytes.clone())?;
-
-        let epoch = {
-            let states = self.group_states().lock().await;
-            resolved
-                .group_state(&states)
-                .map(|gs| gs.epoch)
-                .unwrap_or(0)
-        };
-
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let _ = self
-            .send_message_prepared(convo_id, &proposal_bytes, epoch, &message_id)
-            .await;
-
         self.leave_group(convo_id).await
     }
 
