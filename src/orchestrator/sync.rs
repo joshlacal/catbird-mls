@@ -223,6 +223,8 @@ where
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        Box::pin(self.reconcile_direct_request_outcomes()).await;
         Ok(report)
     }
 
@@ -362,6 +364,8 @@ where
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        Box::pin(self.reconcile_direct_request_outcomes()).await;
         result
     }
 
@@ -508,6 +512,9 @@ where
 
         #[cfg(not(target_arch = "wasm32"))]
         if any_needs_recovery {
+            // Each task-local scope retains its inner future. Box the batch
+            // before wrapping it so nested scopes do not multiply the large
+            // reconciliation state on the thread stack.
             if self.batch_inventory_snapshot().is_none() {
                 if let Ok(inv) = self.fetch_authorized_inventory_snapshot().await {
                     let inv = std::sync::Arc::new(inv);
@@ -521,7 +528,11 @@ where
                             inv,
                             super::with_batch_recovery_inbox_scope(
                                 inbox,
-                                self.reconcile_server_conversations_batch(user_did, all_convos, blocked_controls),
+                                Box::pin(self.reconcile_server_conversations_batch(
+                                    user_did,
+                                    all_convos,
+                                    blocked_controls,
+                                )),
                             ),
                         ).await;
                     }
@@ -531,13 +542,22 @@ where
                     let inbox = std::sync::Arc::new(inbox);
                     return super::with_batch_recovery_inbox_scope(
                         inbox,
-                        self.reconcile_server_conversations_batch(user_did, all_convos, blocked_controls),
+                        Box::pin(self.reconcile_server_conversations_batch(
+                            user_did,
+                            all_convos,
+                            blocked_controls,
+                        )),
                     ).await;
                 }
             }
         }
 
-        self.reconcile_server_conversations_batch(user_did, all_convos, blocked_controls).await
+        Box::pin(self.reconcile_server_conversations_batch(
+            user_did,
+            all_convos,
+            blocked_controls,
+        ))
+        .await
     }
 
     async fn reconcile_server_conversations_batch(
