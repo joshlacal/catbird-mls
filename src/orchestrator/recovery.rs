@@ -394,11 +394,7 @@ impl RecoveryTracker {
         self.note_leaf_recovery_requested_with_ttl(convo_id, super::reset_flow::LEAF_RECOVERY_TTL);
     }
 
-    pub fn note_leaf_recovery_requested_with_ttl(
-        &mut self,
-        convo_id: &str,
-        ttl: Duration,
-    ) {
+    pub fn note_leaf_recovery_requested_with_ttl(&mut self, convo_id: &str, ttl: Duration) {
         let now = Instant::now();
         self.note_leaf_recovery_requested_at(convo_id, now);
         self.leaf_recovery_expires_at
@@ -409,8 +405,10 @@ impl RecoveryTracker {
     pub fn note_leaf_recovery_requested_at(&mut self, convo_id: &str, at: Instant) {
         self.leaf_recovery_requested_at
             .insert(convo_id.to_string(), at);
-        self.leaf_recovery_expires_at
-            .insert(convo_id.to_string(), at + super::reset_flow::LEAF_RECOVERY_TTL);
+        self.leaf_recovery_expires_at.insert(
+            convo_id.to_string(),
+            at + super::reset_flow::LEAF_RECOVERY_TTL,
+        );
     }
 
     /// `Some(elapsed)` while a leaf-recovery request opened by this device
@@ -1752,16 +1750,29 @@ where
         let mut any_needs_recovery = false;
         for convo in &conversations {
             let convo_id = &convo.conversation_id;
-            let persisted_state = self.storage().get_conversation_state(convo_id).await.ok().flatten();
+            let persisted_state = self
+                .storage()
+                .get_conversation_state(convo_id)
+                .await
+                .ok()
+                .flatten();
             let needs_rejoin = self.storage().needs_rejoin(convo_id).await.unwrap_or(false);
             let in_memory_state = if persisted_state.is_none() {
-                self.conversation_states().lock().await.get(convo_id).cloned()
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .get(convo_id)
+                    .cloned()
             } else {
                 None
             };
             if needs_rejoin
-                || persisted_state.as_ref().is_some_and(Self::state_requires_deferred_recovery)
-                || in_memory_state.as_ref().is_some_and(Self::state_requires_deferred_recovery)
+                || persisted_state
+                    .as_ref()
+                    .is_some_and(Self::state_requires_deferred_recovery)
+                || in_memory_state
+                    .as_ref()
+                    .is_some_and(Self::state_requires_deferred_recovery)
             {
                 any_needs_recovery = true;
                 break;
@@ -1789,7 +1800,8 @@ where
                 )
                 .await;
             } else if self.batch_recovery_inbox_snapshot().is_none() {
-                let inbox = std::sync::Arc::new(self.fetch_authorized_recovery_inbox_snapshot().await?);
+                let inbox =
+                    std::sync::Arc::new(self.fetch_authorized_recovery_inbox_snapshot().await?);
                 return super::with_batch_recovery_inbox_scope(
                     inbox,
                     self.run_deferred_recovery_inner(reason, conversations, report),
@@ -1798,7 +1810,8 @@ where
             }
         }
 
-        self.run_deferred_recovery_inner(reason, conversations, report).await
+        self.run_deferred_recovery_inner(reason, conversations, report)
+            .await
     }
 
     async fn run_deferred_recovery_inner(
@@ -3235,9 +3248,15 @@ where
         }
 
         if self.mls_context().supports_direct_request_bootstrap()
-            && self.mls_context().list_direct_request_journal()?.iter().any(|journal| journal.conversation_id == convo_id)
+            && self
+                .mls_context()
+                .list_direct_request_journal()?
+                .iter()
+                .any(|journal| journal.conversation_id == convo_id)
         {
-            return Err(OrchestratorError::RecoveryFailed("Legacy force rejoin cannot replace request-owned custody".into()));
+            return Err(OrchestratorError::RecoveryFailed(
+                "Legacy force rejoin cannot replace request-owned custody".into(),
+            ));
         }
 
         // GroupInfo fetched successfully — now delete old local group state.

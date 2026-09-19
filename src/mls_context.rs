@@ -219,7 +219,9 @@ impl ManifestStorage {
     /// The Welcome-only provider borrows this connection so its KeyPackage,
     /// group and receipt writes share one transaction. Never use the ordinary
     /// provider's separate connection while that transaction is open.
-    pub(crate) fn welcome_ack_connection(&self) -> &Connection { &self.conn }
+    pub(crate) fn welcome_ack_connection(&self) -> &Connection {
+        &self.conn
+    }
     fn open_connection(
         db_path: &std::path::Path,
         encryption_key: &str,
@@ -532,7 +534,10 @@ impl ManifestStorage {
     /// Callers retain old JSON exactly and retry a failed comparison; a returned
     /// write error remains ambiguous until the row is reread.
     pub(crate) fn compare_exchange_manifest<T: Serialize>(
-        &self, key: &str, expected: Option<&str>, value: &T,
+        &self,
+        key: &str,
+        expected: Option<&str>,
+        value: &T,
     ) -> Result<bool, MLSError> {
         let next = serde_json::to_string(value).map_err(|_| MLSError::SerializationError)?;
         let changed = match expected {
@@ -544,7 +549,8 @@ impl ManifestStorage {
                 "INSERT OR IGNORE INTO mls_manifests(key,value) VALUES(?1,?2)",
                 rusqlite::params![key, next],
             ),
-        }.map_err(|e| map_sqlite_error("compare_exchange_manifest", &e))?;
+        }
+        .map_err(|e| map_sqlite_error("compare_exchange_manifest", &e))?;
         Ok(changed == 1)
     }
 
@@ -2122,20 +2128,39 @@ fn validate_existing_sqlite_storage(
     // Request candidates own durable OpenMLS rows without a live group mapping.
     // Only a validated journal row grants this exception; unrelated orphan rows
     // remain a hard preflight error and published rows must use the live index.
-    let mut expected_group_ids=manifested_group_ids.clone();
-    let mut request_query=conn.prepare("SELECT value FROM mls_manifests WHERE key LIKE 'direct_request_v2:%'").map_err(|_|MLSError::StorageFailed)?;
-    let request_rows=request_query.query_map([],|row|row.get::<_,String>(0)).map_err(|_|MLSError::StorageFailed)?;
-    let mut request_group_ids=HashSet::new();
+    let mut expected_group_ids = manifested_group_ids.clone();
+    let mut request_query = conn
+        .prepare("SELECT value FROM mls_manifests WHERE key LIKE 'direct_request_v2:%'")
+        .map_err(|_| MLSError::StorageFailed)?;
+    let request_rows = request_query
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| MLSError::StorageFailed)?;
+    let mut request_group_ids = HashSet::new();
     for row in request_rows {
-        use crate::orchestrator::direct_request_journal::{DirectRequestJournal,DirectRequestJournalPhase};
-        let record:DirectRequestJournal=serde_json::from_str(&row.map_err(|_|MLSError::StorageFailed)?).map_err(|_|MLSError::StorageFailed)?;
+        use crate::orchestrator::direct_request_journal::{
+            DirectRequestJournal, DirectRequestJournalPhase,
+        };
+        let record: DirectRequestJournal =
+            serde_json::from_str(&row.map_err(|_| MLSError::StorageFailed)?)
+                .map_err(|_| MLSError::StorageFailed)?;
         record.validate()?;
-        let encoded=record.bootstrap.coordinates["groupId"].as_str().ok_or(MLSError::StorageFailed)?;
-        let gid=base64::Engine::decode(&base64::engine::general_purpose::STANDARD,encoded).map_err(|_|MLSError::StorageFailed)?;
-        let hex_id=hex::encode(gid);
-        if !request_group_ids.insert(hex_id.clone()) {return Err(MLSError::StorageFailed);}
-        let published=matches!(record.phase,DirectRequestJournalPhase::PublishedAwaitingProjection|DirectRequestJournalPhase::RequestSent);
-        if published != manifested_group_ids.contains(&hex_id) {return Err(MLSError::StorageFailed);}
+        let encoded = record.bootstrap.coordinates["groupId"]
+            .as_str()
+            .ok_or(MLSError::StorageFailed)?;
+        let gid = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+            .map_err(|_| MLSError::StorageFailed)?;
+        let hex_id = hex::encode(gid);
+        if !request_group_ids.insert(hex_id.clone()) {
+            return Err(MLSError::StorageFailed);
+        }
+        let published = matches!(
+            record.phase,
+            DirectRequestJournalPhase::PublishedAwaitingProjection
+                | DirectRequestJournalPhase::RequestSent
+        );
+        if published != manifested_group_ids.contains(&hex_id) {
+            return Err(MLSError::StorageFailed);
+        }
         if record.phase != DirectRequestJournalPhase::RetiredPublished {
             expected_group_ids.insert(hex_id);
         }
@@ -2482,7 +2507,8 @@ impl MLSContext {
         }
 
         // Validate request ownership before any live MLS group becomes visible.
-        let request_ownership = crate::orchestrator::direct_request_journal::native::list(&manifest_storage)?;
+        let request_ownership =
+            crate::orchestrator::direct_request_journal::native::list(&manifest_storage)?;
         // 🔄 GROUP LOADING: Load all persisted groups from storage
         crate::info_log!("[MLS-CONTEXT] 🔄 Loading persisted groups...");
         let mut groups = HashMap::new();
@@ -2500,9 +2526,21 @@ impl MLSContext {
                 for hex_id in &group_id_list {
                     for request in &request_ownership {
                         use crate::orchestrator::direct_request_journal::DirectRequestJournalPhase;
-                        let raw_id = request.bootstrap.coordinates["groupId"].as_str().ok_or(MLSError::StorageFailed)?;
-                        let request_group = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, raw_id).map_err(|_| MLSError::StorageFailed)?;
-                        if hex::encode(request_group) == *hex_id && !matches!(request.phase, DirectRequestJournalPhase::PublishedAwaitingProjection | DirectRequestJournalPhase::RequestSent) {
+                        let raw_id = request.bootstrap.coordinates["groupId"]
+                            .as_str()
+                            .ok_or(MLSError::StorageFailed)?;
+                        let request_group = base64::Engine::decode(
+                            &base64::engine::general_purpose::STANDARD,
+                            raw_id,
+                        )
+                        .map_err(|_| MLSError::StorageFailed)?;
+                        if hex::encode(request_group) == *hex_id
+                            && !matches!(
+                                request.phase,
+                                DirectRequestJournalPhase::PublishedAwaitingProjection
+                                    | DirectRequestJournalPhase::RequestSent
+                            )
+                        {
                             return Err(MLSError::StorageFailed);
                         }
                     }
@@ -2525,9 +2563,7 @@ impl MLSContext {
                                         return Err(MLSError::StorageFailed);
                                     }
                                     Vec::new()
-                                } else if let Some(own_leaf) =
-                                    group.own_leaf_node()
-                                {
+                                } else if let Some(own_leaf) = group.own_leaf_node() {
                                     let own_credential = own_leaf.credential().serialized_content();
                                     let leaf_signature_key =
                                         own_leaf.signature_key().as_slice().to_vec();
@@ -3065,17 +3101,14 @@ impl MLSContext {
         // An unpublished request deliberately has no live-map entry. Its
         // durable journal still owns the OpenMLS rows, including after a
         // terminal outcome; an external join must never overwrite them.
-        for request in crate::orchestrator::direct_request_journal::native::list(
-            &self.manifest_storage,
-        )? {
+        for request in
+            crate::orchestrator::direct_request_journal::native::list(&self.manifest_storage)?
+        {
             let encoded = request.bootstrap.coordinates["groupId"]
                 .as_str()
                 .ok_or(MLSError::StorageFailed)?;
-            let owned = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                encoded,
-            )
-            .map_err(|_| MLSError::StorageFailed)?;
+            let owned = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                .map_err(|_| MLSError::StorageFailed)?;
             if owned == advertised_group_id {
                 return Err(MLSError::InvalidState(
                     "Cannot stage an external join over request-owned group".into(),
@@ -3788,9 +3821,14 @@ impl MLSContext {
     /// Publication after the canonical Welcome transaction has committed.
     /// This cannot roll back or delete a group paired with a durable receipt.
     pub(crate) fn publish_welcome_group(&mut self, group: MlsGroup, signer_public_key: Vec<u8>) {
-        self.groups.insert(group.group_id().as_slice().to_vec(), GroupState {
-            group, signer_public_key, pending_external_join: None,
-        });
+        self.groups.insert(
+            group.group_id().as_slice().to_vec(),
+            GroupState {
+                group,
+                signer_public_key,
+                pending_external_join: None,
+            },
+        );
     }
 
     /// Register a signer public key for an identity
@@ -4063,7 +4101,9 @@ impl MLSContext {
     /// the live in-memory group is removed so callers can retain a retryable
     /// pending-delete intent.
     pub fn delete_group(&mut self, group_id: &[u8]) -> Result<bool, MLSError> {
-        if let Some(deleted) = crate::orchestrator::direct_request_journal::retire_published_group(self, group_id)? {
+        if let Some(deleted) =
+            crate::orchestrator::direct_request_journal::retire_published_group(self, group_id)?
+        {
             self.groups.remove(group_id);
             return Ok(deleted);
         }

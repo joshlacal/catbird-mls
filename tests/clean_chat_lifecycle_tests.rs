@@ -387,7 +387,10 @@ async fn closed_conversation_retry_finishes_failed_terminal_projection_from_exac
         .mls_context()
         .get_epoch(hex::decode(gid).unwrap())
         .is_ok());
-    assert_eq!(alice.storage.get_conversation_state(&cid).await.unwrap(), Some(ConversationState::Closed));
+    assert_eq!(
+        alice.storage.get_conversation_state(&cid).await.unwrap(),
+        Some(ConversationState::Closed)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

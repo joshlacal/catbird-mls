@@ -341,7 +341,9 @@ where
 
     async fn reject_send_if_reset_pending(&self, conversation_id: &str) -> Result<()> {
         if self.pending_conversation_admission(conversation_id).await? {
-            return Err(OrchestratorError::InvalidInput("Accept this invitation before sending messages.".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "Accept this invitation before sending messages.".into(),
+            ));
         }
         if let Some(pending) = self.reset_pending_payload_result(conversation_id).await? {
             return Err(OrchestratorError::ResetCompletionNotCommitted {
@@ -432,7 +434,10 @@ where
         self.check_shutdown().await?;
         self.require_user_did().await?;
         if self.pending_conversation_admission(convo_id).await? {
-            return Ok(Self::ready_result(ConversationRecoveryState::Recovering, None));
+            return Ok(Self::ready_result(
+                ConversationRecoveryState::Recovering,
+                None,
+            ));
         }
 
         let had_in_memory_reset_authority = matches!(
@@ -622,12 +627,27 @@ where
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
-        if let Some(reference) = payload.checked_group_invitation().map_err(|_| OrchestratorError::InvalidInput("Invalid group invitation note".into()))? {
+        if let Some(reference) = payload
+            .checked_group_invitation()
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid group invitation note".into()))?
+        {
             let destination = self.fetch_conversation_lifecycle(conversation_id).await?;
-            validate_group_note_destination(&destination["state"], conversation_id, &user_did, &reference)?;
-            let fresh = self.get_group_invitation_reference(&reference.conversation_id, &reference.recipient_did).await?;
+            validate_group_note_destination(
+                &destination["state"],
+                conversation_id,
+                &user_did,
+                &reference,
+            )?;
+            let fresh = self
+                .get_group_invitation_reference(
+                    &reference.conversation_id,
+                    &reference.recipient_did,
+                )
+                .await?;
             if fresh.as_ref() != Some(&reference) {
-                return Err(OrchestratorError::InvalidInput("The group invitation changed; no note was sent".into()));
+                return Err(OrchestratorError::InvalidInput(
+                    "The group invitation changed; no note was sent".into(),
+                ));
             }
         }
         self.reject_send_if_reset_pending(conversation_id).await?;
@@ -1000,7 +1020,10 @@ where
         };
 
         if self.known_direct_request(&resolved.conversation_id).await?
-            && self.pending_conversation_admission(&resolved.conversation_id).await? {
+            && self
+                .pending_conversation_admission(&resolved.conversation_id)
+                .await?
+        {
             return Err(OrchestratorError::InvalidInput("RequestNotAccepted".into()));
         }
 
@@ -1312,9 +1335,7 @@ where
                             let alternate = alternate_uuid_representation(server_id);
                             let mut pending = self.pending_messages().lock().await;
                             let in_memory_pending = pending.remove(server_id)
-                                || alternate
-                                    .as_ref()
-                                    .is_some_and(|alt| pending.remove(alt));
+                                || alternate.as_ref().is_some_and(|alt| pending.remove(alt));
                             drop(pending);
                             let in_storage_pending = if in_memory_pending {
                                 let _ = self.storage().remove_pending_message(server_id).await;
@@ -1350,10 +1371,7 @@ where
                                     Some(e) => e,
                                     None => {
                                         let states = self.group_states().lock().await;
-                                        resolved
-                                            .group_state(&states)
-                                            .map(|s| s.epoch)
-                                            .unwrap_or(0)
+                                        resolved.group_state(&states).map(|s| s.epoch).unwrap_or(0)
                                     }
                                 };
                                 let direct_proof = self
@@ -1832,7 +1850,9 @@ where
                     if reference.invited_by_did != sender
                         || (!is_own && reference.recipient_did != receiver)
                     {
-                        tracing::warn!("Ignoring group invitation note with mismatched authenticated parties");
+                        tracing::warn!(
+                            "Ignoring group invitation note with mismatched authenticated parties"
+                        );
                         return Ok(None);
                     }
                 }
@@ -1929,7 +1949,9 @@ where
             text: plaintext,
             timestamp: envelope.timestamp,
             epoch: decrypt_result.epoch,
-            sequence_number: envelope.server_sequence.unwrap_or(decrypt_result.sequence_number),
+            sequence_number: envelope
+                .server_sequence
+                .unwrap_or(decrypt_result.sequence_number),
             is_own,
             delivery_status: None,
             payload_json,
@@ -1948,11 +1970,26 @@ where
         envelope.validate_server_metadata()?;
         if envelope.canonical_entry_json.is_some() {
             let message = Box::pin(self.consume_request_control(envelope)).await?;
-            let events = message.as_ref().map(|m| vec![crate::orchestrator::EngineEvent::MessageInserted { message_id:m.id.clone(),convo_id:m.conversation_id.clone() }]).unwrap_or_else(|| vec![crate::orchestrator::EngineEvent::ConversationUpdated { convo_id:envelope.conversation_id.clone() }]);
+            let events = message
+                .as_ref()
+                .map(|m| {
+                    vec![crate::orchestrator::EngineEvent::MessageInserted {
+                        message_id: m.id.clone(),
+                        convo_id: m.conversation_id.clone(),
+                    }]
+                })
+                .unwrap_or_else(|| {
+                    vec![crate::orchestrator::EngineEvent::ConversationUpdated {
+                        convo_id: envelope.conversation_id.clone(),
+                    }]
+                });
             return Ok(MessageProcessingResult { message, events });
         }
         if self.known_direct_request(&envelope.conversation_id).await?
-            && self.pending_conversation_admission(&envelope.conversation_id).await? {
+            && self
+                .pending_conversation_admission(&envelope.conversation_id)
+                .await?
+        {
             return Err(OrchestratorError::InvalidInput("RequestNotAccepted".into()));
         }
         if let Some(server_epoch) = envelope.server_epoch {
@@ -2023,7 +2060,8 @@ where
     ) -> Result<(Vec<Message>, Option<String>)> {
         self.check_shutdown().await?;
         if self.pending_conversation_admission(conversation_id).await?
-            && !self.known_direct_request(conversation_id).await? {
+            && !self.known_direct_request(conversation_id).await?
+        {
             return Ok((Vec::new(), None));
         }
 
@@ -2461,18 +2499,47 @@ mod tests {
 
 /// The typed invitation may only be sent to its exact recipient in an accepted
 /// direct conversation. This check supplements, never replaces, ordinary send gates.
-fn validate_group_note_destination(state: &serde_json::Value, conversation_id: &str, owner: &str, reference: &super::GroupInvitationReference) -> Result<()> {
+fn validate_group_note_destination(
+    state: &serde_json::Value,
+    conversation_id: &str,
+    owner: &str,
+    reference: &super::GroupInvitationReference,
+) -> Result<()> {
     let valid = || -> Option<()> {
-        let typed = super::canonical_transport::decode_conversation_state(&serde_json::to_vec(state).ok()?).ok()?;
-        if typed.coordinates.conversation_id.as_str() != conversation_id || typed.conversation_kind.as_str() != "direct" || typed.coordinates.lifecycle.as_str() != "active"
-            || owner != reference.invited_by_did || typed.participants.len() != 2
-            || !typed.participants.iter().all(|p| p.status.as_str() == "active")
-            || !typed.participants.iter().any(|p| p.user_did.as_str() == owner)
-            || !typed.participants.iter().any(|p| p.user_did.as_str() == reference.recipient_did)
-            || state.get("directRequest").is_some_and(|r| r["consent"] != "accepted") { return None; }
+        let typed =
+            super::canonical_transport::decode_conversation_state(&serde_json::to_vec(state).ok()?)
+                .ok()?;
+        if typed.coordinates.conversation_id.as_str() != conversation_id
+            || typed.conversation_kind.as_str() != "direct"
+            || typed.coordinates.lifecycle.as_str() != "active"
+            || owner != reference.invited_by_did
+            || typed.participants.len() != 2
+            || !typed
+                .participants
+                .iter()
+                .all(|p| p.status.as_str() == "active")
+            || !typed
+                .participants
+                .iter()
+                .any(|p| p.user_did.as_str() == owner)
+            || !typed
+                .participants
+                .iter()
+                .any(|p| p.user_did.as_str() == reference.recipient_did)
+            || state
+                .get("directRequest")
+                .is_some_and(|r| r["consent"] != "accepted")
+        {
+            return None;
+        }
         Some(())
     };
-    valid().ok_or_else(|| OrchestratorError::InvalidInput("Accept the exact recipient's direct conversation before sending an invitation note".into()))
+    valid().ok_or_else(|| {
+        OrchestratorError::InvalidInput(
+            "Accept the exact recipient's direct conversation before sending an invitation note"
+                .into(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -2480,18 +2547,35 @@ mod group_invitation_note_destination_tests {
     use super::*;
     #[test]
     fn group_note_destination_requires_exact_accepted_direct_recipient() {
-        let mut state: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/group-invitation-note-state.json")).unwrap();
-        let owner = state["participants"][0]["userDid"].as_str().unwrap().to_string();
-        let cid = state["coordinates"]["conversationId"].as_str().unwrap().to_string();
-        let reference = super::super::GroupInvitationReference { authority_did: "did:web:chat.catbird.blue".into(), conversation_id: "22222222-2222-4222-9222-222222222222".into(), invitation_transition_id: "33333333-3333-4333-9333-333333333333".into(), invited_by_did: owner.clone(), invited_by_device_id: "44444444-4444-4444-9444-444444444444".into(), recipient_did: state["participants"][1]["userDid"].as_str().unwrap().into() };
-        assert!(validate_group_note_destination(&state,&cid,&owner,&reference).is_ok());
-        assert!(validate_group_note_destination(&state,"other",&owner,&reference).is_err());
-        let mut wrong=reference.clone();wrong.recipient_did="did:plc:cccccccccccccccccccccccc".into();
-        assert!(validate_group_note_destination(&state,&cid,&owner,&wrong).is_err());
-        state["participants"][1]["status"]=serde_json::json!("pending");
-        assert!(validate_group_note_destination(&state,&cid,&owner,&reference).is_err());
-        state["participants"][1]["status"]=serde_json::json!("active");
-        state["conversationKind"]=serde_json::json!("group");
-        assert!(validate_group_note_destination(&state,&cid,&owner,&reference).is_err());
+        let mut state: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/group-invitation-note-state.json"
+        ))
+        .unwrap();
+        let owner = state["participants"][0]["userDid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cid = state["coordinates"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let reference = super::super::GroupInvitationReference {
+            authority_did: "did:web:chat.catbird.blue".into(),
+            conversation_id: "22222222-2222-4222-9222-222222222222".into(),
+            invitation_transition_id: "33333333-3333-4333-9333-333333333333".into(),
+            invited_by_did: owner.clone(),
+            invited_by_device_id: "44444444-4444-4444-9444-444444444444".into(),
+            recipient_did: state["participants"][1]["userDid"].as_str().unwrap().into(),
+        };
+        assert!(validate_group_note_destination(&state, &cid, &owner, &reference).is_ok());
+        assert!(validate_group_note_destination(&state, "other", &owner, &reference).is_err());
+        let mut wrong = reference.clone();
+        wrong.recipient_did = "did:plc:cccccccccccccccccccccccc".into();
+        assert!(validate_group_note_destination(&state, &cid, &owner, &wrong).is_err());
+        state["participants"][1]["status"] = serde_json::json!("pending");
+        assert!(validate_group_note_destination(&state, &cid, &owner, &reference).is_err());
+        state["participants"][1]["status"] = serde_json::json!("active");
+        state["conversationKind"] = serde_json::json!("group");
+        assert!(validate_group_note_destination(&state, &cid, &owner, &reference).is_err());
     }
 }

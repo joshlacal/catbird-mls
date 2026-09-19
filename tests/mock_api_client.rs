@@ -351,7 +351,11 @@ impl PublishGroupInfoGate {
 
 impl MockDeliveryService {
     pub fn queue_incoming_page(&self, envelopes: Vec<IncomingEnvelope>, cursor: Option<String>) {
-        self.state.lock().unwrap().incoming_pages.push((envelopes, cursor));
+        self.state
+            .lock()
+            .unwrap()
+            .incoming_pages
+            .push((envelopes, cursor));
     }
 
     pub fn queue_request_operation_response(

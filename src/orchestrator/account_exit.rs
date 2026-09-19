@@ -276,7 +276,11 @@ where
             record.validate()?;
             self.mls_context().put_account_exit(&record)?;
         }
-        self.retain_verified_departure_coordinate(cid, &body[if close { "retired" } else { "next" }]).await?;
+        self.retain_verified_departure_coordinate(
+            cid,
+            &body[if close { "retired" } else { "next" }],
+        )
+        .await?;
         let prior_group = super::welcome_ack::bytes(&body["prior"]["groupId"])?;
         let newer_native = match self.mls_context().group_is_active(prior_group.clone()) {
             Ok(true) => {
@@ -400,9 +404,12 @@ where
             }
         }
         if close {
-            let entry = super::direct_requests::normalized_close_entry(record.accepted_response.as_ref().unwrap()["result"]["entry"].clone());
+            let entry = super::direct_requests::normalized_close_entry(
+                record.accepted_response.as_ref().unwrap()["result"]["entry"].clone(),
+            );
             let key = self.verify_terminal_signed_body(&entry).await?;
-            self.retain_verified_request_close(cid, &entry, &key).await?;
+            self.retain_verified_request_close(cid, &entry, &key)
+                .await?;
         }
         self.mls_context().ensure_storage_durable()?;
         if stored.is_none() {

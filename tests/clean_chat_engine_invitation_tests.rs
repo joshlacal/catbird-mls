@@ -360,10 +360,7 @@ async fn fresh_recipient_native_sync_yields_durable_pending_invitation_without_c
         "fresh recipient storage must be empty before sync"
     );
 
-    let bob_requests_before = world
-        .delivery_service()
-        .submitted_prepared_requests()
-        .len();
+    let bob_requests_before = world.delivery_service().submitted_prepared_requests().len();
 
     // Bob runs native sync_with_server
     bob.orchestrator
@@ -372,14 +369,13 @@ async fn fresh_recipient_native_sync_yields_durable_pending_invitation_without_c
         .expect("fresh recipient sync must succeed");
 
     // 1. Durable storage row was materialized
-    let stored_convos = bob
-        .storage
-        .list_conversations(&bob.did)
-        .await
-        .unwrap();
-    assert_eq!(stored_convos.len(), 1, "durable conversation row must exist");
+    let stored_convos = bob.storage.list_conversations(&bob.did).await.unwrap();
+    assert_eq!(
+        stored_convos.len(),
+        1,
+        "durable conversation row must exist"
+    );
     assert_eq!(stored_convos[0].conversation_id, *cid);
-
 
     // 3. Conversation display snapshot yields the pending conversation with canonical policy
     let snapshot = bob
@@ -411,13 +407,15 @@ async fn fresh_recipient_native_sync_yields_durable_pending_invitation_without_c
             .unwrap_or(false),
         "recipient must NOT join MLS group or create a leaf before acceptance"
     );
-    let transitions_by_bob = world
-        .delivery_service()
-        .submitted_prepared_requests()[bob_requests_before..]
+    let transitions_by_bob = world.delivery_service().submitted_prepared_requests()
+        [bob_requests_before..]
         .iter()
         .filter(|r| r.operation == CanonicalOperation::SubmitTransition)
         .count();
-    assert_eq!(transitions_by_bob, 0, "no transitions may be submitted by pending recipient");
+    assert_eq!(
+        transitions_by_bob, 0,
+        "no transitions may be submitted by pending recipient"
+    );
 
     // 5. Restart visibility: restart Bob and verify pending invitation remains visible without local leaf
     world.restart_client("Bob").await;
@@ -428,7 +426,11 @@ async fn fresh_recipient_native_sync_yields_durable_pending_invitation_without_c
         .conversation_display_snapshot(&bob.did)
         .await
         .unwrap();
-    assert_eq!(restart_snapshot.len(), 1, "pending conversation must be visible after restart");
+    assert_eq!(
+        restart_snapshot.len(),
+        1,
+        "pending conversation must be visible after restart"
+    );
     assert_eq!(restart_snapshot[0].conversation_id, *cid);
     let restart_canonical = restart_snapshot[0]
         .canonical_state
@@ -488,7 +490,9 @@ async fn fresh_recipient_live_batch_yields_durable_pending_invitation_with_resta
 
     // Pending admission must emit updated event
     assert!(
-        events.iter().any(|e| matches!(e, EngineEvent::ConversationUpdated { convo_id } if convo_id == cid)),
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::ConversationUpdated { convo_id } if convo_id == cid)),
         "live batch must emit ConversationUpdated event for pending invitation"
     );
 
@@ -506,12 +510,11 @@ async fn fresh_recipient_live_batch_yields_durable_pending_invitation_with_resta
     );
 
     // Invariant: no local MLS group created
-    assert!(
-        !bob.orchestrator
-            .mls_context()
-            .group_is_active(gid.clone())
-            .unwrap_or(false)
-    );
+    assert!(!bob
+        .orchestrator
+        .mls_context()
+        .group_is_active(gid.clone())
+        .unwrap_or(false));
 
     // Restart Bob and verify visibility
     world.restart_client("Bob").await;
@@ -528,10 +531,9 @@ async fn fresh_recipient_live_batch_yields_durable_pending_invitation_with_resta
         restart_snapshot[0].canonical_state.is_some(),
         "canonical_state must survive restart after live batch"
     );
-    assert!(
-        !bob.orchestrator
-            .mls_context()
-            .group_is_active(gid)
-            .unwrap_or(false)
-    );
+    assert!(!bob
+        .orchestrator
+        .mls_context()
+        .group_is_active(gid)
+        .unwrap_or(false));
 }

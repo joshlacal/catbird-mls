@@ -441,7 +441,11 @@ pub(crate) fn resolve(
     use native::*;
     use openmls::prelude::*;
     use openmls_traits::OpenMlsProvider;
-    let tx = inner.manifest_storage.welcome_ack_connection().unchecked_transaction().map_err(error)?;
+    let tx = inner
+        .manifest_storage
+        .welcome_ack_connection()
+        .unchecked_transaction()
+        .map_err(error)?;
     let mut record = read(&tx, id)?.ok_or(MLSError::StorageFailed)?;
     record.verify_terminal_receipt(receipt, authority_key, published)?;
     if let Some(old) = &record.terminal_receipt {
@@ -889,8 +893,7 @@ pub(crate) fn commit_closed_projection(
     for candidate in list(&inner.manifest_storage)? {
         if candidate.conversation_id == cid {
             if journal.is_some()
-                || candidate.bootstrap.coordinates["groupId"]
-                    != group_id
+                || candidate.bootstrap.coordinates["groupId"] != group_id
                 || !matches!(
                     candidate.phase,
                     DirectRequestJournalPhase::PublishedAwaitingProjection

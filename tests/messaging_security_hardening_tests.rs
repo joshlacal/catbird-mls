@@ -897,7 +897,11 @@ async fn secret_reuse_own_sent_message_with_durable_evidence_skips_and_advances_
         .await
         .expect("locally accounted SecretReuse must advance the cursor");
     assert!(messages.is_empty(), "own echo is skipped");
-    assert_eq!(cursor.as_deref(), Some("1"), "cursor must advance past the skipped echo");
+    assert_eq!(
+        cursor.as_deref(),
+        Some("1"),
+        "cursor must advance past the skipped echo"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2482,23 +2486,58 @@ async fn canonical_incoming_sequence_survives_durable_store_and_duplicate_delive
     let fixture = controlled_inbound_fixture_with_group(
         "8d85cf39-997f-4861-a45e-a71f944db857",
         "9192939495969798999a9b9c9d9e9fa09192939495969798999a9b9c9d9e9fa0",
-        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(Duration::ZERO)),
-    ).await;
-    let mut envelope = test_envelope(&fixture.conversation_id, "e94874a0-86ab-49f4-8355-35a5d972b607");
+        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(
+            Duration::ZERO,
+        )),
+    )
+    .await;
+    let mut envelope = test_envelope(
+        &fixture.conversation_id,
+        "e94874a0-86ab-49f4-8355-35a5d972b607",
+    );
     envelope.server_sequence = Some(271);
     envelope.timestamp = "2026-09-05T04:52:13.456Z".parse().unwrap();
-    let message = fixture.orchestrator.process_incoming(&envelope).await.unwrap().unwrap();
-    assert_eq!(message.sequence_number, 271, "server sequence must replace the process-local crypto counter");
+    let message = fixture
+        .orchestrator
+        .process_incoming(&envelope)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        message.sequence_number, 271,
+        "server sequence must replace the process-local crypto counter"
+    );
     assert_eq!(message.timestamp, envelope.timestamp);
     assert_eq!(message.epoch, 1);
-    let before = fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap();
-    assert!(fixture.orchestrator.process_incoming(&envelope).await.unwrap().is_none());
+    let before = fixture
+        .storage
+        .get_messages(&fixture.conversation_id, 10, None)
+        .await
+        .unwrap();
+    assert!(fixture
+        .orchestrator
+        .process_incoming(&envelope)
+        .await
+        .unwrap()
+        .is_none());
     let mut unproven_metadata = envelope.clone();
     unproven_metadata.server_sequence = Some(999);
     unproven_metadata.timestamp = "2026-09-05T05:52:13.456Z".parse().unwrap();
-    assert!(fixture.orchestrator.process_incoming(&unproven_metadata).await.unwrap().is_none());
-    let after = fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap();
-    assert_eq!(serde_json::to_value(&before).unwrap(), serde_json::to_value(&after).unwrap());
+    assert!(fixture
+        .orchestrator
+        .process_incoming(&unproven_metadata)
+        .await
+        .unwrap()
+        .is_none());
+    let after = fixture
+        .storage
+        .get_messages(&fixture.conversation_id, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&before).unwrap(),
+        serde_json::to_value(&after).unwrap()
+    );
     assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -2507,16 +2546,36 @@ async fn canonical_invalid_id_is_rejected_before_decrypt_but_legacy_ids_remain_a
     let fixture = controlled_inbound_fixture_with_group(
         "8d85cf39-997f-4861-a45e-a71f944db857",
         "9192939495969798999a9b9c9d9e9fa09192939495969798999a9b9c9d9e9fa0",
-        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(Duration::ZERO)),
-    ).await;
-    let mut envelope = test_envelope(&fixture.conversation_id, "membership-left:e94874a0-86ab-49f4-8355-35a5d972b607:e94874a0-86ab-49f4-8355-35a5d972b607");
+        Arc::new(ControlledCommitCrypto::application_then_secret_reuse(
+            Duration::ZERO,
+        )),
+    )
+    .await;
+    let mut envelope = test_envelope(
+        &fixture.conversation_id,
+        "membership-left:e94874a0-86ab-49f4-8355-35a5d972b607:e94874a0-86ab-49f4-8355-35a5d972b607",
+    );
     envelope.server_sequence = Some(271);
-    assert!(fixture.orchestrator.process_incoming_message(&envelope).await.is_err());
+    assert!(fixture
+        .orchestrator
+        .process_incoming_message(&envelope)
+        .await
+        .is_err());
     assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 0);
-    assert!(fixture.storage.get_messages(&fixture.conversation_id, 10, None).await.unwrap().is_empty());
+    assert!(fixture
+        .storage
+        .get_messages(&fixture.conversation_id, 10, None)
+        .await
+        .unwrap()
+        .is_empty());
     envelope.server_sequence = None;
     envelope.server_message_id = Some("arbitrary-legacy-id".into());
-    assert!(fixture.orchestrator.process_incoming(&envelope).await.unwrap().is_some());
+    assert!(fixture
+        .orchestrator
+        .process_incoming(&envelope)
+        .await
+        .unwrap()
+        .is_some());
     assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -2550,7 +2609,10 @@ async fn send_message_binds_authoritative_coordinates_from_point_read() {
         .delivery_service()
         .submitted_prepared_requests()
         .iter()
-        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
         .count();
 
     alice
@@ -2563,12 +2625,20 @@ async fn send_message_binds_authoritative_coordinates_from_point_read() {
         .delivery_service()
         .submitted_prepared_requests()
         .into_iter()
-        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
         .collect();
-    assert_eq!(sends.len(), prior_send_count + 1, "exactly one SendMessage request must be emitted");
+    assert_eq!(
+        sends.len(),
+        prior_send_count + 1,
+        "exactly one SendMessage request must be emitted"
+    );
 
     let last_send = sends.last().unwrap();
-    let wire: serde_json::Value = serde_json::from_slice(last_send.body.as_deref().unwrap()).unwrap();
+    let wire: serde_json::Value =
+        serde_json::from_slice(last_send.body.as_deref().unwrap()).unwrap();
     let inner_body = wire
         .get("signedRequest")
         .and_then(|s| s.get("body"))
@@ -2615,7 +2685,10 @@ async fn send_message_fails_closed_without_sending_when_point_read_fails_or_lack
         .delivery_service()
         .submitted_prepared_requests()
         .iter()
-        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
         .count();
 
     // 1. Point read fails (non-200 / error)
@@ -2626,8 +2699,12 @@ async fn send_message_fails_closed_without_sending_when_point_read_fails_or_lack
         .await
         .expect_err("send must fail when point read fails");
     assert!(
-        err.to_string().contains("injected getConversationState failure")
-            || matches!(err, catbird_mls::orchestrator::OrchestratorError::ServerError { .. })
+        err.to_string()
+            .contains("injected getConversationState failure")
+            || matches!(
+                err,
+                catbird_mls::orchestrator::OrchestratorError::ServerError { .. }
+            )
             || matches!(err, catbird_mls::orchestrator::OrchestratorError::Api(_)),
         "unexpected error: {err}"
     );
@@ -2635,42 +2712,61 @@ async fn send_message_fails_closed_without_sending_when_point_read_fails_or_lack
         .delivery_service()
         .submitted_prepared_requests()
         .iter()
-        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
         .count();
-    assert_eq!(send_count_after_500, send_count_before, "zero send attempts when point read fails");
+    assert_eq!(
+        send_count_after_500, send_count_before,
+        "zero send attempts when point read fails"
+    );
 
     // 2. Point read returns non-200 status (e.g. 404 ConversationNotFound)
-    world.delivery_service().set_next_get_conversation_state_custom_response(
-        404,
-        serde_json::json!({ "error": "ConversationNotFound" }),
-    );
+    world
+        .delivery_service()
+        .set_next_get_conversation_state_custom_response(
+            404,
+            serde_json::json!({ "error": "ConversationNotFound" }),
+        );
     let err = alice
         .orchestrator
         .send_message(group_id, "fail on 404")
         .await
         .expect_err("send must fail when point read returns 404");
     assert!(
-        matches!(err, catbird_mls::orchestrator::OrchestratorError::ServerError { status: 404, .. }),
+        matches!(
+            err,
+            catbird_mls::orchestrator::OrchestratorError::ServerError { status: 404, .. }
+        ),
         "unexpected error: {err}"
     );
     let send_count_after_404 = world
         .delivery_service()
         .submitted_prepared_requests()
         .iter()
-        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
         .count();
-    assert_eq!(send_count_after_404, send_count_before, "zero send attempts when point read returns 404");
+    assert_eq!(
+        send_count_after_404, send_count_before,
+        "zero send attempts when point read returns 404"
+    );
 
     // 3. Point read returns body without state.coordinates
-    world.delivery_service().set_next_get_conversation_state_custom_response(
-        200,
-        serde_json::json!({
-            "state": {
-                "conversationKind": "group"
-                // missing coordinates!
-            }
-        }),
-    );
+    world
+        .delivery_service()
+        .set_next_get_conversation_state_custom_response(
+            200,
+            serde_json::json!({
+                "state": {
+                    "conversationKind": "group"
+                    // missing coordinates!
+                }
+            }),
+        );
     let err = alice
         .orchestrator
         .send_message(group_id, "fail on missing coords")
@@ -2684,7 +2780,10 @@ async fn send_message_fails_closed_without_sending_when_point_read_fails_or_lack
         .delivery_service()
         .submitted_prepared_requests()
         .iter()
-        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
         .count();
     assert_eq!(
         send_count_after_missing_coords, send_count_before,
@@ -2693,7 +2792,8 @@ async fn send_message_fails_closed_without_sending_when_point_read_fails_or_lack
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn send_message_fails_closed_without_sending_when_coordinates_identify_different_conversation() {
+async fn send_message_fails_closed_without_sending_when_coordinates_identify_different_conversation(
+) {
     let mut world = TestWorld::new();
     world.add_client("Alice").await;
     world.register_device("Alice").await.unwrap();
@@ -2710,7 +2810,10 @@ async fn send_message_fails_closed_without_sending_when_coordinates_identify_dif
         .delivery_service()
         .submitted_prepared_requests()
         .iter()
-        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
         .count();
 
     let mut state = world
@@ -2729,7 +2832,8 @@ async fn send_message_fails_closed_without_sending_when_coordinates_identify_dif
         .await
         .expect_err("send must fail when coordinates identify different conversation");
     assert!(
-        err.to_string().contains("coordinates identify a different conversation"),
+        err.to_string()
+            .contains("coordinates identify a different conversation"),
         "error must mention conversation mismatch: {err}"
     );
 
@@ -2737,7 +2841,10 @@ async fn send_message_fails_closed_without_sending_when_coordinates_identify_dif
         .delivery_service()
         .submitted_prepared_requests()
         .iter()
-        .filter(|r| r.operation == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage)
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
         .count();
     assert_eq!(
         send_count_after, send_count_before,

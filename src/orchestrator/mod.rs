@@ -10,12 +10,12 @@ pub mod credentials;
 pub mod crypto_provider;
 pub mod devices;
 mod direct_adoption;
-pub mod direct_request_types;
-pub mod direct_requests;
-pub mod direct_request_shared_crypto;
 pub mod direct_request_bootstrap;
 pub mod direct_request_journal;
 pub mod direct_request_keys;
+pub mod direct_request_shared_crypto;
+pub mod direct_request_types;
+pub mod direct_requests;
 pub mod error;
 pub mod event_observer;
 pub mod groups;
@@ -28,8 +28,8 @@ pub mod messaging;
 pub mod mls_provider;
 pub mod orchestrator;
 pub mod ordering;
-pub mod projection_commit;
 pub(crate) mod pagination;
+pub mod projection_commit;
 pub mod recovery;
 pub mod reset_flow;
 pub mod staged_commit;
@@ -68,11 +68,11 @@ pub use canonical_transport::{
     CleanChatTransportFfiError,
 };
 pub use constants::*;
-pub use direct_request_types::*;
 pub use credential_binding::{
     extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,
 };
 pub use credentials::{CleanChatSigningAuthority, CredentialStore};
+pub use direct_request_types::*;
 pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
 pub use mls_provider::{MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof};

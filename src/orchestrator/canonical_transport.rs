@@ -23,8 +23,8 @@ use crate::atproto::blue_catbird::chat::{
     get_blob_usage::GetBlobUsageRequest,
     get_conversation_state::GetConversationStateRequest,
     get_conversations::{GetConversations, GetConversationsRequest},
-    get_devices::GetDevicesRequest,
     get_device_key::GetDeviceKeyRequest,
+    get_devices::GetDevicesRequest,
     get_entries::{GetEntries, GetEntriesRequest},
     get_leaf_recovery_inbox::GetLeafRecoveryInboxRequest,
     get_own_devices::GetOwnDevicesRequest,
@@ -495,7 +495,9 @@ impl From<CleanChatOperationFfi> for CanonicalOperation {
         match operation {
             CleanChatOperationFfi::PrepareDirectRequest => Self::PrepareDirectRequest,
             CleanChatOperationFfi::PublishDirectRequest => Self::PublishDirectRequest,
-            CleanChatOperationFfi::CancelDirectRequestPreparation => Self::CancelDirectRequestPreparation,
+            CleanChatOperationFfi::CancelDirectRequestPreparation => {
+                Self::CancelDirectRequestPreparation
+            }
             CleanChatOperationFfi::GetDirectRequestOutcome => Self::GetDirectRequestOutcome,
             CleanChatOperationFfi::PublishDirectRequestKeys => Self::PublishDirectRequestKeys,
             CleanChatOperationFfi::AcceptConversation => Self::AcceptConversation,
@@ -540,7 +542,9 @@ impl From<CanonicalOperation> for CleanChatOperationFfi {
         match operation {
             CanonicalOperation::PrepareDirectRequest => Self::PrepareDirectRequest,
             CanonicalOperation::PublishDirectRequest => Self::PublishDirectRequest,
-            CanonicalOperation::CancelDirectRequestPreparation => Self::CancelDirectRequestPreparation,
+            CanonicalOperation::CancelDirectRequestPreparation => {
+                Self::CancelDirectRequestPreparation
+            }
             CanonicalOperation::GetDirectRequestOutcome => Self::GetDirectRequestOutcome,
             CanonicalOperation::PublishDirectRequestKeys => Self::PublishDirectRequestKeys,
             CanonicalOperation::AcceptConversation => Self::AcceptConversation,
@@ -652,13 +656,23 @@ fn parse_ffi_request(
     operation: CanonicalOperation,
     body: &[u8],
 ) -> Result<CleanChatRequest, CleanChatTransportFfiError> {
-    validate_direct_endpoint_raw(operation,body).map_err(ffi_error)?;
+    validate_direct_endpoint_raw(operation, body).map_err(ffi_error)?;
     match operation {
-        CanonicalOperation::PrepareDirectRequest => parse_json_req(body, CleanChatRequest::PrepareDirectRequest),
-        CanonicalOperation::PublishDirectRequest => parse_json_req(body, CleanChatRequest::PublishDirectRequest),
-        CanonicalOperation::CancelDirectRequestPreparation => parse_json_req(body, CleanChatRequest::CancelDirectRequestPreparation),
-        CanonicalOperation::GetDirectRequestOutcome => parse_json_req(body, CleanChatRequest::GetDirectRequestOutcome),
-        CanonicalOperation::PublishDirectRequestKeys => parse_json_req(body, CleanChatRequest::PublishDirectRequestKeys),
+        CanonicalOperation::PrepareDirectRequest => {
+            parse_json_req(body, CleanChatRequest::PrepareDirectRequest)
+        }
+        CanonicalOperation::PublishDirectRequest => {
+            parse_json_req(body, CleanChatRequest::PublishDirectRequest)
+        }
+        CanonicalOperation::CancelDirectRequestPreparation => {
+            parse_json_req(body, CleanChatRequest::CancelDirectRequestPreparation)
+        }
+        CanonicalOperation::GetDirectRequestOutcome => {
+            parse_json_req(body, CleanChatRequest::GetDirectRequestOutcome)
+        }
+        CanonicalOperation::PublishDirectRequestKeys => {
+            parse_json_req(body, CleanChatRequest::PublishDirectRequestKeys)
+        }
         CanonicalOperation::AcceptConversation => {
             parse_json_req(body, CleanChatRequest::AcceptConversation)
         }
@@ -779,11 +793,21 @@ pub fn decode_clean_chat_response(
     let response =
         CleanChatResponse::decode(operation.into(), &response_json).map_err(ffi_error)?;
     match response {
-        CleanChatResponse::PrepareDirectRequest(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::PublishDirectRequest(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::CancelDirectRequestPreparation(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::GetDirectRequestOutcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatResponse::PublishDirectRequestKeys(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::PrepareDirectRequest(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::PublishDirectRequest(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::CancelDirectRequestPreparation(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::GetDirectRequestOutcome(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::PublishDirectRequestKeys(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::AcceptConversation(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
         }
@@ -853,11 +877,21 @@ pub fn decode_clean_chat_error(
 ) -> Result<Vec<u8>, CleanChatTransportFfiError> {
     let error = CleanChatError::decode(operation.into(), &error_json).map_err(ffi_error)?;
     match error {
-        CleanChatError::PrepareDirectRequest(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::PublishDirectRequest(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::CancelDirectRequestPreparation(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::GetDirectRequestOutcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
-        CleanChatError::PublishDirectRequestKeys(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::PrepareDirectRequest(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::PublishDirectRequest(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::CancelDirectRequestPreparation(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::GetDirectRequestOutcome(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::PublishDirectRequestKeys(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatError::AcceptConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::AcknowledgeWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::ActivateReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
@@ -906,7 +940,9 @@ impl CleanChatRequest {
         match self {
             Self::PrepareDirectRequest(_) => CanonicalOperation::PrepareDirectRequest,
             Self::PublishDirectRequest(_) => CanonicalOperation::PublishDirectRequest,
-            Self::CancelDirectRequestPreparation(_) => CanonicalOperation::CancelDirectRequestPreparation,
+            Self::CancelDirectRequestPreparation(_) => {
+                CanonicalOperation::CancelDirectRequestPreparation
+            }
             Self::GetDirectRequestOutcome(_) => CanonicalOperation::GetDirectRequestOutcome,
             Self::PublishDirectRequestKeys(_) => CanonicalOperation::PublishDirectRequestKeys,
             Self::AcceptConversation(_) => CanonicalOperation::AcceptConversation,
@@ -2370,7 +2406,10 @@ impl<'de> Deserialize<'de> for ConversationReadJson {
                 Ok(ConversationReadJson(value.into()))
             }
 
-            fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut sequence: A,
+            ) -> Result<Self::Value, A::Error> {
                 let mut values = Vec::new();
                 while let Some(ConversationReadJson(value)) = sequence.next_element()? {
                     values.push(value);
@@ -2394,24 +2433,40 @@ impl<'de> Deserialize<'de> for ConversationReadJson {
 }
 
 fn remove_read_routing_extensions(state: &mut serde_json::Value) -> Result<(), TransportError> {
-    let Some(fields) = state.as_object_mut() else { return Ok(()); };
+    let Some(fields) = state.as_object_mut() else {
+        return Ok(());
+    };
     if let Some(did) = fields.remove("sequencerDid") {
         match did {
             serde_json::Value::Null => {}
             serde_json::Value::String(did)
-                if crate::atproto::jacquard_common::types::string::Did::new(did.as_str()).is_ok() => {}
-            _ => return Err(TransportError::Serialization("sequencerDid must be a valid DID or null".into())),
+                if crate::atproto::jacquard_common::types::string::Did::new(did.as_str())
+                    .is_ok() => {}
+            _ => {
+                return Err(TransportError::Serialization(
+                    "sequencerDid must be a valid DID or null".into(),
+                ))
+            }
         }
     }
     if let Some(term) = fields.remove("sequencerTerm") {
-        if !term.is_null() && !term.as_u64().is_some_and(|term| term <= 9_007_199_254_740_991) {
-            return Err(TransportError::Serialization("sequencerTerm must be a nonnegative safe integer or null".into()));
+        if !term.is_null()
+            && !term
+                .as_u64()
+                .is_some_and(|term| term <= 9_007_199_254_740_991)
+        {
+            return Err(TransportError::Serialization(
+                "sequencerTerm must be a nonnegative safe integer or null".into(),
+            ));
         }
     }
     Ok(())
 }
 
-fn parse_conversation_read_json(raw: &[u8], inventory: bool) -> Result<StrictSignedJson, TransportError> {
+fn parse_conversation_read_json(
+    raw: &[u8],
+    inventory: bool,
+) -> Result<StrictSignedJson, TransportError> {
     // Keep the existing read size/framing limit before allocating or compacting
     // the response. The unchanged strict parser checks the remaining policy.
     if raw.is_empty()
@@ -2419,16 +2474,25 @@ fn parse_conversation_read_json(raw: &[u8], inventory: bool) -> Result<StrictSig
         || raw.first() != Some(&b'{')
         || raw.last() != Some(&b'}')
     {
-        return Err(TransportError::Serialization("conversation read JSON has an invalid root or framing".into()));
+        return Err(TransportError::Serialization(
+            "conversation read JSON has an invalid root or framing".into(),
+        ));
     }
     let mut deserializer = serde_json::Deserializer::from_slice(raw);
     let ConversationReadJson(mut value) = ConversationReadJson::deserialize(&mut deserializer)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
-    deserializer.end().map_err(|error| TransportError::Serialization(error.to_string()))?;
+    deserializer
+        .end()
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
     if inventory {
-        if let Some(items) = value.get_mut("items").and_then(serde_json::Value::as_array_mut) {
+        if let Some(items) = value
+            .get_mut("items")
+            .and_then(serde_json::Value::as_array_mut)
+        {
             for item in items {
-                if item["$type"].as_str() == Some("blue.catbird.chat.defs#conversationInventoryState") {
+                if item["$type"].as_str()
+                    == Some("blue.catbird.chat.defs#conversationInventoryState")
+                {
                     if let Some(state) = item.get_mut("state") {
                         remove_read_routing_extensions(state)?;
                     }
@@ -2438,7 +2502,8 @@ fn parse_conversation_read_json(raw: &[u8], inventory: bool) -> Result<StrictSig
     } else {
         remove_read_routing_extensions(&mut value)?;
     }
-    let raw = serde_json::to_vec(&value).map_err(|error| TransportError::Serialization(error.to_string()))?;
+    let raw = serde_json::to_vec(&value)
+        .map_err(|error| TransportError::Serialization(error.to_string()))?;
     parse_strict_signed_json(&raw)
 }
 
@@ -2456,24 +2521,44 @@ fn normalize_read_type_tags(
             normalize_read_type_tags(chat_definition(name)?, input, Some(name), false)
         }
         Some("union") => {
-            let StrictSignedJson::Object(values) = input else { return Ok(()); };
-            let Some(value) = values.get("$type") else { return Ok(()); };
+            let StrictSignedJson::Object(values) = input else {
+                return Ok(());
+            };
+            let Some(value) = values.get("$type") else {
+                return Ok(());
+            };
             let tag = strict_text(value, "$type")?;
-            let name = tag.strip_prefix(TYPE_PREFIX).ok_or_else(|| TransportError::Serialization("invalid read union namespace".into()))?.to_owned();
-            if !schema["refs"].as_array().is_some_and(|refs| refs.iter().any(|value| value.as_str() == Some(&format!("#{name}")))) {
-                return Err(TransportError::Serialization("unknown read union variant".into()));
+            let name = tag
+                .strip_prefix(TYPE_PREFIX)
+                .ok_or_else(|| {
+                    TransportError::Serialization("invalid read union namespace".into())
+                })?
+                .to_owned();
+            if !schema["refs"].as_array().is_some_and(|refs| {
+                refs.iter()
+                    .any(|value| value.as_str() == Some(&format!("#{name}")))
+            }) {
+                return Err(TransportError::Serialization(
+                    "unknown read union variant".into(),
+                ));
             }
             normalize_read_type_tags(chat_definition(&name)?, input, Some(&name), true)
         }
         Some("object") => {
-            let StrictSignedJson::Object(values) = input else { return Ok(()); };
+            let StrictSignedJson::Object(values) = input else {
+                return Ok(());
+            };
             if let (Some(name), Some(tag)) = (definition, values.get("$type")) {
                 if strict_text(tag, "$type")? != format!("{TYPE_PREFIX}{name}") {
-                    return Err(TransportError::Serialization("wrong read object $type".into()));
+                    return Err(TransportError::Serialization(
+                        "wrong read object $type".into(),
+                    ));
                 }
                 // Swift emits redundant tags for fixed refs. The endpoint's
                 // schema already fixes their type; unions retain their tag.
-                if !union_variant { values.remove("$type"); }
+                if !union_variant {
+                    values.remove("$type");
+                }
             }
             if let Some(properties) = schema["properties"].as_object() {
                 for (name, value) in values {
@@ -2486,7 +2571,9 @@ fn normalize_read_type_tags(
         }
         Some("array") => {
             if let StrictSignedJson::Array(values) = input {
-                for value in values { normalize_read_type_tags(&schema["items"], value, None, false)?; }
+                for value in values {
+                    normalize_read_type_tags(&schema["items"], value, None, false)?;
+                }
             }
             Ok(())
         }
@@ -2498,7 +2585,12 @@ pub fn decode_conversation_state(
     raw: &[u8],
 ) -> Result<catbird_atproto::blue_catbird::chat::ConversationState, TransportError> {
     let mut input = parse_conversation_read_json(raw, false)?;
-    normalize_read_type_tags(chat_definition("conversationState")?, &mut input, Some("conversationState"), false)?;
+    normalize_read_type_tags(
+        chat_definition("conversationState")?,
+        &mut input,
+        Some("conversationState"),
+        false,
+    )?;
     let projected = project_schema_ref("conversationState", &input, false)?;
     let state = serde_json::from_value(generated_json_ref("conversationState", &projected, false)?)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
@@ -2507,39 +2599,64 @@ pub fn decode_conversation_state(
     Ok(state)
 }
 
-pub fn decode_conversation_coordinates(raw: &[u8]) -> Result<catbird_atproto::blue_catbird::chat::ConversationCoordinates, TransportError> {
+pub fn decode_conversation_coordinates(
+    raw: &[u8],
+) -> Result<catbird_atproto::blue_catbird::chat::ConversationCoordinates, TransportError> {
     let mut input = parse_strict_signed_json(raw)?;
-    normalize_read_type_tags(chat_definition("conversationCoordinates")?, &mut input, Some("conversationCoordinates"), false)?;
+    normalize_read_type_tags(
+        chat_definition("conversationCoordinates")?,
+        &mut input,
+        Some("conversationCoordinates"),
+        false,
+    )?;
     let projected = project_schema_ref("conversationCoordinates", &input, false)?;
-    serde_json::from_value(generated_json_ref("conversationCoordinates", &projected, false)?)
-        .map_err(|error| TransportError::Serialization(error.to_string()))
+    serde_json::from_value(generated_json_ref(
+        "conversationCoordinates",
+        &projected,
+        false,
+    )?)
+    .map_err(|error| TransportError::Serialization(error.to_string()))
 }
 
-fn wrap_read_wire_bytes(schema: &serde_json::Value, value: &mut serde_json::Value) -> Result<(), TransportError> {
+fn wrap_read_wire_bytes(
+    schema: &serde_json::Value,
+    value: &mut serde_json::Value,
+) -> Result<(), TransportError> {
     match schema["type"].as_str() {
         Some("ref") => wrap_read_wire_bytes(chat_definition(schema_ref_name(schema)?)?, value),
         Some("bytes") => {
-            let text = value.as_str().ok_or_else(|| TransportError::Serialization("invalid encoded read bytes".into()))?;
+            let text = value.as_str().ok_or_else(|| {
+                TransportError::Serialization("invalid encoded read bytes".into())
+            })?;
             *value = serde_json::json!({"$bytes": text});
             Ok(())
         }
         Some("object") => {
-            if let (Some(properties), Some(values)) = (schema["properties"].as_object(), value.as_object_mut()) {
+            if let (Some(properties), Some(values)) =
+                (schema["properties"].as_object(), value.as_object_mut())
+            {
                 for (name, value) in values {
-                    if let Some(property) = properties.get(name) { wrap_read_wire_bytes(property, value)?; }
+                    if let Some(property) = properties.get(name) {
+                        wrap_read_wire_bytes(property, value)?;
+                    }
                 }
             }
             Ok(())
         }
         Some("array") => {
             if let Some(values) = value.as_array_mut() {
-                for value in values { wrap_read_wire_bytes(&schema["items"], value)?; }
+                for value in values {
+                    wrap_read_wire_bytes(&schema["items"], value)?;
+                }
             }
             Ok(())
         }
         Some("union") => {
-            let name = value["$type"].as_str().and_then(|tag| tag.strip_prefix(TYPE_PREFIX))
-                .ok_or_else(|| TransportError::Serialization("invalid encoded read union".into()))?.to_owned();
+            let name = value["$type"]
+                .as_str()
+                .and_then(|tag| tag.strip_prefix(TYPE_PREFIX))
+                .ok_or_else(|| TransportError::Serialization("invalid encoded read union".into()))?
+                .to_owned();
             wrap_read_wire_bytes(chat_definition(&name)?, value)
         }
         _ => Ok(()),
@@ -2555,44 +2672,72 @@ pub fn encode_conversation_state(
     let raw = serde_json::to_vec(state)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
     let mut input = parse_conversation_read_json(&raw, false)?;
-    normalize_read_type_tags(chat_definition("conversationState")?, &mut input, Some("conversationState"), false)?;
+    normalize_read_type_tags(
+        chat_definition("conversationState")?,
+        &mut input,
+        Some("conversationState"),
+        false,
+    )?;
     let projected = project_schema_ref("conversationState", &input, false)?;
     let mut output = wire_json_ref("conversationState", &projected, false)?;
     // FFI consumers use generated ATProto Bytes, including aliases, whose
     // portable JSON representation is the explicit $bytes object.
     wrap_read_wire_bytes(chat_definition("conversationState")?, &mut output)?;
-    serde_json::to_vec(&output)
-        .map_err(|error| TransportError::Serialization(error.to_string()))
+    serde_json::to_vec(&output).map_err(|error| TransportError::Serialization(error.to_string()))
 }
 
 /// Decode a canonical inventory while retaining its cursors and all tombstone
 /// variants. Only schema-defined item bytes are converted for generated Rust.
 pub fn decode_conversations_inventory(
     raw: &[u8],
-) -> Result<catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput, TransportError> {
+) -> Result<
+    catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput,
+    TransportError,
+> {
     let input = parse_conversation_read_json(raw, true)?;
     let StrictSignedJson::Object(fields) = input else {
-        return Err(TransportError::Serialization("inventory must be an object".into()));
+        return Err(TransportError::Serialization(
+            "inventory must be an object".into(),
+        ));
     };
     let Some(StrictSignedJson::Array(items)) = fields.get("items") else {
-        return Err(TransportError::Serialization("inventory items must be an array".into()));
+        return Err(TransportError::Serialization(
+            "inventory items must be an array".into(),
+        ));
     };
     let mut output: serde_json::Value = serde_json::from_slice(raw)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
-    if let Some(scope)=fields.get("inventoryScope") {
-        let mut scope=scope.clone();
-        normalize_read_type_tags(chat_definition("directRequestInventoryScope")?,&mut scope,Some("directRequestInventoryScope"),false)?;
-        let projected=project_schema_ref("directRequestInventoryScope",&scope,false)?;
-        output["inventoryScope"]=generated_json_ref("directRequestInventoryScope",&projected,false)?;
+    if let Some(scope) = fields.get("inventoryScope") {
+        let mut scope = scope.clone();
+        normalize_read_type_tags(
+            chat_definition("directRequestInventoryScope")?,
+            &mut scope,
+            Some("directRequestInventoryScope"),
+            false,
+        )?;
+        let projected = project_schema_ref("directRequestInventoryScope", &scope, false)?;
+        output["inventoryScope"] =
+            generated_json_ref("directRequestInventoryScope", &projected, false)?;
     }
-    output["items"] = serde_json::Value::Array(items.iter().map(|item| {
-        let mut item = item.clone();
-        normalize_read_type_tags(chat_definition("conversationInventoryItem")?, &mut item, Some("conversationInventoryItem"), true)?;
-        let projected = project_schema_ref("conversationInventoryItem", &item, true)?;
-        generated_json_ref("conversationInventoryItem", &projected, true)
-    }).collect::<Result<Vec<_>, TransportError>>()?);
+    output["items"] = serde_json::Value::Array(
+        items
+            .iter()
+            .map(|item| {
+                let mut item = item.clone();
+                normalize_read_type_tags(
+                    chat_definition("conversationInventoryItem")?,
+                    &mut item,
+                    Some("conversationInventoryItem"),
+                    true,
+                )?;
+                let projected = project_schema_ref("conversationInventoryItem", &item, true)?;
+                generated_json_ref("conversationInventoryItem", &projected, true)
+            })
+            .collect::<Result<Vec<_>, TransportError>>()?,
+    );
     let output: catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput =
-        serde_json::from_value(output).map_err(|error| TransportError::Serialization(error.to_string()))?;
+        serde_json::from_value(output)
+            .map_err(|error| TransportError::Serialization(error.to_string()))?;
     for item in &output.items {
         if let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = item {
             super::admission::validate_conversation_policy(&item.state)
@@ -2604,25 +2749,80 @@ pub fn decode_conversations_inventory(
 
 /// Strict schema-aware inventory decoder, including byte aliases in scoped
 /// reader fences and Welcome/recovery variants. Raw bytes remain host custody.
-pub fn validate_authenticated_inventory_page(operation:CanonicalOperation,raw:&[u8])->Result<(),TransportError>{
-    if operation==CanonicalOperation::GetConversations {decode_conversations_inventory(raw)?;return Ok(());}
-    if !matches!(operation,CanonicalOperation::GetPendingWelcomes|CanonicalOperation::GetLeafRecoveryInbox){return Err(TransportError::Serialization("not an inventory endpoint".into()));}
-    let input=parse_strict_signed_json(raw)?;
-    let StrictSignedJson::Object(fields)=input else{return Err(TransportError::Serialization("inventory must be an object".into()))};
-    let Some(StrictSignedJson::Array(items))=fields.get("items") else{return Err(TransportError::Serialization("inventory items must be an array".into()))};
-    let mut output:serde_json::Value=serde_json::from_slice(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;
-    if let Some(scope)=fields.get("inventoryScope") {
-        let mut scope=scope.clone();normalize_read_type_tags(chat_definition("directRequestInventoryScope")?,&mut scope,Some("directRequestInventoryScope"),false)?;
-        output["inventoryScope"]=generated_json_ref("directRequestInventoryScope",&project_schema_ref("directRequestInventoryScope",&scope,false)?,false)?;
+pub fn validate_authenticated_inventory_page(
+    operation: CanonicalOperation,
+    raw: &[u8],
+) -> Result<(), TransportError> {
+    if operation == CanonicalOperation::GetConversations {
+        decode_conversations_inventory(raw)?;
+        return Ok(());
     }
-    output["items"]=serde_json::Value::Array(items.iter().enumerate().map(|(index,item)|{
-        let name=if operation==CanonicalOperation::GetLeafRecoveryInbox {"leafRecoveryInboxItem"}else{
-            match output["items"][index]["$type"].as_str(){Some("blue.catbird.chat.defs#welcomeView")=>"welcomeView",Some("blue.catbird.chat.defs#directRequestWelcomeView")=>"directRequestWelcomeView",_=>return Err(TransportError::Serialization("unknown Welcome inventory item".into()))}
-        };
-        let mut item=item.clone();normalize_read_type_tags(chat_definition(name)?,&mut item,Some(name),true)?;
-        generated_json_ref(name,&project_schema_ref(name,&item,true)?,true)
-    }).collect::<Result<Vec<_>,TransportError>>()?);
-    CleanChatResponse::decode(operation,&serde_json::to_vec(&output).map_err(|e|TransportError::Serialization(e.to_string()))?)?;Ok(())
+    if !matches!(
+        operation,
+        CanonicalOperation::GetPendingWelcomes | CanonicalOperation::GetLeafRecoveryInbox
+    ) {
+        return Err(TransportError::Serialization(
+            "not an inventory endpoint".into(),
+        ));
+    }
+    let input = parse_strict_signed_json(raw)?;
+    let StrictSignedJson::Object(fields) = input else {
+        return Err(TransportError::Serialization(
+            "inventory must be an object".into(),
+        ));
+    };
+    let Some(StrictSignedJson::Array(items)) = fields.get("items") else {
+        return Err(TransportError::Serialization(
+            "inventory items must be an array".into(),
+        ));
+    };
+    let mut output: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    if let Some(scope) = fields.get("inventoryScope") {
+        let mut scope = scope.clone();
+        normalize_read_type_tags(
+            chat_definition("directRequestInventoryScope")?,
+            &mut scope,
+            Some("directRequestInventoryScope"),
+            false,
+        )?;
+        output["inventoryScope"] = generated_json_ref(
+            "directRequestInventoryScope",
+            &project_schema_ref("directRequestInventoryScope", &scope, false)?,
+            false,
+        )?;
+    }
+    output["items"] = serde_json::Value::Array(
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let name = if operation == CanonicalOperation::GetLeafRecoveryInbox {
+                    "leafRecoveryInboxItem"
+                } else {
+                    match output["items"][index]["$type"].as_str() {
+                        Some("blue.catbird.chat.defs#welcomeView") => "welcomeView",
+                        Some("blue.catbird.chat.defs#directRequestWelcomeView") => {
+                            "directRequestWelcomeView"
+                        }
+                        _ => {
+                            return Err(TransportError::Serialization(
+                                "unknown Welcome inventory item".into(),
+                            ))
+                        }
+                    }
+                };
+                let mut item = item.clone();
+                normalize_read_type_tags(chat_definition(name)?, &mut item, Some(name), true)?;
+                generated_json_ref(name, &project_schema_ref(name, &item, true)?, true)
+            })
+            .collect::<Result<Vec<_>, TransportError>>()?,
+    );
+    CleanChatResponse::decode(
+        operation,
+        &serde_json::to_vec(&output).map_err(|e| TransportError::Serialization(e.to_string()))?,
+    )?;
+    Ok(())
 }
 
 fn generated_json_ref(
@@ -3638,7 +3838,11 @@ pub(crate) fn get_conversations(
         query.push_str("&pageCursor=");
         query.push_str(&encode_query(cursor));
     }
-    for version in value["supportedProtocolVersions"].as_array().into_iter().flatten() {
+    for version in value["supportedProtocolVersions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
         query.push_str("&supportedProtocolVersions=");
         query.push_str(&encode_query(version.as_str().unwrap_or_default()));
     }
@@ -3893,7 +4097,8 @@ mod read_routing_extension_tests {
         // coordinates, keys, IDs, field shapes and routing were preserved.
         serde_json::from_str(include_str!(
             "../../tests/fixtures/live_870_conversation_inventory_states.json"
-        )).unwrap()
+        ))
+        .unwrap()
     }
 
     fn policy_only(mut state: serde_json::Value) -> serde_json::Value {
@@ -3916,11 +4121,19 @@ mod read_routing_extension_tests {
         let items = live_items();
         for item in &items {
             let wire = &item["state"];
-            let expected = decode_conversation_state(&serde_json::to_vec(&policy_only(wire.clone())).unwrap()).unwrap();
+            let expected =
+                decode_conversation_state(&serde_json::to_vec(&policy_only(wire.clone())).unwrap())
+                    .unwrap();
             let actual = decode_conversation_state(&serde_json::to_vec(wire).unwrap()).unwrap();
             assert_eq!(actual, expected);
-            assert!(actual.extra_data.as_ref().is_none_or(|extra| extra.is_empty()));
-            assert_eq!(decode_conversation_state(&encode_conversation_state(&actual).unwrap()).unwrap(), expected);
+            assert!(actual
+                .extra_data
+                .as_ref()
+                .is_none_or(|extra| extra.is_empty()));
+            assert_eq!(
+                decode_conversation_state(&encode_conversation_state(&actual).unwrap()).unwrap(),
+                expected
+            );
             assert!(canonical_cbor_for_schema_impl("conversationState", wire, false).is_err());
 
             // A generated DTO preserves unknown wire fields as extra_data.
@@ -3928,11 +4141,17 @@ mod read_routing_extension_tests {
             let mut generated = serde_json::to_value(&expected).unwrap();
             generated["sequencerDid"] = wire["sequencerDid"].clone();
             generated["sequencerTerm"] = wire["sequencerTerm"].clone();
-            let generated: catbird_atproto::blue_catbird::chat::ConversationState = serde_json::from_value(generated).unwrap();
+            let generated: catbird_atproto::blue_catbird::chat::ConversationState =
+                serde_json::from_value(generated).unwrap();
             assert!(generated.extra_data.is_some());
-            assert_eq!(decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(), expected);
+            assert_eq!(
+                decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(),
+                expected
+            );
         }
-        let output = decode_conversations_inventory(&serde_json::to_vec(&inventory(items)).unwrap()).unwrap();
+        let output =
+            decode_conversations_inventory(&serde_json::to_vec(&inventory(items)).unwrap())
+                .unwrap();
         assert_eq!(output.items.len(), 3);
         assert_eq!(output.snapshot_event_cursor.as_str(), "synthetic-cursor");
     }
@@ -3943,22 +4162,43 @@ mod read_routing_extension_tests {
         let expected = decode_conversation_state(&serde_json::to_vec(&state).unwrap()).unwrap();
         for (did, term) in [
             (serde_json::Value::Null, serde_json::Value::Null),
-            (serde_json::json!("did:web:chat.catbird.blue"), serde_json::Value::Null),
-            (serde_json::Value::Null, serde_json::json!(9_007_199_254_740_991u64)),
-            (serde_json::json!("did:web:another.example"), serde_json::json!(1)),
+            (
+                serde_json::json!("did:web:chat.catbird.blue"),
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::Value::Null,
+                serde_json::json!(9_007_199_254_740_991u64),
+            ),
+            (
+                serde_json::json!("did:web:another.example"),
+                serde_json::json!(1),
+            ),
         ] {
             let mut wire = state.clone();
             wire["sequencerDid"] = did;
             wire["sequencerTerm"] = term;
-            assert_eq!(decode_conversation_state(&serde_json::to_vec(&wire).unwrap()).unwrap(), expected);
+            assert_eq!(
+                decode_conversation_state(&serde_json::to_vec(&wire).unwrap()).unwrap(),
+                expected
+            );
             assert!(canonical_cbor_for_schema_impl("conversationState", &wire, false).is_err());
             let mut generated = serde_json::to_value(&expected).unwrap();
             generated["sequencerDid"] = wire["sequencerDid"].clone();
             generated["sequencerTerm"] = wire["sequencerTerm"].clone();
-            let generated: catbird_atproto::blue_catbird::chat::ConversationState = serde_json::from_value(generated).unwrap();
-            assert_eq!(decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(), expected);
-            let items = vec![serde_json::json!({"$type":"blue.catbird.chat.defs#conversationInventoryState", "state":wire})];
-            assert!(decode_conversations_inventory(&serde_json::to_vec(&inventory(items)).unwrap()).is_ok());
+            let generated: catbird_atproto::blue_catbird::chat::ConversationState =
+                serde_json::from_value(generated).unwrap();
+            assert_eq!(
+                decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(),
+                expected
+            );
+            let items = vec![
+                serde_json::json!({"$type":"blue.catbird.chat.defs#conversationInventoryState", "state":wire}),
+            ];
+            assert!(decode_conversations_inventory(
+                &serde_json::to_vec(&inventory(items)).unwrap()
+            )
+            .is_ok());
         }
     }
 
@@ -3966,7 +4206,10 @@ mod read_routing_extension_tests {
     fn routing_extensions_reject_malformed_unknown_nested_and_duplicate_fields() {
         let state = policy_only(live_items().remove(0)["state"].clone());
         for (field, value) in [
-            ("sequencerDid", serde_json::json!("https://chat.catbird.blue")),
+            (
+                "sequencerDid",
+                serde_json::json!("https://chat.catbird.blue"),
+            ),
             ("sequencerDid", serde_json::json!(17)),
             ("sequencerDid", serde_json::json!({})),
             ("sequencerTerm", serde_json::json!("0")),
@@ -3979,10 +4222,18 @@ mod read_routing_extension_tests {
         ] {
             let mut wire = state.clone();
             wire[field] = value;
-            assert!(decode_conversation_state(&serde_json::to_vec(&wire).unwrap()).is_err(), "accepted {field}: {}", wire[field]);
+            assert!(
+                decode_conversation_state(&serde_json::to_vec(&wire).unwrap()).is_err(),
+                "accepted {field}: {}",
+                wire[field]
+            );
         }
         for field in ["sequencerDid", "sequencerTerm"] {
-            for value in [serde_json::Value::Null, serde_json::json!(0), serde_json::json!("did:web:chat.catbird.blue")] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!(0),
+                serde_json::json!("did:web:chat.catbird.blue"),
+            ] {
                 let mut nested = state.clone();
                 nested["coordinates"][field] = value;
                 assert!(decode_conversation_state(&serde_json::to_vec(&nested).unwrap()).is_err());
@@ -4054,48 +4305,112 @@ fn participant_acceptance_transcript_matches_server_exactly() {
     assert_eq!(hex::encode(prepared.transcript), server_hex);
 }
 
-
 /// Request v2 uses its own strict signing domains while retaining generated DTOs.
-fn prepare_direct_request_json<T: Serialize>(auth: &TransportAuth, generation: Option<i64>, operation: CanonicalOperation, request: &T) -> Result<PreparedRequest, TransportError> {
+fn prepare_direct_request_json<T: Serialize>(
+    auth: &TransportAuth,
+    generation: Option<i64>,
+    operation: CanonicalOperation,
+    request: &T,
+) -> Result<PreparedRequest, TransportError> {
     auth.validate()?;
     let body = serialize_json(request)?;
-    let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| TransportError::Serialization(e.to_string()))?;
-    validate_direct_endpoint_raw(operation,&body)?;
-    let field=if operation==CanonicalOperation::AcceptConversation {"directRequest"} else {"signedRequest"};
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    validate_direct_endpoint_raw(operation, &body)?;
+    let field = if operation == CanonicalOperation::AcceptConversation {
+        "directRequest"
+    } else {
+        "signedRequest"
+    };
     let signed = &value[field]["body"];
     let kind = match operation {
-        CanonicalOperation::AcceptConversation => crate::chat_v2::transcript::direct_request::DirectRequestKind::Accept,
-        CanonicalOperation::PrepareDirectRequest => crate::chat_v2::transcript::direct_request::DirectRequestKind::Prepare,
-        CanonicalOperation::PublishDirectRequest => crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish,
-        CanonicalOperation::CancelDirectRequestPreparation => crate::chat_v2::transcript::direct_request::DirectRequestKind::Cancel,
-        CanonicalOperation::PublishDirectRequestKeys => crate::chat_v2::transcript::direct_request::DirectRequestKind::Keys,
-        _ => return Err(TransportError::UnsupportedOperation {operation,reason:"not a signed direct request mutation"}),
+        CanonicalOperation::AcceptConversation => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Accept
+        }
+        CanonicalOperation::PrepareDirectRequest => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Prepare
+        }
+        CanonicalOperation::PublishDirectRequest => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish
+        }
+        CanonicalOperation::CancelDirectRequestPreparation => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Cancel
+        }
+        CanonicalOperation::PublishDirectRequestKeys => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Keys
+        }
+        _ => {
+            return Err(TransportError::UnsupportedOperation {
+                operation,
+                reason: "not a signed direct request mutation",
+            })
+        }
     };
-    crate::chat_v2::transcript::direct_request::direct_request_signing_bytes(kind, &serde_json::to_vec(signed).map_err(|e|TransportError::Serialization(e.to_string()))?).map_err(|e|TransportError::Serialization(e.to_string()))?;
-    if signed["actorDeviceId"].as_str()!=Some(auth.device_id.as_str()) {
-        return Err(TransportError::DeviceBindingMismatch{body:signed["actorDeviceId"].as_str().unwrap_or_default().into(),authenticated:auth.device_id.clone()});
+    crate::chat_v2::transcript::direct_request::direct_request_signing_bytes(
+        kind,
+        &serde_json::to_vec(signed).map_err(|e| TransportError::Serialization(e.to_string()))?,
+    )
+    .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    if signed["actorDeviceId"].as_str() != Some(auth.device_id.as_str()) {
+        return Err(TransportError::DeviceBindingMismatch {
+            body: signed["actorDeviceId"].as_str().unwrap_or_default().into(),
+            authenticated: auth.device_id.clone(),
+        });
     }
-    let expected=generation.ok_or(TransportError::MissingAuthGeneration)?;
-    let actual=signed["authGeneration"].as_i64().ok_or(TransportError::MissingAuthGeneration)?;
-    if actual!=expected { return Err(TransportError::AuthGenerationMismatch{expected,actual}); }
-    Ok(PreparedRequest{operation,method:"POST".into(),path:operation.path().into(),body:Some(body)})
+    let expected = generation.ok_or(TransportError::MissingAuthGeneration)?;
+    let actual = signed["authGeneration"]
+        .as_i64()
+        .ok_or(TransportError::MissingAuthGeneration)?;
+    if actual != expected {
+        return Err(TransportError::AuthGenerationMismatch { expected, actual });
+    }
+    Ok(PreparedRequest {
+        operation,
+        method: "POST".into(),
+        path: operation.path().into(),
+        body: Some(body),
+    })
 }
 
-fn validate_direct_endpoint_raw(operation:CanonicalOperation,raw:&[u8])->Result<(),TransportError> {
-    use crate::chat_v2::transcript::{decode_strict_json,project_ref,direct_request};
-    let schema=match operation {
-        CanonicalOperation::PrepareDirectRequest=>"signedDirectRequestPreparation",
-        CanonicalOperation::PublishDirectRequest=>"signedDirectRequestPublication",
-        CanonicalOperation::CancelDirectRequestPreparation=>"signedDirectRequestCancellation",
-        CanonicalOperation::PublishDirectRequestKeys=>"signedDirectRequestKeysPublication",
-        CanonicalOperation::AcceptConversation=>{direct_request::direct_request_acceptance_endpoint_is_v2(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;return Ok(());},
-        _=>return Ok(()),
+fn validate_direct_endpoint_raw(
+    operation: CanonicalOperation,
+    raw: &[u8],
+) -> Result<(), TransportError> {
+    use crate::chat_v2::transcript::{decode_strict_json, direct_request, project_ref};
+    let schema = match operation {
+        CanonicalOperation::PrepareDirectRequest => "signedDirectRequestPreparation",
+        CanonicalOperation::PublishDirectRequest => "signedDirectRequestPublication",
+        CanonicalOperation::CancelDirectRequestPreparation => "signedDirectRequestCancellation",
+        CanonicalOperation::PublishDirectRequestKeys => "signedDirectRequestKeysPublication",
+        CanonicalOperation::AcceptConversation => {
+            direct_request::direct_request_acceptance_endpoint_is_v2(raw)
+                .map_err(|e| TransportError::Serialization(e.to_string()))?;
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
-    if raw.len()>direct_request::MAX_PUBLISH_HTTP_BODY_BYTES {return Err(TransportError::Serialization("direct request HTTP byte cap".into()));}
-    decode_strict_json(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;
-    let value:serde_json::Value=serde_json::from_slice(raw).map_err(|e|TransportError::Serialization(e.to_string()))?;
-    if value.as_object().is_none_or(|o|o.len()!=1||!o.contains_key("signedRequest")) {return Err(TransportError::Serialization("direct request requires exactly signedRequest".into()));}
-    let strict=decode_strict_json(&serde_json::to_vec(&value["signedRequest"]).map_err(|e|TransportError::Serialization(e.to_string()))?).map_err(|e|TransportError::Serialization(e.to_string()))?;
-    project_ref(schema,&strict,false).map_err(|e|TransportError::Serialization(e.to_string()))?;
+    if raw.len() > direct_request::MAX_PUBLISH_HTTP_BODY_BYTES {
+        return Err(TransportError::Serialization(
+            "direct request HTTP byte cap".into(),
+        ));
+    }
+    decode_strict_json(raw).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    if value
+        .as_object()
+        .is_none_or(|o| o.len() != 1 || !o.contains_key("signedRequest"))
+    {
+        return Err(TransportError::Serialization(
+            "direct request requires exactly signedRequest".into(),
+        ));
+    }
+    let strict = decode_strict_json(
+        &serde_json::to_vec(&value["signedRequest"])
+            .map_err(|e| TransportError::Serialization(e.to_string()))?,
+    )
+    .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    project_ref(schema, &strict, false)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
     Ok(())
 }

@@ -797,7 +797,9 @@ pub(crate) fn decrypt_introduction(
         .signature_key()
         .as_slice()
         .to_vec();
-    let outcome=super::direct_request_shared_crypto::decrypt_introduction_with_provider(&provider,&mut group,input)?;
+    let outcome = super::direct_request_shared_crypto::decrypt_introduction_with_provider(
+        &provider, &mut group, input,
+    )?;
     tx.execute(
         "INSERT INTO mls_manifests(key,value) VALUES(?1,?2)",
         [cache_key, serde_json::to_string(&outcome).map_err(error)?],

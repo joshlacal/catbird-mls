@@ -580,8 +580,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn add_members_policy_invitation_does_not_advance_local_epoch() {
         let mut world = TestWorld::new();
-        world.add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa").await;
-        world.add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb").await;
+        world
+            .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+            .await;
+        world
+            .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+            .await;
         world
             .register_device("Alice")
             .await
@@ -1604,18 +1608,22 @@ mod tests {
                 .group_id,
             stale_group_hex
         );
-        alice.storage.store_message(&Message {
-            id: "retained-before-direct-adoption".into(),
-            conversation_id: convo_id.clone(),
-            sender_did: bob.did.clone(),
-            text: "Keep this existing message".into(),
-            timestamp: chrono::Utc::now(),
-            epoch: 0,
-            sequence_number: 1,
-            is_own: false,
-            delivery_status: None,
-            payload_json: None,
-        }).await.expect("seed retained history");
+        alice
+            .storage
+            .store_message(&Message {
+                id: "retained-before-direct-adoption".into(),
+                conversation_id: convo_id.clone(),
+                sender_did: bob.did.clone(),
+                text: "Keep this existing message".into(),
+                timestamp: chrono::Utc::now(),
+                epoch: 0,
+                sequence_number: 1,
+                is_own: false,
+                delivery_status: None,
+                payload_json: None,
+            })
+            .await
+            .expect("seed retained history");
 
         // Ensure Alice's in-memory cache is empty
         alice
@@ -1670,7 +1678,11 @@ mod tests {
             .expect("read stored conversation")
             .expect("stored conversation present");
         assert_eq!(stored.group_id, auth_group_id);
-        assert!(alice.storage.message_exists("retained-before-direct-adoption").await.unwrap());
+        assert!(alice
+            .storage
+            .message_exists("retained-before-direct-adoption")
+            .await
+            .unwrap());
         // Alice's in-memory cache also holds the authoritative group
         let cached = alice.orchestrator.conversations().lock().await;
         assert_eq!(cached.get(&convo_id).unwrap().group_id, auth_group_id);
@@ -1914,22 +1926,24 @@ mod tests {
         world
             .delivery_service()
             .set_participant_leaf_count(&created.conversation_id, &bob.did, 0);
-        world.delivery_service().add_pending_leaf_recovery_request(serde_json::json!({
-            "recovery": {
-                "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
-                "conversationId": created.conversation_id,
-                "requesterDid": bob.did,
-                "requesterDeviceId": bob_device_id,
-                "recoveryKind": "add",
-                "status": "open",
-                "reservation": {
-                    "keyPackageRef": { "$bytes": kp_ref_b64 },
-                    "keyPackage": {
-                        "bytes": { "$bytes": kp_b64 }
+        world
+            .delivery_service()
+            .add_pending_leaf_recovery_request(serde_json::json!({
+                "recovery": {
+                    "recoveryRequestId": uuid::Uuid::new_v4().to_string(),
+                    "conversationId": created.conversation_id,
+                    "requesterDid": bob.did,
+                    "requesterDeviceId": bob_device_id,
+                    "recoveryKind": "add",
+                    "status": "open",
+                    "reservation": {
+                        "keyPackageRef": { "$bytes": kp_ref_b64 },
+                        "keyPackage": {
+                            "bytes": { "$bytes": kp_b64 }
+                        }
                     }
                 }
-            }
-        }));
+            }));
 
         let initial_epoch = alice
             .orchestrator
@@ -1937,7 +1951,9 @@ mod tests {
             .get_epoch(hex::decode(&created.group_id).unwrap())
             .expect("alice initial epoch");
         assert_eq!(initial_epoch, 0);
-        world.delivery_service().reject_recovery_requests(409, "StaleCoordinate", 3);
+        world
+            .delivery_service()
+            .reject_recovery_requests(409, "StaleCoordinate", 3);
         let failed_count = alice
             .orchestrator
             .fulfill_pending_leaf_recoveries()
@@ -1950,16 +1966,36 @@ mod tests {
             .get_epoch(hex::decode(&created.group_id).unwrap())
             .expect("unconfirmed transition preserves current epoch");
         assert_eq!(unconfirmed_epoch, 0);
-        assert!(alice.orchestrator.mls_context().get_prepared_control(&created.group_id).unwrap().is_some(),
-            "generic rejection cannot erase uncertainty created by transport retries");
+        assert!(
+            alice
+                .orchestrator
+                .mls_context()
+                .get_prepared_control(&created.group_id)
+                .unwrap()
+                .is_some(),
+            "generic rejection cannot erase uncertainty created by transport retries"
+        );
 
         let count = alice
             .orchestrator
             .fulfill_pending_leaf_recoveries()
             .await
             .expect("fulfill pending leaf recoveries");
-        assert_eq!(count, 1, "must fulfill 1 recovery request: {:?}",
-            if count == 0 { Some(alice.orchestrator.fulfill_leaf_recovery(&created.conversation_id).await) } else { None });
+        assert_eq!(
+            count,
+            1,
+            "must fulfill 1 recovery request: {:?}",
+            if count == 0 {
+                Some(
+                    alice
+                        .orchestrator
+                        .fulfill_leaf_recovery(&created.conversation_id)
+                        .await,
+                )
+            } else {
+                None
+            }
+        );
 
         let updated_epoch = alice
             .orchestrator
@@ -2277,7 +2313,8 @@ mod tests {
             .unwrap();
         let welcome = STANDARD
             .decode(
-                initial["entry"]["signedRequest"]["body"]["manifest"]["welcomeBundle"]["opaqueWelcome"]
+                initial["entry"]["signedRequest"]["body"]["manifest"]["welcomeBundle"]
+                    ["opaqueWelcome"]
                     .as_str()
                     .unwrap(),
             )
@@ -3192,11 +3229,23 @@ pub(crate) fn pending_leaf_recovery_request_id(
     if prior["conversationId"].as_str() != Some(conversation_id) {
         return None;
     }
-    response["pendingLeafRecoveryRequests"].as_array()?.iter().find(|request| {
-        request["conversationId"].as_str() == Some(conversation_id)
-            && eligible_leaf_recovery(request, prior, actor_did, actor_device_id,
-                request_id, None, None)
-    })?["recoveryRequestId"].as_str().map(str::to_owned)
+    response["pendingLeafRecoveryRequests"]
+        .as_array()?
+        .iter()
+        .find(|request| {
+            request["conversationId"].as_str() == Some(conversation_id)
+                && eligible_leaf_recovery(
+                    request,
+                    prior,
+                    actor_did,
+                    actor_device_id,
+                    request_id,
+                    None,
+                    None,
+                )
+        })?["recoveryRequestId"]
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Decode a leaf recovery reservation's key package into `(bytes, base64 ref)`.
@@ -4095,7 +4144,9 @@ where
         self.check_shutdown().await?;
         if Box::pin(self.known_direct_request(conversation_id)).await? {
             Box::pin(self.refresh_request_preview(conversation_id)).await?;
-            if let Some(result)=Box::pin(self.try_accept_direct_request(conversation_id)).await? {return Ok(result);}
+            if let Some(result) = Box::pin(self.try_accept_direct_request(conversation_id)).await? {
+                return Ok(result);
+            }
         }
         let user_did = self.require_user_did().await?;
         let actor_device_id = self.require_actor_device_id().await?;
@@ -4135,9 +4186,16 @@ where
         let state_obj = state_val.get("state").ok_or_else(|| {
             OrchestratorError::Api("getConversationState response missing state".into())
         })?;
-        if state_obj.get("directRequest").is_some_and(|value| !value.is_null()) {
+        if state_obj
+            .get("directRequest")
+            .is_some_and(|value| !value.is_null())
+        {
             Box::pin(self.refresh_request_preview(&convo_uuid_str)).await?;
-            return Box::pin(self.try_accept_direct_request(&convo_uuid_str)).await?.ok_or_else(||OrchestratorError::InvalidInput("Request publication proof unavailable".into()));
+            return Box::pin(self.try_accept_direct_request(&convo_uuid_str))
+                .await?
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("Request publication proof unavailable".into())
+                });
         }
         let latest_coord = state_obj.get("coordinates").cloned().ok_or_else(|| {
             OrchestratorError::Api("conversation state missing coordinates".into())
@@ -4164,14 +4222,22 @@ where
             .and_then(|v| v.as_str())
             .unwrap_or("pending");
         if status == "active" {
-            if let Err(error) = self.retain_conversation_policy_json(&convo_uuid_str, state_obj).await {
+            if let Err(error) = self
+                .retain_conversation_policy_json(&convo_uuid_str, state_obj)
+                .await
+            {
                 tracing::warn!(conversation_id, %error, "Current admission policy refresh will retry during sync");
             }
             // Account membership does not imply missing keys. Repeatedly
             // accepting a healthy local device must not replace its leaf or
             // reset the conversation for everyone else.
-            if self.device_group_matches_current_state(&convo_uuid_str, state_obj).await? {
-                return Ok(serde_json::json!({"epoch": latest_coord["epoch"], "deviceAccess": "active"}));
+            if self
+                .device_group_matches_current_state(&convo_uuid_str, state_obj)
+                .await?
+            {
+                return Ok(
+                    serde_json::json!({"epoch": latest_coord["epoch"], "deviceAccess": "active"}),
+                );
             }
             // Already a member, but this device holds no leaf: a live leaf of
             // another participant must re-add us, or an admin resets.
@@ -4227,7 +4293,11 @@ where
         self.check_shutdown().await?;
         if Box::pin(self.known_direct_request(conversation_id)).await? {
             Box::pin(self.refresh_request_preview(conversation_id)).await?;
-            return Box::pin(self.try_accept_direct_request(conversation_id)).await?.ok_or_else(||OrchestratorError::InvalidInput("Request acceptance proof unavailable".into()));
+            return Box::pin(self.try_accept_direct_request(conversation_id))
+                .await?
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("Request acceptance proof unavailable".into())
+                });
         }
         let user_did = self.require_user_did().await?;
         let actor_device_id = self.require_actor_device_id().await?;
@@ -4503,7 +4573,9 @@ where
             .get("snapshotSeq")
             .and_then(|value| value.as_u64())
             .filter(|value| *value <= 9_007_199_254_740_991)
-            .ok_or_else(|| OrchestratorError::Api("getConversationState missing safe snapshot sequence".into()))?;
+            .ok_or_else(|| {
+                OrchestratorError::Api("getConversationState missing safe snapshot sequence".into())
+            })?;
         let prior = state.get("coordinates").cloned().ok_or_else(|| {
             OrchestratorError::Api("getConversationState missing coordinates".into())
         })?;
@@ -4856,7 +4928,8 @@ where
         // staged crypto across lost responses and process restarts. A storage
         // error can itself be ambiguous, so stop clearing secrets before it.
         discard_pending.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.journal_prepared_control_with_snapshot(prepared, projection, prior_snapshot_seq).await?;
+        self.journal_prepared_control_with_snapshot(prepared, projection, prior_snapshot_seq)
+            .await?;
         scopeguard::ScopeGuard::into_inner(cleanup);
         self.replay_prepared_control_locked(&resolved.group_id)
             .await?
@@ -4939,7 +5012,12 @@ where
                 // One accepted Commit changes the coordinate and invalidates
                 // the other reservations. Refresh on the next sync/event.
                 match self.fulfill_leaf_recovery(cid).await {
-                    Ok(output) if output["entry"]["$type"] == "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry" => fulfilled_count += 1,
+                    Ok(output)
+                        if output["entry"]["$type"]
+                            == "blue.catbird.chat.defs#leafRecoveryFulfillmentEntry" =>
+                    {
+                        fulfilled_count += 1
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         tracing::warn!(conversation_id = %cid, %error, "Could not fulfill pending leaf recovery")
@@ -5249,8 +5327,12 @@ where
             .await
             .insert(group_id_hex.clone(), state);
 
-        if self.is_local_conversation_terminal(&convo.conversation_id).await? {
-            self.restore_device_after_verified_welcome(&convo.conversation_id, &group_id_hex).await?;
+        if self
+            .is_local_conversation_terminal(&convo.conversation_id)
+            .await?
+        {
+            self.restore_device_after_verified_welcome(&convo.conversation_id, &group_id_hex)
+                .await?;
         }
 
         // Welcome adoption can land well beyond the retention window. Run
@@ -5342,24 +5424,31 @@ where
         let key_id = super::canonical_transport::derive_key_id(&public_key);
 
         let response = self.fetch_conversation_lifecycle(conversation_id).await?;
-        let convo_state = response.get("state").ok_or_else(||
-            OrchestratorError::InvalidInput("Conversation state is missing.".into()))?;
+        let convo_state = response.get("state").ok_or_else(|| {
+            OrchestratorError::InvalidInput("Conversation state is missing.".into())
+        })?;
         let typed_state = super::canonical_transport::decode_conversation_state(
-            &serde_json::to_vec(convo_state).map_err(|error| OrchestratorError::Serialization(error.to_string()))?
-        ).map_err(|error| OrchestratorError::InvalidInput(error.to_string()))?;
+            &serde_json::to_vec(convo_state)
+                .map_err(|error| OrchestratorError::Serialization(error.to_string()))?,
+        )
+        .map_err(|error| OrchestratorError::InvalidInput(error.to_string()))?;
         if typed_state.coordinates.conversation_id.as_str() != conversation_id
             || hex::encode(&typed_state.coordinates.group_id) != *group_id
             || typed_state.coordinates.lifecycle.as_str() != "active"
         {
-            return Err(OrchestratorError::InvalidInput("Conversation changed before the invitation; refresh and try again.".into()));
+            return Err(OrchestratorError::InvalidInput(
+                "Conversation changed before the invitation; refresh and try again.".into(),
+            ));
         }
         if typed_state.conversation_kind.as_str() != "group" {
             return Err(OrchestratorError::InvalidInput(
                 "direct conversations do not support adding members".into(),
             ));
         }
-        let prior_coord = super::lifecycle::lifecycle_coordinates(&convo_state["coordinates"], conversation_id)?;
-        self.retain_conversation_policy_json(conversation_id, convo_state).await?;
+        let prior_coord =
+            super::lifecycle::lifecycle_coordinates(&convo_state["coordinates"], conversation_id)?;
+        self.retain_conversation_policy_json(conversation_id, convo_state)
+            .await?;
 
         // Fail closed for already-present participants
         let existing_participants = convo_state.get("participants").and_then(|v| v.as_array());
@@ -5413,9 +5502,14 @@ where
             a_did.cmp(b_did)
         });
 
-        let next_version = typed_state.coordinates.state_version.checked_add(1)
+        let next_version = typed_state
+            .coordinates
+            .state_version
+            .checked_add(1)
             .filter(|version| *version <= crate::chat_v2::ids::MAX_SAFE_INTEGER)
-            .ok_or_else(|| OrchestratorError::InvalidInput("Conversation state version cannot advance.".into()))?;
+            .ok_or_else(|| {
+                OrchestratorError::InvalidInput("Conversation state version cannot advance.".into())
+            })?;
         let prior_clean = prior_coord;
         let mut next_coord = prior_clean.clone();
         next_coord["stateVersion"] = serde_json::json!(next_version);

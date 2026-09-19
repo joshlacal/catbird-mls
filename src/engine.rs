@@ -230,40 +230,65 @@ where
         })
     }
 
-    pub fn get_group_invitation_reference(&self, conversation_id:&str, recipient_did:&str) -> Result<Option<crate::GroupInvitationReference>> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
-        crate::async_runtime::block_on(self.orchestrator.get_group_invitation_reference(conversation_id,recipient_did))
+    pub fn get_group_invitation_reference(
+        &self,
+        conversation_id: &str,
+        recipient_did: &str,
+    ) -> Result<Option<crate::GroupInvitationReference>> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(
+            self.orchestrator
+                .get_group_invitation_reference(conversation_id, recipient_did),
+        )
     }
     pub fn get_direct_request_delivery_enabled(&self) -> Result<Option<bool>> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.get_direct_request_delivery_enabled())
     }
     pub fn close_direct_request(&self, conversation_id: &str) -> Result<crate::DirectRequestView> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.close_direct_request(conversation_id))
     }
     pub fn set_direct_request_delivery_enabled(&self, enabled: bool) -> Result<()> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
-        crate::async_runtime::block_on(self.orchestrator.set_direct_request_delivery_enabled(enabled))
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(
+            self.orchestrator
+                .set_direct_request_delivery_enabled(enabled),
+        )
     }
     pub fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.list_direct_request_views())
     }
-    pub fn start_direct_request(&self, input: crate::DirectRequestInput) -> Result<crate::DirectRequestOutcome> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
+    pub fn start_direct_request(
+        &self,
+        input: crate::DirectRequestInput,
+    ) -> Result<crate::DirectRequestOutcome> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.start_direct_request(input))
     }
     pub fn resume_direct_request(&self, draft_id: &str) -> Result<crate::DirectRequestOutcome> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.resume_direct_request(draft_id))
     }
     pub fn cancel_direct_request(&self, draft_id: &str) -> Result<crate::DirectRequestOutcome> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.cancel_direct_request(draft_id))
     }
-    pub fn refresh_request_preview(&self, conversation_id: &str) -> Result<crate::DirectRequestView> {
-        self.current_orchestrator_user_did()?.ok_or(OrchestratorError::NotAuthenticated)?;
+    pub fn refresh_request_preview(
+        &self,
+        conversation_id: &str,
+    ) -> Result<crate::DirectRequestView> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
         crate::async_runtime::block_on(self.orchestrator.refresh_request_preview(conversation_id))
     }
 

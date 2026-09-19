@@ -228,10 +228,7 @@ where
         self.process_canonical_hint_inner(hint).await
     }
 
-    async fn process_canonical_hint_inner(
-        &self,
-        hint: CanonicalHint,
-    ) -> Result<Vec<EngineEvent>> {
+    async fn process_canonical_hint_inner(&self, hint: CanonicalHint) -> Result<Vec<EngineEvent>> {
         let conversation_id = hint.conversation_id.as_deref().unwrap();
         let orch = &self.orchestrator;
         let user_did = orch.require_user_did().await?;
@@ -422,10 +419,18 @@ where
     }
 
     async fn catch_up_event_conversation(&self, conversation_id: &str) -> Result<Vec<EngineEvent>> {
-        if self.orchestrator.known_direct_request(conversation_id).await? {
-            let request=Box::pin(self.orchestrator.refresh_request_preview(conversation_id)).await?;
-            if request.consent!=crate::orchestrator::RequestConsent::Accepted {
-                return Ok(vec![EngineEvent::RequestReceived {convo_id:conversation_id.into(),message_id:request.first_message_id}]);
+        if self
+            .orchestrator
+            .known_direct_request(conversation_id)
+            .await?
+        {
+            let request =
+                Box::pin(self.orchestrator.refresh_request_preview(conversation_id)).await?;
+            if request.consent != crate::orchestrator::RequestConsent::Accepted {
+                return Ok(vec![EngineEvent::RequestReceived {
+                    convo_id: conversation_id.into(),
+                    message_id: request.first_message_id,
+                }]);
             }
         }
         let mut cursor = None;
@@ -2144,9 +2149,18 @@ mod tests {
 
             // Send batch as bare JSON array [hint1, hint2, hint3]
             let batch = json!([
-                event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
-                event("conversationChangedEvent", json!({"conversationId": g2.conversation_id})),
-                event("conversationChangedEvent", json!({"conversationId": g3.conversation_id})),
+                event(
+                    "conversationChangedEvent",
+                    json!({"conversationId": g1.conversation_id})
+                ),
+                event(
+                    "conversationChangedEvent",
+                    json!({"conversationId": g2.conversation_id})
+                ),
+                event(
+                    "conversationChangedEvent",
+                    json!({"conversationId": g3.conversation_id})
+                ),
             ]);
 
             let events = bob_engine.process_server_event(&batch.to_string()).unwrap();
@@ -2185,7 +2199,9 @@ mod tests {
                 "conversationChangedEvent",
                 json!({"conversationId": g.conversation_id}),
             );
-            let events = bob_engine.process_server_event(&single.to_string()).unwrap();
+            let events = bob_engine
+                .process_server_event(&single.to_string())
+                .unwrap();
             assert!(!events.is_empty());
 
             let allocations = world.delivery_service().inventory_allocations_since(start);
@@ -2234,7 +2250,9 @@ mod tests {
                     }),
                 ]
             });
-            let err = bob_engine.process_server_event(&bad_batch.to_string()).unwrap_err();
+            let err = bob_engine
+                .process_server_event(&bad_batch.to_string())
+                .unwrap_err();
             assert!(matches!(err, OrchestratorError::InvalidInput(_)));
 
             // Shared state MUST be discarded after failure
@@ -2248,7 +2266,9 @@ mod tests {
                     event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
                 ]
             });
-            bob_engine.process_server_event(&good_batch.to_string()).unwrap();
+            bob_engine
+                .process_server_event(&good_batch.to_string())
+                .unwrap();
             assert_eq!(
                 world.delivery_service().inventory_allocations_since(start2),
                 1,
@@ -2268,86 +2288,132 @@ mod tests {
             let engine = engine_for(&world, "Alice").await;
 
             // 1. Session ID changes during pagination
-            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
-                status: 200,
-                content_type: Some("application/json".into()),
-                body: serde_json::to_vec(&json!({
-                    "items": [],
-                    "inventorySessionId": "session-1",
-                    "snapshotEventCursor": "fence-1",
-                    "hasMore": true,
-                    "nextPageCursor": "cursor-2"
-                })).unwrap(),
-            }));
-            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
-                status: 200,
-                content_type: Some("application/json".into()),
-                body: serde_json::to_vec(&json!({
-                    "items": [],
-                    "inventorySessionId": "session-MUTATED",
-                    "snapshotEventCursor": "fence-1",
-                    "hasMore": false
-                })).unwrap(),
-            }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-1",
+                        "snapshotEventCursor": "fence-1",
+                        "hasMore": true,
+                        "nextPageCursor": "cursor-2"
+                    }))
+                    .unwrap(),
+                }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-MUTATED",
+                        "snapshotEventCursor": "fence-1",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
 
-            let err = engine.orchestrator.fetch_authorized_inventory_snapshot().await.unwrap_err();
-            assert!(matches!(err, OrchestratorError::InvalidInput(_)), "mutated session ID must fail closed: {err:?}");
+            let err = engine
+                .orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "mutated session ID must fail closed: {err:?}"
+            );
 
             // 2. Fence changes during pagination
-            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
-                status: 200,
-                content_type: Some("application/json".into()),
-                body: serde_json::to_vec(&json!({
-                    "items": [],
-                    "inventorySessionId": "session-2",
-                    "snapshotEventCursor": "fence-original",
-                    "hasMore": true,
-                    "nextPageCursor": "cursor-2"
-                })).unwrap(),
-            }));
-            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
-                status: 200,
-                content_type: Some("application/json".into()),
-                body: serde_json::to_vec(&json!({
-                    "items": [],
-                    "inventorySessionId": "session-2",
-                    "snapshotEventCursor": "fence-CHANGED",
-                    "hasMore": false
-                })).unwrap(),
-            }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-2",
+                        "snapshotEventCursor": "fence-original",
+                        "hasMore": true,
+                        "nextPageCursor": "cursor-2"
+                    }))
+                    .unwrap(),
+                }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-2",
+                        "snapshotEventCursor": "fence-CHANGED",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
 
-            let err2 = engine.orchestrator.fetch_authorized_inventory_snapshot().await.unwrap_err();
-            assert!(matches!(err2, OrchestratorError::InvalidInput(_)), "mutated fence must fail closed: {err2:?}");
+            let err2 = engine
+                .orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err2, OrchestratorError::InvalidInput(_)),
+                "mutated fence must fail closed: {err2:?}"
+            );
 
             // 3. hasMore == true but nextPageCursor is missing/empty
-            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
-                status: 200,
-                content_type: Some("application/json".into()),
-                body: serde_json::to_vec(&json!({
-                    "items": [],
-                    "inventorySessionId": "session-3",
-                    "snapshotEventCursor": "fence-3",
-                    "hasMore": true,
-                    "nextPageCursor": null
-                })).unwrap(),
-            }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-3",
+                        "snapshotEventCursor": "fence-3",
+                        "hasMore": true,
+                        "nextPageCursor": null
+                    }))
+                    .unwrap(),
+                }));
 
-            let err3 = engine.orchestrator.fetch_authorized_inventory_snapshot().await.unwrap_err();
-            assert!(matches!(err3, OrchestratorError::InvalidInput(_)), "inconsistent hasMore must fail closed: {err3:?}");
+            let err3 = engine
+                .orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err3, OrchestratorError::InvalidInput(_)),
+                "inconsistent hasMore must fail closed: {err3:?}"
+            );
 
             // 4. Missing items field
-            world.delivery_service().queue_inventory_result_for_test(Ok(GatewayResponse {
-                status: 200,
-                content_type: Some("application/json".into()),
-                body: serde_json::to_vec(&json!({
-                    "inventorySessionId": "session-4",
-                    "snapshotEventCursor": "fence-4",
-                    "hasMore": false
-                })).unwrap(),
-            }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "inventorySessionId": "session-4",
+                        "snapshotEventCursor": "fence-4",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
 
-            let err4 = engine.orchestrator.fetch_authorized_inventory_snapshot().await.unwrap_err();
-            assert!(matches!(err4, OrchestratorError::InvalidInput(_)), "missing items field must fail closed: {err4:?}");
+            let err4 = engine
+                .orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err4, OrchestratorError::InvalidInput(_)),
+                "missing items field must fail closed: {err4:?}"
+            );
         });
     }
 
@@ -2379,7 +2445,11 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            let bob_device = bob_engine.orchestrator.require_actor_device_id().await.unwrap();
+            let bob_device = bob_engine
+                .orchestrator
+                .require_actor_device_id()
+                .await
+                .unwrap();
             let dummy_welcome = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
             let coords_g1 = json!({
                 "conversationId": g1.conversation_id,
@@ -2405,7 +2475,11 @@ mod tests {
             // Alice creates g2 AFTER Bob's snapshot was taken, so g2 is absent from snapshot
             let g2 = alice
                 .orchestrator
-                .create_group("welcome snapshot group 2 (post-snapshot)", Some(&[bob_did.into()]), None)
+                .create_group(
+                    "welcome snapshot group 2 (post-snapshot)",
+                    Some(&[bob_did.into()]),
+                    None,
+                )
                 .await
                 .unwrap();
             assert!(!snapshot.contains_conversation(&g2.conversation_id));
@@ -2495,14 +2569,35 @@ mod tests {
             let bob_engine = engine_for(&world, "Bob").await;
 
             // Ensure all 3 conversations are in Bob's storage with needs_rejoin = true
-            for gid in [&g1.conversation_id, &g2.conversation_id, &g3.conversation_id] {
-                bob_engine.orchestrator.storage().ensure_conversation_exists(bob_did, gid, "00").await.unwrap();
-                bob_engine.orchestrator.storage().mark_needs_rejoin(gid).await.unwrap();
+            for gid in [
+                &g1.conversation_id,
+                &g2.conversation_id,
+                &g3.conversation_id,
+            ] {
+                bob_engine
+                    .orchestrator
+                    .storage()
+                    .ensure_conversation_exists(bob_did, gid, "00")
+                    .await
+                    .unwrap();
+                bob_engine
+                    .orchestrator
+                    .storage()
+                    .mark_needs_rejoin(gid)
+                    .await
+                    .unwrap();
             }
 
             let start = world.delivery_service().submitted_prepared_requests().len();
-            let report = bob_engine.orchestrator.run_deferred_recovery("test_multi_recon").await.unwrap();
-            assert!(report.attempted >= 3, "should attempt recovery on all 3 conversations");
+            let report = bob_engine
+                .orchestrator
+                .run_deferred_recovery("test_multi_recon")
+                .await
+                .unwrap();
+            assert!(
+                report.attempted >= 3,
+                "should attempt recovery on all 3 conversations"
+            );
 
             let allocations = world.delivery_service().inventory_allocations_since(start);
             assert_eq!(

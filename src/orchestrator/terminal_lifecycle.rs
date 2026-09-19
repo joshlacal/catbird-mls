@@ -651,8 +651,19 @@ where
             .as_str()
             .ok_or_else(|| terminal_invalid("Terminal entry has no actor."))?;
         if kind == SignedMutationKind::ConversationClose {
-            let key = self.request_historical_device_key(actor, body["actorDeviceId"].as_str().ok_or_else(||terminal_invalid("Close device missing"))?, body["keyId"].as_str().ok_or_else(||terminal_invalid("Close key missing"))?).await?;
-            VerifiedMutation::verify(projected, signature, &key).map_err(|_|terminal_invalid("Close signature invalid"))?;
+            let key = self
+                .request_historical_device_key(
+                    actor,
+                    body["actorDeviceId"]
+                        .as_str()
+                        .ok_or_else(|| terminal_invalid("Close device missing"))?,
+                    body["keyId"]
+                        .as_str()
+                        .ok_or_else(|| terminal_invalid("Close key missing"))?,
+                )
+                .await?;
+            VerifiedMutation::verify(projected, signature, &key)
+                .map_err(|_| terminal_invalid("Close signature invalid"))?;
             return Ok(key);
         }
         let (mut lookup, cached) = self
@@ -670,7 +681,10 @@ where
             lookup = self.refresh_authorized_device_keys(actor).await?;
         }
         let key = match lookup {
-            super::credential_binding::DeviceKeyLookup::Keys(keys) => keys.iter().find(|key| VerifiedMutation::verify(projected.clone(), signature, key).is_ok()).cloned(),
+            super::credential_binding::DeviceKeyLookup::Keys(keys) => keys
+                .iter()
+                .find(|key| VerifiedMutation::verify(projected.clone(), signature, key).is_ok())
+                .cloned(),
             super::credential_binding::DeviceKeyLookup::Unsupported => None,
         };
         key.ok_or_else(|| terminal_invalid("Terminal conversation signature is not authorized."))
@@ -716,10 +730,15 @@ where
                 "The signed close does not retire this exact conversation generation.",
             ));
         }
-        if self.replay_verified_request_close(conversation_id, entry).await? {
+        if self
+            .replay_verified_request_close(conversation_id, entry)
+            .await?
+        {
             let transition_lock = self.rejoin_lock(conversation_id).await;
             let _guard = transition_lock.lock().await;
-            return self.project_verified_close_entry_locked(conversation_id, entry).await;
+            return self
+                .project_verified_close_entry_locked(conversation_id, entry)
+                .await;
         }
         let close_key = self.verify_terminal_signed_body(entry).await?;
         let actor = body["actorDid"]
@@ -773,15 +792,27 @@ where
                 "Sync the preceding conversation Commits before applying its signed close.",
             ));
         }
-        self.retain_verified_request_close(conversation_id, entry, &close_key).await?;
-        self.project_verified_close_entry_locked(conversation_id, entry).await
+        self.retain_verified_request_close(conversation_id, entry, &close_key)
+            .await?;
+        self.project_verified_close_entry_locked(conversation_id, entry)
+            .await
     }
 
-    async fn project_verified_close_entry_locked(&self, conversation_id: &str, entry: &Value) -> Result<bool> {
+    async fn project_verified_close_entry_locked(
+        &self,
+        conversation_id: &str,
+        entry: &Value,
+    ) -> Result<bool> {
         let body = &entry["signedRequest"]["body"];
         let prior = &body["prior"];
-        let actor = body["actorDid"].as_str().ok_or_else(|| terminal_invalid("Close actor missing"))?;
-        let timestamp = entry["receivedAt"].as_str().and_then(|s| DateTime::parse_from_rfc3339(s).ok()).ok_or_else(|| terminal_invalid("Close timestamp invalid"))?.with_timezone(&Utc);
+        let actor = body["actorDid"]
+            .as_str()
+            .ok_or_else(|| terminal_invalid("Close actor missing"))?;
+        let timestamp = entry["receivedAt"]
+            .as_str()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .ok_or_else(|| terminal_invalid("Close timestamp invalid"))?
+            .with_timezone(&Utc);
         self.project_non_reset_state_locked(conversation_id, ConversationState::Closed)
             .await?;
         self.storage().clear_rejoin_flag(conversation_id).await?;

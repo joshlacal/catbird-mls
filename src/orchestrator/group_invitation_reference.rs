@@ -146,7 +146,13 @@ where
                     .map_err(|_| invalid())?
                     .try_into()
                     .map_err(|_| invalid())?;
-                let key = self.request_historical_device_key(actor, actor_device, body["keyId"].as_str().ok_or_else(invalid)?).await?;
+                let key = self
+                    .request_historical_device_key(
+                        actor,
+                        actor_device,
+                        body["keyId"].as_str().ok_or_else(invalid)?,
+                    )
+                    .await?;
                 VerifiedMutation::verify(projected, signature, &key).map_err(|_| invalid())?;
                 return Ok(Some(GroupInvitationReference {
                     authority_did: "did:web:chat.catbird.blue".into(),

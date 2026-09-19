@@ -47,7 +47,8 @@ pub fn validate_conversation_policy(state: &CanonicalState) -> Result<()> {
             return Err(invalid("participant status, role, or duplicate"));
         }
         if participant.status.as_str() == "pending"
-            && ((participant.leaf_count != 0 && state.direct_request.is_none()) || participant.invitation_provenance.is_none())
+            && ((participant.leaf_count != 0 && state.direct_request.is_none())
+                || participant.invitation_provenance.is_none())
         {
             return Err(invalid("pending participant lacks invitation provenance"));
         }
@@ -60,21 +61,53 @@ pub fn validate_conversation_policy(state: &CanonicalState) -> Result<()> {
                 .map_err(|_| invalid("inviter DID"))?;
         }
     }
-    if let Some(request)=&state.direct_request {
-        if state.conversation_kind.as_str()!="direct" || participants.len()!=2 || request.sender_did==request.recipient_did || !participants.contains(request.sender_did.as_str()) || !participants.contains(request.recipient_did.as_str()) {
-            return Err(invalid("request must bind exactly its sender and recipient"));
+    if let Some(request) = &state.direct_request {
+        if state.conversation_kind.as_str() != "direct"
+            || participants.len() != 2
+            || request.sender_did == request.recipient_did
+            || !participants.contains(request.sender_did.as_str())
+            || !participants.contains(request.recipient_did.as_str())
+        {
+            return Err(invalid(
+                "request must bind exactly its sender and recipient",
+            ));
         }
-        let sender=state.participants.iter().find(|p|p.user_did==request.sender_did).ok_or_else(||invalid("request sender"))?;
-        let recipient=state.participants.iter().find(|p|p.user_did==request.recipient_did).ok_or_else(||invalid("request recipient"))?;
-        if sender.status.as_str()!="active" || sender.role.as_str()!="admin" || recipient.role.as_str()!="admin" {return Err(invalid("request participant authority"));}
+        let sender = state
+            .participants
+            .iter()
+            .find(|p| p.user_did == request.sender_did)
+            .ok_or_else(|| invalid("request sender"))?;
+        let recipient = state
+            .participants
+            .iter()
+            .find(|p| p.user_did == request.recipient_did)
+            .ok_or_else(|| invalid("request recipient"))?;
+        if sender.status.as_str() != "active"
+            || sender.role.as_str() != "admin"
+            || recipient.role.as_str() != "admin"
+        {
+            return Err(invalid("request participant authority"));
+        }
         match request.consent.as_str() {
-            "incomingPending"|"outgoingPending"=>{
-                let provenance=recipient.invitation_provenance.as_ref().ok_or_else(||invalid("request invitation provenance"))?;
-                if recipient.status.as_str()!="pending" || provenance.invitation_transition_id!=request.request_id || provenance.invited_by_did!=request.sender_did {return Err(invalid("request pending consent provenance"));}
+            "incomingPending" | "outgoingPending" => {
+                let provenance = recipient
+                    .invitation_provenance
+                    .as_ref()
+                    .ok_or_else(|| invalid("request invitation provenance"))?;
+                if recipient.status.as_str() != "pending"
+                    || provenance.invitation_transition_id != request.request_id
+                    || provenance.invited_by_did != request.sender_did
+                {
+                    return Err(invalid("request pending consent provenance"));
+                }
             }
-            "accepted"=>{if recipient.status.as_str()!="active" || request.acceptance_proof.is_none() {return Err(invalid("request acceptance proof missing"));}}
-            "closed"=>{},
-            _=>return Err(invalid("request consent")),
+            "accepted" => {
+                if recipient.status.as_str() != "active" || request.acceptance_proof.is_none() {
+                    return Err(invalid("request acceptance proof missing"));
+                }
+            }
+            "closed" => {}
+            _ => return Err(invalid("request consent")),
         }
     }
     Ok(())
@@ -237,16 +270,19 @@ fn retain_revoked_leaf_status(previous: &CanonicalState, incoming: &mut Canonica
 /// Validate and merge an authenticated policy before a platform's atomic
 /// protected write. Native and browser providers use the same monotonic rules.
 pub fn merge_protected_conversation_policy(
-    previous: Option<&CanonicalState>, incoming: &CanonicalState,
+    previous: Option<&CanonicalState>,
+    incoming: &CanonicalState,
 ) -> Result<Option<CanonicalState>> {
-    let canonical=super::canonical_transport::encode_conversation_state(incoming)
-        .map_err(|e|invalid(&e.to_string()))?;
-    let mut next=super::canonical_transport::decode_conversation_state(&canonical)
-        .map_err(|e|invalid(&e.to_string()))?;
-    if let Some(previous)=previous {
+    let canonical = super::canonical_transport::encode_conversation_state(incoming)
+        .map_err(|e| invalid(&e.to_string()))?;
+    let mut next = super::canonical_transport::decode_conversation_state(&canonical)
+        .map_err(|e| invalid(&e.to_string()))?;
+    if let Some(previous) = previous {
         validate_conversation_policy(previous)?;
-        retain_revoked_leaf_status(previous,&mut next);
-        if !incoming_is_newer(previous,&next)? {return Ok(None);}
+        retain_revoked_leaf_status(previous, &mut next);
+        if !incoming_is_newer(previous, &next)? {
+            return Ok(None);
+        }
     }
     Ok(Some(next))
 }
@@ -254,19 +290,35 @@ pub fn merge_protected_conversation_policy(
 /// Compare authenticated departure coordinates without turning inventory
 /// absence into removal authority. Call only after the departure was verified.
 pub fn merge_protected_conversation_departure(
-    previous:Option<&catbird_atproto::blue_catbird::chat::ConversationCoordinates>,
-    incoming:&catbird_atproto::blue_catbird::chat::ConversationCoordinates,
-)->Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>> {
-    let coordinate=super::canonical_transport::decode_conversation_coordinates(
-        &serde_json::to_vec(incoming).map_err(|e|invalid(&e.to_string()))?)
-        .map_err(|e|invalid(&e.to_string()))?;
-    if let Some(old)=previous {
-        if old.conversation_id!=coordinate.conversation_id{return Err(invalid("departure conversation changed"));}
-        let old_version=(old.generation,old.state_version);
-        let new_version=(coordinate.generation,coordinate.state_version);
-        if new_version<old_version{return Ok(None);}
-        if new_version==old_version{return if old==&coordinate{Ok(None)}else{Err(invalid("conflicting departure"))};}
-        if old.lifecycle.as_str()=="superseded" || (old.generation==coordinate.generation && (old.group_id!=coordinate.group_id || coordinate.epoch<old.epoch)) {return Err(invalid("departure coordinate regressed"));}
+    previous: Option<&catbird_atproto::blue_catbird::chat::ConversationCoordinates>,
+    incoming: &catbird_atproto::blue_catbird::chat::ConversationCoordinates,
+) -> Result<Option<catbird_atproto::blue_catbird::chat::ConversationCoordinates>> {
+    let coordinate = super::canonical_transport::decode_conversation_coordinates(
+        &serde_json::to_vec(incoming).map_err(|e| invalid(&e.to_string()))?,
+    )
+    .map_err(|e| invalid(&e.to_string()))?;
+    if let Some(old) = previous {
+        if old.conversation_id != coordinate.conversation_id {
+            return Err(invalid("departure conversation changed"));
+        }
+        let old_version = (old.generation, old.state_version);
+        let new_version = (coordinate.generation, coordinate.state_version);
+        if new_version < old_version {
+            return Ok(None);
+        }
+        if new_version == old_version {
+            return if old == &coordinate {
+                Ok(None)
+            } else {
+                Err(invalid("conflicting departure"))
+            };
+        }
+        if old.lifecycle.as_str() == "superseded"
+            || (old.generation == coordinate.generation
+                && (old.group_id != coordinate.group_id || coordinate.epoch < old.epoch))
+        {
+            return Err(invalid("departure coordinate regressed"));
+        }
     }
     Ok(Some(coordinate))
 }
@@ -657,8 +709,12 @@ pub(crate) mod native {
             )
             .optional()
             .map_err(failed)?;
-        let previous=raw.map(|raw|decode(&raw,user_did,&cid)).transpose()?;
-        let Some(state)=merge_protected_conversation_policy(previous.as_ref(),state).map_err(failed)? else {return Ok(false)};
+        let previous = raw.map(|raw| decode(&raw, user_did, &cid)).transpose()?;
+        let Some(state) =
+            merge_protected_conversation_policy(previous.as_ref(), state).map_err(failed)?
+        else {
+            return Ok(false);
+        };
         let raw = serde_json::to_string(&PolicyRecord {
             user_did: user_did.into(),
             state: state.clone(),
@@ -739,8 +795,15 @@ pub(crate) mod native {
             )
             .optional()
             .map_err(failed)?;
-        let previous=old.map(|raw|departure_record(&raw,user_did,cid)).transpose()?;
-        let Some(coordinate)=merge_protected_conversation_departure(previous.as_ref(),&coordinate).map_err(failed)? else {return Ok(false)};
+        let previous = old
+            .map(|raw| departure_record(&raw, user_did, cid))
+            .transpose()?;
+        let Some(coordinate) =
+            merge_protected_conversation_departure(previous.as_ref(), &coordinate)
+                .map_err(failed)?
+        else {
+            return Ok(false);
+        };
         let raw = serde_json::to_string(&DepartureRecord {
             user_did: user_did.into(),
             coordinate,

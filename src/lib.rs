@@ -44,16 +44,17 @@ pub use catbird_atproto as atproto;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::*;
 pub use error::*;
-pub use orchestrator::direct_request_types::{
-    DirectRequestInput, DirectRequestOutcome, DirectRequestView, GroupInvitationReference,
-    RequestCapabilities, RequestConsent, RequestCrypto, RequestPreview, RequestIntroductionMetadata,
-};
 #[cfg(not(target_arch = "wasm32"))]
 pub use keychain::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use mls_context::canonical_signer_keychain_key;
 #[cfg(not(target_arch = "wasm32"))]
 pub use mls_context::validate_serialized_signer_keypair_coherence;
+pub use orchestrator::direct_request_types::{
+    DirectRequestInput, DirectRequestOutcome, DirectRequestView, GroupInvitationReference,
+    RequestCapabilities, RequestConsent, RequestCrypto, RequestIntroductionMetadata,
+    RequestPreview,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use platform_lifecycle::*;
 pub use types::*;

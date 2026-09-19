@@ -12,8 +12,8 @@ mod e2e_harness;
 use std::time::{Duration, Instant};
 
 use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
-use catbird_mls::orchestrator::DeferredRecoveryOutcome;
 use catbird_mls::orchestrator::types::ConversationState;
+use catbird_mls::orchestrator::DeferredRecoveryOutcome;
 use catbird_mls::orchestrator::MLSStorageBackend;
 use e2e_harness::TestWorld;
 use serde_json::json;
@@ -40,10 +40,16 @@ fn count_operations(world: &TestWorld, op: CanonicalOperation) -> usize {
 /// Helper: sets up Alice with Device 1 and Device 2 on `alice_did`,
 /// creating a conversation where Device 1 is the active leaf.
 /// Device 2 has no local MLS group (absent).
-async fn setup_leafless_second_device(world: &mut TestWorld, convo_name: &str) -> (String, String, String) {
+async fn setup_leafless_second_device(
+    world: &mut TestWorld,
+    convo_name: &str,
+) -> (String, String, String) {
     let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     world.add_client_with_did("Alice", alice_did).await;
-    world.register_device("Alice").await.expect("register alice device 1");
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice device 1");
 
     let alice = world.client("Alice");
     let dev1_id = alice
@@ -61,13 +67,15 @@ async fn setup_leafless_second_device(world: &mut TestWorld, convo_name: &str) -
 
     // Register second device on same account
     world.add_client_with_did("AliceDev2", alice_did).await;
-    world.register_device("AliceDev2").await.expect("register alice device 2");
+    world
+        .register_device("AliceDev2")
+        .await
+        .expect("register alice device 2");
 
     // Device 1 holds an active leaf on server
-    world.delivery_service().set_conversation_leaves_for_test(
-        &convo_id,
-        vec![leaf(alice_did, &dev1_id, "active")],
-    );
+    world
+        .delivery_service()
+        .set_conversation_leaves_for_test(&convo_id, vec![leaf(alice_did, &dev1_id, "active")]);
 
     (convo_id, dev1_id, alice_did.to_string())
 }
@@ -83,7 +91,10 @@ async fn test_pass_with_live_unexpired_request_mints_zero_new_requests() {
     // Pass 1: AliceDev2 performs server sync.
     // Local MLS group is absent in FFI. Sibling Dev1 holds an active leaf.
     // Must mint exactly 1 RequestLeafRecovery.
-    dev2.orchestrator.sync_with_server(false).await.expect("sync pass 1 succeeds");
+    dev2.orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("sync pass 1 succeeds");
 
     let requests_after_pass1 = count_operations(&world, CanonicalOperation::RequestLeafRecovery);
     assert_eq!(
@@ -93,7 +104,10 @@ async fn test_pass_with_live_unexpired_request_mints_zero_new_requests() {
 
     // Pass 2: Reconcile runs again while the recovery request is live and unexpired.
     // Must consult the live request / cooldown and mint ZERO new requests!
-    dev2.orchestrator.sync_with_server(false).await.expect("sync pass 2 succeeds");
+    dev2.orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("sync pass 2 succeeds");
 
     let requests_after_pass2 = count_operations(&world, CanonicalOperation::RequestLeafRecovery);
     assert_eq!(
@@ -102,7 +116,10 @@ async fn test_pass_with_live_unexpired_request_mints_zero_new_requests() {
     );
 
     // Pass 3: Another pass still mints ZERO new requests.
-    dev2.orchestrator.sync_with_server(false).await.expect("sync pass 3 succeeds");
+    dev2.orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("sync pass 3 succeeds");
 
     let requests_after_pass3 = count_operations(&world, CanonicalOperation::RequestLeafRecovery);
     assert_eq!(
@@ -116,7 +133,10 @@ async fn test_burst_of_passes_over_five_absent_conversations_shares_inbox() {
     let mut world = TestWorld::new();
     let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     world.add_client_with_did("Alice", alice_did).await;
-    world.register_device("Alice").await.expect("register alice device 1");
+    world
+        .register_device("Alice")
+        .await
+        .expect("register alice device 1");
 
     let alice = world.client("Alice");
     let dev1_id = alice
@@ -142,18 +162,30 @@ async fn test_burst_of_passes_over_five_absent_conversations_shares_inbox() {
 
     // Register AliceDev2 on same account (starts with absent local groups)
     world.add_client_with_did("AliceDev2", alice_did).await;
-    world.register_device("AliceDev2").await.expect("register alice device 2");
+    world
+        .register_device("AliceDev2")
+        .await
+        .expect("register alice device 2");
     let dev2 = world.client("AliceDev2");
 
     // Initial state: 0 inbox fetches, 0 recovery requests
-    assert_eq!(count_operations(&world, CanonicalOperation::GetLeafRecoveryInbox), 0);
-    assert_eq!(count_operations(&world, CanonicalOperation::RequestLeafRecovery), 0);
+    assert_eq!(
+        count_operations(&world, CanonicalOperation::GetLeafRecoveryInbox),
+        0
+    );
+    assert_eq!(
+        count_operations(&world, CanonicalOperation::RequestLeafRecovery),
+        0
+    );
 
     // --- Pass 1 ---
     // AliceDev2 syncs all 5 conversations with absent local groups.
     // Thanks to pass-level inbox sharing, GetLeafRecoveryInbox must be fetched
     // at most ONCE for the entire pass (not 5 times!).
-    dev2.orchestrator.sync_with_server(false).await.expect("pass 1 succeeds");
+    dev2.orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("pass 1 succeeds");
 
     let inbox_fetches_pass1 = count_operations(&world, CanonicalOperation::GetLeafRecoveryInbox);
     let recovery_mints_pass1 = count_operations(&world, CanonicalOperation::RequestLeafRecovery);
@@ -169,7 +201,10 @@ async fn test_burst_of_passes_over_five_absent_conversations_shares_inbox() {
 
     // --- Burst of 3 subsequent passes ---
     for pass in 2..=4 {
-        dev2.orchestrator.sync_with_server(false).await.expect(&format!("pass {pass} succeeds"));
+        dev2.orchestrator
+            .sync_with_server(false)
+            .await
+            .expect(&format!("pass {pass} succeeds"));
     }
 
     let recovery_mints_total = count_operations(&world, CanonicalOperation::RequestLeafRecovery);
@@ -195,8 +230,14 @@ async fn test_cooldown_honoured_across_passes_and_released_on_expiry_or_fulfilme
     let dev2 = world.client("AliceDev2");
 
     // Pass 1: Mint leaf recovery request
-    dev2.orchestrator.sync_with_server(false).await.expect("pass 1 succeeds");
-    assert_eq!(count_operations(&world, CanonicalOperation::RequestLeafRecovery), 1);
+    dev2.orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("pass 1 succeeds");
+    assert_eq!(
+        count_operations(&world, CanonicalOperation::RequestLeafRecovery),
+        1
+    );
 
     // Verify cooldown is active
     let cooldown = dev2
@@ -211,7 +252,10 @@ async fn test_cooldown_honoured_across_passes_and_released_on_expiry_or_fulfilme
     );
 
     // Gate skips sync rejoin while cooldown is active
-    let should_rejoin = dev2.orchestrator.should_attempt_sync_rejoin(&convo_id).await;
+    let should_rejoin = dev2
+        .orchestrator
+        .should_attempt_sync_rejoin(&convo_id)
+        .await;
     assert!(
         !should_rejoin,
         "should_attempt_sync_rejoin must be false while liveRequest cooldown is active"
@@ -250,7 +294,10 @@ async fn test_cooldown_honoured_across_passes_and_released_on_expiry_or_fulfilme
         .lock()
         .await
         .leaf_recovery_cooldown_remaining(&convo_id);
-    assert!(rearmed_cooldown.is_some(), "re-armed request has active cooldown");
+    assert!(
+        rearmed_cooldown.is_some(),
+        "re-armed request has active cooldown"
+    );
 
     // Fulfilment signal arrives (e.g. clear_leaf_recovery_wait or group change)
     dev2.orchestrator
@@ -280,7 +327,10 @@ async fn test_rejoin_cannot_proceed_reports_waiting_with_retry_after() {
     let dev2 = world.client("AliceDev2");
 
     // Pass 1: opens recovery request
-    dev2.orchestrator.sync_with_server(false).await.expect("pass 1 succeeds");
+    dev2.orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("pass 1 succeeds");
 
     // Consume deferred recovery on this waiting conversation
     let outcome = dev2
@@ -300,7 +350,10 @@ async fn test_rejoin_cannot_proceed_reports_waiting_with_retry_after() {
                 "waiting retry_after should be bounded by request TTL"
             );
         }
-        other => panic!("expected DeferredRecoveryOutcome::Waiting, got: {:?}", std::mem::discriminant(&other)),
+        other => panic!(
+            "expected DeferredRecoveryOutcome::Waiting, got: {:?}",
+            std::mem::discriminant(&other)
+        ),
     }
 
     // Stored conversation state remains honest: still NeedsRejoin, not marked Active or deleted
@@ -334,7 +387,10 @@ async fn test_rejoin_cannot_proceed_reports_waiting_with_retry_after() {
         .run_deferred_recovery("test_waiting_sweep")
         .await
         .expect("run_deferred_recovery succeeds");
-    assert_eq!(report.failed, 0, "waiting conversation must not count as failure");
+    assert_eq!(
+        report.failed, 0,
+        "waiting conversation must not count as failure"
+    );
     assert!(
         report.waiting >= 1 || report.skipped >= 1,
         "waiting conversation must be counted in waiting/skipped report: {report:?}"

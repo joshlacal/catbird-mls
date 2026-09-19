@@ -40,13 +40,23 @@ where
     ) -> Result<bool> {
         let user_did = self.require_user_did().await?;
         if record.actor_did != user_did
-            || self.credentials().get_device_uuid(&user_did).await?.as_deref()
+            || self
+                .credentials()
+                .get_device_uuid(&user_did)
+                .await?
+                .as_deref()
                 != Some(record.actor_device_id.as_str())
-            || self.reset_pending_payload_result(&record.conversation_id).await?.is_some()
+            || self
+                .reset_pending_payload_result(&record.conversation_id)
+                .await?
+                .is_some()
         {
             return Ok(false);
         }
-        match self.resolve_conversation_context(&record.conversation_id).await {
+        match self
+            .resolve_conversation_context(&record.conversation_id)
+            .await
+        {
             Ok(current) => Ok(current.group_id == record.group_id),
             // An absent mapping cannot prove that this same-device record was
             // retired. Keep it fenced until authoritative mapping is restored.
@@ -66,7 +76,10 @@ where
             // Retained evidence is scoped to its exact actor and group. An
             // explicit reset or device rotation supersedes its authority to
             // block the stable conversation's current, healthy generation.
-            if !self.prepared_control_targets_current_conversation(&record).await? {
+            if !self
+                .prepared_control_targets_current_conversation(&record)
+                .await?
+            {
                 continue;
             }
             let inbound = self.inbound_processing_lock(conversation_id).await;
@@ -79,7 +92,10 @@ where
                 blocked.insert(conversation_id.clone());
                 continue;
             };
-            if !self.prepared_control_targets_current_conversation(&record).await? {
+            if !self
+                .prepared_control_targets_current_conversation(&record)
+                .await?
+            {
                 continue;
             }
             if record.completed {
@@ -103,7 +119,11 @@ where
                     blocked.insert(conversation_id.clone());
                 }
             } else if let Err(error) = self.replay_prepared_control_locked(&record.group_id).await {
-                if self.mls_context().get_prepared_control(&record.group_id)?.is_some() {
+                if self
+                    .mls_context()
+                    .get_prepared_control(&record.group_id)?
+                    .is_some()
+                {
                     tracing::warn!(%conversation_id, %error, "Control confirmation is still pending; preserving local group and deferring conversation sync");
                     blocked.insert(conversation_id.clone());
                 } else {
@@ -130,7 +150,10 @@ where
         for convo in conversations {
             let convo = self.restore_conversation_policy(&user_did, convo)?;
             let convo_id = convo.conversation_id.clone();
-            self.conversations().lock().await.insert(convo_id.clone(), convo);
+            self.conversations()
+                .lock()
+                .await
+                .insert(convo_id.clone(), convo);
             if blocked_controls.contains(&convo_id) {
                 continue;
             }
@@ -496,7 +519,12 @@ where
         let any_needs_recovery = {
             let mut needed = false;
             for c in &all_convos {
-                if self.storage().needs_rejoin(&c.conversation_id).await.unwrap_or(false) {
+                if self
+                    .storage()
+                    .needs_rejoin(&c.conversation_id)
+                    .await
+                    .unwrap_or(false)
+                {
                     needed = true;
                     break;
                 }
@@ -518,11 +546,14 @@ where
             if self.batch_inventory_snapshot().is_none() {
                 if let Ok(inv) = self.fetch_authorized_inventory_snapshot().await {
                     let inv = std::sync::Arc::new(inv);
-                    if let Ok(inbox) = self.fetch_authorized_recovery_inbox_snapshot_with_session(
-                        &inv.session_id,
-                        &inv.event_cursor,
-                        inv.expires_at.as_deref(),
-                    ).await {
+                    if let Ok(inbox) = self
+                        .fetch_authorized_recovery_inbox_snapshot_with_session(
+                            &inv.session_id,
+                            &inv.event_cursor,
+                            inv.expires_at.as_deref(),
+                        )
+                        .await
+                    {
                         let inbox = std::sync::Arc::new(inbox);
                         return super::with_batch_inventory_scope(
                             inv,
@@ -535,7 +566,8 @@ where
                                     false,
                                 )),
                             ),
-                        ).await;
+                        )
+                        .await;
                     }
                 }
             } else if self.batch_recovery_inbox_snapshot().is_none() {
@@ -549,7 +581,8 @@ where
                             blocked_controls,
                             false,
                         )),
-                    ).await;
+                    )
+                    .await;
                 }
             }
         }
@@ -573,17 +606,33 @@ where
         let mut sync_rejoin_attempted = HashSet::new();
         for convo in &all_convos {
             if !*self.sync_in_progress().lock().await {
-                if strict{return Err(OrchestratorError::InvalidInput("Inventory application interrupted".into()));}
+                if strict {
+                    return Err(OrchestratorError::InvalidInput(
+                        "Inventory application interrupted".into(),
+                    ));
+                }
                 break;
             }
 
-            let previous_view = self.conversations().lock().await.get(&convo.conversation_id).cloned();
+            let previous_view = self
+                .conversations()
+                .lock()
+                .await
+                .get(&convo.conversation_id)
+                .cloned();
             let convo = self.restore_conversation_policy(user_did, convo.clone())?;
             let convo = super::admission::merge_conversation_view(previous_view.as_ref(), convo)?;
             let conversation_id = convo.conversation_id.as_str();
-            self.conversations().lock().await.insert(conversation_id.to_string(), convo.clone());
+            self.conversations()
+                .lock()
+                .await
+                .insert(conversation_id.to_string(), convo.clone());
             if blocked_controls.contains(conversation_id) {
-                if strict{return Err(OrchestratorError::InvalidInput("Inventory has unresolved controls".into()));}
+                if strict {
+                    return Err(OrchestratorError::InvalidInput(
+                        "Inventory has unresolved controls".into(),
+                    ));
+                }
                 continue;
             }
             if self.is_local_conversation_terminal(conversation_id).await? {
@@ -596,9 +645,15 @@ where
                 .ensure_conversation_exists(user_did, conversation_id, group_id)
                 .await?;
 
-            if convo.canonical_state.as_ref().is_some_and(|state|state.direct_request.is_some()) {
-                if let Err(error)=Box::pin(self.refresh_request_preview(conversation_id)).await {
-                    if strict{return Err(error);}
+            if convo
+                .canonical_state
+                .as_ref()
+                .is_some_and(|state| state.direct_request.is_some())
+            {
+                if let Err(error) = Box::pin(self.refresh_request_preview(conversation_id)).await {
+                    if strict {
+                        return Err(error);
+                    }
                     tracing::warn!(conversation_id,%error,"Request preview refresh deferred");
                 }
             }
@@ -638,7 +693,10 @@ where
                 crate::info_log!(
                     "[sync] convo={} server group changed {} -> {}; clearing recovery backoff",
                     conversation_id,
-                    previous_view.as_ref().map(|p| p.group_id.as_str()).unwrap_or(""),
+                    previous_view
+                        .as_ref()
+                        .map(|p| p.group_id.as_str())
+                        .unwrap_or(""),
                     convo.group_id
                 );
                 let mut tracker = self.recovery_tracker().lock().await;
@@ -672,7 +730,9 @@ where
                 Ok(gid_bytes) => match self.mls_context().get_epoch(gid_bytes) {
                     Ok(_) => true,
                     Err(crate::MLSError::ContextClosed) => {
-                        if strict{return Err(crate::MLSError::ContextClosed.into());}
+                        if strict {
+                            return Err(crate::MLSError::ContextClosed.into());
+                        }
                         tracing::debug!(
                             conversation_id,
                             group_id,
@@ -718,18 +778,10 @@ where
 
             // Initialize group state if missing OR if the persisted record is stale.
             if !has_state_record || !ffi_has_group {
-                tracing::trace!(
-                    conversation_id,
-                    group_id,
-                    "entering init block"
-                );
+                tracing::trace!(conversation_id, group_id, "entering init block");
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
                 let epoch = if let Ok(gid_bytes) = hex::decode(group_id) {
-                    tracing::trace!(
-                        conversation_id,
-                        group_id,
-                        "pre-get_epoch call"
-                    );
+                    tracing::trace!(conversation_id, group_id, "pre-get_epoch call");
                     match self.mls_context().get_epoch(gid_bytes) {
                         Ok(e) => {
                             tracing::trace!(
@@ -744,7 +796,9 @@ where
                         // (race with a concurrent suspension). Transient — keep the
                         // server epoch and DON'T engage the rejoin gate.
                         Err(crate::MLSError::ContextClosed) => {
-                            if strict{return Err(crate::MLSError::ContextClosed.into());}
+                            if strict {
+                                return Err(crate::MLSError::ContextClosed.into());
+                            }
                             tracing::debug!(
                                 conversation_id,
                                 group_id,
@@ -760,10 +814,7 @@ where
                                 "FFI get_epoch Err"
                             );
                             if !sync_rejoin_attempted.insert(conversation_id.to_string()) {
-                                tracing::debug!(
-                                    conversation_id,
-                                    "SKIP: duplicate in cycle"
-                                );
+                                tracing::debug!(conversation_id, "SKIP: duplicate in cycle");
                                 tracing::debug!(
                                     conversation_id = %conversation_id,
                                     group_id = %group_id,
@@ -814,7 +865,9 @@ where
                                         epoch
                                     }
                                     Err(e) => {
-                                        if strict{return Err(e);}
+                                        if strict {
+                                            return Err(e);
+                                        }
                                         let msg = e.to_string();
                                         if msg.contains("leaf recovery pending") {
                                             tracing::debug!(
@@ -829,10 +882,17 @@ where
                                                 error = %e,
                                                 "Failed to join group via join_or_rejoin"
                                             );
-                                            let _ = self.record_rejoin_failure(conversation_id).await;
-                                            if let Ok(Some(convo_state)) = self.storage().get_conversation_state(conversation_id).await {
+                                            let _ =
+                                                self.record_rejoin_failure(conversation_id).await;
+                                            if let Ok(Some(convo_state)) = self
+                                                .storage()
+                                                .get_conversation_state(conversation_id)
+                                                .await
+                                            {
                                                 if convo_state == ConversationState::Initializing {
-                                                    let _ = self.accept_conversation(conversation_id).await;
+                                                    let _ = self
+                                                        .accept_conversation(conversation_id)
+                                                        .await;
                                                 }
                                             }
                                         }
@@ -948,7 +1008,11 @@ where
                             .unwrap_or(0)
                         };
                         if server_epoch > new_local {
-                            if strict{return Err(OrchestratorError::InvalidInput("Inventory epoch catch-up incomplete".into()));}
+                            if strict {
+                                return Err(OrchestratorError::InvalidInput(
+                                    "Inventory epoch catch-up incomplete".into(),
+                                ));
+                            }
                             tracing::warn!(
                                 conversation_id = %conversation_id,
                                 group_id = %group_id,
@@ -961,7 +1025,9 @@ where
                         }
                     }
                     Err(e) => {
-                        if strict{return Err(e);}
+                        if strict {
+                            return Err(e);
+                        }
                         tracing::warn!(
                             conversation_id = %conversation_id,
                             group_id = %group_id,
@@ -999,7 +1065,9 @@ where
             {
                 Some(Ok(epoch)) => epoch.min(u32::MAX as u64) as u32,
                 Some(Err(e)) => {
-                    if strict{return Err(e.into());}
+                    if strict {
+                        return Err(e.into());
+                    }
                     tracing::debug!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -1009,7 +1077,11 @@ where
                     continue;
                 }
                 None => {
-                    if strict{return Err(OrchestratorError::InvalidInput("Inventory group ID malformed".into()));}
+                    if strict {
+                        return Err(OrchestratorError::InvalidInput(
+                            "Inventory group ID malformed".into(),
+                        ));
+                    }
                     tracing::debug!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -1033,7 +1105,9 @@ where
                     }
                 }
                 Err(e) => {
-                    if strict{return Err(e);}
+                    if strict {
+                        return Err(e);
+                    }
                     tracing::warn!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -1108,7 +1182,9 @@ where
                             );
                         }
                         Err(e) => {
-                            if strict{return Err(e);}
+                            if strict {
+                                return Err(e);
+                            }
                             sync_rejoin_attempted.insert(conversation_id.to_string());
                             tracing::warn!(
                                 conversation_id = %conversation_id,
@@ -1122,7 +1198,9 @@ where
             }
         }
 
-        if strict { return Ok(()); }
+        if strict {
+            return Ok(());
+        }
 
         // Fulfill any pending leaf recovery requests for conversations we are active in.
         if let Err(e) = self.fulfill_pending_leaf_recoveries().await {

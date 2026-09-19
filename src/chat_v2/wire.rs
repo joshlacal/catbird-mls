@@ -127,7 +127,9 @@ impl<S: BosStr> WireEntry for ConversationEntry<S> {
     fn entry_kind(&self) -> &'static str {
         match self {
             Self::DirectRequestEntry(_) => "blue.catbird.chat.defs#directRequestEntry",
-            Self::DirectRequestAcceptanceEntry(_) => "blue.catbird.chat.defs#directRequestAcceptanceEntry",
+            Self::DirectRequestAcceptanceEntry(_) => {
+                "blue.catbird.chat.defs#directRequestAcceptanceEntry"
+            }
             Self::ApplicationEntry(_) => APPLICATION_ENTRY_KIND,
             Self::CommitEntry(_) => COMMIT_ENTRY_KIND,
             Self::PolicyEntry(_) => POLICY_ENTRY_KIND,
@@ -154,7 +156,9 @@ impl<S: BosStr> AppendLogEntry for ConversationEntry<S> {
     fn raw_conversation_id(&self) -> &str {
         match self {
             Self::DirectRequestEntry(entry) => entry.signed_request.body.conversation_id.as_ref(),
-            Self::DirectRequestAcceptanceEntry(entry) => entry.signed_request.body.prior.conversation_id.as_ref(),
+            Self::DirectRequestAcceptanceEntry(entry) => {
+                entry.signed_request.body.prior.conversation_id.as_ref()
+            }
             Self::ApplicationEntry(entry) => entry.conversation_id.as_ref(),
             Self::CommitEntry(entry) => entry.conversation_id.as_ref(),
             Self::PolicyEntry(entry) => entry.conversation_id.as_ref(),

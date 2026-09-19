@@ -139,7 +139,7 @@ where
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
     direct_request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) direct_request_reconcile_backoff: Mutex<HashMap<String,(u32,web_time::Instant)>>,
+    pub(crate) direct_request_reconcile_backoff: Mutex<HashMap<String, (u32, web_time::Instant)>>,
     /// Per-stable-conversation inbound locks. These serialize duplicate HTTP,
     /// push, and catch-up deliveries through their final crypto/application
     /// durability barrier without reusing the rejoin transition lock.
@@ -373,7 +373,9 @@ where
     }
 
     /// Return the currently scoped batch recovery inbox snapshot, if any.
-    pub(crate) fn batch_recovery_inbox_snapshot(&self) -> Option<Arc<AuthorizedRecoveryInboxSnapshot>> {
+    pub(crate) fn batch_recovery_inbox_snapshot(
+        &self,
+    ) -> Option<Arc<AuthorizedRecoveryInboxSnapshot>> {
         BATCH_RECOVERY_INBOX_CONTEXT
             .try_with(|snapshot| {
                 if snapshot.owner_instance_id != self.instance_id {
@@ -538,7 +540,11 @@ where
         &self,
     ) -> Result<AuthorizedRecoveryInboxSnapshot> {
         let (session, fence, expires_at) = if let Some(inv) = self.batch_inventory_snapshot() {
-            (inv.session_id.clone(), inv.event_cursor.clone(), inv.expires_at.clone())
+            (
+                inv.session_id.clone(),
+                inv.event_cursor.clone(),
+                inv.expires_at.clone(),
+            )
         } else {
             let inv = self.fetch_authorized_inventory_snapshot().await?;
             (inv.session_id, inv.event_cursor, inv.expires_at)
@@ -561,8 +567,9 @@ where
         let did = self.require_user_did().await?;
         let device = self.require_actor_device_id().await?;
         let mut page_cursor: Option<String> = None;
-        let mut pagination =
-            super::pagination::PaginationGuard::for_conversations("authorized recovery inbox batch");
+        let mut pagination = super::pagination::PaginationGuard::for_conversations(
+            "authorized recovery inbox batch",
+        );
         let mut inbox_items = Vec::new();
 
         loop {
@@ -595,8 +602,7 @@ where
 
             if page["inventorySessionId"].as_str() != Some(session_id)
                 || page["snapshotEventCursor"].as_str() != Some(event_cursor)
-                || (expires_at.is_some()
-                    && page["snapshotExpiresAt"].as_str() != expires_at)
+                || (expires_at.is_some() && page["snapshotExpiresAt"].as_str() != expires_at)
             {
                 return Err(OrchestratorError::InvalidInput(
                     "recovery inbox session mismatch during pagination".into(),
@@ -1306,8 +1312,12 @@ where
     }
 
     pub(crate) async fn direct_request_operation_lock(&self, draft_id: &str) -> Arc<Mutex<()>> {
-        self.direct_request_locks.lock().await.entry(draft_id.to_owned())
-            .or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        self.direct_request_locks
+            .lock()
+            .await
+            .entry(draft_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Acquire the per-conversation join/rejoin lock object.

@@ -18,8 +18,7 @@ impl IncomingEnvelope {
     /// no append sequence and retain their historical arbitrary message IDs.
     pub fn validate_server_metadata(&self) -> Result<()> {
         if let Some(sequence) = self.server_sequence {
-            CanonicalUuid::parse(&self.conversation_id)
-                .map_err(|_| invalid("conversationId"))?;
+            CanonicalUuid::parse(&self.conversation_id).map_err(|_| invalid("conversationId"))?;
             if sequence == 0 || sequence > MAX_SAFE_INTEGER as u64 {
                 return Err(invalid("sequence"));
             }
@@ -45,22 +44,53 @@ impl IncomingEnvelope {
         entry: &Value,
         expected_conversation_id: &str,
     ) -> Result<Option<Self>> {
-        if matches!(entry["$type"].as_str(), Some("blue.catbird.chat.defs#directRequestEntry" | "blue.catbird.chat.defs#directRequestAcceptanceEntry" | "blue.catbird.chat.defs#conversationCloseEntry")) {
+        if matches!(
+            entry["$type"].as_str(),
+            Some(
+                "blue.catbird.chat.defs#directRequestEntry"
+                    | "blue.catbird.chat.defs#directRequestAcceptanceEntry"
+                    | "blue.catbird.chat.defs#conversationCloseEntry"
+            )
+        ) {
             let body = &entry["signedRequest"]["body"];
-            let coordinate = if entry["$type"] == "blue.catbird.chat.defs#conversationCloseEntry" { &body["prior"] } else { &body["next"] };
-            let cid = entry["conversationId"].as_str().ok_or_else(|| invalid("conversationId"))?;
-            if cid != expected_conversation_id || coordinate["conversationId"] != cid { return Err(invalid("control conversation binding")); }
-            let received_at = entry["receivedAt"].as_str().ok_or_else(|| invalid("receivedAt"))?;
+            let coordinate = if entry["$type"] == "blue.catbird.chat.defs#conversationCloseEntry" {
+                &body["prior"]
+            } else {
+                &body["next"]
+            };
+            let cid = entry["conversationId"]
+                .as_str()
+                .ok_or_else(|| invalid("conversationId"))?;
+            if cid != expected_conversation_id || coordinate["conversationId"] != cid {
+                return Err(invalid("control conversation binding"));
+            }
+            let received_at = entry["receivedAt"]
+                .as_str()
+                .ok_or_else(|| invalid("receivedAt"))?;
             CanonicalTimestamp::parse(received_at).map_err(|_| invalid("receivedAt"))?;
             let envelope = Self {
-                canonical_entry_json: Some(serde_json::to_string(entry).map_err(|_| invalid("control JSON"))?),
+                canonical_entry_json: Some(
+                    serde_json::to_string(entry).map_err(|_| invalid("control JSON"))?,
+                ),
                 conversation_id: cid.into(),
-                sender_did: body["actorDid"].as_str().ok_or_else(|| invalid("actorDid"))?.into(),
+                sender_did: body["actorDid"]
+                    .as_str()
+                    .ok_or_else(|| invalid("actorDid"))?
+                    .into(),
                 ciphertext: Vec::new(),
                 timestamp: received_at.parse().map_err(|_| invalid("receivedAt"))?,
-                server_message_id: Some(entry["entryId"].as_str().ok_or_else(|| invalid("entryId"))?.into()),
+                server_message_id: Some(
+                    entry["entryId"]
+                        .as_str()
+                        .ok_or_else(|| invalid("entryId"))?
+                        .into(),
+                ),
                 server_sequence: Some(entry["seq"].as_u64().ok_or_else(|| invalid("seq"))?),
-                server_epoch: Some(coordinate["epoch"].as_u64().ok_or_else(|| invalid("epoch"))?),
+                server_epoch: Some(
+                    coordinate["epoch"]
+                        .as_u64()
+                        .ok_or_else(|| invalid("epoch"))?,
+                ),
             };
             envelope.validate_server_metadata()?;
             return Ok(Some(envelope));
@@ -255,9 +285,10 @@ mod tests {
         assert_eq!(mapped.server_epoch, Some(7));
         let mut wrong_conversation = envelope.clone();
         wrong_conversation.conversation_id = "not-a-canonical-conversation".into();
-        assert!(crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(
-            wrong_conversation, None
-        ).is_err());
+        assert!(
+            crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(wrong_conversation, None)
+                .is_err()
+        );
         assert!(
             crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(
                 envelope.clone(),
