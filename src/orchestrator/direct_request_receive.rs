@@ -407,7 +407,7 @@ where
         device: &str,
         projection: &mut DirectRequestProjection,
         raw: &mut Option<Vec<u8>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let mut candidate = projection.clone();
         let state = self
             .request_query(
@@ -485,10 +485,11 @@ where
                         conversations.remove(&alias);
                     }
                     conversations.insert(cid.into(), view);
+                    return Ok(true);
                 }
             }
         }
-        Ok(())
+        Ok(false)
     }
     fn save_received_request(
         &self,
@@ -613,8 +614,47 @@ where
             Box::pin(self.resume_account_exits(&std::collections::HashSet::new())).await?;
             return existing.ok_or_else(invalid);
         }
-        if existing.is_none() {
-            Box::pin(self.refresh_request_preview(cid)).await?;
+        let existing = match existing {
+            Some(view) => view,
+            None => Box::pin(self.refresh_request_preview(cid)).await?,
+        };
+        if existing.crypto == RequestCrypto::Unavailable {
+            let owner = self.require_user_did().await?;
+            let device = self.require_actor_device_id().await?;
+            let accepted_exit = self
+                .mls_context()
+                .list_account_exits()?
+                .iter()
+                .any(|record| {
+                    record.accepted_response.is_some()
+                        && record.storage_identity().is_ok_and(|identity| {
+                            identity.conversation_id == cid
+                                && identity.actor_did == owner
+                                && identity.actor_device_id == device
+                        })
+                });
+            if !accepted_exit {
+                // A device omitted from bootstrap has no native epoch. Retain
+                // the independently verified request coordinate before an exit
+                // can be submitted, so terminal host projection has a fence.
+                // Already accepted exit proof remains sufficient for replay.
+                let lock = self.direct_request_operation_lock(cid).await;
+                let _guard = lock.lock().await;
+                let mut raw = self.mls_context().read_direct_request_projection(cid)?;
+                let mut projection = DirectRequestProjection::decode(
+                    raw.as_deref().ok_or_else(invalid)?,
+                    &owner,
+                    &device,
+                )?;
+                if !self
+                    .refresh_request_acceptance(cid, &owner, &device, &mut projection, &mut raw)
+                    .await?
+                {
+                    return Err(OrchestratorError::InvalidInput(
+                        "Request close requires an exact verified conversation coordinate".into(),
+                    ));
+                }
+            }
         }
         Box::pin(self.leave_conversation(cid)).await?;
         let closed = self
