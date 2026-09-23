@@ -908,6 +908,14 @@ impl MLSAPIClient for ClientAPIAdapter {
 
 #[async_trait::async_trait]
 impl CredentialStore for ClientCredentialAdapter {
+    async fn direct_request_receipt_authority_document(
+        &self,
+    ) -> crate::orchestrator::Result<Option<Vec<u8>>> {
+        self.0
+            .direct_request_receipt_authority_document()
+            .map_err(bridge_err)
+    }
+
     async fn store_signing_key(
         &self,
         user_did: &str,
