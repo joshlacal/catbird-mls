@@ -152,7 +152,21 @@ where
                     reason: "Direct request receipt authority resolution unavailable".into(),
                 })
             })?;
-        intent::validate_authority_document(&document)?;
+        intent::validate_authority_document(&document).map_err(|refusal| match refusal {
+            // A structurally valid document naming another authority: the
+            // request has no canonical transaction to join, so report the
+            // typed unsupported capability and never fall back to legacy
+            // federation delivery.
+            intent::AuthorityDocumentRefusal::ForeignAuthority => {
+                OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
+                    reason: "Direct request receipt authority is not the canonical authority"
+                        .into(),
+                })
+            }
+            intent::AuthorityDocumentRefusal::Malformed => OrchestratorError::Storage(
+                "Invalid direct request ownership record".into(),
+            ),
+        })?;
         let public = self
             .mls_context()
             .identity_public_key(format!("{owner}#{device}").into_bytes())?;

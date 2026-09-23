@@ -36,7 +36,7 @@ fn invalid() -> OrchestratorError {
 impl DirectRequestIntent {
     pub fn validate(&self, owner: &str, device: &str) -> Result<()> {
         super::validate_direct_request_input(&self.input)?;
-        validate_authority_document(&self.trusted_authority_document)?;
+        validate_authority_document(&self.trusted_authority_document).map_err(|_| invalid())?;
         for attempt in &self.previous_attempts {
             attempt.validate(owner, device)?;
         }
@@ -231,12 +231,57 @@ impl DirectRequestIntent {
     }
 }
 
+/// The canonical clean-chat authority. Initial atomic publication is limited to
+/// this one authority, which owns pair uniqueness, grants, reservations and
+/// persistence. See the encrypted-message-requests design, "Compatibility and
+/// existing conversations".
+pub const CANONICAL_DIRECT_REQUEST_AUTHORITY: &str = "did:web:chat.catbird.blue";
+
+/// Why a retained authority document cannot authorize a request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthorityDocumentRefusal {
+    /// The document is not usable as an authority document at all: it does not
+    /// parse, has no `verificationMethod` array, or carries no method the
+    /// canonical resolver accepts.
+    Malformed,
+    /// The document is structurally valid and carries a usable receipt method,
+    /// but it names an authority other than the canonical one. This is the
+    /// unsupported cross-authority case: the request has no canonical
+    /// transaction to join, and the caller must report unavailable support
+    /// rather than degrade to legacy federation delivery.
+    ForeignAuthority,
+}
+
 /// Check support before reservation without selecting a server key ourselves.
 /// The response later chooses a method that must resolve within this retained
 /// authenticated document or a freshly authenticated rotation document.
-pub fn validate_authority_document(document: &[u8]) -> Result<()> {
-    let value: serde_json::Value = serde_json::from_slice(document).map_err(|_| invalid())?;
-    let methods = value["verificationMethod"].as_array().ok_or_else(invalid)?;
+pub fn validate_authority_document(
+    document: &[u8],
+) -> std::result::Result<(), AuthorityDocumentRefusal> {
+    let value: serde_json::Value =
+        serde_json::from_slice(document).map_err(|_| AuthorityDocumentRefusal::Malformed)?;
+    let methods = value["verificationMethod"]
+        .as_array()
+        .ok_or(AuthorityDocumentRefusal::Malformed)?;
+    let named = value["id"].as_str().filter(|id| !id.is_empty());
+    if named.is_none()
+        || methods.is_empty()
+        || !methods
+            .iter()
+            .any(|method| method["id"].as_str().is_some_and(|id| !id.is_empty()))
+    {
+        return Err(AuthorityDocumentRefusal::Malformed);
+    }
+    // A structurally valid authority document naming any other authority is the
+    // unsupported cross-authority case. The canonical resolver refuses such a
+    // document outright; naming the failure separately is what lets the caller
+    // report a typed unsupported capability instead of a generic ownership
+    // error.
+    if named != Some(CANONICAL_DIRECT_REQUEST_AUTHORITY) {
+        return Err(AuthorityDocumentRefusal::ForeignAuthority);
+    }
+    // Only the canonical authority proceeds to method resolution, so the
+    // retained document must carry a method the resolver actually accepts.
     if !methods
         .iter()
         .filter_map(|method| method["id"].as_str())
@@ -247,7 +292,7 @@ pub fn validate_authority_document(document: &[u8]) -> Result<()> {
             .is_ok()
         })
     {
-        return Err(invalid());
+        return Err(AuthorityDocumentRefusal::Malformed);
     }
     Ok(())
 }
@@ -385,8 +430,8 @@ impl DirectRequestTerminalAttempt {
 }
 
 pub(super) fn merge_trusted_documents(previous: &[u8], current: &[u8]) -> Result<Vec<u8>> {
-    validate_authority_document(previous)?;
-    validate_authority_document(current)?;
+    validate_authority_document(previous).map_err(|_| invalid())?;
+    validate_authority_document(current).map_err(|_| invalid())?;
     let mut previous: serde_json::Value =
         serde_json::from_slice(previous).map_err(|_| invalid())?;
     let current: serde_json::Value = serde_json::from_slice(current).map_err(|_| invalid())?;
