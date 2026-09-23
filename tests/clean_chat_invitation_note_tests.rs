@@ -67,6 +67,183 @@ fn last_request(world: &TestWorld, op: Op) -> Value {
     .unwrap()
 }
 
+/// Every body the transport actually submitted for one canonical operation, in
+/// call order. This is the server/transport-observed record of what the note
+/// outbox sent, independent of anything the client believes.
+fn submissions(world: &TestWorld, op: Op) -> Vec<Value> {
+    world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .filter(|r| r.operation == op)
+        .map(|r| serde_json::from_slice(r.body.as_deref().unwrap()).unwrap())
+        .collect()
+}
+
+/// Bob's prepared recipient selection: a real key package and a real signed
+/// grant, labeled with Bob's registered device.
+async fn recipient_selection(world: &TestWorld) -> Value {
+    let bob = world.client("Bob");
+    let bob_device = bob
+        .credentials
+        .get_device_uuid(&bob.did)
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = format!("{}#{bob_device}", bob.did).into_bytes();
+    let package = bob
+        .orchestrator
+        .mls_context()
+        .create_key_package(identity.clone())
+        .unwrap();
+    let bob_public = bob
+        .orchestrator
+        .mls_context()
+        .identity_public_key(String::from_utf8(identity.clone()).unwrap())
+        .unwrap();
+    let grant_id = uuid::Uuid::new_v4().to_string();
+    let grant = json!({
+        "$type": "blue.catbird.chat.defs#directRequestGrantBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-GRANT\0",
+        "protocolVersion": "2",
+        "actorDid": bob.did,
+        "actorDeviceId": bob_device,
+        "keyId": URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),
+        "authGeneration": 1,
+        "grantId": grant_id,
+        "grantRevision": 1,
+        "purpose": "direct-request-bootstrap",
+        "profile": "encryptedIntroduction1",
+        "keyPackageRef": STANDARD.encode(&package.hash_ref),
+        "keyPackageSha256": STANDARD.encode(Sha256::digest(&package.key_package_data)),
+        "expiresAt": utc(29 * 86400),
+        "idempotencyKey": grant_id,
+        "signedAt": utc(0),
+    });
+    let signature = bob
+        .orchestrator
+        .mls_context()
+        .sign_with_identity_key(
+            String::from_utf8(identity).unwrap(),
+            protocol::direct_request_signing_bytes(
+                protocol::DirectRequestKind::Grant,
+                &serde_json::to_vec(&grant).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    json!({
+        "actorDid": bob.did,
+        "actorDeviceId": bob_device,
+        "keyId": grant["keyId"],
+        "authGeneration": 1,
+        "keyPackage": {
+            "framing": "mlsMessage",
+            "contentType": "keyPackage",
+            "bytes": STANDARD.encode(&package.key_package_data),
+            "sha256": STANDARD.encode(Sha256::digest(&package.key_package_data)),
+            "keyPackageRef": STANDARD.encode(&package.hash_ref),
+        },
+        "grant": {
+            "body": grant,
+            "signature": STANDARD.encode(signature),
+        }
+    })
+}
+
+/// A receipt-authority-signed preparation echoing the exact prepare request.
+fn signed_preparation(
+    prepare: &Value,
+    prepare_request_digest: &[u8],
+    authority: &p256::ecdsa::SigningKey,
+    method: &str,
+    selected: Value,
+) -> Value {
+    let mut preparation = json!({
+        "protocolVersion": "2",
+        "requestId": prepare["requestId"],
+        "firstMessageId": prepare["firstMessageId"],
+        "conversationId": prepare["conversationId"],
+        "recipientDid": prepare["recipientDid"],
+        "origin": prepare["origin"],
+        "profile": prepare["profile"],
+        "creator": {
+            "actorDid": prepare["actorDid"],
+            "actorDeviceId": prepare["actorDeviceId"],
+            "keyId": prepare["keyId"],
+            "authGeneration": prepare["authGeneration"],
+        },
+        "selectedDevices": [selected],
+        "preparedAt": utc(0),
+        "leaseExpiresAt": utc(600),
+        "minimumImportUntil": utc(7 * 86400 + 300 - 5),
+        "preparationRequestDigest": STANDARD.encode(prepare_request_digest),
+        "authorityDid": "did:web:chat.catbird.blue",
+        "receiptKeyId": method,
+    });
+    let signing = protocol::direct_request_preparation_signing_bytes(
+        &serde_json::to_vec(&preparation).unwrap(),
+    )
+    .unwrap();
+    preparation["preparationDigest"] = json!(STANDARD.encode(Sha256::digest(&signing)));
+    preparation["preparationSignature"] = json!(es256(authority, &signing));
+    preparation
+}
+
+fn prepared_outcome(preparation: Value) -> Value {
+    json!({
+        "outcome": {
+            "$type": "blue.catbird.chat.defs#directRequestPreparedOutcome",
+            "preparation": preparation,
+        }
+    })
+}
+
+/// The authority's signed published receipt for the exact submitted publish bytes.
+fn published_receipt(
+    authority: &p256::ecdsa::SigningKey,
+    method: &str,
+    prepare_request_digest: &[u8],
+    signed_publish: &Value,
+    publish_request_digest: &[u8],
+) -> Value {
+    let p = &signed_publish["body"];
+    let body = json!({
+        "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
+        "protocolVersion": "2",
+        "authorityDid": "did:web:chat.catbird.blue",
+        "keyId": method,
+        "receipt": {
+            "$type": "blue.catbird.chat.defs#directRequestPublishedReceipt",
+            "requestId": p["requestId"],
+            "requestKind": "publish",
+            "requestDigest": STANDARD.encode(publish_request_digest),
+            "preparationRequestDigest": STANDARD.encode(prepare_request_digest),
+            "actorDid": p["actorDid"],
+            "actorDeviceId": p["actorDeviceId"],
+            "actorKeyId": p["keyId"],
+            "authGeneration": p["authGeneration"],
+            "conversationId": p["conversationId"],
+            "firstMessageId": p["firstMessageId"],
+            "coordinates": p["next"],
+            "recordedAt": utc(0),
+        }
+    });
+    json!({
+        "$type": "blue.catbird.chat.defs#signedDirectRequestReceipt",
+        "signature": es256(
+            authority,
+            &protocol::direct_request_signing_bytes(
+                protocol::DirectRequestKind::Outcome,
+                &serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+        ),
+        "body": body,
+    })
+}
+
 /// Sets up a group where Alice is admin and Bob is a pending invitee via a signed policy transition.
 async fn setup_target_group(
     world: &TestWorld,
@@ -399,8 +576,8 @@ async fn c28_no_target_group_leaf_welcome_or_secrets_before_acceptance() {
         .unwrap();
 
     let original = last_request(&world, Op::PrepareDirectRequest);
-    let prepare = &original["signedRequest"]["body"];
-    let (device, pubkey) = {
+    let prepare = original["signedRequest"]["body"].clone();
+    let pubkey = {
         let alice = world.client("Alice");
         let dev = alice
             .credentials
@@ -408,12 +585,11 @@ async fn c28_no_target_group_leaf_welcome_or_secrets_before_acceptance() {
             .await
             .unwrap()
             .unwrap();
-        let pk = alice
+        alice
             .orchestrator
             .mls_context()
             .identity_public_key(format!("{}#{dev}", alice.did))
-            .unwrap();
-        (dev, pk)
+            .unwrap()
     };
     let verified = protocol::verify_signed_request(
         protocol::DirectRequestKind::Prepare,
@@ -422,116 +598,20 @@ async fn c28_no_target_group_leaf_welcome_or_secrets_before_acceptance() {
     )
     .unwrap();
 
-    let (package, signature, grant, bob_device) = {
-        let bob = world.client("Bob");
-        let bob_device = bob
-            .credentials
-            .get_device_uuid(&bob.did)
-            .await
-            .unwrap()
-            .unwrap();
-        let identity = format!("{}#{bob_device}", bob.did).into_bytes();
-        let package = bob
-            .orchestrator
-            .mls_context()
-            .create_key_package(identity.clone())
-            .unwrap();
-        let bob_public = bob
-            .orchestrator
-            .mls_context()
-            .identity_public_key(String::from_utf8(identity.clone()).unwrap())
-            .unwrap();
-        let grant_id = uuid::Uuid::new_v4().to_string();
-        let grant = json!({
-            "$type": "blue.catbird.chat.defs#directRequestGrantBody",
-            "signatureDomain": "CATBIRD-DIRECT-REQUEST-GRANT\0",
-            "protocolVersion": "2",
-            "actorDid": bob.did,
-            "actorDeviceId": bob_device,
-            "keyId": URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),
-            "authGeneration": 1,
-            "grantId": grant_id,
-            "grantRevision": 1,
-            "purpose": "direct-request-bootstrap",
-            "profile": "encryptedIntroduction1",
-            "keyPackageRef": STANDARD.encode(&package.hash_ref),
-            "keyPackageSha256": STANDARD.encode(Sha256::digest(&package.key_package_data)),
-            "expiresAt": utc(29 * 86400),
-            "idempotencyKey": grant_id,
-            "signedAt": utc(0),
-        });
-        let signature = bob
-            .orchestrator
-            .mls_context()
-            .sign_with_identity_key(
-                String::from_utf8(identity).unwrap(),
-                protocol::direct_request_signing_bytes(
-                    protocol::DirectRequestKind::Grant,
-                    &serde_json::to_vec(&grant).unwrap(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        (package, signature, grant, bob_device)
-    };
-
-    let selected = json!({
-        "actorDid": "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb",
-        "actorDeviceId": bob_device,
-        "keyId": grant["keyId"],
-        "authGeneration": 1,
-        "keyPackage": {
-            "framing": "mlsMessage",
-            "contentType": "keyPackage",
-            "bytes": STANDARD.encode(&package.key_package_data),
-            "sha256": STANDARD.encode(Sha256::digest(&package.key_package_data)),
-            "keyPackageRef": STANDARD.encode(&package.hash_ref),
-        },
-        "grant": {
-            "body": grant,
-            "signature": STANDARD.encode(signature),
-        }
-    });
-
-    let mut preparation = json!({
-        "protocolVersion": "2",
-        "requestId": prepare["requestId"],
-        "firstMessageId": prepare["firstMessageId"],
-        "conversationId": prepare["conversationId"],
-        "recipientDid": prepare["recipientDid"],
-        "origin": prepare["origin"],
-        "profile": prepare["profile"],
-        "creator": {
-            "actorDid": prepare["actorDid"],
-            "actorDeviceId": prepare["actorDeviceId"],
-            "keyId": prepare["keyId"],
-            "authGeneration": prepare["authGeneration"],
-        },
-        "selectedDevices": [selected],
-        "preparedAt": utc(0),
-        "leaseExpiresAt": utc(600),
-        "minimumImportUntil": utc(7 * 86400 + 300 - 5),
-        "preparationRequestDigest": STANDARD.encode(verified.request_digest()),
-        "authorityDid": "did:web:chat.catbird.blue",
-        "receiptKeyId": method,
-    });
-    let signing = protocol::direct_request_preparation_signing_bytes(
-        &serde_json::to_vec(&preparation).unwrap(),
-    )
-    .unwrap();
-    preparation["preparationDigest"] = json!(STANDARD.encode(Sha256::digest(&signing)));
-    preparation["preparationSignature"] = json!(es256(&authority, &signing));
+    let preparation = signed_preparation(
+        &prepare,
+        verified.request_digest(),
+        &authority,
+        &method,
+        recipient_selection(&world).await,
+    );
 
     world.delivery_service().queue_request_operation_response(
         Op::PrepareDirectRequest,
         200,
-        json!({
-            "outcome": {
-                "$type": "blue.catbird.chat.defs#directRequestPreparedOutcome",
-                "preparation": preparation,
-            }
-        }),
+        prepared_outcome(preparation),
     );
+
     world.delivery_service().queue_request_operation_response(
         Op::PublishDirectRequest,
         503,
@@ -546,7 +626,7 @@ async fn c28_no_target_group_leaf_welcome_or_secrets_before_acceptance() {
         .unwrap();
 
     let publication = last_request(&world, Op::PublishDirectRequest);
-    let p = &publication["signedRequest"]["body"];
+    let p = publication["signedRequest"]["body"].clone();
     let verified_publish = protocol::verify_signed_request(
         protocol::DirectRequestKind::Publish,
         &serde_json::to_vec(&publication["signedRequest"]).unwrap(),
@@ -554,40 +634,13 @@ async fn c28_no_target_group_leaf_welcome_or_secrets_before_acceptance() {
     )
     .unwrap();
 
-    let body = json!({
-        "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
-        "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
-        "protocolVersion": "2",
-        "authorityDid": "did:web:chat.catbird.blue",
-        "keyId": method,
-        "receipt": {
-            "$type": "blue.catbird.chat.defs#directRequestPublishedReceipt",
-            "requestId": p["requestId"],
-            "requestKind": "publish",
-            "requestDigest": STANDARD.encode(verified_publish.request_digest()),
-            "preparationRequestDigest": STANDARD.encode(verified.request_digest()),
-            "actorDid": p["actorDid"],
-            "actorDeviceId": p["actorDeviceId"],
-            "actorKeyId": p["keyId"],
-            "authGeneration": p["authGeneration"],
-            "conversationId": p["conversationId"],
-            "firstMessageId": p["firstMessageId"],
-            "coordinates": p["next"],
-            "recordedAt": utc(0),
-        }
-    });
-    let receipt = json!({
-        "$type": "blue.catbird.chat.defs#signedDirectRequestReceipt",
-        "signature": es256(
-            &authority,
-            &protocol::direct_request_signing_bytes(
-                protocol::DirectRequestKind::Outcome,
-                &serde_json::to_vec(&body).unwrap(),
-            )
-            .unwrap(),
-        ),
-        "body": body,
-    });
+    let receipt = published_receipt(
+        &authority,
+        &method,
+        verified.request_digest(),
+        &publication["signedRequest"],
+        verified_publish.request_digest(),
+    );
 
     world.delivery_service().queue_request_operation_response(
         Op::PublishDirectRequest,
@@ -717,7 +770,7 @@ async fn c28_partial_note_delivery_retry_does_not_duplicate_invitation() {
         world.add_client_with_did(name, did).await;
         world.register_device(name).await.unwrap();
     }
-    let (_authority, doc, _method) = receipt_authority();
+    let (authority, doc, method) = receipt_authority();
     for name in ["Alice", "Bob"] {
         world
             .client(name)
@@ -729,35 +782,56 @@ async fn c28_partial_note_delivery_retry_does_not_duplicate_invitation() {
     let (target_cid, group_state, invitation_entry, _alice_dev) =
         setup_target_group(&world, &invitation_id).await;
 
-    // First attempt to get invitation reference
-    world.delivery_service().queue_request_operation_response(
-        Op::GetConversationState,
-        200,
-        json!({"state": group_state}),
-    );
-    world.delivery_service().queue_request_operation_response(
-        Op::GetEntries,
-        200,
-        json!({"entries": [invitation_entry.clone()], "hasMore": false, "nextAfterSeq": 3}),
-    );
+    // The invitation-bearing mutations the target group has seen so far. The
+    // note attempt and its retry must add none of them.
+    let group_creations_before_note = submissions(&world, Op::CreateConversation).len();
+    let transitions_before_note = submissions(&world, Op::SubmitTransition).len();
 
-    let first_ref = world
-        .client("Alice")
-        .orchestrator
-        .get_group_invitation_reference(&target_cid, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
-        .await
-        .unwrap()
-        .unwrap();
-
-    // Partial note delivery fails on transport (or draft retry)
-    let _input = DirectRequestInput {
-        draft_id: uuid::Uuid::new_v4().to_string(),
-        recipient_did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
-        text: "Note attempt 1".into(),
-        invitation: Some(first_ref.clone()),
+    let alice_pubkey = {
+        let alice = world.client("Alice");
+        let device = alice
+            .credentials
+            .get_device_uuid(&alice.did)
+            .await
+            .unwrap()
+            .unwrap();
+        alice
+            .orchestrator
+            .mls_context()
+            .identity_public_key(format!("{}#{device}", alice.did))
+            .unwrap()
     };
 
-    // Retry sending note to the same pending recipient
+    let invitation_ref = {
+        world.delivery_service().queue_request_operation_response(
+            Op::GetConversationState,
+            200,
+            json!({"state": group_state}),
+        );
+        world.delivery_service().queue_request_operation_response(
+            Op::GetEntries,
+            200,
+            json!({"entries": [invitation_entry.clone()], "hasMore": false, "nextAfterSeq": 3}),
+        );
+        world
+            .client("Alice")
+            .orchestrator
+            .get_group_invitation_reference(&target_cid, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(invitation_ref.invitation_transition_id, invitation_id);
+
+    let input = DirectRequestInput {
+        draft_id: uuid::Uuid::new_v4().to_string(),
+        recipient_did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        text: "Please join our group chat".into(),
+        invitation: Some(invitation_ref.clone()),
+    };
+
+    // 1. Transport drops the first prepare response. The note outbox retains an
+    //    unresolved attempt carrying the exact invitation.
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
         200,
@@ -768,7 +842,123 @@ async fn c28_partial_note_delivery_retry_does_not_duplicate_invitation() {
         200,
         json!({"entries": [invitation_entry.clone()], "hasMore": false, "nextAfterSeq": 3}),
     );
+    world.delivery_service().queue_request_operation_response(
+        Op::PrepareDirectRequest,
+        503,
+        json!({"error": "unavailable"}),
+    );
+    let first = world
+        .client("Alice")
+        .orchestrator
+        .start_direct_request(input.clone())
+        .await
+        .unwrap();
+    assert!(matches!(first, DirectRequestOutcome::OutcomeUnknown { .. }));
 
+    let prepare_bodies = submissions(&world, Op::PrepareDirectRequest);
+    assert_eq!(prepare_bodies.len(), 1);
+    let verified_prepare = protocol::verify_signed_request(
+        protocol::DirectRequestKind::Prepare,
+        &serde_json::to_vec(&prepare_bodies[0]["signedRequest"]).unwrap(),
+        &alice_pubkey,
+    )
+    .unwrap();
+    let prepare = prepare_bodies[0]["signedRequest"]["body"].clone();
+
+    // 2. The server answers that exact prepare; the publish response is lost.
+    world.delivery_service().queue_request_operation_response(
+        Op::PrepareDirectRequest,
+        200,
+        prepared_outcome(signed_preparation(
+            &prepare,
+            verified_prepare.request_digest(),
+            &authority,
+            &method,
+            recipient_selection(&world).await,
+        )),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequest,
+        503,
+        json!({"error": "lost"}),
+    );
+    let second = world
+        .client("Alice")
+        .orchestrator
+        .resume_direct_request(&input.draft_id)
+        .await
+        .unwrap();
+    assert!(matches!(second, DirectRequestOutcome::OutcomeUnknown { .. }));
+
+    let lost_publish = submissions(&world, Op::PublishDirectRequest);
+    assert_eq!(lost_publish.len(), 1, "first publish reached the transport");
+    let verified_publish = protocol::verify_signed_request(
+        protocol::DirectRequestKind::Publish,
+        &serde_json::to_vec(&lost_publish[0]["signedRequest"]).unwrap(),
+        &alice_pubkey,
+    )
+    .unwrap();
+    let p = lost_publish[0]["signedRequest"]["body"].clone();
+    assert_eq!(p["requestId"], prepare["requestId"]);
+
+    // 3. Retry the unresolved attempt; the authority confirms the same request.
+    let receipt = published_receipt(
+        &authority,
+        &method,
+        verified_prepare.request_digest(),
+        &lost_publish[0]["signedRequest"],
+        verified_publish.request_digest(),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::PublishDirectRequest,
+        200,
+        json!({"outcome": receipt}),
+    );
+    let sent = world
+        .client("Alice")
+        .orchestrator
+        .resume_direct_request(&input.draft_id)
+        .await
+        .unwrap();
+    assert!(matches!(sent, DirectRequestOutcome::RequestSent { .. }));
+
+    // 3a. Transport-observed retry: the same two requests replayed byte-for-byte.
+    //     The retry minted no second request identity and no second introduction.
+    let publish_bodies = submissions(&world, Op::PublishDirectRequest);
+    assert_eq!(publish_bodies.len(), 2, "publish retried through the outbox");
+    assert_eq!(
+        publish_bodies[0], publish_bodies[1],
+        "lost-response retry must replay the identical publication"
+    );
+    let prepare_bodies = submissions(&world, Op::PrepareDirectRequest);
+    assert_eq!(prepare_bodies.len(), 2, "prepare retried through the outbox");
+    assert_eq!(prepare_bodies[0], prepare_bodies[1]);
+
+    // 3b. The retry submitted no new invitation-bearing mutation to the target
+    //     group: no creation and no policy transition was resubmitted.
+    assert_eq!(
+        submissions(&world, Op::CreateConversation).len(),
+        group_creations_before_note
+    );
+    assert_eq!(
+        submissions(&world, Op::SubmitTransition).len(),
+        transitions_before_note
+    );
+
+    // 3c. The production resolver, re-run against the server's current target
+    //     group snapshot after the retry, still yields the identical single
+    //     invitation (two pending rows for the recipient would be an error, none
+    //     a `None`).
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        200,
+        json!({"state": group_state}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetEntries,
+        200,
+        json!({"entries": [invitation_entry.clone()], "hasMore": false, "nextAfterSeq": 3}),
+    );
     let retry_ref = world
         .client("Alice")
         .orchestrator
@@ -776,32 +966,57 @@ async fn c28_partial_note_delivery_retry_does_not_duplicate_invitation() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(retry_ref, invitation_ref);
 
-    // Verify:
-    // - Invitation transition ID is IDENTICAL (invitation was NOT duplicated)
-    assert_eq!(
-        first_ref.invitation_transition_id, retry_ref.invitation_transition_id,
-        "Note delivery retry must reuse the existing invitation without duplicating it"
+    // 4. Recipient projection: the single published introduction decrypts for
+    //    Bob with the original target-group invitation, exactly once.
+    let direct_cid = p["conversationId"].as_str().unwrap().to_string();
+    let publication_entry = json!({
+        "$type": "blue.catbird.chat.defs#directRequestEntry",
+        "entryId": uuid::Uuid::new_v4().to_string(),
+        "conversationId": direct_cid,
+        "seq": 1,
+        "signedRequest": lost_publish[0]["signedRequest"],
+        "receivedAt": receipt["body"]["receipt"]["recordedAt"].clone(),
+    });
+    world.delivery_service().queue_request_operation_response(
+        Op::GetEntries,
+        200,
+        json!({"entries": [publication_entry], "hasMore": false, "nextAfterSeq": 1}),
     );
-    assert_eq!(first_ref.conversation_id, retry_ref.conversation_id);
-    assert_eq!(first_ref.recipient_did, retry_ref.recipient_did);
-    assert_eq!(first_ref.invited_by_did, retry_ref.invited_by_did);
-
-    // - Target group participants list contains exactly ONE pending entry for Bob
-    let participants = group_state["participants"].as_array().unwrap();
-    let bob_entries: Vec<_> = participants
-        .iter()
-        .filter(|p| p["userDid"] == "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
-        .collect();
-    assert_eq!(
-        bob_entries.len(),
-        1,
-        "Target group must have exactly one pending participant entry for recipient"
+    world.delivery_service().queue_request_operation_response(
+        Op::GetDirectRequestOutcome,
+        200,
+        json!({"outcome": receipt}),
+    );
+    world.delivery_service().queue_request_operation_response(
+        Op::GetConversationState,
+        503,
+        json!({"error": "offline"}),
     );
 
-    // - Target group state version and sequence number are not advanced by note retry
-    assert_eq!(group_state["coordinates"]["stateVersion"], json!(3));
-    assert_eq!(group_state["snapshotSeq"], json!(3));
+    let bob_view = world
+        .client("Bob")
+        .orchestrator
+        .refresh_request_preview(&direct_cid)
+        .await
+        .unwrap();
+    assert_eq!(bob_view.crypto, RequestCrypto::Ready);
+    match &bob_view.preview {
+        Some(RequestPreview::Ready { text, invitation }) => {
+            assert_eq!(text, "Please join our group chat");
+            assert_eq!(
+                invitation.as_ref(),
+                Some(&invitation_ref),
+                "recipient must see the original invitation, not a duplicate"
+            );
+            assert_eq!(
+                invitation.as_ref().unwrap().invitation_transition_id,
+                invitation_id
+            );
+        }
+        other => panic!("Expected one decrypted introduction, got: {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
