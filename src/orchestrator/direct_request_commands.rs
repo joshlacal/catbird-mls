@@ -818,9 +818,13 @@ where
                 })
             }
             "blue.catbird.chat.defs#directRequestExpiredReceipt" => {
+                let code = match proof.get("requestKind").and_then(|v| v.as_str()) {
+                    Some("publishedExpiry") => "RequestExpired",
+                    _ => "PreparationExpired",
+                };
                 Ok(DirectRequestOutcome::TerminalNotPublished {
                     request_id: id,
-                    code: "PreparationExpired".into(),
+                    code: code.into(),
                 })
             }
             "blue.catbird.chat.defs#directRequestRejectedReceipt" => {
