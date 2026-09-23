@@ -8116,6 +8116,72 @@ impl MlsCryptoContext for MLSContext {
         crate::orchestrator::direct_request_journal::projection_list(&inner.manifest_storage)
     }
 
+    fn read_request_value(&self, namespace: &str, id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("read_request_value");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_value_read(
+            &inner.manifest_storage,
+            namespace,
+            id,
+        )
+    }
+
+    fn compare_exchange_request_value(
+        &self,
+        namespace: &str,
+        id: &str,
+        expected: Option<&[u8]>,
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("compare_exchange_request_value");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_value_cas(
+            &inner.manifest_storage,
+            namespace,
+            id,
+            expected,
+            next,
+        )
+    }
+
+    fn list_request_values(&self, namespace: &str) -> Result<Vec<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("list_request_values");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_values_list(
+            &inner.manifest_storage,
+            namespace,
+        )
+    }
+
+    fn request_values_total_bytes(&self, namespace: &str) -> Result<u64, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("request_values_total_bytes");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_values_total_bytes(
+            &inner.manifest_storage,
+            namespace,
+        )
+    }
+
     fn read_direct_request_key_publication(
         &self,
         device: &str,

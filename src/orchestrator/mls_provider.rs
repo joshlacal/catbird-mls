@@ -282,6 +282,33 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         })
     }
 
+    fn read_request_value(&self, _namespace: &str, _id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+    fn compare_exchange_request_value(
+        &self,
+        _namespace: &str,
+        _id: &str,
+        _expected: Option<&[u8]>,
+        _next: &[u8],
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+    fn list_request_values(&self, _namespace: &str) -> Result<Vec<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+    fn request_values_total_bytes(&self, _namespace: &str) -> Result<u64, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+
     fn read_direct_request_key_publication(
         &self,
         _device: &str,

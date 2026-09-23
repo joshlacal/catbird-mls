@@ -82,3 +82,4 @@ pub use types::*;
 pub use welcome_recovery::*;
 
 pub mod authenticated_inventory;
+pub mod subscription;
