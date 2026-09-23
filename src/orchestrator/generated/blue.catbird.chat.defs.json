@@ -7240,7 +7240,8 @@
         "ProtocolUpgradeRequired",
         "RequestNotAccepted",
         "UnavailableIntroduction",
-        "RateLimited"
+        "RateLimited",
+        "RecipientAuthorityUnsupported"
       ]
     },
     "directRequestUnknownOutcome": {
