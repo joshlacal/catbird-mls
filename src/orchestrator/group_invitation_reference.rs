@@ -8,6 +8,26 @@ use serde_json::Value;
 fn invalid() -> OrchestratorError {
     OrchestratorError::InvalidInput("Group invitation proof is unavailable or inconsistent".into())
 }
+/// Signed bodies carry bare base64 bytes while read responses may present the
+/// same bytes as `{"$bytes": …}`. Normalize both coordinate presentations with
+/// the shared contract-checked read normalizer, then compare canonical bytes.
+fn same_group_id(signed_next: &Value, read_current: &Value) -> Result<bool> {
+    let group_id = |coordinates: &Value| -> Result<Value> {
+        let raw = serde_json::to_vec(coordinates).map_err(|_| invalid())?;
+        let normalized =
+            crate::chat_v2::transcript::direct_request::normalize_direct_request_read_presentation(
+                &raw,
+                "conversationCoordinates",
+                false,
+            )
+            .map_err(|_| invalid())?;
+        match &normalized["groupId"] {
+            Value::String(_) => Ok(normalized["groupId"].clone()),
+            _ => Err(invalid()),
+        }
+    };
+    Ok(group_id(signed_next)? == group_id(read_current)?)
+}
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -121,7 +141,7 @@ where
                     || body["actorDid"] != actor
                     || body["actorDeviceId"] != actor_device
                     || body["next"]["conversationId"] != cid
-                    || body["next"]["groupId"] != state["coordinates"]["groupId"]
+                    || !same_group_id(&body["next"], &state["coordinates"])?
                     || body["next"]["generation"] != state["coordinates"]["generation"]
                     || body["next"]["stateVersion"].as_u64()
                         > state["coordinates"]["stateVersion"].as_u64()
@@ -173,5 +193,57 @@ where
             after = next;
         }
         Err(invalid())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn coordinates(group_id: Value) -> Value {
+        json!({
+            "conversationId": "53e6db38-605c-4e32-bee9-094594ac5ccb",
+            "generation": 0,
+            "stateVersion": 1,
+            "groupId": group_id,
+            "epoch": 0,
+            "groupContextHash": "TBLXfzMUuzsnHwTnKKKwRAqWB/sLwBor4Wp7SGpPt0U=",
+            "confirmationTag": "QUeUKdE2aaOd7d3/DFoydzw3k/t+vha6cid2klXdg3M=",
+            "lifecycle": "active"
+        })
+    }
+
+    // Captured from the shipping router: signed policy body uses bare base64,
+    // getConversationState presents the same group id as `$bytes`.
+    const GROUP: &str = "YoI1GTvhpDAKAHBbELWIRzu7OzyHLKStU+zNqf/vWE4=";
+
+    #[test]
+    fn group_id_matches_across_bare_and_dollar_bytes_presentations() {
+        let signed = coordinates(json!(GROUP));
+        let mut read = coordinates(json!({ "$bytes": GROUP }));
+        read["groupContextHash"] = json!({ "$bytes": signed["groupContextHash"] });
+        read["confirmationTag"] = json!({ "$bytes": signed["confirmationTag"] });
+        assert!(same_group_id(&signed, &read).unwrap());
+        assert!(same_group_id(&read, &signed).unwrap());
+        assert!(same_group_id(&signed, &signed).unwrap());
+    }
+
+    #[test]
+    fn different_group_ids_do_not_match_and_bad_shapes_fail_closed() {
+        let other = STANDARD.encode([7u8; 32]);
+        assert!(!same_group_id(
+            &coordinates(json!(GROUP)),
+            &coordinates(json!({ "$bytes": other }))
+        )
+        .unwrap());
+        for malformed in [
+            json!({ "$bytes": GROUP, "extra": true }),
+            json!({ "bytes": GROUP }),
+            json!([1, 2]),
+            json!(null),
+        ] {
+            assert!(same_group_id(&coordinates(json!(GROUP)), &coordinates(malformed)).is_err());
+        }
     }
 }
