@@ -147,6 +147,56 @@ where
             .iter()
             .any(|p| p["userDid"] == owner && p["status"] != "active"))
     }
+    /// A device outside the publication's addressed set (for example one
+    /// enrolled after publication) is refused the request entry and holds no
+    /// request keys. Its truthful view is the account's consent from the
+    /// validated conversation state with crypto unavailable. Nothing is
+    /// retained, so later leaf recovery never inherits a fabricated preview.
+    async fn unaddressed_direct_request_view(
+        &self,
+        cid: &str,
+        owner: &str,
+        device: &str,
+    ) -> Result<DirectRequestView> {
+        let result = self
+            .request_query(
+                CanonicalOperation::GetConversationState,
+                format!("actorDeviceId={device}&conversationId={cid}"),
+            )
+            .await?;
+        let view = super::super::admission::conversation_view_from_state_json(&result["state"])
+            .ok_or_else(invalid)?;
+        super::super::admission::validate_conversation_view(&view)?;
+        let state = view.canonical_state.as_ref().ok_or_else(invalid)?;
+        super::super::admission::validate_conversation_policy(state)?;
+        let request = state.direct_request.as_ref().ok_or_else(invalid)?;
+        if state.coordinates.conversation_id.as_str() != cid {
+            return Err(invalid());
+        }
+        let recipient = owner == request.recipient_did.as_str();
+        let sender = owner == request.sender_did.as_str();
+        let consent = match request.consent.as_str() {
+            _ if !(recipient || sender) => return Err(invalid()),
+            "accepted" => RequestConsent::Accepted,
+            "closed" => RequestConsent::Closed,
+            "incomingPending" | "outgoingPending" if recipient => RequestConsent::IncomingPending,
+            "incomingPending" | "outgoingPending" => RequestConsent::OutgoingPending,
+            _ => return Err(invalid()),
+        };
+        Ok(DirectRequestView {
+            introduction: None,
+            conversation_id: cid.into(),
+            first_message_id: None,
+            consent,
+            crypto: RequestCrypto::Unavailable,
+            preview: Some(RequestPreview::Unavailable {
+                code: "DeviceNotAddressed".into(),
+            }),
+            capabilities: RequestCapabilities::derive(consent, RequestCrypto::Unavailable, false),
+            state_version: u64::try_from(state.coordinates.state_version).map_err(|_| invalid())?,
+            generation: u64::try_from(state.coordinates.generation).map_err(|_| invalid())?,
+        })
+    }
     pub(crate) async fn request_query(
         &self,
         operation: CanonicalOperation,
@@ -198,12 +248,21 @@ where
         let mut projection = if let Some(raw) = &raw {
             DirectRequestProjection::decode(raw, &owner, &device)?
         } else {
-            let entries = self
+            let entries = match self
                 .request_query(
                     CanonicalOperation::GetEntries,
                     format!("actorDeviceId={device}&conversationId={cid}&afterSeq=0&limit=100"),
                 )
-                .await?;
+                .await
+            {
+                Err(OrchestratorError::ServerError { status: 400, body })
+                    if serde_json::from_str::<Value>(&body)
+                        .is_ok_and(|error| error["error"] == "NotEntitled") =>
+                {
+                    return self.unaddressed_direct_request_view(cid, &owner, &device).await;
+                }
+                result => result?,
+            };
             let entries = entries["entries"].as_array().ok_or_else(invalid)?;
             let requests = entries
                 .iter()
