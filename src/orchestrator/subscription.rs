@@ -452,16 +452,16 @@ fn query(
         CanonicalOperation::GetPendingWelcomes => "getPendingWelcomes",
         _ => "getLeafRecoveryInbox",
     };
-    let mut path = format!(
-        "/xrpc/blue.catbird.chat.{nsid}?actorDeviceId={actor}&limit=100&supportedProtocolVersions=1&supportedProtocolVersions=2"
-    );
+    let mut path = format!("/xrpc/blue.catbird.chat.{nsid}?actorDeviceId=");
+    push_query_value(&mut path, actor);
+    path.push_str("&limit=100&supportedProtocolVersions=1&supportedProtocolVersions=2");
     if let Some(session) = session {
         path.push_str("&inventorySessionId=");
-        path.push_str(session);
+        push_query_value(&mut path, session);
     }
     if let Some(cursor) = cursor {
         path.push_str("&pageCursor=");
-        path.push_str(cursor);
+        push_query_value(&mut path, cursor);
     }
     PreparedRequest {
         operation,
@@ -471,57 +471,41 @@ fn query(
     }
 }
 
-fn validate_endpoint(endpoint_str: &str) -> Result<()> {
-    if !endpoint_str.starts_with("wss://") {
-        return Err(invalid("Endpoint must use wss:// scheme"));
+/// Percent-encode everything outside the RFC 3986 unreserved set.
+fn push_query_value(out: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
     }
-    let rest = &endpoint_str["wss://".len()..];
-    if rest.contains('@') {
-        return Err(invalid("Endpoint cannot contain credentials"));
-    }
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, ""),
-    };
-    if path != "/xrpc/blue.catbird.chat.subscribeEvents" {
-        return Err(invalid("Endpoint path must be /xrpc/blue.catbird.chat.subscribeEvents"));
-    }
-    let host = match authority.find(':') {
-        Some(idx) => &authority[..idx],
-        None => authority,
-    };
-    let valid_host = matches!(
-        host,
-        "chat.catbird.blue" | "chat.example.test" | "127.0.0.1" | "localhost"
-    );
-    if !valid_host {
-        return Err(invalid(format!("Invalid endpoint host: {host}")));
+}
+
+/// The only admitted subscription endpoint: the production service on its
+/// default port, with no userinfo, query, or fragment.
+fn validate_endpoint(endpoint: &str) -> Result<()> {
+    const PATH: &str = "/xrpc/blue.catbird.chat.subscribeEvents";
+    let authority = endpoint
+        .strip_prefix("wss://")
+        .and_then(|rest| rest.strip_suffix(PATH))
+        .ok_or_else(|| invalid("Endpoint must be wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents"))?;
+    if !matches!(authority, "chat.catbird.blue" | "chat.catbird.blue:443") {
+        return Err(invalid(format!("Invalid endpoint authority: {authority}")));
     }
     Ok(())
 }
 
+/// Decode one `subscriptionMessage` frame under the strict canonical schema:
+/// duplicate keys, unknown fields, and unknown union variants are rejected
+/// before any state or cursor is touched.
 pub fn decode_subscription_frame(raw: &str) -> Result<serde_json::Value> {
     if raw.len() > MAX_FRAME_BYTES {
         return Err(invalid("Subscription frame exceeds bound"));
     }
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(invalid_err)?;
-    let obj = value.as_object().ok_or_else(|| invalid("Frame must be a JSON object"))?;
-    let type_tag = obj
-        .get("$type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| invalid("Missing $type in subscription frame"))?;
-    match type_tag {
-        "blue.catbird.chat.defs#subscriptionMessage" => {
-            // Unwrap inner union if wrapped
-            if let Some(inner) = obj.get("payload") {
-                Ok(inner.clone())
-            } else {
-                Ok(value)
-            }
-        }
-        "blue.catbird.chat.defs#eventEnvelope" | "blue.catbird.chat.defs#typingEvent" => Ok(value),
-        _ => Err(invalid(format!("Unexpected frame type: {type_tag}"))),
-    }
+    super::canonical_transport::validate_read_shape("subscriptionMessage", raw.as_bytes())
+        .map_err(invalid)
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -737,12 +721,14 @@ where
         Ok(self.synchronize_inventory_internal(force_fresh).await?.1)
     }
 
-    /// Prepare a subscription ticket using explicit identity parameters.
+    /// Prepare a subscription ticket using explicit identity parameters. The
+    /// ticket's inventory scope must equal the snapshot's `inventory_scope_digest`.
     pub async fn prepare_subscription_ticket(
         &self,
         actor_device_id: &str,
         inventory_session_id: &str,
         event_cursor: &str,
+        inventory_scope_digest: &str,
     ) -> Result<SubscriptionTicket> {
         self.check_shutdown().await?;
         let owner = self.require_user_did().await?;
@@ -800,6 +786,9 @@ where
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
         ticket.inventory_scope.validate()?;
+        if ticket.inventory_scope.scope_digest != inventory_scope_digest {
+            return Err(invalid("ticket inventory scope does not match snapshot"));
+        }
         fresh(&ticket.expires_at)?;
 
         validate_endpoint(&ticket.endpoint)?;
@@ -824,7 +813,12 @@ where
         let namespace = format!("inventory:{owner}");
 
         let ticket = self
-            .prepare_subscription_ticket(&actor, &snapshot.inventory_session_id, &snapshot.event_cursor)
+            .prepare_subscription_ticket(
+                &actor,
+                &snapshot.inventory_session_id,
+                &snapshot.event_cursor,
+                &snapshot.scope_digest,
+            )
             .await?;
 
         if self
@@ -960,26 +954,12 @@ where
 
         let value = decode_subscription_frame(raw)?;
 
-        if value.get("$type").and_then(|v| v.as_str()) == Some("blue.catbird.chat.defs#typingEvent") {
-            let cid = value
-                .get("conversationId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let did = value
-                .get("did")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let is_typing = value
-                .get("isTyping")
-                .and_then(|v| v.as_bool())
-                .or_else(|| value.get("typing").and_then(|v| v.as_bool()))
-                .unwrap_or(true);
+        // The strict decode guarantees every required typingEvent field.
+        if value["$type"] == "blue.catbird.chat.defs#typingEvent" {
             return Ok(SubscriptionDispatchOutcome::Typing {
-                conversation_id: cid,
-                sender_did: did,
-                is_typing,
+                conversation_id: value["conversationId"].as_str().unwrap_or_default().to_string(),
+                sender_did: value["actorDid"].as_str().unwrap_or_default().to_string(),
+                is_typing: value["isTyping"] == true,
             });
         }
 
@@ -1189,31 +1169,34 @@ mod tests {
         assert_eq!(decoded["previousCursor"], "c1");
         assert_eq!(decoded["cursor"], "c2");
 
-        // Typing event decode
-        let typing = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#typingEvent",
-            "conversationId": "convo-1",
-            "did": "did:plc:alice",
-            "isTyping": true
-        });
-        let raw_typing = serde_json::to_string(&typing).unwrap();
+        // Canonical typing event decode
+        let raw_typing = typing_frame("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa");
         let decoded_typing = decode_subscription_frame(&raw_typing).unwrap();
         assert_eq!(decoded_typing["$type"], "blue.catbird.chat.defs#typingEvent");
 
-        // Wrapped in subscriptionMessage
+        // subscriptionMessage is the union itself, never a wrapper variant
         let wrapped = serde_json::json!({
             "$type": "blue.catbird.chat.defs#subscriptionMessage",
             "payload": valid_watermark
         });
-        let decoded_wrapped = decode_subscription_frame(&serde_json::to_string(&wrapped).unwrap()).unwrap();
-        assert_eq!(decoded_wrapped["cursor"], "c2");
+        assert!(decode_subscription_frame(&serde_json::to_string(&wrapped).unwrap()).is_err());
 
-        // Unknown $type rejected
+        // Unknown frame $type rejected
         let invalid_type = serde_json::json!({
             "$type": "blue.catbird.chat.defs#unknownFutureEvent",
             "data": 123
         });
         assert!(decode_subscription_frame(&serde_json::to_string(&invalid_type).unwrap()).is_err());
+
+        // Unknown payload variant, unknown field, and duplicate key rejected
+        let unknown_payload = raw.replace("#watermarkEvent", "#unknownEvent");
+        assert!(decode_subscription_frame(&unknown_payload).is_err());
+        let unknown_field = raw.replace(r#""cursor":"c2""#, r#""cursor":"c2","extra":"x""#);
+        assert_ne!(unknown_field, raw);
+        assert!(decode_subscription_frame(&unknown_field).is_err());
+        let duplicate_key = raw.replace(r#""cursor":"c2""#, r#""cursor":"c2","cursor":"c9""#);
+        assert_ne!(duplicate_key, raw);
+        assert!(decode_subscription_frame(&duplicate_key).is_err());
 
         // Oversized frame rejected
         let huge = "x".repeat(MAX_FRAME_BYTES + 1);
@@ -1259,9 +1242,17 @@ mod tests {
     #[test]
     fn validate_endpoint_scenarios() {
         assert!(validate_endpoint("wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_ok());
-        assert!(validate_endpoint("wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents").is_ok());
-        assert!(validate_endpoint("wss://127.0.0.1:443/xrpc/blue.catbird.chat.subscribeEvents").is_ok());
-        assert!(validate_endpoint("wss://localhost/xrpc/blue.catbird.chat.subscribeEvents").is_ok());
+        assert!(validate_endpoint("wss://chat.catbird.blue:443/xrpc/blue.catbird.chat.subscribeEvents").is_ok());
+
+        // Fixture hosts and non-default ports are not admitted
+        assert!(validate_endpoint("wss://chat.example.test/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+        assert!(validate_endpoint("wss://127.0.0.1:443/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+        assert!(validate_endpoint("wss://localhost/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+        assert!(validate_endpoint("wss://chat.catbird.blue:8443/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+
+        // Query and fragment rejected
+        assert!(validate_endpoint("wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents?x=1").is_err());
+        assert!(validate_endpoint("wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents#f").is_err());
 
         // Scheme must be wss
         assert!(validate_endpoint("ws://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_err());
@@ -1272,10 +1263,38 @@ mod tests {
 
         // Credentials rejected
         assert!(validate_endpoint("wss://user:pass@chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_err());
+        assert!(validate_endpoint("wss://evil.test@chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents").is_err());
 
         // Path must be exact
         assert!(validate_endpoint("wss://chat.catbird.blue/xrpc/other.endpoint").is_err());
         assert!(validate_endpoint("wss://chat.catbird.blue/").is_err());
+    }
+
+    #[test]
+    fn inventory_query_percent_encodes_untrusted_values() {
+        let path = query(
+            CanonicalOperation::GetConversations,
+            "actor/1",
+            Some("session&other"),
+            Some("page cursor=+"),
+        )
+        .path;
+        assert!(path.contains("?actorDeviceId=actor%2F1&limit=100&"));
+        assert!(path.contains("&inventorySessionId=session%26other"));
+        assert!(path.ends_with("&pageCursor=page%20cursor%3D%2B"));
+    }
+
+    fn typing_frame(actor_did: &str) -> String {
+        serde_json::json!({
+            "$type": "blue.catbird.chat.defs#typingEvent",
+            "typingId": "00000000-0000-4000-8000-00000000000a",
+            "conversationId": "00000000-0000-4000-8000-00000000000b",
+            "actorDid": actor_did,
+            "actorDeviceId": "00000000-0000-4000-8000-00000000000c",
+            "isTyping": true,
+            "expiresAt": "2026-09-23T00:00:05.000Z"
+        })
+        .to_string()
     }
 
     struct MockStorage;
@@ -1497,14 +1516,9 @@ mod tests {
         assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-2");
 
         // 4. Typing event does NOT advance cursor
-        let typing_frame = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#typingEvent",
-            "conversationId": "convo-1",
-            "did": "did:plc:bob",
-            "isTyping": true
-        }).to_string();
-        let outcome = orchestrator.apply_subscription_frame(&typing_frame).await.unwrap();
-        assert!(matches!(outcome, SubscriptionDispatchOutcome::Typing { ref conversation_id, ref sender_did, is_typing: true } if conversation_id == "convo-1" && sender_did == "did:plc:bob"));
+        let bob = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+        let outcome = orchestrator.apply_subscription_frame(&typing_frame(bob)).await.unwrap();
+        assert!(matches!(outcome, SubscriptionDispatchOutcome::Typing { ref conversation_id, ref sender_did, is_typing: true } if conversation_id == "00000000-0000-4000-8000-00000000000b" && sender_did == bob));
         // Cursor must remain cursor-2
         assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-2");
 
@@ -1531,12 +1545,29 @@ mod tests {
             "createdAt": "2026-09-23T00:00:00.000Z",
             "payload": {
                 "$type": "blue.catbird.chat.defs#accessEndedEvent",
-                "userDid": "did:plc:foreign",
-                "deviceId": "00000000-0000-4000-8000-000000000999"
+                "conversationId": "00000000-0000-4000-8000-00000000000b",
+                "membershipIntervalId": "00000000-0000-4000-8000-00000000000d",
+                "userDid": "did:plc:ffffffffffffffffffffffff",
+                "deviceId": "00000000-0000-4000-8000-000000000999",
+                "terminalSeq": 1
             }
         }).to_string();
         let err = orchestrator.apply_subscription_frame(&foreign_access_ended).await.unwrap_err();
         assert!(err.to_string().contains("Foreign access-ended audience"));
+        assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-3");
+
+        // 6b. Unknown payload variant is rejected before the cursor moves
+        let unknown_variant = serde_json::json!({
+            "$type": "blue.catbird.chat.defs#eventEnvelope",
+            "previousCursor": "cursor-3",
+            "cursor": "cursor-4",
+            "createdAt": "2026-09-23T00:00:00.000Z",
+            "payload": {
+                "$type": "blue.catbird.chat.defs#unknownEvent",
+                "issuedAt": "2026-09-23T00:00:00.000Z"
+            }
+        }).to_string();
+        assert!(orchestrator.apply_subscription_frame(&unknown_variant).await.is_err());
         assert_eq!(orchestrator.current_subscription_cursor().await.unwrap().unwrap().cursor, "cursor-3");
 
         // 7. Concurrent CAS modification: another process updates subscriptionCursor
@@ -1610,6 +1641,14 @@ mod tests {
         assert_eq!(ticket.event_cursor, "cursor-inv-1");
         assert_eq!(ticket.endpoint, "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents");
         assert_eq!(ticket.ticket, "ticket-12345678901234567890123456789012");
+
+        // 2b. A ticket whose inventory scope differs from the snapshot is refused
+        let foreign_scope = STANDARD.encode([4u8; 32]);
+        let err = orchestrator
+            .prepare_subscription_ticket(actor, &ticket.inventory_session_id, &ticket.event_cursor, &foreign_scope)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("ticket inventory scope does not match snapshot"));
 
         // 3. Second call with force_fresh=false restores from cached journal
         let fence2 = orchestrator.synchronize_authenticated_inventory(false).await.unwrap();

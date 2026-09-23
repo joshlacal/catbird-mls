@@ -1736,6 +1736,17 @@ fn project_schema_ref(
     }
 }
 
+/// Validate an unsigned read/event shape against the pinned canonical schema:
+/// duplicate keys, unknown fields, null, and unknown closed-union variants are
+/// rejected. This validates framing only; orchestration owns state authority.
+pub(crate) fn validate_read_shape(
+    name: &str,
+    raw: &[u8],
+) -> Result<serde_json::Value, TransportError> {
+    project_schema_ref(name, &parse_strict_signed_json(raw)?, false)?;
+    serde_json::from_slice(raw).map_err(|e| TransportError::Serialization(e.to_string()))
+}
+
 fn project_schema(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
