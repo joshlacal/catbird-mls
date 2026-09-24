@@ -8288,6 +8288,49 @@ impl MlsCryptoContext for MLSContext {
     ) -> Result<Vec<u8>, MLSError> {
         MLSContext::export_metadata_key_from_pending(self, group_id, target_epoch)
     }
+    fn export_canonical_metadata_key(
+        &self,
+        group_id: Vec<u8>,
+        coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        inner.with_group(&GroupId::from_slice(&group_id), |group, provider, _signer| {
+            Ok(crate::orchestrator::direct_request_bootstrap::request_metadata_key(
+                group,
+                provider,
+                coordinates,
+            )?
+            .to_vec())
+        })
+    }
+    fn export_canonical_metadata_key_from_pending(
+        &self,
+        group_id: Vec<u8>,
+        coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        inner.with_group(&GroupId::from_slice(&group_id), |group, provider, _signer| {
+            let staged = group
+                .pending_commit()
+                .ok_or_else(|| MLSError::Internal("no pending commit".into()))?;
+            Ok(
+                crate::orchestrator::direct_request_bootstrap::request_metadata_key_from_staged(
+                    staged,
+                    provider.crypto(),
+                    coordinates,
+                )?
+                .to_vec(),
+            )
+        })
+    }
 
     fn get_current_metadata(
         &self,

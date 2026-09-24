@@ -484,18 +484,52 @@ pub fn metadata_coordinate(coordinates: &Value) -> Result<Value, MLSError> {
     );
     Ok(coordinate)
 }
+/// A canonical metadata coordinate in the bootstrap's JSON shape, from typed
+/// parts. Later transitions build their successor coordinate with this so the
+/// exporter context and AAD are byte-identical to what readers derive.
+pub fn canonical_metadata_coordinates(
+    conversation_id: &str,
+    group_id: &[u8],
+    generation: u64,
+    epoch: u64,
+    group_context_hash: &[u8],
+    confirmation_tag: &[u8],
+) -> Value {
+    serde_json::json!({"conversationId":conversation_id,"groupId":STANDARD.encode(group_id),"generation":generation,"epoch":epoch,"groupContextHash":STANDARD.encode(group_context_hash),"confirmationTag":STANDARD.encode(confirmation_tag)})
+}
+fn request_metadata_exporter_context(coordinates: &Value) -> Result<Vec<u8>, MLSError> {
+    let coordinate = metadata_coordinate(coordinates)?;
+    let exporter = serde_json::json!({"protocol":"blue.catbird.chat.metadata","version":1,"conversationId":coordinate["conversationId"],"generation":coordinate["generation"],"epoch":coordinate["epoch"],"groupContextHash":coordinate["groupContextHash"],"metadataVersion":1});
+    metadata_cbor("metadataExporterContext", &exporter)
+}
+const REQUEST_METADATA_EXPORTER_LABEL: &str = "blue.catbird.chat.metadata.v1";
 pub fn request_metadata_key<P: OpenMlsProvider>(
     group: &MlsGroup,
     provider: &P,
     coordinates: &Value,
 ) -> Result<[u8; 32], MLSError> {
-    let coordinate = metadata_coordinate(coordinates)?;
-    let exporter = serde_json::json!({"protocol":"blue.catbird.chat.metadata","version":1,"conversationId":coordinate["conversationId"],"generation":coordinate["generation"],"epoch":coordinate["epoch"],"groupContextHash":coordinate["groupContextHash"],"metadataVersion":1});
     group
         .export_secret(
             provider.crypto(),
-            "blue.catbird.chat.metadata.v1",
-            &metadata_cbor("metadataExporterContext", &exporter)?,
+            REQUEST_METADATA_EXPORTER_LABEL,
+            &request_metadata_exporter_context(coordinates)?,
+            32,
+        )
+        .map_err(crypto_error)?
+        .try_into()
+        .map_err(|_| invalid("Invalid metadata key"))
+}
+/// The canonical metadata key of the successor epoch a pending commit creates.
+pub fn request_metadata_key_from_staged(
+    staged: &StagedCommit,
+    crypto: &impl openmls_traits::crypto::OpenMlsCrypto,
+    coordinates: &Value,
+) -> Result<[u8; 32], MLSError> {
+    staged
+        .export_secret(
+            crypto,
+            REQUEST_METADATA_EXPORTER_LABEL,
+            &request_metadata_exporter_context(coordinates)?,
             32,
         )
         .map_err(crypto_error)?
@@ -513,6 +547,76 @@ pub fn request_metadata_aad(
     aad.extend(metadata_cbor("metadataAad", &value)?);
     Ok(aad)
 }
+/// Seal a signed canonical metadata plaintext at `coordinates`.
+pub fn seal_request_metadata(
+    key: &[u8; 32],
+    coordinates: &Value,
+    origin_transition_id: &str,
+    nonce: &[u8; 12],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, MLSError> {
+    use aes_gcm::{
+        aead::{Aead, Payload},
+        Aes256Gcm, KeyInit,
+    };
+    let aad = request_metadata_aad(coordinates, origin_transition_id, plaintext.len() + 16)?;
+    Aes256Gcm::new_from_slice(key)
+        .map_err(crypto_error)?
+        .encrypt(
+            nonce.into(),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(crypto_error)
+}
+/// Open a canonical metadata ciphertext sealed at `coordinates`, returning the
+/// exact signed plaintext so re-seals can carry it unchanged.
+pub fn open_request_metadata(
+    key: &[u8; 32],
+    coordinates: &Value,
+    origin_transition_id: &str,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, MLSError> {
+    use aes_gcm::{
+        aead::{Aead, Payload},
+        Aes256Gcm, KeyInit,
+    };
+    let aad = request_metadata_aad(coordinates, origin_transition_id, ciphertext.len())?;
+    Aes256Gcm::new_from_slice(key)
+        .map_err(crypto_error)?
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
+        .map_err(crypto_error)
+}
+/// Display fields of a signed canonical metadata plaintext.
+pub fn decode_request_metadata(plaintext: &[u8]) -> Result<crate::metadata::GroupMetadataV1, MLSError> {
+    #[derive(Deserialize)]
+    struct Content {
+        title: String,
+        #[serde(default)]
+        description: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Signed {
+        content: Content,
+    }
+    let signed: Signed = serde_ipld_dagcbor::from_slice(plaintext).map_err(crypto_error)?;
+    Ok(crate::metadata::GroupMetadataV1 {
+        version: 1,
+        title: signed.content.title,
+        description: signed.content.description.unwrap_or_default(),
+        avatar_blob_locator: None,
+        avatar_content_type: None,
+    })
+}
 pub fn encrypt_request_metadata<P: OpenMlsProvider>(
     group: &MlsGroup,
     provider: &P,
@@ -522,10 +626,6 @@ pub fn encrypt_request_metadata<P: OpenMlsProvider>(
     metadata: &crate::metadata::GroupMetadataV1,
     nonce: &[u8; 12],
 ) -> Result<Vec<u8>, MLSError> {
-    use aes_gcm::{
-        aead::{Aead, Payload},
-        Aes256Gcm, KeyInit,
-    };
     use openmls_traits::signatures::Signer;
     if metadata.avatar_blob_locator.is_some() || metadata.avatar_content_type.is_some() {
         return Err(invalid("Request bootstrap has no avatar binding"));
@@ -544,18 +644,8 @@ pub fn encrypt_request_metadata<P: OpenMlsProvider>(
     signing.extend(metadata_cbor("metadataContentProjection", &content)?);
     let signed = serde_json::json!({"content":content,"contentSignature":STANDARD.encode(signer.sign(&signing).map_err(crypto_error)?)});
     let plaintext = metadata_cbor("metadataPlaintext", &signed)?;
-    let aad = request_metadata_aad(coordinates, request_id, plaintext.len() + 16)?;
     let key = request_metadata_key(group, provider, coordinates)?;
-    Aes256Gcm::new_from_slice(&key)
-        .map_err(crypto_error)?
-        .encrypt(
-            nonce.into(),
-            Payload {
-                msg: &plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(crypto_error)
+    seal_request_metadata(&key, coordinates, request_id, nonce, &plaintext)
 }
 
 pub fn introduction_plaintext(input: &DirectRequestBootstrapInput) -> Result<Vec<u8>, MLSError> {

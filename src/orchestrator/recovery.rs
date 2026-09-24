@@ -1231,7 +1231,7 @@ where
             .decrypt_current_metadata_snapshot(&resolved.conversation_id, &gid)
             .await
         {
-            Ok(metadata) => metadata,
+            Ok(opened) => (opened.metadata, opened.version),
             Err(error) => {
                 self.escalate_fork_to_rejoin(convo_id).await;
                 return Err(error);
@@ -2863,9 +2863,10 @@ where
             )));
         }
         let current_group_id = resolved.group_id_bytes()?;
-        let (metadata_plaintext, metadata_version) = self
+        let opened = self
             .decrypt_current_metadata_snapshot(&resolved.conversation_id, &current_group_id)
             .await?;
+        let (metadata_plaintext, metadata_version) = (opened.metadata, opened.version);
 
         // Fetch a fresh key package for the recipient and stage the swap. Same
         // body shape as `swap_members`, but ships through

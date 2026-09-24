@@ -1044,6 +1044,28 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
             reason: "export_metadata_key_from_pending not available on this platform".to_string(),
         })
     }
+    /// Canonical (request-bootstrap) metadata key at the group's current
+    /// epoch, for the metadata coordinate `coordinates`.
+    fn export_canonical_metadata_key(
+        &self,
+        _group_id: Vec<u8>,
+        _coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "export_canonical_metadata_key not available on this platform".to_string(),
+        })
+    }
+    /// Canonical metadata key of the successor epoch a pending commit creates.
+    fn export_canonical_metadata_key_from_pending(
+        &self,
+        _group_id: Vec<u8>,
+        _coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "export_canonical_metadata_key_from_pending not available on this platform"
+                .to_string(),
+        })
+    }
 
     /// Propose self-removal from a group.
     fn propose_self_remove(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError>;

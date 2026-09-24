@@ -25,6 +25,7 @@ mod leaf_recovery;
 pub mod leave_fulfillment;
 pub mod lifecycle;
 pub mod messaging;
+pub(crate) mod metadata_snapshot;
 pub mod mls_provider;
 pub mod orchestrator;
 pub mod ordering;
