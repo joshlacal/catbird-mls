@@ -1718,7 +1718,7 @@ where
             return Ok(DeferredRecoveryOutcome::Skipped);
         }
 
-        match self.join_or_rejoin(convo_id).await {
+        match Box::pin(self.join_or_rejoin(convo_id)).await {
             Ok(epoch) => Ok(DeferredRecoveryOutcome::Recovered(epoch)),
             Err(err) if err.to_string().contains("leaf recovery pending") => {
                 let mut tracker = self.recovery_tracker().lock().await;
@@ -1794,10 +1794,10 @@ where
                 );
                 return super::with_batch_inventory_scope(
                     inv,
-                    super::with_batch_recovery_inbox_scope(
+                    Box::pin(super::with_batch_recovery_inbox_scope(
                         inbox,
-                        self.run_deferred_recovery_inner(reason, conversations, report),
-                    ),
+                        Box::pin(self.run_deferred_recovery_inner(reason, conversations, report)),
+                    )),
                 )
                 .await;
             } else if self.batch_recovery_inbox_snapshot().is_none() {
@@ -1805,13 +1805,13 @@ where
                     std::sync::Arc::new(self.fetch_authorized_recovery_inbox_snapshot().await?);
                 return super::with_batch_recovery_inbox_scope(
                     inbox,
-                    self.run_deferred_recovery_inner(reason, conversations, report),
+                    Box::pin(self.run_deferred_recovery_inner(reason, conversations, report)),
                 )
                 .await;
             }
         }
 
-        self.run_deferred_recovery_inner(reason, conversations, report)
+        Box::pin(self.run_deferred_recovery_inner(reason, conversations, report))
             .await
     }
 
@@ -1872,8 +1872,8 @@ where
                 continue;
             }
 
-            let outcome = self
-                .consume_deferred_recovery_for_conversation(&convo_id, None, None)
+            let outcome = Box::pin(self
+                .consume_deferred_recovery_for_conversation(&convo_id, None, None))
                 .await;
             match outcome {
                 Ok(DeferredRecoveryOutcome::ClearedStale | DeferredRecoveryOutcome::Skipped) => {

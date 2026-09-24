@@ -301,7 +301,7 @@ where
     pub fn run_deferred_recovery(&self, reason: &str) -> Result<DeferredRecoveryReport> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
-        crate::async_runtime::block_on(self.orchestrator.run_deferred_recovery(reason))
+        crate::async_runtime::block_on(Box::pin(self.orchestrator.run_deferred_recovery(reason)))
     }
 
     pub fn ensure_conversation_ready(&self, convo_id: &str) -> Result<ConversationReadyResult> {
