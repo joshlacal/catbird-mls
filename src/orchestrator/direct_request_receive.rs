@@ -301,6 +301,13 @@ where
             }
             let mut receipt = outcome["outcome"].clone();
             receipt.as_object_mut().ok_or_else(invalid)?.remove("$type");
+            // Retain the canonical bare receipt, independent of presentation.
+            let receipt = transcript::normalize_read_presentation(
+                &serde_json::to_vec(&receipt).map_err(|_| invalid())?,
+                "signedDirectRequestReceipt",
+                false,
+            )
+            .map_err(|_| invalid())?;
             let document = self
                 .credentials()
                 .direct_request_receipt_authority_document()

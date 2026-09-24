@@ -606,7 +606,18 @@ where
         raw: &mut Vec<u8>,
         receipt: &[u8],
     ) -> Result<DirectRequestOutcome> {
-        let value: Value = serde_json::from_slice(receipt).map_err(|_| invalid())?;
+        // Responses present lexicon `{"$bytes"}`; journals, intents and
+        // projections retain the one canonical bare form (the pre-F27 bytes),
+        // so immutability checks and strict re-verification are presentation-
+        // independent.
+        let value = transcript::normalize_read_presentation(
+            receipt,
+            "signedDirectRequestReceipt",
+            false,
+        )
+        .map_err(|_| invalid())?;
+        let canonical = serde_json::to_vec(&value).map_err(|_| invalid())?;
+        let receipt = canonical.as_slice();
         let method = value["body"]["keyId"].as_str().ok_or_else(invalid)?;
         let key = match transcript::resolve_direct_request_receipt_key(
             &intent.trusted_authority_document,

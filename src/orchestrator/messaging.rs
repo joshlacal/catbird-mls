@@ -2461,13 +2461,30 @@ where
             OrchestratorError::Serialization("send_message response missing signedRequest".into())
         })?;
 
-        if submitted_signed_request != resp_signed_request {
+        // The submitted wire and the response presentation may spell declared
+        // bytes differently (bare base64 or lexicon `{"$bytes"}`). Compare and
+        // hash the one canonical bare form; the submitted request is unchanged.
+        // Equality with the submitted request is the acceptance check, so only
+        // the declared byte spelling is normalized here.
+        let canonical_signed = |value: &serde_json::Value, what: &str| {
+            let mut value = value.clone();
+            crate::chat_v2::transcript::direct_request::normalize_read_bytes(
+                "signedApplicationSend",
+                &mut value,
+            )
+            .map_err(|e| {
+                OrchestratorError::Serialization(format!("invalid {what} signedRequest: {e}"))
+            })?;
+            Ok::<_, OrchestratorError>(value)
+        };
+        let accepted_signed_request = canonical_signed(resp_signed_request, "send_message response")?;
+        if canonical_signed(submitted_signed_request, "submitted")? != accepted_signed_request {
             return Err(OrchestratorError::Serialization(
                 "send_message response signedRequest does not match submitted signedRequest".into(),
             ));
         }
 
-        let accepted_request_bytes = serde_json::to_vec(resp_signed_request).map_err(|e| {
+        let accepted_request_bytes = serde_json::to_vec(&accepted_signed_request).map_err(|e| {
             OrchestratorError::Serialization(format!("serialize accepted signedRequest: {e}"))
         })?;
         let accepted_request_sha256: [u8; 32] =

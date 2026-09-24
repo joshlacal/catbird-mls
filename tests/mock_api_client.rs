@@ -189,6 +189,8 @@ struct MockState {
             catbird_mls::orchestrator::canonical_transport::GatewayResponse,
         >,
     >,
+    /// Present successful responses with lexicon `{"$bytes"}` byte fields.
+    present_lexicon_bytes: bool,
     /// Custom raw GatewayResponse for the next sendMessage call.
     next_send_custom_response:
         Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
@@ -332,6 +334,8 @@ pub struct MockDeliveryService {
     send_ack_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     /// Per-instance DID override (allows multiple clients to share one mock server).
     instance_did: Option<String>,
+    /// Set on the internal handle that produces the unpresented response.
+    raw_dispatch: bool,
 }
 
 #[derive(Debug, Default)]
@@ -383,6 +387,8 @@ impl MockDeliveryService {
     pub fn new(authenticated_did: &str) -> Self {
         let state = MockState {
             authenticated_did: Some(authenticated_did.to_string()),
+            // Mirror the production DS: responses present lexicon bytes.
+            present_lexicon_bytes: true,
             ..Default::default()
         };
         Self {
@@ -393,6 +399,7 @@ impl MockDeliveryService {
             get_messages_gate: Arc::new(Mutex::new(None)),
             send_ack_gate: Arc::new(Mutex::new(None)),
             instance_did: None,
+            raw_dispatch: false,
         }
     }
 
@@ -407,7 +414,15 @@ impl MockDeliveryService {
             get_messages_gate: Arc::clone(&self.get_messages_gate),
             send_ack_gate: Arc::clone(&self.send_ack_gate),
             instance_did: Some(did.to_string()),
+            raw_dispatch: false,
         }
+    }
+
+    /// Present every successful response the way the production DS does:
+    /// each schema-declared bytes field, including echoed signed requests, as
+    /// lexicon `{"$bytes"}` (existing `{"$bytes"}` objects are kept).
+    pub fn present_lexicon_bytes(&self, enabled: bool) {
+        self.state.lock().unwrap().present_lexicon_bytes = enabled;
     }
 
     pub fn set_next_create_conversation_id(&self, conversation_id: &str) {
@@ -2206,6 +2221,25 @@ impl MLSAPIClient for MockDeliveryService {
         &self,
         request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
     ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        if !self.raw_dispatch && self.state.lock().unwrap().present_lexicon_bytes {
+            let nsid = request
+                .operation
+                .path()
+                .trim_start_matches("/xrpc/")
+                .to_owned();
+            let mut raw = self.clone();
+            raw.raw_dispatch = true;
+            let mut response = Box::pin(raw.submit_prepared_request(request)).await?;
+            if response.status == 200 {
+                if let Some(schema) = lexicon_presentation::output_schema(&nsid) {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&response.body).expect("mock JSON response");
+                    lexicon_presentation::present(schema, &mut value);
+                    response.body = serde_json::to_vec(&value).unwrap();
+                }
+            }
+            return Ok(response);
+        }
         self.state
             .lock()
             .unwrap()
@@ -4275,5 +4309,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(svc.members_of("conv-1").len(), 1);
+    }
+}
+
+/// Schema-directed mirror of the production DS response presentation
+/// (mls-ds `present_endpoint_output`), driven by the vendored lexicon.
+mod lexicon_presentation {
+    use base64::Engine as _;
+    use serde_json::Value;
+    use std::sync::OnceLock;
+
+    fn defs() -> &'static Value {
+        static DEFS: OnceLock<Value> = OnceLock::new();
+        DEFS.get_or_init(|| {
+            serde_json::from_str::<Value>(include_str!(
+                "../src/chat_v2/transcript/vectors/blue.catbird.chat.defs.json"
+            ))
+            .unwrap()["defs"]
+                .clone()
+        })
+    }
+
+    pub(super) fn output_schema(nsid: &str) -> Option<&'static Value> {
+        static OUTPUTS: OnceLock<Value> = OnceLock::new();
+        OUTPUTS
+            .get_or_init(|| {
+                serde_json::from_str(include_str!("fixtures/chat_endpoint_output_schemas.json"))
+                    .unwrap()
+            })
+            .get(nsid)
+    }
+
+    fn definition(reference: &str) -> &'static Value {
+        let name = reference.rsplit('#').next().unwrap();
+        &defs()[name]
+    }
+
+    pub(super) fn present(schema: &Value, value: &mut Value) {
+        match schema["type"].as_str() {
+            Some("ref") => present(definition(schema["ref"].as_str().unwrap()), value),
+            Some("bytes") => {
+                // Deliberately malformed test fixtures stay as authored.
+                let canonical = value.as_str().filter(|text| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(text)
+                        .is_ok_and(|bytes| {
+                            base64::engine::general_purpose::STANDARD.encode(bytes) == *text
+                        })
+                });
+                if let Some(text) = canonical {
+                    *value = serde_json::json!({ "$bytes": text });
+                }
+            }
+            Some("object") => {
+                if let Some(object) = value.as_object_mut() {
+                    for (field, item) in object {
+                        if let Some(property) = schema["properties"].get(field) {
+                            present(property, item);
+                        }
+                    }
+                }
+            }
+            Some("array") => {
+                if let Some(items) = value.as_array_mut() {
+                    for item in items {
+                        present(&schema["items"], item);
+                    }
+                }
+            }
+            Some("union") => {
+                if let Some(tag) = value.get("$type").and_then(Value::as_str) {
+                    present(definition(tag), value);
+                }
+            }
+            _ => {}
+        }
     }
 }

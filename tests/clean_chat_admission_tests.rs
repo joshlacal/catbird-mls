@@ -330,7 +330,11 @@ async fn fulfill_bob_recovery(f: &AdmissionFixture) -> (CanonicalState, Value) {
 async fn adopt_bob_welcome(f: &AdmissionFixture, next: &CanonicalState, welcome: &Value) {
     assert_eq!(welcome["recipientDid"], BOB);
     let bytes = STANDARD
-        .decode(welcome["opaqueWelcome"].as_str().unwrap())
+        .decode(
+            welcome["opaqueWelcome"]["$bytes"]
+                .as_str()
+                .expect("submitTransition presents lexicon bytes"),
+        )
         .unwrap();
     let joined = f
         .world
@@ -1355,9 +1359,9 @@ async fn real_native_welcome_at_newer_epoch_supersedes_a_retained_pending_gate()
     assert_eq!(bob.orchestrator.mls_context().get_conversation_policy(BOB, &f.cid).unwrap(), Some(f.state.clone()), "direct signed consent must leave the old retained policy available for this native-proof regression");
     let reserved_package = STANDARD
         .decode(
-            accepted["recovery"]["reservation"]["keyPackage"]["bytes"]
+            accepted["recovery"]["reservation"]["keyPackage"]["bytes"]["$bytes"]
                 .as_str()
-                .unwrap(),
+                .expect("acceptConversation presents lexicon bytes"),
         )
         .unwrap();
     let added = alice
