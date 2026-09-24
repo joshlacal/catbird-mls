@@ -18,6 +18,7 @@ use super::pagination::PaginationGuard;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
+#[derive(Debug)]
 pub enum DeferredRecoveryOutcome {
     ClearedStale,
     Skipped,
@@ -1871,14 +1872,15 @@ where
                 continue;
             }
 
-            match self
+            let outcome = self
                 .consume_deferred_recovery_for_conversation(&convo_id, None, None)
-                .await
-            {
+                .await;
+            match outcome {
                 Ok(DeferredRecoveryOutcome::ClearedStale | DeferredRecoveryOutcome::Skipped) => {
                     report.skipped += 1;
                 }
                 Ok(DeferredRecoveryOutcome::Waiting { .. }) => {
+                    report.attempted += 1;
                     report.waiting += 1;
                 }
                 Ok(DeferredRecoveryOutcome::Recovered(epoch)) => {
