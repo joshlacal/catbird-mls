@@ -673,7 +673,35 @@ where
                 return Err(invalid());
             }
         }
+        let publish_digest = || -> Result<[u8; 32]> {
+            let j = self
+                .mls_context()
+                .list_direct_request_journal()?
+                .into_iter()
+                .find(|j| j.request_id == id)
+                .ok_or_else(invalid)?;
+            let exact: Value =
+                serde_json::from_slice(j.publish_request.as_ref().ok_or_else(invalid)?)
+                    .map_err(|_| invalid())?;
+            Ok(*transcript::verify_signed_request(
+                DirectRequestKind::Publish,
+                &serde_json::to_vec(exact.get("signedRequest").unwrap_or(&exact))
+                    .map_err(|_| invalid())?,
+                &intent.actor_public_key,
+            )
+            .map_err(|_| invalid())?
+            .request_digest())
+        };
+        let receipt_digest = bytes(&proof["requestDigest"])?;
+        // An expiry receipt bound to the publish digest is the server's 30-day
+        // expiry of a published, unanswered request; bound to the prepare
+        // digest it is a preparation-lease expiry.
+        let mut published_expiry = false;
         let trigger_digest = match proof["requestKind"].as_str() {
+            Some("expiry") if receipt_digest != prepare.request_digest().as_slice() => {
+                published_expiry = true;
+                publish_digest()?
+            }
             Some("prepare" | "expiry") => *prepare.request_digest(),
             Some("cancel") => *transcript::verify_signed_request(
                 DirectRequestKind::Cancel,
@@ -682,28 +710,10 @@ where
             )
             .map_err(|_| invalid())?
             .request_digest(),
-            Some("publish") => {
-                let j = self
-                    .mls_context()
-                    .list_direct_request_journal()?
-                    .into_iter()
-                    .find(|j| j.request_id == id)
-                    .ok_or_else(invalid)?;
-                let exact: Value =
-                    serde_json::from_slice(j.publish_request.as_ref().ok_or_else(invalid)?)
-                        .map_err(|_| invalid())?;
-                *transcript::verify_signed_request(
-                    DirectRequestKind::Publish,
-                    &serde_json::to_vec(exact.get("signedRequest").unwrap_or(&exact))
-                        .map_err(|_| invalid())?,
-                    &intent.actor_public_key,
-                )
-                .map_err(|_| invalid())?
-                .request_digest()
-            }
+            Some("publish") => publish_digest()?,
             _ => return Err(invalid()),
         };
-        if bytes(&proof["requestDigest"])? != trigger_digest {
+        if receipt_digest != trigger_digest {
             return Err(invalid());
         }
         let journal = self
@@ -791,6 +801,15 @@ where
                 conversation_id: adopted.conversation_id,
                 message_id: adopted.first_message_id,
                 request_id: id,
+            });
+        }
+        if published_expiry {
+            // The request was published and later expired unanswered. The
+            // published bootstrap, projection and authored draft stay local;
+            // no resend, no deletion.
+            return Ok(DirectRequestOutcome::TerminalNotPublished {
+                request_id: id,
+                code: "RequestExpired".into(),
             });
         }
         if journal.is_some() {

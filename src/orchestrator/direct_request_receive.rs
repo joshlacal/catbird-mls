@@ -178,7 +178,7 @@ where
         let consent = match request.consent.as_str() {
             _ if !(recipient || sender) => return Err(invalid()),
             "accepted" => RequestConsent::Accepted,
-            "closed" => RequestConsent::Closed,
+            "closed" | "expired" => RequestConsent::Closed,
             "incomingPending" | "outgoingPending" if recipient => RequestConsent::IncomingPending,
             "incomingPending" | "outgoingPending" => RequestConsent::OutgoingPending,
             _ => return Err(invalid()),
