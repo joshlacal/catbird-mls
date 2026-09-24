@@ -1801,6 +1801,27 @@ fn project_union(
     project_schema_ref(variant, input, true)
 }
 
+/// Unsigned routing extensions present in read-view lexicons but strictly excluded
+/// from the canonical signed schema per ADR-010 and DECISIONS.md (2026-09-05).
+///
+/// These fields (e.g. `sequencerDid` and `sequencerTerm` on `conversationState`)
+/// are transport routing hints used by clients to locate the current sequencer DS.
+/// They are never part of signed MLS conversation state and must be rejected
+/// by the canonical signed schema derivation.
+const UNSIGNED_ROUTING_EXTENSIONS: &[(&str, &str)] = &[
+    ("conversationState", "sequencerDid"),
+    ("conversationState", "sequencerTerm"),
+];
+
+fn is_unsigned_routing_extension(definition: Option<&str>, field: &str) -> bool {
+    let Some(def) = definition else {
+        return false;
+    };
+    UNSIGNED_ROUTING_EXTENSIONS
+        .iter()
+        .any(|&(d, f)| d == def && f == field)
+}
+
 fn project_object(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1831,6 +1852,11 @@ fn project_object(
             }
             output.insert(name.clone(), CanonicalValue::Text(expected));
             continue;
+        }
+        if is_unsigned_routing_extension(definition_name, name) {
+            return Err(TransportError::Serialization(format!(
+                "unknown closed clean-chat field {name}"
+            )));
         }
         let property = properties.get(name).ok_or_else(|| {
             TransportError::Serialization(format!("unknown closed clean-chat field {name}"))
@@ -4168,14 +4194,21 @@ mod read_routing_extension_tests {
             );
             assert!(canonical_cbor_for_schema_impl("conversationState", wire, false).is_err());
 
-            // A generated DTO preserves unknown wire fields as extra_data.
+            // A generated DTO accepts live routing extensions in its typed fields.
             // Its FFI encoding must use the same routing-only normalization.
             let mut generated = serde_json::to_value(&expected).unwrap();
             generated["sequencerDid"] = wire["sequencerDid"].clone();
             generated["sequencerTerm"] = wire["sequencerTerm"].clone();
             let generated: catbird_atproto::blue_catbird::chat::ConversationState =
                 serde_json::from_value(generated).unwrap();
-            assert!(generated.extra_data.is_some());
+            assert_eq!(
+                generated.sequencer_did.as_ref().map(|d| d.as_ref()),
+                wire["sequencerDid"].as_str()
+            );
+            assert_eq!(
+                generated.sequencer_term,
+                wire["sequencerTerm"].as_i64()
+            );
             assert_eq!(
                 decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(),
                 expected
