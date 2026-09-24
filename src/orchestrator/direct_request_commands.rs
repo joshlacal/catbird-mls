@@ -824,9 +824,23 @@ where
                 })
             }
             "blue.catbird.chat.defs#directRequestRejectedReceipt" => {
+                let code = proof["code"].as_str().ok_or_else(invalid)?;
+                // The authority refused before any reservation because the
+                // recipient's declaration names another delivery service. The
+                // signed receipt is retained with the draft; the caller gets
+                // the same typed unsupported capability as a foreign sender
+                // authority, never a legacy-delivery fallback.
+                if code == "RecipientAuthorityUnsupported" {
+                    return Err(OrchestratorError::Mls(
+                        crate::MLSError::OperationNotSupported {
+                            reason: "Direct request recipient is homed on another chat authority"
+                                .into(),
+                        },
+                    ));
+                }
                 Ok(DirectRequestOutcome::TerminalNotPublished {
                     request_id: id,
-                    code: proof["code"].as_str().ok_or_else(invalid)?.into(),
+                    code: code.into(),
                 })
             }
             _ => Err(invalid()),
