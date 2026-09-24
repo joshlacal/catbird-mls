@@ -2317,9 +2317,9 @@ mod tests {
         let welcome = STANDARD
             .decode(
                 initial["entry"]["signedRequest"]["body"]["manifest"]["welcomeBundle"]
-                    ["opaqueWelcome"]
+                    ["opaqueWelcome"]["$bytes"]
                     .as_str()
-                    .unwrap(),
+                    .expect("submitTransition presents lexicon bytes"),
             )
             .unwrap();
         world
