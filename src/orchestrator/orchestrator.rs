@@ -148,6 +148,9 @@ where
     inbound_processing_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
     /// Sync state lock.
     sync_in_progress: Mutex<bool>,
+    /// Fired whenever `sync_in_progress` clears (success, error, or cancel),
+    /// so a coalesced caller observes the in-flight pass's reconciled state.
+    sync_finished: tokio::sync::Notify,
     /// Consecutive sync failures (for circuit breaker).
     consecutive_sync_failures: Mutex<u32>,
     /// When the circuit breaker was last tripped (for cooldown recovery).
@@ -317,6 +320,7 @@ where
             direct_request_reconcile_backoff: Mutex::new(HashMap::new()),
             inbound_processing_locks: Mutex::new(HashMap::new()),
             sync_in_progress: Mutex::new(false),
+            sync_finished: tokio::sync::Notify::new(),
             consecutive_sync_failures: Mutex::new(0),
             circuit_breaker_tripped_at: Mutex::new(None),
             circuit_breaker_cooldown_secs: Mutex::new(constants::SYNC_CIRCUIT_BREAKER_BASE_SECS),
@@ -1357,6 +1361,11 @@ where
     /// Access the sync-in-progress flag.
     pub fn sync_in_progress(&self) -> &Mutex<bool> {
         &self.sync_in_progress
+    }
+
+    /// Signal fired after `sync_in_progress` is cleared.
+    pub(crate) fn sync_finished(&self) -> &tokio::sync::Notify {
+        &self.sync_finished
     }
 
     /// Access the consecutive sync failures counter.

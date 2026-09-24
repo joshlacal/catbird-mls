@@ -339,28 +339,40 @@ where
             }
         }
 
-        // Acquire sync lock
+        // Acquire sync lock. A caller that finds a pass in flight coalesces
+        // onto it: it waits for that pass to finish instead of returning Ok
+        // at once, so its own follow-up reads (e.g. request hydration) see
+        // the reconciled state. The waiter registers before the flag lock is
+        // released, so a completion signal cannot be missed; dropping the
+        // caller's future still cancels only the wait.
         {
             let mut syncing = self.sync_in_progress().lock().await;
             if *syncing {
-                tracing::debug!("Sync already in progress, skipping");
+                let finished = self.sync_finished().notified();
+                drop(syncing);
+                tracing::debug!("Sync already in progress, awaiting it");
+                finished.await;
                 return Ok(());
             }
             *syncing = true;
         }
 
-        // Ensure sync_in_progress is always reset, even on panic
+        // Ensure sync_in_progress is always reset and waiters released, even
+        // on panic or cancellation of this pass.
         let sync_flag = self.sync_in_progress();
+        let sync_finished = self.sync_finished();
         let _sync_guard = scopeguard::guard((), |_| {
             if let Ok(mut syncing) = sync_flag.try_lock() {
                 *syncing = false;
             }
+            sync_finished.notify_waiters();
         });
 
         let result = self.do_sync(&user_did, full_sync).await;
 
         // Release sync lock (guard handles this on panic/early return too)
         *self.sync_in_progress().lock().await = false;
+        self.sync_finished().notify_waiters();
 
         match &result {
             Ok(_) => {

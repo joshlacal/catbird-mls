@@ -249,10 +249,12 @@ where
             *busy = true;
         }
         let flag = self.sync_in_progress();
+        let finished = self.sync_finished();
         let _guard = scopeguard::guard((), |_| {
             if let Ok(mut flag) = flag.try_lock() {
                 *flag = false;
             }
+            finished.notify_waiters();
         });
         let result = super::with_batch_inventory_scope(
             inv,
@@ -286,6 +288,7 @@ where
         )
         .await;
         *self.sync_in_progress().lock().await = false;
+        self.sync_finished().notify_waiters();
         result?;
         Ok(AppliedInventoryFence {
             snapshot_digest: snapshot.digest()?,
