@@ -161,24 +161,16 @@ pub(crate) struct DirectRequestCloseProof {
     pub publication_digest: [u8; 32],
     pub verified_prior: Value,
 }
-pub(crate) fn normalized_close_entry(mut entry: Value) -> Value {
-    fn normalize(value: &mut Value) {
-        match value {
-            Value::Object(map)
-                if map.len() == 1 && map.get("$bytes").is_some_and(Value::is_string) =>
-            {
-                *value = map["$bytes"].clone();
-            }
-            Value::Object(map) => map.values_mut().for_each(normalize),
-            Value::Array(items) => items.iter_mut().for_each(normalize),
-            _ => {}
-        }
-    }
-    normalize(&mut entry);
+pub(crate) fn normalized_close_entry(mut entry: Value) -> Result<Value> {
     entry["$type"] = Value::String("blue.catbird.chat.defs#conversationCloseEntry".into());
     entry["signedRequest"]["body"]["$type"] =
         Value::String("blue.catbird.chat.defs#conversationCloseBody".into());
-    entry
+    crate::chat_v2::transcript::direct_request::normalize_read_bytes(
+        "conversationCloseEntry",
+        &mut entry,
+    )
+    .map_err(|_| invalid())?;
+    Ok(entry)
 }
 impl DirectRequestCloseProof {
     pub(crate) fn hash(entry: &Value) -> Result<[u8; 32]> {
@@ -315,41 +307,22 @@ impl DirectRequestCloseProof {
     }
 }
 
-/// Normalize only transport byte wrappers and the known outer entry tag.
-pub(crate) fn request_control_entry(mut entry: Value) -> Result<Value> {
-    // Request controls have a schema-bound read adapter. It converts only
-    // declared bytes and retains every other field for closed-schema validation.
-    if let Some(name) = entry["$type"].as_str().and_then(|tag| {
-        tag.strip_prefix("blue.catbird.chat.defs#")
-            .filter(|name| matches!(*name, "directRequestEntry" | "directRequestAcceptanceEntry"))
-    }) {
-        let raw = serde_json::to_vec(&entry).map_err(|_| invalid())?;
-        let mut canonical =
-            crate::chat_v2::transcript::direct_request::normalize_direct_request_read_presentation(
-                &raw, name, true,
-            )
+/// Normalize a tagged read entry of any kind through the one schema-directed
+/// read normalizer, then drop the known outer entry tag.
+pub(crate) fn request_control_entry(entry: Value) -> Result<Value> {
+    let name = entry["$type"]
+        .as_str()
+        .and_then(|tag| tag.strip_prefix("blue.catbird.chat.defs#"))
+        .ok_or_else(invalid)?;
+    let raw = serde_json::to_vec(&entry).map_err(|_| invalid())?;
+    let mut canonical =
+        crate::chat_v2::transcript::direct_request::normalize_read_presentation(&raw, name, true)
             .map_err(|_| invalid())?;
-        canonical
-            .as_object_mut()
-            .ok_or_else(invalid)?
-            .remove("$type");
-        return Ok(canonical);
-    }
-    fn bytes(value: &mut Value) {
-        match value {
-            Value::Object(map)
-                if map.len() == 1 && map.get("$bytes").is_some_and(Value::is_string) =>
-            {
-                *value = map["$bytes"].clone()
-            }
-            Value::Object(map) => map.values_mut().for_each(bytes),
-            Value::Array(values) => values.iter_mut().for_each(bytes),
-            _ => {}
-        }
-    }
-    bytes(&mut entry);
-    entry.as_object_mut().ok_or_else(invalid)?.remove("$type");
-    Ok(entry)
+    canonical
+        .as_object_mut()
+        .ok_or_else(invalid)?
+        .remove("$type");
+    Ok(canonical)
 }
 pub(crate) fn verify_request_publication_entry(
     entry: &Value,

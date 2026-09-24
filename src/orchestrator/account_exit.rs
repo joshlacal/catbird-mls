@@ -465,7 +465,7 @@ where
         if close {
             let entry = super::direct_requests::normalized_close_entry(
                 record.accepted_response.as_ref().unwrap()["result"]["entry"].clone(),
-            );
+            )?;
             let key = self.verify_terminal_signed_body(&entry).await?;
             self.retain_verified_request_close(cid, &entry, &key)
                 .await?;

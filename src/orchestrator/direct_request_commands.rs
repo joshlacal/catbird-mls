@@ -381,7 +381,7 @@ where
         if raw.len() > transcript::MAX_PREPARE_HTTP_RESPONSE_BYTES {
             return Err(invalid());
         }
-        let value = transcript::normalize_direct_request_read_presentation(
+        let value = transcript::normalize_read_presentation(
             raw,
             "directRequestPreparationView",
             false,

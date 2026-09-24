@@ -199,7 +199,7 @@ fn read_bytes(mode: bool, name: &str, tagged: bool, value: &Value) -> Value {
     let mut presented = value.clone();
     convert(&contract["defs"], &contract["defs"][name], &mut presented);
     assert_eq!(
-        protocol::normalize_direct_request_read_presentation(
+        protocol::normalize_read_presentation(
             &serde_json::to_vec(&presented).unwrap(),
             name,
             tagged

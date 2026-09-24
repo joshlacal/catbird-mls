@@ -44,6 +44,31 @@ impl IncomingEnvelope {
         entry: &Value,
         expected_conversation_id: &str,
     ) -> Result<Option<Self>> {
+        // Reads present declared bytes as lexicon `{"$bytes"}` or bare base64;
+        // the one schema-directed read normalizer yields bare base64 for every
+        // entry kind before any field is read or retained.
+        let Some(name) = entry["$type"]
+            .as_str()
+            .and_then(|tag| tag.strip_prefix(crate::chat_v2::transcript::TYPE_PREFIX))
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "directRequestEntry"
+                        | "directRequestAcceptanceEntry"
+                        | "conversationCloseEntry"
+                        | "applicationEntry"
+                        | "commitEntry"
+                        | "leafRecoveryFulfillmentEntry"
+                        | "leaveCommitFulfillmentEntry"
+                )
+            })
+        else {
+            return Ok(None);
+        };
+        let mut normalized = entry.clone();
+        crate::chat_v2::transcript::direct_request::normalize_read_bytes(name, &mut normalized)
+            .map_err(|_| invalid("entry bytes presentation"))?;
+        let entry = &normalized;
         if matches!(
             entry["$type"].as_str(),
             Some(
@@ -140,11 +165,8 @@ impl IncomingEnvelope {
         } else {
             "commit"
         }];
-        let encoded = artifact
+        let encoded = artifact["bytes"]
             .as_str()
-            .or_else(|| artifact["$bytes"].as_str())
-            .or_else(|| artifact["bytes"].as_str())
-            .or_else(|| artifact["bytes"]["$bytes"].as_str())
             .ok_or_else(|| invalid("MLS artifact"))?;
         let ciphertext = STANDARD
             .decode(encoded)
@@ -180,9 +202,30 @@ mod tests {
     fn row() -> Value {
         json!({"$type": APPLICATION_ENTRY_KIND, "entryId": ID, "conversationId": CID,
         "seq": 519, "receivedAt": "2026-09-05T05:40:30.125Z", "signedRequest": {"body": {
+            "$type": "blue.catbird.chat.defs#applicationSendBody",
             "actorDid": "did:plc:alice", "prior": {"conversationId": CID, "epoch": 7},
             "applicationMessage": {"bytes": {"$bytes": STANDARD.encode([1,2,3])}}
-        }}})
+        }, "signature": {"$bytes": STANDARD.encode([9u8; 64])}}})
+    }
+    #[test]
+    fn lexicon_and_bare_byte_presentations_yield_the_same_envelope() {
+        let mut bare = row();
+        bare["signedRequest"]["body"]["applicationMessage"]["bytes"] =
+            json!(STANDARD.encode([1, 2, 3]));
+        bare["signedRequest"]["signature"] = json!(STANDARD.encode([9u8; 64]));
+        let lexicon = IncomingEnvelope::from_canonical_entry(&row(), CID).unwrap().unwrap();
+        let bare = IncomingEnvelope::from_canonical_entry(&bare, CID).unwrap().unwrap();
+        assert_eq!(lexicon.ciphertext, [1, 2, 3]);
+        assert_eq!(lexicon.ciphertext, bare.ciphertext);
+        // Byte objects outside declared bytes fields and non-canonical base64
+        // are refused, never guessed.
+        let mut wrong = row();
+        wrong["signedRequest"]["body"]["applicationMessage"]["bytes"] =
+            json!({"$bytes": "AQID", "extra": 1});
+        assert!(IncomingEnvelope::from_canonical_entry(&wrong, CID).is_err());
+        let mut wrong = row();
+        wrong["signedRequest"]["body"]["applicationMessage"]["bytes"] = json!({"$bytes": "AQI"});
+        assert!(IncomingEnvelope::from_canonical_entry(&wrong, CID).is_err());
     }
     #[test]
     fn canonical_entries_retain_wire_identity_sequence_timestamp_and_epoch() {
@@ -252,6 +295,10 @@ mod tests {
         ] {
             let mut value = row();
             value["$type"] = json!(kind);
+            value["signedRequest"]["body"]
+                .as_object_mut()
+                .unwrap()
+                .remove("$type");
             value["signedRequest"]["body"]["next"] = json!({"conversationId": CID, "epoch":8});
             value["signedRequest"]["body"]["commit"] = json!({"bytes": STANDARD.encode([4,5,6])});
             let envelope = IncomingEnvelope::from_canonical_entry(&value, CID)

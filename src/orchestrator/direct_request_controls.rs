@@ -40,7 +40,7 @@ where
         }
         let cid = &envelope.conversation_id;
         if entry["$type"] == "blue.catbird.chat.defs#conversationCloseEntry" {
-            let canonical = super::projection::normalized_close_entry(entry.clone());
+            let canonical = super::projection::normalized_close_entry(entry.clone())?;
             if !self.replay_verified_request_close(cid, &canonical).await? {
                 // A valid signed intent is not proof that the server committed
                 // it. Re-read the exact immutable canonical row before close.
@@ -59,7 +59,7 @@ where
                 if rows.len() != 1 || rows[0]["$type"] != entry["$type"] {
                     return Err(invalid());
                 }
-                let committed = super::projection::normalized_close_entry(rows[0].clone());
+                let committed = super::projection::normalized_close_entry(rows[0].clone())?;
                 if super::projection::DirectRequestCloseProof::hash(&committed)?
                     != super::projection::DirectRequestCloseProof::hash(&canonical)?
                 {

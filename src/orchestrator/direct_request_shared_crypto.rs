@@ -136,7 +136,7 @@ pub fn validate_request_welcome_receipt(input: &DirectRequestWelcomeInput) -> Re
         return Err(invalid("Unexpected publication wrapper fields"));
     }
     let wrapper = received.get("signedRequest").unwrap_or(&received);
-    let publication = transcript::normalize_direct_request_read_presentation(
+    let publication = transcript::normalize_read_presentation(
         &serde_json::to_vec(wrapper).map_err(error)?,
         "signedDirectRequestPublication",
         false,

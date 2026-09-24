@@ -503,8 +503,10 @@ pub fn verify_direct_request_preparation(
     if raw_view.len() > MAX_PREPARE_HTTP_RESPONSE_BYTES {
         return Err(error("preparation response byte cap"));
     }
-    project(raw_view, "directRequestPreparationView", false)?;
-    let view: Value = serde_json::from_slice(raw_view).map_err(error)?;
+    let normalized = normalize_read_presentation(raw_view, "directRequestPreparationView", false)?;
+    let normalized_bytes = serde_json::to_vec(&normalized).map_err(error)?;
+    project(&normalized_bytes, "directRequestPreparationView", false)?;
+    let view = normalized;
     if view["receiptKeyId"].as_str()
         != Some(direct_request_receipt_key_id(trusted_public_key)?.as_str())
     {
@@ -1068,11 +1070,14 @@ fn read_definition(name: &str) -> Result<&'static Value> {
     super::contract::definition(name).map_err(error)
 }
 
-/// Normalize only schema-declared bytes in a received read presentation. This is
-/// not mutation admission: the strict signing and ingress APIs remain unchanged.
+/// Normalize only schema-declared bytes in a received read presentation of any
+/// `blue.catbird.chat.defs` definition (entries of every kind, state, inventory
+/// scopes, outcomes, receipts): lexicon `{"$bytes"}` objects become bare
+/// canonical base64 and bare base64 is kept. This is not mutation admission:
+/// the strict signing and ingress APIs remain unchanged.
 /// Duplicate raw fields are rejected before JSON values can discard evidence.
 /// The returned value still passes the complete closed contract projection.
-pub fn normalize_direct_request_read_presentation(
+pub fn normalize_read_presentation(
     raw: &[u8],
     name: &str,
     tagged: bool,
@@ -1082,9 +1087,15 @@ pub fn normalize_direct_request_read_presentation(
     }
     strict_document(raw)?;
     let mut value: Value = serde_json::from_slice(raw).map_err(error)?;
-    normalize_read_schema(read_definition(name)?, &mut value, 0)?;
+    normalize_read_bytes(name, &mut value)?;
     project(&serde_json::to_vec(&value).map_err(error)?, name, tagged)?;
     Ok(value)
+}
+
+/// The schema-directed byte conversion of [`normalize_read_presentation`]
+/// alone, for callers that project or verify the value themselves.
+pub(crate) fn normalize_read_bytes(name: &str, value: &mut Value) -> Result<()> {
+    normalize_read_schema(read_definition(name)?, value, 0)
 }
 
 fn normalize_read_schema(schema: &Value, value: &mut Value, depth: usize) -> Result<()> {
@@ -1137,7 +1148,12 @@ fn normalize_read_schema(schema: &Value, value: &mut Value, depth: usize) -> Res
             }
         }
         Some("union") => {
-            let name = value["$type"]
+            // An untagged value has no selected variant; the strict projector
+            // decides whether the tag is required.
+            let Some(tag) = value.get("$type") else {
+                return Ok(());
+            };
+            let name = tag
                 .as_str()
                 .and_then(|s| s.strip_prefix("blue.catbird.chat.defs#"))
                 .ok_or_else(|| error("invalid read union tag"))?;
@@ -1169,7 +1185,7 @@ pub fn verify_received_signed_request(
     let wrapper: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
     let tagged = kind == DirectRequestKind::Outcome && wrapper.get("$type").is_some();
     let normalized =
-        normalize_direct_request_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
+        normalize_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
     let mut verified = verify_signed_request(
         kind,
         &serde_json::to_vec(&normalized).map_err(error)?,
@@ -1186,7 +1202,7 @@ pub fn verify_received_direct_request_acceptance_proof(
     trusted_authority_key: &[u8],
     recipient_device_key: &[u8],
 ) -> Result<Value> {
-    let proof = normalize_direct_request_read_presentation(
+    let proof = normalize_read_presentation(
         raw_proof,
         "directRequestAcceptanceProof",
         false,
@@ -1288,7 +1304,7 @@ mod read_presentation_tests {
                 .unwrap();
             let mut read_body = row["body"].clone();
             present(read_definition(kind.body_name()).unwrap(), &mut read_body);
-            let normalized = normalize_direct_request_read_presentation(
+            let normalized = normalize_read_presentation(
                 &serde_json::to_vec(&read_body).unwrap(),
                 kind.body_name(),
                 true,
@@ -1368,7 +1384,7 @@ mod read_presentation_tests {
         );
         let text = json!({"text":"YWJjZA=="});
         assert_eq!(
-            normalize_direct_request_read_presentation(
+            normalize_read_presentation(
                 &serde_json::to_vec(&text).unwrap(),
                 "directRequestIntroduction",
                 false
@@ -1376,7 +1392,7 @@ mod read_presentation_tests {
             .unwrap(),
             text
         );
-        assert!(normalize_direct_request_read_presentation(
+        assert!(normalize_read_presentation(
             br#"{"text":{"$bytes":"YWJjZA=="}}"#,
             "directRequestIntroduction",
             false

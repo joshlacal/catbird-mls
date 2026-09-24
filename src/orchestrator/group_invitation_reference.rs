@@ -15,7 +15,7 @@ fn same_group_id(signed_next: &Value, read_current: &Value) -> Result<bool> {
     let group_id = |coordinates: &Value| -> Result<Value> {
         let raw = serde_json::to_vec(coordinates).map_err(|_| invalid())?;
         let normalized =
-            crate::chat_v2::transcript::direct_request::normalize_direct_request_read_presentation(
+            crate::chat_v2::transcript::direct_request::normalize_read_presentation(
                 &raw,
                 "conversationCoordinates",
                 false,

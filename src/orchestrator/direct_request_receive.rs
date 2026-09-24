@@ -616,7 +616,7 @@ where
             return Ok(());
         };
         let mut projection = DirectRequestProjection::decode(&raw, &owner, &device)?;
-        let entry = super::projection::normalized_close_entry(entry.clone());
+        let entry = super::projection::normalized_close_entry(entry.clone())?;
         let hash = super::projection::DirectRequestCloseProof::hash(&entry)?;
         if let Some(old) = &projection.close_proof {
             if old.entry_sha256 != hash {
