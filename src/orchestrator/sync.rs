@@ -744,7 +744,12 @@ where
                     if strict {
                         return Err(error);
                     }
-                    tracing::warn!(conversation_id,%error,"Request preview refresh deferred");
+                    // Platform-visible: tracing never reaches Android/iOS logs.
+                    crate::warn_log!(
+                        "[sync] request preview refresh deferred convo={}: {}",
+                        conversation_id,
+                        error
+                    );
                 }
             }
             if self.pending_conversation_admission(conversation_id).await? {

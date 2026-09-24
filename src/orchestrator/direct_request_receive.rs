@@ -259,6 +259,7 @@ where
                     if serde_json::from_str::<Value>(&body)
                         .is_ok_and(|error| error["error"] == "NotEntitled") =>
                 {
+                    crate::info_log!("[request] convo={} GetEntries NotEntitled: unaddressed view, nothing persisted", cid);
                     return self.unaddressed_direct_request_view(cid, &owner, &device).await;
                 }
                 result => result?,
