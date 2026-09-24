@@ -220,12 +220,12 @@ where
             );
             return crate::orchestrator::with_batch_inventory_scope(
                 snapshot,
-                self.process_canonical_hint_inner(hint),
+                Box::pin(self.process_canonical_hint_inner(hint)),
             )
             .await;
         }
 
-        self.process_canonical_hint_inner(hint).await
+        Box::pin(self.process_canonical_hint_inner(hint)).await
     }
 
     async fn process_canonical_hint_inner(&self, hint: CanonicalHint) -> Result<Vec<EngineEvent>> {

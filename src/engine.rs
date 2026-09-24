@@ -418,17 +418,17 @@ where
         if value.get("$type").and_then(|t| t.as_str())
             == Some("blue.catbird.internal#inventoryHintBatch")
         {
-            return crate::async_runtime::block_on(self.process_inventory_hint_batch(value));
+            return crate::async_runtime::block_on(Box::pin(self.process_inventory_hint_batch(value)));
         }
         if let Some(events_arr) = value.as_array() {
             let batch = serde_json::json!({
                 "events": events_arr,
             });
-            return crate::async_runtime::block_on(self.process_inventory_hint_batch(batch));
+            return crate::async_runtime::block_on(Box::pin(self.process_inventory_hint_batch(batch)));
         }
         if value.get("$type").is_some() || value.get("payload").is_some() {
             let hint = server_events::CanonicalHint::parse(value)?;
-            return crate::async_runtime::block_on(self.process_canonical_hint(hint));
+            return crate::async_runtime::block_on(Box::pin(self.process_canonical_hint(hint)));
         }
         let event: ServerEventEnvelope = serde_json::from_str(event_json).map_err(|err| {
             OrchestratorError::InvalidInput(format!("Failed to decode server event JSON: {err}"))
@@ -511,14 +511,14 @@ where
                 .await?,
         );
 
-        crate::orchestrator::with_batch_inventory_scope(snapshot, async {
+        crate::orchestrator::with_batch_inventory_scope(snapshot, Box::pin(async {
             let mut all_events = Vec::new();
             for hint in hints {
                 let events = self.process_canonical_hint(hint).await?;
                 all_events.extend(events);
             }
             Ok(all_events)
-        })
+        }))
         .await
     }
 
