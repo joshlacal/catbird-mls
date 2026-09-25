@@ -2885,6 +2885,9 @@ impl MLSAPIClient for MockDeliveryService {
                 let reply = |status, value: serde_json::Value| catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status, content_type: Some("application/json".into()), body:serde_json::to_vec(&value).unwrap()
                 };
+                if std::mem::take(&mut guard.failures.fail_next_commit_group_change) {
+                    return Ok(reply(500, serde_json::json!({"error":"CommitGroupChangeFailed"})));
+                }
                 if let Some(entry) = guard.entries.iter().find(|entry| entry["entryId"] == inner_body["transitionId"] && entry["conversationId"] == cid) {
                     assert_eq!(entry["signedRequest"], body_val["signedRequest"]);
                     return Ok(reply(200, serde_json::json!({"coordinates":inner_body["next"],"entry":entry})));

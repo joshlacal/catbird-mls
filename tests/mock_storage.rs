@@ -878,14 +878,18 @@ impl MLSStorageBackend for MockStorage {
             ));
         }
         if let Some(old) = inner.conversations.get(&view.conversation_id) {
-            if old.user_did != request.owner_user_did
+            let is_mismatch = old.user_did != request.owner_user_did
                 || matches!(
                     old.state,
-                    ConversationState::Closed
-                        | ConversationState::DeviceRemoved
-                        | ConversationState::ResetPending { .. }
+                    ConversationState::Closed | ConversationState::DeviceRemoved
                 )
-            {
+                || match &old.state {
+                    ConversationState::ResetPending { new_group_id, .. } => {
+                        &view.group_id != new_group_id
+                    }
+                    _ => false,
+                };
+            if is_mismatch {
                 return Ok(Outcome::FenceMismatch { affected_rows: 0 });
             }
             if let (Some(a), Some(b)) = (&old.view.canonical_state, &view.canonical_state) {

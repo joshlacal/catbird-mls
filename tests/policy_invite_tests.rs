@@ -8,8 +8,12 @@ use serde_json::Value;
 #[tokio::test(flavor = "multi_thread")]
 async fn add_members_submits_signed_policy_transition_with_exact_fields_and_provenance() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
-    world.add_client("Bob").await;
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world
+        .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+        .await;
 
     world
         .register_device("Alice")
@@ -245,7 +249,9 @@ async fn add_members_submits_signed_policy_transition_with_exact_fields_and_prov
 #[tokio::test(flavor = "multi_thread")]
 async fn add_members_multi_did_strictly_sorted() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
+    world
+        .add_client_with_did("Alice", "did:plc:aliceaaaaaaaaaaaaaaaaaaa")
+        .await;
     world
         .register_device("Alice")
         .await
@@ -377,7 +383,9 @@ async fn add_members_fails_closed_for_direct_conversations() {
 #[tokio::test(flavor = "multi_thread")]
 async fn add_members_fails_closed_on_non_2xx_server_response() {
     let mut world = TestWorld::new();
-    world.add_client("Alice").await;
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
     world
         .register_device("Alice")
         .await
@@ -390,7 +398,7 @@ async fn add_members_fails_closed_on_non_2xx_server_response() {
         .await
         .expect("create group");
 
-    let bob_did = "did:plc:bobservererrortest123".to_string();
+    let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".to_string();
 
     // Inject commit_group_change / SubmitTransition failure
     world.delivery_service().fail_next_commit_group_change();

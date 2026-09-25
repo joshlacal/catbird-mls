@@ -919,7 +919,7 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
     }
     alice
         .storage
-        .delete_conversations(&alice.did, &[&group_id])
+        .delete_conversations(&alice.did, &[&convo.conversation_id])
         .await
         .expect("retire superseded conversation projection");
     alice
@@ -927,8 +927,7 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
         .conversations()
         .lock()
         .await
-        .remove(&group_id);
-
+        .remove(&convo.conversation_id);
     let group_id_bytes = hex::decode(&group_id).expect("invalid group id hex");
     alice
         .orchestrator
