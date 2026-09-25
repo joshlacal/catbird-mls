@@ -12,7 +12,8 @@ use catbird_mls::chat_v2::transcript::direct_request as protocol;
 use catbird_mls::orchestrator::{
     canonical_transport::CanonicalOperation as Op,
     direct_requests::{reduce_request_preview, DirectRequestIntent, RequestPreviewUpdate},
-    MlsCryptoContext, OrchestratorError,
+    ConversationRecoveryState, ConversationState, MLSStorageBackend, MlsCryptoContext,
+    OrchestratorError,
 };
 use catbird_mls::{
     DirectRequestInput, DirectRequestOutcome, DirectRequestView, RequestCapabilities,
@@ -557,6 +558,156 @@ async fn test_c18_pending_direct_request_refuses_orchestrator_sends_and_reaction
             .iter()
             .all(|r| r.operation != Op::SendMessage),
         "Refused sends must produce zero SendMessage operations on the delivery service"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_unaccepted_direct_request_with_needs_rejoin_or_epoch_behind_projection_blocks_join() {
+    let mut world = TestWorld::new();
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world
+        .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+        .await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let (_authority, doc, _method) = receipt_authority();
+    for name in ["Alice", "Bob"] {
+        world
+            .client(name)
+            .credentials
+            .set_request_authority_document(doc.clone());
+    }
+
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+
+    // Create group where Bob is pending
+    let view = alice
+        .orchestrator
+        .create_group("Pending Direct", Some(&[bob.did.clone()]), None)
+        .await
+        .unwrap();
+    let cid = view.conversation_id.clone();
+    let requests = world.delivery_service().submitted_prepared_requests();
+    let create = requests
+        .iter()
+        .rev()
+        .find(|r| r.operation == Op::CreateConversation)
+        .unwrap();
+    let wrapper: Value = serde_json::from_slice(create.body.as_ref().unwrap()).unwrap();
+    let b = &wrapper["signedRequest"]["body"];
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut participants = b["manifest"]["participants"].clone();
+    for p in participants.as_array_mut().unwrap() {
+        if p["userDid"] == bob.did {
+            p["status"] = json!("pending");
+            p["leafCount"] = json!(0);
+            p["invitationProvenance"] = json!({
+                "invitationTransitionId": request_id,
+                "invitedByDid": alice.did,
+                "invitedByDeviceId": b["actorDeviceId"]
+            });
+        } else {
+            p["status"] = json!("active");
+            p["leafCount"] = json!(1);
+        }
+    }
+    let pending_state = json!({
+        "conversationKind": b["conversationKind"],
+        "coordinates": b["next"],
+        "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+        "participants": participants,
+        "leaves": [{
+            "userDid": b["actorDid"],
+            "deviceId": b["actorDeviceId"],
+            "deviceStatus": "active",
+            "leafOrigin": "genesis",
+            "keyId": b["keyId"]
+        }],
+        "metadataSnapshot": b["metadataSnapshot"],
+        "snapshotSeq": 1,
+        "directRequest": {
+            "requestId": request_id,
+            "firstMessageId": uuid::Uuid::new_v4().to_string(),
+            "senderDid": alice.did.clone(),
+            "recipientDid": bob.did.clone(),
+            "consent": "outgoingPending",
+            "importUntil": utc(604800),
+            "contextHash": STANDARD.encode([1u8; 32]),
+            "preparationDigest": STANDARD.encode([2u8; 32])
+        }
+    });
+
+    let mut bob_view = view.clone();
+    bob_view.canonical_state = Some(
+        catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+            &serde_json::to_vec(&pending_state).unwrap(),
+        )
+        .unwrap(),
+    );
+    bob.storage
+        .ensure_conversation_exists(&bob.did, &cid, &view.group_id)
+        .await
+        .unwrap();
+    bob.orchestrator
+        .conversations()
+        .lock()
+        .await
+        .insert(cid.clone(), bob_view);
+
+    // Case 1: Projection is NeedsRejoin
+    bob.orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .insert(cid.clone(), ConversationState::NeedsRejoin);
+
+    let baseline_requests = world.delivery_service().submitted_prepared_requests().len();
+
+    let ready = bob
+        .orchestrator
+        .ensure_conversation_ready(&cid)
+        .await
+        .expect("readiness on pending direct request must succeed");
+    assert_eq!(
+        ready.recovery_state,
+        ConversationRecoveryState::Recovering,
+        "unaccepted direct request must report Recovering despite NeedsRejoin projection"
+    );
+    assert!(!ready.send_allowed);
+
+    let after_needs_rejoin_requests = world.delivery_service().submitted_prepared_requests().len();
+    assert_eq!(
+        after_needs_rejoin_requests, baseline_requests,
+        "ensure_conversation_ready on unaccepted request with NeedsRejoin must not call join_or_rejoin or submit transitions"
+    );
+
+    // Case 2: Projection is EpochBehind (ForkDetected)
+    bob.orchestrator
+        .conversation_states()
+        .lock()
+        .await
+        .insert(cid.clone(), ConversationState::ForkDetected);
+
+    let ready2 = bob
+        .orchestrator
+        .ensure_conversation_ready(&cid)
+        .await
+        .expect("readiness on pending direct request must succeed");
+    assert_eq!(
+        ready2.recovery_state,
+        ConversationRecoveryState::Recovering,
+        "unaccepted direct request must report Recovering despite EpochBehind projection"
+    );
+    assert!(!ready2.send_allowed);
+
+    let after_epoch_behind_requests = world.delivery_service().submitted_prepared_requests().len();
+    assert_eq!(
+        after_epoch_behind_requests, baseline_requests,
+        "ensure_conversation_ready on unaccepted request with EpochBehind must not call join_or_rejoin or submit transitions"
     );
 }
 

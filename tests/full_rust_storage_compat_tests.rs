@@ -478,7 +478,14 @@ fn storage_lifecycle_status_reports_busy_interrupt_suspend_and_close() {
     assert_eq!(initial.state, StorageLifecycleState::Open);
     assert!(!initial.is_busy);
     assert_eq!(initial.busy_contexts, 0);
-    assert_eq!(initial.last_operation_label.as_deref(), Some("initialized"));
+    assert!(
+        matches!(
+            initial.last_operation_label.as_deref(),
+            Some("initialized") | Some("list_direct_request_projections")
+        ),
+        "engine status should reflect the initial storage state or direct-request hydration operation, got: {:?}",
+        initial.last_operation_label
+    );
     assert_eq!(initial.interruptible_contexts, 2);
 
     epoch_secret_test_support::install(&context);
@@ -1072,34 +1079,65 @@ fn reopen_existing_db_rejects_bundle_drift_without_modifying_file() {
             .expect("delete key package");
     }
 
-    let before_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
-    let before_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
-
-    // 3. Reopen must detect drift and fail closed without touching the file
-    let err = MLSContext::new(
+    // 3. Reopen under F48 contract: reconciles stale bundle into quarantine and succeeds
+    let ctx2 = MLSContext::new(
         db_path.to_string_lossy().to_string(),
         key.to_string(),
         Box::new(keychain.clone()),
     )
-    .err()
-    .expect("reopening database with key package drift must fail validation");
-    assert!(
-        err.to_string()
-            .contains("missing from openmls_key_packages")
-            || err.to_string().contains("drift")
-            || err.to_string().contains("Key package drift")
-    );
+    .expect("reopening database with key package drift must reconcile and succeed under F48 contract");
+    ctx2.flush_and_prepare_close().expect("flush and close ctx2");
 
-    let after_hash = Sha256::digest(&std::fs::read(&db_path).unwrap());
-    let after_mtime = std::fs::metadata(&db_path).unwrap().modified().unwrap();
-    assert_eq!(
-        before_hash, after_hash,
-        "failed drift validation must not mutate file"
-    );
-    assert_eq!(
-        before_mtime, after_mtime,
-        "failed drift validation must not update mtime"
-    );
+    // 4. Verify post-reconciliation state: stale bundle quarantined, active stores parity
+    {
+        let conn = open_test_connection(&db_path, key);
+        let kp_count: i64 = conn
+            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| r.get(0))
+            .expect("count openmls_key_packages");
+        let bundle_count: i64 = conn
+            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| r.get(0))
+            .expect("count mls_key_package_bundles");
+        let quarantined_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM mls_manifests WHERE key LIKE 'quarantined_key_package:stale_bundle:%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count quarantined");
+
+        assert_eq!(kp_count, 0, "openmls_key_packages must have 0 rows");
+        assert_eq!(bundle_count, 0, "mls_key_package_bundles must have 0 rows after reconciliation");
+        assert_eq!(quarantined_count, 1, "stale bundle must be quarantined in mls_manifests");
+    }
+
+    // 5. Subsequent reopen must succeed cleanly without resurrection
+    let ctx3 = MLSContext::new(
+        db_path.to_string_lossy().to_string(),
+        key.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("subsequent reopen must succeed cleanly");
+    ctx3.flush_and_prepare_close().expect("flush and close ctx3");
+    {
+        let conn = open_test_connection(&db_path, key);
+        let kp_count: i64 = conn
+            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| r.get(0))
+            .expect("count openmls_key_packages");
+        let bundle_count: i64 = conn
+            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| r.get(0))
+            .expect("count mls_key_package_bundles");
+        let quarantined_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM mls_manifests WHERE key LIKE 'quarantined_key_package:stale_bundle:%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count quarantined");
+
+        assert_eq!(kp_count, 0, "openmls_key_packages must remain 0 (never resurrected)");
+        assert_eq!(bundle_count, 0, "mls_key_package_bundles must remain 0 (never resurrected)");
+        assert_eq!(quarantined_count, 1, "quarantine record must persist without duplicates");
+    }
 }
 
 #[test]

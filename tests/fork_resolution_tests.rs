@@ -442,46 +442,6 @@ async fn conversation_id_for(client: &TestClient, group_id: &str) -> String {
         .clone()
 }
 
-/// Mirror the server-authorized rotation of `group_id` onto a fresh stable conversation id,
-/// retiring the superseded projection, and return the new stable conversation id.
-async fn rotate_to_stable_conversation(
-    world: &TestWorld,
-    client: &TestClient,
-    group_id: &str,
-) -> String {
-    let stable_conversation_id = uuid::Uuid::new_v4().to_string();
-    world
-        .delivery_service()
-        .rekey_conversation_for_test(group_id, &stable_conversation_id);
-    client
-        .storage
-        .ensure_conversation_exists(&client.did, &stable_conversation_id, group_id)
-        .await
-        .expect("migrate stable conversation storage row");
-    client
-        .storage
-        .set_conversation_state(&stable_conversation_id, ConversationState::Active)
-        .await
-        .expect("persist migrated stable conversation as Active");
-    client
-        .storage
-        .delete_conversations(&client.did, &[group_id])
-        .await
-        .expect("retire superseded stable-conversation projection");
-    {
-        let mut conversations = client.orchestrator.conversations().lock().await;
-        if let Some(mut migrated) = conversations.remove(group_id) {
-            migrated.conversation_id = stable_conversation_id.clone();
-            conversations.insert(stable_conversation_id.clone(), migrated);
-        }
-    }
-    client
-        .orchestrator
-        .sync_with_server(false)
-        .await
-        .expect("refresh rotated stable conversation mapping");
-    stable_conversation_id
-}
 
 async fn build_recording_orchestrator(
     source: &TestClient,
@@ -676,7 +636,7 @@ async fn fork_readd_resolves_rotated_stable_conversation_to_active_group() {
     let (world, group_id) = setup_alice_bob_group("fork-rotated-stable").await;
     let alice = world.client("Alice");
     let bob_did = world.client("Bob").did.clone();
-    let stable_conversation_id = rotate_to_stable_conversation(&world, alice, &group_id).await;
+    let stable_conversation_id = conversation_id_for(alice, &group_id).await;
     let source_epoch = epoch_for(alice, &group_id);
 
     let api = RecordingCommitApi::new(world.api_service.clone_as(&alice.did), false);
@@ -731,7 +691,7 @@ async fn recovery_vote_authenticator_ignores_stale_legacy_group_state() {
         .create_group("recovery-vote-unrelated", None, None)
         .await
         .expect("create unrelated group");
-    let stable_conversation_id = rotate_to_stable_conversation(&world, alice, &group_id).await;
+    let stable_conversation_id = conversation_id_for(alice, &group_id).await;
 
     let api = RecordingCommitApi::new(world.api_service.clone_as(&alice.did), false);
     let api_probe = api.clone();

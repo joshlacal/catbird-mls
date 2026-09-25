@@ -2353,6 +2353,63 @@ impl MLSAPIClient for MockDeliveryService {
                     "authorized-device-key resolution is required but unsupported by this test directory".into(),
                 ));
             }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetDeviceKey => {
+                let query_str = request.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                let mut owner_did = String::new();
+                let mut device_id = String::new();
+                let mut key_id = String::new();
+                for part in query_str.split('&') {
+                    if let Some((k, v)) = part.split_once('=') {
+                        let decoded = v.replace("%3A", ":");
+                        match k {
+                            "ownerDid" => owner_did = decoded,
+                            "deviceId" => device_id = decoded,
+                            "keyId" => key_id = decoded,
+                            _ => {}
+                        }
+                    }
+                }
+                let guard = self.state.lock().unwrap();
+                let device = guard
+                    .devices
+                    .get(&owner_did)
+                    .and_then(|devs| {
+                        devs.iter().find(|d| {
+                            d.info.device_id == device_id
+                                && d.info.key_id.as_deref() == Some(&key_id)
+                        })
+                    })
+                    .or_else(|| {
+                        guard.devices.values().flatten().find(|d| {
+                            d.info.device_id == device_id
+                                && d.info.key_id.as_deref() == Some(&key_id)
+                        })
+                    });
+
+                if let Some(dev) = device {
+                    let sig_key = dev.info.signature_public_key.as_ref().unwrap();
+                    let body = serde_json::json!({
+                        "ownerDid": owner_did,
+                        "deviceId": device_id,
+                        "keyId": key_id,
+                        "signaturePublicKey": base64::engine::general_purpose::STANDARD.encode(sig_key),
+                    });
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 200,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&body).unwrap(),
+                    });
+                } else {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 404,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&serde_json::json!({
+                            "error": "DeviceNotFound",
+                            "message": "device key not found"
+                        })).unwrap(),
+                    });
+                }
+            }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation => {
                 if let Some(resp) = self.state.lock().unwrap().next_create_custom_response.take() {
                     return Ok(resp);
