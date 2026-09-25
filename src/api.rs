@@ -743,6 +743,17 @@ struct MetadataReseal {
     avatar_content_type: Option<String>,
 }
 
+thread_local! {
+    static POST_BUILD_KEY_PACKAGE_HOOK: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[doc(hidden)]
+pub fn set_post_build_key_package_hook<F: Fn() + Send + Sync + 'static>(hook: Option<F>) {
+    POST_BUILD_KEY_PACKAGE_HOOK.with(|h| {
+        *h.borrow_mut() = hook.map(|f| Arc::new(f) as Arc<dyn Fn() + Send + Sync>);
+    });
+}
+
 #[uniffi::export]
 impl MLSContext {
     /// Create a new context with per-DID SQLite storage
@@ -3598,6 +3609,7 @@ impl MLSContext {
         Ok(result)
     }
 
+
     /// Create `count` key packages with a SINGLE persistence pass: one bundle-row
     /// transaction and one WAL checkpoint at the end of the batch, instead of a
     /// full manifest rewrite + checkpoint per package.
@@ -3622,7 +3634,7 @@ impl MLSContext {
             .inner
             .lock()
             .map_err(|_| MLSError::ContextNotInitialized)?;
-        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let mut inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
 
         let identity = String::from_utf8(identity_bytes)
             .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
@@ -3662,6 +3674,14 @@ impl MLSContext {
         if results.is_empty() {
             return Err(MLSError::ContextClosed);
         }
+        let hook = POST_BUILD_KEY_PACKAGE_HOOK.with(|h| h.borrow().clone());
+        if let Some(hook) = hook {
+            drop(guard);
+            hook();
+            guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+            inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        }
+
 
         // Single persistence pass for the whole batch (one small transaction —
         // per-row inserts, NOT a rewrite of every stored bundle).
@@ -8232,6 +8252,18 @@ impl MlsCryptoContext for MLSContext {
 
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
         self.create_key_package(identity)
+    }
+
+    fn record_replenish_intent(&self, needed: u32, identity: &str) -> Result<String, MLSError> {
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.record_replenish_intent(needed, identity)
+    }
+
+    fn clear_replenish_intent(&self) -> Result<(), MLSError> {
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.clear_replenish_intent()
     }
 
     fn create_last_resort_key_package(

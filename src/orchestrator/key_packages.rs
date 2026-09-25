@@ -134,8 +134,10 @@ where
                 )
             })?;
         let identity_bytes = format!("{user_did}#{device_uuid}").into_bytes();
-        let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
-
+        let intent_identity = String::from_utf8_lossy(&identity_bytes);
+        if let Err(e) = self.mls_context().record_replenish_intent(needed, &intent_identity) {
+            tracing::warn!(error = %e, "Failed to record replenish intent");
+        }
         let mut batch: Vec<crate::types::KeyPackageResult> = Vec::with_capacity(needed as usize);
         for i in 0..needed {
             match self
@@ -163,6 +165,9 @@ where
                 );
                 break;
             }
+        }
+        if let Err(e) = self.mls_context().clear_replenish_intent() {
+            tracing::warn!(error = %e, "Failed to clear replenish intent");
         }
         Ok(())
     }

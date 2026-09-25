@@ -393,3 +393,179 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
         assert!(journal_row.is_none(), "Incomplete replenish journal must be cleared after reconciliation");
     }
 }
+
+#[test]
+fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_context_a() {
+    let (db_path, _dir) = make_db_path();
+    let keychain = TestKeychain::new();
+
+    let ctx_a = MLSContext::new(
+        db_path.clone(),
+        TEST_KEY.to_string(),
+        Box::new(keychain.clone()),
+    )
+    .expect("context A init");
+
+    // Simulate Context A being an external process (e.g. PID 1 / launchd, always alive on Unix)
+    // by recording an active replenish journal with a foreign PID.
+    {
+        let conn = open_raw_sqlite(&db_path, TEST_KEY);
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let intent_json = serde_json::json!({
+            "operation_id": "multi-proc-race-op-1",
+            "needed": 1,
+            "identity": "did:plc:testuser#device-1",
+            "phase": "Started",
+            "owner_pid": 1u32, // PID 1 is always alive
+            "staged_hash_refs": [],
+            "created_at": now,
+        })
+        .to_string();
+        conn.execute(
+            "INSERT OR REPLACE INTO mls_manifests (key, value) VALUES ('key_package_replenish_journal', ?1)",
+            [&intent_json],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+
+    let db_path_clone = db_path.clone();
+    let keychain_clone = keychain.clone();
+
+    // Hook between Context A's OpenMLS build and manifest insert:
+    // Context B opens on the same DB while A has an in-flight key package in openmls_key_packages.
+    catbird_mls::set_post_build_key_package_hook(Some(move || {
+        let ctx_b = MLSContext::new(
+            db_path_clone.clone(),
+            TEST_KEY.to_string(),
+            Box::new(keychain_clone.clone()),
+        );
+        assert!(
+            ctx_b.is_ok(),
+            "Context B must open cleanly without failing on Context A's in-flight drift: {:?}",
+            ctx_b.err()
+        );
+
+        // Verify Context B did NOT quarantine Context A's in-flight package!
+        let conn = open_raw_sqlite(&db_path_clone, TEST_KEY);
+        let quarantined_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM mls_manifests WHERE key LIKE 'quarantined_key_package:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            quarantined_count, 0,
+            "Context B must NOT quarantine Context A's in-flight key package while live journal is active"
+        );
+    }));
+
+    let kps = ctx_a
+        .create_key_packages(IDENTITY.to_vec(), 1)
+        .expect("context A create key package");
+    assert_eq!(kps.len(), 1);
+
+    // Reset hook
+    catbird_mls::set_post_build_key_package_hook::<fn()>(None);
+
+    // Verify final state: both stores have 1 row, 0 quarantined
+    {
+        let conn = open_raw_sqlite(&db_path, TEST_KEY);
+        let kp_count: i64 = conn
+            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let bundle_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM mls_key_package_bundles",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let quarantined_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM mls_manifests WHERE key LIKE 'quarantined_key_package:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(kp_count, 1, "openmls_key_packages must have 1 row");
+        assert_eq!(bundle_count, 1, "mls_key_package_bundles must have 1 row");
+        assert_eq!(quarantined_count, 0, "Quarantined count must be 0");
+    }
+}
+
+#[test]
+fn test_extension_process_tolerates_drift_without_destructive_reconciliation() {
+    let (db_path, _dir) = make_db_path();
+    let keychain = TestKeychain::new();
+
+    // 1. Clean startup and create 2 key packages
+    {
+        let ctx = MLSContext::new(
+            db_path.clone(),
+            TEST_KEY.to_string(),
+            Box::new(keychain.clone()),
+        )
+        .unwrap();
+        ctx.create_key_packages(IDENTITY.to_vec(), 2).unwrap();
+    }
+
+    // 2. Inject an orphan into openmls_key_packages
+    let orphan_ref = hex::decode("deadbeef0102030405060708deadbeef").unwrap();
+    let orphan_kp_bytes = hex::decode("cafe0102030405060708cafe01020304").unwrap();
+    {
+        let conn = open_raw_sqlite(&db_path, TEST_KEY);
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute(
+            "INSERT INTO openmls_key_packages (provider_version, key_package_ref, key_package) VALUES (1, ?1, ?2)",
+            rusqlite::params![orphan_ref, orphan_kp_bytes],
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+
+    // 3. Open with extension process simulation enabled
+    catbird_mls::set_simulate_extension_process_for_test(true);
+    let ext_ctx = MLSContext::new(
+        db_path.clone(),
+        TEST_KEY.to_string(),
+        Box::new(keychain.clone()),
+    );
+    catbird_mls::set_simulate_extension_process_for_test(false);
+
+    assert!(ext_ctx.is_ok(), "Extension process must open without error");
+
+    // 4. Verify no destructive changes were made:
+    // openmls_key_packages still has 3, mls_manifests has 0 quarantined records
+    {
+        let conn = open_raw_sqlite(&db_path, TEST_KEY);
+        let kp_count: i64 = conn
+            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let quarantined_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM mls_manifests WHERE key LIKE 'quarantined_key_package:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kp_count, 3,
+            "Extension process must not delete orphan from openmls_key_packages"
+        );
+        assert_eq!(
+            quarantined_count, 0,
+            "Extension process must not quarantine orphan"
+        );
+    }
+}

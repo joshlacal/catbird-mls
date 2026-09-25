@@ -193,6 +193,62 @@ fn unix_now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+thread_local! {
+    static SIMULATE_EXTENSION_PROCESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[doc(hidden)]
+pub fn set_simulate_extension_process_for_test(val: bool) {
+    SIMULATE_EXTENSION_PROCESS.with(|c| c.set(val));
+}
+
+pub(crate) fn is_extension_process() -> bool {
+    if SIMULATE_EXTENSION_PROCESS.with(|c| c.get()) {
+        return true;
+    }
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().contains(".appex/"))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe {
+        kill(pid as i32, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(1) // EPERM = 1 on POSIX
+    }
+}
+
+#[cfg(not(unix))]
+fn is_process_alive(_pid: u32) -> bool {
+    // ponytail: Windows Catmos is single-process per DID (cdf53709); cross-process multi-context concurrency only exists on Apple platforms (.appex NSE)
+    false
+}
+// ponytail: pid alive check via kill(pid, 0) and 5m timeout to detect dead replenishers
+fn is_replenish_journal_active(journal_str: &str) -> bool {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(journal_str) else {
+        return false;
+    };
+    let owner_pid = val.get("owner_pid").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+    let created_at = val.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0);
+    let now = unix_now_secs();
+    let age = now.saturating_sub(created_at);
+    if age > 300 {
+        // Expired (> 5 minutes old) - considered dead
+        return false;
+    }
+    if owner_pid == 0 {
+        return false;
+    }
+    is_process_alive(owner_pid)
+}
+
 /// The serde-encoded OpenMLS `KeyPackageRef` for a cached bundle, as
 /// `delete_bundle_entries` expects it. `None` when the bundle is no longer
 /// cached or its ref cannot be recomputed/encoded, in which case there is
@@ -529,6 +585,15 @@ impl ManifestStorage {
 
         Ok(())
     }
+    /// Delete a manifest key.
+    pub(crate) fn delete_manifest(&self, key: &str) -> Result<(), MLSError> {
+        self.conn
+            .execute("DELETE FROM mls_manifests WHERE key = ?1", [key])
+            .map_err(|e| map_sqlite_error("delete_manifest", &e))?;
+        self.maybe_truncate_checkpoint();
+        Ok(())
+    }
+
 
     /// Atomic journal update across native contexts sharing this encrypted DB.
     /// Callers retain old JSON exactly and retry a failed comparison; a returned
@@ -1108,11 +1173,10 @@ fn validate_existing_sqlite_storage(
     encryption_key: &str,
     keychain: Arc<dyn KeychainAccess>,
 ) -> Result<(), MLSError> {
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI;
-    let conn = Connection::open_with_flags(path, flags).map_err(|e| {
-        MLSError::invalid_input(format!("Failed to open existing DB in read-only mode: {e}"))
+    let conn = Connection::open(path).map_err(|e| {
+        MLSError::invalid_input(format!("Failed to open existing DB: {e}"))
     })?;
-    apply_cipher_pragmas(&conn, encryption_key)?;
+    configure_sqlcipher_connection(&conn, encryption_key)?;
 
     // 0. Full read-only database page integrity checks before inspecting tables
     {
@@ -1960,20 +2024,47 @@ fn validate_existing_sqlite_storage(
         }
     }
 
-    // 5. Validate all bundle rows in mls_key_package_bundles and verify backing in openmls_key_packages
+    // 5. Validate all bundle rows in mls_key_package_bundles and reconcile with openmls_key_packages
     {
+        conn.execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| MLSError::invalid_input(format!("Failed to begin immediate transaction: {e}")))?;
+
+        let is_appex = is_extension_process();
+
+        let active_journal_opt: Option<String> = conn
+            .query_row(
+                "SELECT value FROM mls_manifests WHERE key = 'key_package_replenish_journal'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| MLSError::invalid_input(format!("Failed to read replenish journal: {e}")))?;
+
+        let other_process_replenishing = if let Some(jstr) = &active_journal_opt {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(jstr) {
+                let owner_pid = val.get("owner_pid").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
+                owner_pid != std::process::id() && is_replenish_journal_active(jstr)
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let mut stmt = conn
             .prepare("SELECT hash_ref, bundle_b64 FROM mls_key_package_bundles")
             .map_err(|e| MLSError::invalid_input(format!("Failed to prepare bundle query: {e}")))?;
         let mut rows = stmt
             .query([])
             .map_err(|e| MLSError::invalid_input(format!("Failed to query bundles: {e}")))?;
-        let mut bundle_count = 0i64;
+
+        let mut manifested_serialized_refs: HashMap<Vec<u8>, String> = HashMap::new();
+        let mut stale_bundles: Vec<String> = Vec::new();
+
         while let Some(row) = rows
             .next()
             .map_err(|e| MLSError::invalid_input(format!("Corrupt bundle row iteration: {e}")))?
         {
-            bundle_count += 1;
             let hash_ref: String = row
                 .get(0)
                 .map_err(|e| MLSError::invalid_input(format!("Corrupt hash_ref column: {e}")))?;
@@ -2019,23 +2110,153 @@ fn validate_existing_sqlite_storage(
                 .optional()
                 .map_err(|e| MLSError::invalid_input(format!("Failed to query openmls_key_packages for bundle {hash_ref}: {e}")))?
                 .unwrap_or(false);
-            if !openmls_kp_exists {
-                return Err(MLSError::invalid_input(format!(
-                    "Manifested key package bundle {hash_ref} missing from openmls_key_packages"
-                )));
+            if openmls_kp_exists {
+                manifested_serialized_refs.insert(serialized_key_package_ref, hash_ref);
+            } else {
+                stale_bundles.push(hash_ref);
             }
         }
-        let openmls_kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .map_err(|e| {
-                MLSError::invalid_input(format!("Failed to count openmls_key_packages: {e}"))
-            })?;
-        if bundle_count != openmls_kp_count {
-            return Err(MLSError::invalid_input(format!(
-                "Key package drift detected: {bundle_count} manifested bundles vs {openmls_kp_count} OpenMLS key packages"
-            )));
+        drop(rows);
+        drop(stmt);
+
+        // Find any unmanifested orphans in openmls_key_packages
+        let mut kp_stmt = conn
+            .prepare("SELECT provider_version, key_package_ref, key_package FROM openmls_key_packages")
+            .map_err(|e| MLSError::invalid_input(format!("Failed to prepare openmls_key_packages query: {e}")))?;
+        let mut kp_rows = kp_stmt
+            .query([])
+            .map_err(|e| MLSError::invalid_input(format!("Failed to query openmls_key_packages: {e}")))?;
+
+        let mut unmanifested_orphans: Vec<(i64, Vec<u8>, Vec<u8>)> = Vec::new();
+        while let Some(row) = kp_rows
+            .next()
+            .map_err(|e| MLSError::invalid_input(format!("Corrupt openmls_key_packages row: {e}")))?
+        {
+            let pv: i64 = row.get(0).map_err(|e| MLSError::invalid_input(e.to_string()))?;
+            let kp_ref: Vec<u8> = row.get(1).map_err(|e| MLSError::invalid_input(e.to_string()))?;
+            let kp_blob: Vec<u8> = row.get(2).map_err(|e| MLSError::invalid_input(e.to_string()))?;
+
+            if !manifested_serialized_refs.contains_key(&kp_ref) {
+                unmanifested_orphans.push((pv, kp_ref, kp_blob));
+            }
+        }
+        drop(kp_rows);
+        drop(kp_stmt);
+
+        if is_appex {
+            if !unmanifested_orphans.is_empty() || !stale_bundles.is_empty() {
+                crate::warn_log!(
+                    "[MLS-RECONCILE] App extension (.appex) observed key package drift ({} unmanifested orphans, {} stale bundles); skipping destructive reconciliation",
+                    unmanifested_orphans.len(),
+                    stale_bundles.len()
+                );
+            }
+            conn.execute_batch("COMMIT;")
+                .map_err(|e| MLSError::invalid_input(format!("Failed to commit extension check: {e}")))?;
+        } else if other_process_replenishing {
+            crate::warn_log!(
+                "[MLS-RECONCILE] Active replenish journal owned by live process in progress; skipping orphan quarantine to avoid race"
+            );
+            conn.execute_batch("COMMIT;")
+                .map_err(|e| MLSError::invalid_input(format!("Failed to commit non-racing check: {e}")))?;
+        } else {
+            if !unmanifested_orphans.is_empty() || !stale_bundles.is_empty() {
+                let now = unix_now_secs();
+
+                for (pv, kp_ref, kp_blob) in &unmanifested_orphans {
+                    let hex_ref = hex::encode(kp_ref);
+                    let quarantine_key = format!("quarantined_key_package:openmls_orphan:{hex_ref}");
+                    let quarantine_val = serde_json::json!({
+                        "key_package_ref": hex_ref,
+                        "key_package_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, kp_blob),
+                        "provider_version": pv,
+                        "quarantined_at": now,
+                        "reason": "unmanifested_openmls_orphan"
+                    }).to_string();
+
+                    conn.execute(
+                        "INSERT OR REPLACE INTO mls_manifests (key, value) VALUES (?1, ?2)",
+                        [&quarantine_key, &quarantine_val],
+                    )
+                    .map_err(|e| MLSError::invalid_input(format!("Failed to quarantine orphan {hex_ref}: {e}")))?;
+
+                    conn.execute(
+                        "DELETE FROM openmls_key_packages WHERE provider_version = ?1 AND key_package_ref = ?2",
+                        rusqlite::params![pv, kp_ref],
+                    )
+                    .map_err(|e| MLSError::invalid_input(format!("Failed to delete orphan {hex_ref} from openmls_key_packages: {e}")))?;
+
+                    crate::warn_log!(
+                        "[MLS-RECONCILE] ⚠️ Quarantined unmanifested OpenMLS key package orphan {} (provider_version {}) to mls_manifests; removed from active store to eliminate drift",
+                        hex_ref, pv
+                    );
+                }
+
+                for hash_ref in &stale_bundles {
+                    let quarantine_key = format!("quarantined_key_package:stale_bundle:{hash_ref}");
+                    let quarantine_val = serde_json::json!({
+                        "hash_ref": hash_ref,
+                        "quarantined_at": now,
+                        "reason": "missing_openmls_key_package"
+                    }).to_string();
+
+                    conn.execute(
+                        "INSERT OR REPLACE INTO mls_manifests (key, value) VALUES (?1, ?2)",
+                        [&quarantine_key, &quarantine_val],
+                    )
+                    .map_err(|e| MLSError::invalid_input(format!("Failed to quarantine stale bundle {hash_ref}: {e}")))?;
+
+                    conn.execute(
+                        "DELETE FROM mls_key_package_bundles WHERE hash_ref = ?1",
+                        [hash_ref],
+                    )
+                    .map_err(|e| MLSError::invalid_input(format!("Failed to delete stale bundle {hash_ref}: {e}")))?;
+
+                    crate::warn_log!(
+                        "[MLS-RECONCILE] ⚠️ Quarantined and removed stale manifested bundle {} missing from openmls_key_packages",
+                        hash_ref
+                    );
+                }
+
+                let _ = conn.execute(
+                    "DELETE FROM mls_manifests WHERE key = 'key_package_replenish_journal'",
+                    [],
+                );
+
+                crate::info_log!(
+                    "[MLS-RECONCILE] ✅ Key package drift reconciled: {} orphans quarantined, {} stale bundles removed",
+                    unmanifested_orphans.len(),
+                    stale_bundles.len()
+                );
+            } else if active_journal_opt.is_some() {
+                let _ = conn.execute(
+                    "DELETE FROM mls_manifests WHERE key = 'key_package_replenish_journal'",
+                    [],
+                );
+            }
+
+            conn.execute_batch("COMMIT;")
+                .map_err(|e| MLSError::invalid_input(format!("Failed to commit reconciliation transaction: {e}")))?;
+
+            let bundle_count: i64 = conn
+                .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
+                    r.get(0)
+                })
+                .map_err(|e| {
+                    MLSError::invalid_input(format!("Failed to count mls_key_package_bundles: {e}"))
+                })?;
+            let openmls_kp_count: i64 = conn
+                .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
+                    r.get(0)
+                })
+                .map_err(|e| {
+                    MLSError::invalid_input(format!("Failed to count openmls_key_packages: {e}"))
+                })?;
+            if bundle_count != openmls_kp_count {
+                return Err(MLSError::invalid_input(format!(
+                    "Key package drift detected after reconciliation: {bundle_count} manifested bundles vs {openmls_kp_count} OpenMLS key packages"
+                )));
+            }
         }
     }
 
@@ -2706,6 +2927,28 @@ impl MLSContext {
     /// Call this once at app startup to clear leftover WAL from previous session.
     pub fn launch_checkpoint(&self) -> Result<(), MLSError> {
         self.manifest_storage.launch_truncate_checkpoint()
+    }
+
+    /// Record an active key package replenish intent in mls_manifests before generation.
+    pub fn record_replenish_intent(&self, needed: u32, identity: &str) -> Result<String, MLSError> {
+        let op_id = uuid::Uuid::new_v4().to_string();
+        let now = unix_now_secs();
+        let intent = serde_json::json!({
+            "operation_id": op_id,
+            "needed": needed,
+            "identity": identity,
+            "phase": "Started",
+            "owner_pid": std::process::id(),
+            "staged_hash_refs": Vec::<String>::new(),
+            "created_at": now,
+        });
+        self.manifest_storage.write_manifest("key_package_replenish_journal", &intent)?;
+        Ok(op_id)
+    }
+
+    /// Clear the active key package replenish intent after completion.
+    pub fn clear_replenish_intent(&self) -> Result<(), MLSError> {
+        self.manifest_storage.delete_manifest("key_package_replenish_journal")
     }
 
     /// Get reference to epoch secret manager for setting storage backend
