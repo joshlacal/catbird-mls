@@ -59,8 +59,10 @@ pub use orchestrator::direct_request_types::{
 pub use platform_lifecycle::*;
 pub use types::*;
 
+#[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use api::set_post_build_key_package_hook;
+#[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use mls_context::set_simulate_extension_process_for_test;
 // ═══════════════════════════════════════════════════════════════════════════
