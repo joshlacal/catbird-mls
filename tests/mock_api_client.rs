@@ -312,6 +312,14 @@ struct MockState {
     /// Call count for get_key_packages
     get_key_packages_call_count: usize,
 
+    /// When true, every `MLSAPIClient` transport method fails with the same
+    /// transport-unavailable error before doing any work. Models a genuinely
+    /// unreachable delivery service, as distinct from a single injected
+    /// operation response. Off by default so no existing test is affected.
+    transport_offline: bool,
+    /// Transport calls refused while `transport_offline` was set.
+    transport_refused_calls: usize,
+
     /// Failure injection flags.
     failures: FailureFlags,
 }
@@ -817,6 +825,39 @@ impl MockDeliveryService {
         } else {
             guard.authenticated_did.clone()
         }
+    }
+
+    // -- transport availability -----------------------------------------------
+
+    /// Make every transport call fail until [`Self::allow_transport`] is
+    /// called. Local session queries (`is_authenticated_as`, `current_did`)
+    /// stay answerable because they are not transport calls.
+    pub fn refuse_all_transport(&self) {
+        self.state.lock().unwrap().transport_offline = true;
+    }
+
+    /// Restore transport availability after [`Self::refuse_all_transport`].
+    pub fn allow_transport(&self) {
+        self.state.lock().unwrap().transport_offline = false;
+    }
+
+    /// Number of transport calls refused since the last counter reset.
+    pub fn refused_transport_calls(&self) -> usize {
+        self.state.lock().unwrap().transport_refused_calls
+    }
+
+    /// The single check every transport method runs first. Returns the
+    /// product's typed transport-unavailable error while the switch is set,
+    /// counting the refusal; otherwise `None` and the method proceeds.
+    fn refuse_when_offline(&self) -> Option<OrchestratorError> {
+        let mut guard = self.state.lock().unwrap();
+        if !guard.transport_offline {
+            return None;
+        }
+        guard.transport_refused_calls += 1;
+        Some(OrchestratorError::Api(
+            "transport unavailable: delivery service is unreachable".into(),
+        ))
     }
 
     // -- failure injection ----------------------------------------------------
@@ -2177,6 +2218,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         {
             let mut guard = self.state.lock().unwrap();
             guard
@@ -2192,6 +2236,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn publish_welcome(&self, convo_id: &str, welcome_data: &[u8]) -> Result<()> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let did = self.current_did().await.unwrap_or_default();
         let mut guard = self.state.lock().unwrap();
         let group_id_opt = guard
@@ -2221,6 +2268,14 @@ impl MLSAPIClient for MockDeliveryService {
         &self,
         request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
     ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        // `raw_dispatch` is the internal recursion that strips lexicon
+        // presentation; it is not a second transport call, so the refusal is
+        // counted once at the outer entry.
+        if !self.raw_dispatch {
+            if let Some(error) = self.refuse_when_offline() {
+                return Err(error);
+            }
+        }
         if !self.raw_dispatch && self.state.lock().unwrap().present_lexicon_bytes {
             let nsid = request
                 .operation
@@ -3757,6 +3812,9 @@ impl MLSAPIClient for MockDeliveryService {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let result = {
             let mut guard = self.state.lock().unwrap();
             check_fail(
@@ -3840,6 +3898,9 @@ impl MLSAPIClient for MockDeliveryService {
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let gate = self.get_messages_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.reached.notify_one();
@@ -3937,6 +3998,9 @@ impl MLSAPIClient for MockDeliveryService {
         _actor_device_id: &str,
         dids: &[String],
     ) -> Result<Vec<KeyPackageRef>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let mut guard = self.state.lock().unwrap();
         guard.get_key_packages_call_count += 1;
         check_fail(
@@ -3977,6 +4041,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let guard = self.state.lock().unwrap();
         let did = self
             .effective_did_from_guard(&guard)
@@ -3995,6 +4062,9 @@ impl MLSAPIClient for MockDeliveryService {
         local_hashes: &[String],
         _device_id: &str,
     ) -> Result<KeyPackageSyncResult> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         Ok(KeyPackageSyncResult {
             orphaned_count: 0,
             deleted_count: local_hashes.len() as u32,
@@ -4002,6 +4072,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let guard = self.state.lock().unwrap();
         let did = self
             .effective_did_from_guard(&guard)
@@ -4020,6 +4093,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let mut guard = self.state.lock().unwrap();
         *guard
             .get_group_info_calls
@@ -4037,6 +4113,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let mut guard = self.state.lock().unwrap();
         *guard
             .get_welcome_calls
@@ -4089,6 +4168,9 @@ impl MLSAPIClient for MockDeliveryService {
         _convo_id: &str,
         _message_ids: &[String],
     ) -> Result<Vec<(String, DeliveryStatus)>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         Ok(vec![])
     }
 }
@@ -4271,6 +4353,90 @@ mod tests {
             .unwrap();
         let data = svc.get_group_info("conv-1").await.unwrap();
         assert_eq!(data, b"group-info-blob");
+    }
+
+    /// The offline switch must refuse every transport method, not a subset:
+    /// a single unguarded method would let a caller's "offline" assertions
+    /// pass while still reaching the service.
+    ///
+    /// Calls go through `MLSAPIClient` explicitly: `MockDeliveryService` also
+    /// has inherent methods with these names (`publish_group_info`,
+    /// `get_delivery_status`), and inherent resolution would silently test the
+    /// wrong function. The orchestrator is generic over the trait, so the
+    /// trait method is the one product code actually reaches.
+    #[tokio::test]
+    async fn refuse_all_transport_covers_every_transport_method() {
+        use catbird_mls::orchestrator::canonical_transport::{
+            CanonicalOperation, PreparedRequest,
+        };
+
+        let svc = MockDeliveryService::new("did:plc:alice");
+        svc.create_conversation("conv-1", Some(&["did:plc:bob".to_string()]), None, None, None)
+            .await
+            .unwrap();
+        svc.publish_group_info("conv-1", b"gi").await.unwrap();
+        svc.publish_key_package(b"kp", "suite", "2099-01-01", None)
+            .await
+            .unwrap();
+
+        svc.refuse_all_transport();
+
+        let prepared = PreparedRequest {
+            operation: CanonicalOperation::GetConversations,
+            method: "GET".into(),
+            path: CanonicalOperation::GetConversations.path().into(),
+            body: None,
+        };
+        // Every transport method on the trait, in trait order. `is_authenticated_as`
+        // and `current_did` are absent deliberately: they read local session state.
+        let refused: Vec<std::result::Result<(), OrchestratorError>> = vec![
+            MLSAPIClient::submit_prepared_request(&svc, prepared)
+                .await
+                .map(|_| ()),
+            MLSAPIClient::publish_group_info(&svc, "conv-1", b"gi2").await,
+            MLSAPIClient::publish_welcome(&svc, "conv-1", b"w").await,
+            MLSAPIClient::get_conversations(&svc, 10, None).await.map(|_| ()),
+            MLSAPIClient::get_messages(&svc, "conv-1", None, 10, None, None, None)
+                .await
+                .map(|_| ()),
+            MLSAPIClient::get_key_packages(&svc, "dev", &["did:plc:alice".to_string()])
+                .await
+                .map(|_| ()),
+            MLSAPIClient::get_key_package_stats(&svc).await.map(|_| ()),
+            MLSAPIClient::sync_key_packages(&svc, &["h".to_string()], "dev")
+                .await
+                .map(|_| ()),
+            MLSAPIClient::list_devices(&svc, "dev").await.map(|_| ()),
+            MLSAPIClient::get_group_info(&svc, "conv-1").await.map(|_| ()),
+            MLSAPIClient::get_welcome(&svc, "conv-1").await.map(|_| ()),
+            MLSAPIClient::get_delivery_status(&svc, "conv-1", &["m".to_string()])
+                .await
+                .map(|_| ()),
+        ];
+        for (index, outcome) in refused.iter().enumerate() {
+            let error = outcome
+                .as_ref()
+                .err()
+                .unwrap_or_else(|| panic!("transport method #{index} was not refused offline"));
+            assert!(
+                error.to_string().contains("transport unavailable"),
+                "method #{index} failed with an unrelated error: {error}"
+            );
+        }
+        assert_eq!(svc.refused_transport_calls(), refused.len());
+
+        // Local session state is not transport and must keep answering.
+        assert!(MLSAPIClient::is_authenticated_as(&svc, "did:plc:alice").await);
+        assert_eq!(
+            MLSAPIClient::current_did(&svc).await,
+            Some("did:plc:alice".to_string())
+        );
+
+        // Restoring transport must return the service to normal operation.
+        svc.allow_transport();
+        let page = MLSAPIClient::get_conversations(&svc, 10, None).await.unwrap();
+        assert_eq!(page.conversations.len(), 1);
+        assert_eq!(svc.refused_transport_calls(), refused.len());
     }
 
     #[tokio::test]
