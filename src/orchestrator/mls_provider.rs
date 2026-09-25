@@ -339,7 +339,6 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
 
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError>;
 
-
     fn record_replenish_intent(&self, _needed: u32, _identity: &str) -> Result<String, MLSError> {
         Ok(String::new())
     }

@@ -110,11 +110,9 @@ fn test_crash_boundary_unmanifested_openmls_orphan_reconciles_on_startup() {
             })
             .unwrap();
         let initial_bundle_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM mls_key_package_bundles",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(initial_kp_count, 3);
         assert_eq!(initial_bundle_count, 3);
@@ -163,11 +161,9 @@ fn test_crash_boundary_unmanifested_openmls_orphan_reconciles_on_startup() {
             })
             .unwrap();
         let final_bundle_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM mls_key_package_bundles",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(
             final_kp_count, 3,
@@ -246,11 +242,9 @@ fn test_crash_boundary_stale_manifested_bundle_reconciles_on_startup() {
             })
             .unwrap();
         let bundle_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM mls_key_package_bundles",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(kp_count, 2);
         assert_eq!(bundle_count, 3);
@@ -282,11 +276,9 @@ fn test_crash_boundary_stale_manifested_bundle_reconciles_on_startup() {
             })
             .unwrap();
         let final_bundle_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM mls_key_package_bundles",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(final_kp_count, 2);
         assert_eq!(final_bundle_count, 2);
@@ -373,11 +365,9 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
             })
             .unwrap();
         let final_bundle_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM mls_key_package_bundles",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(final_kp_count, 2);
         assert_eq!(final_bundle_count, 2);
@@ -390,7 +380,10 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
                 |r| r.get(0),
             )
             .ok();
-        assert!(journal_row.is_none(), "Incomplete replenish journal must be cleared after reconciliation");
+        assert!(
+            journal_row.is_none(),
+            "Incomplete replenish journal must be cleared after reconciliation"
+        );
     }
 }
 
@@ -410,7 +403,8 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
     // by recording an active replenish journal with a foreign PID.
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -430,7 +424,8 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
             [&intent_json],
         )
         .unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     let db_path_clone = db_path.clone();
@@ -482,11 +477,9 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
             })
             .unwrap();
         let bundle_count: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM mls_key_package_bundles",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let quarantined_count: i64 = conn
             .query_row(
@@ -523,13 +516,15 @@ fn test_extension_process_tolerates_drift_without_destructive_reconciliation() {
     let orphan_kp_bytes = hex::decode("cafe0102030405060708cafe01020304").unwrap();
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         conn.execute(
             "INSERT INTO openmls_key_packages (provider_version, key_package_ref, key_package) VALUES (1, ?1, ?2)",
             rusqlite::params![orphan_ref, orphan_kp_bytes],
         )
         .unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // 3. Open with extension process simulation enabled
