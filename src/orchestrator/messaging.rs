@@ -455,11 +455,40 @@ where
     ) -> Result<ConversationReadyResult> {
         self.check_shutdown().await?;
         self.require_user_did().await?;
-        if self.pending_conversation_admission(convo_id).await? {
-            return Ok(Self::ready_result(
-                ConversationRecoveryState::Recovering,
-                None,
-            ));
+        match self.pending_conversation_admission(convo_id).await {
+            Ok(true) => {
+                return Ok(Self::ready_result(
+                    ConversationRecoveryState::Recovering,
+                    None,
+                ));
+            }
+            Ok(false) => {}
+            Err(OrchestratorError::Mls(crate::error::MLSError::ContextClosed)) => {
+                // A suspended context cannot prove admission; only a known
+                // non-ready projection may answer, and never by joining.
+                let projected = self
+                    .project_conversation_recovery_state_result(convo_id)
+                    .await?;
+                if !matches!(
+                    projected,
+                    ConversationRecoveryState::NeedsRejoin
+                        | ConversationRecoveryState::ResetPending
+                        | ConversationRecoveryState::EpochBehind
+                        | ConversationRecoveryState::UnrecoverableLocal
+                        | ConversationRecoveryState::Recovering
+                ) {
+                    return Err(OrchestratorError::Mls(
+                        crate::error::MLSError::ContextClosed,
+                    ));
+                }
+                tracing::debug!(
+                    convo_id,
+                    ?projected,
+                    "ensure_conversation_ready: context closed during admission probe; bailing with known non-ready projection"
+                );
+                return Ok(Self::ready_result(projected, None));
+            }
+            Err(err) => return Err(err),
         }
 
         let had_in_memory_reset_authority = matches!(
