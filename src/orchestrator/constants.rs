@@ -37,6 +37,9 @@ pub const SYNC_INTERVAL_SECS: u64 = 5;
 pub const SYNC_CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
 pub const SYNC_CIRCUIT_BREAKER_BASE_SECS: u64 = 30;
 pub const SYNC_CIRCUIT_BREAKER_MAX_SECS: u64 = 300;
+/// Longest an authenticated-inventory ingest waits for an in-flight sync pass to finish
+/// before failing closed.
+pub const INVENTORY_SYNC_WAIT_SECS: u64 = 60;
 
 // §10 Key Packages
 pub const KEY_PACKAGE_TARGET: u32 = 50;

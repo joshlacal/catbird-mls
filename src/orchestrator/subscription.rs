@@ -763,7 +763,9 @@ where
 
         self.verify_actor_identity(&owner, actor_device_id, generation).await?;
         if response.status != 200 {
-            return Err(OrchestratorError::Api(format!("ticket HTTP {}", response.status)));
+            // A rejected ticket names its protocol error only in the body.
+            let reason = String::from_utf8_lossy(&response.body[..response.body.len().min(256)]).into_owned();
+            return Err(OrchestratorError::Api(format!("ticket HTTP {}: {reason}", response.status)));
         }
 
         if response.body.len() > 16384 {
@@ -805,9 +807,14 @@ where
         })
     }
 
-    /// Convenience: synchronize inventory and prepare subscription ticket in one step.
+    /// Synchronize a fresh inventory and prepare its subscription ticket in one step.
+    ///
+    /// Every (re)connect mints from a freshly fetched and applied inventory: the server keeps
+    /// one inventory session per device and replaces its capability once newer events exist,
+    /// so a session restored from an earlier journal (e.g. the previous launch's) is refused
+    /// with InventorySessionMismatch.
     pub async fn prepare_subscription(&self) -> Result<SubscriptionTicket> {
-        let (snapshot, _applied, completed) = self.synchronize_inventory_internal(false).await?;
+        let (snapshot, _applied, completed) = self.synchronize_inventory_internal(true).await?;
         let actor = self.require_actor_device_id().await?;
         let owner = self.require_user_did().await?;
         let namespace = format!("inventory:{owner}");
@@ -1374,9 +1381,18 @@ mod tests {
         async fn get_group_info(&self, _: &str) -> Result<Vec<u8>> { Ok(vec![]) }
     }
 
+    /// Serves one inventory snapshot, numbered `snapshot`. Like the server, which keeps one
+    /// session per device and replaces its capability once newer events exist, the ticket
+    /// endpoint only accepts the current snapshot's session.
     struct MockInventoryApi {
         did: String,
         expires: String,
+        snapshot: u8,
+    }
+    impl MockInventoryApi {
+        fn session(&self) -> String {
+            format!("session-inv-{}234567890123456789012", self.snapshot)
+        }
     }
     #[async_trait::async_trait]
     impl MLSAPIClient for MockInventoryApi {
@@ -1386,6 +1402,14 @@ mod tests {
             let expires = self.expires.as_str();
             let scope_bytes = STANDARD.encode([3u8; 32]);
             if req.operation == CanonicalOperation::GetSubscriptionTicket {
+                let asked: serde_json::Value = serde_json::from_slice(req.body.as_deref().unwrap_or_default()).unwrap();
+                if asked["inventorySessionId"] != self.session().as_str() {
+                    return Ok(super::super::canonical_transport::GatewayResponse {
+                        status: 400,
+                        content_type: Some("application/json".into()),
+                        body: br#"{"error":"InventorySessionMismatch","message":"InventorySessionMismatch"}"#.to_vec(),
+                    });
+                }
                 let body = serde_json::json!({
                     "ticket": "ticket-12345678901234567890123456789012",
                     "endpoint": "wss://chat.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents",
@@ -1402,8 +1426,8 @@ mod tests {
                 });
             }
             let page = serde_json::json!({
-                "inventorySessionId": "session-inv-1234567890123456789012",
-                "snapshotEventCursor": "cursor-inv-1",
+                "inventorySessionId": self.session(),
+                "snapshotEventCursor": format!("cursor-inv-{}", self.snapshot),
                 "snapshotExpiresAt": expires,
                 "hasMore": false,
                 "items": [],
@@ -1597,10 +1621,14 @@ mod tests {
         assert!(orchestrator.apply_subscription_frame(&advance_frame_4).await.is_err());
     }
 
+    /// An initialized orchestrator over the mock inventory API serving `snapshot`
+    /// (`session-inv-<snapshot>…`, `cursor-inv-<snapshot>`), ticket `ticket-…`. Reusing `dir`
+    /// is a relaunch on the same storage.
     #[cfg(not(target_arch = "wasm32"))]
-    #[tokio::test]
-    async fn synchronize_inventory_and_prepare_ticket_lifecycle() {
-        let dir = tempfile::tempdir().unwrap();
+    async fn inventory_orchestrator(
+        dir: &tempfile::TempDir,
+        snapshot: u8,
+    ) -> MLSOrchestrator<MockStorage, MockInventoryApi, MockCreds, crate::MLSContext> {
         let db_path = dir.path().join("sub_inv_test.db").to_string_lossy().to_string();
         let context = crate::MLSContext::new(
             db_path,
@@ -1608,7 +1636,6 @@ mod tests {
             Box::new(NoopKeychain),
         )
         .unwrap();
-
         let owner = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
         let actor = "00000000-0000-4000-8000-000000000001";
         let creds = Arc::new(MockCreds {
@@ -1616,19 +1643,26 @@ mod tests {
             actor: actor.into(),
             gen: 1,
         });
-        let storage = Arc::new(MockStorage);
         let expires = (chrono::Utc::now() + chrono::Duration::minutes(10))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let api = Arc::new(MockInventoryApi { did: owner.into(), expires });
-
+        let api = Arc::new(MockInventoryApi { did: owner.into(), expires, snapshot });
         let orchestrator = MLSOrchestrator::new(
-            context.clone(),
-            storage,
+            context,
+            Arc::new(MockStorage),
             api,
             creds,
             super::super::orchestrator::OrchestratorConfig::default(),
         );
         orchestrator.initialize(owner).await.unwrap();
+        orchestrator
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn synchronize_inventory_and_prepare_ticket_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = inventory_orchestrator(&dir, 1).await;
+        let actor = "00000000-0000-4000-8000-000000000001";
 
         // 1. Synchronize inventory
         let fence = orchestrator.synchronize_authenticated_inventory(false).await.unwrap();
@@ -1654,5 +1688,49 @@ mod tests {
         let fence2 = orchestrator.synchronize_authenticated_inventory(false).await.unwrap();
         assert_eq!(fence2.inventory_session_id(), "session-inv-1234567890123456789012");
         assert_eq!(fence2.event_cursor(), "cursor-inv-1");
+    }
+
+    /// F71: a subscription requested while a sync pass is running (the 5 s periodic sync or a
+    /// UI refresh) waits for that pass and then gets its ticket, instead of failing with
+    /// "another sync is in progress" and backing the stream off.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn ticket_requested_during_in_flight_sync_is_prepared_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let orchestrator = inventory_orchestrator(&dir, 1).await;
+
+        *orchestrator.sync_in_progress().lock().await = true;
+        let pending = orchestrator.prepare_subscription();
+        tokio::pin!(pending);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut pending).await;
+        assert!(early.is_err(), "ticket must wait for the in-flight pass, got {early:?}");
+
+        *orchestrator.sync_in_progress().lock().await = false;
+        orchestrator.sync_finished().notify_waiters();
+        let ticket = pending.await.expect("ticket after the pass finished");
+        assert_eq!(ticket.ticket, "ticket-12345678901234567890123456789012");
+        assert!(!*orchestrator.sync_in_progress().lock().await, "ingest released the sync flag");
+    }
+
+    /// F71: after any newer event the server replaces the device's inventory session
+    /// capability (and its tickets). A relaunched client must mint its ticket from a fresh
+    /// applied inventory, not from the session restored out of the previous launch's journal,
+    /// which the server now answers with 400 InventorySessionMismatch.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn relaunch_after_server_event_mints_ticket_from_fresh_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = inventory_orchestrator(&dir, 1).await;
+        let ticket = first.prepare_subscription().await.unwrap();
+        assert_eq!(ticket.event_cursor, "cursor-inv-1");
+        drop(first);
+
+        let relaunched = inventory_orchestrator(&dir, 2).await;
+        let ticket = relaunched
+            .prepare_subscription()
+            .await
+            .expect("ticket minted from the fresh inventory");
+        assert_eq!(ticket.inventory_session_id, "session-inv-2234567890123456789012");
+        assert_eq!(ticket.event_cursor, "cursor-inv-2");
     }
 }

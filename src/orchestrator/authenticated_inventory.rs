@@ -241,12 +241,23 @@ where
             user_did: snapshot.owner_did.clone(),
             device_id: snapshot.actor_device_id.clone(),
         });
-        {
+        // An ingest that finds a sync pass in flight (the periodic sync, a UI refresh) waits for
+        // it and then runs its own snapshot, as sync_with_server callers coalesce in sync.rs.
+        // The waiter registers before the flag lock is released, so a completion cannot be
+        // missed; a pass that outlives the bound fails closed.
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(super::constants::INVENTORY_SYNC_WAIT_SECS);
+        loop {
             let mut busy = self.sync_in_progress().lock().await;
-            if *busy {
+            if !*busy {
+                *busy = true;
+                break;
+            }
+            let finished = self.sync_finished().notified();
+            drop(busy);
+            if tokio::time::timeout_at(deadline, finished).await.is_err() {
                 return Err(invalid("another sync is in progress"));
             }
-            *busy = true;
         }
         let flag = self.sync_in_progress();
         let finished = self.sync_finished();
