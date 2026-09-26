@@ -245,6 +245,7 @@ where
         // it and then runs its own snapshot, as sync_with_server callers coalesce in sync.rs.
         // The waiter registers before the flag lock is released, so a completion cannot be
         // missed; a pass that outlives the bound fails closed.
+        #[cfg(not(target_arch = "wasm32"))]
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_secs(super::constants::INVENTORY_SYNC_WAIT_SECS);
         loop {
@@ -255,9 +256,12 @@ where
             }
             let finished = self.sync_finished().notified();
             drop(busy);
+            #[cfg(not(target_arch = "wasm32"))]
             if tokio::time::timeout_at(deadline, finished).await.is_err() {
                 return Err(invalid("another sync is in progress"));
             }
+            #[cfg(target_arch = "wasm32")]
+            finished.await;
         }
         let flag = self.sync_in_progress();
         let finished = self.sync_finished();
