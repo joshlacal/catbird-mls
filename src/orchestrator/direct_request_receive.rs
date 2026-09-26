@@ -562,9 +562,20 @@ where
                             view.epoch = view.epoch.max(epoch);
                         }
                     }
-                    let aliases = self
+                    let aliases = match self
                         .persist_sync_conversation_projection(owner, &view)
-                        .await?;
+                        .await?
+                    {
+                        crate::orchestrator::sync::SyncProjectionOutcome::Committed {
+                            retired_aliases,
+                        } => retired_aliases,
+                        // An in-flight reset owns this conversation; neither the
+                        // accepted policy nor the view may be published until it
+                        // completes. A later sync retries the refresh.
+                        crate::orchestrator::sync::SyncProjectionOutcome::FencedByReset => {
+                            return Ok(false)
+                        }
+                    };
                     self.retain_conversation_policy_json(cid, &state["state"])
                         .await?;
                     let mut conversations = self.conversations().lock().await;

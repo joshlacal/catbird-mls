@@ -27,6 +27,23 @@ fn conversation_contains_user_root_exact(
         .any(|member| member_matches_user_root_exact(&member.did, expected_root_did))
 }
 
+/// Outcome of committing a conversation projection during server sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SyncProjectionOutcome {
+    Committed { retired_aliases: Vec<String> },
+    FencedByReset,
+}
+
+impl SyncProjectionOutcome {
+    #[cfg(test)]
+    pub(crate) fn unwrap_retired(self) -> Vec<String> {
+        match self {
+            Self::Committed { retired_aliases } => retired_aliases,
+            Self::FencedByReset => panic!("expected Committed projection, got FencedByReset"),
+        }
+    }
+}
+
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -614,7 +631,7 @@ where
         &self,
         user_did: &str,
         canonical: &ConversationView,
-    ) -> Result<Vec<String>> {
+    ) -> Result<SyncProjectionOutcome> {
         if self.require_user_did().await? != user_did {
             return Err(OrchestratorError::NotAuthenticated);
         }
@@ -628,7 +645,9 @@ where
                     &canonical.group_id,
                 )
                 .await?;
-            return Ok(Vec::new());
+            return Ok(SyncProjectionOutcome::Committed {
+                retired_aliases: Vec::new(),
+            });
         }
         let aliases = self
             .storage()
@@ -667,8 +686,18 @@ where
             .iter()
             .map(|claim| claim.alias_conversation_id.clone())
             .collect();
-        let request =
+        let mut request =
             ConversationProjectionCommitRequest::live(user_did, canonical.clone(), claims);
+        if let Some(payload) = self
+            .reset_pending_payload_result(&canonical.conversation_id)
+            .await?
+        {
+            if payload.new_group_id == canonical.group_id {
+                request.canonical_lifecycle.reset_generation = Some(payload.reset_generation);
+                request.canonical_lifecycle.reset_pending_target_group_id =
+                    Some(payload.new_group_id.clone());
+            }
+        }
         match self
             .storage()
             .commit_conversation_projection(&request)
@@ -676,17 +705,35 @@ where
         {
             ConversationProjectionCommitOutcome::Retired { .. }
             | ConversationProjectionCommitOutcome::AlreadyAbsent { .. } => {}
-            ConversationProjectionCommitOutcome::FenceMismatch { .. }
-            | ConversationProjectionCommitOutcome::Ambiguous { .. } => {
+            ConversationProjectionCommitOutcome::FenceMismatch { .. } => {
+                let is_reset_pending = self
+                    .reset_blocks_non_reset_transition_locked(&canonical.conversation_id)
+                    .await?
+                    || self
+                        .storage()
+                        .get_conversation_state(&canonical.conversation_id)
+                        .await?
+                        .is_some_and(|s| matches!(s, ConversationState::ResetPending { .. }));
+                if is_reset_pending {
+                    return Ok(SyncProjectionOutcome::FencedByReset);
+                }
                 return Err(OrchestratorError::Storage(
                     "Canonical projection transaction rejected its durable fences".into(),
-                ))
+                ));
+            }
+            ConversationProjectionCommitOutcome::Ambiguous { canonical_ids, .. } => {
+                return Err(OrchestratorError::Storage(format!(
+                    "Canonical projection transaction rejected ambiguous projection for canonical IDs: {:?}",
+                    canonical_ids
+                )));
             }
         }
         if self.require_user_did().await? != user_did {
             return Err(OrchestratorError::NotAuthenticated);
         }
-        Ok(retired)
+        Ok(SyncProjectionOutcome::Committed {
+            retired_aliases: retired,
+        })
     }
 
     pub(crate) async fn reconcile_server_conversations_batch(
@@ -736,9 +783,19 @@ where
             let group_id = convo.group_id.as_str();
             let mut effective_convo = convo.clone();
 
-            let retired_aliases = self
+            let outcome = self
                 .persist_sync_conversation_projection(user_did, &convo)
                 .await?;
+            let retired_aliases = match outcome {
+                SyncProjectionOutcome::Committed { retired_aliases } => retired_aliases,
+                SyncProjectionOutcome::FencedByReset => {
+                    crate::warn_log!(
+                        "[sync] convo={} projection fenced by in-flight ResetPending; skipping loop body to preserve memory/durable integrity and avoid non-target rejoin",
+                        conversation_id
+                    );
+                    continue;
+                }
+            };
             {
                 let mut conversations = self.conversations().lock().await;
                 for alias in retired_aliases {
@@ -1519,7 +1576,8 @@ mod projection_ingestion_tests {
             .orchestrator
             .persist_sync_conversation_projection(&alice.did, &view)
             .await
-            .unwrap();
+            .unwrap()
+            .unwrap_retired();
         assert_eq!(retired, vec![view.group_id.clone()]);
         let rows = alice.storage.list_conversations(&alice.did).await.unwrap();
         assert_eq!(rows.len(), 1);
@@ -1584,7 +1642,8 @@ mod projection_ingestion_tests {
             .orchestrator
             .persist_sync_conversation_projection(&alice.did, &view)
             .await
-            .unwrap();
+            .unwrap()
+            .unwrap_retired();
         assert!(retired.is_empty());
         assert_eq!(
             alice
@@ -1650,7 +1709,8 @@ mod projection_ingestion_tests {
             .orchestrator
             .persist_sync_conversation_projection(&alice.did, &view)
             .await
-            .unwrap();
+            .unwrap()
+            .unwrap_retired();
         assert_eq!(retired, vec![view.group_id.clone()]);
         assert_eq!(
             alice.storage.get_conversation_messages(&view.group_id)[0].id,
@@ -1726,6 +1786,200 @@ mod projection_ingestion_tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_pending_canonical_rejects_non_target_group_projection() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, CID, &view.group_id)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_conversation_state(
+                CID,
+                ConversationState::ResetPending {
+                    new_group_id: "73".repeat(32),
+                    reset_generation: 5,
+                    notified_at_ms: 456,
+                },
+            )
+            .await
+            .unwrap();
+        alice
+            .storage
+            .mark_reset_pending(CID, &"73".repeat(32), 5, 456)
+            .await
+            .unwrap();
+        let outcome = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap();
+        assert_eq!(outcome, SyncProjectionOutcome::FencedByReset);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_pending_canonical_accepts_target_group_projection() {
+        let (world, mut view) = fixture().await;
+        let alice = world.client("Alice");
+        let target_group = "73".repeat(32);
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, CID, &view.group_id)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_conversation_state(
+                CID,
+                ConversationState::ResetPending {
+                    new_group_id: target_group.clone(),
+                    reset_generation: 5,
+                    notified_at_ms: 456,
+                },
+            )
+            .await
+            .unwrap();
+        alice
+            .storage
+            .mark_reset_pending(CID, &target_group, 5, 456)
+            .await
+            .unwrap();
+        view.group_id = target_group;
+        let outcome = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SyncProjectionOutcome::Committed { .. }));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_batch_continues_for_other_conversations_when_one_fenced_by_reset() {
+        let (mut world, view1) = fixture().await;
+        world.register_device("Alice").await.unwrap();
+        let alice = world.client("Alice");
+        let convo1_id = view1.conversation_id.clone();
+        let old_group1 = view1.group_id.clone();
+        let target_group1 = "73".repeat(32);
+
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &convo1_id, &old_group1)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_conversation_state(
+                &convo1_id,
+                ConversationState::ResetPending {
+                    new_group_id: target_group1.clone(),
+                    reset_generation: 7,
+                    notified_at_ms: 100,
+                },
+            )
+            .await
+            .unwrap();
+        alice
+            .storage
+            .mark_reset_pending(&convo1_id, &target_group1, 7, 100)
+            .await
+            .unwrap();
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(convo1_id.clone(), view1.clone());
+
+        let convo2_id = "00000000-0000-4000-8000-000000000002".to_string();
+        let group2 = "22".repeat(32);
+        let view2 = ConversationView {
+            conversation_id: convo2_id.clone(),
+            group_id: group2.clone(),
+            epoch: 3,
+            members: vec![],
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+            canonical_state: None,
+        };
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &convo2_id, &group2)
+            .await
+            .unwrap();
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(convo2_id.clone(), view2.clone());
+
+        let stale_non_target_group = "99".repeat(32);
+        let mut server_convo1 = view1.clone();
+        server_convo1.group_id = stale_non_target_group.clone();
+
+        let mut server_convo2 = view2.clone();
+        server_convo2.epoch = 4;
+
+        let batch = vec![server_convo1, server_convo2];
+        let baseline_submits = world.delivery_service().submitted_prepared_requests().len();
+
+        *alice.orchestrator.sync_in_progress().lock().await = true;
+        alice
+            .orchestrator
+            .reconcile_server_conversations_batch(
+                &alice.did,
+                batch,
+                std::collections::HashSet::new(),
+                false,
+            )
+            .await
+            .expect("sync batch must not fail when one conversation is fenced by reset");
+
+        // (a) Sync batch continued: convo2 was updated in memory
+        let in_memory_convo2 = alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .get(&convo2_id)
+            .cloned()
+            .expect("convo2 must be present in memory");
+        assert_eq!(
+            in_memory_convo2.epoch, 4,
+            "convo2 must have been processed and updated by sync"
+        );
+
+        // (b) No join/rejoin transport call targeted the non-target group
+        let requests = world.delivery_service().submitted_prepared_requests();
+        let new_requests = &requests[baseline_submits..];
+        for req in new_requests {
+            if let Some(body) = &req.body {
+                let text = String::from_utf8_lossy(body);
+                assert!(
+                    !text.contains(&stale_non_target_group),
+                    "no transport request may target the non-target group"
+                );
+            }
+        }
+
+        // (c) The in-memory view for convo1 stays the durable one (old_group1), NOT the rejected server view
+        let in_memory_convo1 = alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .get(&convo1_id)
+            .cloned()
+            .expect("convo1 must remain in memory");
+        assert_eq!(
+            in_memory_convo1.group_id, old_group1,
+            "in-memory view must remain the durable one, not the rejected server view"
         );
     }
 }
