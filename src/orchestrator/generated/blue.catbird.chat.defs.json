@@ -7969,9 +7969,9 @@
     },
     "directRequestReceiptKeyId": {
       "type": "string",
-      "minLength": 111,
-      "maxLength": 111,
-      "description": "Exact did:web:chat.catbird.blue#chat-request-receipt- plus lowercase hex SHA256 of compressed P256 SEC1 public key. Resolve authenticated authority DID document unique method/controller/P256 Multikey. Retain historical verification methods across key rotation."
+      "minLength": 98,
+      "maxLength": 347,
+      "description": "Exact expected coordinator authority DID plus #chat-request-receipt- and lowercase hex SHA256 of compressed P256 SEC1 public key. Resolve authenticated authority DID document unique method/controller/P256 Multikey. Retain historical verification methods across key rotation."
     },
     "directRequestAcceptanceCommitReceiptBody": {
       "type": "object",
