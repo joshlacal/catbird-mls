@@ -910,9 +910,10 @@ impl MLSAPIClient for ClientAPIAdapter {
 impl CredentialStore for ClientCredentialAdapter {
     async fn direct_request_receipt_authority_document(
         &self,
+        expected_authority_did: &str,
     ) -> crate::orchestrator::Result<Option<Vec<u8>>> {
         self.0
-            .direct_request_receipt_authority_document()
+            .direct_request_receipt_authority_document(expected_authority_did.to_string())
             .map_err(bridge_err)
     }
 

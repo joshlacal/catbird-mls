@@ -63,6 +63,8 @@ fn last_prepare(world: &TestWorld) -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
+    let test_start_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    println!("C35 CORE TEST STARTED: {}", test_start_iso);
     let mut world = TestWorld::new();
     world
         .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
@@ -411,6 +413,10 @@ async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
     // What must now hold is the converse: once resolved, the terminal outcome
     // is durable, so a fresh reopen resolves it WITHOUT any transport call.
     // If it needed the network again, this would have to issue a request.
+    // Disable transport again to prove this reopen/resume operates genuinely offline.
+    world.delivery_service().refuse_all_transport();
+    let refusals_before_durable = world.delivery_service().refused_transport_calls();
+    let submissions_before_durable = world.delivery_service().submitted_prepared_requests().len();
     reopened_orch
         .mls_context()
         .flush_and_prepare_close()
@@ -432,7 +438,7 @@ async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
         .initialize(&alice_did)
         .await
         .expect("reopen reaches Ready");
-    let refusals_before_durable = world.delivery_service().refused_transport_calls();
+    // Refusals and submissions before durable reopen recorded above
     let durable_outcome = durable_orch
         .resume_direct_request(&draft_id)
         .await
@@ -448,8 +454,14 @@ async fn test_c35_core_offline_journal_hydration_and_ownership_protection() {
     assert_eq!(
         world.delivery_service().refused_transport_calls(),
         refusals_before_durable,
-        "a durable terminal outcome must not require a transport call to read back"
+        "a durable terminal outcome must not require a transport call to read back (attempted zero refusals while offline)"
     );
-
+    assert_eq!(
+        world.delivery_service().submitted_prepared_requests().len(),
+        submissions_before_durable,
+        "a durable terminal outcome must not submit any request"
+    );
+    let test_end_iso = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    println!("C35 CORE TEST ENDED: {}", test_end_iso);
     println!("C35 CORE OFFLINE HYDRATION: ALL ASSERTIONS AND COUNTERFACTUALS PASS");
 }

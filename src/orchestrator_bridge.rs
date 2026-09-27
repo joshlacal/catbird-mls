@@ -357,13 +357,16 @@ pub trait OrchestratorAPICallback: Send + Sync {
 /// Credential store callback interface for Swift/Kotlin.
 #[uniffi::export(callback_interface)]
 pub trait OrchestratorCredentialCallback: Send + Sync {
-    /// Authenticated resolution of did:web:chat.catbird.blue only. Rust checks
-    /// the receipt method and persists the trusted historical method.
+    /// Authenticated resolution of the expected authority DID document.
+    /// Rust checks the receipt method and persists the trusted historical method.
     fn direct_request_receipt_authority_document(
         &self,
+        expected_authority_did: String,
     ) -> Result<Option<Vec<u8>>, OrchestratorBridgeError> {
+        let _ = expected_authority_did;
         Ok(None)
     }
+
 
     fn store_signing_key(
         &self,
@@ -2270,11 +2273,13 @@ impl MLSAPIClient for APIAdapter {
 impl CredentialStore for CredentialAdapter {
     async fn direct_request_receipt_authority_document(
         &self,
+        expected_authority_did: &str,
     ) -> crate::orchestrator::Result<Option<Vec<u8>>> {
         self.0
-            .direct_request_receipt_authority_document()
+            .direct_request_receipt_authority_document(expected_authority_did.to_string())
             .map_err(bridge_err)
     }
+
 
     async fn store_signing_key(
         &self,

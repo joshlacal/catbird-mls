@@ -1,7 +1,13 @@
-//! C28: Group-note separation.
+//! C28: Group-note separation (core component qualification).
 //! Note is bound to authentic invitation, recipient, and authority.
 //! No target-group leaf, Welcome, exporter secret, or app history before group acceptance.
 //! Partial note delivery retry does not duplicate invitation.
+//!
+//! Note on test boundaries:
+//! - This suite qualifies the client-side core orchestrator, outbox, and crypto logic in-memory.
+//! - The live dedicated-DB shipping-router lost-response committed note publication and retry
+//!   qualification (with real PostgreSQL row locks and fault transport) is in
+//!   `mls-ds/e2e-tests/tests/encrypted_request_c28.rs`.
 #![allow(dead_code)]
 mod e2e_harness;
 use base64::{
@@ -760,6 +766,9 @@ async fn c28_no_target_group_leaf_welcome_or_secrets_before_acceptance() {
     );
 }
 
+/// Core in-memory outbox qualification: note retry does not duplicate invitation.
+/// Live shipping router, dedicated PostgreSQL database, and DeterministicFaultTransport
+/// qualification lives in `mls-ds/e2e-tests/tests/encrypted_request_c28.rs`.
 #[tokio::test(flavor = "multi_thread")]
 async fn c28_partial_note_delivery_retry_does_not_duplicate_invitation() {
     let mut world = TestWorld::new();

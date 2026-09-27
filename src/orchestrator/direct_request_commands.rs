@@ -143,16 +143,21 @@ where
                 ));
             }
         }
+        let expected_coordinator = if let Some(invitation) = &input.invitation {
+            invitation.authority_did.clone()
+        } else {
+            intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+        };
         let document = self
             .credentials()
-            .direct_request_receipt_authority_document()
+            .direct_request_receipt_authority_document(&expected_coordinator)
             .await?
             .ok_or_else(|| {
                 OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
                     reason: "Direct request receipt authority resolution unavailable".into(),
                 })
             })?;
-        intent::validate_authority_document(&document).map_err(|refusal| match refusal {
+        intent::validate_authority_document_for_expected_authority(&document, &expected_coordinator).map_err(|refusal| match refusal {
             // A structurally valid document naming another authority: the
             // request has no canonical transaction to join, so report the
             // typed unsupported capability and never fall back to legacy
@@ -387,13 +392,18 @@ where
             false,
         )
         .map_err(|_| invalid())?;
+        let auth_did = intent
+            .trusted_authority_did()
+            .unwrap_or_else(|| intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string());
         let method = value["receiptKeyId"].as_str().ok_or_else(invalid)?;
-        let key = transcript::resolve_direct_request_receipt_key(
+        let key = transcript::resolve_direct_request_receipt_key_for_authority(
+            &auth_did,
             &intent.trusted_authority_document,
             method,
         )
         .map_err(|_| invalid())?;
-        let preparation = transcript::verify_direct_request_preparation(
+        let preparation = transcript::verify_direct_request_preparation_for_authority(
+            &auth_did,
             &serde_json::to_vec(&value).map_err(|_| invalid())?,
             &key,
         )
@@ -500,10 +510,20 @@ where
             return Err(invalid());
         }
         let context = json!({"protocolVersion":"2","requestId":body["requestId"],"firstMessageId":body["firstMessageId"],"conversationId":body["conversationId"],"origin":body["origin"],"actorDid":body["actorDid"],"actorDeviceId":body["actorDeviceId"],"actorKeyId":body["keyId"],"recipientDid":body["recipientDid"],"preparationDigest":preparation["preparationDigest"]});
+        let auth_did = intent
+            .trusted_authority_did()
+            .unwrap_or_else(|| intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string());
         let method = preparation["receiptKeyId"].as_str().ok_or_else(invalid)?;
-        let key = transcript::resolve_direct_request_receipt_key(
+        let key = transcript::resolve_direct_request_receipt_key_for_authority(
+            &auth_did,
             &intent.trusted_authority_document,
             method,
+        )
+        .map_err(|_| invalid())?;
+        transcript::verify_direct_request_preparation_for_authority(
+            &auth_did,
+            &raw_preparation,
+            &key,
         )
         .map_err(|_| invalid())?;
         self.mls_context()
@@ -618,8 +638,12 @@ where
         .map_err(|_| invalid())?;
         let canonical = serde_json::to_vec(&value).map_err(|_| invalid())?;
         let receipt = canonical.as_slice();
+        let auth_did = intent
+            .trusted_authority_did()
+            .unwrap_or_else(|| intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string());
         let method = value["body"]["keyId"].as_str().ok_or_else(invalid)?;
-        let key = match transcript::resolve_direct_request_receipt_key(
+        let key = match transcript::resolve_direct_request_receipt_key_for_authority(
+            &auth_did,
             &intent.trusted_authority_document,
             method,
         ) {
@@ -627,11 +651,15 @@ where
             Err(_) => {
                 let authenticated = self
                     .credentials()
-                    .direct_request_receipt_authority_document()
+                    .direct_request_receipt_authority_document(&auth_did)
                     .await?
                     .ok_or_else(invalid)?;
-                let key = transcript::resolve_direct_request_receipt_key(&authenticated, method)
-                    .map_err(|_| invalid())?;
+                let key = transcript::resolve_direct_request_receipt_key_for_authority(
+                    &auth_did,
+                    &authenticated,
+                    method,
+                )
+                .map_err(|_| invalid())?;
                 let mut previous: Value =
                     serde_json::from_slice(&intent.trusted_authority_document)
                         .map_err(|_| invalid())?;
@@ -658,9 +686,13 @@ where
                 key
             }
         };
-        let verified =
-            transcript::verify_received_signed_request(DirectRequestKind::Outcome, receipt, &key)
-                .map_err(|_| invalid())?;
+        let verified = transcript::verify_received_signed_request_for_authority(
+            &auth_did,
+            transcript::DirectRequestKind::Outcome,
+            receipt,
+            &key,
+        )
+        .map_err(|_| invalid())?;
         let prepare = transcript::verify_signed_request(
             DirectRequestKind::Prepare,
             &intent.prepare_wrapper,
@@ -1030,11 +1062,17 @@ where
         let public = self
             .mls_context()
             .identity_public_key(format!("{owner}#{device}").into_bytes())?;
+        let auth_did = {
+            let val: Value = serde_json::from_slice(&projection.trusted_authority_document)
+                .map_err(|_| invalid())?;
+            val["id"].as_str().ok_or_else(invalid)?.to_string()
+        };
         let proof_value: Value = serde_json::from_slice(&proof).map_err(|_| invalid())?;
         let method = proof_value["receipt"]["body"]["keyId"]
             .as_str()
             .ok_or_else(invalid)?;
-        if transcript::resolve_direct_request_receipt_key(
+        if transcript::resolve_direct_request_receipt_key_for_authority(
+            &auth_did,
             &projection.trusted_authority_document,
             method,
         )
@@ -1042,24 +1080,32 @@ where
         {
             let doc = self
                 .credentials()
-                .direct_request_receipt_authority_document()
+                .direct_request_receipt_authority_document(&auth_did)
                 .await?
                 .ok_or_else(invalid)?;
-            transcript::resolve_direct_request_receipt_key(&doc, method).map_err(|_| invalid())?;
+            transcript::resolve_direct_request_receipt_key_for_authority(&auth_did, &doc, method)
+                .map_err(|_| invalid())?;
             projection.trusted_authority_document =
-                intent::merge_trusted_documents(&projection.trusted_authority_document, &doc)?;
+                intent::merge_trusted_documents_for_expected_authority(
+                    &projection.trusted_authority_document,
+                    &doc,
+                    &auth_did,
+                )?;
         }
-        let authority_key = transcript::resolve_direct_request_receipt_key(
+        let authority_key = transcript::resolve_direct_request_receipt_key_for_authority(
+            &auth_did,
             &projection.trusted_authority_document,
             method,
         )
         .map_err(|_| invalid())?;
-        let canonical_proof = transcript::verify_received_direct_request_acceptance_proof(
-            &proof,
-            &authority_key,
-            &public,
-        )
-        .map_err(|_| invalid())?;
+        let canonical_proof =
+            transcript::verify_received_direct_request_acceptance_proof_for_authority(
+                &auth_did,
+                &proof,
+                &authority_key,
+                &public,
+            )
+            .map_err(|_| invalid())?;
         projection.acceptance_proof =
             Some(serde_json::to_vec(&canonical_proof).map_err(|_| invalid())?);
         projection.recipient_public_key = Some(public);

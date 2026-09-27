@@ -36,7 +36,14 @@ fn invalid() -> OrchestratorError {
 impl DirectRequestIntent {
     pub fn validate(&self, owner: &str, device: &str) -> Result<()> {
         super::validate_direct_request_input(&self.input)?;
-        validate_authority_document(&self.trusted_authority_document).map_err(|_| invalid())?;
+        let auth_did = self
+            .trusted_authority_did()
+            .unwrap_or_else(|| CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string());
+        validate_authority_document_for_expected_authority(
+            &self.trusted_authority_document,
+            &auth_did,
+        )
+        .map_err(|_| invalid())?;
         for attempt in &self.previous_attempts {
             attempt.validate(owner, device)?;
         }
@@ -105,16 +112,20 @@ impl DirectRequestIntent {
         }
         if let Some(raw) = &self.preparation_response {
             use crate::chat_v2::transcript::direct_request::{
-                resolve_direct_request_receipt_key, verify_direct_request_preparation,
+                resolve_direct_request_receipt_key_for_authority,
+                verify_direct_request_preparation_for_authority,
             };
             use base64::Engine as _;
             let value: serde_json::Value = serde_json::from_slice(raw).map_err(|_| invalid())?;
-            let key = resolve_direct_request_receipt_key(
+            let key = resolve_direct_request_receipt_key_for_authority(
+                &auth_did,
                 &self.trusted_authority_document,
                 value["receiptKeyId"].as_str().ok_or_else(invalid)?,
             )
             .map_err(|_| invalid())?;
-            let snapshot = verify_direct_request_preparation(raw, &key).map_err(|_| invalid())?;
+            let snapshot =
+                verify_direct_request_preparation_for_authority(&auth_did, raw, &key)
+                    .map_err(|_| invalid())?;
             for field in [
                 "requestId",
                 "firstMessageId",
@@ -229,6 +240,16 @@ impl DirectRequestIntent {
     pub fn matches_input(&self, input: &DirectRequestInput) -> bool {
         self.input == *input
     }
+    pub fn trusted_authority_did(&self) -> Option<String> {
+        let value: serde_json::Value =
+            serde_json::from_slice(&self.trusted_authority_document).ok()?;
+        let id = value["id"].as_str()?;
+        if crate::chat_v2::ids::BareDid::parse(id).is_ok() {
+            Some(id.to_string())
+        } else {
+            None
+        }
+    }
 }
 
 /// The canonical clean-chat authority. Initial atomic publication is limited to
@@ -258,6 +279,13 @@ pub enum AuthorityDocumentRefusal {
 pub fn validate_authority_document(
     document: &[u8],
 ) -> std::result::Result<(), AuthorityDocumentRefusal> {
+    validate_authority_document_for_expected_authority(document, CANONICAL_DIRECT_REQUEST_AUTHORITY)
+}
+
+pub fn validate_authority_document_for_expected_authority(
+    document: &[u8],
+    expected_authority: &str,
+) -> std::result::Result<(), AuthorityDocumentRefusal> {
     let value: serde_json::Value =
         serde_json::from_slice(document).map_err(|_| AuthorityDocumentRefusal::Malformed)?;
     let methods = value["verificationMethod"]
@@ -272,22 +300,17 @@ pub fn validate_authority_document(
     {
         return Err(AuthorityDocumentRefusal::Malformed);
     }
-    // A structurally valid authority document naming any other authority is the
-    // unsupported cross-authority case. The canonical resolver refuses such a
-    // document outright; naming the failure separately is what lets the caller
-    // report a typed unsupported capability instead of a generic ownership
-    // error.
-    if named != Some(CANONICAL_DIRECT_REQUEST_AUTHORITY) {
+    if named != Some(expected_authority) {
         return Err(AuthorityDocumentRefusal::ForeignAuthority);
     }
-    // Only the canonical authority proceeds to method resolution, so the
-    // retained document must carry a method the resolver actually accepts.
     if !methods
         .iter()
         .filter_map(|method| method["id"].as_str())
         .any(|id| {
-            crate::chat_v2::transcript::direct_request::resolve_direct_request_receipt_key(
-                document, id,
+            crate::chat_v2::transcript::direct_request::resolve_direct_request_receipt_key_for_authority(
+                expected_authority,
+                document,
+                id,
             )
             .is_ok()
         })
@@ -319,7 +342,10 @@ impl DirectRequestTerminalAttempt {
         self.validate_receipt(owner, device, false)
     }
     fn validate_receipt(&self, owner: &str, device: &str, allow_published: bool) -> Result<()> {
-        use crate::chat_v2::transcript::direct_request::resolve_direct_request_receipt_key;
+        use crate::chat_v2::transcript::direct_request::{
+            resolve_direct_request_receipt_key_for_authority,
+            verify_received_signed_request_for_authority,
+        };
         use base64::Engine as _;
         let prepare = verify_signed_request(
             DirectRequestKind::Prepare,
@@ -330,12 +356,20 @@ impl DirectRequestTerminalAttempt {
         if prepare.actor_did() != Some(owner) || prepare.actor_device_id() != Some(device) {
             return Err(invalid());
         }
+        let auth_val: serde_json::Value =
+            serde_json::from_slice(&self.trusted_authority_document).map_err(|_| invalid())?;
+        let doc_auth = auth_val["id"].as_str().ok_or_else(invalid)?;
         let value: serde_json::Value =
             serde_json::from_slice(&self.receipt).map_err(|_| invalid())?;
         let method = value["body"]["keyId"].as_str().ok_or_else(invalid)?;
-        let key = resolve_direct_request_receipt_key(&self.trusted_authority_document, method)
-            .map_err(|_| invalid())?;
-        let receipt = crate::chat_v2::transcript::direct_request::verify_received_signed_request(
+        let key = resolve_direct_request_receipt_key_for_authority(
+            doc_auth,
+            &self.trusted_authority_document,
+            method,
+        )
+        .map_err(|_| invalid())?;
+        let receipt = verify_received_signed_request_for_authority(
+            doc_auth,
             DirectRequestKind::Outcome,
             &self.receipt,
             &key,
@@ -429,9 +463,15 @@ impl DirectRequestTerminalAttempt {
     }
 }
 
-pub(super) fn merge_trusted_documents(previous: &[u8], current: &[u8]) -> Result<Vec<u8>> {
-    validate_authority_document(previous).map_err(|_| invalid())?;
-    validate_authority_document(current).map_err(|_| invalid())?;
+pub(super) fn merge_trusted_documents_for_expected_authority(
+    previous: &[u8],
+    current: &[u8],
+    expected_authority: &str,
+) -> Result<Vec<u8>> {
+    validate_authority_document_for_expected_authority(previous, expected_authority)
+        .map_err(|_| invalid())?;
+    validate_authority_document_for_expected_authority(current, expected_authority)
+        .map_err(|_| invalid())?;
     let mut previous: serde_json::Value =
         serde_json::from_slice(previous).map_err(|_| invalid())?;
     let current: serde_json::Value = serde_json::from_slice(current).map_err(|_| invalid())?;
@@ -452,3 +492,10 @@ pub(super) fn merge_trusted_documents(previous: &[u8], current: &[u8]) -> Result
     }
     serde_json::to_vec(&previous).map_err(|_| invalid())
 }
+
+pub(super) fn merge_trusted_documents(previous: &[u8], current: &[u8]) -> Result<Vec<u8>> {
+    let prev_val: serde_json::Value = serde_json::from_slice(previous).map_err(|_| invalid())?;
+    let auth = prev_val["id"].as_str().ok_or_else(invalid)?;
+    merge_trusted_documents_for_expected_authority(previous, current, auth)
+}
+

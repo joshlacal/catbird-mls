@@ -142,7 +142,7 @@ async fn c33_unsupported_cross_authority_refused_before_any_reservation() {
     assert_eq!(
         client
             .credentials
-            .direct_request_receipt_authority_document()
+            .direct_request_receipt_authority_document("did:web:chat.catbird.blue")
             .await
             .expect("authority resolution"),
         None,
@@ -296,5 +296,205 @@ async fn c33_foreign_authority_document_never_accepted() {
     assert_eq!(
         world.delivery_service().submitted_prepared_requests().len(),
         before
+    );
+}
+
+#[test]
+fn deterministic_coordinator_derivation_contract() {
+    let alice_home = "did:web:alice-chat.example";
+    let bob_home = "did:web:bob-chat.example";
+
+    // Lexicographic minimum
+    let coord1 = protocol::derive_deterministic_coordinator(alice_home, bob_home).unwrap();
+    let coord2 = protocol::derive_deterministic_coordinator(bob_home, alice_home).unwrap();
+    assert_eq!(coord1, "did:web:alice-chat.example");
+    assert_eq!(
+        coord1, coord2,
+        "opposite-direction race must converge on the exact same coordinator"
+    );
+
+    // Canonical local + foreign
+    let local = "did:web:chat.catbird.blue";
+    let foreign = "did:web:chat.federation.example";
+    let coord_local = protocol::derive_deterministic_coordinator(local, foreign).unwrap();
+    assert_eq!(coord_local, local);
+    let coord_local_rev = protocol::derive_deterministic_coordinator(foreign, local).unwrap();
+    assert_eq!(coord_local_rev, local);
+
+    // Invalid non-bare DIDs rejected
+    assert!(protocol::derive_deterministic_coordinator("not-a-did", local).is_err());
+    assert!(protocol::derive_deterministic_coordinator("did:web:host#fragment", local).is_err());
+    assert!(protocol::derive_deterministic_coordinator(local, "did:web:host/path").is_err());
+}
+
+fn authority_doc_for_authority(authority_id: &str, key: &p256::ecdsa::SigningKey) -> Vec<u8> {
+    let point = key.verifying_key().to_encoded_point(true);
+    let method_id =
+        protocol::direct_request_receipt_key_id_for_authority(authority_id, point.as_bytes())
+            .unwrap();
+    let mut multikey = vec![0x80, 0x24];
+    multikey.extend(point.as_bytes());
+    serde_json::to_vec(&json!({
+        "id": authority_id,
+        "verificationMethod": [{
+            "id": method_id,
+            "controller": authority_id,
+            "type": "Multikey",
+            "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey),
+        }],
+    }))
+    .unwrap()
+}
+
+#[test]
+fn foreign_valid_authority_vs_forged_receipt_and_retained_trust() {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use p256::ecdsa::signature::Signer as _;
+
+    let foreign_key = p256::ecdsa::SigningKey::from_slice(&[0x42; 32]).unwrap();
+    let foreign_doc = authority_doc_for_authority(FOREIGN_AUTHORITY, &foreign_key);
+    let point = foreign_key.verifying_key().to_encoded_point(true);
+    let foreign_key_id =
+        protocol::direct_request_receipt_key_id_for_authority(FOREIGN_AUTHORITY, point.as_bytes())
+            .unwrap();
+
+    // 1. Foreign authority document resolves when expected authority matches
+    let resolved = protocol::resolve_direct_request_receipt_key_for_authority(
+        FOREIGN_AUTHORITY,
+        &foreign_doc,
+        &foreign_key_id,
+    )
+    .expect("resolves with matching expected authority");
+    assert_eq!(resolved, point.as_bytes());
+
+    // 2. Canonical resolver refuses foreign document (no silent cross-authority expansion)
+    assert!(
+        protocol::resolve_direct_request_receipt_key(&foreign_doc, &foreign_key_id).is_err(),
+        "canonical resolver must reject foreign authority document"
+    );
+
+    // 3. Construct a genuine foreign outcome receipt
+    let receipt_body = json!({
+        "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
+        "protocolVersion": "2",
+        "authorityDid": FOREIGN_AUTHORITY,
+        "keyId": foreign_key_id,
+        "receipt": {
+            "$type": "blue.catbird.chat.defs#directRequestRejectedReceipt",
+            "requestId": "12345678-1234-4234-8234-123456789abc",
+            "requestKind": "publish",
+            "requestDigest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "preparationRequestDigest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "actorDid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            "actorDeviceId": "11111111-1111-4111-8111-111111111111",
+            "code": "RecipientAuthorityUnsupported"
+        }
+    });
+    let transcript = protocol::direct_request_signing_bytes(
+        protocol::DirectRequestKind::Outcome,
+        &serde_json::to_vec(&receipt_body).unwrap(),
+    )
+    .unwrap();
+    let sig: p256::ecdsa::Signature = foreign_key.sign(&transcript);
+    let signed_receipt = json!({
+        "body": receipt_body,
+        "signature": STANDARD.encode(sig.to_bytes()),
+    });
+    let raw_signed_receipt = serde_json::to_vec(&signed_receipt).unwrap();
+
+    // 4. Verifies under expected foreign authority
+    let verified = protocol::verify_received_signed_request_for_authority(
+        FOREIGN_AUTHORITY,
+        protocol::DirectRequestKind::Outcome,
+        &raw_signed_receipt,
+        &resolved,
+    )
+    .expect("verifies under expected foreign authority");
+    assert_eq!(verified.body()["authorityDid"], json!(FOREIGN_AUTHORITY));
+
+    // 5. Rejects under expected canonical authority (no receipt self-trust)
+    assert!(
+        protocol::verify_received_signed_request(
+            protocol::DirectRequestKind::Outcome,
+            &raw_signed_receipt,
+            &resolved,
+        )
+        .is_err(),
+        "must not verify when caller expects canonical authority"
+    );
+
+    // 6. Attacker forging receipt: attacker claims evil authority or tampers with authorityDid
+    let attacker_key = p256::ecdsa::SigningKey::from_slice(&[0x66; 32]).unwrap();
+    let attacker_point = attacker_key.verifying_key().to_encoded_point(true);
+    let evil_authority = "did:web:attacker.example";
+    let evil_doc = authority_doc_for_authority(evil_authority, &attacker_key);
+    let evil_key_id = protocol::direct_request_receipt_key_id_for_authority(
+        evil_authority,
+        attacker_point.as_bytes(),
+    )
+    .unwrap();
+
+    // Verifier expecting FOREIGN_AUTHORITY refuses evil_doc
+    assert!(
+        protocol::resolve_direct_request_receipt_key_for_authority(
+            FOREIGN_AUTHORITY,
+            &evil_doc,
+            &evil_key_id,
+        )
+        .is_err(),
+        "verifier expecting foreign authority must reject attacker doc"
+    );
+
+    // Forged receipt signed by attacker claiming evil authority
+    let forged_receipt_body = json!({
+        "$type": "blue.catbird.chat.defs#directRequestReceiptBody",
+        "signatureDomain": "CATBIRD-DIRECT-REQUEST-OUTCOME\0",
+        "protocolVersion": "2",
+        "authorityDid": evil_authority,
+        "keyId": evil_key_id,
+        "receipt": receipt_body["receipt"],
+    });
+    let forged_transcript = protocol::direct_request_signing_bytes(
+        protocol::DirectRequestKind::Outcome,
+        &serde_json::to_vec(&forged_receipt_body).unwrap(),
+    )
+    .unwrap();
+    let forged_sig: p256::ecdsa::Signature = attacker_key.sign(&forged_transcript);
+    let forged_receipt = json!({
+        "body": forged_receipt_body,
+        "signature": STANDARD.encode(forged_sig.to_bytes()),
+    });
+    let raw_forged = serde_json::to_vec(&forged_receipt).unwrap();
+
+    // Verifier expecting FOREIGN_AUTHORITY rejects forged receipt even with attacker's key
+    assert!(
+        protocol::verify_received_signed_request_for_authority(
+            FOREIGN_AUTHORITY,
+            protocol::DirectRequestKind::Outcome,
+            &raw_forged,
+            attacker_point.as_bytes(),
+        )
+        .is_err(),
+        "forged receipt must fail when authorityDid does not match expected authority"
+    );
+
+    // 7. Retained document trust: document validation retains trust for the specified expected authority
+    assert!(
+        catbird_mls::orchestrator::direct_request_intent::validate_authority_document_for_expected_authority(
+            &foreign_doc,
+            FOREIGN_AUTHORITY,
+        )
+        .is_ok(),
+        "retained authority document validates for its expected authority"
+    );
+    assert!(
+        catbird_mls::orchestrator::direct_request_intent::validate_authority_document_for_expected_authority(
+            &foreign_doc,
+            "did:web:chat.catbird.blue",
+        )
+        .is_err(),
+        "retained foreign document refused when canonical is expected"
     );
 }

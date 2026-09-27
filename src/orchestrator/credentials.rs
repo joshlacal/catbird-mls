@@ -40,7 +40,10 @@ pub trait CredentialStore: CredentialStoreBounds {
     /// controller, P256 Multikey encoding, and immutable fingerprint itself.
     /// Never resolve a receipt-supplied URL. None is unsupported and prohibits
     /// new request reservation; retained trusted methods can verify exact replay.
-    async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
+    async fn direct_request_receipt_authority_document(
+        &self,
+        _expected_authority_did: &str,
+    ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
 

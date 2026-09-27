@@ -198,6 +198,20 @@ pub fn verify_signed_request(
     raw_wrapper: &[u8],
     public_key: &[u8],
 ) -> Result<VerifiedDirectRequest> {
+    verify_signed_request_for_authority(
+        CANONICAL_DIRECT_REQUEST_AUTHORITY,
+        kind,
+        raw_wrapper,
+        public_key,
+    )
+}
+
+pub fn verify_signed_request_for_authority(
+    expected_authority: &str,
+    kind: DirectRequestKind,
+    raw_wrapper: &[u8],
+    public_key: &[u8],
+) -> Result<VerifiedDirectRequest> {
     // Project the ORIGINAL bytes first, preserving duplicate-field rejection.
     strict_document(raw_wrapper)?;
     let presentation: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
@@ -222,7 +236,14 @@ pub fn verify_signed_request(
     ) {
         use p256::ecdsa::signature::Verifier;
         let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key).map_err(error)?;
-        if body["keyId"].as_str() != Some(direct_request_receipt_key_id(public_key)?.as_str()) {
+        if let Some(auth) = body["authorityDid"].as_str() {
+            if auth != expected_authority {
+                return Err(error("receipt authorityDid mismatch"));
+            }
+        }
+        let expected_key_id =
+            direct_request_receipt_key_id_for_authority(expected_authority, public_key)?;
+        if body["keyId"].as_str() != Some(expected_key_id.as_str()) {
             return Err(error("receipt method fingerprint mismatch"));
         }
         let sig = p256::ecdsa::Signature::from_slice(&signature).map_err(error)?;
@@ -252,6 +273,7 @@ pub fn verify_signed_request(
         accepted_wrapper: raw_wrapper.to_vec(),
     })
 }
+
 
 pub fn direct_request_context_hash(raw_context_json: &[u8]) -> Result<[u8; 32]> {
     let mut bytes = b"CATBIRD-DIRECT-REQUEST-CONTEXT\0".to_vec();
@@ -486,16 +508,46 @@ mod tests {
 
 /// Identifier only, not trust establishment. The caller must resolve this exact
 /// retained method from the authenticated configured authority DID document.
-pub fn direct_request_receipt_key_id(public_key: &[u8]) -> Result<String> {
+pub const CANONICAL_DIRECT_REQUEST_AUTHORITY: &str = "did:web:chat.catbird.blue";
+
+/// Deterministic canonical coordinator DID for a pair of account-home chat authority DIDs.
+/// Per the Catbird MLS chat federation contract, this is the lexicographic minimum of
+/// the two normalized authority DIDs.
+pub fn derive_deterministic_coordinator(
+    actor_authority: &str,
+    recipient_authority: &str,
+) -> Result<String> {
+    let actor_did = crate::chat_v2::ids::BareDid::parse(actor_authority).map_err(error)?;
+    let recipient_did = crate::chat_v2::ids::BareDid::parse(recipient_authority).map_err(error)?;
+    let coordinator = std::cmp::min(actor_did, recipient_did);
+    Ok(coordinator.as_str().to_string())
+}
+
+/// Identifier only, not trust establishment. The caller must resolve this exact
+/// retained method from the authenticated configured authority DID document.
+pub fn direct_request_receipt_key_id_for_authority(
+    authority_did: &str,
+    public_key: &[u8],
+) -> Result<String> {
+    crate::chat_v2::ids::BareDid::parse(authority_did).map_err(|e| error(e.to_string()))?;
     let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key).map_err(error)?;
     let hash = Sha256::digest(key.to_encoded_point(true).as_bytes());
     Ok(format!(
-        "did:web:chat.catbird.blue#chat-request-receipt-{}",
+        "{authority_did}#chat-request-receipt-{}",
         hex::encode(hash)
     ))
 }
+
+pub fn direct_request_receipt_key_id(public_key: &[u8]) -> Result<String> {
+    direct_request_receipt_key_id_for_authority(
+        CANONICAL_DIRECT_REQUEST_AUTHORITY,
+        public_key,
+    )
+}
+
 /// Verify the complete immutable snapshot with an independently trusted method.
-pub fn verify_direct_request_preparation(
+pub fn verify_direct_request_preparation_for_authority(
+    expected_authority: &str,
     raw_view: &[u8],
     trusted_public_key: &[u8],
 ) -> Result<Value> {
@@ -507,9 +559,14 @@ pub fn verify_direct_request_preparation(
     let normalized_bytes = serde_json::to_vec(&normalized).map_err(error)?;
     project(&normalized_bytes, "directRequestPreparationView", false)?;
     let view = normalized;
-    if view["receiptKeyId"].as_str()
-        != Some(direct_request_receipt_key_id(trusted_public_key)?.as_str())
-    {
+    if let Some(auth) = view["authorityDid"].as_str() {
+        if auth != expected_authority {
+            return Err(error("preparation authority mismatch"));
+        }
+    }
+    let expected_key_id =
+        direct_request_receipt_key_id_for_authority(expected_authority, trusted_public_key)?;
+    if view["receiptKeyId"].as_str() != Some(expected_key_id.as_str()) {
         return Err(error("preparation receipt method mismatch"));
     }
     let mut snapshot = view.clone();
@@ -541,19 +598,31 @@ pub fn verify_direct_request_preparation(
     Ok(view)
 }
 
+pub fn verify_direct_request_preparation(
+    raw_view: &[u8],
+    trusted_public_key: &[u8],
+) -> Result<Value> {
+    verify_direct_request_preparation_for_authority(
+        CANONICAL_DIRECT_REQUEST_AUTHORITY,
+        raw_view,
+        trusted_public_key,
+    )
+}
+
 /// The document must have been obtained through the caller's authenticated DID
 /// resolver. This pure validation never turns receipt-provided keys into trust.
-pub fn resolve_direct_request_receipt_key(
+pub fn resolve_direct_request_receipt_key_for_authority(
+    expected_authority_did: &str,
     authenticated_document: &[u8],
     method_id: &str,
 ) -> Result<Vec<u8>> {
-    const AUTHORITY: &str = "did:web:chat.catbird.blue";
+    crate::chat_v2::ids::BareDid::parse(expected_authority_did).map_err(|e| error(e.to_string()))?;
     if authenticated_document.len() > 1024 * 1024 {
         return Err(error("DID document byte cap"));
     }
     strict_document(authenticated_document)?;
     let doc: Value = serde_json::from_slice(authenticated_document).map_err(error)?;
-    if doc["id"].as_str() != Some(AUTHORITY) {
+    if doc["id"].as_str() != Some(expected_authority_did) {
         return Err(error("receipt document owner mismatch"));
     }
     let methods = doc["verificationMethod"]
@@ -567,7 +636,7 @@ pub fn resolve_direct_request_receipt_key(
         return Err(error("receipt method missing or ambiguous"));
     }
     let method = found[0];
-    if method["controller"].as_str() != Some(AUTHORITY)
+    if method["controller"].as_str() != Some(expected_authority_did)
         || method["type"].as_str() != Some("Multikey")
     {
         return Err(error("receipt controller or key type mismatch"));
@@ -582,11 +651,23 @@ pub fn resolve_direct_request_receipt_key(
         return Err(error("receipt key must be compressed P256 multikey"));
     }
     let key = &bytes[2..];
-    if direct_request_receipt_key_id(key)? != method_id {
+    if direct_request_receipt_key_id_for_authority(expected_authority_did, key)? != method_id {
         return Err(error("receipt immutable method fingerprint mismatch"));
     }
     Ok(key.to_vec())
 }
+
+pub fn resolve_direct_request_receipt_key(
+    authenticated_document: &[u8],
+    method_id: &str,
+) -> Result<Vec<u8>> {
+    resolve_direct_request_receipt_key_for_authority(
+        CANONICAL_DIRECT_REQUEST_AUTHORITY,
+        authenticated_document,
+        method_id,
+    )
+}
+
 
 fn strict_document(raw: &[u8]) -> Result<()> {
     super::decode_strict_json(raw).map_err(error)?;
@@ -646,6 +727,20 @@ pub fn verify_direct_request_acceptance_proof(
     trusted_authority_key: &[u8],
     recipient_device_key: &[u8],
 ) -> Result<Value> {
+    verify_direct_request_acceptance_proof_for_authority(
+        CANONICAL_DIRECT_REQUEST_AUTHORITY,
+        raw_proof,
+        trusted_authority_key,
+        recipient_device_key,
+    )
+}
+
+pub fn verify_direct_request_acceptance_proof_for_authority(
+    expected_authority: &str,
+    raw_proof: &[u8],
+    trusted_authority_key: &[u8],
+    recipient_device_key: &[u8],
+) -> Result<Value> {
     project(raw_proof, "directRequestAcceptanceProof", false)?;
     let proof: Value = serde_json::from_slice(raw_proof).map_err(error)?;
     let acceptance = verify_signed_request(
@@ -653,7 +748,8 @@ pub fn verify_direct_request_acceptance_proof(
         &serde_json::to_vec(&proof["entry"]["signedRequest"]).map_err(error)?,
         recipient_device_key,
     )?;
-    let receipt = verify_signed_request(
+    let receipt = verify_signed_request_for_authority(
+        expected_authority,
         DirectRequestKind::AcceptanceCommit,
         &serde_json::to_vec(&proof["receipt"]).map_err(error)?,
         trusted_authority_key,
@@ -691,6 +787,7 @@ pub fn verify_direct_request_acceptance_proof(
     }
     Ok(proof)
 }
+
 
 /// Strict introduction plaintext profile. This function must run before encryption
 /// and after decryption; it never authorizes bot forwarding or account acceptance.
@@ -1181,12 +1278,27 @@ pub fn verify_received_signed_request(
     raw_wrapper: &[u8],
     public_key: &[u8],
 ) -> Result<VerifiedDirectRequest> {
+    verify_received_signed_request_for_authority(
+        CANONICAL_DIRECT_REQUEST_AUTHORITY,
+        kind,
+        raw_wrapper,
+        public_key,
+    )
+}
+
+pub fn verify_received_signed_request_for_authority(
+    expected_authority: &str,
+    kind: DirectRequestKind,
+    raw_wrapper: &[u8],
+    public_key: &[u8],
+) -> Result<VerifiedDirectRequest> {
     strict_document(raw_wrapper)?;
     let wrapper: Value = serde_json::from_slice(raw_wrapper).map_err(error)?;
     let tagged = kind == DirectRequestKind::Outcome && wrapper.get("$type").is_some();
     let normalized =
         normalize_read_presentation(raw_wrapper, kind.wrapper_name(), tagged)?;
-    let mut verified = verify_signed_request(
+    let mut verified = verify_signed_request_for_authority(
+        expected_authority,
         kind,
         &serde_json::to_vec(&normalized).map_err(error)?,
         public_key,
@@ -1195,9 +1307,21 @@ pub fn verify_received_signed_request(
     Ok(verified)
 }
 
-/// Read-side counterpart: normalize nested byte presentations before strict
-/// signature verification and acceptance-entry/receipt equality checks.
 pub fn verify_received_direct_request_acceptance_proof(
+    raw_proof: &[u8],
+    trusted_authority_key: &[u8],
+    recipient_device_key: &[u8],
+) -> Result<Value> {
+    verify_received_direct_request_acceptance_proof_for_authority(
+        CANONICAL_DIRECT_REQUEST_AUTHORITY,
+        raw_proof,
+        trusted_authority_key,
+        recipient_device_key,
+    )
+}
+
+pub fn verify_received_direct_request_acceptance_proof_for_authority(
+    expected_authority: &str,
     raw_proof: &[u8],
     trusted_authority_key: &[u8],
     recipient_device_key: &[u8],
@@ -1207,12 +1331,14 @@ pub fn verify_received_direct_request_acceptance_proof(
         "directRequestAcceptanceProof",
         false,
     )?;
-    verify_direct_request_acceptance_proof(
+    verify_direct_request_acceptance_proof_for_authority(
+        expected_authority,
         &serde_json::to_vec(&proof).map_err(error)?,
         trusted_authority_key,
         recipient_device_key,
     )
 }
+
 
 #[cfg(test)]
 mod read_presentation_tests {

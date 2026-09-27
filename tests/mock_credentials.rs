@@ -158,7 +158,10 @@ impl Default for MockCredentials {
 
 #[async_trait]
 impl CredentialStore for MockCredentials {
-    async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
+    async fn direct_request_receipt_authority_document(
+        &self,
+        _expected_authority_did: &str,
+    ) -> Result<Option<Vec<u8>>> {
         Ok(self.request_authority_document.lock().unwrap().clone())
     }
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {

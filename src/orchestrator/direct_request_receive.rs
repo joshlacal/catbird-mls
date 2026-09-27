@@ -309,9 +309,10 @@ where
                 false,
             )
             .map_err(|_| invalid())?;
+            let expected_coordinator = super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY;
             let document = self
                 .credentials()
-                .direct_request_receipt_authority_document()
+                .direct_request_receipt_authority_document(expected_coordinator)
                 .await?
                 .ok_or_else(|| {
                     OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
@@ -356,8 +357,14 @@ where
                 return Err(invalid());
             }
             if let Some(delivery) = addressed.first() {
+                let auth_did = {
+                    let val: Value = serde_json::from_slice(&projection.trusted_authority_document)
+                        .map_err(|_| invalid())?;
+                    val["id"].as_str().ok_or_else(invalid)?.to_string()
+                };
                 let receipt = decode(&projection.publication_receipt)?;
-                let key = transcript::resolve_direct_request_receipt_key(
+                let key = transcript::resolve_direct_request_receipt_key_for_authority(
+                    &auth_did,
                     &projection.trusted_authority_document,
                     receipt["body"]["keyId"].as_str().ok_or_else(invalid)?,
                 )
@@ -503,7 +510,13 @@ where
             let method = proof["receipt"]["body"]["keyId"]
                 .as_str()
                 .ok_or_else(invalid)?;
-            if transcript::resolve_direct_request_receipt_key(
+            let auth_did = {
+                let val: Value = serde_json::from_slice(&candidate.trusted_authority_document)
+                    .map_err(|_| invalid())?;
+                val["id"].as_str().ok_or_else(invalid)?.to_string()
+            };
+            if transcript::resolve_direct_request_receipt_key_for_authority(
+                &auth_did,
                 &candidate.trusted_authority_document,
                 method,
             )
@@ -511,26 +524,32 @@ where
             {
                 let doc = self
                     .credentials()
-                    .direct_request_receipt_authority_document()
+                    .direct_request_receipt_authority_document(&auth_did)
                     .await?
                     .ok_or_else(invalid)?;
-                transcript::resolve_direct_request_receipt_key(&doc, method)
+                transcript::resolve_direct_request_receipt_key_for_authority(&auth_did, &doc, method)
                     .map_err(|_| invalid())?;
-                candidate.trusted_authority_document = super::intent::merge_trusted_documents(
-                    &candidate.trusted_authority_document,
-                    &doc,
-                )?;
+                candidate.trusted_authority_document =
+                    super::intent::merge_trusted_documents_for_expected_authority(
+                        &candidate.trusted_authority_document,
+                        &doc,
+                        &auth_did,
+                    )?;
             }
-            let canonical = transcript::verify_received_direct_request_acceptance_proof(
-                &serde_json::to_vec(proof).map_err(|_| invalid())?,
-                &transcript::resolve_direct_request_receipt_key(
-                    &candidate.trusted_authority_document,
-                    method,
-                )
-                .map_err(|_| invalid())?,
-                &key,
+            let authority_key = transcript::resolve_direct_request_receipt_key_for_authority(
+                &auth_did,
+                &candidate.trusted_authority_document,
+                method,
             )
             .map_err(|_| invalid())?;
+            let canonical =
+                transcript::verify_received_direct_request_acceptance_proof_for_authority(
+                    &auth_did,
+                    &serde_json::to_vec(proof).map_err(|_| invalid())?,
+                    &authority_key,
+                    &key,
+                )
+                .map_err(|_| invalid())?;
             candidate.acceptance_proof =
                 Some(serde_json::to_vec(&canonical).map_err(|_| invalid())?);
             candidate.recipient_public_key = Some(key);

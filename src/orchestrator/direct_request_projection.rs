@@ -1,8 +1,9 @@
 //! Protected request projection backed by signed publication and consent proof.
 use super::super::direct_request_types::*;
 use crate::chat_v2::transcript::direct_request::{
-    resolve_direct_request_receipt_key, verify_received_signed_request as verify_signed_request,
-    DirectRequestKind,
+    resolve_direct_request_receipt_key_for_authority,
+    verify_received_signed_request as verify_signed_request,
+    verify_signed_request_for_authority, DirectRequestKind,
 };
 use crate::orchestrator::{OrchestratorError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -54,10 +55,19 @@ impl DirectRequestProjection {
         let envelope: Value =
             serde_json::from_slice(&self.publication_receipt).map_err(|_| invalid())?;
         let method = envelope["body"]["keyId"].as_str().ok_or_else(invalid)?;
-        let authority_key =
-            resolve_direct_request_receipt_key(&self.trusted_authority_document, method)
+        let auth_did = {
+            let val: Value = serde_json::from_slice(&self.trusted_authority_document)
                 .map_err(|_| invalid())?;
-        let receipt = verify_signed_request(
+            val["id"].as_str().ok_or_else(invalid)?.to_string()
+        };
+        let authority_key = resolve_direct_request_receipt_key_for_authority(
+            &auth_did,
+            &self.trusted_authority_document,
+            method,
+        )
+        .map_err(|_| invalid())?;
+        let receipt = verify_signed_request_for_authority(
+            &auth_did,
             DirectRequestKind::Outcome,
             &self.publication_receipt,
             &authority_key,
@@ -93,11 +103,20 @@ impl DirectRequestProjection {
                 let method = value["receipt"]["body"]["keyId"]
                     .as_str()
                     .ok_or_else(invalid)?;
-                let key =
-                    resolve_direct_request_receipt_key(&self.trusted_authority_document, method)
-                        .map_err(|_| invalid())?;
-                let verified=crate::chat_v2::transcript::direct_request::verify_received_direct_request_acceptance_proof(proof,&key,recipient_key).map_err(|_|invalid())?;
-                let accepted = &verified["entry"]["signedRequest"]["body"];
+                let key = resolve_direct_request_receipt_key_for_authority(
+                    &auth_did,
+                    &self.trusted_authority_document,
+                    method,
+                )
+                .map_err(|_| invalid())?;
+                let verified =
+                    crate::chat_v2::transcript::direct_request::verify_received_direct_request_acceptance_proof_for_authority(
+                        &auth_did,
+                        proof,
+                        &key,
+                        recipient_key,
+                    )
+                    .map_err(|_| invalid())?;
                 if accepted["prior"] != coordinate
                     || accepted["requestId"] != body["requestId"]
                     || accepted["actorDid"] != body["recipientDid"]
