@@ -146,7 +146,39 @@ where
         let expected_coordinator = if let Some(invitation) = &input.invitation {
             invitation.authority_did.clone()
         } else {
-            intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+            let actor_auth = self
+                .credentials()
+                .get_chat_declaration_authority(&owner)
+                .await?;
+            let recipient_auth = self
+                .credentials()
+                .get_chat_declaration_authority(&input.recipient_did)
+                .await?;
+            match (actor_auth, recipient_auth) {
+                (Some(a), Some(b)) => {
+                    transcript::derive_deterministic_coordinator(&a, &b)
+                        .map_err(|_| {
+                            OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
+                                reason: "Direct request authority DID is invalid".into(),
+                            })
+                        })?
+                }
+                (None, None) => intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string(),
+                (Some(auth), None) if auth == intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
+                    intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+                }
+                (None, Some(auth)) if auth == intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
+                    intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+                }
+                _ => {
+                    return Err(OrchestratorError::Mls(
+                        crate::MLSError::OperationNotSupported {
+                            reason: "Direct request receipt authority resolution unavailable"
+                                .into(),
+                        },
+                    ));
+                }
+            }
         };
         let document = self
             .credentials()

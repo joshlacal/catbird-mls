@@ -309,16 +309,51 @@ where
                 false,
             )
             .map_err(|_| invalid())?;
-            let expected_coordinator = super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY;
+            let actor_did = verified.body()["actorDid"].as_str().ok_or_else(invalid)?;
+            let recipient_did = &owner;
+            let actor_auth = self
+                .credentials()
+                .get_chat_declaration_authority(actor_did)
+                .await?;
+            let recipient_auth = self
+                .credentials()
+                .get_chat_declaration_authority(recipient_did)
+                .await?;
+            let expected_coordinator = match (actor_auth, recipient_auth) {
+                (Some(a), Some(b)) => {
+                    transcript::derive_deterministic_coordinator(&a, &b)
+                        .map_err(|_| invalid())?
+                }
+                (None, None) => super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string(),
+                (Some(auth), None) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
+                    super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+                }
+                (None, Some(auth)) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
+                    super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
+                }
+                _ => {
+                    return Err(OrchestratorError::Mls(
+                        crate::MLSError::OperationNotSupported {
+                            reason: "Direct request receipt authority resolution unavailable"
+                                .into(),
+                        },
+                    ));
+                }
+            };
             let document = self
                 .credentials()
-                .direct_request_receipt_authority_document(expected_coordinator)
+                .direct_request_receipt_authority_document(&expected_coordinator)
                 .await?
                 .ok_or_else(|| {
                     OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
                         reason: "Direct request receipt authority resolution unavailable".into(),
                     })
                 })?;
+            super::intent::validate_authority_document_for_expected_authority(
+                &document,
+                &expected_coordinator,
+            )
+            .map_err(|_| invalid())?;
             let projection = DirectRequestProjection {
                 owner_did: owner.clone(),
                 device_id: device.clone(),

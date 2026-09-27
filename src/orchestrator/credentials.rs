@@ -46,6 +46,18 @@ pub trait CredentialStore: CredentialStoreBounds {
     ) -> Result<Option<Vec<u8>>> {
         Ok(None)
     }
+    /// Resolve verified account-home chat declaration for an actor DID from authenticated PDS.
+    /// Returns:
+    /// - Ok(Some(did)) if verified blue.catbird.chat.declaration/self declares deliveryService: did
+    /// - Ok(None) ONLY when verified getRecord returns 404 RecordNotFound
+    /// - Err(OperationNotSupported) if declaration reader is unavailable / unimplemented (FAIL-CLOSED)
+    async fn get_chat_declaration_authority(&self, _user_did: &str) -> Result<Option<String>> {
+        Err(OrchestratorError::Mls(
+            crate::MLSError::OperationNotSupported {
+                reason: "Chat declaration resolution unavailable".into(),
+            },
+        ))
+    }
 
     /// Store a signing key for a user DID.
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()>;

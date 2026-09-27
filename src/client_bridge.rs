@@ -916,6 +916,14 @@ impl CredentialStore for ClientCredentialAdapter {
             .direct_request_receipt_authority_document(expected_authority_did.to_string())
             .map_err(bridge_err)
     }
+    async fn get_chat_declaration_authority(
+        &self,
+        user_did: &str,
+    ) -> crate::orchestrator::Result<Option<String>> {
+        self.0
+            .get_chat_declaration_authority(user_did.to_string())
+            .map_err(bridge_err)
+    }
 
     async fn store_signing_key(
         &self,

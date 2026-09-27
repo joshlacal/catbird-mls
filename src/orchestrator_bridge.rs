@@ -366,6 +366,20 @@ pub trait OrchestratorCredentialCallback: Send + Sync {
         let _ = expected_authority_did;
         Ok(None)
     }
+    /// Resolve verified account-home chat declaration for an actor DID from authenticated PDS.
+    /// Returns:
+    /// - Ok(Some(did)) if verified blue.catbird.chat.declaration/self declares deliveryService: did
+    /// - Ok(None) ONLY when verified getRecord returns 404 RecordNotFound
+    /// - Err(Credential) if declaration resolution is unavailable or failed (FAIL-CLOSED)
+    fn get_chat_declaration_authority(
+        &self,
+        user_did: String,
+    ) -> Result<Option<String>, OrchestratorBridgeError> {
+        let _ = user_did;
+        Err(OrchestratorBridgeError::Credential {
+            message: "Chat declaration resolution unavailable".into(),
+        })
+    }
 
 
     fn store_signing_key(
@@ -2277,6 +2291,14 @@ impl CredentialStore for CredentialAdapter {
     ) -> crate::orchestrator::Result<Option<Vec<u8>>> {
         self.0
             .direct_request_receipt_authority_document(expected_authority_did.to_string())
+            .map_err(bridge_err)
+    }
+    async fn get_chat_declaration_authority(
+        &self,
+        user_did: &str,
+    ) -> crate::orchestrator::Result<Option<String>> {
+        self.0
+            .get_chat_declaration_authority(user_did.to_string())
             .map_err(bridge_err)
     }
 

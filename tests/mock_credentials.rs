@@ -43,6 +43,8 @@ pub struct MockCredentials {
     /// transient platform/network failures separately from `Ok(None)`, which
     /// means the resolver capability is unsupported.
     authorized_device_key_failures: Arc<Mutex<std::collections::HashSet<String>>>,
+    chat_declaration_authorities: Arc<Mutex<HashMap<String, Option<String>>>>,
+    chat_declaration_failures: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// A one-shot signing callback barrier. The captured authority is returned only
@@ -79,6 +81,8 @@ impl MockCredentials {
             authorized_device_keys: Arc::new(Mutex::new(HashMap::new())),
             device_key_lookup_counts: Arc::new(Mutex::new(HashMap::new())),
             authorized_device_key_failures: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            chat_declaration_authorities: Arc::new(Mutex::new(HashMap::new())),
+            chat_declaration_failures: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -116,6 +120,24 @@ impl MockCredentials {
             failures.insert(root_did.to_string());
         } else {
             failures.remove(root_did);
+        }
+    }
+    /// Set the verified chat declaration authority for a DID.
+    /// Some(auth) means declaration is present with deliveryService = auth.
+    /// None means confirmed 404 RecordNotFound on PDS.
+    pub fn set_chat_declaration_authority(&self, user_did: &str, authority: Option<&str>) {
+        self.chat_declaration_authorities
+            .lock()
+            .unwrap()
+            .insert(user_did.to_string(), authority.map(|s| s.to_string()));
+    }
+
+    pub fn set_chat_declaration_failure(&self, user_did: &str, fail: bool) {
+        let mut failures = self.chat_declaration_failures.lock().unwrap();
+        if fail {
+            failures.insert(user_did.to_string());
+        } else {
+            failures.remove(user_did);
         }
     }
 
@@ -163,6 +185,21 @@ impl CredentialStore for MockCredentials {
         _expected_authority_did: &str,
     ) -> Result<Option<Vec<u8>>> {
         Ok(self.request_authority_document.lock().unwrap().clone())
+    }
+    async fn get_chat_declaration_authority(&self, user_did: &str) -> Result<Option<String>> {
+        if self.chat_declaration_failures.lock().unwrap().contains(user_did) {
+            return Err(OrchestratorError::Mls(
+                crate::MLSError::OperationNotSupported {
+                    reason: "Chat declaration resolution unavailable".into(),
+                },
+            ));
+        }
+        let map = self.chat_declaration_authorities.lock().unwrap();
+        if let Some(entry) = map.get(user_did) {
+            Ok(entry.clone())
+        } else {
+            Ok(None)
+        }
     }
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
         let mut map = self.state.lock().unwrap();

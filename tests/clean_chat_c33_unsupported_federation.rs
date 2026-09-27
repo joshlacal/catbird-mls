@@ -498,3 +498,85 @@ fn foreign_valid_authority_vs_forged_receipt_and_retained_trust() {
         "retained foreign document refused when canonical is expected"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn c33_declaration_coordinator_derivation_and_fail_closed_boundaries() {
+    let mut world = TestWorld::new();
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world.register_device("Alice").await.unwrap();
+    let client = world.client("Alice");
+
+    // 1. Explicit declaration resolution failure fails closed with OperationNotSupported
+    client
+        .credentials
+        .set_chat_declaration_failure("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", true);
+    let result = client.orchestrator.start_direct_request(draft_input()).await;
+    assert!(
+        matches!(
+            result,
+            Err(OrchestratorError::Mls(MLSError::OperationNotSupported { .. }))
+        ),
+        "declaration resolution failure must fail closed as OperationNotSupported: {result:?}"
+    );
+    client
+        .credentials
+        .set_chat_declaration_failure("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", false);
+
+    // 2. Set declared authorities: Alice on a.example, Bob on b.example
+    let a_authority = "did:web:chat.a.example";
+    let b_authority = "did:web:chat.b.example";
+    client
+        .credentials
+        .set_chat_declaration_authority("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", Some(a_authority));
+    client
+        .credentials
+        .set_chat_declaration_authority("did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", Some(b_authority));
+
+    // Expected coordinator is min(a, b) = did:web:chat.a.example.
+    // If no document for did:web:chat.a.example is installed, it fails with authority unavailable.
+    let result = client.orchestrator.start_direct_request(draft_input()).await;
+    match &result {
+        Err(OrchestratorError::Mls(MLSError::OperationNotSupported { reason })) => {
+            assert_eq!(
+                reason, "Direct request receipt authority resolution unavailable",
+                "must report authority resolution unavailable for derived coordinator"
+            );
+        }
+        other => panic!("expected OperationNotSupported, got {other:?}"),
+    }
+
+    // 3. Install a valid authority document for did:web:chat.a.example
+    let a_key = p256::ecdsa::SigningKey::from_slice(&[0x11; 32]).unwrap();
+    let a_doc = authority_doc_for_authority(a_authority, &a_key);
+    client
+        .credentials
+        .set_request_authority_document(a_doc.clone());
+
+    // When the installed document matches the derived coordinator (did:web:chat.a.example),
+    // document validation passes!
+    assert!(
+        catbird_mls::orchestrator::direct_request_intent::validate_authority_document_for_expected_authority(
+            &a_doc,
+            a_authority,
+        )
+        .is_ok(),
+        "document matching derived coordinator passes validation"
+    );
+
+    // If an attacker supplies a document for a different authority (e.g. b_authority when a is expected),
+    // it refuses with ForeignAuthority
+    let b_key = p256::ecdsa::SigningKey::from_slice(&[0x22; 32]).unwrap();
+    let b_doc = authority_doc_for_authority(b_authority, &b_key);
+    assert!(
+        matches!(
+            catbird_mls::orchestrator::direct_request_intent::validate_authority_document_for_expected_authority(
+                &b_doc,
+                a_authority,
+            ),
+            Err(catbird_mls::orchestrator::direct_request_intent::AuthorityDocumentRefusal::ForeignAuthority)
+        ),
+        "document not matching derived coordinator must be refused as ForeignAuthority"
+    );
+}
