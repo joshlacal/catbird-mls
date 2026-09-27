@@ -162,6 +162,19 @@ pub(crate) struct DirectRequestCloseProof {
     pub verified_prior: Value,
 }
 pub(crate) fn normalized_close_entry(mut entry: Value) -> Result<Value> {
+    for (pointer, expected) in [
+        ("/$type", "blue.catbird.chat.defs#conversationCloseEntry"),
+        (
+            "/signedRequest/body/$type",
+            "blue.catbird.chat.defs#conversationCloseBody",
+        ),
+    ] {
+        if let Some(tag) = entry.pointer(pointer) {
+            if tag != expected {
+                return Err(invalid());
+            }
+        }
+    }
     entry["$type"] = Value::String("blue.catbird.chat.defs#conversationCloseEntry".into());
     entry["signedRequest"]["body"]["$type"] =
         Value::String("blue.catbird.chat.defs#conversationCloseBody".into());
@@ -173,6 +186,7 @@ pub(crate) fn normalized_close_entry(mut entry: Value) -> Result<Value> {
     Ok(entry)
 }
 impl DirectRequestCloseProof {
+    /// Caller normalizes the read-boundary entry once before hashing or replay.
     pub(crate) fn hash(entry: &Value) -> Result<[u8; 32]> {
         use crate::chat_v2::transcript::{
             control_entry_fingerprint, decode_strict_json, project_ref, project_signed_body,
@@ -287,7 +301,7 @@ impl DirectRequestCloseProof {
             replaces_operation: None,
             reset_evidence: None,
         };
-        record.validate()?;
+        record.validate().map_err(|_| invalid())?;
         let strict = decode_strict_json(&serde_json::to_vec(body).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
         let canonical = project_signed_body(SignedMutationKind::ConversationClose, &strict)
@@ -350,4 +364,110 @@ pub(crate) fn verify_request_publication_entry(
         return Err(invalid());
     }
     Ok(hash)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde_json::json;
+
+    fn sample_close_entry() -> Value {
+        let tombstone = json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseTombstone",
+            "conversationId": "11111111-1111-4111-9111-111111111111",
+            "conversationKind": "direct",
+            "retired": {
+                "conversationId": "11111111-1111-4111-9111-111111111111",
+                "groupId": STANDARD.encode([2u8; 32]),
+                "generation": 0,
+                "epoch": 0,
+                "stateVersion": 1,
+                "groupContextHash": STANDARD.encode([3u8; 32]),
+                "confirmationTag": STANDARD.encode([4u8; 32]),
+                "lifecycle": "superseded"
+            },
+            "closedByDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+            "closedByDeviceId": "72727272-7272-4272-b272-727272727272",
+            "terminalSeq": 10,
+            "closedAt": "2026-07-22T12:34:56.000Z"
+        });
+        json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseEntry",
+            "entryId": "66666666-6666-4666-a666-666666666666",
+            "conversationId": "11111111-1111-4111-9111-111111111111",
+            "seq": 10,
+            "signedRequest": {
+                "body": {
+                    "$type": "blue.catbird.chat.defs#conversationCloseBody",
+                    "actorDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+                    "actorDeviceId": "72727272-7272-4272-b272-727272727272",
+                    "authGeneration": 1,
+                    "conversationKind": "direct",
+                    "idempotencyKey": "67676767-6767-4767-a767-676767676767",
+                    "keyId": "OQpJSMbjoMkp9Mz8qJRGo6zAieMT1g9qNZJr8WtW6i8",
+                    "prior": {
+                        "conversationId": "11111111-1111-4111-9111-111111111111",
+                        "groupId": STANDARD.encode([2u8; 32]),
+                        "generation": 0,
+                        "epoch": 0,
+                        "stateVersion": 0,
+                        "groupContextHash": STANDARD.encode([3u8; 32]),
+                        "confirmationTag": STANDARD.encode([4u8; 32]),
+                        "lifecycle": "active"
+                    },
+                    "retired": {
+                        "conversationId": "11111111-1111-4111-9111-111111111111",
+                        "groupId": STANDARD.encode([2u8; 32]),
+                        "generation": 0,
+                        "epoch": 0,
+                        "stateVersion": 1,
+                        "groupContextHash": STANDARD.encode([3u8; 32]),
+                        "confirmationTag": STANDARD.encode([4u8; 32]),
+                        "lifecycle": "superseded"
+                    },
+                    "signatureDomain": "CATBIRD-CHAT-CLOSE\0",
+                    "signedAt": "2026-07-22T12:34:55.000Z",
+                    "transitionId": "03adfab0-b088-4e86-b992-0f611d2eb64a"
+                },
+                "signature": STANDARD.encode([5u8; 64])
+            },
+            "receivedAt": "2026-07-22T12:34:56.000Z",
+            "tombstone": tombstone
+        })
+    }
+
+    #[test]
+    fn close_proof_hash_matches_normalized_read_bytes_and_rejects_forged_tags() {
+        let canonical = sample_close_entry();
+        let canonical_hash = DirectRequestCloseProof::hash(&canonical).unwrap();
+
+        // Server read-boundary entry presents byte fields as {"$bytes": "..."}
+        let mut read_entry = canonical.clone();
+        read_entry["signedRequest"]["signature"] = json!({
+            "$bytes": canonical["signedRequest"]["signature"]
+        });
+        let read_hash = DirectRequestCloseProof::hash(&normalized_close_entry(read_entry.clone()).unwrap()).unwrap();
+        assert_eq!(canonical_hash, read_hash);
+
+        // Mismatched signature fails to match the original hash
+        let mut mismatched = canonical.clone();
+        mismatched["signedRequest"]["signature"] = json!(STANDARD.encode([99u8; 64]));
+        let mismatched_hash = DirectRequestCloseProof::hash(&mismatched).unwrap();
+        assert_ne!(canonical_hash, mismatched_hash);
+
+        // Mismatched read entry also hashes to the mismatched hash
+        let mut mismatched_read = mismatched.clone();
+        mismatched_read["signedRequest"]["signature"] = json!({
+            "$bytes": mismatched["signedRequest"]["signature"]
+        });
+        assert_eq!(mismatched_hash, DirectRequestCloseProof::hash(&normalized_close_entry(mismatched_read).unwrap()).unwrap());
+        let mut forged_tag = read_entry.clone();
+        forged_tag["$type"] = json!("blue.catbird.chat.defs#directRequestEntry");
+        assert!(normalized_close_entry(forged_tag.clone()).is_err());
+        forged_tag["$type"] = canonical["$type"].clone();
+        forged_tag["signedRequest"]["body"]["$type"] =
+            json!("blue.catbird.chat.defs#directRequestBody");
+        assert!(normalized_close_entry(forged_tag).is_err());
+    }
 }

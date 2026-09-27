@@ -947,6 +947,18 @@ async fn sender_fixture(legacy: bool, dag_json: bool) {
         .process_incoming_message(&closed_envelope)
         .await
         .is_ok());
+    let mut server_read_entry = entry.clone();
+    server_read_entry["signedRequest"]["signature"] =
+        json!({"$bytes": entry["signedRequest"]["signature"]});
+    let read_closed_envelope =
+        catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(&server_read_entry, &cid)
+            .unwrap()
+            .unwrap();
+    assert!(alice
+        .orchestrator
+        .process_incoming_message(&read_closed_envelope)
+        .await
+        .is_ok());
     assert!(alice
         .orchestrator
         .process_incoming_message(&closed_envelope)

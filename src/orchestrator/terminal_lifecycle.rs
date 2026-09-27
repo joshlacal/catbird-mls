@@ -734,14 +734,15 @@ where
                 "The signed close does not retire this exact conversation generation.",
             ));
         }
+        let canonical = super::direct_requests::normalized_close_entry(entry.clone())?;
         if self
-            .replay_verified_request_close(conversation_id, entry)
+            .replay_verified_request_close(conversation_id, &canonical)
             .await?
         {
             let transition_lock = self.rejoin_lock(conversation_id).await;
             let _guard = transition_lock.lock().await;
             return self
-                .project_verified_close_entry_locked(conversation_id, entry)
+                .project_verified_close_entry_locked(conversation_id, &canonical)
                 .await;
         }
         let close_key = self.verify_terminal_signed_body(entry).await?;
@@ -796,9 +797,9 @@ where
                 "Sync the preceding conversation Commits before applying its signed close.",
             ));
         }
-        self.retain_verified_request_close(conversation_id, entry, &close_key)
+        self.retain_verified_request_close(conversation_id, &canonical, &close_key)
             .await?;
-        self.project_verified_close_entry_locked(conversation_id, entry)
+        self.project_verified_close_entry_locked(conversation_id, &canonical)
             .await
     }
 

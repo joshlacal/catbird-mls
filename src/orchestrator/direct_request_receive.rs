@@ -618,6 +618,7 @@ where
 {
     /// Invoked only after the existing canonical terminal verifier has accepted
     /// the server entry and authorized historical actor key.
+    /// Callers pass an entry normalized once at the read boundary.
     pub(crate) async fn retain_verified_request_close(
         &self,
         cid: &str,
@@ -635,7 +636,7 @@ where
             return Ok(());
         };
         let mut projection = DirectRequestProjection::decode(&raw, &owner, &device)?;
-        let entry = super::projection::normalized_close_entry(entry.clone())?;
+        let entry = entry.clone();
         let hash = super::projection::DirectRequestCloseProof::hash(&entry)?;
         if let Some(old) = &projection.close_proof {
             if old.entry_sha256 != hash {
@@ -672,6 +673,7 @@ where
         }
         Ok(())
     }
+    /// Callers pass an entry normalized once at the read boundary.
     pub(crate) async fn replay_verified_request_close(
         &self,
         cid: &str,
@@ -813,5 +815,87 @@ mod coordinate_tests {
         assert!(!same_request_coordinates(&coordinate, &read).unwrap());
         read["groupId"]["extra"] = json!(true);
         assert!(same_request_coordinates(&coordinate, &read).is_err());
+    }
+
+    #[test]
+    fn replay_verified_close_hash_accepts_read_boundary_bytes_identically() {
+        let tombstone = json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseTombstone",
+            "conversationId": "11111111-1111-4111-9111-111111111111",
+            "conversationKind": "direct",
+            "retired": {
+                "conversationId": "11111111-1111-4111-9111-111111111111",
+                "groupId": STANDARD.encode([2u8; 32]),
+                "generation": 0,
+                "epoch": 0,
+                "stateVersion": 1,
+                "groupContextHash": STANDARD.encode([3u8; 32]),
+                "confirmationTag": STANDARD.encode([4u8; 32]),
+                "lifecycle": "superseded"
+            },
+            "closedByDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+            "closedByDeviceId": "72727272-7272-4272-b272-727272727272",
+            "terminalSeq": 10,
+            "closedAt": "2026-07-22T12:34:56.000Z"
+        });
+        let canonical = json!({
+            "$type": "blue.catbird.chat.defs#conversationCloseEntry",
+            "entryId": "66666666-6666-4666-a666-666666666666",
+            "conversationId": "11111111-1111-4111-9111-111111111111",
+            "seq": 10,
+            "signedRequest": {
+                "body": {
+                    "$type": "blue.catbird.chat.defs#conversationCloseBody",
+                    "actorDid": "did:plc:alicefixtureaaaaaaaaaaaa",
+                    "actorDeviceId": "72727272-7272-4272-b272-727272727272",
+                    "authGeneration": 1,
+                    "conversationKind": "direct",
+                    "idempotencyKey": "67676767-6767-4767-a767-676767676767",
+                    "keyId": "OQpJSMbjoMkp9Mz8qJRGo6zAieMT1g9qNZJr8WtW6i8",
+                    "prior": {
+                        "conversationId": "11111111-1111-4111-9111-111111111111",
+                        "groupId": STANDARD.encode([2u8; 32]),
+                        "generation": 0,
+                        "epoch": 0,
+                        "stateVersion": 0,
+                        "groupContextHash": STANDARD.encode([3u8; 32]),
+                        "confirmationTag": STANDARD.encode([4u8; 32]),
+                        "lifecycle": "active"
+                    },
+                    "retired": {
+                        "conversationId": "11111111-1111-4111-9111-111111111111",
+                        "groupId": STANDARD.encode([2u8; 32]),
+                        "generation": 0,
+                        "epoch": 0,
+                        "stateVersion": 1,
+                        "groupContextHash": STANDARD.encode([3u8; 32]),
+                        "confirmationTag": STANDARD.encode([4u8; 32]),
+                        "lifecycle": "superseded"
+                    },
+                    "signatureDomain": "CATBIRD-CHAT-CLOSE\0",
+                    "signedAt": "2026-07-22T12:34:55.000Z",
+                    "transitionId": "03adfab0-b088-4e86-b992-0f611d2eb64a"
+                },
+                "signature": STANDARD.encode([5u8; 64])
+            },
+            "receivedAt": "2026-07-22T12:34:56.000Z",
+            "tombstone": tombstone
+        });
+        let canonical_hash = super::super::projection::DirectRequestCloseProof::hash(&canonical).unwrap();
+        let mut server_read = canonical.clone();
+        server_read["signedRequest"]["signature"] = json!({
+            "$bytes": canonical["signedRequest"]["signature"]
+        });
+        let server_read_hash = super::super::projection::DirectRequestCloseProof::hash(
+            &super::super::projection::normalized_close_entry(server_read.clone()).unwrap(),
+        ).unwrap();
+        assert_eq!(canonical_hash, server_read_hash);
+
+        let mut forged = server_read.clone();
+        forged["signedRequest"]["signature"] = json!({"$bytes": STANDARD.encode([88u8; 64])});
+        let forged_hash = super::super::projection::DirectRequestCloseProof::hash(
+            &super::super::projection::normalized_close_entry(forged).unwrap(),
+        ).unwrap();
+        assert_ne!(canonical_hash, forged_hash);
     }
 }
