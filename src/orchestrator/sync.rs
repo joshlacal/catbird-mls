@@ -386,9 +386,11 @@ where
         });
 
         let result = self.do_sync(&user_did, full_sync).await;
-
-        // Release sync lock (guard handles this on panic/early return too)
-        *self.sync_in_progress().lock().await = false;
+        let mut syncing = self.sync_in_progress().lock().await;
+        // A waiter may start a new pass as soon as this flag clears.
+        scopeguard::ScopeGuard::into_inner(_sync_guard);
+        *syncing = false;
+        drop(syncing);
         self.sync_finished().notify_waiters();
 
         match &result {

@@ -302,7 +302,11 @@ where
             ),
         )
         .await;
-        *self.sync_in_progress().lock().await = false;
+        let mut flag = self.sync_in_progress().lock().await;
+        // A waiter may start a new pass as soon as this flag clears.
+        scopeguard::ScopeGuard::into_inner(_guard);
+        *flag = false;
+        drop(flag);
         self.sync_finished().notify_waiters();
         result?;
         Ok(AppliedInventoryFence {
