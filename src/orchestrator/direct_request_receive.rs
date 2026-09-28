@@ -411,6 +411,7 @@ where
                     publication_request: projection.publication.clone(),
                     actor_signature_public_key: projection.sender_public_key.clone(),
                     published_receipt: projection.publication_receipt.clone(),
+                    receipt_authority_did: auth_did,
                     receipt_authority_key: key,
                     preparation_request_digest: bytes(
                         &receipt["body"]["receipt"]["preparationRequestDigest"],

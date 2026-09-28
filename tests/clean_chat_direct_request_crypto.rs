@@ -714,6 +714,7 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
         publication_request: publication,
         actor_signature_public_key: kp.leaf_node().signature_key().as_slice().to_vec(),
         published_receipt: receipt,
+        receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: authority_key,
         preparation_request_digest: input.preparation_request_digest,
     };

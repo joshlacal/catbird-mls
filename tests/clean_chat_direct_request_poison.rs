@@ -183,6 +183,7 @@ async fn proof(world: &TestWorld) -> Proof {
         publication_request: vec![],
         actor_signature_public_key: public,
         published_receipt: vec![],
+        receipt_authority_did: "did:web:chat.catbird.blue".into(),
         receipt_authority_key: authority_key,
         preparation_request_digest: input.preparation_request_digest,
     };

@@ -117,6 +117,7 @@ impl DirectRequestProjection {
                         recipient_key,
                     )
                     .map_err(|_| invalid())?;
+                let accepted = &verified["entry"]["signedRequest"]["body"];
                 if accepted["prior"] != coordinate
                     || accepted["requestId"] != body["requestId"]
                     || accepted["actorDid"] != body["recipientDid"]

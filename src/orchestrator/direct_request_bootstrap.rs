@@ -678,6 +678,8 @@ pub struct DirectRequestWelcomeInput {
     pub publication_request: Vec<u8>,
     pub actor_signature_public_key: Vec<u8>,
     pub published_receipt: Vec<u8>,
+    /// Independently resolved coordinator DID for the pinned receipt key.
+    pub receipt_authority_did: String,
     /// Resolved independently through the trusted service DID by the caller.
     pub receipt_authority_key: Vec<u8>,
     pub preparation_request_digest: [u8; 32],

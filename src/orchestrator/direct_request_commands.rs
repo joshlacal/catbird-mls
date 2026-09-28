@@ -554,7 +554,7 @@ where
         .map_err(|_| invalid())?;
         transcript::verify_direct_request_preparation_for_authority(
             &auth_did,
-            &raw_preparation,
+            &serde_json::to_vec(preparation).map_err(|_| invalid())?,
             &key,
         )
         .map_err(|_| invalid())?;

@@ -6649,8 +6649,8 @@
           "ref": "#artifactHash"
         },
         "authorityDid": {
-          "type": "string",
-          "const": "did:web:chat.catbird.blue"
+          "type": "ref",
+          "ref": "#bareDid"
         },
         "receiptKeyId": {
           "type": "ref",
@@ -7598,8 +7598,8 @@
           "const": "2"
         },
         "authorityDid": {
-          "type": "string",
-          "const": "did:web:chat.catbird.blue"
+          "type": "ref",
+          "ref": "#bareDid"
         },
         "keyId": {
           "type": "ref",
@@ -7957,8 +7957,8 @@
           "ref": "#artifactHash"
         },
         "authorityDid": {
-          "type": "string",
-          "const": "did:web:chat.catbird.blue"
+          "type": "ref",
+          "ref": "#bareDid"
         },
         "receiptKeyId": {
           "type": "ref",
@@ -7997,8 +7997,8 @@
           "const": "2"
         },
         "authorityDid": {
-          "type": "string",
-          "const": "did:web:chat.catbird.blue"
+          "type": "ref",
+          "ref": "#bareDid"
         },
         "keyId": {
           "type": "ref",

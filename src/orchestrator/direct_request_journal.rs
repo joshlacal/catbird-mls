@@ -112,12 +112,11 @@ impl DirectRequestJournal {
             return Err(MLSError::StorageFailed);
         }
         if let (Some(receipt), Some(key)) = (&self.terminal_receipt, &self.terminal_authority_key) {
-            use crate::chat_v2::transcript::direct_request::{
-                verify_received_signed_request as verify_signed_request, DirectRequestKind,
-            };
             use base64::{engine::general_purpose::STANDARD, Engine as _};
-            let verified = verify_signed_request(DirectRequestKind::Outcome, receipt, key)
-                .map_err(|_| MLSError::StorageFailed)?;
+            let verified = super::direct_request_shared_crypto::verify_pinned_terminal_receipt(
+                receipt, key,
+            )
+            .map_err(|_| MLSError::StorageFailed)?;
             let proof = &verified.body()["receipt"];
             let published = matches!(
                 self.phase,
@@ -436,7 +435,6 @@ pub(crate) fn resolve(
     authority_key: &[u8],
     published: bool,
 ) -> Result<DirectRequestJournal, MLSError> {
-    use crate::chat_v2::transcript::direct_request::{verify_signed_request, DirectRequestKind};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use native::*;
     use openmls::prelude::*;

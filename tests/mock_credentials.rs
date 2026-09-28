@@ -189,7 +189,7 @@ impl CredentialStore for MockCredentials {
     async fn get_chat_declaration_authority(&self, user_did: &str) -> Result<Option<String>> {
         if self.chat_declaration_failures.lock().unwrap().contains(user_did) {
             return Err(OrchestratorError::Mls(
-                crate::MLSError::OperationNotSupported {
+                catbird_mls::MLSError::OperationNotSupported {
                     reason: "Chat declaration resolution unavailable".into(),
                 },
             ));

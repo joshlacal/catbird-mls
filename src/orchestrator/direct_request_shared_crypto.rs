@@ -7,7 +7,7 @@ use super::direct_request_journal::{DirectRequestJournal, DirectRequestJournalPh
 use super::direct_request_keys::{DirectRequestKeyPublication, DirectRequestKeyPublicationInput};
 use crate::{
     chat_v2::transcript::direct_request::{
-        self as transcript, verify_received_signed_request as verify_signed_request,
+        self as transcript, verify_received_signed_request_for_authority as verify_signed_request,
         DirectRequestKind,
     },
     MLSError,
@@ -32,6 +32,23 @@ fn crypto_error(value: impl std::fmt::Debug) -> MLSError {
     MLSError::OpenMLS(format!("direct request bootstrap: {value:?}"))
 }
 
+pub(crate) fn verify_pinned_terminal_receipt(
+    receipt: &[u8],
+    authority_key: &[u8],
+) -> Result<transcript::VerifiedDirectRequest, MLSError> {
+    let wrapper: Value = serde_json::from_slice(receipt).map_err(error)?;
+    let authority_did = wrapper["body"]["authorityDid"]
+        .as_str()
+        .ok_or_else(|| invalid("Missing receipt authority DID"))?;
+    transcript::verify_received_signed_request_for_authority(
+        authority_did,
+        DirectRequestKind::Outcome,
+        receipt,
+        authority_key,
+    )
+    .map_err(error)
+}
+
 impl DirectRequestJournal {
     pub fn verify_terminal_receipt(
         &self,
@@ -41,8 +58,7 @@ impl DirectRequestJournal {
     ) -> Result<(), MLSError> {
         let record = self;
         let id = self.request_id.as_str();
-        let verified = verify_signed_request(DirectRequestKind::Outcome, receipt, authority_key)
-            .map_err(error)?;
+        let verified = verify_pinned_terminal_receipt(receipt, authority_key)?;
         let proof = &verified.body()["receipt"];
         let digest = proof["requestDigest"]
             .as_str()
@@ -147,6 +163,7 @@ pub fn validate_request_welcome_receipt(input: &DirectRequestWelcomeInput) -> Re
         &input.actor_signature_public_key,
     )?;
     let verified = verify_signed_request(
+        &input.receipt_authority_did,
         DirectRequestKind::Outcome,
         &input.published_receipt,
         &input.receipt_authority_key,

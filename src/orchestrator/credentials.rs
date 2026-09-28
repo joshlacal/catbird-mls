@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use super::credential_binding::{check_identity_claim, CredentialVerification};
-use super::error::Result;
+use super::error::{OrchestratorError, Result};
 
 /// Public signing result returned by a credential authority.
 ///
