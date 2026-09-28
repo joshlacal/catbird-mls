@@ -49,9 +49,9 @@ ARTIFACT_RELATIVE = Path("src/orchestrator/generated/blue.catbird.chat.defs.json
 GENERATOR_NAME = "scripts/generate_chat_schema.py"
 GENERATOR_VERSION = 9
 PROVENANCE_KEY = "_catbird_mls_provenance"
-CANONICAL_SOURCE_REVISION = "aa0d0d489443d8a5622a86732e771d3116748b0e"
-CANONICAL_SOURCE_TREE = "c2ac511de9bda609af5155615c51d536b35a6c30"
-CANONICAL_SOURCE_SHA256 = "dea9b6e72128d71d70f8c05036bf90889c2f91987c7a11fb82904a3e63df6caf"
+CANONICAL_SOURCE_REVISION = "3fe103463e09d4c47077e433883df982ff9e2beb"
+CANONICAL_SOURCE_TREE = "9feac29cb51cdf46cc92155bb7b56ed4d74e3e08"
+CANONICAL_SOURCE_SHA256 = "e7a23bc2b8e383729d8046a33cd24d86ef6cf8261989692f327e816e10343938"
 SERVER_SOURCE_REVISION = "ec5028ce4f424af3819aa3e993c86fca1a85bbde"
 SERVER_SOURCE_TREE = "e29416025c27ac91c74930514b2bc85385f93a0c"
 SERVER_VECTOR_SET = "signed-mutation"
@@ -92,15 +92,18 @@ def resolve_tree(repository: Path, commit_id: str) -> str:
     )
     if res.returncode == 0 and res.stdout.strip():
         return res.stdout.strip()
-    canonical_repo = (repository.parents[2] / repository.name).resolve()
-    if canonical_repo.exists():
-        res = subprocess.run(
-            ["git", "-C", str(canonical_repo), "rev-parse", f"{commit_id}^{{tree}}"],
-            capture_output=True,
-            text=True,
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            return res.stdout.strip()
+    for canonical_repo in (
+        repository.parents[2] / repository.name,
+        repository.parents[2] / "Catbird+Petrel" / repository.name,
+    ):
+        if canonical_repo.exists():
+            res = subprocess.run(
+                ["git", "-C", str(canonical_repo), "rev-parse", f"{commit_id}^{{tree}}"],
+                capture_output=True,
+                text=True,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
     raise ValueError(f"unable to resolve git tree for {commit_id} in {repository}")
 
 

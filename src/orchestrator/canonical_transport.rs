@@ -4138,6 +4138,38 @@ pub fn canonical_cbor_for_schema(
 }
 
 #[cfg(test)]
+mod variable_request_authority_tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn acceptance_receipt_canonicalizes_both_valid_home_authorities() {
+        let hash = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let coordinates = serde_json::json!({
+            "conversationId": id, "generation": 1, "stateVersion": 1,
+            "groupId": hash, "epoch": 0, "groupContextHash": hash,
+            "confirmationTag": hash, "lifecycle": "active"
+        });
+        let mut receipt = serde_json::json!({
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\u{0}",
+            "protocolVersion": "2",
+            "authorityDid": "did:web:ds1.fixture.catbird.blue",
+            "keyId": format!("did:web:ds1.fixture.catbird.blue#chat-request-receipt-{}", "0".repeat(64)),
+            "requestId": id, "acceptanceDigest": hash, "entryHash": hash,
+            "prior": coordinates, "next": coordinates,
+            "recordedAt": "2026-09-28T08:15:52.893Z"
+        });
+        let first = canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).unwrap();
+        receipt["authorityDid"] = serde_json::json!("did:web:ds2.fixture.catbird.blue");
+        let second = canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).unwrap();
+        assert_ne!(first, second);
+        receipt["authorityDid"] = serde_json::json!("not-a-did");
+        assert!(canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).is_err());
+    }
+}
+
+#[cfg(test)]
 mod read_routing_extension_tests {
     use super::*;
 
