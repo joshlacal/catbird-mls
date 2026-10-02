@@ -254,6 +254,16 @@ static NEXT_ORCHESTRATOR_INSTANCE_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 static NEXT_BATCH_EXECUTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+pub(crate) fn required_inventory_expiry(value: Option<&str>) -> Result<&str> {
+    let value = value.ok_or_else(|| {
+        OrchestratorError::InvalidInput("missing or non-string snapshotExpiresAt".into())
+    })?;
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+        OrchestratorError::InvalidInput("invalid snapshotExpiresAt timestamp".into())
+    })?;
+    Ok(value)
+}
+
 tokio::task_local! {
     pub(crate) static BATCH_INVENTORY_CONTEXT: Arc<AuthorizedInventorySnapshot>;
 }
@@ -460,15 +470,16 @@ where
                     OrchestratorError::InvalidInput("missing or invalid snapshotEventCursor".into())
                 })?;
 
+            let expiry = required_inventory_expiry(page["snapshotExpiresAt"].as_str())?;
             if is_first_page {
                 session_id = session.to_string();
                 event_cursor = fence.to_string();
-                expires_at = page
-                    .get("snapshotExpiresAt")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
+                expires_at = Some(expiry.to_string());
                 is_first_page = false;
-            } else if session != session_id || fence != event_cursor {
+            } else if session != session_id
+                || fence != event_cursor
+                || Some(expiry) != expires_at.as_deref()
+            {
                 return Err(OrchestratorError::InvalidInput(
                     "inventory session changed during pagination".into(),
                 ));
@@ -570,6 +581,7 @@ where
         self.check_shutdown().await?;
         let did = self.require_user_did().await?;
         let device = self.require_actor_device_id().await?;
+        let expires_at = required_inventory_expiry(expires_at)?;
         let mut page_cursor: Option<String> = None;
         let mut pagination = super::pagination::PaginationGuard::for_conversations(
             "authorized recovery inbox batch",
@@ -608,9 +620,10 @@ where
             let page: serde_json::Value = serde_json::from_slice(&response.body)
                 .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
 
+            let page_expiry = required_inventory_expiry(page["snapshotExpiresAt"].as_str())?;
             if page["inventorySessionId"].as_str() != Some(session_id)
                 || page["snapshotEventCursor"].as_str() != Some(event_cursor)
-                || (expires_at.is_some() && page["snapshotExpiresAt"].as_str() != expires_at)
+                || page_expiry != expires_at
             {
                 return Err(OrchestratorError::InvalidInput(
                     "recovery inbox session mismatch during pagination".into(),
@@ -646,7 +659,7 @@ where
             execution_id,
             session_id: session_id.to_string(),
             event_cursor: event_cursor.to_string(),
-            expires_at: expires_at.map(str::to_string),
+            expires_at: Some(expires_at.to_string()),
             items: inbox_items,
             user_did: did,
             device_id: device,

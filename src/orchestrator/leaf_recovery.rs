@@ -14,7 +14,7 @@ use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::lifecycle::lifecycle_coordinates;
 use super::mls_provider::MlsCryptoContext;
-use super::orchestrator::MLSOrchestrator;
+use super::orchestrator::{required_inventory_expiry, MLSOrchestrator};
 use super::pagination::PaginationGuard;
 use super::reset_flow::ServerConversationState;
 use super::storage::MLSStorageBackend;
@@ -75,6 +75,7 @@ where
         let coordinate = lifecycle_coordinates(&state.coordinates, &state.conversation_id)?;
         if let Some(inbox) = self.batch_recovery_inbox_snapshot() {
             if inbox.user_did == did && inbox.device_id == device {
+                required_inventory_expiry(inbox.expires_at.as_deref())?;
                 return Ok(inbox.find_open_request(
                     &state.conversation_id,
                     &did,
@@ -192,6 +193,7 @@ where
                 let expires_at = inventory["snapshotExpiresAt"].as_str().map(str::to_string);
                 (session, event_cursor, expires_at)
             };
+        let expires_at = required_inventory_expiry(expires_at.as_deref())?;
         let mut cursor: Option<String> = None;
         let mut pages = PaginationGuard::for_conversations("own leaf recovery inbox");
         loop {
@@ -203,10 +205,10 @@ where
             let page = self
                 .recovery_read_json(CanonicalOperation::GetLeafRecoveryInbox, path)
                 .await?;
+            let page_expiry = required_inventory_expiry(page["snapshotExpiresAt"].as_str())?;
             if page["inventorySessionId"].as_str() != Some(&session)
                 || page["snapshotEventCursor"].as_str() != Some(&event_cursor)
-                || (expires_at.is_some()
-                    && page["snapshotExpiresAt"].as_str() != expires_at.as_deref())
+                || page_expiry != expires_at
             {
                 return Err(invalid("recovery inbox changed inventory session"));
             }

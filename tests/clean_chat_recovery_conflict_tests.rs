@@ -115,6 +115,30 @@ fn page(items: Vec<Value>, next: Option<&str>) -> GatewayResponse {
     response(200, body)
 }
 
+fn page_with_expiry(
+    items: Vec<Value>,
+    next: Option<&str>,
+    expiry: Option<Value>,
+) -> GatewayResponse {
+    let mut body: Value = serde_json::from_slice(&page(items, next).body).unwrap();
+    match expiry {
+        Some(expiry) => body["snapshotExpiresAt"] = expiry,
+        None => {
+            body.as_object_mut().unwrap().remove("snapshotExpiresAt");
+        }
+    }
+    response(200, body)
+}
+
+fn invalid_expiries() -> Vec<(&'static str, Option<Value>)> {
+    vec![
+        ("missing", None),
+        ("null", Some(Value::Null)),
+        ("non-string", Some(json!(1724155200))),
+        ("invalid date", Some(json!("2026-02-30T12:00:00.000Z"))),
+    ]
+}
+
 fn assert_no_replacement(fixture: &Fixture, packages_before: usize) {
     let world = &fixture.world;
     assert_eq!(
@@ -265,6 +289,107 @@ fn assert_request_error(error: OrchestratorError, expected_status: u16, expected
         other => panic!(
             "expected original request error {expected_status}/{expected_code}, got {other:?}"
         ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn already_open_rejects_missing_or_malformed_inventory_expiry() {
+    for (case, expiry) in invalid_expiries() {
+        let fixture = outstanding_recovery().await;
+        let world = &fixture.world;
+        let inbox_before = count(world, CanonicalOperation::GetLeafRecoveryInbox);
+        let sessions_before = count(world, CanonicalOperation::GetConversations);
+        let packages_before = world
+            .delivery_service()
+            .key_package_count(&world.client("Alice").did);
+        world
+            .delivery_service()
+            .set_next_inventory_result_for_test(Ok(page_with_expiry(vec![], None, expiry.clone())));
+        // Give both reads the same malformed field: equality alone cannot
+        // establish a valid expiry, and absent/non-string values cannot opt out.
+        world
+            .delivery_service()
+            .set_leaf_recovery_inbox_responses(vec![page_with_expiry(
+                vec![fixture.recovery.clone()],
+                None,
+                expiry,
+            )]);
+
+        let error = world
+            .client("AliceDev2")
+            .orchestrator
+            .accept_conversation(&fixture.conversation_id)
+            .await
+            .expect_err(&format!("{case} inventory expiry cannot prove AlreadyOpen"));
+
+        assert!(
+            matches!(error, OrchestratorError::InvalidInput(_)),
+            "{case}: expected an invalid inventory error, got {error:?}"
+        );
+        assert_eq!(
+            count(world, CanonicalOperation::GetConversations) - sessions_before,
+            1,
+            "{case}: malformed metadata must not trigger a fresh-session retry"
+        );
+        assert_eq!(
+            count(world, CanonicalOperation::GetLeafRecoveryInbox),
+            inbox_before,
+            "{case}: reject the invalid allocation before reading the inbox"
+        );
+        assert_no_replacement(&fixture, packages_before);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn already_open_rejects_missing_malformed_or_changed_inbox_expiry_on_every_page() {
+    for bad_page_index in 0..=1 {
+        let mut cases = invalid_expiries();
+        cases.push(("changed", Some(json!("2026-08-20T12:00:01.000Z"))));
+        for (case, expiry) in cases {
+            let fixture = outstanding_recovery().await;
+            let world = &fixture.world;
+            let inbox_before = count(world, CanonicalOperation::GetLeafRecoveryInbox);
+            let sessions_before = count(world, CanonicalOperation::GetConversations);
+            let packages_before = world
+                .delivery_service()
+                .key_package_count(&world.client("Alice").did);
+            let mut pages = Vec::new();
+            if bad_page_index == 1 {
+                pages.push(page(vec![], Some("page-two")));
+            }
+            pages.push(page_with_expiry(
+                vec![fixture.recovery.clone()],
+                None,
+                expiry,
+            ));
+            world
+                .delivery_service()
+                .set_leaf_recovery_inbox_responses(pages);
+
+            let error = world
+                .client("AliceDev2")
+                .orchestrator
+                .accept_conversation(&fixture.conversation_id)
+                .await
+                .expect_err(&format!(
+                    "{case} inbox expiry on page {bad_page_index} cannot prove AlreadyOpen"
+                ));
+
+            assert!(
+                matches!(error, OrchestratorError::InvalidInput(_)),
+                "{case}: expected an invalid inbox error, got {error:?}"
+            );
+            assert_eq!(
+                count(world, CanonicalOperation::GetConversations) - sessions_before,
+                1,
+                "{case}: do not refresh malformed or changed snapshot metadata"
+            );
+            assert_eq!(
+                count(world, CanonicalOperation::GetLeafRecoveryInbox) - inbox_before,
+                bad_page_index + 1
+            );
+            assert_no_replacement(&fixture, packages_before);
+        }
     }
 }
 

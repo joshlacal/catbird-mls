@@ -11,12 +11,13 @@ mod e2e_harness;
 
 use std::time::{Duration, Instant};
 
-use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+use catbird_mls::orchestrator::canonical_transport::{CanonicalOperation, GatewayResponse};
+use catbird_mls::orchestrator::error::OrchestratorError;
 use catbird_mls::orchestrator::types::ConversationState;
 use catbird_mls::orchestrator::DeferredRecoveryOutcome;
 use catbird_mls::orchestrator::MLSStorageBackend;
 use e2e_harness::TestWorld;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn leaf(user_did: &str, device_id: &str, status: &str) -> serde_json::Value {
     json!({
@@ -78,6 +79,322 @@ async fn setup_leafless_second_device(
         .set_conversation_leaves_for_test(&convo_id, vec![leaf(alice_did, &dev1_id, "active")]);
 
     (convo_id, dev1_id, alice_did.to_string())
+}
+
+struct RecoveryBatchFixture {
+    world: TestWorld,
+    conversations: Vec<(String, Vec<u8>, u64)>,
+    packages_before: usize,
+    requests_before: usize,
+}
+
+async fn outstanding_recovery_batch() -> RecoveryBatchFixture {
+    let mut world = TestWorld::new();
+    let (first, dev1_id, alice_did) =
+        setup_leafless_second_device(&mut world, "expiry batch first").await;
+    let second = world
+        .client("Alice")
+        .orchestrator
+        .create_group("expiry batch second", None, None)
+        .await
+        .unwrap()
+        .conversation_id;
+    world
+        .delivery_service()
+        .set_conversation_leaves_for_test(&second, vec![leaf(&alice_did, &dev1_id, "active")]);
+    world
+        .client("AliceDev2")
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .expect("initial sync opens one recovery request per absent group");
+
+    let requests_before = count_operations(&world, CanonicalOperation::RequestLeafRecovery);
+    assert_eq!(requests_before, 2);
+    let mut conversations = Vec::new();
+    for conversation_id in [first, second] {
+        let alice = world.client("Alice");
+        let group_id = hex::decode(
+            &alice.orchestrator.conversations().lock().await[&conversation_id].group_id,
+        )
+        .unwrap();
+        let epoch = alice
+            .orchestrator
+            .mls_context()
+            .get_epoch(group_id.clone())
+            .unwrap();
+        conversations.push((conversation_id, group_id, epoch));
+    }
+    let packages_before = world.delivery_service().key_package_count(&alice_did);
+    RecoveryBatchFixture {
+        world,
+        conversations,
+        packages_before,
+        requests_before,
+    }
+}
+
+fn inventory_page(expiry: Option<Value>, next: Option<&str>) -> GatewayResponse {
+    let mut body = json!({
+        "items": [],
+        "inventorySessionId": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+        "snapshotEventCursor": "018f3f6a-7b2c-4d91-8a5e-0f123456789a",
+        "hasMore": next.is_some(),
+    });
+    if let Some(expiry) = expiry {
+        body["snapshotExpiresAt"] = expiry;
+    }
+    if let Some(next) = next {
+        body["nextPageCursor"] = json!(next);
+    }
+    GatewayResponse {
+        status: 200,
+        content_type: Some("application/json".into()),
+        body: serde_json::to_vec(&body).unwrap(),
+    }
+}
+
+fn valid_expiry() -> Option<Value> {
+    // Raw readers bind this server expiry; the authenticated-ingest path owns
+    // clock freshness. Keep this historical fixture usable without a fake clock.
+    Some(json!("2026-08-20T12:00:00.000Z"))
+}
+
+fn invalid_expiries() -> Vec<(&'static str, Option<Value>)> {
+    vec![
+        ("missing", None),
+        ("null", Some(Value::Null)),
+        ("non-string", Some(json!(1724155200))),
+        ("invalid date", Some(json!("2026-02-30T12:00:00.000Z"))),
+    ]
+}
+
+async fn assert_batch_preserved(fixture: &RecoveryBatchFixture) {
+    let world = &fixture.world;
+    assert_eq!(
+        count_operations(world, CanonicalOperation::RequestLeafRecovery),
+        fixture.requests_before,
+        "invalid shared evidence must not replace an outstanding recovery request"
+    );
+    assert_eq!(count_operations(world, CanonicalOperation::RequestReset), 0);
+    assert_eq!(
+        count_operations(world, CanonicalOperation::ActivateReset),
+        0
+    );
+    assert_eq!(
+        world
+            .delivery_service()
+            .key_package_count(&world.client("Alice").did),
+        fixture.packages_before,
+        "all existing reservations and remaining KeyPackages must survive"
+    );
+    for (conversation_id, group_id, epoch) in &fixture.conversations {
+        assert_eq!(
+            world
+                .delivery_service()
+                .bootstrap_reset_group_call_count(conversation_id),
+            0
+        );
+        assert_eq!(
+            world
+                .client("Alice")
+                .orchestrator
+                .mls_context()
+                .get_epoch(group_id.clone())
+                .unwrap(),
+            *epoch,
+            "the active sibling's group must keep its original epoch"
+        );
+        let device = world.client("AliceDev2");
+        assert!(
+            device
+                .orchestrator
+                .mls_context()
+                .get_epoch(group_id.clone())
+                .is_err(),
+            "invalid evidence must not fabricate a local group"
+        );
+        assert!(device.storage.needs_rejoin(conversation_id).await.unwrap());
+        assert_eq!(
+            device
+                .storage
+                .get_conversation_state(conversation_id)
+                .await
+                .unwrap(),
+            Some(ConversationState::NeedsRejoin)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_recovery_batch_rejects_missing_or_malformed_inventory_expiry() {
+    for (case, expiry) in invalid_expiries() {
+        let fixture = outstanding_recovery_batch().await;
+        let world = &fixture.world;
+        let sessions_before = count_operations(world, CanonicalOperation::GetConversations);
+        let inbox_before = count_operations(world, CanonicalOperation::GetLeafRecoveryInbox);
+        world
+            .delivery_service()
+            .set_next_inventory_result_for_test(Ok(inventory_page(expiry.clone(), None)));
+        // Matching malformed metadata in both readers must not bypass expiry
+        // validation or silently convert an absent value into unbound evidence.
+        world
+            .delivery_service()
+            .set_leaf_recovery_inbox_responses(vec![inventory_page(expiry, None)]);
+
+        let error = world
+            .client("AliceDev2")
+            .orchestrator
+            .run_deferred_recovery("malformed-inventory-expiry")
+            .await
+            .expect_err(&format!(
+                "{case} allocation expiry cannot authorize a batch"
+            ));
+
+        assert!(
+            matches!(error, OrchestratorError::InvalidInput(_)),
+            "{case}: expected an invalid inventory error, got {error:?}"
+        );
+        assert_eq!(
+            count_operations(world, CanonicalOperation::GetConversations) - sessions_before,
+            1
+        );
+        assert_eq!(
+            count_operations(world, CanonicalOperation::GetLeafRecoveryInbox),
+            inbox_before,
+            "{case}: reject before allocating any shared inbox evidence"
+        );
+        assert_batch_preserved(&fixture).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_recovery_batch_rejects_missing_malformed_or_changed_inventory_continuation_expiry() {
+    let mut cases = invalid_expiries();
+    cases.push(("changed", Some(json!("2026-08-20T12:00:01.000Z"))));
+    for (case, expiry) in cases {
+        let fixture = outstanding_recovery_batch().await;
+        let world = &fixture.world;
+        let sessions_before = count_operations(world, CanonicalOperation::GetConversations);
+        let inbox_before = count_operations(world, CanonicalOperation::GetLeafRecoveryInbox);
+        world
+            .delivery_service()
+            .queue_inventory_result_for_test(Ok(inventory_page(
+                valid_expiry(),
+                Some("inventory-page-two"),
+            )));
+        world
+            .delivery_service()
+            .queue_inventory_result_for_test(Ok(inventory_page(expiry, None)));
+
+        let error = world
+            .client("AliceDev2")
+            .orchestrator
+            .run_deferred_recovery("changed-inventory-continuation-expiry")
+            .await
+            .expect_err(&format!(
+                "{case} continuation expiry cannot authorize a batch"
+            ));
+
+        assert!(
+            matches!(error, OrchestratorError::InvalidInput(_)),
+            "{case}: expected an invalid inventory error, got {error:?}"
+        );
+        assert_eq!(
+            count_operations(world, CanonicalOperation::GetConversations) - sessions_before,
+            2
+        );
+        assert_eq!(
+            count_operations(world, CanonicalOperation::GetLeafRecoveryInbox),
+            inbox_before,
+            "{case}: all inventory pages must agree before sharing inbox evidence"
+        );
+        assert_batch_preserved(&fixture).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_recovery_batch_rejects_missing_malformed_or_changed_inbox_expiry_on_every_page() {
+    for bad_page_index in 0..=1 {
+        let mut cases = invalid_expiries();
+        cases.push(("changed", Some(json!("2026-08-20T12:00:01.000Z"))));
+        for (case, expiry) in cases {
+            let fixture = outstanding_recovery_batch().await;
+            let world = &fixture.world;
+            let sessions_before = count_operations(world, CanonicalOperation::GetConversations);
+            let inbox_before = count_operations(world, CanonicalOperation::GetLeafRecoveryInbox);
+            let mut pages = Vec::new();
+            if bad_page_index == 1 {
+                pages.push(inventory_page(valid_expiry(), Some("inbox-page-two")));
+            }
+            pages.push(inventory_page(expiry, None));
+            world
+                .delivery_service()
+                .set_leaf_recovery_inbox_responses(pages);
+
+            let error = world
+                .client("AliceDev2")
+                .orchestrator
+                .run_deferred_recovery("malformed-inbox-expiry")
+                .await
+                .expect_err(&format!(
+                    "{case} inbox expiry on page {bad_page_index} cannot authorize a batch"
+                ));
+
+            assert!(
+                matches!(error, OrchestratorError::InvalidInput(_)),
+                "{case}: expected an invalid inbox error, got {error:?}"
+            );
+            assert_eq!(
+                count_operations(world, CanonicalOperation::GetConversations) - sessions_before,
+                1
+            );
+            assert_eq!(
+                count_operations(world, CanonicalOperation::GetLeafRecoveryInbox) - inbox_before,
+                bad_page_index + 1
+            );
+            assert_batch_preserved(&fixture).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_recovery_batch_shares_paginated_inbox_with_unchanged_valid_expiry() {
+    let fixture = outstanding_recovery_batch().await;
+    let world = &fixture.world;
+    let sessions_before = count_operations(world, CanonicalOperation::GetConversations);
+    let inbox_before = count_operations(world, CanonicalOperation::GetLeafRecoveryInbox);
+    for next in [Some("inventory-page-two"), None] {
+        world
+            .delivery_service()
+            .queue_inventory_result_for_test(Ok(inventory_page(valid_expiry(), next)));
+    }
+    world
+        .delivery_service()
+        .set_leaf_recovery_inbox_responses(vec![
+            inventory_page(valid_expiry(), Some("inbox-page-two")),
+            inventory_page(valid_expiry(), None),
+        ]);
+
+    let report = world
+        .client("AliceDev2")
+        .orchestrator
+        .run_deferred_recovery("valid-paginated-expiry")
+        .await
+        .expect("valid bound expiry remains usable by both batch readers");
+
+    assert_eq!(report.failed, 0);
+    assert_eq!(report.waiting, 2);
+    assert_eq!(
+        count_operations(world, CanonicalOperation::GetConversations) - sessions_before,
+        2
+    );
+    assert_eq!(
+        count_operations(world, CanonicalOperation::GetLeafRecoveryInbox) - inbox_before,
+        2,
+        "the same two-page inbox is shared by both waiting conversations"
+    );
+    assert_batch_preserved(&fixture).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
