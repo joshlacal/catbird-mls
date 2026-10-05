@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use labyrinth::client::{
-    Backends, CompositeDirectory, Labyrinth, LoadedMessage, PurgeReport, SystemClock,
+    delete_account_remote, Backends, CompositeDirectory, Labyrinth, LoadedMessage, PurgeReport,
+    RedactedMessage, RepinProposal, RosterExclusion, SystemClock, ThreadList,
 };
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PdsRecords};
@@ -47,6 +48,10 @@ pub struct HistoryPage {
     /// False if mls-ds refused the conversation's sender records; only the
     /// owner archive is then included.
     pub space_readable: bool,
+    /// Redacted messages, each labelled by what proves it: `by_author`
+    /// ("unsent"), `account_deleted` (signed by the sequencer DS), or
+    /// `removed_by_server` (nothing proves why).
+    pub redacted: Vec<RedactedMessage>,
 }
 
 /// What importing a conversation's history into local storage did.
@@ -76,8 +81,7 @@ impl SessionDeps {
     fn backends(&self) -> Backends {
         let t = self.transport.clone();
         let ds = Box::new(XrpcDirectory::new(t.clone()));
-        let (directory, publishers): (Box<dyn MailboxDirectory + Send>, Vec<_>) = match &self.pds
-        {
+        let (directory, publishers): (Box<dyn MailboxDirectory + Send>, Vec<_>) = match &self.pds {
             Some(pds) => (
                 Box::new(CompositeDirectory::new(
                     Box::new(PdsDirectory::new(pds.clone())),
@@ -96,6 +100,21 @@ impl SessionDeps {
             publishers,
             clock: Box::new(SystemClock),
         }
+    }
+
+    /// The remote half of an account deletion, without any client state:
+    /// retract the PDS `mailboxKeys` records (when configured), then mls-ds
+    /// `deleteAccountData`. Idempotent; the retry after
+    /// [`LabyrinthSession::purge_account`] reported `remote_pending`.
+    pub fn delete_account_remote(&self) -> labyrinth::Result<()> {
+        let mailbox = XrpcMailboxStore::new(&self.did, self.transport.clone());
+        let pds = self
+            .pds
+            .as_ref()
+            .map(|p| PdsPublisher::new(&self.did, p.clone()));
+        let publishers: Vec<&dyn KeyPublisher> =
+            pds.iter().map(|p| p as &dyn KeyPublisher).collect();
+        delete_account_remote(&mailbox, &publishers)
     }
 
     /// With a PDS directory: makes sure the account's PDS carries its
@@ -223,22 +242,55 @@ impl LabyrinthSession {
     /// account removal). The session must be dropped afterwards; the
     /// server-side mailbox is untouched.
     pub fn forget(&mut self) -> Result<()> {
-        self.vault.delete(&self.did).map_err(OrchestratorError::Mls)?;
+        self.vault
+            .delete(&self.did)
+            .map_err(OrchestratorError::Mls)?;
         self.persisted = None;
         Ok(())
     }
 
     /// Deletes the account's Labyrinth data everywhere: the server-side
-    /// account deletion (`deleteAccountData`: mailbox purge plus an
-    /// unsigned redaction of every item the account wrote), the PDS
+    /// account deletion (`deleteAccountData`: mailbox purge plus a
+    /// sequencer redaction of every item the account wrote), the PDS
     /// `mailboxKeys` records, then this device's saved state. Drop the
     /// session afterwards.
+    ///
+    /// The saved state is erased whatever happens remotely: a remote
+    /// failure (including a chat-key signing failure) comes back in
+    /// [`PurgeReport::remote_pending`] for the caller to retry with
+    /// [`SessionDeps::delete_account_remote`].
     pub fn purge_account(&mut self) -> Result<PurgeReport> {
         let out = self.lab.purge_account();
-        surface(&self.fault)?;
-        let report = out.map_err(map_error)?;
+        let fault = self.fault.take();
         self.forget()?;
+        let mut report = out.unwrap_or_else(|e| PurgeReport {
+            remote_pending: Some(e),
+            ..PurgeReport::default()
+        });
+        if let Some(e) = fault {
+            report
+                .remote_pending
+                .get_or_insert(labyrinth::Error::Backend(format!("chat key signer: {e}")));
+        }
         Ok(report)
+    }
+
+    /// The safety-number change to show before re-pinning `did` after it
+    /// reset its mailbox ([CB-29]); changes nothing.
+    pub fn propose_repin(&mut self, did: &str) -> Result<RepinProposal> {
+        self.run(|lab| lab.propose_repin(did))
+    }
+
+    /// Re-pins `did` to the head the user confirmed (see the crate's
+    /// `Labyrinth::repin_peer`) and saves the pin.
+    pub fn repin_peer(&mut self, did: &str, confirmed_head: [u8; 32]) -> Result<()> {
+        self.run(|lab| lab.repin_peer(did, &confirmed_head).map(|_| ()))
+    }
+
+    /// The conversations this account has history in; `incomplete` names
+    /// sequencer DSes mls-ds could not reach (the list may miss theirs).
+    pub fn list_threads(&mut self) -> Result<ThreadList> {
+        self.run(|lab| lab.list_threads_report())
     }
 
     /// [CB-36] After chat device `chat_key` was revoked, revokes the
@@ -256,6 +308,19 @@ impl LabyrinthSession {
     /// account revoke it with [`revoke_device`](Self::revoke_device).
     pub fn device_key_hex(&self) -> String {
         hex::encode(self.lab.device_public().device_key_pub.0)
+    }
+
+    /// Runs `f`, surfaces a signing failure and saves the state, but
+    /// hands back `f`'s own error instead of mapping it: the outer error
+    /// is a signer or local-state failure, the inner one Labyrinth's.
+    fn try_run<R>(
+        &mut self,
+        f: impl FnOnce(&mut Labyrinth) -> labyrinth::Result<R>,
+    ) -> Result<labyrinth::Result<R>> {
+        let out = f(&mut self.lab);
+        surface(&self.fault)?;
+        self.save()?;
+        Ok(out)
     }
 
     /// Runs `f`, surfaces a signing failure, then saves the state.
@@ -335,16 +400,54 @@ impl LabyrinthSession {
 
     /// Whether this account's copy of `message_id` is already stored in the
     /// conversation (live or since unsent): the archive queue's duplicate
-    /// check after a crash.
-    pub fn has_archived(&mut self, conversation_id: &str, message_id: &str) -> Result<bool> {
+    /// check after a crash. Outer error: signer or local state; inner:
+    /// the lookup.
+    pub fn has_archived(
+        &mut self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<labyrinth::Result<bool>> {
         let did = self.did.clone();
-        let h = self.run(|lab| lab.load_message(conversation_id, message_id))?;
-        Ok(h.messages
-            .iter()
-            .any(|m| m.message_id == message_id && m.sender.as_deref() == Some(did.as_str()))
-            || h.redacted
+        let h = self.try_run(|lab| lab.load_message(conversation_id, message_id))?;
+        Ok(h.map(|h| {
+            h.messages
                 .iter()
-                .any(|r| r.message_id == message_id && r.sender == did))
+                .any(|m| m.message_id == message_id && m.sender.as_deref() == Some(did.as_str()))
+                || h.redacted
+                    .iter()
+                    .any(|r| r.message_id == message_id && r.sender == did)
+        }))
+    }
+
+    /// Archives one conversation's sent messages (`(messageId,
+    /// timestampMs, frame)`) for `members` and writes them. A member whose
+    /// epoch fails a trust check is left out and returned, never fatal.
+    /// On a Labyrinth error nothing of this conversation stays buffered.
+    /// Outer error: signer or local state; inner: Labyrinth.
+    pub fn archive_conversation(
+        &mut self,
+        conversation_id: &str,
+        members: &[String],
+        items: &[(String, u64, Vec<u8>)],
+    ) -> Result<labyrinth::Result<Vec<RosterExclusion>>> {
+        let out = self.try_run(|lab| {
+            let members: Vec<&str> = members.iter().map(String::as_str).collect();
+            let r = lab.resolve_roster_report(&members)?;
+            for (message_id, ts, frame) in items {
+                lab.archive_outgoing(conversation_id, &r.roster, message_id, *ts, frame)?;
+            }
+            lab.flush_thread(conversation_id)?;
+            Ok(r.excluded)
+        });
+        if !matches!(out, Ok(Ok(_))) {
+            self.lab.discard_pending(conversation_id);
+        }
+        out
+    }
+
+    /// Drops this conversation's unwritten buffer (after a failure).
+    pub fn discard_pending(&mut self, conversation_id: &str) {
+        self.lab.discard_pending(conversation_id);
     }
 
     /// Decrypts the conversation's history in `range`.
@@ -357,6 +460,7 @@ impl LabyrinthSession {
             undecryptable: h.undecryptable.len(),
             space_readable: h.space_readable,
             messages: h.messages,
+            redacted: h.redacted,
         })
     }
 

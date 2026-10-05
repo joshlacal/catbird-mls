@@ -12,6 +12,7 @@ use labyrinth::store::TimeRange;
 
 use super::super::queue::{flush_queue, ArchiveQueueStore, PendingArchive, QueueConfig};
 use super::super::session::LabyrinthSession;
+use super::super::status::ArchiveStatus;
 use super::*;
 use crate::orchestrator::error::Result as OResult;
 
@@ -22,12 +23,29 @@ const B1: &str = "22222222-2222-4222-8222-222222222222";
 /// An in-memory queue whose `remove` can be made to fail (a crash between
 /// the server write and the local removal).
 #[derive(Default)]
-struct MemQueue {
+pub(super) struct MemQueue {
     rows: Mutex<Vec<PendingArchive>>,
     fail_remove: AtomicBool,
+    status: Mutex<HashMap<String, ArchiveStatus>>,
 }
 
 impl ArchiveQueueStore for MemQueue {
+    fn load_status(&self, did: &str) -> OResult<ArchiveStatus> {
+        Ok(self
+            .status
+            .lock()
+            .unwrap()
+            .get(did)
+            .cloned()
+            .unwrap_or_default())
+    }
+    fn save_status(&self, did: &str, status: &ArchiveStatus) -> OResult<()> {
+        self.status
+            .lock()
+            .unwrap()
+            .insert(did.to_owned(), status.clone());
+        Ok(())
+    }
     fn put(&self, row: &PendingArchive) -> OResult<()> {
         let mut rows = self.rows.lock().unwrap();
         rows.retain(|r| !(r.did == row.did && r.message_id == row.message_id));
@@ -58,7 +76,7 @@ impl ArchiveQueueStore for MemQueue {
     }
 }
 
-fn appends(gw: &RefGateway) -> usize {
+pub(super) fn appends(gw: &RefGateway) -> usize {
     gw.log
         .lock()
         .unwrap()
@@ -79,7 +97,7 @@ fn queue(q: &MemQueue, n: u8) {
 }
 
 /// Message ids Bob reads, with how many copies each.
-fn copies(b: &mut LabyrinthSession) -> Vec<(String, usize)> {
+pub(super) fn copies(b: &mut LabyrinthSession) -> Vec<(String, usize)> {
     let page = b.load_history(THREAD, TimeRange::ALL).unwrap();
     let mut out: Vec<(String, usize)> = Vec::new();
     for m in page.messages {
@@ -104,10 +122,13 @@ fn one_flush_writes_one_batch_for_many_queued_messages() {
         queue(&q, n);
     }
     let before = appends(&gw);
-    assert_eq!(flush_queue(&mut a, &alice.deps, &q).unwrap(), 3);
+    assert_eq!(flush_queue(&mut a, &alice.deps, &q).unwrap().archived, 3);
     assert_eq!(appends(&gw) - before, 1, "three messages, one appendBatch");
     assert!(q.list(ALICE).unwrap().is_empty());
-    assert_eq!(flush_queue(&mut a, &alice.deps, &q).unwrap(), 0);
+    assert_eq!(
+        flush_queue(&mut a, &alice.deps, &q).unwrap().left_queue(),
+        0
+    );
     let ids: Vec<String> = copies(&mut b).into_iter().map(|(id, _)| id).collect();
     assert_eq!(ids, ["m-1", "m-2", "m-3"]);
 }
@@ -134,7 +155,7 @@ fn a_crash_after_the_write_does_not_archive_twice() {
     q.fail_remove.store(false, Ordering::SeqCst);
     let mut a = alice.deps.clone().open().unwrap().unwrap();
     let writes = appends(&gw);
-    assert_eq!(flush_queue(&mut a, &alice.deps, &q).unwrap(), 2);
+    assert_eq!(flush_queue(&mut a, &alice.deps, &q).unwrap().archived, 2);
     assert_eq!(appends(&gw), writes, "nothing was archived twice");
     assert_eq!(copies(&mut b), [("m-1".into(), 1), ("m-2".into(), 1)]);
 }
@@ -149,12 +170,16 @@ fn a_crash_before_the_write_archives_on_retry() {
     let q = MemQueue::default();
     queue(&q, 1);
     *gw.fail_nsid.lock().unwrap() = Some("blue.catbird.labyrinth.appendBatch".into());
-    assert!(flush_queue(&mut a, &alice.deps, &q).is_err());
+    let r = flush_queue(&mut a, &alice.deps, &q).unwrap();
+    assert_eq!((r.archived, r.failed_conversations), (0, 1));
+    // A dropped connection is transient: recorded, not counted.
+    let rows = q.list(ALICE).unwrap();
+    assert!(rows[0].last_error.is_some() && rows[0].failures == 0 && !rows[0].quarantined);
     drop(a);
     *gw.fail_nsid.lock().unwrap() = None;
     queue(&q, 2);
     let mut a = alice.deps.clone().open().unwrap().unwrap();
-    assert_eq!(flush_queue(&mut a, &alice.deps, &q).unwrap(), 2);
+    assert_eq!(flush_queue(&mut a, &alice.deps, &q).unwrap().archived, 2);
     assert_eq!(copies(&mut b), [("m-1".into(), 1), ("m-2".into(), 1)]);
 }
 
@@ -207,17 +232,29 @@ fn epochs_are_published_to_the_pds_and_cross_checked() {
     let alice = with_pds(alice, &repos);
     let mut a = alice.deps.clone().open().unwrap().unwrap();
     for rkey in ["self", "000000000000"] {
-        assert!(repos.lock().unwrap().contains_key(&(ALICE.into(), rkey.into())));
+        assert!(repos
+            .lock()
+            .unwrap()
+            .contains_key(&(ALICE.into(), rkey.into())));
     }
     // Bob, enabled with the PDS, publishes at genesis and reads Alice
     // through the PDS + mls-ds composite.
     let bob = with_pds(Device::new(&gw, BOB, B1, 2), &repos);
     let mut b = bob.deps.clone().enable().unwrap();
-    assert!(repos.lock().unwrap().contains_key(&(BOB.into(), "self".into())));
+    assert!(repos
+        .lock()
+        .unwrap()
+        .contains_key(&(BOB.into(), "self".into())));
     let members = vec![ALICE.to_owned(), BOB.to_owned()];
     b.archive_sent(THREAD, &members, "m-1", 1_791_000_000_000, b"hi")
         .unwrap();
-    assert_eq!(a.load_history(THREAD, TimeRange::ALL).unwrap().messages.len(), 1);
+    assert_eq!(
+        a.load_history(THREAD, TimeRange::ALL)
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
 
     // A PDS serving a different head for Bob is a directory fork: Alice
     // refuses to address him.
@@ -226,7 +263,12 @@ fn epochs_are_published_to_the_pds_and_cross_checked() {
         .lock()
         .unwrap()
         .insert((BOB.into(), "self".into()), alice_self);
-    let fresh = Device::new(&gw, "did:plc:carol", "44444444-4444-4444-8444-444444444444", 4);
+    let fresh = Device::new(
+        &gw,
+        "did:plc:carol",
+        "44444444-4444-4444-8444-444444444444",
+        4,
+    );
     let mut c = with_pds(fresh, &repos).deps.enable().unwrap();
     let e = c
         .archive_sent(THREAD, &members, "m-2", 1_791_000_000_100, b"x")
@@ -241,7 +283,11 @@ fn revoking_a_chat_device_revokes_its_labyrinth_device() {
     let mut a1 = alice1.deps.clone().enable().unwrap();
     let code = a1.create_recovery_code().unwrap();
     let alice2 = Device::new(&gw, ALICE, A2, 3);
-    let a2 = alice2.deps.clone().restore_with_recovery_code(&code).unwrap();
+    let a2 = alice2
+        .deps
+        .clone()
+        .restore_with_recovery_code(&code)
+        .unwrap();
     let chat2 = alice2.deps.signer.public_key();
     drop(a2);
     // Unknown chat key: nothing to revoke.

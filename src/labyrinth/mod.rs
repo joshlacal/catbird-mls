@@ -20,6 +20,8 @@
 //! | One account's synchronous Labyrinth session | [`session`] |
 //! | Orchestrator hooks (enable, restore, archive, history, revoke, leave, sign-out) | [`hooks`] |
 //! | Background archive queue (batched, crash-safe) | [`queue`] |
+//! | One flush, conversation by conversation | [`flush`] |
+//! | Exclusions, dropped rows, pending remote deletion | [`status`] |
 //! | UniFFI methods on `OrchestratorBridge` | `ffi.rs` (a child module of `orchestrator_bridge`) |
 //!
 //! The crate is synchronous and runtime-free; the orchestrator is async.
@@ -35,11 +37,14 @@
 //! (bindings not yet regenerated), and the `*_labyrinth_mailbox_keys`
 //! callback methods give the PDS half of the directory.
 
+pub mod flush;
 pub mod hooks;
+pub mod hooks_status;
 pub mod queue;
 pub mod session;
 pub mod signer;
 pub mod state;
+pub mod status;
 pub mod transport;
 pub mod write_auth;
 
@@ -50,10 +55,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::orchestrator::error::OrchestratorError;
 
+pub use flush::FlushReport;
+pub use hooks_status::ArchiveStatusReport;
 pub use queue::{ArchiveQueueStore, ArchiveWorker, MlsArchiveQueue, PendingArchive, QueueConfig};
 pub use session::{ArchiveBatch, HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
 pub use signer::{ChatKeySigner, OrchestratorChatSigner, SignerFault};
 pub use state::{MlsStateVault, StateVault, STATE_NAMESPACE};
+pub use status::ArchiveStatus;
 pub use transport::{ApiGateway, GatewayXrpcTransport, LabyrinthGateway};
 
 /// One Labyrinth XRPC, ready for the platform gateway.

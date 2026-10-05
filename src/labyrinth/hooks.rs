@@ -14,11 +14,12 @@ use labyrinth::store::TimeRange;
 use serde_json::Value;
 
 use super::queue::{
-    flush_in_slot, ArchiveQueueStore, MlsArchiveQueue, PendingArchive, QueueConfig,
+    enqueue, flush_in_slot, ArchiveQueueStore, MlsArchiveQueue, PendingArchive, QueueConfig,
 };
 use super::session::{HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
 use super::signer::{ChatKeySigner, OrchestratorChatSigner};
 use super::state::MlsStateVault;
+use super::status::{now_ms, PendingDeletion};
 use super::transport::{ApiGateway, GatewayXrpcTransport};
 use crate::orchestrator::api_client::MLSAPIClient;
 use crate::orchestrator::canonical_transport::derive_key_id;
@@ -45,7 +46,7 @@ pub(crate) fn roster_members(conversation_state: &Value) -> Vec<String> {
         .collect()
 }
 
-fn join_error(e: tokio::task::JoinError) -> OrchestratorError {
+pub(super) fn join_error(e: tokio::task::JoinError) -> OrchestratorError {
     OrchestratorError::Api(format!("labyrinth task failed: {e}"))
 }
 
@@ -57,7 +58,7 @@ where
     M: MlsCryptoContext + 'static,
 {
     /// Session inputs for the current account and chat device.
-    async fn labyrinth_deps(&self) -> Result<SessionDeps> {
+    pub(super) async fn labyrinth_deps(&self) -> Result<SessionDeps> {
         let did = self.require_user_did().await?;
         let device_id = self.require_actor_device_id().await?;
         let public = self
@@ -103,7 +104,7 @@ where
     /// `open` decides what happens when the slot holds no session for the
     /// current account and chat key: it receives the deps and returns the
     /// session to install, or `None` to skip `f` (Labyrinth not enabled).
-    async fn with_labyrinth<R: Send + 'static>(
+    pub(super) async fn with_labyrinth<R: Send + 'static>(
         &self,
         open: impl FnOnce(SessionDeps) -> Result<Option<LabyrinthSession>> + Send + 'static,
         f: impl FnOnce(&mut LabyrinthSession) -> Result<R> + Send + 'static,
@@ -148,7 +149,18 @@ where
     /// key (hex). If another device already created the mailbox this fails
     /// with a `labyrinth: store conflict` error; restore with a recovery
     /// code instead.
+    ///
+    /// A previous account deletion whose remote half is still pending is
+    /// retried first; while it fails, enabling is refused (a new mailbox
+    /// would be erased by the retry).
     pub async fn labyrinth_enable(&self) -> Result<String> {
+        if !self.labyrinth_retry_remote_deletion().await? {
+            return Err(OrchestratorError::Api(
+                "labyrinth: the previous account deletion is still pending on the server; \
+                 retry when online"
+                    .into(),
+            ));
+        }
         let key = self
             .with_labyrinth(|deps| deps.enable().map(Some), |s| Ok(s.device_key_hex()))
             .await?
@@ -284,7 +296,11 @@ where
         self.labyrinth_close();
         let queue = self.labyrinth_queue_store();
         tokio::task::spawn_blocking(move || {
-            let had = deps.vault.load(&did).map_err(OrchestratorError::Mls)?.is_some();
+            let had = deps
+                .vault
+                .load(&did)
+                .map_err(OrchestratorError::Mls)?
+                .is_some();
             deps.vault.delete(&did).map_err(OrchestratorError::Mls)?;
             queue.clear(&did)?;
             Ok(had)
@@ -297,18 +313,60 @@ where
     /// `deleteAccountData`, PDS `mailboxKeys`), then this device's saved
     /// state and archive queue. Other devices of the account lose their
     /// mailbox; their own saved state is erased when they next sign out.
+    ///
+    /// The user can always delete: this device's state and queue are
+    /// erased even when the remote half fails, or when the session cannot
+    /// even be opened (offline). The remote half is then recorded as a
+    /// pending deletion ([`PurgeReport::remote_pending`]; status
+    /// `pending_remote_deletion`), retried in the background, at
+    /// [`Self::labyrinth_flush_archive`] and before
+    /// [`Self::labyrinth_enable`].
     pub async fn labyrinth_delete_account(&self) -> Result<PurgeReport> {
         self.labyrinth_stop_archive_worker();
-        let report = self
-            .with_labyrinth(SessionDeps::open, |s| s.purge_account())
-            .await?
-            .ok_or_else(not_enabled)?;
-        self.labyrinth_close();
-        let did = self.require_user_did().await?;
+        let deps = self.labyrinth_deps().await?;
+        let retry_deps = deps.clone();
+        let slot = self.labyrinth_slot().clone();
         let queue = self.labyrinth_queue_store();
-        tokio::task::spawn_blocking(move || queue.clear(&did))
-            .await
-            .map_err(join_error)??;
+        let report = tokio::task::spawn_blocking(move || {
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            let key = deps.signer.public_key();
+            let open = match guard.take() {
+                Some(s) if s.is_for(&deps.did, &key) => Ok(Some(s)),
+                _ => deps.clone().open(),
+            };
+            let saved = deps.vault.load(&deps.did).map_err(OrchestratorError::Mls)?;
+            let report = match open {
+                Ok(Some(mut s)) => s.purge_account()?,
+                Ok(None) if saved.is_none() => return Err(not_enabled()),
+                Ok(None) => PurgeReport::default(),
+                Err(e) => PurgeReport {
+                    remote_pending: Some(labyrinth::Error::Backend(format!(
+                        "could not open the session: {e}"
+                    ))),
+                    ..PurgeReport::default()
+                },
+            };
+            deps.vault
+                .delete(&deps.did)
+                .map_err(OrchestratorError::Mls)?;
+            queue.clear(&deps.did)?;
+            let pending = report.remote_pending.as_ref().map(|e| PendingDeletion {
+                attempts: 1,
+                last_error: e.to_string(),
+                since_ms: now_ms(),
+            });
+            queue.update_status(&deps.did, &mut |s| {
+                s.pending_remote_deletion = pending.clone();
+                s.excluded_members.clear();
+            })?;
+            Ok(report)
+        })
+        .await
+        .map_err(join_error)??;
+        if let Some(error) = &report.remote_pending {
+            tracing::warn!(%error, "labyrinth: remote account deletion failed; will retry");
+            self.labyrinth_spawn_deletion_retry(retry_deps);
+        }
         Ok(report)
     }
 
@@ -344,14 +402,19 @@ where
     /// Archives every pending sent message now (for example before the app
     /// suspends, or at launch to drain what a killed process left). Returns
     /// how many left the queue.
+    /// Also retries a pending remote account deletion first.
     pub async fn labyrinth_flush_archive(&self) -> Result<usize> {
+        if !self.labyrinth_retry_remote_deletion().await? {
+            return Ok(0);
+        }
         let deps = self.labyrinth_deps().await?;
-        let n = flush_in_slot(
+        let report = flush_in_slot(
             self.labyrinth_slot().clone(),
             deps.clone(),
             self.labyrinth_queue_store(),
         )
         .await?;
+        let n = report.left_queue();
         self.labyrinth_archive().flushed(n);
         self.labyrinth_start_archive_worker(deps).await?;
         Ok(n)
@@ -370,7 +433,8 @@ where
     ) {
         let result = async {
             let deps = self.labyrinth_deps().await?;
-            let row = PendingArchive::new(&deps.did, conversation_id, message_id, timestamp_ms, frame);
+            let row =
+                PendingArchive::new(&deps.did, conversation_id, message_id, timestamp_ms, frame);
             // Enabled on this device = a saved state exists.
             let (vault, did) = (deps.vault.clone(), deps.did.clone());
             let enabled = tokio::task::spawn_blocking(move || vault.load(&did))
@@ -385,10 +449,12 @@ where
             // pending, and this one is counted by `enqueued`.
             self.labyrinth_start_archive_worker(deps).await?;
             let store = self.labyrinth_queue_store();
-            tokio::task::spawn_blocking(move || store.put(&row))
+            let queued = tokio::task::spawn_blocking(move || enqueue(store.as_ref(), &row))
                 .await
                 .map_err(join_error)??;
-            self.labyrinth_archive().enqueued();
+            if queued {
+                self.labyrinth_archive().enqueued();
+            }
             Ok::<_, OrchestratorError>(())
         }
         .await;
@@ -416,7 +482,7 @@ where
     }
 }
 
-fn not_enabled() -> OrchestratorError {
+pub(super) fn not_enabled() -> OrchestratorError {
     OrchestratorError::InvalidInput(
         "labyrinth: history backup is not enabled on this device".into(),
     )

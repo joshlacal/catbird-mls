@@ -16,8 +16,8 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
 use labyrinth::client::MessageSource;
 use labyrinth::store::memory::MemoryBackend;
-use labyrinth::store::xrpc::server::MemoryXrpcServer;
 use labyrinth::store::xrpc::read_auth::{verify_read, READ_HEADER, READ_SIGNATURE_HEADER};
+use labyrinth::store::xrpc::server::MemoryXrpcServer;
 use labyrinth::store::xrpc::{map_error, XrpcError};
 use labyrinth::store::TimeRange;
 use serde::Deserialize;
@@ -133,6 +133,8 @@ struct RefGateway {
     log: Arc<Mutex<Vec<LabyrinthRequest>>>,
     /// Requests to this NSID fail with no response (a dropped connection).
     fail_nsid: Arc<Mutex<Option<String>>>,
+    /// Requests to this NSID are refused with 403 and this error name.
+    refuse_nsid: Arc<Mutex<Option<(String, String)>>>,
 }
 
 fn reply(r: Result<Vec<u8>, XrpcError>) -> GatewayResponse {
@@ -162,6 +164,7 @@ impl RefGateway {
             devices: Arc::default(),
             log: Arc::default(),
             fail_nsid: Arc::default(),
+            refuse_nsid: Arc::default(),
         }
     }
 
@@ -299,6 +302,15 @@ impl LabyrinthGateway for RefGateway {
             return Err("connection dropped".into());
         }
         self.log.lock().unwrap().push(req.clone());
+        if let Some((_, name)) = self
+            .refuse_nsid
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|(n, _)| *n == req.nsid)
+        {
+            return Ok(refuse(403, name));
+        }
         Ok(match req.method.as_str() {
             "GET" => self.query(&req.path, Some(&req.headers)),
             _ => self.procedure(&req),
@@ -352,6 +364,8 @@ impl Device {
 
 #[path = "queue_tests.rs"]
 mod queue_tests;
+#[path = "review_tests.rs"]
+mod review_tests;
 
 // ── tests ───────────────────────────────────────────────────────────────
 
@@ -431,7 +445,10 @@ fn a_read_signed_by_another_key_is_refused() {
         .transport
         .query("blue.catbird.labyrinth.listDevices", &[])
         .unwrap_err();
-    assert_eq!((e.status, e.error.as_deref()), (401, Some("InvalidSignature")));
+    assert_eq!(
+        (e.status, e.error.as_deref()),
+        (401, Some("InvalidSignature"))
+    );
     // A failing signer sends nothing.
     let locked = Device::with_signer(
         &gw,
@@ -721,7 +738,10 @@ async fn orchestrator_archives_a_send_and_a_restored_device_imports_it() {
             .count()
     };
     assert_eq!(appends(&gw), 0, "the send itself wrote no batch");
-    assert_eq!(alice.orchestrator.labyrinth_flush_archive().await.unwrap(), 1);
+    assert_eq!(
+        alice.orchestrator.labyrinth_flush_archive().await.unwrap(),
+        1
+    );
     assert!(gw
         .log
         .lock()

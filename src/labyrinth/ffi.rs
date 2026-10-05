@@ -10,7 +10,7 @@
 //! platform build picks up this revision.
 
 use super::{OrchestratorBridge, OrchestratorBridgeError};
-use crate::labyrinth::{HistoryPage, ImportReport};
+use crate::labyrinth::{ArchiveStatusReport, HistoryPage, ImportReport};
 use labyrinth::client::MessageSource;
 
 /// One decrypted history message.
@@ -28,12 +28,146 @@ pub struct FfiLabyrinthMessage {
     pub conflict: bool,
 }
 
+/// How a redacted history message must be labelled.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiLabyrinthRedactionLabel {
+    /// Signed by one of the author's chat devices: "unsent".
+    Unsent,
+    /// Signed by the conversation's sequencer DS: "deleted (account
+    /// removed)".
+    AccountDeleted,
+    /// Nothing proves why: "removed by server".
+    RemovedByServer,
+}
+
+/// One redacted history message.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiLabyrinthRedacted {
+    pub message_id: String,
+    pub sender_did: String,
+    pub timestamp_ms: u64,
+    pub label: FfiLabyrinthRedactionLabel,
+}
+
 /// One page of decrypted history.
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct FfiLabyrinthHistory {
     pub messages: Vec<FfiLabyrinthMessage>,
     pub undecryptable_count: u64,
     pub space_readable: bool,
+    pub redacted: Vec<FfiLabyrinthRedacted>,
+}
+
+/// What account deletion did.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiLabyrinthDeletion {
+    /// Publishers that could not retract their records.
+    pub publishers_not_retracted: u64,
+    /// The remote half failed with this error and is retried in the
+    /// background; this device's state is erased regardless.
+    pub remote_pending: Option<String>,
+}
+
+/// A queued message the archive skips until retried.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiLabyrinthQuarantined {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub failures: u32,
+    pub last_error: Option<String>,
+}
+
+/// A member left out of a conversation's archive (it cannot read the
+/// messages archived meanwhile).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiLabyrinthExcludedMember {
+    pub conversation_id: String,
+    pub did: String,
+    pub reason: String,
+    /// A pin conflict: offer `labyrinth_propose_repin(did)`.
+    pub needs_repin: bool,
+    pub at_ms: u64,
+}
+
+/// A queued message dropped unarchived.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiLabyrinthDropped {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub reason: String,
+    pub at_ms: u64,
+}
+
+/// What background Labyrinth work could not do.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiLabyrinthArchiveStatus {
+    pub pending: u64,
+    pub quarantined: Vec<FfiLabyrinthQuarantined>,
+    pub excluded_members: Vec<FfiLabyrinthExcludedMember>,
+    pub dropped: Vec<FfiLabyrinthDropped>,
+    /// The last error of an account deletion whose remote half is pending.
+    pub remote_deletion_pending: Option<String>,
+}
+
+/// A safety-number change to confirm before re-pinning a peer.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiLabyrinthRepinProposal {
+    pub did: String,
+    pub pinned_epoch: Option<u64>,
+    pub old_safety_number: Option<String>,
+    pub new_epoch: u64,
+    /// Pass back to `labyrinth_repin_peer` once the user accepts.
+    pub new_head_hex: String,
+    pub new_safety_number: String,
+}
+
+/// The conversations this account has history in.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct FfiLabyrinthThreads {
+    pub conversation_ids: Vec<String>,
+    /// Sequencer DSes mls-ds could not reach: the list may miss their
+    /// conversations.
+    pub incomplete_sequencers: Vec<String>,
+}
+
+fn status_to_ffi(r: ArchiveStatusReport) -> FfiLabyrinthArchiveStatus {
+    FfiLabyrinthArchiveStatus {
+        pending: r.pending as u64,
+        quarantined: r
+            .quarantined
+            .into_iter()
+            .map(|q| FfiLabyrinthQuarantined {
+                conversation_id: q.conversation_id,
+                message_id: q.message_id,
+                failures: q.failures,
+                last_error: q.last_error,
+            })
+            .collect(),
+        excluded_members: r
+            .status
+            .excluded_members
+            .into_iter()
+            .map(|x| FfiLabyrinthExcludedMember {
+                conversation_id: x.conversation_id,
+                did: x.did,
+                reason: x.reason,
+                needs_repin: x.needs_repin,
+                at_ms: x.at_ms,
+            })
+            .collect(),
+        dropped: r
+            .status
+            .dropped
+            .into_iter()
+            .map(|d| FfiLabyrinthDropped {
+                conversation_id: d.conversation_id,
+                message_id: d.message_id,
+                reason: d.reason,
+                at_ms: d.at_ms,
+            })
+            .collect(),
+        remote_deletion_pending: r.status.pending_remote_deletion.map(|p| p.last_error),
+    }
 }
 
 /// What importing a conversation's history stored.
@@ -49,6 +183,22 @@ fn history_to_ffi(page: HistoryPage) -> FfiLabyrinthHistory {
     FfiLabyrinthHistory {
         undecryptable_count: page.undecryptable as u64,
         space_readable: page.space_readable,
+        redacted: page
+            .redacted
+            .into_iter()
+            .map(|r| FfiLabyrinthRedacted {
+                label: if r.by_author {
+                    FfiLabyrinthRedactionLabel::Unsent
+                } else if r.account_deleted {
+                    FfiLabyrinthRedactionLabel::AccountDeleted
+                } else {
+                    FfiLabyrinthRedactionLabel::RemovedByServer
+                },
+                message_id: r.message_id,
+                sender_did: r.sender,
+                timestamp_ms: r.timestamp,
+            })
+            .collect(),
         messages: page
             .messages
             .into_iter()
@@ -138,16 +288,102 @@ impl OrchestratorBridge {
     /// a later sign-in restores with a recovery code. Returns whether any
     /// state was saved.
     pub fn labyrinth_sign_out(&self) -> Result<bool, OrchestratorBridgeError> {
-        Ok(crate::async_runtime::block_on(self.inner.labyrinth_sign_out())?)
+        Ok(crate::async_runtime::block_on(
+            self.inner.labyrinth_sign_out(),
+        )?)
     }
 
     /// Delete the account's history backup everywhere: the server mailbox
     /// and every message the account archived (shown to others as removed),
-    /// the PDS `mailboxKeys` records, and this device's state. Returns how
-    /// many publishers could not retract their records.
-    pub fn labyrinth_delete_account(&self) -> Result<u64, OrchestratorBridgeError> {
+    /// the PDS `mailboxKeys` records, and this device's state. This
+    /// device's state is erased even if the server cannot be reached; the
+    /// remote half is then retried (`remote_pending`).
+    pub fn labyrinth_delete_account(
+        &self,
+    ) -> Result<FfiLabyrinthDeletion, OrchestratorBridgeError> {
         let report = crate::async_runtime::block_on(self.inner.labyrinth_delete_account())?;
-        Ok(report.publishers_not_retracted as u64)
+        Ok(FfiLabyrinthDeletion {
+            publishers_not_retracted: report.publishers_not_retracted as u64,
+            remote_pending: report.remote_pending.map(|e| e.to_string()),
+        })
+    }
+
+    /// Retry a pending remote account deletion now. Returns true when
+    /// nothing is pending any more.
+    pub fn labyrinth_retry_remote_deletion(&self) -> Result<bool, OrchestratorBridgeError> {
+        Ok(crate::async_runtime::block_on(
+            self.inner.labyrinth_retry_remote_deletion(),
+        )?)
+    }
+
+    /// What background archiving and deletion could not do (show it):
+    /// quarantined messages, members left out of a conversation's archive
+    /// (with pin conflicts to resolve), dropped messages, and a pending
+    /// remote deletion.
+    pub fn labyrinth_archive_status(
+        &self,
+    ) -> Result<FfiLabyrinthArchiveStatus, OrchestratorBridgeError> {
+        Ok(status_to_ffi(crate::async_runtime::block_on(
+            self.inner.labyrinth_archive_status(),
+        )?))
+    }
+
+    /// Retry every quarantined message now. Returns how many there were.
+    pub fn labyrinth_retry_quarantined(&self) -> Result<u64, OrchestratorBridgeError> {
+        Ok(crate::async_runtime::block_on(self.inner.labyrinth_retry_quarantined())? as u64)
+    }
+
+    /// Forget the recorded exclusions and dropped messages (the user saw them).
+    pub fn labyrinth_clear_archive_reports(&self) -> Result<(), OrchestratorBridgeError> {
+        Ok(crate::async_runtime::block_on(
+            self.inner.labyrinth_clear_archive_reports(),
+        )?)
+    }
+
+    /// A contact's history keys changed (they reset their backup): the
+    /// safety-number change to show, like Signal. Fails if the new keys are
+    /// not vouched for by one of the contact's current chat devices.
+    pub fn labyrinth_propose_repin(
+        &self,
+        did: String,
+    ) -> Result<FfiLabyrinthRepinProposal, OrchestratorBridgeError> {
+        let p = crate::async_runtime::block_on(self.inner.labyrinth_propose_repin(&did))?;
+        Ok(FfiLabyrinthRepinProposal {
+            did: p.did,
+            pinned_epoch: p.pinned_seq,
+            old_safety_number: p.old_safety_number,
+            new_epoch: p.offered_seq,
+            new_head_hex: hex::encode(p.offered_head),
+            new_safety_number: p.new_safety_number,
+        })
+    }
+
+    /// The user accepted the new safety number: trust the contact's new
+    /// history keys (`new_head_hex` from the proposal).
+    pub fn labyrinth_repin_peer(
+        &self,
+        did: String,
+        new_head_hex: String,
+    ) -> Result<(), OrchestratorBridgeError> {
+        let head: [u8; 32] = hex::decode(&new_head_hex)
+            .ok()
+            .and_then(|h| h.try_into().ok())
+            .ok_or_else(|| OrchestratorBridgeError::InvalidInput {
+                message: "labyrinth: head must be 32 hex bytes".into(),
+            })?;
+        Ok(crate::async_runtime::block_on(
+            self.inner.labyrinth_repin_peer(&did, head),
+        )?)
+    }
+
+    /// The conversations this account has backed-up history in. A
+    /// non-empty `incomplete_sequencers` means the list is partial.
+    pub fn labyrinth_list_threads(&self) -> Result<FfiLabyrinthThreads, OrchestratorBridgeError> {
+        let l = crate::async_runtime::block_on(self.inner.labyrinth_list_threads())?;
+        Ok(FfiLabyrinthThreads {
+            conversation_ids: l.threads.into_iter().map(|t| t.thread_id).collect(),
+            incomplete_sequencers: l.incomplete,
+        })
     }
 
     /// Revoke another device of this account from the backup.
