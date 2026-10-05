@@ -65,6 +65,27 @@ Override by: editing `hooks::roster_members` or `labyrinth_import_history`.
 Chose: revocation is explicit, through `labyrinth_revoke_device(device_key_hex)`. Because: at `labyrinth-1.1` a Labyrinth device record has no link to a chat device id. The `gaps` lane in the labyrinth repo (`8b634487`, unmerged) adds a `chatBinding` ([CB-36]). Once that lands, `remove_device` can map a chat device to its Labyrinth device and revoke both.
 **Superseded 2026-10-05:** `remove_device` now revokes the chat device first (mls-ds requires that order), then calls `labyrinth_revoke_chat_device(chat key from listDevices.signaturePublicKey)`, which revokes every unrevoked Labyrinth device whose verified chat binding names that key (crate `Labyrinth::revoke_chat_device`) and opens a new epoch for each. Best effort: rotations already drop members whose chat device is not current, so a failure only delays the exclusion to the next rotation.
 
+## 2026-10-05 · catbird-mls · D10 Second security review: the queue fails per conversation and never silently; deletion never strands the user
+Context: the second Labyrinth security review found several problems. `flush_queue` was all-or-nothing, and one member whose epoch failed `resolve_roster` (`EpochRollback`, `Unattested`, `DirectoryFork`) aborted every archive. A peer who legitimately reset its mailbox stayed pinned-out forever. Reads carried no device signature. A failed remote deletion made account deletion fail. The crate half is in the labyrinth repo's `docs/DECISIONS.md` (2026-10-05, "Second security review, client half").
+
+Chose (provisional):
+- **Per-conversation flush** (`src/labyrinth/flush.rs`). Each conversation is resolved, archived and written on its own; one failing never holds back another.
+  - Roster members that fail a trust check are excluded and recorded (`status.rs`, `excluded_members`, `needs_repin` for pin conflicts). They are never dropped silently. Transient errors still fail the conversation, so a network blip never excludes anyone.
+  - A conversation mls-ds no longer has (`ConversationNotFound`) drops its rows, with the reason recorded.
+  - Non-transient failures count per row. After `MAX_FAILURES` = 5 a row is quarantined: kept, skipped, and reported until `labyrinth_retry_quarantined`. Transient failures are no response, 5xx, 408 and 429; they are recorded but not counted, and the worker backs off.
+  - The queue holds at most `MAX_QUEUE_ROWS` = 1000 rows per account. When full, the oldest quarantined row is evicted; if there is none, the new message is refused. Either way the drop is recorded.
+- **Re-pin.** `labyrinth_propose_repin(did)` returns the old and new safety numbers. `labyrinth_repin_peer(did, head)` accepts exactly the head the user saw. Both go through the crate's `propose_repin` / `repin_peer`, which require the new genesis to be attested by a current chat device. A re-pin clears that peer's pin-conflict exclusions and retries quarantined rows.
+- **Signed reads.** `GatewayXrpcTransport` adds `catbird-labyrinth-read` and `catbird-labyrinth-read-signature` to every Labyrinth query, signed by the chat device key over every wire parameter (including `actorDeviceId`). If the signer fails, nothing is sent. The format is byte-identical to mls-ds; both repos pin the golden vector `labyrinth-wire/tests/vectors/labyrinth_read_header.json`.
+- **Account deletion.** `labyrinth_delete_account` always erases this device's state and queue, even if the session cannot be opened (offline).
+  - A remote failure is recorded as `pending_remote_deletion`. It is retried by a background task (2 s doubling to 10 min), at `labyrinth_flush_archive` (call it at launch), and on demand (`labyrinth_retry_remote_deletion`).
+  - `labyrinth_enable` refuses while a deletion is pending, because the retry would erase the new mailbox.
+- **Status API** (UniFFI): `labyrinth_archive_status`, `labyrinth_retry_quarantined`, `labyrinth_clear_archive_reports`, `labyrinth_propose_repin`, `labyrinth_repin_peer`, `labyrinth_retry_remote_deletion`, and `labyrinth_list_threads`, which returns `incomplete_sequencers` when the list is partial.
+  - History pages now carry `redacted` with a label: `Unsent`, `AccountDeleted` (only when the sequencer DS signature verifies) or `RemovedByServer`.
+  - `labyrinth_delete_account` now returns a record with `remote_pending`. Bindings are not regenerated; run `ffi-propagate`.
+  - Known gap: there is no source for the mls-ds redaction key yet, so over mls-ds alone account deletions show as `RemovedByServer` (fail closed).
+
+Reversible until: any push of catbird-mls. Override by: editing `flush.rs`, `status.rs` and `hooks_status.rs`. Behaviour is pinned by `src/labyrinth/review_tests.rs`.
+
 ## Tests
 
 Gap-closure lane (2026-10-05) adds, in `src/labyrinth/queue_tests.rs` and `ffi.rs`: one flush → one `appendBatch` for many queued messages; a crash after the write does not archive twice; a crash before the write archives on retry; PDS publication, backfill and the fork refusal; chat-device revocation; sign-out and account deletion erase the vault; the orchestrator worker flushes by size and by time and nothing is written on the send path; `APIAdapter` forwards the Labyrinth and PDS callback methods.
