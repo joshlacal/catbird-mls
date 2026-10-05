@@ -4,12 +4,15 @@
 
 use std::sync::Arc;
 
-use labyrinth::client::{Backends, Labyrinth, LoadedMessage, SystemClock};
+use labyrinth::client::{
+    Backends, CompositeDirectory, Labyrinth, LoadedMessage, PurgeReport, SystemClock,
+};
 use labyrinth::sign::XVerifyingKey;
+use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PdsRecords};
 use labyrinth::store::xrpc::{
     XrpcDirectory, XrpcMailboxStore, XrpcOrf, XrpcThreadStore, XrpcTransport,
 };
-use labyrinth::store::TimeRange;
+use labyrinth::store::{KeyPublisher, MailboxDirectory, TimeRange};
 use labyrinth::virtual_device::Mechanism;
 use zeroize::Zeroizing;
 
@@ -25,6 +28,12 @@ pub struct SessionDeps {
     pub transport: Arc<dyn XrpcTransport>,
     pub signer: Arc<dyn ChatKeySigner>,
     pub vault: Arc<dyn StateVault>,
+    /// The PDS `mailboxKeys` records, when the platform implements them
+    /// (`OrchestratorAPICallback::labyrinth_pds_enabled`). With it, every
+    /// epoch is also published to the account's PDS and peers' heads are
+    /// cross-checked between PDS and mls-ds ([CB-28], [CB-29]); without
+    /// it mls-ds is the only directory (plan doc, D6).
+    pub pds: Option<Arc<dyn PdsRecords>>,
 }
 
 /// One page of decrypted history (`load_thread` over a time range).
@@ -66,16 +75,44 @@ fn surface(fault: &SignerFault) -> Result<()> {
 impl SessionDeps {
     fn backends(&self) -> Backends {
         let t = self.transport.clone();
+        let ds = Box::new(XrpcDirectory::new(t.clone()));
+        let (directory, publishers): (Box<dyn MailboxDirectory + Send>, Vec<_>) = match &self.pds
+        {
+            Some(pds) => (
+                Box::new(CompositeDirectory::new(
+                    Box::new(PdsDirectory::new(pds.clone())),
+                    ds,
+                )),
+                vec![Box::new(PdsPublisher::new(&self.did, pds.clone()))
+                    as Box<dyn KeyPublisher + Send>],
+            ),
+            None => (ds, Vec::new()),
+        };
         Backends {
             mailbox: Box::new(XrpcMailboxStore::new(&self.did, t.clone())),
             threads: Box::new(XrpcThreadStore::new(&self.did, t.clone())),
-            // Single directory: mls-ds. The PDS `mailboxKeys` side of a
-            // `CompositeDirectory` has no store yet (plan doc, D6).
-            directory: Box::new(XrpcDirectory::new(t.clone())),
+            directory,
             orf: Box::new(XrpcOrf::new(t)),
-            publishers: Vec::new(),
+            publishers,
             clock: Box::new(SystemClock),
         }
+    }
+
+    /// With a PDS directory: makes sure the account's PDS carries its
+    /// latest epoch (an account enabled before PDS publication, or a
+    /// publish that failed after its epoch was created).
+    fn backfill_pds(&self, s: &mut LabyrinthSession) -> Result<()> {
+        let Some(pds) = &self.pds else {
+            return Ok(());
+        };
+        let latest = s.lab.latest_public().map_err(map_error)?;
+        let published = PdsDirectory::new(pds.clone())
+            .latest(&self.did)
+            .map_err(map_error)?;
+        if published.is_none_or(|p| p.seq < latest.seq) {
+            s.run(|lab| lab.publish_latest_keys())?;
+        }
+        Ok(())
     }
 
     fn transport_signer(&self, fault: &SignerFault) -> Box<LatchedTransportSigner> {
@@ -116,8 +153,9 @@ impl SessionDeps {
         );
         surface(&fault)?;
         let lab = lab.map_err(map_error)?;
-        let mut s = self.session(lab, fault, Some(saved));
+        let mut s = self.clone().session(lab, fault, Some(saved));
         s.run(|lab| lab.sync_epochs().map(|_| ()))?;
+        self.backfill_pds(&mut s)?;
         Ok(Some(s))
     }
 
@@ -155,6 +193,10 @@ impl SessionDeps {
     }
 }
 
+/// One conversation's messages for [`LabyrinthSession::archive_many`]:
+/// `(conversationId, member DIDs, [(messageId, timestampMs, frame)])`.
+pub type ArchiveBatch = (String, Vec<String>, Vec<(String, u64, Vec<u8>)>);
+
 /// An enabled account on this device.
 pub struct LabyrinthSession {
     did: String,
@@ -175,6 +217,39 @@ impl LabyrinthSession {
     /// True if this session was opened for `did` with chat key `key`.
     pub fn is_for(&self, did: &str, transport_key: &[u8; 32]) -> bool {
         self.did == did && self.transport_key == *transport_key
+    }
+
+    /// Erases this account's saved state on this device (sign-out or
+    /// account removal). The session must be dropped afterwards; the
+    /// server-side mailbox is untouched.
+    pub fn forget(&mut self) -> Result<()> {
+        self.vault.delete(&self.did).map_err(OrchestratorError::Mls)?;
+        self.persisted = None;
+        Ok(())
+    }
+
+    /// Deletes the account's Labyrinth data everywhere: the server-side
+    /// account deletion (`deleteAccountData`: mailbox purge plus an
+    /// unsigned redaction of every item the account wrote), the PDS
+    /// `mailboxKeys` records, then this device's saved state. Drop the
+    /// session afterwards.
+    pub fn purge_account(&mut self) -> Result<PurgeReport> {
+        let out = self.lab.purge_account();
+        surface(&self.fault)?;
+        let report = out.map_err(map_error)?;
+        self.forget()?;
+        Ok(report)
+    }
+
+    /// [CB-36] After chat device `chat_key` was revoked, revokes the
+    /// Labyrinth device(s) it enrolled (found by their verified chat
+    /// bindings) and opens a new epoch for each. Returns the new epochs;
+    /// empty when that chat device enrolled none.
+    pub fn revoke_chat_device(&mut self, chat_key: [u8; 32]) -> Result<Vec<u64>> {
+        self.run(|lab| {
+            lab.revoke_chat_device(&chat_key)
+                .map(|v| v.into_iter().map(|r| r.new_epoch).collect())
+        })
     }
 
     /// This device's Labyrinth device key (hex). Other devices of the
@@ -226,10 +301,7 @@ impl LabyrinthSession {
 
     /// Archives one sent message for `members` (the conversation's MLS
     /// member DIDs; unenrolled ones are skipped) and writes it at once.
-    ///
-    /// Flushing per message trades batching for durability: the state blob
-    /// does not include unflushed batches, so a killed app would otherwise
-    /// lose them (docs/plans/2026-10-05-labyrinth-history-backup.md, D7).
+    /// The send path uses the background queue instead ([`super::queue`]).
     pub fn archive_sent(
         &mut self,
         conversation_id: &str,
@@ -238,12 +310,41 @@ impl LabyrinthSession {
         timestamp_ms: u64,
         frame: &[u8],
     ) -> Result<()> {
-        let members: Vec<&str> = members.iter().map(String::as_str).collect();
+        self.archive_many(&[(
+            conversation_id.to_owned(),
+            members.to_vec(),
+            vec![(message_id.to_owned(), timestamp_ms, frame.to_vec())],
+        )])
+    }
+
+    /// Archives sent messages of several conversations, each item
+    /// `(messageId, timestampMs, frame)`, then writes everything with one
+    /// flush (one `appendBatch` per conversation and MEK, [CB-20]).
+    pub fn archive_many(&mut self, batches: &[ArchiveBatch]) -> Result<()> {
         self.run(|lab| {
-            let roster = lab.resolve_roster(&members)?;
-            lab.archive_outgoing(conversation_id, &roster, message_id, timestamp_ms, frame)?;
+            for (conversation_id, members, items) in batches {
+                let members: Vec<&str> = members.iter().map(String::as_str).collect();
+                let roster = lab.resolve_roster(&members)?;
+                for (message_id, ts, frame) in items {
+                    lab.archive_outgoing(conversation_id, &roster, message_id, *ts, frame)?;
+                }
+            }
             lab.flush().map(|_| ())
         })
+    }
+
+    /// Whether this account's copy of `message_id` is already stored in the
+    /// conversation (live or since unsent): the archive queue's duplicate
+    /// check after a crash.
+    pub fn has_archived(&mut self, conversation_id: &str, message_id: &str) -> Result<bool> {
+        let did = self.did.clone();
+        let h = self.run(|lab| lab.load_message(conversation_id, message_id))?;
+        Ok(h.messages
+            .iter()
+            .any(|m| m.message_id == message_id && m.sender.as_deref() == Some(did.as_str()))
+            || h.redacted
+                .iter()
+                .any(|r| r.message_id == message_id && r.sender == did))
     }
 
     /// Decrypts the conversation's history in `range`.

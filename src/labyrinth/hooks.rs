@@ -9,10 +9,13 @@
 use std::sync::Arc;
 
 use chrono::{TimeZone as _, Utc};
-use labyrinth::client::MessageSource;
+use labyrinth::client::{MessageSource, PurgeReport};
 use labyrinth::store::TimeRange;
 use serde_json::Value;
 
+use super::queue::{
+    flush_in_slot, ArchiveQueueStore, MlsArchiveQueue, PendingArchive, QueueConfig,
+};
 use super::session::{HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
 use super::signer::{ChatKeySigner, OrchestratorChatSigner};
 use super::state::MlsStateVault;
@@ -75,7 +78,14 @@ where
             runtime: runtime.clone(),
         });
         let gateway = Arc::new(ApiGateway::new(self.api_client().clone(), runtime));
+        let pds: Option<Arc<dyn labyrinth::store::pds::PdsRecords>> =
+            if self.api_client().labyrinth_pds_enabled().await {
+                Some(gateway.clone())
+            } else {
+                None
+            };
         Ok(SessionDeps {
+            pds,
             transport: Arc::new(GatewayXrpcTransport::new(
                 gateway,
                 signer.clone(),
@@ -138,9 +148,13 @@ where
     /// with a `labyrinth: store conflict` error; restore with a recovery
     /// code instead.
     pub async fn labyrinth_enable(&self) -> Result<String> {
-        self.with_labyrinth(|deps| deps.enable().map(Some), |s| Ok(s.device_key_hex()))
+        let key = self
+            .with_labyrinth(|deps| deps.enable().map(Some), |s| Ok(s.device_key_hex()))
             .await?
-            .ok_or_else(|| OrchestratorError::Api("labyrinth session missing".into()))
+            .ok_or_else(|| OrchestratorError::Api("labyrinth session missing".into()))?;
+        self.labyrinth_start_archive_worker(self.labyrinth_deps().await?)
+            .await?;
+        Ok(key)
     }
 
     /// A new recovery code (show it to the user once).
@@ -230,10 +244,9 @@ where
 
     /// Revokes another device of the account by its Labyrinth device key
     /// (hex) and opens a new epoch without it. Returns the new epoch.
-    ///
-    /// Revoking a chat device does not call this: a chat device id cannot
-    /// be mapped to its Labyrinth device key yet
-    /// (docs/plans/2026-10-05-labyrinth-history-backup.md, D9).
+    /// Revoking a chat device ([`Self::remove_device`]) also revokes the
+    /// Labyrinth device it enrolled, through
+    /// [`Self::labyrinth_revoke_chat_device`].
     pub async fn labyrinth_revoke_device(&self, device_key_hex: &str) -> Result<u64> {
         let key: [u8; 32] = hex::decode(device_key_hex)
             .ok()
@@ -246,7 +259,107 @@ where
             .ok_or_else(not_enabled)
     }
 
-    /// Send hook: archives a message this device just sent. Best effort.
+    /// Revoke hook: after chat device `chat_key` was revoked, revokes the
+    /// Labyrinth device(s) its chat binding names ([CB-36]) and returns the
+    /// new epochs. A no-op until Labyrinth is enabled on this device.
+    /// Rotations exclude unbound devices regardless, so a failure here
+    /// delays the revocation to the next rotation; it never keeps the
+    /// device in.
+    pub async fn labyrinth_revoke_chat_device(&self, chat_key: [u8; 32]) -> Result<Vec<u64>> {
+        Ok(self
+            .with_labyrinth(SessionDeps::open, move |s| s.revoke_chat_device(chat_key))
+            .await?
+            .unwrap_or_default())
+    }
+
+    /// Sign-out / account removal on this device: drops the session and
+    /// erases its saved state and its pending archive queue. The mailbox on
+    /// mls-ds is kept, so the account can restore later with a recovery
+    /// code. Returns whether anything was saved.
+    pub async fn labyrinth_sign_out(&self) -> Result<bool> {
+        let deps = self.labyrinth_deps().await?;
+        let did = deps.did.clone();
+        self.labyrinth_stop_archive_worker();
+        self.labyrinth_close();
+        let queue = self.labyrinth_queue_store();
+        tokio::task::spawn_blocking(move || {
+            let had = deps.vault.load(&did).map_err(OrchestratorError::Mls)?.is_some();
+            deps.vault.delete(&did).map_err(OrchestratorError::Mls)?;
+            queue.clear(&did)?;
+            Ok(had)
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    /// Deletes the account's Labyrinth data everywhere (server-side
+    /// `deleteAccountData`, PDS `mailboxKeys`), then this device's saved
+    /// state and archive queue. Other devices of the account lose their
+    /// mailbox; their own saved state is erased when they next sign out.
+    pub async fn labyrinth_delete_account(&self) -> Result<PurgeReport> {
+        self.labyrinth_stop_archive_worker();
+        let report = self
+            .with_labyrinth(SessionDeps::open, |s| s.purge_account())
+            .await?
+            .ok_or_else(not_enabled)?;
+        self.labyrinth_close();
+        let did = self.require_user_did().await?;
+        let queue = self.labyrinth_queue_store();
+        tokio::task::spawn_blocking(move || queue.clear(&did))
+            .await
+            .map_err(join_error)??;
+        Ok(report)
+    }
+
+    /// The durable archive queue in the encrypted MLS database.
+    pub(crate) fn labyrinth_queue_store(&self) -> Arc<dyn ArchiveQueueStore> {
+        Arc::new(MlsArchiveQueue(self.mls_context().clone()))
+    }
+
+    /// Stops the background archive worker; pending rows stay saved.
+    pub(crate) fn labyrinth_stop_archive_worker(&self) {
+        self.labyrinth_archive().stop();
+    }
+
+    /// Starts the archive worker for the current account (no-op if it
+    /// runs), counting rows a previous process left pending.
+    async fn labyrinth_start_archive_worker(&self, deps: SessionDeps) -> Result<()> {
+        let store = self.labyrinth_queue_store();
+        let (did, s) = (deps.did.clone(), store.clone());
+        let already = tokio::task::spawn_blocking(move || s.list(&did).map(|v| v.len()))
+            .await
+            .map_err(join_error)??;
+        self.labyrinth_archive()
+            .ensure(self.labyrinth_slot().clone(), deps, store, already);
+        Ok(())
+    }
+
+    /// When the background worker flushes (default: 32 messages or 2 s).
+    pub fn labyrinth_set_archive_policy(&self, config: QueueConfig) {
+        self.labyrinth_archive().set_config(config);
+        self.labyrinth_stop_archive_worker();
+    }
+
+    /// Archives every pending sent message now (for example before the app
+    /// suspends, or at launch to drain what a killed process left). Returns
+    /// how many left the queue.
+    pub async fn labyrinth_flush_archive(&self) -> Result<usize> {
+        let deps = self.labyrinth_deps().await?;
+        let n = flush_in_slot(
+            self.labyrinth_slot().clone(),
+            deps.clone(),
+            self.labyrinth_queue_store(),
+        )
+        .await?;
+        self.labyrinth_archive().flushed(n);
+        self.labyrinth_start_archive_worker(deps).await?;
+        Ok(n)
+    }
+
+    /// Send hook: queues a message this device just sent for the
+    /// background archive worker ([`super::queue`]). Only a local database
+    /// write happens here; no network call is added to the send. Best
+    /// effort: a failure is logged and never fails the send.
     pub(crate) async fn labyrinth_archive_sent(
         &self,
         conversation_id: &str,
@@ -255,25 +368,31 @@ where
         frame: &[u8],
     ) {
         let result = async {
-            if !self.labyrinth_is_enabled().await? {
+            let deps = self.labyrinth_deps().await?;
+            let row = PendingArchive::new(&deps.did, conversation_id, message_id, timestamp_ms, frame);
+            // Enabled on this device = a saved state exists.
+            let (vault, did) = (deps.vault.clone(), deps.did.clone());
+            let enabled = tokio::task::spawn_blocking(move || vault.load(&did))
+                .await
+                .map_err(join_error)?
+                .map_err(OrchestratorError::Mls)?
+                .is_some();
+            if !enabled {
                 return Ok(());
             }
-            let state = self.fetch_conversation_lifecycle(conversation_id).await?;
-            let members = roster_members(&state);
-            let (c, id, frame) = (
-                conversation_id.to_owned(),
-                message_id.to_owned(),
-                frame.to_vec(),
-            );
-            self.with_labyrinth(SessionDeps::open, move |s| {
-                s.archive_sent(&c, &members, &id, timestamp_ms, &frame)
-            })
-            .await
-            .map(|_| ())
+            // Start (or keep) the worker first: it counts the rows already
+            // pending, and this one is counted by `enqueued`.
+            self.labyrinth_start_archive_worker(deps).await?;
+            let store = self.labyrinth_queue_store();
+            tokio::task::spawn_blocking(move || store.put(&row))
+                .await
+                .map_err(join_error)??;
+            self.labyrinth_archive().enqueued();
+            Ok::<_, OrchestratorError>(())
         }
         .await;
         if let Err(error) = result {
-            tracing::warn!(conversation_id, %error, "labyrinth: archiving a sent message failed");
+            tracing::warn!(conversation_id, %error, "labyrinth: queueing a sent message failed");
         }
     }
 

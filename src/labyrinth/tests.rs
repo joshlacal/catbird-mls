@@ -81,6 +81,10 @@ impl StateVault for MemVault {
         m.insert(did.to_owned(), next.to_vec());
         Ok(true)
     }
+    fn delete(&self, did: &str) -> Result<(), MLSError> {
+        self.0.lock().unwrap().remove(did);
+        Ok(())
+    }
 }
 
 /// `labyrinthWriteBody` exactly as mls-ds parses it.
@@ -126,6 +130,8 @@ struct RefGateway {
     server: MemoryXrpcServer,
     devices: DeviceRegistry,
     log: Arc<Mutex<Vec<LabyrinthRequest>>>,
+    /// Requests to this NSID fail with no response (a dropped connection).
+    fail_nsid: Arc<Mutex<Option<String>>>,
 }
 
 fn reply(r: Result<Vec<u8>, XrpcError>) -> GatewayResponse {
@@ -154,6 +160,7 @@ impl RefGateway {
             server: MemoryXrpcServer::new(MemoryBackend::new()),
             devices: Arc::default(),
             log: Arc::default(),
+            fail_nsid: Arc::default(),
         }
     }
 
@@ -262,6 +269,9 @@ impl RefGateway {
 
 impl LabyrinthGateway for RefGateway {
     fn submit_labyrinth(&self, req: LabyrinthRequest) -> Result<GatewayResponse, String> {
+        if self.fail_nsid.lock().unwrap().as_deref() == Some(req.nsid.as_str()) {
+            return Err("connection dropped".into());
+        }
         self.log.lock().unwrap().push(req.clone());
         Ok(match req.method.as_str() {
             "GET" => self.query(&req.path),
@@ -303,10 +313,14 @@ impl Device {
                 transport,
                 signer,
                 vault: Arc::new(MemVault::default()),
+                pds: None,
             },
         }
     }
 }
+
+#[path = "queue_tests.rs"]
+mod queue_tests;
 
 // ── tests ───────────────────────────────────────────────────────────────
 
@@ -607,11 +621,28 @@ async fn orchestrator_archives_a_send_and_a_restored_device_imports_it() {
     assert!(!alice.orchestrator.labyrinth_is_enabled().await.unwrap());
 
     alice.orchestrator.labyrinth_enable().await.unwrap();
+    // Archiving is queued off the send path; hold it until flushed.
+    alice
+        .orchestrator
+        .labyrinth_set_archive_policy(super::QueueConfig {
+            max_batch: 1000,
+            max_delay: std::time::Duration::from_secs(3600),
+        });
     let sent = alice
         .orchestrator
         .send_message(&thread, "remember me")
         .await
         .unwrap();
+    let appends = |gw: &RefGateway| {
+        gw.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.nsid == "blue.catbird.labyrinth.appendBatch")
+            .count()
+    };
+    assert_eq!(appends(&gw), 0, "the send itself wrote no batch");
+    assert_eq!(alice.orchestrator.labyrinth_flush_archive().await.unwrap(), 1);
     assert!(gw
         .log
         .lock()

@@ -28,6 +28,8 @@ pub trait StateVault: Send + Sync {
         expected: Option<&[u8]>,
         next: &[u8],
     ) -> Result<bool, MLSError>;
+    /// Erases the account's blob (sign-out, account removal). Idempotent.
+    fn delete(&self, did: &str) -> Result<(), MLSError>;
 }
 
 /// [`StateVault`] in the encrypted MLS database.
@@ -46,5 +48,9 @@ impl<M: MlsCryptoContext + 'static> StateVault for MlsStateVault<M> {
     ) -> Result<bool, MLSError> {
         self.0
             .compare_exchange_request_value(STATE_NAMESPACE, did, expected, next)
+    }
+
+    fn delete(&self, did: &str) -> Result<(), MLSError> {
+        self.0.delete_request_value(STATE_NAMESPACE, did).map(|_| ())
     }
 }

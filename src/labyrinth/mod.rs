@@ -18,7 +18,8 @@
 //! | Chat device Ed25519 key as Labyrinth's [`labyrinth::sign::TransportSigner`] | [`signer`] |
 //! | Client state persisted in the encrypted MLS database | [`state`] |
 //! | One account's synchronous Labyrinth session | [`session`] |
-//! | Orchestrator hooks (enable, restore, archive, history, revoke, leave) | [`hooks`] |
+//! | Orchestrator hooks (enable, restore, archive, history, revoke, leave, sign-out) | [`hooks`] |
+//! | Background archive queue (batched, crash-safe) | [`queue`] |
 //! | UniFFI methods on `OrchestratorBridge` | `ffi.rs` (a child module of `orchestrator_bridge`) |
 //!
 //! The crate is synchronous and runtime-free; the orchestrator is async.
@@ -30,11 +31,12 @@
 //! [`crate::orchestrator::MLSAPIClient::submit_labyrinth_request`]: attach
 //! the atproto service-auth JWT whose `lxm` is [`LabyrinthRequest::nsid`],
 //! forward the extra headers verbatim, and return the raw response. The
-//! UniFFI `OrchestratorAPICallback` does not forward it yet, so on iOS and
-//! Android every Labyrinth call fails with an `Api` error until that
-//! callback method is added and the bindings are regenerated.
+//! UniFFI `OrchestratorAPICallback::submit_labyrinth_request` forwards it
+//! (bindings not yet regenerated), and the `*_labyrinth_mailbox_keys`
+//! callback methods give the PDS half of the directory.
 
 pub mod hooks;
+pub mod queue;
 pub mod session;
 pub mod signer;
 pub mod state;
@@ -48,7 +50,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::orchestrator::error::OrchestratorError;
 
-pub use session::{HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
+pub use queue::{ArchiveQueueStore, ArchiveWorker, MlsArchiveQueue, PendingArchive, QueueConfig};
+pub use session::{ArchiveBatch, HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
 pub use signer::{ChatKeySigner, OrchestratorChatSigner, SignerFault};
 pub use state::{MlsStateVault, StateVault, STATE_NAMESPACE};
 pub use transport::{ApiGateway, GatewayXrpcTransport, LabyrinthGateway};

@@ -143,6 +143,9 @@ where
     /// (feature `labyrinth`; see `crate::labyrinth`).
     #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
     labyrinth: crate::labyrinth::LabyrinthSlot,
+    /// The background Labyrinth archive worker (feature `labyrinth`).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    labyrinth_archive: std::sync::Arc<crate::labyrinth::ArchiveWorker>,
     direct_request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) direct_request_reconcile_backoff: Mutex<HashMap<String, (u32, web_time::Instant)>>,
@@ -331,6 +334,8 @@ where
             rejoin_locks: Mutex::new(HashMap::new()),
             #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
             labyrinth: Default::default(),
+            #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+            labyrinth_archive: Default::default(),
             direct_request_locks: Mutex::new(HashMap::new()),
             #[cfg(not(target_arch = "wasm32"))]
             direct_request_reconcile_backoff: Mutex::new(HashMap::new()),
@@ -939,6 +944,7 @@ where
         self.inbound_processing_locks.lock().await.clear();
         #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
         {
+            self.labyrinth_archive.stop();
             *self.labyrinth.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         if let Ok(mut fds) = self.fork_detection_states.lock() {
@@ -1004,6 +1010,12 @@ where
     #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
     pub(crate) fn labyrinth_slot(&self) -> &crate::labyrinth::LabyrinthSlot {
         &self.labyrinth
+    }
+
+    /// The background archive worker (feature `labyrinth`).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    pub(crate) fn labyrinth_archive(&self) -> &crate::labyrinth::ArchiveWorker {
+        &self.labyrinth_archive
     }
 
     /// Access the MLS crypto context.

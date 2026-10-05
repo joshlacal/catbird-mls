@@ -56,6 +56,28 @@ impl<A: MLSAPIClient + 'static> LabyrinthGateway for ApiGateway<A> {
     }
 }
 
+/// The PDS half of the Labyrinth directory ([CB-19]) through the
+/// platform's `*_labyrinth_mailbox_keys` gateway methods.
+impl<A: MLSAPIClient + 'static> labyrinth::store::pds::PdsRecords for ApiGateway<A> {
+    fn put_mailbox_keys(&self, rkey: &str, record: &[u8]) -> Result<(), String> {
+        self.runtime
+            .block_on(self.api.put_labyrinth_mailbox_keys(rkey, record))
+            .map_err(|e| e.to_string())
+    }
+
+    fn get_mailbox_keys(&self, did: &str, rkey: &str) -> Result<Option<Vec<u8>>, String> {
+        self.runtime
+            .block_on(self.api.get_labyrinth_mailbox_keys(did, rkey))
+            .map_err(|e| e.to_string())
+    }
+
+    fn delete_all_mailbox_keys(&self) -> Result<(), String> {
+        self.runtime
+            .block_on(self.api.delete_labyrinth_mailbox_keys())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// The Labyrinth stores' transport for one chat device.
 pub struct GatewayXrpcTransport {
     gateway: Arc<dyn LabyrinthGateway>,

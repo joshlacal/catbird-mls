@@ -365,12 +365,20 @@ where
             let pk = self.mls_context().identity_public_key(identity_bytes)?;
             super::canonical_transport::derive_key_id(&pk)
         };
-        let target_auth_generation = self
+        let target = self
             .api_client()
             .list_devices(&actor_device_id)
             .await?
             .into_iter()
-            .find(|d| d.device_id == target_device_id || d.device_uuid == target_device_id)
+            .find(|d| d.device_id == target_device_id || d.device_uuid == target_device_id);
+        // The revoked chat device's Ed25519 key: its Labyrinth device is
+        // found by the chat binding that names this key ([CB-36]).
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        let target_chat_key: Option<[u8; 32]> = target
+            .as_ref()
+            .and_then(|d| d.signature_public_key.as_deref())
+            .and_then(|k| k.try_into().ok());
+        let target_auth_generation = target
             .and_then(|d| d.auth_generation)
             .ok_or_else(|| {
                 OrchestratorError::InvalidInput("target device auth generation unavailable".into())
@@ -400,6 +408,21 @@ where
                 response.status,
                 String::from_utf8_lossy(&response.body)
             )));
+        }
+        // Labyrinth: the chat device is revoked first (mls-ds requires that
+        // order), then the Labyrinth device it enrolled. Best effort: every
+        // later rotation excludes a device whose chat device is gone.
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        if let Some(key) = target_chat_key {
+            match self.labyrinth_revoke_chat_device(key).await {
+                Ok(epochs) if !epochs.is_empty() => {
+                    tracing::info!(?epochs, "labyrinth: revoked the removed device's backup key")
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "labyrinth: revoking the removed device's backup key failed")
+                }
+            }
         }
         Ok(())
     }

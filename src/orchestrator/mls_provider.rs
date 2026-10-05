@@ -303,6 +303,12 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
             reason: "request value storage unavailable".into(),
         })
     }
+    /// Deletes one request value; `Ok(false)` if it did not exist.
+    fn delete_request_value(&self, _namespace: &str, _id: &str) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
     fn request_values_total_bytes(&self, _namespace: &str) -> Result<u64, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "request value storage unavailable".into(),

@@ -8188,6 +8188,21 @@ impl MlsCryptoContext for MLSContext {
         )
     }
 
+    fn delete_request_value(&self, namespace: &str, id: &str) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("delete_request_value");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_value_delete(
+            &inner.manifest_storage,
+            namespace,
+            id,
+        )
+    }
+
     fn request_values_total_bytes(&self, namespace: &str) -> Result<u64, MLSError> {
         self.check_suspended()?;
         let _operation = self.begin_storage_operation("request_values_total_bytes");

@@ -126,6 +126,30 @@ impl OrchestratorBridge {
         Ok(import_to_ffi(report))
     }
 
+    /// Archive every queued sent message now. Call it when the app is about
+    /// to suspend and at launch (a killed process leaves its queue saved).
+    /// Returns how many messages were archived.
+    pub fn labyrinth_flush_archive(&self) -> Result<u64, OrchestratorBridgeError> {
+        Ok(crate::async_runtime::block_on(self.inner.labyrinth_flush_archive())? as u64)
+    }
+
+    /// Sign-out or account removal on this device: erase this device's
+    /// backup state and queue. The account's backup on the server stays, so
+    /// a later sign-in restores with a recovery code. Returns whether any
+    /// state was saved.
+    pub fn labyrinth_sign_out(&self) -> Result<bool, OrchestratorBridgeError> {
+        Ok(crate::async_runtime::block_on(self.inner.labyrinth_sign_out())?)
+    }
+
+    /// Delete the account's history backup everywhere: the server mailbox
+    /// and every message the account archived (shown to others as removed),
+    /// the PDS `mailboxKeys` records, and this device's state. Returns how
+    /// many publishers could not retract their records.
+    pub fn labyrinth_delete_account(&self) -> Result<u64, OrchestratorBridgeError> {
+        let report = crate::async_runtime::block_on(self.inner.labyrinth_delete_account())?;
+        Ok(report.publishers_not_retracted as u64)
+    }
+
     /// Revoke another device of this account from the backup.
     pub fn labyrinth_revoke_device(
         &self,

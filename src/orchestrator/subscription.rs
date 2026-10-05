@@ -296,6 +296,24 @@ pub(crate) fn request_value_cas(
     Ok(true)
 }
 
+/// Deletes one request value; `Ok(false)` if it did not exist.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn request_value_delete(
+    storage: &crate::mls_context::ManifestStorage,
+    namespace: &str,
+    id: &str,
+) -> std::result::Result<bool, MLSError> {
+    checked_namespace(namespace)?;
+    checked_id(id)?;
+    let key = format!("direct_request_value_v2:{namespace}:{id}");
+    let n = storage
+        .welcome_ack_connection()
+        .execute("DELETE FROM mls_manifests WHERE key=?1", [&key])
+        .map_err(|_| MLSError::StorageFailed)?;
+    storage.flush_database()?;
+    Ok(n > 0)
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn request_values_list(
     storage: &crate::mls_context::ManifestStorage,
