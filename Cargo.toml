@@ -102,13 +102,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 
 # Labyrinth 1.1 encrypted chat history (feature `labyrinth`, off by default).
 # LOCAL-ONLY: the crate lives in the PRIVATE joshlacal/labyrinth repo, checked
-# out at ~/Developer/labyrinth (bookmark `labyrinth-1.1`). The relative path
-# resolves only from a lane workspace two levels below ~/Developer (e.g.
-# ~/Developer/.workspaces/<lane>/catbird-mls). Cargo loads the manifest of
+# out for this lane in the jj workspace ~/Developer/.workspaces/labyrinth-wire
+# (bookmark `local/labyrinth-wire-20261005`). The relative path resolves only
+# from ~/Developer/.workspaces/labyrinth-mlsds-server/catbird-mls. Cargo loads the manifest of
 # every path dependency even when its feature is off, so this line must not
 # reach a public branch until Josh decides how the crate is published
 # (docs/plans/2026-10-05-labyrinth-history-backup.md, decision D1).
-labyrinth = { path = "../../../labyrinth", features = ["xrpc"], optional = true }
+labyrinth = { path = "../../labyrinth-wire", features = ["xrpc"], optional = true }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
