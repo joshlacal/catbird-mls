@@ -18,6 +18,8 @@ pub mod field_encryption;
 mod hybrid_storage;
 #[cfg(not(target_arch = "wasm32"))]
 mod keychain;
+#[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+pub mod labyrinth;
 pub mod logging;
 mod message_limits;
 pub mod metadata;

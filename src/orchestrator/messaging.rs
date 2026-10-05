@@ -989,6 +989,16 @@ where
         self.storage().store_message(&message).await?;
         self.validate_send_actor(&actor).await?;
 
+        // Labyrinth history backup (best effort: the send already succeeded).
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        self.labyrinth_archive_sent(
+            &resolved.conversation_id,
+            &message.id,
+            u64::try_from(message.timestamp.timestamp_millis()).unwrap_or(0),
+            &payload_bytes,
+        )
+        .await;
+
         tracing::debug!(conversation_id, "Message sent successfully");
         Ok(message)
     }

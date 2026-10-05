@@ -100,6 +100,16 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+# Labyrinth 1.1 encrypted chat history (feature `labyrinth`, off by default).
+# LOCAL-ONLY: the crate lives in the PRIVATE joshlacal/labyrinth repo, checked
+# out at ~/Developer/labyrinth (bookmark `labyrinth-1.1`). The relative path
+# resolves only from a lane workspace two levels below ~/Developer (e.g.
+# ~/Developer/.workspaces/<lane>/catbird-mls). Cargo loads the manifest of
+# every path dependency even when its feature is off, so this line must not
+# reach a public branch until Josh decides how the crate is published
+# (docs/plans/2026-10-05-labyrinth-history-backup.md, decision D1).
+labyrinth = { path = "../../../labyrinth", features = ["xrpc"], optional = true }
+
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
 
@@ -124,6 +134,9 @@ storage-driver-prototype = []
 # In-process AAD emitters for cross-repository container tests; never UniFFI-exported.
 e2e-aad = []
 test-utils = ["openmls/test-utils", "openmls_rust_crypto/test-utils", "openmls_memory_storage/test-utils"]
+# Labyrinth 1.1 encrypted history backup over the mls-ds
+# `blue.catbird.labyrinth.*` endpoints (src/labyrinth/). Native targets only.
+labyrinth = ["dep:labyrinth"]
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 openmls_sqlite_storage = { version = "=0.3.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }

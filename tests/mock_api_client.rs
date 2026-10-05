@@ -332,6 +332,30 @@ struct MockState {
 ///
 /// Wrap in `Arc` and share across orchestrator instances to simulate a real
 /// server where all participants see the same state.
+/// Test stand-in for the platform's Labyrinth gateway (feature `labyrinth`).
+#[cfg(feature = "labyrinth")]
+pub type LabyrinthHandlerFn = Arc<
+    dyn Fn(
+            catbird_mls::labyrinth::LabyrinthRequest,
+        ) -> std::result::Result<
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+            String,
+        > + Send
+        + Sync,
+>;
+
+/// Shared slot for [`LabyrinthHandlerFn`]; every `clone_as` view sees it.
+#[cfg(feature = "labyrinth")]
+#[derive(Clone, Default)]
+pub struct LabyrinthHandler(Arc<Mutex<Option<LabyrinthHandlerFn>>>);
+
+#[cfg(feature = "labyrinth")]
+impl std::fmt::Debug for LabyrinthHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LabyrinthHandler")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MockDeliveryService {
     state: Arc<Mutex<MockState>>,
@@ -344,6 +368,8 @@ pub struct MockDeliveryService {
     instance_did: Option<String>,
     /// Set on the internal handle that produces the unpresented response.
     raw_dispatch: bool,
+    #[cfg(feature = "labyrinth")]
+    labyrinth: LabyrinthHandler,
 }
 
 #[derive(Debug, Default)]
@@ -408,7 +434,15 @@ impl MockDeliveryService {
             send_ack_gate: Arc::new(Mutex::new(None)),
             instance_did: None,
             raw_dispatch: false,
+            #[cfg(feature = "labyrinth")]
+            labyrinth: LabyrinthHandler::default(),
         }
+    }
+
+    /// Route every `submit_labyrinth_request` to `handler`.
+    #[cfg(feature = "labyrinth")]
+    pub fn set_labyrinth_handler(&self, handler: LabyrinthHandlerFn) {
+        *self.labyrinth.0.lock().unwrap() = Some(handler);
     }
 
     /// Create a new mock that shares the same backing state but is
@@ -423,6 +457,8 @@ impl MockDeliveryService {
             send_ack_gate: Arc::clone(&self.send_ack_gate),
             instance_did: Some(did.to_string()),
             raw_dispatch: false,
+            #[cfg(feature = "labyrinth")]
+            labyrinth: self.labyrinth.clone(),
         }
     }
 
@@ -2207,6 +2243,17 @@ impl MockDeliveryService {
 
 #[async_trait]
 impl MLSAPIClient for MockDeliveryService {
+    #[cfg(feature = "labyrinth")]
+    async fn submit_labyrinth_request(
+        &self,
+        request: catbird_mls::labyrinth::LabyrinthRequest,
+    ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        let handler = self.labyrinth.0.lock().unwrap().clone().ok_or_else(|| {
+            catbird_mls::orchestrator::OrchestratorError::Api("no Labyrinth handler".into())
+        })?;
+        handler(request).map_err(catbird_mls::orchestrator::OrchestratorError::Api)
+    }
+
     async fn is_authenticated_as(&self, did: &str) -> bool {
         let guard = self.state.lock().unwrap();
         self.effective_did_from_guard(&guard).as_deref() == Some(did)

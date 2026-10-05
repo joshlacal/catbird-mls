@@ -139,6 +139,10 @@ where
     creation_generation: AtomicU64,
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
+    /// Labyrinth encrypted-history session for the current account
+    /// (feature `labyrinth`; see `crate::labyrinth`).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    labyrinth: crate::labyrinth::LabyrinthSlot,
     direct_request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) direct_request_reconcile_backoff: Mutex<HashMap<String, (u32, web_time::Instant)>>,
@@ -325,6 +329,8 @@ where
             reissue_attempts_mem: Mutex::new(HashMap::new()),
             creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
+            #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+            labyrinth: Default::default(),
             direct_request_locks: Mutex::new(HashMap::new()),
             #[cfg(not(target_arch = "wasm32"))]
             direct_request_reconcile_backoff: Mutex::new(HashMap::new()),
@@ -931,6 +937,10 @@ where
         self.own_commit_expectations.lock().await.clear();
         self.rejoin_locks.lock().await.clear();
         self.inbound_processing_locks.lock().await.clear();
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        {
+            *self.labyrinth.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         if let Ok(mut fds) = self.fork_detection_states.lock() {
             fds.clear();
         }
@@ -988,6 +998,12 @@ where
             | OrchestratorLifecycleState::Shutdown => Err(OrchestratorError::ShuttingDown),
             _ => Ok(()),
         }
+    }
+
+    /// The Labyrinth session slot (feature `labyrinth`).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    pub(crate) fn labyrinth_slot(&self) -> &crate::labyrinth::LabyrinthSlot {
+        &self.labyrinth
     }
 
     /// Access the MLS crypto context.

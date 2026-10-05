@@ -2426,6 +2426,11 @@ impl CredentialStore for CredentialAdapter {
 
 type ConcreteOrchestrator =
     MLSOrchestrator<StorageAdapter, APIAdapter, CredentialAdapter, MLSContext>;
+
+/// Labyrinth history-backup methods on [`OrchestratorBridge`].
+#[cfg(feature = "labyrinth")]
+#[path = "labyrinth/ffi.rs"]
+mod labyrinth_ffi;
 type ConcreteEngine = MlsEngine<StorageAdapter, APIAdapter, CredentialAdapter, MLSContext>;
 
 /// UniFFI-exported MLS Orchestrator object.

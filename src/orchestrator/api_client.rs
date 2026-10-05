@@ -109,6 +109,24 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         Ok(vec![])
     }
 
+    /// Submit one `blue.catbird.labyrinth.*` XRPC (feature `labyrinth`).
+    ///
+    /// The gateway attaches the account's service-auth JWT with `lxm` =
+    /// `request.nsid`, exactly as for clean-chat requests, sends
+    /// `request.headers` unchanged (the signed `labyrinthWriteBody` on
+    /// procedures), and returns the raw response. The default refuses, so a
+    /// gateway that has not adopted Labyrinth fails closed.
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn submit_labyrinth_request(
+        &self,
+        request: crate::labyrinth::LabyrinthRequest,
+    ) -> Result<GatewayResponse> {
+        Err(crate::orchestrator::error::OrchestratorError::Api(format!(
+            "this gateway does not implement Labyrinth requests ({})",
+            request.nsid
+        )))
+    }
+
     /// Download an encrypted metadata blob from the DS via `blue.catbird.chat.getBlob`.
     async fn get_group_metadata_blob(
         &self,

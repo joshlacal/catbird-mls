@@ -140,6 +140,13 @@ where
                         .conversation_id
                 }
             };
+        // [CB-22] Labyrinth re-archive before losing access (best effort,
+        // outside the transition lock because it is network-bound).
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        {
+            self.labyrinth_rearchive_before_leave(&conversation_id)
+                .await;
+        }
         let transition_lock = self.rejoin_lock(&conversation_id).await;
         let _guard = transition_lock.lock().await;
         let mut replaces_operation = None;
