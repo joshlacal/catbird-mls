@@ -3,7 +3,11 @@
 //!
 //! Every call names the calling chat device: queries carry
 //! `actorDeviceId` as a query parameter, procedures carry it inside the
-//! signed `labyrinthWriteBody` ([`super::write_auth`]). The gateway adds
+//! signed `labyrinthWriteBody` ([`super::write_auth`]). Every Labyrinth
+//! query also carries the device-signed read headers
+//! (`catbird-labyrinth-read`, `catbird-labyrinth-read-signature`; the
+//! crate's `store::xrpc::read_auth`), signed by the same chat device key
+//! over every query parameter on the wire. The gateway adds
 //! the account's service-auth JWT (`lxm` = the NSID). The one non-Labyrinth
 //! query the stores make, `blue.catbird.chat.getConversationState`, goes
 //! through the existing clean-chat route so gateways need nothing new for
@@ -11,6 +15,7 @@
 
 use std::sync::Arc;
 
+use labyrinth::store::xrpc::read_auth::{self, ReadClaim};
 use labyrinth::store::xrpc::{XrpcError, XrpcTransport};
 use tokio::runtime::Handle;
 
@@ -82,34 +87,57 @@ impl<A: MLSAPIClient + 'static> labyrinth::store::pds::PdsRecords for ApiGateway
 pub struct GatewayXrpcTransport {
     gateway: Arc<dyn LabyrinthGateway>,
     signer: Arc<dyn ChatKeySigner>,
+    did: String,
     device_id: String,
 }
 
 impl GatewayXrpcTransport {
+    /// The transport of chat device `device_id` (key `signer`) of `did`.
     pub fn new(
         gateway: Arc<dyn LabyrinthGateway>,
         signer: Arc<dyn ChatKeySigner>,
+        did: String,
         device_id: String,
     ) -> Self {
         Self {
             gateway,
             signer,
+            did,
             device_id,
         }
     }
 
-    fn query_path(&self, nsid: &str, params: &[(&str, String)]) -> String {
-        let mut path = format!(
-            "/xrpc/{nsid}?actorDeviceId={}",
-            encode_query(&self.device_id)
-        );
-        for (k, v) in params {
-            path.push('&');
-            path.push_str(&encode_query(k));
-            path.push('=');
-            path.push_str(&encode_query(v));
-        }
-        path
+    /// Every query parameter on the wire: `actorDeviceId`, then `params`.
+    fn wire_params<'a>(&self, params: &[(&'a str, String)]) -> Vec<(&'a str, String)> {
+        let mut all = Vec::with_capacity(params.len() + 1);
+        all.push(("actorDeviceId", self.device_id.clone()));
+        all.extend(params.iter().cloned());
+        all
+    }
+
+    fn query_path(nsid: &str, params: &[(&str, String)]) -> String {
+        let query: Vec<String> = params
+            .iter()
+            .map(|(k, v)| format!("{}={}", encode_query(k), encode_query(v)))
+            .collect();
+        format!("/xrpc/{nsid}?{}", query.join("&"))
+    }
+
+    /// The device-signed read headers for `GET nsid?params` (all wire
+    /// parameters), issued now.
+    fn read_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+    ) -> Result<Vec<(String, String)>, XrpcError> {
+        let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
+        let claim = ReadClaim::new(nsid, params, &self.did, &self.device_id, now);
+        let json = claim.to_json();
+        let signature = self
+            .signer
+            .sign(&ReadClaim::signing_input(&json))
+            .map_err(transport_error)?;
+        Ok(read_auth::read_headers(&json, &signature))
     }
 }
 
@@ -145,8 +173,14 @@ pub(crate) fn decode_response(
 }
 
 impl XrpcTransport for GatewayXrpcTransport {
-    fn query(&self, nsid: &str, params: &[(&str, String)]) -> Result<Vec<u8>, XrpcError> {
-        let path = self.query_path(nsid, params);
+    fn query_with_headers(
+        &self,
+        nsid: &str,
+        params: &[(&str, String)],
+        headers: &[(String, String)],
+    ) -> Result<Vec<u8>, XrpcError> {
+        let params = self.wire_params(params);
+        let path = Self::query_path(nsid, &params);
         let canonical = CanonicalOperation::ALL
             .iter()
             .copied()
@@ -158,13 +192,17 @@ impl XrpcTransport for GatewayXrpcTransport {
                 path,
                 body: None,
             }),
-            None => self.gateway.submit_labyrinth(LabyrinthRequest {
-                nsid: nsid.to_owned(),
-                method: "GET".into(),
-                path,
-                body: None,
-                headers: Vec::new(),
-            }),
+            None => {
+                let mut all = headers.to_vec();
+                all.extend(self.read_headers(nsid, &params)?);
+                self.gateway.submit_labyrinth(LabyrinthRequest {
+                    nsid: nsid.to_owned(),
+                    method: "GET".into(),
+                    path,
+                    body: None,
+                    headers: all,
+                })
+            }
         };
         decode_response(response)
     }

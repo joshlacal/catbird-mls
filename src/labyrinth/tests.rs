@@ -17,6 +17,7 @@ use ed25519_dalek::{Signer as _, SigningKey, Verifier as _};
 use labyrinth::client::MessageSource;
 use labyrinth::store::memory::MemoryBackend;
 use labyrinth::store::xrpc::server::MemoryXrpcServer;
+use labyrinth::store::xrpc::read_auth::{verify_read, READ_HEADER, READ_SIGNATURE_HEADER};
 use labyrinth::store::xrpc::{map_error, XrpcError};
 use labyrinth::store::TimeRange;
 use serde::Deserialize;
@@ -193,7 +194,10 @@ impl RefGateway {
         self.devices.lock().unwrap().get(id).cloned()
     }
 
-    fn query(&self, path: &str) -> GatewayResponse {
+    /// A query. `read` holds the request headers of a Labyrinth query,
+    /// whose device-signed read claim is verified as mls-ds does; a
+    /// clean-chat query (`None`) carries none.
+    fn query(&self, path: &str, read: Option<&[(String, String)]>) -> GatewayResponse {
         let (route, query) = path.split_once('?').unwrap_or((path, ""));
         let nsid = route.strip_prefix("/xrpc/").unwrap();
         let mut params: Vec<(String, String)> = query
@@ -204,6 +208,7 @@ impl RefGateway {
                 (percent_decode(k), percent_decode(v))
             })
             .collect();
+        let all = params.clone();
         let actors: Vec<String> = params
             .iter()
             .filter(|(k, _)| k == "actorDeviceId")
@@ -216,6 +221,27 @@ impl RefGateway {
         let Some((did, key)) = self.device(actor) else {
             return refuse(401, "NotAuthorized");
         };
+        if let Some(headers) = read {
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            // mls-ds: 401 InvalidSignature when the signature fails, 400
+            // InvalidRequest for a missing header or a mismatched claim.
+            let (Some(h), Some(s)) = (header(READ_HEADER), header(READ_SIGNATURE_HEADER)) else {
+                return refuse(400, "InvalidRequest");
+            };
+            let wire: Vec<(&str, String)> =
+                all.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            let now = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap();
+            match verify_read(h, s, &key) {
+                Err(labyrinth::Error::BadSignature) => return refuse(401, "InvalidSignature"),
+                Ok(c) if c.matches(nsid, &wire, &did, actor, now) => {}
+                _ => return refuse(400, "InvalidRequest"),
+            }
+        }
         let p: Vec<(&str, String)> = params
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
@@ -274,14 +300,14 @@ impl LabyrinthGateway for RefGateway {
         }
         self.log.lock().unwrap().push(req.clone());
         Ok(match req.method.as_str() {
-            "GET" => self.query(&req.path),
+            "GET" => self.query(&req.path, Some(&req.headers)),
             _ => self.procedure(&req),
         })
     }
 
     fn submit_canonical(&self, req: PreparedRequest) -> Result<GatewayResponse, String> {
         assert_eq!(req.method, "GET");
-        Ok(self.query(&req.path))
+        Ok(self.query(&req.path, None))
     }
 }
 
@@ -291,6 +317,10 @@ struct Device {
 }
 
 impl Device {
+    fn key(&self) -> [u8; 32] {
+        self.deps.signer.public_key()
+    }
+
     fn new(gw: &RefGateway, did: &str, device_id: &str, seed: u8) -> Self {
         let key = gw.add_device(did, device_id, seed);
         Self::with_signer(gw, did, device_id, key)
@@ -305,6 +335,7 @@ impl Device {
         let transport = Arc::new(GatewayXrpcTransport::new(
             Arc::new(gw.clone()),
             signer.clone(),
+            did.to_owned(),
             device_id.to_owned(),
         ));
         Self {
@@ -367,7 +398,55 @@ fn queries_name_the_device_and_encode_parameters() {
         req.path,
         "/xrpc/blue.catbird.labyrinth.getEpochHead?actorDeviceId=11111111-1111-4111-8111-111111111111&did=did%3Aplc%3Aa%20b"
     );
-    assert!(req.headers.is_empty() && req.body.is_none());
+    assert!(req.body.is_none());
+    // The device-signed read claim covers every wire parameter.
+    let names: Vec<&str> = req.headers.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(names, [READ_HEADER, READ_SIGNATURE_HEADER]);
+    let claim = verify_read(&req.headers[0].1, &req.headers[1].1, &alice.key()).unwrap();
+    assert_eq!(claim.did, ALICE);
+    assert_eq!(claim.device_id, "11111111-1111-4111-8111-111111111111");
+    assert_eq!(claim.nsid, "blue.catbird.labyrinth.getEpochHead");
+    assert_eq!(
+        claim.query,
+        "actorDeviceId=11111111-1111-4111-8111-111111111111&did=did%3Aplc%3Aa%20b"
+    );
+    let skew = claim
+        .issued_at
+        .abs_diff(u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap());
+    assert!(skew < 60_000);
+}
+
+#[test]
+fn a_read_signed_by_another_key_is_refused() {
+    let gw = RefGateway::new();
+    gw.add_device(ALICE, "11111111-1111-4111-8111-111111111111", 1);
+    let impostor = Device::with_signer(
+        &gw,
+        ALICE,
+        "11111111-1111-4111-8111-111111111111",
+        Arc::new(TestKey(SigningKey::from_bytes(&[7; 32]))),
+    );
+    let e = impostor
+        .deps
+        .transport
+        .query("blue.catbird.labyrinth.listDevices", &[])
+        .unwrap_err();
+    assert_eq!((e.status, e.error.as_deref()), (401, Some("InvalidSignature")));
+    // A failing signer sends nothing.
+    let locked = Device::with_signer(
+        &gw,
+        ALICE,
+        "11111111-1111-4111-8111-111111111111",
+        Arc::new(FailingKey([0; 32])),
+    );
+    let before = gw.log.lock().unwrap().len();
+    let e = locked
+        .deps
+        .transport
+        .query("blue.catbird.labyrinth.listDevices", &[])
+        .unwrap_err();
+    assert_eq!(e.status, 0);
+    assert_eq!(gw.log.lock().unwrap().len(), before);
 }
 
 #[test]

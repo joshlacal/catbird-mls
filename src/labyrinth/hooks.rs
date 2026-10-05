@@ -89,6 +89,7 @@ where
             transport: Arc::new(GatewayXrpcTransport::new(
                 gateway,
                 signer.clone(),
+                did.clone(),
                 device_id,
             )),
             vault: Arc::new(MlsStateVault(self.mls_context().clone())),
