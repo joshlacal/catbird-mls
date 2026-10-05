@@ -281,6 +281,14 @@ pub struct FFIGatewayResponse {
     pub body: Vec<u8>,
 }
 
+/// One extra HTTP header of a Labyrinth request
+/// ([`OrchestratorAPICallback::submit_labyrinth_request`]).
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FFILabyrinthHeader {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct FFIDeliveryStatusPair {
     pub message_id: String,
@@ -352,6 +360,85 @@ pub trait OrchestratorAPICallback: Send + Sync {
         group_id_hex: String,
         blob_locator: String,
     ) -> Result<Vec<u8>, OrchestratorBridgeError>;
+
+    // ── Labyrinth history backup (feature `labyrinth`) ──────────────────
+    //
+    // Rust never holds the account's atproto session, so every Labyrinth
+    // request leaves through the platform. Each method has a refusing
+    // default so platforms that have not adopted Labyrinth fail closed.
+    // These methods are not feature-gated: UniFFI's callback-interface
+    // scaffolding cannot carry `#[cfg]` on a method, so they are part of
+    // every build's FFI surface (only the `labyrinth` feature calls them).
+
+    /// Send one `blue.catbird.labyrinth.*` XRPC to the account's mls-ds.
+    ///
+    /// Attach an atproto service-auth JWT whose `lxm` is `nsid` and whose
+    /// `aud` is the delivery service, exactly as for
+    /// `submit_prepared_request`. `path` is `/xrpc/{nsid}` plus the
+    /// already-encoded query string (it carries `actorDeviceId`); send it
+    /// verbatim. Send every `headers` entry unchanged: on procedures they
+    /// are `catbird-labyrinth-write` and `catbird-labyrinth-write-signature`,
+    /// the device-signed write body mls-ds verifies. `body` is the JSON
+    /// body of a procedure (`method` = `POST`), absent on queries (`GET`).
+    /// Return the raw response, including non-2xx statuses with their
+    /// atproto error body: Rust maps the error names.
+    fn submit_labyrinth_request(
+        &self,
+        method: String,
+        nsid: String,
+        path: String,
+        body: Option<Vec<u8>>,
+        headers: Vec<FFILabyrinthHeader>,
+    ) -> Result<FFIGatewayResponse, OrchestratorBridgeError> {
+        let _ = (method, path, body, headers);
+        Err(OrchestratorBridgeError::Api {
+            message: format!("this gateway does not implement Labyrinth requests ({nsid})"),
+        })
+    }
+
+    /// True once the platform implements the three `*_labyrinth_mailbox_keys`
+    /// methods below. Rust then publishes every epoch to the PDS as well and
+    /// cross-checks peers' PDS records against mls-ds ([CB-28], [CB-29]).
+    fn labyrinth_pds_enabled(&self) -> bool {
+        false
+    }
+
+    /// `com.atproto.repo.putRecord` of `record` (JSON, `$type` included) into
+    /// the signed-in account's repo, collection
+    /// `blue.catbird.labyrinth.mailboxKeys`, rkey `rkey` (`self` or a
+    /// 12-digit epoch number). Create or replace.
+    fn put_labyrinth_mailbox_keys(
+        &self,
+        rkey: String,
+        record: Vec<u8>,
+    ) -> Result<(), OrchestratorBridgeError> {
+        let _ = (rkey, record);
+        Err(OrchestratorBridgeError::Api {
+            message: "PDS mailboxKeys publication is not implemented".into(),
+        })
+    }
+
+    /// `com.atproto.repo.getRecord` of `blue.catbird.labyrinth.mailboxKeys`
+    /// / `rkey` from `did`'s repo (resolve its PDS). Return the record value
+    /// JSON, or `None` when the record (or the repo) does not exist.
+    fn get_labyrinth_mailbox_keys(
+        &self,
+        did: String,
+        rkey: String,
+    ) -> Result<Option<Vec<u8>>, OrchestratorBridgeError> {
+        let _ = (did, rkey);
+        Err(OrchestratorBridgeError::Api {
+            message: "PDS mailboxKeys lookup is not implemented".into(),
+        })
+    }
+
+    /// Delete every `blue.catbird.labyrinth.mailboxKeys` record in the
+    /// signed-in account's repo (account deletion).
+    fn delete_labyrinth_mailbox_keys(&self) -> Result<(), OrchestratorBridgeError> {
+        Err(OrchestratorBridgeError::Api {
+            message: "PDS mailboxKeys deletion is not implemented".into(),
+        })
+    }
 }
 
 /// Credential store callback interface for Swift/Kotlin.
@@ -380,7 +467,6 @@ pub trait OrchestratorCredentialCallback: Send + Sync {
             message: "Chat declaration resolution unavailable".into(),
         })
     }
-
 
     fn store_signing_key(
         &self,
@@ -2277,6 +2363,66 @@ impl MLSAPIClient for APIAdapter {
             )
             .map_err(bridge_err)
     }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn submit_labyrinth_request(
+        &self,
+        request: crate::labyrinth::LabyrinthRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse>
+    {
+        let headers = request
+            .headers
+            .into_iter()
+            .map(|(name, value)| FFILabyrinthHeader { name, value })
+            .collect();
+        let r = self
+            .0
+            .submit_labyrinth_request(
+                request.method,
+                request.nsid,
+                request.path,
+                request.body,
+                headers,
+            )
+            .map_err(bridge_err)?;
+        Ok(crate::orchestrator::canonical_transport::GatewayResponse {
+            status: r.status,
+            content_type: r.content_type,
+            body: r.body,
+        })
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn labyrinth_pds_enabled(&self) -> bool {
+        self.0.labyrinth_pds_enabled()
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn put_labyrinth_mailbox_keys(
+        &self,
+        rkey: &str,
+        record: &[u8],
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .put_labyrinth_mailbox_keys(rkey.to_owned(), record.to_vec())
+            .map_err(bridge_err)
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn get_labyrinth_mailbox_keys(
+        &self,
+        did: &str,
+        rkey: &str,
+    ) -> crate::orchestrator::Result<Option<Vec<u8>>> {
+        self.0
+            .get_labyrinth_mailbox_keys(did.to_owned(), rkey.to_owned())
+            .map_err(bridge_err)
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn delete_labyrinth_mailbox_keys(&self) -> crate::orchestrator::Result<()> {
+        self.0.delete_labyrinth_mailbox_keys().map_err(bridge_err)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2301,7 +2447,6 @@ impl CredentialStore for CredentialAdapter {
             .get_chat_declaration_authority(user_did.to_string())
             .map_err(bridge_err)
     }
-
 
     async fn store_signing_key(
         &self,

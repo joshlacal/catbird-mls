@@ -127,6 +127,42 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         )))
     }
 
+    /// True when the gateway publishes and reads `blue.catbird.labyrinth.mailboxKeys`
+    /// records in atproto repos (the PDS half of the Labyrinth directory).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn labyrinth_pds_enabled(&self) -> bool {
+        false
+    }
+
+    /// `putRecord` `blue.catbird.labyrinth.mailboxKeys/{rkey}` (record JSON)
+    /// in the signed-in account's repo.
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn put_labyrinth_mailbox_keys(&self, rkey: &str, record: &[u8]) -> Result<()> {
+        let _ = (rkey, record);
+        Err(crate::orchestrator::error::OrchestratorError::Api(
+            "this gateway does not publish mailboxKeys".into(),
+        ))
+    }
+
+    /// `getRecord` `blue.catbird.labyrinth.mailboxKeys/{rkey}` from `did`'s
+    /// repo; `None` if absent.
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn get_labyrinth_mailbox_keys(&self, did: &str, rkey: &str) -> Result<Option<Vec<u8>>> {
+        let _ = (did, rkey);
+        Err(crate::orchestrator::error::OrchestratorError::Api(
+            "this gateway does not read mailboxKeys".into(),
+        ))
+    }
+
+    /// Delete every `blue.catbird.labyrinth.mailboxKeys` record of the
+    /// signed-in account.
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn delete_labyrinth_mailbox_keys(&self) -> Result<()> {
+        Err(crate::orchestrator::error::OrchestratorError::Api(
+            "this gateway does not delete mailboxKeys".into(),
+        ))
+    }
+
     /// Download an encrypted metadata blob from the DS via `blue.catbird.chat.getBlob`.
     async fn get_group_metadata_blob(
         &self,
