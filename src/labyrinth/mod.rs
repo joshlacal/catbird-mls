@@ -18,6 +18,7 @@
 //! | Chat device Ed25519 key as Labyrinth's [`labyrinth::sign::TransportSigner`] | [`signer`] |
 //! | Client state persisted in the encrypted MLS database | [`state`] |
 //! | One account's synchronous Labyrinth session | [`session`] |
+//! | The mailbox in the account's own PDS Space, and where each account's mailbox lives | [`space`] |
 //! | Orchestrator hooks (enable, restore, archive, history, revoke, leave, sign-out) | [`hooks`] |
 //! | Background archive queue (batched, crash-safe) | [`queue`] |
 //! | One flush, conversation by conversation | [`flush`] |
@@ -35,7 +36,10 @@
 //! forward the extra headers verbatim, and return the raw response. The
 //! UniFFI `OrchestratorAPICallback::submit_labyrinth_request` forwards it
 //! (bindings not yet regenerated), and the `*_labyrinth_mailbox_keys`
-//! callback methods give the PDS half of the directory.
+//! callback methods give the PDS half of the directory. Gateways that can
+//! reach the account's PDS Space also implement
+//! `submit_labyrinth_space_request` and `labyrinth_space_enabled`
+//! ([`space`]).
 
 pub mod flush;
 pub mod hooks;
@@ -43,6 +47,7 @@ pub mod hooks_status;
 pub mod queue;
 pub mod session;
 pub mod signer;
+pub mod space;
 pub mod state;
 pub mod status;
 pub mod transport;
@@ -60,6 +65,10 @@ pub use hooks_status::ArchiveStatusReport;
 pub use queue::{ArchiveQueueStore, ArchiveWorker, MlsArchiveQueue, PendingArchive, QueueConfig};
 pub use session::{ArchiveBatch, HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
 pub use signer::{ChatKeySigner, OrchestratorChatSigner, SignerFault};
+pub use space::{
+    LabyrinthSpaceGateway, LabyrinthSpaceRequest, MlsPlacementVault, Placement, SpaceXrpcTransport,
+    PLACEMENT_NAMESPACE,
+};
 pub use state::{MlsStateVault, StateVault, STATE_NAMESPACE};
 pub use status::ArchiveStatus;
 pub use transport::{ApiGateway, GatewayXrpcTransport, LabyrinthGateway};
@@ -92,6 +101,9 @@ pub(crate) fn map_error(error: labyrinth::Error) -> OrchestratorError {
     match error {
         labyrinth::Error::BadRecoveryCode => {
             OrchestratorError::InvalidInput("labyrinth: recovery code is invalid".into())
+        }
+        labyrinth::Error::Backend(m) if m.contains(transport::SIGNING_FAILED) => {
+            OrchestratorError::Credential(format!("labyrinth: {m}"))
         }
         other => OrchestratorError::Api(format!("labyrinth: {other}")),
     }

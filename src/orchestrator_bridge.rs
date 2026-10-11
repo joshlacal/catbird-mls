@@ -439,6 +439,36 @@ pub trait OrchestratorAPICallback: Send + Sync {
             message: "PDS mailboxKeys deletion is not implemented".into(),
         })
     }
+
+    /// True once the platform implements `submit_labyrinth_space_request`
+    /// against a PDS that serves `com.atproto.space.*`. Together with
+    /// `labyrinth_pds_enabled`, a new history mailbox then goes into the
+    /// account's own Space instead of mls-ds. Report false for a PDS
+    /// without Spaces (bsky.social today).
+    fn labyrinth_space_enabled(&self) -> bool {
+        false
+    }
+
+    /// Send one `com.atproto.space.*` XRPC to the signed-in account's own
+    /// PDS with its OAuth (DPoP) session, the way `com.atproto.repo.*` calls
+    /// go: no service auth and no extra headers. `nsid` always starts with
+    /// `com.atproto.space.`; `path` is `/xrpc/{nsid}` plus the
+    /// already-encoded query string, sent verbatim; `body` is the JSON body
+    /// of a procedure (`method` = `POST`), absent on queries (`GET`).
+    /// Return the raw response, including non-2xx statuses with their
+    /// atproto error body.
+    fn submit_labyrinth_space_request(
+        &self,
+        method: String,
+        nsid: String,
+        path: String,
+        body: Option<Vec<u8>>,
+    ) -> Result<FFIGatewayResponse, OrchestratorBridgeError> {
+        let _ = (method, path, body);
+        Err(OrchestratorBridgeError::Api {
+            message: format!("this gateway does not reach the account's PDS Space ({nsid})"),
+        })
+    }
 }
 
 /// Credential store callback interface for Swift/Kotlin.
@@ -2422,6 +2452,33 @@ impl MLSAPIClient for APIAdapter {
     #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
     async fn delete_labyrinth_mailbox_keys(&self) -> crate::orchestrator::Result<()> {
         self.0.delete_labyrinth_mailbox_keys().map_err(bridge_err)
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn labyrinth_space_enabled(&self) -> bool {
+        self.0.labyrinth_space_enabled()
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn submit_labyrinth_space_request(
+        &self,
+        request: crate::labyrinth::LabyrinthSpaceRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse>
+    {
+        let r = self
+            .0
+            .submit_labyrinth_space_request(
+                request.method,
+                request.nsid,
+                request.path,
+                request.body,
+            )
+            .map_err(bridge_err)?;
+        Ok(crate::orchestrator::canonical_transport::GatewayResponse {
+            status: r.status,
+            content_type: r.content_type,
+            body: r.body,
+        })
     }
 }
 

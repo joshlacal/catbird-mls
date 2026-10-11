@@ -18,6 +18,7 @@ use super::queue::{
 };
 use super::session::{HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
 use super::signer::{ChatKeySigner, OrchestratorChatSigner};
+use super::space::{MlsPlacementVault, SpaceXrpcTransport};
 use super::state::MlsStateVault;
 use super::status::{now_ms, PendingDeletion};
 use super::transport::{ApiGateway, GatewayXrpcTransport};
@@ -85,8 +86,16 @@ where
             } else {
                 None
             };
+        let space: Option<Arc<dyn labyrinth::store::xrpc::XrpcTransport>> =
+            if self.api_client().labyrinth_space_enabled().await {
+                Some(Arc::new(SpaceXrpcTransport::new(gateway.clone())))
+            } else {
+                None
+            };
         Ok(SessionDeps {
             pds,
+            space,
+            placements: Arc::new(MlsPlacementVault(self.mls_context().clone())),
             transport: Arc::new(GatewayXrpcTransport::new(
                 gateway,
                 signer.clone(),
@@ -302,6 +311,9 @@ where
                 .map_err(OrchestratorError::Mls)?
                 .is_some();
             deps.vault.delete(&did).map_err(OrchestratorError::Mls)?;
+            deps.placements
+                .delete(&did)
+                .map_err(OrchestratorError::Mls)?;
             queue.clear(&did)?;
             Ok(had)
         })
@@ -347,6 +359,9 @@ where
                 },
             };
             deps.vault
+                .delete(&deps.did)
+                .map_err(OrchestratorError::Mls)?;
+            deps.placements
                 .delete(&deps.did)
                 .map_err(OrchestratorError::Mls)?;
             queue.clear(&deps.did)?;

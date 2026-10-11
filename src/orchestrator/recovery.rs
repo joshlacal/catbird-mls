@@ -4263,6 +4263,10 @@ where
             if let Err(error) = crate::labyrinth::StateVault::delete(&vault, &user_did) {
                 tracing::warn!(%error, "labyrinth: erasing saved state during silent recovery failed");
             }
+            let placements = crate::labyrinth::MlsPlacementVault(self.mls_context().clone());
+            if let Err(error) = crate::labyrinth::StateVault::delete(&placements, &user_did) {
+                tracing::warn!(%error, "labyrinth: erasing mailbox placement during silent recovery failed");
+            }
         }
 
         // 3. Re-register device

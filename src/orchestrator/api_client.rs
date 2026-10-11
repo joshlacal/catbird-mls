@@ -163,6 +163,29 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         ))
     }
 
+    /// True when the gateway reaches the signed-in account's own PDS Space
+    /// endpoints (`com.atproto.space.*`) with its OAuth session. With
+    /// [`labyrinth_pds_enabled`](Self::labyrinth_pds_enabled) also true, a
+    /// new Labyrinth mailbox goes into the account's Space.
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn labyrinth_space_enabled(&self) -> bool {
+        false
+    }
+
+    /// Send one `com.atproto.space.*` XRPC to the signed-in account's own
+    /// PDS with its OAuth session (not service auth), and return the raw
+    /// response. The default refuses.
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn submit_labyrinth_space_request(
+        &self,
+        request: crate::labyrinth::LabyrinthSpaceRequest,
+    ) -> Result<GatewayResponse> {
+        Err(crate::orchestrator::error::OrchestratorError::Api(format!(
+            "this gateway does not reach the account's PDS Space ({})",
+            request.nsid
+        )))
+    }
+
     /// Download an encrypted metadata blob from the DS via `blue.catbird.chat.getBlob`.
     async fn get_group_metadata_blob(
         &self,

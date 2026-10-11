@@ -416,10 +416,14 @@ mod forwarding_tests {
         Vec<FFILabyrinthHeader>,
     );
 
+    /// `(method, nsid, path, body)` of a Space request.
+    type SpaceSeen = (String, String, String, Option<Vec<u8>>);
+
     #[derive(Default)]
     struct Platform {
         seen: Mutex<Vec<Seen>>,
         pds: Mutex<Vec<(String, Vec<u8>)>>,
+        space: Mutex<Vec<SpaceSeen>>,
         implements: bool,
     }
 
@@ -549,6 +553,26 @@ mod forwarding_tests {
                 .find(|(k, _)| *k == rkey)
                 .map(|(_, v)| v.clone()))
         }
+        fn labyrinth_space_enabled(&self) -> bool {
+            self.implements
+        }
+        fn submit_labyrinth_space_request(
+            &self,
+            method: String,
+            nsid: String,
+            path: String,
+            body: Option<Vec<u8>>,
+        ) -> Result<FFIGatewayResponse, OrchestratorBridgeError> {
+            if !self.implements {
+                return unused();
+            }
+            self.space.lock().unwrap().push((method, nsid, path, body));
+            Ok(FFIGatewayResponse {
+                status: 200,
+                content_type: Some("application/json".into()),
+                body: br#"{"records":[]}"#.to_vec(),
+            })
+        }
     }
 
     #[tokio::test]
@@ -597,5 +621,35 @@ mod forwarding_tests {
 
         let legacy = APIAdapter(Arc::new(Platform::default()));
         assert!(!legacy.labyrinth_pds_enabled().await);
+    }
+
+    #[tokio::test]
+    async fn the_adapter_forwards_space_requests() {
+        let platform = Arc::new(Platform {
+            implements: true,
+            ..Platform::default()
+        });
+        let adapter = APIAdapter(platform.clone());
+        assert!(adapter.labyrinth_space_enabled().await);
+        let req = crate::labyrinth::LabyrinthSpaceRequest {
+            nsid: "com.atproto.space.listRecords".into(),
+            method: "GET".into(),
+            path: "/xrpc/com.atproto.space.listRecords?limit=1".into(),
+            body: None,
+        };
+        let r = adapter.submit_labyrinth_space_request(req).await.unwrap();
+        assert_eq!((r.status, r.body), (200, br#"{"records":[]}"#.to_vec()));
+        assert_eq!(
+            platform.space.lock().unwrap().pop().unwrap(),
+            (
+                "GET".into(),
+                "com.atproto.space.listRecords".into(),
+                "/xrpc/com.atproto.space.listRecords?limit=1".into(),
+                None
+            )
+        );
+
+        let legacy = APIAdapter(Arc::new(Platform::default()));
+        assert!(!legacy.labyrinth_space_enabled().await);
     }
 }

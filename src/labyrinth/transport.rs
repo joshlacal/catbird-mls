@@ -61,6 +61,19 @@ impl<A: MLSAPIClient + 'static> LabyrinthGateway for ApiGateway<A> {
     }
 }
 
+/// The account's PDS Space ([`super::space`]) through the platform's
+/// `submit_labyrinth_space_request`.
+impl<A: MLSAPIClient + 'static> super::space::LabyrinthSpaceGateway for ApiGateway<A> {
+    fn submit_space(
+        &self,
+        request: super::space::LabyrinthSpaceRequest,
+    ) -> Result<GatewayResponse, String> {
+        self.runtime
+            .block_on(self.api.submit_labyrinth_space_request(request))
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// The PDS half of the Labyrinth directory ([CB-19]) through the
 /// platform's `*_labyrinth_mailbox_keys` gateway methods.
 impl<A: MLSAPIClient + 'static> labyrinth::store::pds::PdsRecords for ApiGateway<A> {
@@ -136,8 +149,22 @@ impl GatewayXrpcTransport {
         let signature = self
             .signer
             .sign(&ReadClaim::signing_input(&json))
-            .map_err(transport_error)?;
+            .map_err(signing_error)?;
         Ok(read_auth::read_headers(&json, &signature))
+    }
+}
+
+/// The XRPC error name of a request this device could not sign: the chat
+/// key is unavailable (for example a locked keychain). [`super::map_error`]
+/// reports it as a credential error, like a failing Labyrinth signature.
+pub(crate) const SIGNING_FAILED: &str = "ChatKeySigningFailed";
+
+/// `status = 0`: the request was never sent because signing it failed.
+fn signing_error(message: String) -> XrpcError {
+    XrpcError {
+        status: 0,
+        error: Some(SIGNING_FAILED.into()),
+        message: Some(message),
     }
 }
 
@@ -229,7 +256,7 @@ impl XrpcTransport for GatewayXrpcTransport {
         let signature = self
             .signer
             .sign(&WriteBody::signing_input(&json))
-            .map_err(transport_error)?;
+            .map_err(signing_error)?;
         decode_response(self.gateway.submit_labyrinth(LabyrinthRequest {
             nsid: nsid.to_owned(),
             method: "POST".into(),
