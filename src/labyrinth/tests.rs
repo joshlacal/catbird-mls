@@ -364,14 +364,14 @@ impl Device {
     }
 }
 
+#[path = "live_space_tests.rs"]
+mod live_space_tests;
 #[path = "queue_tests.rs"]
 mod queue_tests;
 #[path = "review_tests.rs"]
 mod review_tests;
 #[path = "space_tests.rs"]
 mod space_tests;
-#[path = "live_space_tests.rs"]
-mod live_space_tests;
 
 // ── tests ───────────────────────────────────────────────────────────────
 

@@ -102,6 +102,9 @@ pub(crate) fn map_error(error: labyrinth::Error) -> OrchestratorError {
         labyrinth::Error::BadRecoveryCode => {
             OrchestratorError::InvalidInput("labyrinth: recovery code is invalid".into())
         }
+        labyrinth::Error::Backend(m) if m.contains(transport::SIGNING_FAILED) => {
+            OrchestratorError::Credential(format!("labyrinth: {m}"))
+        }
         other => OrchestratorError::Api(format!("labyrinth: {other}")),
     }
 }

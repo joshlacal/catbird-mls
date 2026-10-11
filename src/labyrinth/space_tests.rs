@@ -264,10 +264,49 @@ fn a_space_mailbox_is_not_opened_without_the_space() {
     let mut alice = net.space_device(ALICE, A1, 1);
     alice.deps.placements = Arc::new(MemVault::default());
     alice.deps.pds = None;
+    let e = alice.deps.probe_placement().err().unwrap();
+    assert!(e.to_string().contains("PDS Space"), "{e}");
+    // An account with no Labyrinth history at all still starts on mls-ds.
+    let mut bob = net.pds_device(BOB, B1, 2);
+    bob.deps.pds = None;
     assert_eq!(
-        alice.deps.probe_placement().unwrap(),
+        bob.deps.probe_placement().unwrap(),
         super::super::space::Placement::MlsDs
     );
+}
+
+/// A new device of a Space account, on a platform without the Space, is
+/// refused instead of opening a second mailbox on mls-ds (which would then
+/// also block the Space devices' head publishes there).
+#[test]
+fn a_new_device_without_the_space_does_not_fork_the_mailbox_onto_mlsds() {
+    let net = Net::new();
+    let alice = net.space_device(ALICE, A1, 1);
+    let code = alice
+        .deps
+        .clone()
+        .enable()
+        .unwrap()
+        .create_recovery_code()
+        .unwrap();
+    let second = net.pds_device(ALICE, A2, 3);
+    let e = second.deps.clone().enable().err().unwrap();
+    assert!(e.to_string().contains("PDS Space"), "{e}");
+    let e = second
+        .deps
+        .clone()
+        .restore_with_recovery_code(&code)
+        .err()
+        .unwrap();
+    assert!(e.to_string().contains("PDS Space"), "{e}");
+    assert!(net
+        .gw
+        .net()
+        .mailbox(ALICE)
+        .list_devices()
+        .unwrap()
+        .is_empty());
+    assert_eq!(placement(&second), None);
 }
 
 #[test]

@@ -117,13 +117,7 @@ impl SessionDeps {
         let mailbox: Box<dyn MailboxStore + Send> = match placement {
             Placement::MlsDs => Box::new(XrpcMailboxStore::new(&self.did, t.clone())),
             Placement::Space => {
-                let space = self.space_store().ok_or_else(|| {
-                    OrchestratorError::Api(
-                        "labyrinth: this account's history mailbox is in its PDS Space, \
-                         which this app cannot reach"
-                            .into(),
-                    )
-                })?;
+                let space = self.space_store().ok_or_else(space_unreachable)?;
                 // The Space store writes `mailboxKeys` itself; mls-ds gets
                 // the head chain as the independent directory ([CB-28]).
                 publishers = vec![Box::new(XrpcDirectory::new(t.clone()))];
@@ -181,19 +175,43 @@ impl SessionDeps {
 
     /// Where a device that has no saved state finds (or creates) the
     /// account's mailbox: an existing Space mailbox, else an existing mls-ds
-    /// mailbox, else a new one in the Space. Without a reachable Space,
-    /// always mls-ds. A mailbox is never moved between backends.
+    /// mailbox, else a new one in the Space. A mailbox is never moved
+    /// between backends.
+    ///
+    /// Without a reachable Space, mls-ds; but an account that has published
+    /// heads and keeps no mailbox on mls-ds has it in a Space this app
+    /// cannot reach, and is refused rather than given a second mailbox.
     pub fn probe_placement(&self) -> Result<Placement> {
+        let mlsds = XrpcMailboxStore::new(&self.did, self.transport.clone());
         let Some(space) = self.space_store() else {
+            if !has_genesis(&mlsds)? && self.has_published_head()? {
+                return Err(space_unreachable());
+            }
             return Ok(Placement::MlsDs);
         };
         if has_genesis(&space)? {
             return Ok(Placement::Space);
         }
-        if has_genesis(&XrpcMailboxStore::new(&self.did, self.transport.clone()))? {
+        if has_genesis(&mlsds)? {
             return Ok(Placement::MlsDs);
         }
         Ok(Placement::Space)
+    }
+
+    /// Whether the account has a head on mls-ds, or `mailboxKeys` on its
+    /// PDS when the platform reads it.
+    fn has_published_head(&self) -> Result<bool> {
+        let ds = XrpcDirectory::new(self.transport.clone());
+        if ds.latest(&self.did).map_err(map_error)?.is_some() {
+            return Ok(true);
+        }
+        match &self.pds {
+            Some(pds) => Ok(PdsDirectory::new(pds.clone())
+                .latest(&self.did)
+                .map_err(map_error)?
+                .is_some()),
+            None => Ok(false),
+        }
     }
 
     /// The remote half of an account deletion, without any client state:
@@ -596,6 +614,14 @@ impl LabyrinthSession {
 
 /// Whether `mailbox` holds an epoch 0. A Space nobody has written to, or an
 /// mls-ds account without a mailbox, reads as empty.
+fn space_unreachable() -> OrchestratorError {
+    OrchestratorError::Api(
+        "labyrinth: this account's history mailbox is in its PDS Space, \
+         which this app cannot reach"
+            .into(),
+    )
+}
+
 fn has_genesis(mailbox: &dyn MailboxStore) -> Result<bool> {
     match mailbox.get_epoch(0) {
         Ok(e) => Ok(e.is_some()),
