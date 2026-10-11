@@ -16,6 +16,7 @@ Code: `src/labyrinth/` (module docs list each file). Crate design: `docs/MLSDS_B
 | Chat-device revocation | `remove_device` → `labyrinth_revoke_chat_device` | Revokes the Labyrinth device the removed chat device enrolled (D9 superseded). |
 | Sign-out / account deletion | `labyrinth_sign_out`, `labyrinth_delete_account`, `perform_silent_recovery` | Erase saved state and queue; delete also runs server-side `deleteAccountData` and retracts PDS records (D5 gap closed). |
 | PDS directory | `SessionDeps::pds` via `OrchestratorAPICallback::*_labyrinth_mailbox_keys` | `CompositeDirectory` over PDS + mls-ds when the platform implements it (D6 amended). |
+| Space mailbox | `SessionDeps::space` via `OrchestratorAPICallback::submit_labyrinth_space_request` / `labyrinth_space_enabled` (`src/labyrinth/space.rs`) | A new mailbox goes into the account's own PDS Space when the platform reaches it and publishes `mailboxKeys`; the placement is saved per device (D11). |
 | History | `labyrinth_load_history`, `labyrinth_import_history` | Decrypts history; import stores missing messages through `MLSStorageBackend`. |
 | Revoke | `labyrinth_revoke_device(device_key_hex)` | Revokes a device and opens a new epoch ([CB-11]). |
 | Leave | `leave_conversation` → `labyrinth_rearchive_before_leave` | Best effort ([CB-22]). |
@@ -85,6 +86,17 @@ Chose (provisional):
   - Known gap: there is no source for the mls-ds redaction key yet, so over mls-ds alone account deletions show as `RemovedByServer` (fail closed).
 
 Reversible until: any push of catbird-mls. Override by: editing `flush.rs`, `status.rs` and `hooks_status.rs`. Behaviour is pinned by `src/labyrinth/review_tests.rs`.
+
+## 2026-10-11 · catbird-mls · D11 New mailboxes go into the account's PDS Space when the platform reaches it
+Chose:
+- **Transport.** `OrchestratorAPICallback` gains `labyrinth_space_enabled()` and `submit_labyrinth_space_request(method, nsid, path, body)` (refusing defaults; `MLSAPIClient` counterparts behind the feature). The platform sends `com.atproto.space.*` to the account's own PDS with its OAuth session, like `com.atproto.repo.*`, with no service auth. `SpaceXrpcTransport` refuses any other NSID. The crate's `SpaceMailboxStore` (labyrinth feature `space`) does the rest, against `at://{did}/space/blue.catbird.labyrinth.mailbox/self`, and never calls `createSpace`.
+- **What moves.** Only the mailbox: devices, epochs, members, recovery bundles, owner archive. `mailboxKeys` goes to the public repo through the PDS publisher. Threads, MEKs, the ORF, attachment references, chat device keys and the head chain stay on mls-ds, which becomes the independent directory for [CB-28] (labyrinth `docs/MLSDS_BACKEND.md` §1c).
+- **When.** Space needs both `labyrinth_space_enabled` and `labyrinth_pds_enabled`. A device without saved state probes once: an existing Space mailbox wins, then an existing mls-ds mailbox, else a new one goes into the Space. The answer is saved in request-value namespace `labyrinthMailboxPlacement` next to the client state, erased with it (sign-out, account deletion, silent recovery). Saved state without a placement predates this and is mls-ds. Nothing moves a mailbox between backends; an account whose mailbox is in a Space fails clearly on a platform that cannot reach it.
+- **Deletion.** `SpaceMailbox` wraps the Space store so `deleteAccountData` still runs on mls-ds (atomic cross-DS redaction, ORF, head chain), followed by a purge of every Space record and the `mailboxKeys`. `SessionDeps::delete_account_remote` (the retry with no saved state) does mls-ds first and then purges the Space whenever the platform reaches it, whatever the placement was.
+- **Feature.** The `labyrinth` dependency now enables the crate's `space` feature (it implies `xrpc`).
+
+**Blocker on the server.** mls-ds on `labyrinth-backend-20261004` does not accept a Space account yet: `publishEpochHead` only re-publishes epochs already in its own `labyrinth.epochs` (`server/src/labyrinth/repo/directory.rs:139`), and `deleteOrfState` needs a Labyrinth device bound on mls-ds (`require_bound`). With the mailbox in a Space, the head publish after every epoch fails with `EpochNotFound` and revocation cannot drop the revoked device's ORF state. The crate's memory reference server is laxer, which is why the tests here pass. Until mls-ds gains a rule for Space accounts, platforms must keep `labyrinth_space_enabled` false.
+Reversible until: a platform reports `labyrinth_space_enabled`. Override by: editing `src/labyrinth/space.rs` and `SessionDeps::probe_placement`. Tests: `src/labyrinth/space_tests.rs`.
 
 ## Tests
 

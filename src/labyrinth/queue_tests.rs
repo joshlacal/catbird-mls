@@ -184,11 +184,11 @@ fn a_crash_before_the_write_archives_on_retry() {
 }
 
 /// Every account's `mailboxKeys` records: (did, rkey) → bytes.
-type Repos = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
+pub(super) type Repos = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
 
-struct MockPds {
-    me: String,
-    repos: Repos,
+pub(super) struct MockPds {
+    pub(super) me: String,
+    pub(super) repos: Repos,
 }
 
 impl PdsRecords for MockPds {
@@ -213,7 +213,7 @@ impl PdsRecords for MockPds {
     }
 }
 
-fn with_pds(mut d: Device, repos: &Repos) -> Device {
+pub(super) fn with_pds(mut d: Device, repos: &Repos) -> Device {
     d.deps.pds = Some(Arc::new(MockPds {
         me: d.deps.did.clone(),
         repos: repos.clone(),

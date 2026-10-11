@@ -357,6 +357,8 @@ impl Device {
                 signer,
                 vault: Arc::new(MemVault::default()),
                 pds: None,
+                space: None,
+                placements: Arc::new(MemVault::default()),
             },
         }
     }
@@ -366,6 +368,8 @@ impl Device {
 mod queue_tests;
 #[path = "review_tests.rs"]
 mod review_tests;
+#[path = "space_tests.rs"]
+mod space_tests;
 
 // ── tests ───────────────────────────────────────────────────────────────
 

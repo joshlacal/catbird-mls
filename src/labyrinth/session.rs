@@ -10,15 +10,17 @@ use labyrinth::client::{
 };
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PdsRecords};
+use labyrinth::store::space::SpaceMailboxStore;
 use labyrinth::store::xrpc::{
     XrpcDirectory, XrpcMailboxStore, XrpcOrf, XrpcThreadStore, XrpcTransport,
 };
-use labyrinth::store::{KeyPublisher, MailboxDirectory, TimeRange};
+use labyrinth::store::{KeyPublisher, MailboxDirectory, MailboxStore, TimeRange};
 use labyrinth::virtual_device::Mechanism;
 use zeroize::Zeroizing;
 
 use super::map_error;
 use super::signer::{ChatKeySigner, LatchedTransportSigner, SignerFault};
+use super::space::{Placement, SpaceMailbox};
 use super::state::StateVault;
 use crate::orchestrator::error::{OrchestratorError, Result};
 
@@ -35,6 +37,14 @@ pub struct SessionDeps {
     /// cross-checked between PDS and mls-ds ([CB-28], [CB-29]); without
     /// it mls-ds is the only directory (plan doc, D6).
     pub pds: Option<Arc<dyn PdsRecords>>,
+    /// The account's own PDS Space (`com.atproto.space.*` with its OAuth
+    /// session), when the platform reaches it
+    /// (`OrchestratorAPICallback::labyrinth_space_enabled`). A new mailbox
+    /// goes there when `pds` is also set ([`super::space`]).
+    pub space: Option<Arc<dyn XrpcTransport>>,
+    /// Which backend holds the account's mailbox, saved on this device
+    /// ([`super::space::MlsPlacementVault`]).
+    pub placements: Arc<dyn StateVault>,
 }
 
 /// One page of decrypted history (`load_thread` over a time range).
@@ -78,33 +88,119 @@ fn surface(fault: &SignerFault) -> Result<()> {
 }
 
 impl SessionDeps {
-    fn backends(&self) -> Backends {
+    /// The account's Space mailbox store, when this platform reaches both
+    /// its Space and its public repo (`mailboxKeys` goes to the repo).
+    fn space_store(&self) -> Option<SpaceMailboxStore> {
+        let (space, pds) = (self.space.as_ref()?, self.pds.as_ref()?);
+        Some(SpaceMailboxStore::new(
+            &self.did,
+            space.clone(),
+            Box::new(PdsPublisher::new(&self.did, pds.clone())),
+        ))
+    }
+
+    fn backends(&self, placement: Placement) -> Result<Backends> {
         let t = self.transport.clone();
         let ds = Box::new(XrpcDirectory::new(t.clone()));
-        let (directory, publishers): (Box<dyn MailboxDirectory + Send>, Vec<_>) = match &self.pds {
-            Some(pds) => (
-                Box::new(CompositeDirectory::new(
-                    Box::new(PdsDirectory::new(pds.clone())),
-                    ds,
-                )),
-                vec![Box::new(PdsPublisher::new(&self.did, pds.clone()))
-                    as Box<dyn KeyPublisher + Send>],
-            ),
-            None => (ds, Vec::new()),
+        let (directory, mut publishers): (Box<dyn MailboxDirectory + Send>, Vec<_>) =
+            match &self.pds {
+                Some(pds) => (
+                    Box::new(CompositeDirectory::new(
+                        Box::new(PdsDirectory::new(pds.clone())),
+                        ds,
+                    )),
+                    vec![Box::new(PdsPublisher::new(&self.did, pds.clone()))
+                        as Box<dyn KeyPublisher + Send>],
+                ),
+                None => (ds, Vec::new()),
+            };
+        let mailbox: Box<dyn MailboxStore + Send> = match placement {
+            Placement::MlsDs => Box::new(XrpcMailboxStore::new(&self.did, t.clone())),
+            Placement::Space => {
+                let space = self.space_store().ok_or_else(|| {
+                    OrchestratorError::Api(
+                        "labyrinth: this account's history mailbox is in its PDS Space, \
+                         which this app cannot reach"
+                            .into(),
+                    )
+                })?;
+                // The Space store writes `mailboxKeys` itself; mls-ds gets
+                // the head chain as the independent directory ([CB-28]).
+                publishers = vec![Box::new(XrpcDirectory::new(t.clone()))];
+                Box::new(SpaceMailbox::new(
+                    space,
+                    XrpcMailboxStore::new(&self.did, t.clone()),
+                ))
+            }
         };
-        Backends {
-            mailbox: Box::new(XrpcMailboxStore::new(&self.did, t.clone())),
+        Ok(Backends {
+            mailbox,
             threads: Box::new(XrpcThreadStore::new(&self.did, t.clone())),
             directory,
             orf: Box::new(XrpcOrf::new(t)),
             publishers,
             clock: Box::new(SystemClock),
+        })
+    }
+
+    /// The saved placement of the account's mailbox. Saved state without
+    /// one predates Space support and is an mls-ds mailbox.
+    fn saved_placement(&self) -> Result<Placement> {
+        let saved = self
+            .placements
+            .load(&self.did)
+            .map_err(OrchestratorError::Mls)?;
+        match saved {
+            None => Ok(Placement::MlsDs),
+            Some(b) => Placement::parse(&b).ok_or_else(|| {
+                OrchestratorError::Storage("labyrinth: unknown mailbox placement".into())
+            }),
         }
+    }
+
+    fn save_placement(&self, placement: Placement) -> Result<()> {
+        let current = self
+            .placements
+            .load(&self.did)
+            .map_err(OrchestratorError::Mls)?;
+        let next = placement.as_str().as_bytes();
+        if current.as_deref() == Some(next) {
+            return Ok(());
+        }
+        let swapped = self
+            .placements
+            .compare_exchange(&self.did, current.as_deref(), next)
+            .map_err(OrchestratorError::Mls)?;
+        if !swapped {
+            return Err(OrchestratorError::Storage(
+                "labyrinth: mailbox placement changed concurrently; reopen the session".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Where a device that has no saved state finds (or creates) the
+    /// account's mailbox: an existing Space mailbox, else an existing mls-ds
+    /// mailbox, else a new one in the Space. Without a reachable Space,
+    /// always mls-ds. A mailbox is never moved between backends.
+    pub fn probe_placement(&self) -> Result<Placement> {
+        let Some(space) = self.space_store() else {
+            return Ok(Placement::MlsDs);
+        };
+        if has_genesis(&space)? {
+            return Ok(Placement::Space);
+        }
+        if has_genesis(&XrpcMailboxStore::new(&self.did, self.transport.clone()))? {
+            return Ok(Placement::MlsDs);
+        }
+        Ok(Placement::Space)
     }
 
     /// The remote half of an account deletion, without any client state:
     /// retract the PDS `mailboxKeys` records (when configured), then mls-ds
-    /// `deleteAccountData`. Idempotent; the retry after
+    /// `deleteAccountData`, then (when this platform reaches the account's
+    /// Space) every Space mailbox record. It does not depend on the saved
+    /// placement, which is already erased. Idempotent; the retry after
     /// [`LabyrinthSession::purge_account`] reported `remote_pending`.
     pub fn delete_account_remote(&self) -> labyrinth::Result<()> {
         let mailbox = XrpcMailboxStore::new(&self.did, self.transport.clone());
@@ -114,7 +210,11 @@ impl SessionDeps {
             .map(|p| PdsPublisher::new(&self.did, p.clone()));
         let publishers: Vec<&dyn KeyPublisher> =
             pds.iter().map(|p| p as &dyn KeyPublisher).collect();
-        delete_account_remote(&mailbox, &publishers)
+        delete_account_remote(&mailbox, &publishers)?;
+        match self.space_store().map(|s| s.purge_mailbox()) {
+            None | Some(Ok(())) | Some(Err(labyrinth::Error::NotFound("space"))) => Ok(()),
+            Some(Err(e)) => Err(e),
+        }
     }
 
     /// With a PDS directory: makes sure the account's PDS carries its
@@ -153,6 +253,7 @@ impl SessionDeps {
             lab,
             fault,
             vault: self.vault,
+            placements: self.placements,
             persisted: persisted.map(Zeroizing::new),
         }
     }
@@ -168,7 +269,7 @@ impl SessionDeps {
             &saved,
             &self.did,
             self.transport_signer(&fault),
-            self.backends(),
+            self.backends(self.saved_placement()?)?,
         );
         surface(&fault)?;
         let lab = lab.map_err(map_error)?;
@@ -185,10 +286,17 @@ impl SessionDeps {
         if let Some(s) = self.clone().open()? {
             return Ok(s);
         }
+        let placement = self.probe_placement()?;
         let fault = SignerFault::default();
-        let lab = Labyrinth::initialize(&self.did, self.transport_signer(&fault), self.backends());
+        let lab = Labyrinth::initialize(
+            &self.did,
+            self.transport_signer(&fault),
+            self.backends(placement)?,
+        );
         surface(&fault)?;
-        let mut s = self.session(lab.map_err(map_error)?, fault, None);
+        let lab = lab.map_err(map_error)?;
+        self.save_placement(placement)?;
+        let mut s = self.session(lab, fault, None);
         s.save()?;
         Ok(s)
     }
@@ -196,15 +304,17 @@ impl SessionDeps {
     /// Enrolls this device from a recovery code (typos are corrected) and
     /// replaces any saved state for the account.
     pub fn restore_with_recovery_code(self, code: &str) -> Result<LabyrinthSession> {
+        let placement = self.probe_placement()?;
         let fault = SignerFault::default();
         let restored = Labyrinth::restore_with_recovery_code(
             &self.did,
             code,
             self.transport_signer(&fault),
-            self.backends(),
+            self.backends(placement)?,
         );
         surface(&fault)?;
         let (lab, _enrollment) = restored.map_err(map_error)?;
+        self.save_placement(placement)?;
         let existing = self.vault.load(&self.did).map_err(OrchestratorError::Mls)?;
         let mut s = self.session(lab, fault, existing);
         s.save()?;
@@ -223,6 +333,7 @@ pub struct LabyrinthSession {
     lab: Labyrinth,
     fault: SignerFault,
     vault: Arc<dyn StateVault>,
+    placements: Arc<dyn StateVault>,
     /// The bytes last read from or written to the vault.
     persisted: Option<Zeroizing<Vec<u8>>>,
 }
@@ -243,6 +354,9 @@ impl LabyrinthSession {
     /// server-side mailbox is untouched.
     pub fn forget(&mut self) -> Result<()> {
         self.vault
+            .delete(&self.did)
+            .map_err(OrchestratorError::Mls)?;
+        self.placements
             .delete(&self.did)
             .map_err(OrchestratorError::Mls)?;
         self.persisted = None;
@@ -477,5 +591,15 @@ impl LabyrinthSession {
     /// account's own mailbox before leaving. Returns how many were copied.
     pub fn rearchive_before_leave(&mut self, conversation_id: &str) -> Result<usize> {
         self.run(|lab| lab.rearchive_thread_before_leave(conversation_id))
+    }
+}
+
+/// Whether `mailbox` holds an epoch 0. A Space nobody has written to, or an
+/// mls-ds account without a mailbox, reads as empty.
+fn has_genesis(mailbox: &dyn MailboxStore) -> Result<bool> {
+    match mailbox.get_epoch(0) {
+        Ok(e) => Ok(e.is_some()),
+        Err(labyrinth::Error::NotFound(_)) => Ok(false),
+        Err(e) => Err(map_error(e)),
     }
 }

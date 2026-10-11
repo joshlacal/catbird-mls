@@ -61,6 +61,19 @@ impl<A: MLSAPIClient + 'static> LabyrinthGateway for ApiGateway<A> {
     }
 }
 
+/// The account's PDS Space ([`super::space`]) through the platform's
+/// `submit_labyrinth_space_request`.
+impl<A: MLSAPIClient + 'static> super::space::LabyrinthSpaceGateway for ApiGateway<A> {
+    fn submit_space(
+        &self,
+        request: super::space::LabyrinthSpaceRequest,
+    ) -> Result<GatewayResponse, String> {
+        self.runtime
+            .block_on(self.api.submit_labyrinth_space_request(request))
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// The PDS half of the Labyrinth directory ([CB-19]) through the
 /// platform's `*_labyrinth_mailbox_keys` gateway methods.
 impl<A: MLSAPIClient + 'static> labyrinth::store::pds::PdsRecords for ApiGateway<A> {
