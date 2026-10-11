@@ -370,6 +370,8 @@ mod queue_tests;
 mod review_tests;
 #[path = "space_tests.rs"]
 mod space_tests;
+#[path = "live_space_tests.rs"]
+mod live_space_tests;
 
 // ── tests ───────────────────────────────────────────────────────────────
 
