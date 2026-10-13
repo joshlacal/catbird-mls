@@ -2549,7 +2549,7 @@ fn validate_labyrinth_head(head: &serde_json::Value) -> Result<(), TransportErro
     if !fields
         .get("attestationKeyId")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|key_id| key_id.chars().count() <= MAX_ATTESTATION_KEY_ID_LEN)
+        .is_some_and(|key_id| key_id.len() <= MAX_ATTESTATION_KEY_ID_LEN)
     {
         return Err(invalid());
     }
@@ -4469,12 +4469,16 @@ mod read_routing_extension_tests {
         short["epochHead"] = serde_json::json!({"$bytes": "AQID"});
         let mut extra = labyrinth_head();
         extra["unknown"] = serde_json::json!(1);
+        // maxLength counts UTF-8 bytes: 128 CJK chars are 384 bytes.
+        let mut wide_key_id = labyrinth_head();
+        wide_key_id["attestationKeyId"] = serde_json::json!("鍵".repeat(128));
         for head in [
             serde_json::json!(17),
             serde_json::json!("head"),
             missing,
             short,
             extra,
+            wide_key_id,
         ] {
             let mut wire = state.clone();
             wire["participants"][0]["labyrinthHead"] = head.clone();
