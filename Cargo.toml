@@ -100,15 +100,11 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
-# Labyrinth 1.1 encrypted chat history (feature `labyrinth`, off by default).
-# LOCAL-ONLY: the crate lives in the PRIVATE joshlacal/labyrinth repo, checked
-# out for this lane in the jj workspace ~/Developer/.workspaces/labyrinth-wire
-# (bookmark `local/labyrinth-wire-20261005`). The relative path resolves only
-# from ~/Developer/.workspaces/labyrinth-mlsds-server/catbird-mls. Cargo loads the manifest of
-# every path dependency even when its feature is off, so this line must not
-# reach a public branch until Josh decides how the crate is published
+# Labyrinth 1.1 encrypted chat history: the private `labyrinth` crate is not a
+# dependency of this release source. A lane checkout re-adds
+#   labyrinth = { path = "../../labyrinth-wire", features = ["space"], optional = true }
+# and sets the `labyrinth` feature below back to ["dep:labyrinth"]
 # (docs/plans/2026-10-05-labyrinth-history-backup.md, decision D1).
-labyrinth = { path = "../../labyrinth-wire", features = ["space"], optional = true }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
@@ -136,7 +132,8 @@ e2e-aad = []
 test-utils = ["openmls/test-utils", "openmls_rust_crypto/test-utils", "openmls_memory_storage/test-utils"]
 # Labyrinth 1.1 encrypted history backup over the mls-ds
 # `blue.catbird.labyrinth.*` endpoints (src/labyrinth/). Native targets only.
-labyrinth = ["dep:labyrinth"]
+# Needs the lane-only `labyrinth` dependency (see above); does not build here.
+labyrinth = []
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 openmls_sqlite_storage = { version = "=0.3.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
