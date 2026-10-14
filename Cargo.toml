@@ -101,14 +101,11 @@ clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Labyrinth 1.1 encrypted chat history (feature `labyrinth`, off by default).
-# LOCAL-ONLY: the crate lives in the PRIVATE joshlacal/labyrinth repo, checked
-# out for this lane in the jj workspace ~/Developer/.workspaces/labyrinth-wire
-# (bookmark `local/labyrinth-wire-20261005`). The relative path resolves only
-# from ~/Developer/.workspaces/labyrinth-mlsds-server/catbird-mls. Cargo loads the manifest of
-# every path dependency even when its feature is off, so this line must not
-# reach a public branch until Josh decides how the crate is published
-# (docs/plans/2026-10-05-labyrinth-history-backup.md, decision D1).
-labyrinth = { path = "../../labyrinth-wire", features = ["space"], optional = true }
+# Pinned by git rev on joshlacal/labyrinth (decision D1, amended 2026-10-14:
+# the repo is public). Bump the rev to pick up labyrinth changes. To build
+# against a local checkout, use a `[patch."https://github.com/joshlacal/labyrinth"]`
+# override in your own `.cargo/config.toml` rather than editing this line.
+labyrinth = { git = "https://github.com/joshlacal/labyrinth", rev = "b42ae3d1faeaadcda585d4245e119b61131e5849", features = ["space"], optional = true }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
