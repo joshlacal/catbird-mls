@@ -11,6 +11,15 @@ echo ""
 export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-18.0}"
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
+# Cargo features of the shipped library. Labyrinth history backup is on: it
+# does nothing until the account enables it on a device. Set
+# CATBIRD_MLS_FEATURES="" to build without it.
+CATBIRD_MLS_FEATURES="${CATBIRD_MLS_FEATURES-labyrinth}"
+FEATURE_ARGS=()
+if [ -n "$CATBIRD_MLS_FEATURES" ]; then
+    FEATURE_ARGS=(--features "$CATBIRD_MLS_FEATURES")
+fi
+
 # Clean previous builds
 rm -rf CatbirdMLSFFI.xcframework
 rm -rf build/frameworks
@@ -26,7 +35,7 @@ fi
 
 echo "🔧 Step 1: Build host library for metadata extraction"
 echo "Target: $HOST_TARGET"
-cargo build --locked --release --target "$HOST_TARGET"
+cargo build --locked --release --target "$HOST_TARGET" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo ""
 echo "🧠 Step 2: Generate Swift bindings from compiled library"
@@ -49,25 +58,25 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch
 echo ""
 echo "🏗️  Step 4: Build static libraries"
 echo "Building for iOS Device (ARM64)..."
-cargo build --locked --release --target aarch64-apple-ios
+cargo build --locked --release --target aarch64-apple-ios ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "Building for iOS Simulator (ARM64)..."
-cargo build --locked --release --target aarch64-apple-ios-sim
+cargo build --locked --release --target aarch64-apple-ios-sim ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "Building for iOS Simulator (x86_64)..."
-cargo build --locked --release --target x86_64-apple-ios
+cargo build --locked --release --target x86_64-apple-ios ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "Building for Mac Catalyst (arm64)..."
-cargo build --locked --release --target aarch64-apple-ios-macabi
+cargo build --locked --release --target aarch64-apple-ios-macabi ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "Building for Mac Catalyst (x86_64)..."
-cargo build --locked --release --target x86_64-apple-ios-macabi
+cargo build --locked --release --target x86_64-apple-ios-macabi ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "Building for macOS (arm64)..."
-cargo build --locked --release --target aarch64-apple-darwin
+cargo build --locked --release --target aarch64-apple-darwin ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo "Building for macOS (x86_64)..."
-cargo build --locked --release --target x86_64-apple-darwin
+cargo build --locked --release --target x86_64-apple-darwin ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
 echo ""
 echo "📦 Step 5: Create XCFramework structure"
