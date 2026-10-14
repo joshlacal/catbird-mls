@@ -105,7 +105,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 # the repo is public). Bump the rev to pick up labyrinth changes. To build
 # against a local checkout, use a `[patch."https://github.com/joshlacal/labyrinth"]`
 # override in your own `.cargo/config.toml` rather than editing this line.
-labyrinth = { git = "https://github.com/joshlacal/labyrinth", rev = "0c44b060c53ab0c7a267feb75aa570476bb31a34", features = ["space"], optional = true }
+labyrinth = { git = "https://github.com/joshlacal/labyrinth", rev = "b42ae3d1faeaadcda585d4245e119b61131e5849", features = ["space"], optional = true }
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

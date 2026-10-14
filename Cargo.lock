@@ -2501,7 +2501,7 @@ dependencies = [
 [[package]]
 name = "labyrinth"
 version = "0.1.0"
-source = "git+https://github.com/joshlacal/labyrinth?rev=0c44b060c53ab0c7a267feb75aa570476bb31a34#0c44b060c53ab0c7a267feb75aa570476bb31a34"
+source = "git+https://github.com/joshlacal/labyrinth?rev=b42ae3d1faeaadcda585d4245e119b61131e5849#b42ae3d1faeaadcda585d4245e119b61131e5849"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
