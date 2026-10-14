@@ -2497,6 +2497,76 @@ fn remove_read_routing_extensions(state: &mut serde_json::Value) -> Result<(), T
             ));
         }
     }
+    if let Some(participants) = fields
+        .get_mut("participants")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for participant in participants {
+            if let Some(head) = participant
+                .as_object_mut()
+                .and_then(|participant| participant.remove("labyrinthHead"))
+            {
+                validate_labyrinth_head(&head)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `participantView.labyrinthHead` (PetrelCatbird 55e4eff4) is a read-only
+/// pointer into the mls-ds Labyrinth head directory. Like the sequencer
+/// routing hints it is server-attached display/routing data, not signed
+/// conversation state, so it is shape-checked against `#labyrinthHead` and
+/// then dropped before the closed canonical projection. Labyrinth consumers
+/// resolve heads through `blue.catbird.labyrinth.getEpochHead` instead.
+fn validate_labyrinth_head(head: &serde_json::Value) -> Result<(), TransportError> {
+    use base64::{
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+        Engine as _,
+    };
+    const MAX_EPOCH_NUMBER: u64 = 1_099_511_627_776;
+    const MAX_ATTESTATION_KEY_ID_LEN: usize = 128;
+    let invalid = || {
+        TransportError::Serialization(
+            "labyrinthHead must be null or a valid #labyrinthHead object".into(),
+        )
+    };
+    let fields = match head {
+        serde_json::Value::Null => return Ok(()),
+        serde_json::Value::Object(fields) => fields,
+        _ => return Err(invalid()),
+    };
+    if fields.len() != 3 {
+        return Err(invalid());
+    }
+    if !fields
+        .get("epochNumber")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|number| number <= MAX_EPOCH_NUMBER)
+    {
+        return Err(invalid());
+    }
+    if !fields
+        .get("attestationKeyId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|key_id| key_id.len() <= MAX_ATTESTATION_KEY_ID_LEN)
+    {
+        return Err(invalid());
+    }
+    let epoch_head = match fields.get("epochHead") {
+        Some(serde_json::Value::Object(bytes)) if bytes.len() == 1 => bytes
+            .get("$bytes")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid)?,
+        _ => return Err(invalid()),
+    };
+    let decoded = STANDARD
+        .decode(epoch_head)
+        .or_else(|_| STANDARD_NO_PAD.decode(epoch_head))
+        .map_err(|_| invalid())?;
+    if decoded.len() != 32 {
+        return Err(invalid());
+    }
     Ok(())
 }
 
@@ -4337,6 +4407,90 @@ mod read_routing_extension_tests {
         wrong_tag["$type"] = serde_json::json!("blue.catbird.chat.defs#conversationCoordinates");
         wrong_tag["sequencerDid"] = serde_json::Value::Null;
         assert!(decode_conversation_state(&serde_json::to_vec(&wrong_tag).unwrap()).is_err());
+    }
+
+    fn labyrinth_head() -> serde_json::Value {
+        // Shape of blue.catbird.chat.defs#labyrinthHead (PetrelCatbird 55e4eff4).
+        serde_json::json!({
+            "epochNumber": 7,
+            "epochHead": {"$bytes": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"},
+            "attestationKeyId": "device-key-1"
+        })
+    }
+
+    #[test]
+    fn participant_labyrinth_head_is_accepted_and_excluded_from_signed_state() {
+        let state = policy_only(live_items().remove(0)["state"].clone());
+        let expected = decode_conversation_state(&serde_json::to_vec(&state).unwrap()).unwrap();
+        for head in [labyrinth_head(), serde_json::Value::Null] {
+            let mut wire = state.clone();
+            for participant in wire["participants"].as_array_mut().unwrap() {
+                participant["labyrinthHead"] = head.clone();
+            }
+            assert_eq!(
+                decode_conversation_state(&serde_json::to_vec(&wire).unwrap()).unwrap(),
+                expected
+            );
+            // The directory head is never part of the canonical signed state.
+            assert!(canonical_cbor_for_schema_impl("conversationState", &wire, false).is_err());
+            let items = vec![serde_json::json!({
+                "$type": "blue.catbird.chat.defs#conversationInventoryState",
+                "state": wire,
+            })];
+            let output =
+                decode_conversations_inventory(&serde_json::to_vec(&inventory(items)).unwrap())
+                    .unwrap();
+            assert_eq!(output.items.len(), 1);
+        }
+
+        // A generated DTO carrying the head must re-encode through the same path.
+        let mut generated = serde_json::to_value(&expected).unwrap();
+        for participant in generated["participants"].as_array_mut().unwrap() {
+            participant["labyrinthHead"] = labyrinth_head();
+        }
+        let generated: catbird_atproto::blue_catbird::chat::ConversationState =
+            serde_json::from_value(generated).unwrap();
+        assert!(generated
+            .participants
+            .iter()
+            .all(|participant| participant.labyrinth_head.is_some()));
+        assert_eq!(
+            decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn participant_labyrinth_head_rejects_malformed_values() {
+        let state = policy_only(live_items().remove(0)["state"].clone());
+        let mut missing = labyrinth_head();
+        missing.as_object_mut().unwrap().remove("attestationKeyId");
+        let mut short = labyrinth_head();
+        short["epochHead"] = serde_json::json!({"$bytes": "AQID"});
+        let mut extra = labyrinth_head();
+        extra["unknown"] = serde_json::json!(1);
+        // maxLength counts UTF-8 bytes: 128 CJK chars are 384 bytes.
+        let mut wide_key_id = labyrinth_head();
+        wide_key_id["attestationKeyId"] = serde_json::json!("鍵".repeat(128));
+        for head in [
+            serde_json::json!(17),
+            serde_json::json!("head"),
+            missing,
+            short,
+            extra,
+            wide_key_id,
+        ] {
+            let mut wire = state.clone();
+            wire["participants"][0]["labyrinthHead"] = head.clone();
+            assert!(
+                decode_conversation_state(&serde_json::to_vec(&wire).unwrap()).is_err(),
+                "accepted labyrinthHead {head}"
+            );
+        }
+        // Only participants carry the extension.
+        let mut misplaced = state;
+        misplaced["labyrinthHead"] = labyrinth_head();
+        assert!(decode_conversation_state(&serde_json::to_vec(&misplaced).unwrap()).is_err());
     }
 }
 
