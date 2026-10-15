@@ -221,6 +221,63 @@ pub(super) fn with_pds(mut d: Device, repos: &Repos) -> Device {
     d
 }
 
+/// A PDS directory whose reads fail the way a timed-out or suspended
+/// platform callback does.
+struct FlakyPds {
+    inner: MockPds,
+    fail_reads: Arc<AtomicBool>,
+}
+
+impl PdsRecords for FlakyPds {
+    fn put_mailbox_keys(&self, rkey: &str, record: &[u8]) -> Result<(), String> {
+        self.inner.put_mailbox_keys(rkey, record)
+    }
+    fn get_mailbox_keys(&self, did: &str, rkey: &str) -> Result<Option<Vec<u8>>, String> {
+        if self.fail_reads.load(Ordering::SeqCst) {
+            return Err("labyrinth callback refused while MLS is suspended".into());
+        }
+        self.inner.get_mailbox_keys(did, rkey)
+    }
+    fn delete_all_mailbox_keys(&self) -> Result<(), String> {
+        self.inner.delete_all_mailbox_keys()
+    }
+}
+
+#[test]
+fn a_failed_pds_read_is_transient() {
+    let gw = RefGateway::new();
+    let repos = Repos::default();
+    let fail_reads = Arc::new(AtomicBool::new(false));
+    let mut alice = Device::new(&gw, ALICE, A1, 1);
+    alice.deps.pds = Some(Arc::new(FlakyPds {
+        inner: MockPds {
+            me: ALICE.into(),
+            repos: repos.clone(),
+        },
+        fail_reads: fail_reads.clone(),
+    }));
+    let bob = with_pds(Device::new(&gw, BOB, B1, 2), &repos);
+    let mut a = alice.deps.clone().enable().unwrap();
+    let mut b = bob.deps.clone().enable().unwrap();
+    let q = MemQueue::default();
+    queue(&q, 1);
+    fail_reads.store(true, Ordering::SeqCst);
+    for _ in 0..=super::super::queue::MAX_FAILURES {
+        let r = flush_queue(&mut a, &alice.deps, &q).unwrap();
+        assert_eq!(
+            (r.archived, r.failed_conversations, r.quarantined),
+            (0, 1, 0)
+        );
+    }
+    let rows = q.list(ALICE).unwrap();
+    let error = rows[0].last_error.as_deref().unwrap();
+    assert!(error.contains("pds: "), "{error}");
+    assert!(rows[0].failures == 0 && !rows[0].quarantined);
+    fail_reads.store(false, Ordering::SeqCst);
+    assert_eq!(flush_queue(&mut a, &alice.deps, &q).unwrap().archived, 1);
+    assert_eq!(copies(&mut b), [("m-1".into(), 1)]);
+}
+
 #[test]
 fn epochs_are_published_to_the_pds_and_cross_checked() {
     let gw = RefGateway::new();
