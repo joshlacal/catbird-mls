@@ -50,11 +50,12 @@ impl FlushReport {
 }
 
 /// Failures that say nothing about the conversation: no response, a
-/// server error, rate limiting, no randomness. They are recorded but do
-/// not count towards quarantine.
+/// server error, rate limiting, no randomness, a failed platform call to a
+/// member's PDS (`pds: `, for example one timed out or cut short by app
+/// suspension). They are recorded but do not count towards quarantine.
 pub(crate) fn is_transient(e: &labyrinth::Error) -> bool {
     match e {
-        labyrinth::Error::Backend(m) => ["xrpc 0:", "xrpc 5", "xrpc 429", "xrpc 408"]
+        labyrinth::Error::Backend(m) => ["xrpc 0:", "xrpc 5", "xrpc 429", "xrpc 408", "pds: "]
             .iter()
             .any(|p| m.starts_with(p)),
         labyrinth::Error::Rng => true,
