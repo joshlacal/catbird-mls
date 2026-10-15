@@ -123,6 +123,15 @@ export ANDROID_NDK_HOME="$ANDROID_NDK_DIR"
 export ANDROID_NDK_ROOT="$ANDROID_NDK_DIR"
 export PATH="$TOOLCHAIN_DIR/bin:$PATH"
 
+# Cargo features of the shipped library. Labyrinth history backup is on: it
+# does nothing until the account enables it on a device. Set
+# CATBIRD_MLS_FEATURES="" to build without it.
+CATBIRD_MLS_FEATURES="${CATBIRD_MLS_FEATURES-labyrinth}"
+FEATURE_ARGS=()
+if [ -n "$CATBIRD_MLS_FEATURES" ]; then
+    FEATURE_ARGS=(--features "$CATBIRD_MLS_FEATURES")
+fi
+
 log_info "Building catbird-mls for Android"
 log_info "Using Android NDK: $ANDROID_NDK_DIR"
 log_info "Using LLVM toolchain: $TOOLCHAIN_DIR"
@@ -198,7 +207,7 @@ build_for_target() {
     "RANLIB_${target}=$ranlib" \
     "RANLIB_${normalized_target}=$ranlib" \
     "CARGO_TARGET_${upper_target}_LINKER=$linker" \
-    cargo build --release --target "$target"
+    cargo build --release --target "$target" ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
 
   if [[ ! -f "$source_path" ]]; then
     log_error "Expected library not found: $source_path"
