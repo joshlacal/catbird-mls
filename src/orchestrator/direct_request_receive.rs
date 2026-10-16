@@ -310,7 +310,9 @@ where
             )
             .map_err(|_| invalid())?;
             let actor_did = verified.body()["actorDid"].as_str().ok_or_else(invalid)?;
-            let recipient_did = &owner;
+            let recipient_did = verified.body()["recipientDid"]
+                .as_str()
+                .ok_or_else(invalid)?;
             let actor_auth = self
                 .credentials()
                 .get_chat_declaration_authority(actor_did)

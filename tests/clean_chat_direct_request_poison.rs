@@ -510,3 +510,104 @@ async fn c17_invalid_welcome_final_tree_provenance_rolls_back_every_native_row()
         DirectRequestIntroductionResult::Ready { .. }
     ));
 }
+
+fn receipt_authority_document(authority_did: &str, key: &p256::ecdsa::SigningKey) -> Vec<u8> {
+    let point = key.verifying_key().to_encoded_point(true);
+    let method =
+        protocol::direct_request_receipt_key_id_for_authority(authority_did, point.as_bytes())
+            .unwrap();
+    let mut multikey = vec![0x80, 0x24];
+    multikey.extend(point.as_bytes());
+    serde_json::to_vec(&json!({
+        "id": authority_did,
+        "verificationMethod": [{
+            "id": method,
+            "controller": authority_did,
+            "type": "Multikey",
+            "publicKeyMultibase": multibase::encode(multibase::Base::Base58Btc, multikey),
+        }],
+    }))
+    .unwrap()
+}
+
+impl Proof {
+    /// Re-issue the publication receipt from `authority_did`, as the pair's
+    /// coordinator does when it is not the canonical authority.
+    fn reissue_receipt(&mut self, authority_did: &str, authority: p256::ecdsa::SigningKey) {
+        let mut receipt = serde_json::from_slice::<Value>(&self.welcome.published_receipt).unwrap();
+        let mut body = receipt["body"].take();
+        let key = authority.verifying_key().to_encoded_point(true);
+        body["authorityDid"] = json!(authority_did);
+        body["keyId"] = json!(protocol::direct_request_receipt_key_id_for_authority(
+            authority_did,
+            key.as_bytes()
+        )
+        .unwrap());
+        let signature: p256::ecdsa::Signature = authority.sign(
+            &protocol::direct_request_signing_bytes(
+                protocol::DirectRequestKind::Outcome,
+                &serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+        );
+        let signature = signature.normalize_s().unwrap_or(signature);
+        let receipt = json!({"body": body, "signature": STANDARD.encode(signature.to_bytes())});
+        self.welcome.published_receipt = serde_json::to_vec(&receipt).unwrap();
+        self.welcome.receipt_authority_did = authority_did.into();
+        self.welcome.receipt_authority_key = key.as_bytes().to_vec();
+        self.authority_doc = receipt_authority_document(authority_did, &authority);
+        self.authority = authority;
+    }
+}
+
+/// A sender's other device reads its own published request back from the
+/// server, so the reading account is the publication's actor, not its
+/// recipient. The receipt coordinator is still min(actor authority, recipient
+/// authority). The recipient's declared authority sorts below the sender's
+/// here, so the coordinator is the recipient's authority, never the reading
+/// account's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn sender_other_device_verifies_receipt_against_pair_coordinator() {
+    const SENDER_AUTHORITY: &str = "did:web:chat-z.catbird.blue";
+    const RECIPIENT_AUTHORITY: &str = "did:web:chat-a.catbird.blue";
+    let mut world = world().await;
+    let alice_did = world.client("Alice").did.clone();
+    let bob_did = world.client("Bob").did.clone();
+    world.add_client_with_did("AliceOther", &alice_did).await;
+    world.register_device("AliceOther").await.unwrap();
+    let mut proof = proof(&world).await;
+    proof.reissue_receipt(
+        RECIPIENT_AUTHORITY,
+        p256::ecdsa::SigningKey::from_slice(&[64; 32]).unwrap(),
+    );
+    let other = world.client("AliceOther");
+    other
+        .credentials
+        .set_chat_declaration_authority(&alice_did, Some(SENDER_AUTHORITY));
+    other
+        .credentials
+        .set_chat_declaration_authority(&bob_did, Some(RECIPIENT_AUTHORITY));
+    other
+        .credentials
+        .set_request_authority_document(proof.authority_doc.clone());
+    proof.queue(&world);
+    let view = other
+        .orchestrator
+        .refresh_request_preview(proof.cid())
+        .await
+        .expect("sender's other device accepts the pair coordinator's receipt");
+    assert_eq!(view.consent, RequestConsent::OutgoingPending);
+    assert_eq!(view.crypto, RequestCrypto::Unavailable);
+    assert_eq!(
+        view.preview,
+        Some(RequestPreview::Unavailable {
+            code: "DeviceNotAddressed".into()
+        })
+    );
+    let introduction = view.introduction.expect("verified publication metadata");
+    assert_eq!(introduction.sender_did, alice_did);
+    assert_eq!(
+        introduction.sender_device_id,
+        proof.body["actorDeviceId"].as_str().unwrap()
+    );
+}
