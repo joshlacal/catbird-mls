@@ -14,13 +14,12 @@ fn invalid() -> OrchestratorError {
 fn same_group_id(signed_next: &Value, read_current: &Value) -> Result<bool> {
     let group_id = |coordinates: &Value| -> Result<Value> {
         let raw = serde_json::to_vec(coordinates).map_err(|_| invalid())?;
-        let normalized =
-            crate::chat_v2::transcript::direct_request::normalize_read_presentation(
-                &raw,
-                "conversationCoordinates",
-                false,
-            )
-            .map_err(|_| invalid())?;
+        let normalized = crate::chat_v2::transcript::direct_request::normalize_read_presentation(
+            &raw,
+            "conversationCoordinates",
+            false,
+        )
+        .map_err(|_| invalid())?;
         match &normalized["groupId"] {
             Value::String(_) => Ok(normalized["groupId"].clone()),
             _ => Err(invalid()),
@@ -167,7 +166,7 @@ where
                     .try_into()
                     .map_err(|_| invalid())?;
                 let key = self
-                    .request_historical_device_key(
+                    .request_authorized_device_key(
                         actor,
                         actor_device,
                         body["keyId"].as_str().ok_or_else(invalid)?,

@@ -186,7 +186,9 @@ where
             }
         }
         for raw in self.mls_context().list_direct_request_projections()? {
-            let projection = projection::DirectRequestProjection::decode(&raw, owner, &device)?;
+            let projection = projection::DirectRequestProjection::decode_for_reauthorization(
+                &raw, owner, &device,
+            )?;
             if let Some(pending) = &projection.pending_acceptance {
                 let public = self
                     .mls_context()
@@ -270,8 +272,10 @@ where
             })
             .map(|j| j.conversation_id)
             .collect();
-        for raw in self.mls_context().list_direct_request_projections()? {
-            let projection = projection::DirectRequestProjection::decode(&raw, &owner, &device)?;
+        for mut raw in self.mls_context().list_direct_request_projections()? {
+            let projection = self
+                .authorize_direct_request_projection(&mut raw, &owner, &device)
+                .await?;
             let view = projection.view(&owner, &device)?;
             if !ids.insert(view.conversation_id.clone()) {
                 return Err(OrchestratorError::Storage(
@@ -297,20 +301,22 @@ where
         }
         let owner = self.require_user_did().await?;
         let device = self.require_actor_device_id().await?;
-        self.mls_context()
+        let Some(mut raw) = self
+            .mls_context()
             .read_direct_request_projection(conversation_id)?
-            .map(|raw| {
-                let projection =
-                    projection::DirectRequestProjection::decode(&raw, &owner, &device)?;
-                let view = projection.view(&owner, &device)?;
-                if view.conversation_id != conversation_id {
-                    return Err(OrchestratorError::Storage(
-                        "Request projection conversation mismatch".into(),
-                    ));
-                }
-                Ok(view)
-            })
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        let projection = self
+            .authorize_direct_request_projection(&mut raw, &owner, &device)
+            .await?;
+        let view = projection.view(&owner, &device)?;
+        if view.conversation_id != conversation_id {
+            return Err(OrchestratorError::Storage(
+                "Request projection conversation mismatch".into(),
+            ));
+        }
+        Ok(Some(view))
     }
 }
 

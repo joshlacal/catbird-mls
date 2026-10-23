@@ -440,18 +440,18 @@ pub trait OrchestratorAPICallback: Send + Sync {
         })
     }
 
-    /// True once the platform implements `submit_labyrinth_space_request`
-    /// against a PDS that serves `com.atproto.space.*`. Together with
-    /// `labyrinth_pds_enabled`, a new history mailbox then goes into the
-    /// account's own Space instead of mls-ds. Report false for a PDS
-    /// without Spaces (bsky.social today).
+    /// True once the platform implements owner OAuth Space operations and
+    /// verified foreign conversation getRecord. This is adapter capability,
+    /// not a claim that the current host supports Spaces. Rust probes the
+    /// host and pins placement; unavailable adapters report false.
     fn labyrinth_space_enabled(&self) -> bool {
         false
     }
 
-    /// Send one `com.atproto.space.*` XRPC to the signed-in account's own
-    /// PDS with its OAuth (DPoP) session, the way `com.atproto.repo.*` calls
-    /// go: no service auth and no extra headers. `nsid` always starts with
+    /// Send one allowlisted `com.atproto.space.*` XRPC. Owner operations use
+    /// the account's OAuth session. Foreign conversation getRecord must
+    /// verify the credential response MAC, requested URI and CID before
+    /// returning success. `nsid` always starts with
     /// `com.atproto.space.`; `path` is `/xrpc/{nsid}` plus the
     /// already-encoded query string, sent verbatim; `body` is the JSON body
     /// of a procedure (`method` = `POST`), absent on queries (`GET`).

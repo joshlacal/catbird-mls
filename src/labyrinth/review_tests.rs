@@ -221,9 +221,31 @@ async fn the_orchestrator_deletes_offline_and_retries_the_server_half() {
     gw.register(&did, &device, key);
     let o = &alice.orchestrator;
     o.labyrinth_enable().await.unwrap();
+    let recovery = o.labyrinth_create_recovery_code().await.unwrap();
 
+    // Observe persistence at the first remote deletion boundary. A crash
+    // after this callback must still leave retry intent on disk.
+    let journal = o.labyrinth_queue_store();
+    let journal_did = did.clone();
+    let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = checked.clone();
+    let handler = gw.clone();
+    world
+        .api_service
+        .set_labyrinth_handler(Arc::new(move |req| {
+            if req.nsid == "blue.catbird.labyrinth.deleteAccountData" {
+                assert!(journal
+                    .load_status(&journal_did)
+                    .unwrap()
+                    .pending_remote_deletion
+                    .is_some());
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            handler.submit_labyrinth(req)
+        }));
     *gw.fail_nsid.lock().unwrap() = Some("blue.catbird.labyrinth.deleteAccountData".into());
     let report = o.labyrinth_delete_account().await.unwrap();
+    assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
     assert!(report.remote_pending.is_some());
     assert!(
         !o.labyrinth_is_enabled().await.unwrap(),
@@ -232,11 +254,112 @@ async fn the_orchestrator_deletes_offline_and_retries_the_server_half() {
     let status = o.labyrinth_archive_status().await.unwrap();
     assert!(status.status.pending_remote_deletion.is_some());
     assert!(o.labyrinth_enable().await.is_err(), "refused while pending");
+    let before_restore = gw.log.lock().unwrap().len();
+    let error = o
+        .labyrinth_restore_with_recovery_code(&recovery)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("deletion is still pending"));
+    assert!(
+        gw.log.lock().unwrap()[before_restore..]
+            .iter()
+            .all(|request| request.nsid == "blue.catbird.labyrinth.deleteAccountData"),
+        "pending deletion must prevent all recovery reads and enrollment writes"
+    );
+    assert!(!o.labyrinth_is_enabled().await.unwrap());
 
     *gw.fail_nsid.lock().unwrap() = None;
     assert!(o.labyrinth_retry_remote_deletion().await.unwrap());
     let status = o.labyrinth_archive_status().await.unwrap();
     assert!(status.status.pending_remote_deletion.is_none());
     o.labyrinth_enable().await.unwrap();
+    assert!(o.labyrinth_is_enabled().await.unwrap());
+}
+
+/// Cancellation of the async retry cannot release lifecycle exclusion while
+/// its blocking network operation is still deleting the old mailbox.
+#[tokio::test(flavor = "multi_thread")]
+async fn in_flight_deletion_serializes_retry_and_reenable_after_caller_cancellation() {
+    use crate::recovery_e2e_harness::TestWorld;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Condvar;
+
+    let gw = RefGateway::new();
+    let mut world = TestWorld::new();
+    let handler = gw.clone();
+    world
+        .api_service
+        .set_labyrinth_handler(Arc::new(move |request| handler.submit_labyrinth(request)));
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let (device, key) = super::chat_device(&alice.orchestrator, &alice.did).await;
+    gw.register(&alice.did, &device, key);
+    let o = &alice.orchestrator;
+    o.labyrinth_enable().await.unwrap();
+    *gw.fail_nsid.lock().unwrap() = Some("blue.catbird.labyrinth.deleteAccountData".into());
+    assert!(o
+        .labyrinth_delete_account()
+        .await
+        .unwrap()
+        .remote_pending
+        .is_some());
+    *gw.fail_nsid.lock().unwrap() = None;
+
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let release = ReleaseOnDrop(gate.clone());
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    let entered = Arc::new(Mutex::new(Some(entered)));
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = count.clone();
+    let handler = gw.clone();
+    world
+        .api_service
+        .set_labyrinth_handler(Arc::new(move |request| {
+            if request.nsid == "blue.catbird.labyrinth.deleteAccountData" {
+                observed.fetch_add(1, Ordering::SeqCst);
+                if let Some(entered) = entered.lock().unwrap().take() {
+                    let _ = entered.send(());
+                    let (lock, wake) = &*gate;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = wake.wait(released).unwrap();
+                    }
+                }
+            }
+            handler.submit_labyrinth(request)
+        }));
+    let mut cancelled_retry = Box::pin(o.labyrinth_retry_remote_deletion());
+    tokio::select! {
+        result = &mut cancelled_retry => panic!("retry finished before release: {result:?}"),
+        result = waiting => result.unwrap(),
+    }
+    drop(cancelled_retry);
+    assert!(o.labyrinth_archive().lifecycle_lock().try_lock().is_err());
+
+    let mut retry = Box::pin(o.labyrinth_retry_remote_deletion());
+    let mut enable = Box::pin(o.labyrinth_enable());
+    tokio::select! {
+        result = &mut retry => panic!("second retry crossed active purge: {result:?}"),
+        result = &mut enable => panic!("enable crossed active purge: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    drop(release);
+    let (retried, enabled) = tokio::join!(retry, enable);
+    assert!(retried.unwrap());
+    enabled.unwrap();
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "queued retry must re-read cleared intent"
+    );
     assert!(o.labyrinth_is_enabled().await.unwrap());
 }

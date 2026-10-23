@@ -57,6 +57,17 @@ pub struct PendingDeletion {
     pub attempts: u32,
     pub last_error: String,
     pub since_ms: u64,
+    /// Captured before erasing local state. An unavailable Space must not
+    /// turn a partial deletion into a reported success on another platform.
+    #[serde(default)]
+    pub mailbox_placement: Option<String>,
+    /// Owner ciphertext cleanup targets retained after local pin erasure.
+    #[serde(default)]
+    pub conversation_spaces: Vec<String>,
+    /// Discovery on the owner PDS is still required even if this device
+    /// never opened the conversations written by another account device.
+    #[serde(default)]
+    pub space_cleanup_required: bool,
 }
 
 /// One account's status.

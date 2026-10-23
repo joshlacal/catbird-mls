@@ -163,17 +163,9 @@ where
     /// retried first; while it fails, enabling is refused (a new mailbox
     /// would be erased by the retry).
     pub async fn labyrinth_enable(&self) -> Result<String> {
-        if !self.labyrinth_retry_remote_deletion().await? {
-            return Err(OrchestratorError::Api(
-                "labyrinth: the previous account deletion is still pending on the server; \
-                 retry when online"
-                    .into(),
-            ));
-        }
         let key = self
-            .with_labyrinth(|deps| deps.enable().map(Some), |s| Ok(s.device_key_hex()))
-            .await?
-            .ok_or_else(|| OrchestratorError::Api("labyrinth session missing".into()))?;
+            .labyrinth_enroll_after_deletion(false, SessionDeps::enable)
+            .await?;
         self.labyrinth_start_archive_worker(self.labyrinth_deps().await?)
             .await?;
         Ok(key)
@@ -189,13 +181,49 @@ where
     /// Enrolls this device into the account's mailbox from a recovery code.
     pub async fn labyrinth_restore_with_recovery_code(&self, code: &str) -> Result<String> {
         let code = code.to_owned();
-        self.labyrinth_close();
-        self.with_labyrinth(
-            move |deps| deps.restore_with_recovery_code(&code).map(Some),
-            |s| Ok(s.device_key_hex()),
-        )
-        .await?
-        .ok_or_else(|| OrchestratorError::Api("labyrinth session missing".into()))
+        self.labyrinth_enroll_after_deletion(true, move |deps| {
+            deps.restore_with_recovery_code(&code)
+        })
+        .await
+    }
+
+    async fn labyrinth_enroll_after_deletion(
+        &self,
+        replace: bool,
+        enroll: impl FnOnce(SessionDeps) -> Result<LabyrinthSession> + Send + 'static,
+    ) -> Result<String> {
+        let deps = self.labyrinth_deps().await?;
+        let store = self.labyrinth_queue_store();
+        let slot = self.labyrinth_slot().clone();
+        let lifecycle = self.labyrinth_archive().lifecycle_lock();
+        tokio::task::spawn_blocking(move || {
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            // All explicit and background retries share this guard. No older
+            // purge can remain in flight after enrollment begins, even when
+            // the caller awaiting a blocking operation has been cancelled.
+            if !super::hooks_status::retry_deletion_blocking(&deps, store.as_ref())? {
+                return Err(OrchestratorError::Api(
+                    "labyrinth: the previous account deletion is still pending on the server; \
+                     retry when online"
+                        .into(),
+                ));
+            }
+            let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if replace
+                || !guard
+                    .as_ref()
+                    .is_some_and(|s| s.is_for(&deps.did, &deps.signer.public_key()))
+            {
+                *guard = None;
+                *guard = Some(enroll(deps)?);
+            }
+            guard
+                .as_ref()
+                .map(|s| s.device_key_hex())
+                .ok_or_else(|| OrchestratorError::Api("labyrinth session missing".into()))
+        })
+        .await
+        .map_err(join_error)?
     }
 
     /// Decrypted history of a conversation in `[from_ms, until_ms)`.
@@ -302,9 +330,12 @@ where
         let deps = self.labyrinth_deps().await?;
         let did = deps.did.clone();
         self.labyrinth_stop_archive_worker();
-        self.labyrinth_close();
+        let slot = self.labyrinth_slot().clone();
+        let lifecycle = self.labyrinth_archive().lifecycle_lock();
         let queue = self.labyrinth_queue_store();
         tokio::task::spawn_blocking(move || {
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
             let had = deps
                 .vault
                 .load(&did)
@@ -313,6 +344,9 @@ where
             deps.vault.delete(&did).map_err(OrchestratorError::Mls)?;
             deps.placements
                 .delete(&did)
+                .map_err(OrchestratorError::Mls)?;
+            deps.placements
+                .delete(&super::space::thread_placement_key(&did))
                 .map_err(OrchestratorError::Mls)?;
             queue.clear(&did)?;
             Ok(had)
@@ -339,17 +373,75 @@ where
         let retry_deps = deps.clone();
         let slot = self.labyrinth_slot().clone();
         let queue = self.labyrinth_queue_store();
-        let report = tokio::task::spawn_blocking(move || {
+        let lifecycle = self.labyrinth_archive().lifecycle_lock();
+        let report = tokio::task::spawn_blocking(move || -> Result<PurgeReport> {
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+            // Write the retry intent before opening a network-backed session
+            // or deleting local secrets. A crash at any later boundary must
+            // leave an account-bound deletion to resume on the next launch.
+            let saved_placement = deps
+                .placements
+                .load(&deps.did)
+                .map_err(OrchestratorError::Mls)?
+                .map(|p| {
+                    String::from_utf8(p).map_err(|_| {
+                        OrchestratorError::Storage("invalid Labyrinth mailbox placement".into())
+                    })
+                })
+                .transpose()?;
+            let prior = queue.load_status(&deps.did)?.pending_remote_deletion;
+            let mailbox_placement = prior
+                .as_ref()
+                .and_then(|pending| pending.mailbox_placement.clone())
+                .or(saved_placement);
+            let mut conversation_spaces = deps
+                .conversation_spaces()
+                .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+            if let Some(pending) = &prior {
+                conversation_spaces.extend(pending.conversation_spaces.iter().cloned());
+            }
+            conversation_spaces.sort();
+            conversation_spaces.dedup();
+            let space_cleanup_required = deps.space.is_some()
+                || !conversation_spaces.is_empty()
+                || prior.as_ref().is_some_and(|p| p.space_cleanup_required);
+            let parsed_placement = mailbox_placement
+                .as_deref()
+                .map(|p| {
+                    super::space::Placement::parse(p.as_bytes()).ok_or_else(|| {
+                        OrchestratorError::Storage("invalid Labyrinth deletion placement".into())
+                    })
+                })
+                .transpose()?;
+            queue.update_status(&deps.did, &mut |s| {
+                if s.pending_remote_deletion.is_none() {
+                    s.pending_remote_deletion = Some(PendingDeletion {
+                        attempts: 0,
+                        last_error: "deletion interrupted before completion".into(),
+                        since_ms: now_ms(),
+                        mailbox_placement: mailbox_placement.clone(),
+                        conversation_spaces: conversation_spaces.clone(),
+                        space_cleanup_required,
+                    });
+                } else if let Some(pending) = &mut s.pending_remote_deletion {
+                    pending.mailbox_placement = mailbox_placement.clone();
+                    pending.conversation_spaces = conversation_spaces.clone();
+                    pending.space_cleanup_required = space_cleanup_required;
+                }
+            })?;
             let key = deps.signer.public_key();
             let open = match guard.take() {
                 Some(s) if s.is_for(&deps.did, &key) => Ok(Some(s)),
                 _ => deps.clone().open(),
             };
             let saved = deps.vault.load(&deps.did).map_err(OrchestratorError::Mls)?;
-            let report = match open {
+            let mut report = match open {
                 Ok(Some(mut s)) => s.purge_account()?,
-                Ok(None) if saved.is_none() => return Err(not_enabled()),
+                Ok(None) if saved.is_none() => PurgeReport {
+                    remote_pending: deps.delete_account_remote_at(parsed_placement).err(),
+                    ..PurgeReport::default()
+                },
                 Ok(None) => PurgeReport::default(),
                 Err(e) => PurgeReport {
                     remote_pending: Some(labyrinth::Error::Backend(format!(
@@ -358,17 +450,28 @@ where
                     ..PurgeReport::default()
                 },
             };
+            if let Err(error) =
+                deps.delete_conversation_records(&conversation_spaces, space_cleanup_required)
+            {
+                report.remote_pending.get_or_insert(error);
+            }
             deps.vault
                 .delete(&deps.did)
                 .map_err(OrchestratorError::Mls)?;
             deps.placements
                 .delete(&deps.did)
                 .map_err(OrchestratorError::Mls)?;
+            deps.placements
+                .delete(&super::space::thread_placement_key(&deps.did))
+                .map_err(OrchestratorError::Mls)?;
             queue.clear(&deps.did)?;
             let pending = report.remote_pending.as_ref().map(|e| PendingDeletion {
                 attempts: 1,
                 last_error: e.to_string(),
                 since_ms: now_ms(),
+                mailbox_placement,
+                conversation_spaces,
+                space_cleanup_required,
             });
             queue.update_status(&deps.did, &mut |s| {
                 s.pending_remote_deletion = pending.clone();

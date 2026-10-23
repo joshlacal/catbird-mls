@@ -32,21 +32,36 @@ pub struct ArchiveStatusReport {
 
 /// Retries a pending remote deletion once. `Ok(true)`: nothing is pending
 /// (any more). `Ok(false)`: it is still pending (the attempt is recorded).
-fn retry_deletion_blocking(deps: &SessionDeps, store: &dyn ArchiveQueueStore) -> Result<bool> {
-    if store
-        .load_status(&deps.did)?
-        .pending_remote_deletion
-        .is_none()
-    {
+pub(super) fn retry_deletion_blocking(
+    deps: &SessionDeps,
+    store: &dyn ArchiveQueueStore,
+) -> Result<bool> {
+    let Some(pending) = store.load_status(&deps.did)?.pending_remote_deletion else {
         return Ok(true);
-    }
-    let result = deps.delete_account_remote();
+    };
+    let placement = pending
+        .mailbox_placement
+        .as_deref()
+        .map(|p| {
+            super::space::Placement::parse(p.as_bytes()).ok_or_else(|| {
+                crate::orchestrator::error::OrchestratorError::Storage(
+                    "invalid Labyrinth deletion placement".into(),
+                )
+            })
+        })
+        .transpose()?;
+    let result = deps.delete_account_remote_at(placement).and_then(|_| {
+        deps.delete_conversation_records(
+            &pending.conversation_spaces,
+            pending.space_cleanup_required,
+        )
+    });
     store.update_status(
         &deps.did,
         &mut |s| match (&result, &mut s.pending_remote_deletion) {
             (Ok(()), p) => *p = None,
             (Err(e), Some(p)) => {
-                p.attempts += 1;
+                p.attempts = p.attempts.saturating_add(1);
                 p.last_error = e.to_string();
             }
             (Err(_), None) => {}
@@ -169,9 +184,13 @@ where
     pub async fn labyrinth_retry_remote_deletion(&self) -> Result<bool> {
         let deps = self.labyrinth_deps().await?;
         let store = self.labyrinth_queue_store();
-        tokio::task::spawn_blocking(move || retry_deletion_blocking(&deps, store.as_ref()))
-            .await
-            .map_err(join_error)?
+        let lifecycle = self.labyrinth_archive().lifecycle_lock();
+        tokio::task::spawn_blocking(move || {
+            let _lifecycle = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            retry_deletion_blocking(&deps, store.as_ref())
+        })
+        .await
+        .map_err(join_error)?
     }
 
     /// Retries the pending remote deletion in the background with
@@ -180,13 +199,18 @@ where
     /// launch retries too.
     pub(super) fn labyrinth_spawn_deletion_retry(&self, deps: SessionDeps) {
         let store: Arc<dyn ArchiveQueueStore> = self.labyrinth_queue_store();
+        let lifecycle = self.labyrinth_archive().lifecycle_lock();
         tokio::spawn(async move {
             let mut delay = Duration::from_secs(2);
             loop {
                 tokio::time::sleep(delay).await;
                 let (d, s) = (deps.clone(), store.clone());
-                match tokio::task::spawn_blocking(move || retry_deletion_blocking(&d, s.as_ref()))
-                    .await
+                let lifecycle = lifecycle.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let _lifecycle = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                    retry_deletion_blocking(&d, s.as_ref())
+                })
+                .await
                 {
                     Ok(Ok(true)) => return,
                     Ok(Ok(false)) => {}

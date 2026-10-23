@@ -336,6 +336,154 @@ fn account_deletion_clears_the_space_the_pds_and_mlsds() {
     assert_eq!(net.labyrinth_calls("deleteAccountData"), 2);
 }
 
+struct UnavailableSpace {
+    status: u16,
+    name: &'static str,
+}
+
+impl XrpcTransport for UnavailableSpace {
+    fn query_with_headers(
+        &self,
+        _: &str,
+        _: &[(&str, String)],
+        _: &[(String, String)],
+    ) -> std::result::Result<Vec<u8>, labyrinth::store::xrpc::XrpcError> {
+        Err(labyrinth::store::xrpc::XrpcError {
+            status: self.status,
+            error: Some(self.name.into()),
+            message: None,
+        })
+    }
+
+    fn procedure(
+        &self,
+        _: &str,
+        _: &[u8],
+        _: [u8; 16],
+    ) -> std::result::Result<Vec<u8>, labyrinth::store::xrpc::XrpcError> {
+        panic!("placement probe must not write")
+    }
+}
+
+#[test]
+fn only_explicit_unsupported_space_can_use_the_first_mailbox_fallback() {
+    let net = Net::new();
+    let mut alice = net.space_device(ALICE, A1, 1);
+    alice.deps.space = Some(Arc::new(UnavailableSpace {
+        status: 501,
+        name: "MethodNotImplemented",
+    }));
+    assert_eq!(
+        alice.deps.probe_placement().unwrap(),
+        super::super::space::Placement::MlsDs
+    );
+    for (status, name) in [
+        (503, "UpstreamFailure"),
+        (403, "Forbidden"),
+        (400, "SpaceDeleted"),
+        (404, "NotFound"),
+    ] {
+        alice.deps.space = Some(Arc::new(UnavailableSpace { status, name }));
+        assert!(alice.deps.probe_placement().is_err(), "{status} {name}");
+    }
+    assert_eq!(placement(&alice), None);
+    assert_eq!(net.space_records(ALICE, None), 0);
+}
+
+#[test]
+fn unsupported_space_on_a_second_device_does_not_fork_the_existing_mailbox() {
+    let net = Net::new();
+    net.space_device(ALICE, A1, 1).deps.enable().unwrap();
+    let mut second = net.space_device(ALICE, A2, 3);
+    second.deps.space = Some(Arc::new(UnavailableSpace {
+        status: 501,
+        name: "MethodNotImplemented",
+    }));
+    assert!(second.deps.enable().is_err());
+    assert!(net
+        .gw
+        .net()
+        .mailbox(ALICE)
+        .list_devices()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn retry_does_not_report_success_when_the_required_space_adapter_is_unavailable() {
+    let net = Net::new();
+    let alice = net.pds_device(ALICE, A1, 1);
+    let result = alice
+        .deps
+        .delete_account_remote_at(Some(super::super::space::Placement::Space));
+    assert!(result.is_err());
+    assert_eq!(net.labyrinth_calls("deleteAccountData"), 0);
+}
+
+#[test]
+fn conversation_placement_pins_survive_reopen_and_are_account_isolated() {
+    use super::super::space::AccountThreadPlacementPins;
+    use labyrinth::store::space::thread::{ThreadPlacement, ThreadPlacementPins};
+    let vault: Arc<dyn StateVault> = Arc::new(MemVault::default());
+    let original = ThreadPlacement {
+        placement: "mlsds".into(),
+        generation: "11111111-1111-4111-8111-111111111111".into(),
+        space: None,
+    };
+    AccountThreadPlacementPins {
+        did: ALICE.into(),
+        vault: vault.clone(),
+    }
+    .check_or_pin(THREAD, &original)
+    .unwrap();
+    let changed = ThreadPlacement {
+        generation: "22222222-2222-4222-8222-222222222222".into(),
+        ..original.clone()
+    };
+    let reopened = AccountThreadPlacementPins {
+        did: ALICE.into(),
+        vault: vault.clone(),
+    };
+    assert!(reopened.check_or_pin(THREAD, &changed).is_err());
+    reopened.check_or_pin(THREAD, &original).unwrap();
+    AccountThreadPlacementPins {
+        did: BOB.into(),
+        vault,
+    }
+    .check_or_pin(THREAD, &changed)
+    .unwrap();
+}
+
+#[test]
+fn account_cleanup_discovers_ciphertext_written_by_another_device() {
+    let net = Net::new();
+    let alice = net.space_device(ALICE, A1, 1);
+    let space = SpaceRef::parse("at://did:plc:authority/space/blue.catbird.labyrinth.conversation/11111111-1111-4111-8111-111111111111").unwrap();
+    net.host.tamper(
+        &space,
+        ALICE,
+        nsid::BATCH,
+        "prior-device",
+        serde_json::json!({"prior": true}),
+    );
+    net.host.tamper(
+        &space,
+        BOB,
+        nsid::BATCH,
+        "foreign",
+        serde_json::json!({"foreign": true}),
+    );
+    assert!(alice.deps.conversation_spaces().unwrap().is_empty());
+    alice.deps.delete_conversation_records(&[], true).unwrap();
+    assert_eq!(net.host.record_count(&space, ALICE, None), 0);
+    assert_eq!(net.host.record_count(&space, BOB, None), 1);
+    let unavailable = net.pds_device(ALICE, A2, 3);
+    assert!(unavailable
+        .deps
+        .delete_conversation_records(&[], true)
+        .is_err());
+}
+
 #[test]
 fn the_space_transport_sends_only_space_requests() {
     let net = Net::new();

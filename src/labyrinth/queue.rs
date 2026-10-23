@@ -296,6 +296,10 @@ type WorkerTask = (String, [u8; 32], JoinHandle<()>);
 /// The orchestrator's archive worker state (one account at a time).
 #[derive(Default)]
 pub struct ArchiveWorker {
+    /// Covers complete blocking remote deletion and enrollment operations.
+    /// The guard lives inside the blocking task, so cancellation of its async
+    /// caller cannot release it while a remote purge is still executing.
+    lifecycle: Arc<Mutex<()>>,
     notify: Arc<Notify>,
     pending: Arc<AtomicUsize>,
     config: Mutex<QueueConfig>,
@@ -303,6 +307,10 @@ pub struct ArchiveWorker {
 }
 
 impl ArchiveWorker {
+    pub(super) fn lifecycle_lock(&self) -> Arc<Mutex<()>> {
+        self.lifecycle.clone()
+    }
+
     pub fn set_config(&self, config: QueueConfig) {
         *self.config.lock().unwrap_or_else(|e| e.into_inner()) = config;
         self.notify.notify_one();

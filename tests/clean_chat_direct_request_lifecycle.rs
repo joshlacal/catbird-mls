@@ -122,15 +122,251 @@ fn last_request(world: &TestWorld, op: Op) -> Value {
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn native_sender_exact_retry_and_recipient_preview_survive_reopen_without_acceptance() {
-    sender_fixture(false, false).await;
+    Box::pin(sender_fixture(false, false, false)).await;
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn legacy_pending_direct_retains_exact_prior_and_builds_successor_generation() {
-    sender_fixture(true, false).await;
+    Box::pin(sender_fixture(true, false, false)).await;
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn native_dag_json_read_preview_acceptance_and_exact_retry_survive_restart() {
-    sender_fixture(false, true).await;
+    Box::pin(sender_fixture(false, true, false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_authority_blocks_ds_only_keys_and_reauthorizes_legacy_projections_on_restart() {
+    Box::pin(sender_fixture(false, true, true)).await;
+}
+
+/// The old native encrypted projection is structurally and cryptographically
+/// valid, but predates independent repository authorization. Failed migration
+/// must preserve its exact bytes; successful migration must survive key removal.
+async fn check_legacy_reauthorization(
+    world: &mut TestWorld,
+    name: &str,
+    cid: &str,
+    denied_did: &str,
+    authorized_key: &[u8],
+) {
+    let client = world.client(name);
+    let original = client
+        .orchestrator
+        .mls_context()
+        .read_direct_request_projection(cid)
+        .unwrap()
+        .unwrap();
+    let mut legacy: Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("authorization_version"),
+        Some(json!(1))
+    );
+    // Whitespace deliberately differs from encode(); the CAS must use old bytes.
+    let raw = serde_json::to_vec_pretty(&legacy).unwrap();
+    assert!(client
+        .orchestrator
+        .mls_context()
+        .compare_exchange_direct_request_projection(cid, Some(&original), &raw)
+        .unwrap());
+    client
+        .credentials
+        .set_authorized_device_keys(denied_did, vec![vec![91; 32]]);
+    world.restart_client(name).await;
+    let client = world.client(name);
+    assert!(
+        client
+            .orchestrator
+            .list_direct_request_views()
+            .await
+            .is_err(),
+        "legacy proof cannot grant capabilities without repository authority"
+    );
+    assert!(client
+        .orchestrator
+        .refresh_request_preview(cid)
+        .await
+        .is_err());
+    assert_eq!(
+        client
+            .orchestrator
+            .mls_context()
+            .read_direct_request_projection(cid)
+            .unwrap()
+            .unwrap(),
+        raw,
+        "failed authorization must preserve exact encrypted history bytes"
+    );
+    client
+        .credentials
+        .set_authorized_device_keys(denied_did, vec![authorized_key.to_vec()]);
+    client.orchestrator.invalidate_device_key_cache().await;
+    let authorized = client
+        .orchestrator
+        .list_direct_request_views()
+        .await
+        .unwrap();
+    let upgraded_raw = client
+        .orchestrator
+        .mls_context()
+        .read_direct_request_projection(cid)
+        .unwrap()
+        .unwrap();
+    let mut upgraded: Value = serde_json::from_slice(&upgraded_raw).unwrap();
+    assert_eq!(
+        upgraded
+            .as_object_mut()
+            .unwrap()
+            .remove("authorization_version"),
+        Some(json!(1))
+    );
+    assert_eq!(
+        upgraded, legacy,
+        "migration changes only authorization evidence"
+    );
+    assert!(
+        !client
+            .orchestrator
+            .mls_context()
+            .compare_exchange_direct_request_projection(cid, Some(&raw), &raw)
+            .unwrap(),
+        "old exact bytes cannot overwrite the upgrade"
+    );
+    client
+        .credentials
+        .set_authorized_device_key_resolution_failure(denied_did, true);
+    world.restart_client(name).await;
+    let client = world.client(name);
+    let lookups = client.credentials.device_key_lookup_count(denied_did);
+    assert_eq!(
+        client
+            .orchestrator
+            .list_direct_request_views()
+            .await
+            .unwrap(),
+        authorized
+    );
+    assert_eq!(
+        client.credentials.device_key_lookup_count(denied_did),
+        lookups,
+        "independently authorized protected history replays offline"
+    );
+    client
+        .credentials
+        .set_authorized_device_key_resolution_failure(denied_did, false);
+}
+
+/// Keep authorized publisher and recipient proofs intact, but model a legacy
+/// close signed by an attacker key attributed to the publisher's device. The
+/// re-open validates every signature; only repository authorization rejects it.
+async fn check_legacy_close_signer(world: &mut TestWorld, cid: &str) {
+    use catbird_mls::chat_v2::transcript::{
+        control_entry_fingerprint, decode_strict_json, project_ref, project_signed_body,
+        ControlEntryKind, ControlServerFields, EntryRow, SignedMutationKind, SigningTranscript,
+    };
+    let client = world.client("Alice");
+    let original = client
+        .orchestrator
+        .mls_context()
+        .read_direct_request_projection(cid)
+        .unwrap()
+        .unwrap();
+    let mut legacy: Value = serde_json::from_slice(&original).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("authorization_version");
+    let signer = ed25519_dalek::SigningKey::from_bytes(&[93; 32]);
+    let key = signer.verifying_key().as_bytes().to_vec();
+    let close = &mut legacy["close_proof"];
+    close["actor_public_key"] = json!(key);
+    let entry = &mut close["entry"];
+    entry["signedRequest"]["body"]["keyId"] = json!(URL_SAFE_NO_PAD.encode(Sha256::digest(&key)));
+    let body =
+        decode_strict_json(&serde_json::to_vec(&entry["signedRequest"]["body"]).unwrap()).unwrap();
+    let transcript = SigningTranscript::build_for(
+        SignedMutationKind::ConversationClose,
+        &project_signed_body(SignedMutationKind::ConversationClose, &body).unwrap(),
+    )
+    .unwrap();
+    let signature = signer.sign(transcript.bytes()).to_bytes();
+    entry["signedRequest"]["signature"] = json!(STANDARD.encode(signature));
+    let mut tombstone = entry["tombstone"].clone();
+    tombstone.as_object_mut().unwrap().remove("$type");
+    let fields = ControlServerFields::single(
+        ControlEntryKind::ConversationClose,
+        "tombstone",
+        project_ref(
+            "conversationCloseTombstone",
+            &decode_strict_json(&serde_json::to_vec(&tombstone).unwrap()).unwrap(),
+            false,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let row = EntryRow {
+        entry_id: *uuid::Uuid::parse_str(entry["entryId"].as_str().unwrap())
+            .unwrap()
+            .as_bytes(),
+        conversation_id: *uuid::Uuid::parse_str(cid).unwrap().as_bytes(),
+        seq: entry["seq"].as_u64().unwrap(),
+        request_digest: *transcript.request_digest(),
+        signature,
+        received_at: entry["receivedAt"].as_str().unwrap().into(),
+    };
+    close["entry_sha256"] =
+        json!(
+            control_entry_fingerprint(ControlEntryKind::ConversationClose, &row, &fields)
+                .unwrap()
+                .fingerprint()
+                .as_bytes()
+        );
+    let raw = serde_json::to_vec(&legacy).unwrap();
+    assert!(client
+        .orchestrator
+        .mls_context()
+        .compare_exchange_direct_request_projection(cid, Some(&original), &raw)
+        .unwrap());
+    world.restart_client("Alice").await;
+    let client = world.client("Alice");
+    let error = client
+        .orchestrator
+        .list_direct_request_views()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, OrchestratorError::InvalidInput(ref reason) if reason.contains("repository authorized")),
+        "valid legacy close must fail solely on repository authority: {error:?}"
+    );
+    let envelope = catbird_mls::orchestrator::IncomingEnvelope::from_canonical_entry(
+        &legacy["close_proof"]["entry"],
+        cid,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        client
+            .orchestrator
+            .process_incoming_message(&envelope)
+            .await
+            .is_err(),
+        "unverified legacy close cannot use protected replay"
+    );
+    assert_eq!(
+        client
+            .orchestrator
+            .mls_context()
+            .read_direct_request_projection(cid)
+            .unwrap()
+            .unwrap(),
+        raw
+    );
+    assert!(client
+        .orchestrator
+        .mls_context()
+        .compare_exchange_direct_request_projection(cid, Some(&raw), &original)
+        .unwrap());
 }
 
 fn last_request_bytes(world: &TestWorld, op: Op) -> Vec<u8> {
@@ -244,7 +480,7 @@ async fn seed_pending_origin(world: &TestWorld, group: bool) -> (Value, Value) {
     let entry = json!({"$type":"blue.catbird.chat.defs#creationEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":wrapper["signedRequest"],"receivedAt":utc(0)});
     (state, entry)
 }
-async fn sender_fixture(legacy: bool, dag_json: bool) {
+async fn sender_fixture(legacy: bool, dag_json: bool, authorization_checks: bool) {
     let mut world = TestWorld::new();
     for (name, did) in [
         ("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -489,6 +725,50 @@ async fn sender_fixture(legacy: bool, dag_json: bool) {
         .unwrap());
     let publication_entry = json!({"$type":"blue.catbird.chat.defs#directRequestEntry","entryId":uuid::Uuid::new_v4().to_string(),"conversationId":cid,"seq":1,"signedRequest":publication["signedRequest"],"receivedAt":receipt["body"]["receipt"]["recordedAt"]});
     let publication_entry = read_bytes(dag_json, "directRequestEntry", true, &publication_entry);
+    if authorization_checks {
+        for unauthorized in [None, Some(vec![]), Some(vec![vec![91; 32]])] {
+            match unauthorized {
+                Some(keys) => bob.credentials.set_authorized_device_keys(&alice.did, keys),
+                None => bob.credentials.clear_authorized_device_keys(&alice.did),
+            }
+            bob.orchestrator.invalidate_device_key_cache().await;
+            world.delivery_service().queue_request_operation_response(
+                Op::GetEntries,
+                200,
+                json!({"entries":[publication_entry],"nextAfterSeq":1,"hasMore":false}),
+            );
+            assert!(
+                bob.orchestrator.refresh_request_preview(cid).await.is_err(),
+                "a valid self-signed publication must not authorize a DS-only sender key"
+            );
+            assert!(bob
+                .orchestrator
+                .mls_context()
+                .read_direct_request_projection(cid)
+                .unwrap()
+                .is_none());
+            assert!(bob
+                .storage
+                .get_conversation(&bob.did, cid)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(
+                bob.orchestrator
+                    .mls_context()
+                    .get_epoch(
+                        STANDARD
+                            .decode(p["next"]["groupId"].as_str().unwrap())
+                            .unwrap()
+                    )
+                    .is_err(),
+                "unauthorized sender cannot import native group state"
+            );
+        }
+        bob.credentials
+            .set_authorized_device_keys(&alice.did, vec![pubkey.clone()]);
+        bob.orchestrator.invalidate_device_key_cache().await;
+    }
     world.delivery_service().queue_request_operation_response(
         Op::GetEntries,
         200,
@@ -611,6 +891,16 @@ async fn sender_fixture(legacy: bool, dag_json: bool) {
     }
 
     let cid = cid.to_owned();
+    if authorization_checks {
+        Box::pin(check_legacy_reauthorization(
+            &mut world,
+            "Bob",
+            &cid,
+            p["actorDid"].as_str().unwrap(),
+            &pubkey,
+        ))
+        .await;
+    }
     world.restart_client("Bob").await;
     world.delivery_service().queue_request_operation_response(
         Op::GetConversationState,
@@ -678,6 +968,16 @@ async fn sender_fixture(legacy: bool, dag_json: bool) {
         .unwrap();
     assert_eq!(accepted_view.consent, RequestConsent::Accepted);
     assert!(accepted_view.capabilities.can_send);
+    if authorization_checks {
+        Box::pin(check_legacy_reauthorization(
+            &mut world,
+            "Bob",
+            &cid,
+            p["recipientDid"].as_str().unwrap(),
+            &bob_public,
+        ))
+        .await;
+    }
     if dag_json {
         world.restart_client("Bob").await;
         world.delivery_service().queue_request_operation_response(
@@ -714,9 +1014,18 @@ async fn sender_fixture(legacy: bool, dag_json: bool) {
         200,
         json!({"state":read_bytes(dag_json, "conversationState", false, &state)}),
     );
+    world
+        .client("Alice")
+        .credentials
+        .set_authorized_device_keys(p["recipientDid"].as_str().unwrap(), vec![vec![91; 32]]);
+    world
+        .client("Alice")
+        .orchestrator
+        .invalidate_device_key_cache()
+        .await;
     world.delivery_service().queue_request_operation_response(
         Op::GetDeviceKey, 200,
-        json!({"ownerDid":p["recipientDid"],"deviceId":bob_device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"signaturePublicKey":STANDARD.encode([0u8;32])}),
+        json!({"ownerDid":p["recipientDid"],"deviceId":bob_device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"signaturePublicKey":STANDARD.encode(&bob_public)}),
     );
     let unverified = world
         .client("Alice")
@@ -735,6 +1044,18 @@ async fn sender_fixture(legacy: bool, dag_json: bool) {
         Op::GetDeviceKey, 200,
         json!({"ownerDid":p["recipientDid"],"deviceId":bob_device,"keyId":URL_SAFE_NO_PAD.encode(Sha256::digest(&bob_public)),"signaturePublicKey":STANDARD.encode(&bob_public)}),
     );
+    world
+        .client("Alice")
+        .credentials
+        .set_authorized_device_keys(
+            p["recipientDid"].as_str().unwrap(),
+            vec![bob_public.clone()],
+        );
+    world
+        .client("Alice")
+        .orchestrator
+        .invalidate_device_key_cache()
+        .await;
     let sender = world
         .client("Alice")
         .orchestrator
@@ -791,6 +1112,34 @@ async fn sender_fixture(legacy: bool, dag_json: bool) {
         200,
         json!({"entries":[invitation_entry],"hasMore":false,"nextAfterSeq":3}),
     );
+    if authorization_checks {
+        author
+            .credentials
+            .set_authorized_device_keys(&author.did, vec![vec![91; 32]]);
+        author.orchestrator.invalidate_device_key_cache().await;
+        assert!(
+            author
+                .orchestrator
+                .get_group_invitation_reference(&cid, p["recipientDid"].as_str().unwrap())
+                .await
+                .is_err(),
+            "local signer and DS row cannot authorize a group invitation"
+        );
+        author
+            .credentials
+            .set_authorized_device_keys(&author.did, vec![pubkey.clone()]);
+        author.orchestrator.invalidate_device_key_cache().await;
+        world.delivery_service().queue_request_operation_response(
+            Op::GetConversationState,
+            200,
+            json!({"state":group_state}),
+        );
+        world.delivery_service().queue_request_operation_response(
+            Op::GetEntries,
+            200,
+            json!({"entries":[invitation_entry],"hasMore":false,"nextAfterSeq":3}),
+        );
+    }
     let link = author
         .orchestrator
         .get_group_invitation_reference(&cid, p["recipientDid"].as_str().unwrap())
@@ -1011,6 +1360,35 @@ async fn sender_fixture(legacy: bool, dag_json: bool) {
             .unwrap(),
         projection
     );
+    if authorization_checks {
+        Box::pin(check_legacy_reauthorization(
+            &mut world,
+            "Alice",
+            &cid,
+            p["actorDid"].as_str().unwrap(),
+            &pubkey,
+        ))
+        .await;
+        Box::pin(check_legacy_close_signer(&mut world, &cid)).await;
+        world
+            .client("Alice")
+            .credentials
+            .set_authorized_device_key_resolution_failure(p["actorDid"].as_str().unwrap(), true);
+        world
+            .client("Alice")
+            .orchestrator
+            .invalidate_device_key_cache()
+            .await;
+        assert!(
+            world
+                .client("Alice")
+                .orchestrator
+                .process_incoming_message(&closed_envelope)
+                .await
+                .is_ok(),
+            "upgraded exact close proof remains replayable after repository resolution disappears"
+        );
+    }
     world.restart_client("Alice").await;
     assert_eq!(
         world

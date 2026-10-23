@@ -30,6 +30,7 @@ use labyrinth::records::{
     Device, Epoch, EpochMember, MailboxKeysRecord, OwnerBatch, VirtualDevice,
 };
 use labyrinth::sign::XVerifyingKey;
+use labyrinth::store::space::thread::{ThreadPlacement, ThreadPlacementPins};
 use labyrinth::store::space::SpaceMailboxStore;
 use labyrinth::store::xrpc::{XrpcError, XrpcMailboxStore, XrpcTransport};
 use labyrinth::store::{MailboxStore, Stored, TimeRange};
@@ -172,6 +173,63 @@ impl Placement {
 
 /// Request-value namespace of the saved [`Placement`], keyed by DID.
 pub const PLACEMENT_NAMESPACE: &str = "labyrinthMailboxPlacement";
+
+/// Generation pins share the encrypted, account-scoped placement vault.
+pub struct AccountThreadPlacementPins {
+    pub did: String,
+    pub vault: Arc<dyn StateVault>,
+}
+
+pub fn thread_placement_key(did: &str) -> String {
+    format!("threads:{did}")
+}
+
+impl ThreadPlacementPins for AccountThreadPlacementPins {
+    fn check_or_pin(&self, thread: &str, placement: &ThreadPlacement) -> labyrinth::Result<()> {
+        let key = thread_placement_key(&self.did);
+        for _ in 0..8 {
+            let raw = self
+                .vault
+                .load(&key)
+                .map_err(|e| labyrinth::Error::Backend(e.to_string()))?;
+            let mut pins: std::collections::BTreeMap<String, ThreadPlacement> = match &raw {
+                Some(bytes) => serde_json::from_slice(bytes)
+                    .map_err(|_| labyrinth::Error::Malformed("saved conversation placements"))?,
+                None => Default::default(),
+            };
+            if let Some(saved) = pins.get(thread) {
+                return if saved == placement {
+                    Ok(())
+                } else {
+                    Err(labyrinth::Error::Backend(
+                        "conversation storage generation changed; explicit adoption required"
+                            .into(),
+                    ))
+                };
+            }
+            // Pins are never evicted to make room: that would permit an old
+            // URI/generation to become trusted again without user intent.
+            if pins.len() >= 10_000 {
+                return Err(labyrinth::Error::Backend(
+                    "conversation placement capacity reached".into(),
+                ));
+            }
+            pins.insert(thread.into(), placement.clone());
+            let next = serde_json::to_vec(&pins)
+                .map_err(|_| labyrinth::Error::Malformed("conversation placements"))?;
+            if self
+                .vault
+                .compare_exchange(&key, raw.as_deref(), &next)
+                .map_err(|e| labyrinth::Error::Backend(e.to_string()))?
+            {
+                return Ok(());
+            }
+        }
+        Err(labyrinth::Error::Backend(
+            "conversation placements changed concurrently".into(),
+        ))
+    }
+}
 
 /// The saved [`Placement`] in the encrypted MLS database, next to the
 /// client state ([`super::state::MlsStateVault`]).

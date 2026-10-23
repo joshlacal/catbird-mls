@@ -225,9 +225,11 @@ where
         let device = self.require_actor_device_id().await?;
         let lock = self.direct_request_operation_lock(cid).await;
         let _guard = lock.lock().await;
-        if let Some(raw) = self.mls_context().read_direct_request_projection(cid)? {
-            let view =
-                DirectRequestProjection::decode(&raw, &owner, &device)?.view(&owner, &device)?;
+        if let Some(mut raw) = self.mls_context().read_direct_request_projection(cid)? {
+            let view = self
+                .authorize_direct_request_projection(&mut raw, &owner, &device)
+                .await?
+                .view(&owner, &device)?;
             if view.consent == RequestConsent::Closed {
                 return Ok(view);
             }
@@ -245,8 +247,9 @@ where
             return Err(OrchestratorError::InvalidInput("RequestRetired".into()));
         }
         let mut raw = self.mls_context().read_direct_request_projection(cid)?;
-        let mut projection = if let Some(raw) = &raw {
-            DirectRequestProjection::decode(raw, &owner, &device)?
+        let mut projection = if let Some(raw) = &mut raw {
+            self.authorize_direct_request_projection(raw, &owner, &device)
+                .await?
         } else {
             let entries = match self
                 .request_query(
@@ -260,7 +263,9 @@ where
                         .is_ok_and(|error| error["error"] == "NotEntitled") =>
                 {
                     crate::info_log!("[request] convo={} GetEntries NotEntitled: unaddressed view, nothing persisted", cid);
-                    return self.unaddressed_direct_request_view(cid, &owner, &device).await;
+                    return self
+                        .unaddressed_direct_request_view(cid, &owner, &device)
+                        .await;
                 }
                 result => result?,
             };
@@ -290,6 +295,18 @@ where
                 &candidate_key,
             )
             .map_err(|_| invalid())?;
+            let authorized_key = self
+                .request_authorized_device_key(
+                    verified.body()["actorDid"].as_str().ok_or_else(invalid)?,
+                    verified.body()["actorDeviceId"]
+                        .as_str()
+                        .ok_or_else(invalid)?,
+                    verified.body()["keyId"].as_str().ok_or_else(invalid)?,
+                )
+                .await?;
+            if authorized_key != candidate_key {
+                return Err(invalid());
+            }
             let request_id = verified.body()["requestId"].as_str().ok_or_else(invalid)?;
             let outcome = self
                 .request_query(
@@ -321,8 +338,7 @@ where
                 .await?;
             let expected_coordinator = match (actor_auth, recipient_auth) {
                 (Some(a), Some(b)) => {
-                    transcript::derive_deterministic_coordinator(&a, &b)
-                        .map_err(|_| invalid())?
+                    transcript::derive_deterministic_coordinator(&a, &b).map_err(|_| invalid())?
                 }
                 (None, None) => super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string(),
                 (Some(auth), None) if auth == super::intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
@@ -355,6 +371,7 @@ where
             )
             .map_err(|_| invalid())?;
             let projection = DirectRequestProjection {
+                authorization_version: super::projection::REQUEST_AUTHORIZATION_VERSION,
                 owner_did: owner.clone(),
                 device_id: device.clone(),
                 trusted_authority_document: document,
@@ -541,7 +558,7 @@ where
             let key_id = body["keyId"].as_str().ok_or_else(invalid)?;
             let recipient_device = body["actorDeviceId"].as_str().ok_or_else(invalid)?;
             let key = self
-                .request_historical_device_key(recipient, recipient_device, key_id)
+                .request_authorized_device_key(recipient, recipient_device, key_id)
                 .await?;
             let method = proof["receipt"]["body"]["keyId"]
                 .as_str()
@@ -563,8 +580,10 @@ where
                     .direct_request_receipt_authority_document(&auth_did)
                     .await?
                     .ok_or_else(invalid)?;
-                transcript::resolve_direct_request_receipt_key_for_authority(&auth_did, &doc, method)
-                    .map_err(|_| invalid())?;
+                transcript::resolve_direct_request_receipt_key_for_authority(
+                    &auth_did, &doc, method,
+                )
+                .map_err(|_| invalid())?;
                 candidate.trusted_authority_document =
                     super::intent::merge_trusted_documents_for_expected_authority(
                         &candidate.trusted_authority_document,
@@ -687,10 +706,12 @@ where
         let device = self.require_actor_device_id().await?;
         let lock = self.direct_request_operation_lock(cid).await;
         let _guard = lock.lock().await;
-        let Some(raw) = self.mls_context().read_direct_request_projection(cid)? else {
+        let Some(mut raw) = self.mls_context().read_direct_request_projection(cid)? else {
             return Ok(());
         };
-        let mut projection = DirectRequestProjection::decode(&raw, &owner, &device)?;
+        let mut projection = self
+            .authorize_direct_request_projection(&mut raw, &owner, &device)
+            .await?;
         let entry = entry.clone();
         let hash = super::projection::DirectRequestCloseProof::hash(&entry)?;
         if let Some(old) = &projection.close_proof {
@@ -739,10 +760,12 @@ where
         }
         let owner = self.require_user_did().await?;
         let device = self.require_actor_device_id().await?;
-        let Some(raw) = self.mls_context().read_direct_request_projection(cid)? else {
+        let Some(mut raw) = self.mls_context().read_direct_request_projection(cid)? else {
             return Ok(false);
         };
-        let projection = DirectRequestProjection::decode(&raw, &owner, &device)?;
+        let projection = self
+            .authorize_direct_request_projection(&mut raw, &owner, &device)
+            .await?;
         let Some(proof) = &projection.close_proof else {
             return Ok(false);
         };
@@ -779,11 +802,13 @@ where
             let lock = self.direct_request_operation_lock(cid).await;
             let _guard = lock.lock().await;
             let mut raw = self.mls_context().read_direct_request_projection(cid)?;
-            let mut projection = DirectRequestProjection::decode(
-                raw.as_deref().ok_or_else(invalid)?,
-                &owner,
-                &device,
-            )?;
+            let mut projection = self
+                .authorize_direct_request_projection(
+                    raw.as_mut().ok_or_else(invalid)?,
+                    &owner,
+                    &device,
+                )
+                .await?;
             let expected = if let Some(accepted) = &projection.acceptance_proof {
                 let proof: Value = serde_json::from_slice(accepted).map_err(|_| invalid())?;
                 proof["receipt"]["body"]["next"].clone()
@@ -936,21 +961,24 @@ mod coordinate_tests {
             "receivedAt": "2026-07-22T12:34:56.000Z",
             "tombstone": tombstone
         });
-        let canonical_hash = super::super::projection::DirectRequestCloseProof::hash(&canonical).unwrap();
+        let canonical_hash =
+            super::super::projection::DirectRequestCloseProof::hash(&canonical).unwrap();
         let mut server_read = canonical.clone();
         server_read["signedRequest"]["signature"] = json!({
             "$bytes": canonical["signedRequest"]["signature"]
         });
         let server_read_hash = super::super::projection::DirectRequestCloseProof::hash(
             &super::super::projection::normalized_close_entry(server_read.clone()).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(canonical_hash, server_read_hash);
 
         let mut forged = server_read.clone();
         forged["signedRequest"]["signature"] = json!({"$bytes": STANDARD.encode([88u8; 64])});
         let forged_hash = super::super::projection::DirectRequestCloseProof::hash(
             &super::super::projection::normalized_close_entry(forged).unwrap(),
-        ).unwrap();
+        )
+        .unwrap();
         assert_ne!(canonical_hash, forged_hash);
     }
 }

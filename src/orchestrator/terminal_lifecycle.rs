@@ -656,7 +656,7 @@ where
             .ok_or_else(|| terminal_invalid("Terminal entry has no actor."))?;
         if kind == SignedMutationKind::ConversationClose {
             let key = self
-                .request_historical_device_key(
+                .request_authorized_device_key(
                     actor,
                     body["actorDeviceId"]
                         .as_str()

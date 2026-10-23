@@ -44,6 +44,11 @@ pub mod welcome_recovery;
 #[cfg(test)]
 mod canonical_transport_tests;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod local_delete_persistence_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod quarantine_persistence_tests;
+
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
 pub use canonical_transport::canonical_application_aad_bytes;

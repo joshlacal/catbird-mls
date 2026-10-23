@@ -163,18 +163,18 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         ))
     }
 
-    /// True when the gateway reaches the signed-in account's own PDS Space
-    /// endpoints (`com.atproto.space.*`) with its OAuth session. With
-    /// [`labyrinth_pds_enabled`](Self::labyrinth_pds_enabled) also true, a
-    /// new Labyrinth mailbox goes into the account's Space.
+    /// True when the gateway implements owner OAuth Space operations and
+    /// verified foreign conversation record reads. This advertises adapter
+    /// capability; the client probes the host and pins actual placement.
     #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
     async fn labyrinth_space_enabled(&self) -> bool {
         false
     }
 
-    /// Send one `com.atproto.space.*` XRPC to the signed-in account's own
-    /// PDS with its OAuth session (not service auth), and return the raw
-    /// response. The default refuses.
+    /// Send an allowlisted Space operation. Owner reads/writes use account
+    /// OAuth. Foreign conversation getRecord must verify the October 22
+    /// credential response MAC, requested URI and CID before success.
+    /// Return raw non-2xx statuses; an unavailable adapter refuses.
     #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
     async fn submit_labyrinth_space_request(
         &self,

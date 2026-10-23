@@ -2501,12 +2501,13 @@ dependencies = [
 [[package]]
 name = "labyrinth"
 version = "0.1.0"
-source = "git+https://github.com/joshlacal/labyrinth?rev=b42ae3d1faeaadcda585d4245e119b61131e5849#b42ae3d1faeaadcda585d4245e119b61131e5849"
+source = "git+https://github.com/joshlacal/labyrinth?rev=385d1ee40ce1c3924c6a02234282e27b29607f2d#385d1ee40ce1c3924c6a02234282e27b29607f2d"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
  "base64 0.23.1",
  "chacha20 0.10.2",
+ "cid",
  "curve25519-dalek 5.0.0",
  "ed25519-dalek 3.0.0",
  "getrandom 0.4.3",
@@ -2516,6 +2517,7 @@ dependencies = [
  "ml-kem",
  "rand_core 0.10.0",
  "serde",
+ "serde_ipld_dagcbor 0.7.0",
  "serde_json",
  "sha2 0.11.0",
  "subtle",

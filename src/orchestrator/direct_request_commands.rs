@@ -155,14 +155,12 @@ where
                 .get_chat_declaration_authority(&input.recipient_did)
                 .await?;
             match (actor_auth, recipient_auth) {
-                (Some(a), Some(b)) => {
-                    transcript::derive_deterministic_coordinator(&a, &b)
-                        .map_err(|_| {
-                            OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
-                                reason: "Direct request authority DID is invalid".into(),
-                            })
-                        })?
-                }
+                (Some(a), Some(b)) => transcript::derive_deterministic_coordinator(&a, &b)
+                    .map_err(|_| {
+                        OrchestratorError::Mls(crate::MLSError::OperationNotSupported {
+                            reason: "Direct request authority DID is invalid".into(),
+                        })
+                    })?,
                 (None, None) => intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string(),
                 (Some(auth), None) if auth == intent::CANONICAL_DIRECT_REQUEST_AUTHORITY => {
                     intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string()
@@ -189,7 +187,11 @@ where
                     reason: "Direct request receipt authority resolution unavailable".into(),
                 })
             })?;
-        intent::validate_authority_document_for_expected_authority(&document, &expected_coordinator).map_err(|refusal| match refusal {
+        intent::validate_authority_document_for_expected_authority(
+            &document,
+            &expected_coordinator,
+        )
+        .map_err(|refusal| match refusal {
             // A structurally valid document naming another authority: the
             // request has no canonical transaction to join, so report the
             // typed unsupported capability and never fall back to legacy
@@ -200,9 +202,9 @@ where
                         .into(),
                 })
             }
-            intent::AuthorityDocumentRefusal::Malformed => OrchestratorError::Storage(
-                "Invalid direct request ownership record".into(),
-            ),
+            intent::AuthorityDocumentRefusal::Malformed => {
+                OrchestratorError::Storage("Invalid direct request ownership record".into())
+            }
         })?;
         let public = self
             .mls_context()
@@ -418,12 +420,9 @@ where
         if raw.len() > transcript::MAX_PREPARE_HTTP_RESPONSE_BYTES {
             return Err(invalid());
         }
-        let value = transcript::normalize_read_presentation(
-            raw,
-            "directRequestPreparationView",
-            false,
-        )
-        .map_err(|_| invalid())?;
+        let value =
+            transcript::normalize_read_presentation(raw, "directRequestPreparationView", false)
+                .map_err(|_| invalid())?;
         let auth_did = intent
             .trusted_authority_did()
             .unwrap_or_else(|| intent::CANONICAL_DIRECT_REQUEST_AUTHORITY.to_string());
@@ -662,12 +661,9 @@ where
         // projections retain the one canonical bare form (the pre-F27 bytes),
         // so immutability checks and strict re-verification are presentation-
         // independent.
-        let value = transcript::normalize_read_presentation(
-            receipt,
-            "signedDirectRequestReceipt",
-            false,
-        )
-        .map_err(|_| invalid())?;
+        let value =
+            transcript::normalize_read_presentation(receipt, "signedDirectRequestReceipt", false)
+                .map_err(|_| invalid())?;
         let canonical = serde_json::to_vec(&value).map_err(|_| invalid())?;
         let receipt = canonical.as_slice();
         let auth_did = intent
@@ -814,6 +810,7 @@ where
                     .map_err(|_| invalid())?;
             let wrapper = exact.get("signedRequest").unwrap_or(&exact);
             let candidate = DirectRequestProjection {
+                authorization_version: super::projection::REQUEST_AUTHORIZATION_VERSION,
                 owner_did: intent.actor_did.clone(),
                 device_id: intent.actor_device_id.clone(),
                 trusted_authority_document: intent.trusted_authority_document.clone(),
@@ -831,15 +828,17 @@ where
                 pending_acceptance: None,
                 close_proof: None,
             };
-            let current = self
+            let mut current = self
                 .mls_context()
                 .read_direct_request_projection(&adopted.conversation_id)?;
-            if let Some(raw) = &current {
-                let retained = DirectRequestProjection::decode(
-                    raw,
-                    &intent.actor_did,
-                    &intent.actor_device_id,
-                )?;
+            if let Some(raw) = &mut current {
+                let retained = self
+                    .authorize_direct_request_projection(
+                        raw,
+                        &intent.actor_did,
+                        &intent.actor_device_id,
+                    )
+                    .await?;
                 if retained.publication != candidate.publication
                     || retained.publication_receipt != candidate.publication_receipt
                     || retained.sender_public_key != candidate.sender_public_key
@@ -847,6 +846,18 @@ where
                     return Err(OrchestratorError::Storage(
                         "Conflicting request publication projection".into(),
                     ));
+                }
+            }
+            if current.is_none() {
+                let actor_key = self
+                    .request_authorized_device_key(
+                        &intent.actor_did,
+                        &intent.actor_device_id,
+                        wrapper["body"]["keyId"].as_str().ok_or_else(invalid)?,
+                    )
+                    .await?;
+                if actor_key != intent.actor_public_key {
+                    return Err(invalid());
                 }
             }
             if current.is_none()
@@ -1004,7 +1015,9 @@ where
         else {
             return Ok(None);
         };
-        let mut projection = DirectRequestProjection::decode(&raw, &owner, &device)?;
+        let mut projection = self
+            .authorize_direct_request_projection(&mut raw, &owner, &device)
+            .await?;
         let view = projection.view(&owner, &device)?;
         if view.consent == RequestConsent::Accepted {
             let proof: Value =
@@ -1138,6 +1151,19 @@ where
                 &public,
             )
             .map_err(|_| invalid())?;
+        let accepted_body = &canonical_proof["entry"]["signedRequest"]["body"];
+        let authorized_key = self
+            .request_authorized_device_key(
+                accepted_body["actorDid"].as_str().ok_or_else(invalid)?,
+                accepted_body["actorDeviceId"]
+                    .as_str()
+                    .ok_or_else(invalid)?,
+                accepted_body["keyId"].as_str().ok_or_else(invalid)?,
+            )
+            .await?;
+        if authorized_key != public {
+            return Err(invalid());
+        }
         projection.acceptance_proof =
             Some(serde_json::to_vec(&canonical_proof).map_err(|_| invalid())?);
         projection.recipient_public_key = Some(public);

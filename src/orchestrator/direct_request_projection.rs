@@ -2,8 +2,8 @@
 use super::super::direct_request_types::*;
 use crate::chat_v2::transcript::direct_request::{
     resolve_direct_request_receipt_key_for_authority,
-    verify_received_signed_request as verify_signed_request,
-    verify_signed_request_for_authority, DirectRequestKind,
+    verify_received_signed_request as verify_signed_request, verify_signed_request_for_authority,
+    DirectRequestKind,
 };
 use crate::orchestrator::{OrchestratorError, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -13,6 +13,11 @@ use serde_json::Value;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DirectRequestProjection {
+    /// Version 1 means every retained actor key was independently authorized by
+    /// its account repository before this protected proof became replayable.
+    /// Legacy records default to zero and cannot produce capabilities.
+    #[serde(default)]
+    pub authorization_version: u32,
     pub owner_did: String,
     pub device_id: String,
     pub trusted_authority_document: Vec<u8>,
@@ -32,7 +37,22 @@ pub(crate) struct DirectRequestProjection {
 fn invalid() -> OrchestratorError {
     OrchestratorError::Storage("Invalid request projection proof".into())
 }
+pub(super) const REQUEST_AUTHORIZATION_VERSION: u32 = 1;
 impl DirectRequestProjection {
+    /// Startup may validate retained bytes without granting any authority or
+    /// requiring network access. Only the migration gate may promote legacy data.
+    pub(super) fn decode_for_reauthorization(
+        raw: &[u8],
+        owner: &str,
+        device: &str,
+    ) -> Result<Self> {
+        let value: Self = serde_json::from_slice(raw).map_err(|_| invalid())?;
+        if value.authorization_version > REQUEST_AUTHORIZATION_VERSION {
+            return Err(invalid());
+        }
+        value.verify_proofs(owner, device)?;
+        Ok(value)
+    }
     pub fn decode(raw: &[u8], owner: &str, device: &str) -> Result<Self> {
         let value: Self = serde_json::from_slice(raw).map_err(|_| invalid())?;
         value.view(owner, device)?;
@@ -43,6 +63,14 @@ impl DirectRequestProjection {
         serde_json::to_vec(self).map_err(|_| invalid())
     }
     pub fn view(&self, owner: &str, device: &str) -> Result<DirectRequestView> {
+        if self.authorization_version != REQUEST_AUTHORIZATION_VERSION {
+            return Err(OrchestratorError::Storage(
+                "Request projection requires repository reauthorization".into(),
+            ));
+        }
+        self.verify_proofs(owner, device)
+    }
+    fn verify_proofs(&self, owner: &str, device: &str) -> Result<DirectRequestView> {
         if self.owner_did != owner || self.device_id != device {
             return Err(invalid());
         }
@@ -56,8 +84,8 @@ impl DirectRequestProjection {
             serde_json::from_slice(&self.publication_receipt).map_err(|_| invalid())?;
         let method = envelope["body"]["keyId"].as_str().ok_or_else(invalid)?;
         let auth_did = {
-            let val: Value = serde_json::from_slice(&self.trusted_authority_document)
-                .map_err(|_| invalid())?;
+            let val: Value =
+                serde_json::from_slice(&self.trusted_authority_document).map_err(|_| invalid())?;
             val["id"].as_str().ok_or_else(invalid)?.to_string()
         };
         let authority_key = resolve_direct_request_receipt_key_for_authority(
@@ -467,7 +495,9 @@ mod tests {
         read_entry["signedRequest"]["signature"] = json!({
             "$bytes": canonical["signedRequest"]["signature"]
         });
-        let read_hash = DirectRequestCloseProof::hash(&normalized_close_entry(read_entry.clone()).unwrap()).unwrap();
+        let read_hash =
+            DirectRequestCloseProof::hash(&normalized_close_entry(read_entry.clone()).unwrap())
+                .unwrap();
         assert_eq!(canonical_hash, read_hash);
 
         // Mismatched signature fails to match the original hash
@@ -481,7 +511,11 @@ mod tests {
         mismatched_read["signedRequest"]["signature"] = json!({
             "$bytes": mismatched["signedRequest"]["signature"]
         });
-        assert_eq!(mismatched_hash, DirectRequestCloseProof::hash(&normalized_close_entry(mismatched_read).unwrap()).unwrap());
+        assert_eq!(
+            mismatched_hash,
+            DirectRequestCloseProof::hash(&normalized_close_entry(mismatched_read).unwrap())
+                .unwrap()
+        );
         let mut forged_tag = read_entry.clone();
         forged_tag["$type"] = json!("blue.catbird.chat.defs#directRequestEntry");
         assert!(normalized_close_entry(forged_tag.clone()).is_err());
@@ -489,5 +523,82 @@ mod tests {
         forged_tag["signedRequest"]["body"]["$type"] =
             json!("blue.catbird.chat.defs#directRequestBody");
         assert!(normalized_close_entry(forged_tag).is_err());
+    }
+}
+
+impl<S, A, C, M> crate::orchestrator::MLSOrchestrator<S, A, C, M>
+where
+    S: crate::orchestrator::MLSStorageBackend + 'static,
+    A: crate::orchestrator::MLSAPIClient + 'static,
+    C: crate::orchestrator::CredentialStore + 'static,
+    M: crate::orchestrator::MlsCryptoContext + 'static,
+{
+    pub(super) async fn authorize_direct_request_projection(
+        &self,
+        raw: &mut Vec<u8>,
+        owner: &str,
+        device: &str,
+    ) -> Result<DirectRequestProjection> {
+        // Keep migration state on the heap: this gate is nested in already
+        // large request/acceptance/terminal async state machines on app threads.
+        Box::pin(async {
+            let mut projection =
+                DirectRequestProjection::decode_for_reauthorization(raw, owner, device)?;
+            if projection.authorization_version == REQUEST_AUTHORIZATION_VERSION {
+                return Ok(projection);
+            }
+            let publication: Value =
+                serde_json::from_slice(&projection.publication).map_err(|_| invalid())?;
+            let mut actors = vec![(&publication["body"], &projection.sender_public_key)];
+            let acceptance: Option<Value> = projection
+                .acceptance_proof
+                .as_ref()
+                .map(|raw| serde_json::from_slice(raw).map_err(|_| invalid()))
+                .transpose()?;
+            if let Some(acceptance) = &acceptance {
+                actors.push((
+                    &acceptance["entry"]["signedRequest"]["body"],
+                    projection
+                        .recipient_public_key
+                        .as_ref()
+                        .ok_or_else(invalid)?,
+                ));
+            }
+            if let Some(close) = &projection.close_proof {
+                actors.push((
+                    &close.entry["signedRequest"]["body"],
+                    &close.actor_public_key,
+                ));
+            }
+            for (body, retained_key) in actors {
+                let key = self
+                    .request_authorized_device_key(
+                        body["actorDid"].as_str().ok_or_else(invalid)?,
+                        body["actorDeviceId"].as_str().ok_or_else(invalid)?,
+                        body["keyId"].as_str().ok_or_else(invalid)?,
+                    )
+                    .await?;
+                if key != *retained_key {
+                    return Err(invalid());
+                }
+            }
+            projection.authorization_version = REQUEST_AUTHORIZATION_VERSION;
+            let next = projection.encode()?;
+            let cid = publication["body"]["conversationId"]
+                .as_str()
+                .ok_or_else(invalid)?;
+            if !self
+                .mls_context()
+                .compare_exchange_direct_request_projection(cid, Some(raw), &next)?
+            {
+                return Err(OrchestratorError::Storage(
+                    "Request authorization migration raced".into(),
+                ));
+            }
+            // Downstream updates must compare against the exact upgraded bytes.
+            *raw = next;
+            Ok(projection)
+        })
+        .await
     }
 }

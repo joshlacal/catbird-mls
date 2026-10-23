@@ -1,8 +1,6 @@
 //! Canonical request controls share the ordinary page cursor, but never the
 //! ordinary MLS decrypt path. A page advances only after protected proof commit.
-use super::projection::{
-    request_control_entry, verify_request_publication_entry, DirectRequestProjection,
-};
+use super::projection::{request_control_entry, verify_request_publication_entry};
 use crate::chat_v2::transcript::direct_request as transcript;
 use crate::orchestrator::*;
 use serde_json::Value;
@@ -90,11 +88,13 @@ where
         let device = self.require_actor_device_id().await?;
         let lock = self.direct_request_operation_lock(cid).await;
         let guard = lock.lock().await;
-        let raw = self
+        let mut raw = self
             .mls_context()
             .read_direct_request_projection(cid)?
             .ok_or_else(invalid)?;
-        let mut projection = DirectRequestProjection::decode(&raw, &owner, &device)?;
+        let mut projection = self
+            .authorize_direct_request_projection(&mut raw, &owner, &device)
+            .await?;
         let kind = entry["$type"].as_str().ok_or_else(invalid)?.to_owned();
         let entry = request_control_entry(entry)?;
         match kind.as_str() {

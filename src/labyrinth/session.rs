@@ -10,17 +10,16 @@ use labyrinth::client::{
 };
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PdsRecords};
+use labyrinth::store::space::thread::SequencedSpaceThreadStore;
 use labyrinth::store::space::SpaceMailboxStore;
-use labyrinth::store::xrpc::{
-    XrpcDirectory, XrpcMailboxStore, XrpcOrf, XrpcThreadStore, XrpcTransport,
-};
+use labyrinth::store::xrpc::{XrpcDirectory, XrpcMailboxStore, XrpcOrf, XrpcTransport};
 use labyrinth::store::{KeyPublisher, MailboxDirectory, MailboxStore, TimeRange};
 use labyrinth::virtual_device::Mechanism;
 use zeroize::Zeroizing;
 
 use super::map_error;
 use super::signer::{ChatKeySigner, LatchedTransportSigner, SignerFault};
-use super::space::{Placement, SpaceMailbox};
+use super::space::{thread_placement_key, AccountThreadPlacementPins, Placement, SpaceMailbox};
 use super::state::StateVault;
 use crate::orchestrator::error::{OrchestratorError, Result};
 
@@ -129,7 +128,15 @@ impl SessionDeps {
         };
         Ok(Backends {
             mailbox,
-            threads: Box::new(XrpcThreadStore::new(&self.did, t.clone())),
+            threads: Box::new(SequencedSpaceThreadStore::new(
+                &self.did,
+                t.clone(),
+                self.space.clone(),
+                Arc::new(AccountThreadPlacementPins {
+                    did: self.did.clone(),
+                    vault: self.placements.clone(),
+                }),
+            )),
             directory,
             orf: Box::new(XrpcOrf::new(t)),
             publishers,
@@ -189,8 +196,19 @@ impl SessionDeps {
             }
             return Ok(Placement::MlsDs);
         };
-        if has_genesis(&space)? {
-            return Ok(Placement::Space);
+        match space.get_epoch(0) {
+            Ok(Some(_)) => return Ok(Placement::Space),
+            Ok(None) | Err(labyrinth::Error::NotFound("space")) => {}
+            Err(labyrinth::Error::NotSupported("personal Space mailbox")) => {
+                // Only an explicit structured endpoint-unsupported response
+                // permits first-time fallback. Outages, denial and deleted
+                // Spaces propagate instead of forking the account's mailbox.
+                if !has_genesis(&mlsds)? && self.has_published_head()? {
+                    return Err(space_unreachable());
+                }
+                return Ok(Placement::MlsDs);
+            }
+            Err(e) => return Err(map_error(e)),
         }
         if has_genesis(&mlsds)? {
             return Ok(Placement::MlsDs);
@@ -221,6 +239,64 @@ impl SessionDeps {
     /// placement, which is already erased. Idempotent; the retry after
     /// [`LabyrinthSession::purge_account`] reported `remote_pending`.
     pub fn delete_account_remote(&self) -> labyrinth::Result<()> {
+        let spaces = self.conversation_spaces()?;
+        self.delete_account_remote_at(None)?;
+        self.delete_conversation_records(&spaces, self.space.is_some())
+    }
+
+    pub(crate) fn conversation_spaces(&self) -> labyrinth::Result<Vec<String>> {
+        let key = super::space::thread_placement_key(&self.did);
+        let Some(raw) = self
+            .placements
+            .load(&key)
+            .map_err(|e| labyrinth::Error::Backend(e.to_string()))?
+        else {
+            return Ok(vec![]);
+        };
+        let pins: std::collections::BTreeMap<
+            String,
+            labyrinth::store::space::thread::ThreadPlacement,
+        > = serde_json::from_slice(&raw)
+            .map_err(|_| labyrinth::Error::Malformed("saved conversation placements"))?;
+        let mut spaces = std::collections::BTreeSet::new();
+        for placement in pins.into_values() {
+            placement.validate()?;
+            if let Some(space) = placement.space {
+                spaces.insert(space);
+            }
+        }
+        Ok(spaces.into_iter().collect())
+    }
+
+    pub(crate) fn delete_conversation_records(
+        &self,
+        spaces: &[String],
+        required: bool,
+    ) -> labyrinth::Result<()> {
+        if spaces.is_empty() && !required {
+            return Ok(());
+        }
+        let transport = self.space.as_ref().ok_or(labyrinth::Error::NotSupported(
+            "conversation Space account deletion",
+        ))?;
+        let mut owned = SequencedSpaceThreadStore::owned_spaces(transport.as_ref())?;
+        owned.extend(spaces.iter().cloned());
+        owned.sort();
+        owned.dedup();
+        for space in owned {
+            SequencedSpaceThreadStore::purge_owned_records(&self.did, transport.as_ref(), &space)?;
+        }
+        Ok(())
+    }
+
+    /// Retries with the placement captured before local state was erased.
+    /// A device without the Space callback cannot finish a Space deletion.
+    pub fn delete_account_remote_at(&self, placement: Option<Placement>) -> labyrinth::Result<()> {
+        if placement == Some(Placement::Space) && self.space_store().is_none() {
+            return Err(labyrinth::Error::Backend(
+                "personal Space deletion requires the account's PDS connection".into(),
+            ));
+        }
         let mailbox = XrpcMailboxStore::new(&self.did, self.transport.clone());
         let pds = self
             .pds
@@ -376,6 +452,9 @@ impl LabyrinthSession {
             .map_err(OrchestratorError::Mls)?;
         self.placements
             .delete(&self.did)
+            .map_err(OrchestratorError::Mls)?;
+        self.placements
+            .delete(&thread_placement_key(&self.did))
             .map_err(OrchestratorError::Mls)?;
         self.persisted = None;
         Ok(())
