@@ -456,7 +456,12 @@ pub trait OrchestratorAPICallback: Send + Sync {
     /// already-encoded query string, sent verbatim; `body` is the JSON body
     /// of a procedure (`method` = `POST`), absent on queries (`GET`).
     /// Return the raw response, including non-2xx statuses with their
-    /// atproto error body.
+    /// atproto error body. Do not reinterpret error names: on a foreign
+    /// getRecord, Rust reads `SpaceNotFound` (the Space or that member's
+    /// repo is gone, or the reader is not authorized; hosts do not tell
+    /// these apart) as a read refusal and falls back to the account's own
+    /// archive, and treats `SpaceDeleted` as terminal. If the credential
+    /// exchange fails with one of these, surface it with its name too.
     fn submit_labyrinth_space_request(
         &self,
         method: String,

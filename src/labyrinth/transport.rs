@@ -266,3 +266,25 @@ impl XrpcTransport for GatewayXrpcTransport {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Platforms return Space errors raw; labyrinth decides what an error
+    /// name means (a member-repo `SpaceNotFound` is a read refusal), so the
+    /// name and status must survive decoding unchanged.
+    #[test]
+    fn space_error_names_pass_through_decoding() {
+        for name in ["SpaceNotFound", "SpaceDeleted", "RecordNotFound"] {
+            let err = decode_response(Ok(GatewayResponse {
+                status: 400,
+                content_type: Some("application/json".into()),
+                body: format!(r#"{{"error":"{name}","message":"m"}}"#).into_bytes(),
+            }))
+            .unwrap_err();
+            assert_eq!(err.status, 400);
+            assert_eq!(err.error.as_deref(), Some(name));
+        }
+    }
+}
