@@ -18,6 +18,8 @@ pub mod field_encryption;
 mod hybrid_storage;
 #[cfg(not(target_arch = "wasm32"))]
 mod keychain;
+#[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+pub mod labyrinth;
 pub mod logging;
 mod message_limits;
 pub mod metadata;
@@ -50,10 +52,21 @@ pub use keychain::*;
 pub use mls_context::canonical_signer_keychain_key;
 #[cfg(not(target_arch = "wasm32"))]
 pub use mls_context::validate_serialized_signer_keypair_coherence;
+pub use orchestrator::direct_request_types::{
+    DirectRequestInput, DirectRequestOutcome, DirectRequestView, GroupInvitationReference,
+    RequestCapabilities, RequestConsent, RequestCrypto, RequestIntroductionMetadata,
+    RequestPreview,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use platform_lifecycle::*;
 pub use types::*;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use api::set_post_build_key_package_hook;
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use mls_context::set_simulate_extension_process_for_test;
 // ═══════════════════════════════════════════════════════════════════════════
 // Build ID for verifying correct FFI version is shipped
 // ═══════════════════════════════════════════════════════════════════════════

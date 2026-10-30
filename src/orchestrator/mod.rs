@@ -10,6 +10,12 @@ pub mod credentials;
 pub mod crypto_provider;
 pub mod devices;
 mod direct_adoption;
+pub mod direct_request_bootstrap;
+pub mod direct_request_journal;
+pub mod direct_request_keys;
+pub mod direct_request_shared_crypto;
+pub mod direct_request_types;
+pub mod direct_requests;
 pub mod error;
 pub mod event_observer;
 pub mod groups;
@@ -19,10 +25,12 @@ mod leaf_recovery;
 pub mod leave_fulfillment;
 pub mod lifecycle;
 pub mod messaging;
+pub(crate) mod metadata_snapshot;
 pub mod mls_provider;
 pub mod orchestrator;
 pub mod ordering;
 pub(crate) mod pagination;
+pub mod projection_commit;
 pub mod recovery;
 pub mod reset_flow;
 pub mod staged_commit;
@@ -36,15 +44,18 @@ pub mod welcome_recovery;
 #[cfg(test)]
 mod canonical_transport_tests;
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod local_delete_persistence_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod quarantine_persistence_tests;
+
 // Re-exports for convenience
 pub use api_client::MLSAPIClient;
-#[cfg(all(feature = "e2e-aad", not(any(test, feature = "test-utils"))))]
 pub use canonical_transport::canonical_application_aad_bytes;
 #[cfg(any(test, feature = "test-utils"))]
 pub use canonical_transport::{
-    canonical_application_aad_bytes, canonical_application_content, canonical_cbor_for_schema,
-    canonical_metadata_aad_bytes, canonical_metadata_content_signing_input,
-    canonical_metadata_exporter_context_bytes,
+    canonical_application_content, canonical_cbor_for_schema, canonical_metadata_aad_bytes,
+    canonical_metadata_content_signing_input, canonical_metadata_exporter_context_bytes,
 };
 pub use canonical_transport::{
     canonical_commit_aad_bytes, canonical_route, decode_clean_chat_blob_response, map_wire_error,
@@ -65,10 +76,16 @@ pub use credential_binding::{
     extract_key_package_binding, CredentialVerification, KeyPackageBindingInfo,
 };
 pub use credentials::{CleanChatSigningAuthority, CredentialStore};
+pub use direct_request_types::*;
 pub use error::{OrchestratorError, Result};
 pub use event_observer::EngineEvent;
 pub use mls_provider::{MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof};
+pub(crate) use orchestrator::{with_batch_inventory_scope, with_batch_recovery_inbox_scope};
 pub use orchestrator::{MLSOrchestrator, OrchestratorConfig};
+pub use recovery::DeferredRecoveryOutcome;
 pub use storage::MLSStorageBackend;
 pub use types::*;
 pub use welcome_recovery::*;
+
+pub mod authenticated_inventory;
+pub mod subscription;

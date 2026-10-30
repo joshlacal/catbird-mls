@@ -490,6 +490,7 @@ async fn external_join_authorization_rejection_does_not_advance_fork_or_rejoin_s
     for index in 0..3 {
         let error = orchestrator
             .process_incoming(&catbird_mls::orchestrator::IncomingEnvelope {
+                canonical_entry_json: None,
                 conversation_id: conversation_id.to_string(),
                 sender_did: "did:plc:outsider".to_string(),
                 ciphertext: format!("external-proposal-{index}").into_bytes(),
@@ -720,6 +721,7 @@ fn test_envelope(
     message_id: &str,
 ) -> catbird_mls::orchestrator::IncomingEnvelope {
     catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: conversation_id.to_string(),
         sender_did: "did:plc:alice".to_string(),
         ciphertext: format!("ciphertext-{message_id}").into_bytes(),
@@ -836,6 +838,189 @@ async fn secret_reuse_without_durable_envelope_evidence_fails_closed_without_rej
         "SecretReuse proof failure is not evidence of a fork"
     );
     assert!(!fixture.storage.has_rejoin_flag(conversation_id));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_reuse_own_sent_message_with_durable_evidence_skips_and_advances_cursor() {
+    let conversation_id = "8182838485868788898a8b8c8d8e8f91";
+    let client_msg_id = "c1c2c3c4-d5d6-47d8-99da-dbdcdddedfe0";
+    let server_entry_id = "f763fcb5-e3e2-4727-9380-f9d54820ac03";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::secret_reuse()),
+    )
+    .await;
+
+    // Simulate own sent message: stored locally with client UUID,
+    // server entryId tracked as pending outbox evidence.
+    fixture
+        .storage
+        .store_message(&Message {
+            id: client_msg_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sender_did: "did:plc:alice".to_string(),
+            text: "own sent message".to_string(),
+            timestamp: chrono::Utc::now(),
+            epoch: 1,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        })
+        .await
+        .expect("store own sent message");
+    fixture
+        .storage
+        .store_pending_message(conversation_id, server_entry_id)
+        .await
+        .expect("store server entryId as pending");
+
+    // Server echoes back the envelope with its assigned entryId
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"echoed-ciphertext", 1, server_entry_id)
+        .await
+        .expect("seed server echo envelope");
+
+    // Also seed a second message so we can verify cursor advances past the echo
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"continuation", 1, "next-server-entry")
+        .await
+        .expect("seed continuation frame");
+
+    // Fetch messages: SecretReuse for own echo is recognized via durable pending evidence,
+    // skipped with Ok(None), and cursor advances!
+    let (messages, cursor) = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect("locally accounted SecretReuse must advance the cursor");
+    assert!(messages.is_empty(), "own echo is skipped");
+    assert_eq!(
+        cursor.as_deref(),
+        Some("1"),
+        "cursor must advance past the skipped echo"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_reuse_aad_message_id_base64_matches_stored_uuid_and_advances_cursor() {
+    let conversation_id = "8182838485868788898a8b8c8d8e8f92";
+    let client_msg_uuid = "f763fcb5-e3e2-4727-9380-f9d54820ac03";
+    let base64_aad_msg_id = "92P8tePiRyeTgPnVSCCsAw==";
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::secret_reuse()),
+    )
+    .await;
+
+    // Stored message row has the hyphenated client UUID
+    fixture
+        .storage
+        .store_message(&Message {
+            id: client_msg_uuid.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sender_did: "did:plc:alice".to_string(),
+            text: "own sent message".to_string(),
+            timestamp: chrono::Utc::now(),
+            epoch: 1,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        })
+        .await
+        .expect("store own sent message with UUID");
+
+    // Incoming envelope carries the base64 AAD message ID representation
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"echoed-ciphertext", 1, base64_aad_msg_id)
+        .await
+        .expect("seed server echo envelope with base64 AAD id");
+
+    // Seed continuation frame so mock API client returns a continuation cursor
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"continuation", 1, "next-server-entry")
+        .await
+        .expect("seed continuation frame");
+
+    let (messages, cursor) = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect("base64 AAD message ID matching stored UUID must advance the cursor");
+    assert!(messages.is_empty(), "own echo is skipped");
+    assert_eq!(cursor.as_deref(), Some("1"), "cursor must advance");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn secret_reuse_with_own_echo_proof_skips_and_advances_cursor() {
+    let conversation_id = "8182838485868788898a8b8c8d8e8f93";
+    let server_entry_id = "server-entry-with-echo-proof";
+    // This controlled decrypt fixture tests proof lookup, not crypto acceptance.
+    // Its public TLS header must carry the actual nonempty AAD of the proof.
+    use tls_codec::Serialize as _;
+    let aad = b"canonical application metadata";
+    let group_bytes = hex::decode(conversation_id).unwrap();
+    let mut ciphertext = vec![0, 1, 0, 2]; // MLS 1.0, PrivateMessage
+    ciphertext.extend(
+        tls_codec::VLBytes::from(group_bytes.clone())
+            .tls_serialize_detached()
+            .unwrap(),
+    );
+    ciphertext.extend(1_u64.to_be_bytes());
+    ciphertext.push(1); // application content
+    for bytes in [aad.as_slice(), &[0_u8; 32], &[0_u8; 32]] {
+        ciphertext.extend(
+            tls_codec::VLBytes::from(bytes)
+                .tls_serialize_detached()
+                .unwrap(),
+        );
+    }
+    let fixture = controlled_inbound_fixture(
+        conversation_id,
+        Arc::new(ControlledCommitCrypto::secret_reuse()),
+    )
+    .await;
+    let group_bytes = hex::decode(conversation_id).unwrap_or_default();
+    let req_hash: [u8; 32] = Sha256::digest(b"test-req").into();
+    let aad_hash: [u8; 32] = Sha256::digest(aad).into();
+    let ct_hash: [u8; 32] = Sha256::digest(&ciphertext).into();
+
+    let proof = OwnEchoProof::new(
+        req_hash,
+        conversation_id.to_string(),
+        group_bytes,
+        server_entry_id.to_string(),
+        1,
+        aad_hash,
+        ct_hash,
+    );
+    fixture.crypto.store_own_echo_proof(&proof).unwrap();
+
+    fixture
+        .api
+        .send_message_with_id(conversation_id, &ciphertext, 1, server_entry_id)
+        .await
+        .expect("seed server echo envelope");
+
+    // Seed continuation frame so mock API client returns a continuation cursor
+    fixture
+        .api
+        .send_message_with_id(conversation_id, b"continuation", 1, "next-server-entry")
+        .await
+        .expect("seed continuation frame");
+
+    let (messages, cursor) = fixture
+        .orchestrator
+        .fetch_messages(conversation_id, None, 1, None, None, None)
+        .await
+        .expect("OwnEchoProof must allow SecretReuse envelope to advance cursor");
+    assert!(messages.is_empty(), "echo message is skipped");
+    assert_eq!(cursor.as_deref(), Some("1"), "cursor advances");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1432,8 +1617,8 @@ async fn post_set_aad_failure_restores_aad_and_echo_matches_exact_proof() {
         add_res.is_err(),
         "add_members_with_aad with invalid key package must fail"
     );
-    // Now Alice sends an application message. The group AAD must have been restored to empty,
-    // so the proof's empty AAD matches the encryption and the subsequent echo.
+    // A failed Add must not contaminate the canonical application AAD chosen by
+    // the next send. The protected proof and echoed wire header must match it.
     let sent = alice
         .orchestrator
         .send_message(group_id, "hello with restored AAD")
@@ -1984,6 +2169,7 @@ async fn credential_rejection_attempts_staged_commit_cleanup_and_surfaces_failur
 
     let error = orchestrator
         .process_incoming(&catbird_mls::orchestrator::IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: conversation_id.to_string(),
             sender_did: "did:plc:mallory".to_string(),
             ciphertext: b"staged-commit".to_vec(),
@@ -2038,6 +2224,7 @@ async fn credential_rejection_leaves_no_staged_commit_residue_when_cleanup_succe
 
     let error = orchestrator
         .process_incoming(&catbird_mls::orchestrator::IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: conversation_id.to_string(),
             sender_did: "did:plc:mallory".to_string(),
             ciphertext: b"staged-commit".to_vec(),
@@ -2409,4 +2596,412 @@ async fn canonical_invalid_id_is_rejected_before_decrypt_but_legacy_ids_remain_a
         .unwrap()
         .is_some());
     assert_eq!(fixture.crypto.decrypt_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_message_binds_authoritative_coordinates_from_point_read() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("coord-test-group", None, None)
+        .await
+        .expect("create_group");
+    let group_id = &convo.group_id;
+    let convo_id = &convo.conversation_id;
+
+    // Set authoritative lifecycle coordinates with non-zero values (gen 0, stateVersion 2)
+    // so defaulting to (0, 0) would fail this test.
+    let mut state = world
+        .delivery_service()
+        .lifecycle_state(convo_id)
+        .expect("lifecycle state");
+    state["coordinates"]["generation"] = serde_json::json!(0);
+    state["coordinates"]["stateVersion"] = serde_json::json!(2);
+    world
+        .delivery_service()
+        .set_lifecycle_state_for_test(convo_id, state);
+
+    let prior_send_count = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
+        .count();
+
+    alice
+        .orchestrator
+        .send_message(group_id, "hello coordinates")
+        .await
+        .expect("send_message must succeed");
+
+    let sends: Vec<_> = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .into_iter()
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
+        .collect();
+    assert_eq!(
+        sends.len(),
+        prior_send_count + 1,
+        "exactly one SendMessage request must be emitted"
+    );
+
+    let last_send = sends.last().unwrap();
+    let wire: serde_json::Value =
+        serde_json::from_slice(last_send.body.as_deref().unwrap()).unwrap();
+    let inner_body = wire
+        .get("signedRequest")
+        .and_then(|s| s.get("body"))
+        .unwrap_or(&wire);
+
+    // Assert outgoing aad.prior.generation and aad.prior.stateVersion equal point read's values
+    assert_eq!(
+        inner_body["aad"]["prior"]["generation"],
+        serde_json::json!(0),
+        "aad.prior.generation must equal point read generation"
+    );
+    assert_eq!(
+        inner_body["aad"]["prior"]["stateVersion"],
+        serde_json::json!(2),
+        "aad.prior.stateVersion must equal point read stateVersion (2, not 0)"
+    );
+    assert_eq!(
+        inner_body["prior"]["generation"],
+        serde_json::json!(0),
+        "body.prior.generation must equal point read generation"
+    );
+    assert_eq!(
+        inner_body["prior"]["stateVersion"],
+        serde_json::json!(2),
+        "body.prior.stateVersion must equal point read stateVersion (2, not 0)"
+    );
+    assert_canonical_application_wire(inner_body);
+}
+
+fn assert_canonical_application_wire(body: &serde_json::Value) {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn, ProtocolMessage};
+    use tls_codec::Deserialize as _;
+    let decode = |value: &serde_json::Value| {
+        STANDARD
+            .decode(value.as_str().or_else(|| value["$bytes"].as_str()).unwrap())
+            .unwrap()
+    };
+    let ciphertext = decode(&body["applicationMessage"]["bytes"]);
+    let frame = MlsMessageIn::tls_deserialize_exact(&ciphertext)
+        .expect("production send must emit exact raw MLS TLS framing");
+    let MlsMessageBodyIn::PrivateMessage(private) = frame.extract() else {
+        panic!("expected private application frame");
+    };
+    let expected_aad =
+        catbird_mls::orchestrator::canonical_application_aad_bytes(&body["aad"]).unwrap();
+    assert!(!expected_aad.is_empty());
+    assert_eq!(private.aad(), expected_aad);
+    let protocol = ProtocolMessage::from(private);
+    assert_eq!(
+        protocol.epoch().as_u64(),
+        body["prior"]["epoch"].as_u64().unwrap()
+    );
+    assert_eq!(
+        protocol.group_id().as_slice(),
+        decode(&body["prior"]["groupId"])
+    );
+    assert_eq!(
+        Sha256::digest(&ciphertext).as_slice(),
+        decode(&body["applicationMessage"]["sha256"])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_retries_only_explicit_stale_coordinates_with_exact_bound_aad() {
+    use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+    for (status, error, expected_sends) in [
+        (400, "StaleCoordinates", 2),
+        (409, "IdempotencyConflict", 1),
+        (409, "UnspecifiedConflict", 1),
+    ] {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        world.register_device("Alice").await.unwrap();
+        let alice = world.client("Alice");
+        let convo = alice
+            .orchestrator
+            .create_group("send-retry", None, None)
+            .await
+            .unwrap();
+        world
+            .api_service
+            .set_next_send_custom_response(status, serde_json::json!({"error": error}));
+        let result = alice
+            .orchestrator
+            .send_message(&convo.group_id, "bounded retry")
+            .await;
+        assert_eq!(result.is_ok(), expected_sends == 2, "{error}: {result:?}");
+        let sends: Vec<serde_json::Value> = world
+            .delivery_service()
+            .submitted_prepared_requests()
+            .into_iter()
+            .filter(|request| request.operation == CanonicalOperation::SendMessage)
+            .map(|request| {
+                serde_json::from_slice::<serde_json::Value>(request.body.as_deref().unwrap())
+                    .unwrap()["signedRequest"]["body"]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(sends.len(), expected_sends, "{error}");
+        for body in &sends {
+            assert_canonical_application_wire(body);
+        }
+        if sends.len() == 2 {
+            assert_eq!(sends[0]["messageId"], sends[1]["messageId"]);
+            assert_eq!(sends[0]["aad"], sends[1]["aad"]);
+            assert_ne!(
+                sends[0]["applicationMessage"]["bytes"],
+                sends[1]["applicationMessage"]["bytes"]
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn canonical_encrypt_rejects_epoch_race_and_restores_group_aad() {
+    use openmls::prelude::{MlsMessageBodyIn, MlsMessageIn};
+    use tls_codec::Deserialize as _;
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("epoch-aad", None, None)
+        .await
+        .unwrap();
+    let group = hex::decode(&convo.group_id).unwrap();
+    let context = alice.orchestrator.mls_context();
+    let epoch = context.get_epoch(group.clone()).unwrap();
+    let aad = b"bound application AAD".to_vec();
+    assert!(context
+        .encrypt_message_with_aad(group.clone(), b"test".to_vec(), aad.clone(), epoch + 1)
+        .is_err());
+    assert!(context
+        .encrypt_message_with_aad(group.clone(), b"test".to_vec(), vec![], epoch)
+        .is_err());
+    let accepted = context
+        .encrypt_message_with_aad(group.clone(), b"test".to_vec(), aad.clone(), epoch)
+        .unwrap();
+    let MlsMessageBodyIn::PrivateMessage(private) =
+        MlsMessageIn::tls_deserialize_exact(&accepted.ciphertext)
+            .unwrap()
+            .extract()
+    else {
+        panic!("private application")
+    };
+    assert_eq!(private.aad(), aad);
+    let legacy = context.encrypt_message(group, b"later".to_vec()).unwrap();
+    let length = u32::from_be_bytes(legacy.ciphertext[..4].try_into().unwrap()) as usize;
+    let MlsMessageBodyIn::PrivateMessage(private) =
+        MlsMessageIn::tls_deserialize_exact(&legacy.ciphertext[4..4 + length])
+            .unwrap()
+            .extract()
+    else {
+        panic!("private application")
+    };
+    assert!(
+        private.aad().is_empty(),
+        "canonical encryption must restore transient group AAD"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_message_fails_closed_without_sending_when_point_read_fails_or_lacks_coordinates() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("coord-fail-group", None, None)
+        .await
+        .expect("create_group");
+    let group_id = &convo.group_id;
+    let convo_id = &convo.conversation_id;
+
+    let send_count_before = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
+        .count();
+
+    // 1. Point read fails (non-200 / error)
+    world.delivery_service().fail_next_get_conversation_state();
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "fail on 500")
+        .await
+        .expect_err("send must fail when point read fails");
+    assert!(
+        err.to_string()
+            .contains("injected getConversationState failure")
+            || matches!(
+                err,
+                catbird_mls::orchestrator::OrchestratorError::ServerError { .. }
+            )
+            || matches!(err, catbird_mls::orchestrator::OrchestratorError::Api(_)),
+        "unexpected error: {err}"
+    );
+    let send_count_after_500 = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
+        .count();
+    assert_eq!(
+        send_count_after_500, send_count_before,
+        "zero send attempts when point read fails"
+    );
+
+    // 2. Point read returns non-200 status (e.g. 404 ConversationNotFound)
+    world
+        .delivery_service()
+        .set_next_get_conversation_state_custom_response(
+            404,
+            serde_json::json!({ "error": "ConversationNotFound" }),
+        );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "fail on 404")
+        .await
+        .expect_err("send must fail when point read returns 404");
+    assert!(
+        matches!(
+            err,
+            catbird_mls::orchestrator::OrchestratorError::ServerError { status: 404, .. }
+        ),
+        "unexpected error: {err}"
+    );
+    let send_count_after_404 = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
+        .count();
+    assert_eq!(
+        send_count_after_404, send_count_before,
+        "zero send attempts when point read returns 404"
+    );
+
+    // 3. Point read returns body without state.coordinates
+    world
+        .delivery_service()
+        .set_next_get_conversation_state_custom_response(
+            200,
+            serde_json::json!({
+                "state": {
+                    "conversationKind": "group"
+                    // missing coordinates!
+                }
+            }),
+        );
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "fail on missing coords")
+        .await
+        .expect_err("send must fail when point read lacks state.coordinates");
+    assert!(
+        err.to_string().contains("carries no coordinates"),
+        "error must mention missing coordinates: {err}"
+    );
+    let send_count_after_missing_coords = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
+        .count();
+    assert_eq!(
+        send_count_after_missing_coords, send_count_before,
+        "zero send attempts when state.coordinates is missing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_message_fails_closed_without_sending_when_coordinates_identify_different_conversation(
+) {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.register_device("Alice").await.unwrap();
+    let alice = world.client("Alice");
+    let convo = alice
+        .orchestrator
+        .create_group("coord-diff-group", None, None)
+        .await
+        .expect("create_group");
+    let group_id = &convo.group_id;
+    let convo_id = &convo.conversation_id;
+
+    let send_count_before = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
+        .count();
+
+    let mut state = world
+        .delivery_service()
+        .lifecycle_state(convo_id)
+        .expect("lifecycle state");
+    // Point read returns coordinates for a different conversationId
+    state["coordinates"]["conversationId"] = serde_json::json!("different-conversation-uuid");
+    world
+        .delivery_service()
+        .set_lifecycle_state_for_test(convo_id, state);
+
+    let err = alice
+        .orchestrator
+        .send_message(group_id, "should fail on convo id mismatch")
+        .await
+        .expect_err("send must fail when coordinates identify different conversation");
+    assert!(
+        err.to_string()
+            .contains("coordinates identify a different conversation"),
+        "error must mention conversation mismatch: {err}"
+    );
+
+    let send_count_after = world
+        .delivery_service()
+        .submitted_prepared_requests()
+        .iter()
+        .filter(|r| {
+            r.operation
+                == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::SendMessage
+        })
+        .count();
+    assert_eq!(
+        send_count_after, send_count_before,
+        "zero send attempts when conversationId is mismatched"
+    );
 }

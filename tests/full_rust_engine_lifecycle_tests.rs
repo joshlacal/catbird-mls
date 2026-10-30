@@ -268,6 +268,7 @@ fn reattach_after_suspend_on_fresh_engine_restores_initialized_phase_without_sta
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let db_path = temp_dir.path().join("mls.db");
     let storage = Arc::new(MockStorage::new());
+    let credentials = Arc::new(MockCredentials::new());
     let keychain = InMemoryKeychain::new();
 
     let first_context = MLSContext::new(
@@ -280,7 +281,7 @@ fn reattach_after_suspend_on_fresh_engine_restores_initialized_phase_without_sta
         first_context,
         Arc::clone(&storage),
         Arc::new(MockDeliveryService::new("did:plc:test")),
-        Arc::new(MockCredentials::new()),
+        Arc::clone(&credentials),
         Arc::new(EngineLifecycle::default()),
         OrchestratorConfig::default(),
     );
@@ -305,7 +306,7 @@ fn reattach_after_suspend_on_fresh_engine_restores_initialized_phase_without_sta
         second_context,
         Arc::clone(&storage),
         Arc::new(MockDeliveryService::new("did:plc:test")),
-        Arc::new(MockCredentials::new()),
+        credentials,
         Arc::new(EngineLifecycle::default()),
         OrchestratorConfig::default(),
     );

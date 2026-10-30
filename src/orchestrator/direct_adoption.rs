@@ -99,22 +99,74 @@ where
             return Ok(None);
         }
         let device = self.require_actor_device_id().await?;
+        if let Some(snapshot) = self.batch_inventory_snapshot() {
+            if snapshot.user_did == user_did && snapshot.device_id == device {
+                for item in &snapshot.items {
+                    let state = item.get("state").unwrap_or(item);
+                    if state["conversationKind"] != "direct"
+                        || state["coordinates"]["lifecycle"] != "active"
+                    {
+                        continue;
+                    }
+                    let Some(participants) = state["participants"].as_array() else {
+                        continue;
+                    };
+                    if participants.len() != 2
+                        || !participants
+                            .iter()
+                            .any(|p| p["userDid"].as_str() == Some(&user_did))
+                        || !participants
+                            .iter()
+                            .any(|p| p["userDid"].as_str() == Some(&peer_did))
+                    {
+                        continue;
+                    }
+                    let conversation_id = state["coordinates"]["conversationId"]
+                        .as_str()
+                        .ok_or_else(|| {
+                            OrchestratorError::Api("Existing direct conversation has no ID.".into())
+                        })?;
+                    crate::chat_v2::ids::uuid::ConversationId::parse(conversation_id).map_err(
+                        |e| {
+                            OrchestratorError::InvalidInput(format!(
+                                "Existing conversation ID is invalid: {e}"
+                            ))
+                        },
+                    )?;
+                    let coordinates = super::lifecycle::lifecycle_coordinates(
+                        &state["coordinates"],
+                        conversation_id,
+                    )?;
+                    return Ok(Some(json!({
+                        "$type": "blue.catbird.chat.defs#existingDirectConversationResult",
+                        "conversationKind": "direct", "conversationId": conversation_id,
+                        "coordinates": coordinates,
+                    })));
+                }
+                return Ok(None);
+            }
+        }
         let mut cursor: Option<String> = None;
         let mut pagination =
             PaginationGuard::for_conversations("existing direct conversation lookup");
         loop {
             let mut path = format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={device}&limit=100"
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
+                super::canonical_transport::encode_query(&device)
             );
             if let Some(cursor) = &cursor {
                 path.push_str("&pageCursor=");
-                path.push_str(cursor);
+                path.push_str(&super::canonical_transport::encode_query(cursor));
             }
             let response = self
                 .api_client()
                 .submit_prepared_request(PreparedRequest {
                     operation: CanonicalOperation::GetConversations,
-                    path,
+                    path: super::canonical_transport::scope_inventory_read_path(
+                        CanonicalOperation::GetConversations,
+                        path,
+                        self.mls_context().supports_direct_request_bootstrap(),
+                    ),
                     method: "GET".into(),
                     body: None,
                 })

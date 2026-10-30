@@ -20,6 +20,11 @@ use super::types::{ConversationRecoveryState, QuarantineExitReason, QuarantineRe
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum EngineEvent {
+    /// Protected request preview changed; must never trigger ordinary message effects.
+    RequestReceived {
+        convo_id: String,
+        message_id: Option<String>,
+    },
     ConversationUpdated {
         convo_id: String,
     },

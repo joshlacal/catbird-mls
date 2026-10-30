@@ -23,6 +23,7 @@ use crate::atproto::blue_catbird::chat::{
     get_blob_usage::GetBlobUsageRequest,
     get_conversation_state::GetConversationStateRequest,
     get_conversations::{GetConversations, GetConversationsRequest},
+    get_device_key::GetDeviceKeyRequest,
     get_devices::GetDevicesRequest,
     get_entries::{GetEntries, GetEntriesRequest},
     get_leaf_recovery_inbox::GetLeafRecoveryInboxRequest,
@@ -200,6 +201,11 @@ pub enum TransportError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum CleanChatRequest {
+    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequest<String>),
+    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequest<String>),
+    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparation<String>),
+    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcome<String>),
+    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeys<String>),
     AcceptConversation(AcceptConversationRequestBody),
     AcknowledgeWelcome(AcknowledgeWelcomeRequestBody),
     ActivateReset(ActivateResetRequestBody),
@@ -214,6 +220,7 @@ pub enum CleanChatRequest {
     GetBlobUsage(GetBlobUsageRequestBody),
     GetConversationState(GetConversationStateRequestBody),
     GetDevices(GetDevicesRequestBody),
+    GetDeviceKey(GetDeviceKeyRequestBody),
     GetEntries(GetEntries<String>),
     GetLeafRecoveryInbox(GetLeafRecoveryInboxRequestBody),
     GetOwnDevices(GetOwnDevicesRequestBody),
@@ -257,6 +264,8 @@ pub type GetConversationStateRequestBody =
     crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationState<String>;
 pub type GetDevicesRequestBody =
     crate::atproto::blue_catbird::chat::get_devices::GetDevices<String>;
+pub type GetDeviceKeyRequestBody =
+    crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKey<String>;
 pub type GetLeafRecoveryInboxRequestBody =
     crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInbox<String>;
 pub type GetOwnDevicesRequestBody =
@@ -293,6 +302,11 @@ pub type UploadBlobRequestBody = crate::atproto::blue_catbird::chat::upload_blob
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub enum CleanChatResponse {
+    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestOutput<String>),
+    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestOutput<String>),
+    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationOutput<String>),
+    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeOutput<String>),
+    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysOutput<String>),
     AcceptConversation(
         crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>,
     ),
@@ -323,6 +337,7 @@ pub enum CleanChatResponse {
         >,
     ),
     GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>),
+    GetDeviceKey(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyOutput<String>),
     GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>),
     GetLeafRecoveryInbox(
         crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxOutput<
@@ -369,6 +384,11 @@ pub enum CleanChatResponse {
 /// A generated clean-chat error body, selected by the canonical operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanChatError {
+    PrepareDirectRequest(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestError),
+    PublishDirectRequest(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestError),
+    CancelDirectRequestPreparation(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationError),
+    GetDirectRequestOutcome(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeError),
+    PublishDirectRequestKeys(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysError),
     AcceptConversation(
         crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError,
     ),
@@ -395,6 +415,7 @@ pub enum CleanChatError {
         crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError,
     ),
     GetDevices(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError),
+    GetDeviceKey(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyError),
     GetEntries(crate::atproto::blue_catbird::chat::get_entries::GetEntriesError),
     GetLeafRecoveryInbox(
         crate::atproto::blue_catbird::chat::get_leaf_recovery_inbox::GetLeafRecoveryInboxError,
@@ -429,6 +450,11 @@ pub enum CleanChatError {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CleanChatOperationFfi {
+    PrepareDirectRequest,
+    PublishDirectRequest,
+    CancelDirectRequestPreparation,
+    GetDirectRequestOutcome,
+    PublishDirectRequestKeys,
     AcceptConversation,
     AcknowledgeWelcome,
     ActivateReset,
@@ -443,6 +469,7 @@ pub enum CleanChatOperationFfi {
     GetBlobUsage,
     GetConversationState,
     GetDevices,
+    GetDeviceKey,
     GetEntries,
     GetLeafRecoveryInbox,
     GetOwnDevices,
@@ -466,6 +493,13 @@ pub enum CleanChatOperationFfi {
 impl From<CleanChatOperationFfi> for CanonicalOperation {
     fn from(operation: CleanChatOperationFfi) -> Self {
         match operation {
+            CleanChatOperationFfi::PrepareDirectRequest => Self::PrepareDirectRequest,
+            CleanChatOperationFfi::PublishDirectRequest => Self::PublishDirectRequest,
+            CleanChatOperationFfi::CancelDirectRequestPreparation => {
+                Self::CancelDirectRequestPreparation
+            }
+            CleanChatOperationFfi::GetDirectRequestOutcome => Self::GetDirectRequestOutcome,
+            CleanChatOperationFfi::PublishDirectRequestKeys => Self::PublishDirectRequestKeys,
             CleanChatOperationFfi::AcceptConversation => Self::AcceptConversation,
             CleanChatOperationFfi::AcknowledgeWelcome => Self::AcknowledgeWelcome,
             CleanChatOperationFfi::ActivateReset => Self::ActivateReset,
@@ -480,6 +514,7 @@ impl From<CleanChatOperationFfi> for CanonicalOperation {
             CleanChatOperationFfi::GetBlobUsage => Self::GetBlobUsage,
             CleanChatOperationFfi::GetConversationState => Self::GetConversationState,
             CleanChatOperationFfi::GetDevices => Self::GetDevices,
+            CleanChatOperationFfi::GetDeviceKey => Self::GetDeviceKey,
             CleanChatOperationFfi::GetEntries => Self::GetEntries,
             CleanChatOperationFfi::GetLeafRecoveryInbox => Self::GetLeafRecoveryInbox,
             CleanChatOperationFfi::GetOwnDevices => Self::GetOwnDevices,
@@ -505,6 +540,13 @@ impl From<CleanChatOperationFfi> for CanonicalOperation {
 impl From<CanonicalOperation> for CleanChatOperationFfi {
     fn from(operation: CanonicalOperation) -> Self {
         match operation {
+            CanonicalOperation::PrepareDirectRequest => Self::PrepareDirectRequest,
+            CanonicalOperation::PublishDirectRequest => Self::PublishDirectRequest,
+            CanonicalOperation::CancelDirectRequestPreparation => {
+                Self::CancelDirectRequestPreparation
+            }
+            CanonicalOperation::GetDirectRequestOutcome => Self::GetDirectRequestOutcome,
+            CanonicalOperation::PublishDirectRequestKeys => Self::PublishDirectRequestKeys,
             CanonicalOperation::AcceptConversation => Self::AcceptConversation,
             CanonicalOperation::AcknowledgeWelcome => Self::AcknowledgeWelcome,
             CanonicalOperation::ActivateReset => Self::ActivateReset,
@@ -519,6 +561,7 @@ impl From<CanonicalOperation> for CleanChatOperationFfi {
             CanonicalOperation::GetBlobUsage => Self::GetBlobUsage,
             CanonicalOperation::GetConversationState => Self::GetConversationState,
             CanonicalOperation::GetDevices => Self::GetDevices,
+            CanonicalOperation::GetDeviceKey => Self::GetDeviceKey,
             CanonicalOperation::GetEntries => Self::GetEntries,
             CanonicalOperation::GetLeafRecoveryInbox => Self::GetLeafRecoveryInbox,
             CanonicalOperation::GetOwnDevices => Self::GetOwnDevices,
@@ -613,7 +656,23 @@ fn parse_ffi_request(
     operation: CanonicalOperation,
     body: &[u8],
 ) -> Result<CleanChatRequest, CleanChatTransportFfiError> {
+    validate_direct_endpoint_raw(operation, body).map_err(ffi_error)?;
     match operation {
+        CanonicalOperation::PrepareDirectRequest => {
+            parse_json_req(body, CleanChatRequest::PrepareDirectRequest)
+        }
+        CanonicalOperation::PublishDirectRequest => {
+            parse_json_req(body, CleanChatRequest::PublishDirectRequest)
+        }
+        CanonicalOperation::CancelDirectRequestPreparation => {
+            parse_json_req(body, CleanChatRequest::CancelDirectRequestPreparation)
+        }
+        CanonicalOperation::GetDirectRequestOutcome => {
+            parse_json_req(body, CleanChatRequest::GetDirectRequestOutcome)
+        }
+        CanonicalOperation::PublishDirectRequestKeys => {
+            parse_json_req(body, CleanChatRequest::PublishDirectRequestKeys)
+        }
         CanonicalOperation::AcceptConversation => {
             parse_json_req(body, CleanChatRequest::AcceptConversation)
         }
@@ -642,6 +701,7 @@ fn parse_ffi_request(
             parse_json_req(body, CleanChatRequest::GetConversationState)
         }
         CanonicalOperation::GetDevices => parse_json_req(body, CleanChatRequest::GetDevices),
+        CanonicalOperation::GetDeviceKey => parse_json_req(body, CleanChatRequest::GetDeviceKey),
         CanonicalOperation::GetEntries => parse_json_req(body, CleanChatRequest::GetEntries),
         CanonicalOperation::GetLeafRecoveryInbox => {
             parse_json_req(body, CleanChatRequest::GetLeafRecoveryInbox)
@@ -733,6 +793,21 @@ pub fn decode_clean_chat_response(
     let response =
         CleanChatResponse::decode(operation.into(), &response_json).map_err(ffi_error)?;
     match response {
+        CleanChatResponse::PrepareDirectRequest(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::PublishDirectRequest(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::CancelDirectRequestPreparation(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::GetDirectRequestOutcome(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatResponse::PublishDirectRequestKeys(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatResponse::AcceptConversation(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
         }
@@ -759,6 +834,7 @@ pub fn decode_clean_chat_response(
             serde_json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatResponse::GetDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatResponse::GetDeviceKey(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatResponse::GetLeafRecoveryInbox(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
@@ -801,6 +877,21 @@ pub fn decode_clean_chat_error(
 ) -> Result<Vec<u8>, CleanChatTransportFfiError> {
     let error = CleanChatError::decode(operation.into(), &error_json).map_err(ffi_error)?;
     match error {
+        CleanChatError::PrepareDirectRequest(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::PublishDirectRequest(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::CancelDirectRequestPreparation(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::GetDirectRequestOutcome(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
+        CleanChatError::PublishDirectRequestKeys(value) => {
+            serde_json::to_vec(&value).map_err(ffi_error)
+        }
         CleanChatError::AcceptConversation(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::AcknowledgeWelcome(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::ActivateReset(value) => serde_json::to_vec(&value).map_err(ffi_error),
@@ -817,6 +908,7 @@ pub fn decode_clean_chat_error(
             serde_json::to_vec(&value).map_err(ffi_error)
         }
         CleanChatError::GetDevices(value) => serde_json::to_vec(&value).map_err(ffi_error),
+        CleanChatError::GetDeviceKey(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::GetEntries(value) => serde_json::to_vec(&value).map_err(ffi_error),
         CleanChatError::GetLeafRecoveryInbox(value) => {
             serde_json::to_vec(&value).map_err(ffi_error)
@@ -846,6 +938,13 @@ pub fn decode_clean_chat_error(
 impl CleanChatRequest {
     pub fn operation(&self) -> CanonicalOperation {
         match self {
+            Self::PrepareDirectRequest(_) => CanonicalOperation::PrepareDirectRequest,
+            Self::PublishDirectRequest(_) => CanonicalOperation::PublishDirectRequest,
+            Self::CancelDirectRequestPreparation(_) => {
+                CanonicalOperation::CancelDirectRequestPreparation
+            }
+            Self::GetDirectRequestOutcome(_) => CanonicalOperation::GetDirectRequestOutcome,
+            Self::PublishDirectRequestKeys(_) => CanonicalOperation::PublishDirectRequestKeys,
             Self::AcceptConversation(_) => CanonicalOperation::AcceptConversation,
             Self::AcknowledgeWelcome(_) => CanonicalOperation::AcknowledgeWelcome,
             Self::ActivateReset(_) => CanonicalOperation::ActivateReset,
@@ -860,6 +959,7 @@ impl CleanChatRequest {
             Self::GetBlobUsage(_) => CanonicalOperation::GetBlobUsage,
             Self::GetConversationState(_) => CanonicalOperation::GetConversationState,
             Self::GetDevices(_) => CanonicalOperation::GetDevices,
+            Self::GetDeviceKey(_) => CanonicalOperation::GetDeviceKey,
             Self::GetEntries(_) => CanonicalOperation::GetEntries,
             Self::GetLeafRecoveryInbox(_) => CanonicalOperation::GetLeafRecoveryInbox,
             Self::GetOwnDevices(_) => CanonicalOperation::GetOwnDevices,
@@ -885,11 +985,17 @@ impl CleanChatRequest {
     pub fn prepare(&self, auth: &CleanChatAuthContext) -> Result<PreparedRequest, TransportError> {
         let internal = auth.as_internal();
         match self {
+            Self::PrepareDirectRequest(request) => prepare_direct_request_json(&internal, auth.auth_generation, self.operation(), request),
+            Self::PublishDirectRequest(request) => prepare_direct_request_json(&internal, auth.auth_generation, self.operation(), request),
+            Self::CancelDirectRequestPreparation(request) => prepare_direct_request_json(&internal, auth.auth_generation, self.operation(), request),
+            Self::GetDirectRequestOutcome(request) => query_request(&internal, self.operation(), request),
+            Self::PublishDirectRequestKeys(request) => prepare_direct_request_json(&internal, auth.auth_generation, self.operation(), request),
             Self::GetConversations(request) => query_request(&internal, self.operation(), request),
             Self::GetBlob(request) => query_request(&internal, self.operation(), request),
             Self::GetBlobUsage(request) => query_request(&internal, self.operation(), request),
             Self::GetConversationState(request) => query_request(&internal, self.operation(), request),
             Self::GetDevices(request) => query_request(&internal, self.operation(), request),
+            Self::GetDeviceKey(request) => query_request(&internal, self.operation(), request),
             Self::GetEntries(request) => query_request(&internal, self.operation(), request),
             Self::GetLeafRecoveryInbox(request) => query_request(&internal, self.operation(), request),
             Self::GetOwnDevices(request) => query_request(&internal, self.operation(), request),
@@ -902,7 +1008,11 @@ impl CleanChatRequest {
                 operation: self.operation(),
                 reason: "subscribeEvents is a WebSocket subscription; use the platform streaming adapter",
             }),
-            Self::AcceptConversation(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
+            Self::AcceptConversation(request) => {
+                let raw=serialize_json(request)?;
+                let v2=crate::chat_v2::transcript::direct_request::direct_request_acceptance_endpoint_is_v2(&raw).map_err(|e|TransportError::Serialization(e.to_string()))?;
+                if v2 {prepare_direct_request_json(&internal,auth.auth_generation,self.operation(),request)} else {prepare_json_request(&internal, auth.auth_generation, self.operation(), request)}
+            },
             Self::AcknowledgeWelcome(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::ActivateReset(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
             Self::CancelLeafRecovery(request) => prepare_json_request(&internal, auth.auth_generation, self.operation(), request),
@@ -941,6 +1051,11 @@ impl CleanChatResponse {
             };
         }
         match operation {
+            CanonicalOperation::PrepareDirectRequest => decode!(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestOutput<String>, PrepareDirectRequest),
+            CanonicalOperation::PublishDirectRequest => decode!(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestOutput<String>, PublishDirectRequest),
+            CanonicalOperation::CancelDirectRequestPreparation => decode!(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationOutput<String>, CancelDirectRequestPreparation),
+            CanonicalOperation::GetDirectRequestOutcome => decode!(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeOutput<String>, GetDirectRequestOutcome),
+            CanonicalOperation::PublishDirectRequestKeys => decode!(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysOutput<String>, PublishDirectRequestKeys),
             CanonicalOperation::AcceptConversation => decode!(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationOutput<String>, AcceptConversation),
             CanonicalOperation::AcknowledgeWelcome => decode!(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeOutput<String>, AcknowledgeWelcome),
             CanonicalOperation::ActivateReset => decode!(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetOutput<String>, ActivateReset),
@@ -971,6 +1086,7 @@ impl CleanChatResponse {
             CanonicalOperation::GetBlobUsage => decode!(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageOutput<String>, GetBlobUsage),
             CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>, GetConversationState),
             CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>, GetDevices),
+            CanonicalOperation::GetDeviceKey => decode!(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyOutput<String>, GetDeviceKey),
             CanonicalOperation::GetEntries => decode!(
                 crate::atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>,
                 GetEntries
@@ -1022,6 +1138,11 @@ impl CleanChatError {
             };
         }
         match operation {
+            CanonicalOperation::PrepareDirectRequest => decode!(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestError, PrepareDirectRequest),
+            CanonicalOperation::PublishDirectRequest => decode!(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestError, PublishDirectRequest),
+            CanonicalOperation::CancelDirectRequestPreparation => decode!(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationError, CancelDirectRequestPreparation),
+            CanonicalOperation::GetDirectRequestOutcome => decode!(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeError, GetDirectRequestOutcome),
+            CanonicalOperation::PublishDirectRequestKeys => decode!(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysError, PublishDirectRequestKeys),
             CanonicalOperation::AcceptConversation => decode!(crate::atproto::blue_catbird::chat::accept_conversation::AcceptConversationError, AcceptConversation),
             CanonicalOperation::AcknowledgeWelcome => decode!(crate::atproto::blue_catbird::chat::acknowledge_welcome::AcknowledgeWelcomeError, AcknowledgeWelcome),
             CanonicalOperation::ActivateReset => decode!(crate::atproto::blue_catbird::chat::activate_reset::ActivateResetError, ActivateReset),
@@ -1045,6 +1166,7 @@ impl CleanChatError {
             CanonicalOperation::GetBlobUsage => decode!(crate::atproto::blue_catbird::chat::get_blob_usage::GetBlobUsageError, GetBlobUsage),
             CanonicalOperation::GetConversationState => decode!(crate::atproto::blue_catbird::chat::get_conversation_state::GetConversationStateError, GetConversationState),
             CanonicalOperation::GetDevices => decode!(crate::atproto::blue_catbird::chat::get_devices::GetDevicesError, GetDevices),
+            CanonicalOperation::GetDeviceKey => decode!(crate::atproto::blue_catbird::chat::get_device_key::GetDeviceKeyError, GetDeviceKey),
             CanonicalOperation::GetEntries => decode!(
                 crate::atproto::blue_catbird::chat::get_entries::GetEntriesError,
                 GetEntries
@@ -1213,13 +1335,13 @@ pub fn prepare_replenishment(
     replenish_key_packages(&auth.as_internal(), signer, input)
 }
 
-pub(crate) fn derive_key_id(public_key: &[u8]) -> String {
+pub fn derive_key_id(public_key: &[u8]) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use sha2::{Digest, Sha256};
     URL_SAFE_NO_PAD.encode(Sha256::digest(public_key))
 }
 
-pub(crate) const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
+pub const DEVICE_ENROLL_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-ENROLL\0";
 const DEVICE_REVOKE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-DEVICE-REVOKE\0";
 const CREATE_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-CREATE\0";
 const COMMIT_SIGNATURE_DOMAIN: &str = "CATBIRD-CHAT-COMMIT\0";
@@ -1614,6 +1736,17 @@ fn project_schema_ref(
     }
 }
 
+/// Validate an unsigned read/event shape against the pinned canonical schema:
+/// duplicate keys, unknown fields, null, and unknown closed-union variants are
+/// rejected. This validates framing only; orchestration owns state authority.
+pub(crate) fn validate_read_shape(
+    name: &str,
+    raw: &[u8],
+) -> Result<serde_json::Value, TransportError> {
+    project_schema_ref(name, &parse_strict_signed_json(raw)?, false)?;
+    serde_json::from_slice(raw).map_err(|e| TransportError::Serialization(e.to_string()))
+}
+
 fn project_schema(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1668,6 +1801,27 @@ fn project_union(
     project_schema_ref(variant, input, true)
 }
 
+/// Unsigned routing extensions present in read-view lexicons but strictly excluded
+/// from the canonical signed schema per ADR-010 and DECISIONS.md (2026-09-05).
+///
+/// These fields (e.g. `sequencerDid` and `sequencerTerm` on `conversationState`)
+/// are transport routing hints used by clients to locate the current sequencer DS.
+/// They are never part of signed MLS conversation state and must be rejected
+/// by the canonical signed schema derivation.
+const UNSIGNED_ROUTING_EXTENSIONS: &[(&str, &str)] = &[
+    ("conversationState", "sequencerDid"),
+    ("conversationState", "sequencerTerm"),
+];
+
+fn is_unsigned_routing_extension(definition: Option<&str>, field: &str) -> bool {
+    let Some(def) = definition else {
+        return false;
+    };
+    UNSIGNED_ROUTING_EXTENSIONS
+        .iter()
+        .any(|&(d, f)| d == def && f == field)
+}
+
 fn project_object(
     schema: &serde_json::Value,
     input: &StrictSignedJson,
@@ -1698,6 +1852,11 @@ fn project_object(
             }
             output.insert(name.clone(), CanonicalValue::Text(expected));
             continue;
+        }
+        if is_unsigned_routing_extension(definition_name, name) {
+            return Err(TransportError::Serialization(format!(
+                "unknown closed clean-chat field {name}"
+            )));
         }
         let property = properties.get(name).ok_or_else(|| {
             TransportError::Serialization(format!("unknown closed clean-chat field {name}"))
@@ -2338,6 +2497,76 @@ fn remove_read_routing_extensions(state: &mut serde_json::Value) -> Result<(), T
             ));
         }
     }
+    if let Some(participants) = fields
+        .get_mut("participants")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for participant in participants {
+            if let Some(head) = participant
+                .as_object_mut()
+                .and_then(|participant| participant.remove("labyrinthHead"))
+            {
+                validate_labyrinth_head(&head)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `participantView.labyrinthHead` (PetrelCatbird 55e4eff4) is a read-only
+/// pointer into the mls-ds Labyrinth head directory. Like the sequencer
+/// routing hints it is server-attached display/routing data, not signed
+/// conversation state, so it is shape-checked against `#labyrinthHead` and
+/// then dropped before the closed canonical projection. Labyrinth consumers
+/// resolve heads through `blue.catbird.labyrinth.getEpochHead` instead.
+fn validate_labyrinth_head(head: &serde_json::Value) -> Result<(), TransportError> {
+    use base64::{
+        engine::general_purpose::{STANDARD, STANDARD_NO_PAD},
+        Engine as _,
+    };
+    const MAX_EPOCH_NUMBER: u64 = 1_099_511_627_776;
+    const MAX_ATTESTATION_KEY_ID_LEN: usize = 128;
+    let invalid = || {
+        TransportError::Serialization(
+            "labyrinthHead must be null or a valid #labyrinthHead object".into(),
+        )
+    };
+    let fields = match head {
+        serde_json::Value::Null => return Ok(()),
+        serde_json::Value::Object(fields) => fields,
+        _ => return Err(invalid()),
+    };
+    if fields.len() != 3 {
+        return Err(invalid());
+    }
+    if !fields
+        .get("epochNumber")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|number| number <= MAX_EPOCH_NUMBER)
+    {
+        return Err(invalid());
+    }
+    if !fields
+        .get("attestationKeyId")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|key_id| key_id.len() <= MAX_ATTESTATION_KEY_ID_LEN)
+    {
+        return Err(invalid());
+    }
+    let epoch_head = match fields.get("epochHead") {
+        Some(serde_json::Value::Object(bytes)) if bytes.len() == 1 => bytes
+            .get("$bytes")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid)?,
+        _ => return Err(invalid()),
+    };
+    let decoded = STANDARD
+        .decode(epoch_head)
+        .or_else(|_| STANDARD_NO_PAD.decode(epoch_head))
+        .map_err(|_| invalid())?;
+    if decoded.len() != 32 {
+        return Err(invalid());
+    }
     Ok(())
 }
 
@@ -2477,7 +2706,7 @@ pub fn decode_conversation_state(
     Ok(state)
 }
 
-pub(crate) fn decode_conversation_coordinates(
+pub fn decode_conversation_coordinates(
     raw: &[u8],
 ) -> Result<catbird_atproto::blue_catbird::chat::ConversationCoordinates, TransportError> {
     let mut input = parse_strict_signed_json(raw)?;
@@ -2585,6 +2814,18 @@ pub fn decode_conversations_inventory(
     };
     let mut output: serde_json::Value = serde_json::from_slice(raw)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
+    if let Some(scope) = fields.get("inventoryScope") {
+        let mut scope = scope.clone();
+        normalize_read_type_tags(
+            chat_definition("directRequestInventoryScope")?,
+            &mut scope,
+            Some("directRequestInventoryScope"),
+            false,
+        )?;
+        let projected = project_schema_ref("directRequestInventoryScope", &scope, false)?;
+        output["inventoryScope"] =
+            generated_json_ref("directRequestInventoryScope", &projected, false)?;
+    }
     output["items"] = serde_json::Value::Array(
         items
             .iter()
@@ -2613,6 +2854,84 @@ pub fn decode_conversations_inventory(
     Ok(output)
 }
 
+/// Strict schema-aware inventory decoder, including byte aliases in scoped
+/// reader fences and Welcome/recovery variants. Raw bytes remain host custody.
+pub fn validate_authenticated_inventory_page(
+    operation: CanonicalOperation,
+    raw: &[u8],
+) -> Result<(), TransportError> {
+    if operation == CanonicalOperation::GetConversations {
+        decode_conversations_inventory(raw)?;
+        return Ok(());
+    }
+    if !matches!(
+        operation,
+        CanonicalOperation::GetPendingWelcomes | CanonicalOperation::GetLeafRecoveryInbox
+    ) {
+        return Err(TransportError::Serialization(
+            "not an inventory endpoint".into(),
+        ));
+    }
+    let input = parse_strict_signed_json(raw)?;
+    let StrictSignedJson::Object(fields) = input else {
+        return Err(TransportError::Serialization(
+            "inventory must be an object".into(),
+        ));
+    };
+    let Some(StrictSignedJson::Array(items)) = fields.get("items") else {
+        return Err(TransportError::Serialization(
+            "inventory items must be an array".into(),
+        ));
+    };
+    let mut output: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    if let Some(scope) = fields.get("inventoryScope") {
+        let mut scope = scope.clone();
+        normalize_read_type_tags(
+            chat_definition("directRequestInventoryScope")?,
+            &mut scope,
+            Some("directRequestInventoryScope"),
+            false,
+        )?;
+        output["inventoryScope"] = generated_json_ref(
+            "directRequestInventoryScope",
+            &project_schema_ref("directRequestInventoryScope", &scope, false)?,
+            false,
+        )?;
+    }
+    output["items"] = serde_json::Value::Array(
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let name = if operation == CanonicalOperation::GetLeafRecoveryInbox {
+                    "leafRecoveryInboxItem"
+                } else {
+                    match output["items"][index]["$type"].as_str() {
+                        Some("blue.catbird.chat.defs#welcomeView") => "welcomeView",
+                        Some("blue.catbird.chat.defs#directRequestWelcomeView") => {
+                            "directRequestWelcomeView"
+                        }
+                        _ => {
+                            return Err(TransportError::Serialization(
+                                "unknown Welcome inventory item".into(),
+                            ))
+                        }
+                    }
+                };
+                let mut item = item.clone();
+                normalize_read_type_tags(chat_definition(name)?, &mut item, Some(name), true)?;
+                generated_json_ref(name, &project_schema_ref(name, &item, true)?, true)
+            })
+            .collect::<Result<Vec<_>, TransportError>>()?,
+    );
+    CleanChatResponse::decode(
+        operation,
+        &serde_json::to_vec(&output).map_err(|e| TransportError::Serialization(e.to_string()))?,
+    )?;
+    Ok(())
+}
+
 fn generated_json_ref(
     name: &str,
     value: &CanonicalValue,
@@ -2631,14 +2950,6 @@ fn generated_json_ref(
             )),
         },
         "bareDid" | "keyId" | "canonicalDatetime" => Ok(canonical_json_value(value)),
-        "artifactHash" | "identifierBytes" => match value {
-            CanonicalValue::Bytes(value) => Ok(serde_json::Value::Array(
-                value.iter().map(|byte| serde_json::json!(*byte)).collect(),
-            )),
-            _ => Err(TransportError::Serialization(
-                "invalid generated byte alias".into(),
-            )),
-        },
         _ => generated_json_schema(chat_definition(name)?, value, tagged),
     }
 }
@@ -2846,7 +3157,6 @@ pub fn canonical_commit_aad_bytes(aad_json: &serde_json::Value) -> Result<Vec<u8
     canonical_aad_with_domain(b"CATBIRD-CHAT-MLS-AAD-COMMIT\0", "commitAad", aad_json)
 }
 
-#[cfg(any(test, feature = "test-utils", feature = "e2e-aad"))]
 pub fn canonical_application_aad_bytes(
     aad_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
@@ -3518,7 +3828,29 @@ pub(crate) fn validate_signed_request_context(
     Ok(())
 }
 
-fn encode_query(value: &str) -> String {
+/// Scope every raw inventory domain/page consistently with provider capability.
+/// Session capabilities do not replace the explicit supported-version query.
+/// Other reads retain their exact query bytes.
+pub(crate) fn scope_inventory_read_path(
+    operation: CanonicalOperation,
+    mut path: String,
+    requests_supported: bool,
+) -> String {
+    if matches!(
+        operation,
+        CanonicalOperation::GetConversations
+            | CanonicalOperation::GetPendingWelcomes
+            | CanonicalOperation::GetLeafRecoveryInbox
+    ) {
+        path.push_str("&supportedProtocolVersions=1");
+        if requests_supported {
+            path.push_str("&supportedProtocolVersions=2");
+        }
+    }
+    path
+}
+
+pub(crate) fn encode_query(value: &str) -> String {
     value
         .bytes()
         .flat_map(|byte| match byte {
@@ -3613,6 +3945,7 @@ pub(crate) fn get_conversations(
         actor_device_id: auth.device_id.clone(),
         limit,
         page_cursor: page_cursor.map(ToOwned::to_owned),
+        supported_protocol_versions: Some(vec![crate::atproto::blue_catbird::chat::get_conversations::GetConversationsSupportedProtocolVersions::_1, crate::atproto::blue_catbird::chat::get_conversations::GetConversationsSupportedProtocolVersions::_2]),
     };
     let value = serde_json::to_value(request)
         .map_err(|error| TransportError::Serialization(error.to_string()))?;
@@ -3624,6 +3957,14 @@ pub(crate) fn get_conversations(
     if let Some(cursor) = value["pageCursor"].as_str() {
         query.push_str("&pageCursor=");
         query.push_str(&encode_query(cursor));
+    }
+    for version in value["supportedProtocolVersions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        query.push_str("&supportedProtocolVersions=");
+        query.push_str(&encode_query(version.as_str().unwrap_or_default()));
     }
     read_request(auth, CanonicalOperation::GetConversations, query)
 }
@@ -3684,6 +4025,11 @@ pub fn prepare_get_entries(
 /// adapters must execute those two media-specific transports themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CanonicalOperation {
+    PrepareDirectRequest,
+    PublishDirectRequest,
+    CancelDirectRequestPreparation,
+    GetDirectRequestOutcome,
+    PublishDirectRequestKeys,
     AcceptConversation,
     AcknowledgeWelcome,
     ActivateReset,
@@ -3698,6 +4044,7 @@ pub enum CanonicalOperation {
     GetBlobUsage,
     GetConversationState,
     GetDevices,
+    GetDeviceKey,
     GetEntries,
     GetLeafRecoveryInbox,
     GetOwnDevices,
@@ -3720,6 +4067,11 @@ pub enum CanonicalOperation {
 impl CanonicalOperation {
     /// Every operation in the route inventory.
     pub const ALL: &'static [Self] = &[
+        Self::PrepareDirectRequest,
+        Self::PublishDirectRequest,
+        Self::CancelDirectRequestPreparation,
+        Self::GetDirectRequestOutcome,
+        Self::PublishDirectRequestKeys,
         Self::AcceptConversation,
         Self::AcknowledgeWelcome,
         Self::ActivateReset,
@@ -3734,6 +4086,7 @@ impl CanonicalOperation {
         Self::GetBlobUsage,
         Self::GetConversationState,
         Self::GetDevices,
+        Self::GetDeviceKey,
         Self::GetEntries,
         Self::GetLeafRecoveryInbox,
         Self::GetOwnDevices,
@@ -3783,6 +4136,11 @@ fn route(path: &'static str) -> CanonicalRoute {
 /// Resolve an operation through the generated canonical endpoint marker.
 pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
     match operation {
+        CanonicalOperation::PrepareDirectRequest => route(crate::atproto::blue_catbird::chat::prepare_direct_request::PrepareDirectRequestRequest::PATH),
+        CanonicalOperation::PublishDirectRequest => route(crate::atproto::blue_catbird::chat::publish_direct_request::PublishDirectRequestRequest::PATH),
+        CanonicalOperation::CancelDirectRequestPreparation => route(crate::atproto::blue_catbird::chat::cancel_direct_request_preparation::CancelDirectRequestPreparationRequest::PATH),
+        CanonicalOperation::GetDirectRequestOutcome => route(crate::atproto::blue_catbird::chat::get_direct_request_outcome::GetDirectRequestOutcomeRequest::PATH),
+        CanonicalOperation::PublishDirectRequestKeys => route(crate::atproto::blue_catbird::chat::publish_direct_request_keys::PublishDirectRequestKeysRequest::PATH),
         CanonicalOperation::AcceptConversation => route(AcceptConversationRequest::PATH),
         CanonicalOperation::AcknowledgeWelcome => route(AcknowledgeWelcomeRequest::PATH),
         CanonicalOperation::ActivateReset => route(ActivateResetRequest::PATH),
@@ -3797,6 +4155,7 @@ pub fn canonical_route(operation: CanonicalOperation) -> CanonicalRoute {
         CanonicalOperation::GetBlobUsage => route(GetBlobUsageRequest::PATH),
         CanonicalOperation::GetConversationState => route(GetConversationStateRequest::PATH),
         CanonicalOperation::GetDevices => route(GetDevicesRequest::PATH),
+        CanonicalOperation::GetDeviceKey => route(GetDeviceKeyRequest::PATH),
         CanonicalOperation::GetEntries => route(GetEntriesRequest::PATH),
         CanonicalOperation::GetLeafRecoveryInbox => route(GetLeafRecoveryInboxRequest::PATH),
         CanonicalOperation::GetOwnDevices => route(GetOwnDevicesRequest::PATH),
@@ -3849,6 +4208,38 @@ pub fn canonical_cbor_for_schema(
 }
 
 #[cfg(test)]
+mod variable_request_authority_tests {
+    use super::*;
+    use base64::Engine;
+
+    #[test]
+    fn acceptance_receipt_canonicalizes_both_valid_home_authorities() {
+        let hash = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let coordinates = serde_json::json!({
+            "conversationId": id, "generation": 1, "stateVersion": 1,
+            "groupId": hash, "epoch": 0, "groupContextHash": hash,
+            "confirmationTag": hash, "lifecycle": "active"
+        });
+        let mut receipt = serde_json::json!({
+            "signatureDomain": "CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\u{0}",
+            "protocolVersion": "2",
+            "authorityDid": "did:web:ds1.fixture.catbird.blue",
+            "keyId": format!("did:web:ds1.fixture.catbird.blue#chat-request-receipt-{}", "0".repeat(64)),
+            "requestId": id, "acceptanceDigest": hash, "entryHash": hash,
+            "prior": coordinates, "next": coordinates,
+            "recordedAt": "2026-09-28T08:15:52.893Z"
+        });
+        let first = canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).unwrap();
+        receipt["authorityDid"] = serde_json::json!("did:web:ds2.fixture.catbird.blue");
+        let second = canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).unwrap();
+        assert_ne!(first, second);
+        receipt["authorityDid"] = serde_json::json!("not-a-did");
+        assert!(canonical_cbor_for_schema("directRequestAcceptanceCommitReceiptBody", &receipt, false).is_err());
+    }
+}
+
+#[cfg(test)]
 mod read_routing_extension_tests {
     use super::*;
 
@@ -3897,14 +4288,21 @@ mod read_routing_extension_tests {
             );
             assert!(canonical_cbor_for_schema_impl("conversationState", wire, false).is_err());
 
-            // A generated DTO preserves unknown wire fields as extra_data.
+            // A generated DTO accepts live routing extensions in its typed fields.
             // Its FFI encoding must use the same routing-only normalization.
             let mut generated = serde_json::to_value(&expected).unwrap();
             generated["sequencerDid"] = wire["sequencerDid"].clone();
             generated["sequencerTerm"] = wire["sequencerTerm"].clone();
             let generated: catbird_atproto::blue_catbird::chat::ConversationState =
                 serde_json::from_value(generated).unwrap();
-            assert!(generated.extra_data.is_some());
+            assert_eq!(
+                generated.sequencer_did.as_ref().map(|d| d.as_ref()),
+                wire["sequencerDid"].as_str()
+            );
+            assert_eq!(
+                generated.sequencer_term,
+                wire["sequencerTerm"].as_i64()
+            );
             assert_eq!(
                 decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(),
                 expected
@@ -4010,6 +4408,90 @@ mod read_routing_extension_tests {
         wrong_tag["sequencerDid"] = serde_json::Value::Null;
         assert!(decode_conversation_state(&serde_json::to_vec(&wrong_tag).unwrap()).is_err());
     }
+
+    fn labyrinth_head() -> serde_json::Value {
+        // Shape of blue.catbird.chat.defs#labyrinthHead (PetrelCatbird 55e4eff4).
+        serde_json::json!({
+            "epochNumber": 7,
+            "epochHead": {"$bytes": "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA"},
+            "attestationKeyId": "device-key-1"
+        })
+    }
+
+    #[test]
+    fn participant_labyrinth_head_is_accepted_and_excluded_from_signed_state() {
+        let state = policy_only(live_items().remove(0)["state"].clone());
+        let expected = decode_conversation_state(&serde_json::to_vec(&state).unwrap()).unwrap();
+        for head in [labyrinth_head(), serde_json::Value::Null] {
+            let mut wire = state.clone();
+            for participant in wire["participants"].as_array_mut().unwrap() {
+                participant["labyrinthHead"] = head.clone();
+            }
+            assert_eq!(
+                decode_conversation_state(&serde_json::to_vec(&wire).unwrap()).unwrap(),
+                expected
+            );
+            // The directory head is never part of the canonical signed state.
+            assert!(canonical_cbor_for_schema_impl("conversationState", &wire, false).is_err());
+            let items = vec![serde_json::json!({
+                "$type": "blue.catbird.chat.defs#conversationInventoryState",
+                "state": wire,
+            })];
+            let output =
+                decode_conversations_inventory(&serde_json::to_vec(&inventory(items)).unwrap())
+                    .unwrap();
+            assert_eq!(output.items.len(), 1);
+        }
+
+        // A generated DTO carrying the head must re-encode through the same path.
+        let mut generated = serde_json::to_value(&expected).unwrap();
+        for participant in generated["participants"].as_array_mut().unwrap() {
+            participant["labyrinthHead"] = labyrinth_head();
+        }
+        let generated: catbird_atproto::blue_catbird::chat::ConversationState =
+            serde_json::from_value(generated).unwrap();
+        assert!(generated
+            .participants
+            .iter()
+            .all(|participant| participant.labyrinth_head.is_some()));
+        assert_eq!(
+            decode_conversation_state(&encode_conversation_state(&generated).unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn participant_labyrinth_head_rejects_malformed_values() {
+        let state = policy_only(live_items().remove(0)["state"].clone());
+        let mut missing = labyrinth_head();
+        missing.as_object_mut().unwrap().remove("attestationKeyId");
+        let mut short = labyrinth_head();
+        short["epochHead"] = serde_json::json!({"$bytes": "AQID"});
+        let mut extra = labyrinth_head();
+        extra["unknown"] = serde_json::json!(1);
+        // maxLength counts UTF-8 bytes: 128 CJK chars are 384 bytes.
+        let mut wide_key_id = labyrinth_head();
+        wide_key_id["attestationKeyId"] = serde_json::json!("鍵".repeat(128));
+        for head in [
+            serde_json::json!(17),
+            serde_json::json!("head"),
+            missing,
+            short,
+            extra,
+            wide_key_id,
+        ] {
+            let mut wire = state.clone();
+            wire["participants"][0]["labyrinthHead"] = head.clone();
+            assert!(
+                decode_conversation_state(&serde_json::to_vec(&wire).unwrap()).is_err(),
+                "accepted labyrinthHead {head}"
+            );
+        }
+        // Only participants carry the extension.
+        let mut misplaced = state;
+        misplaced["labyrinthHead"] = labyrinth_head();
+        assert!(decode_conversation_state(&serde_json::to_vec(&misplaced).unwrap()).is_err());
+    }
 }
 
 #[test]
@@ -4064,4 +4546,145 @@ fn participant_acceptance_transcript_matches_server_exactly() {
     .expect("must prepare signed body");
     let server_hex = "434154424952442d434841542d41434345505400ad646e657874a86565706f6368006767726f757049645820193bb735bc1e20805edec26fef6d0164403a633c0fc584d78d805507eec40763696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e016e636f6e766572736174696f6e496450009ffa924bf94307bf26e7428d53d8006f636f6e6669726d6174696f6e54616758208b1b706fbf188e358427f63df3eff6a4228d8b8aa95f2a3a1551312abb830d1a7067726f7570436f6e7465787448617368582074d6703e5aa2cc90030b597d376555d589daeac4b33675ddbe40a282e2fa07a96524747970657830626c75652e636174626972642e636861742e64656673237061727469636970616e74416363657074616e6365426f6479656b65794964782b4b514c5a6867455232714f5f494f4e6d6746547a6564395542565a41656c6d43685a444b512d5f67616751657072696f72a86565706f6368006767726f757049645820193bb735bc1e20805edec26fef6d0164403a633c0fc584d78d805507eec40763696c6966656379636c65666163746976656a67656e65726174696f6e006c737461746556657273696f6e006e636f6e766572736174696f6e496450009ffa924bf94307bf26e7428d53d8006f636f6e6669726d6174696f6e54616758208b1b706fbf188e358427f63df3eff6a4228d8b8aa95f2a3a1551312abb830d1a7067726f7570436f6e7465787448617368582074d6703e5aa2cc90030b597d376555d589daeac4b33675ddbe40a282e2fa07a9686163746f7244696478206469643a706c633a7a3372776c6471776f7375656b6477706e34356436756c79687369676e656441747818323032362d30382d32315430383a32313a32332e3534335a6c7472616e736974696f6e49645052f04e1a015f40f9a199302a69150a936d6163746f724465766963654964501ad34b5a3c934201a5c9b0951b7bc92a6e6175746847656e65726174696f6e016e6964656d706f74656e63794b65795052f04e1a015f40f9a199302a69150a936f7369676e6174757265446f6d61696e74434154424952442d434841542d41434345505400717265636f766572795265717565737449645052f04e1a015f40f9a199302a69150a9374696e7669746174696f6e50726f76656e616e6365a36c696e7669746564427944696478206469643a706c633a77366133646e636c637473336d6f78757477626f3368663671696e76697465644279446576696365496450f67f7cf1564b4072a6f995120eb43d6976696e7669746174696f6e5472616e736974696f6e4964506bd96af372b24e5abe1d2109ab171196";
     assert_eq!(hex::encode(prepared.transcript), server_hex);
+}
+
+/// Request v2 uses its own strict signing domains while retaining generated DTOs.
+fn prepare_direct_request_json<T: Serialize>(
+    auth: &TransportAuth,
+    generation: Option<i64>,
+    operation: CanonicalOperation,
+    request: &T,
+) -> Result<PreparedRequest, TransportError> {
+    auth.validate()?;
+    let body = serialize_json(request)?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    validate_direct_endpoint_raw(operation, &body)?;
+    let field = if operation == CanonicalOperation::AcceptConversation {
+        "directRequest"
+    } else {
+        "signedRequest"
+    };
+    let signed = &value[field]["body"];
+    let kind = match operation {
+        CanonicalOperation::AcceptConversation => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Accept
+        }
+        CanonicalOperation::PrepareDirectRequest => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Prepare
+        }
+        CanonicalOperation::PublishDirectRequest => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Publish
+        }
+        CanonicalOperation::CancelDirectRequestPreparation => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Cancel
+        }
+        CanonicalOperation::PublishDirectRequestKeys => {
+            crate::chat_v2::transcript::direct_request::DirectRequestKind::Keys
+        }
+        _ => {
+            return Err(TransportError::UnsupportedOperation {
+                operation,
+                reason: "not a signed direct request mutation",
+            })
+        }
+    };
+    crate::chat_v2::transcript::direct_request::direct_request_signing_bytes(
+        kind,
+        &serde_json::to_vec(signed).map_err(|e| TransportError::Serialization(e.to_string()))?,
+    )
+    .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    if signed["actorDeviceId"].as_str() != Some(auth.device_id.as_str()) {
+        return Err(TransportError::DeviceBindingMismatch {
+            body: signed["actorDeviceId"].as_str().unwrap_or_default().into(),
+            authenticated: auth.device_id.clone(),
+        });
+    }
+    let expected = generation.ok_or(TransportError::MissingAuthGeneration)?;
+    let actual = signed["authGeneration"]
+        .as_i64()
+        .ok_or(TransportError::MissingAuthGeneration)?;
+    if actual != expected {
+        return Err(TransportError::AuthGenerationMismatch { expected, actual });
+    }
+    Ok(PreparedRequest {
+        operation,
+        method: "POST".into(),
+        path: operation.path().into(),
+        body: Some(body),
+    })
+}
+
+fn validate_direct_endpoint_raw(
+    operation: CanonicalOperation,
+    raw: &[u8],
+) -> Result<(), TransportError> {
+    use crate::chat_v2::transcript::{decode_strict_json, direct_request, project_ref};
+    let schema = match operation {
+        CanonicalOperation::PrepareDirectRequest => "signedDirectRequestPreparation",
+        CanonicalOperation::PublishDirectRequest => "signedDirectRequestPublication",
+        CanonicalOperation::CancelDirectRequestPreparation => "signedDirectRequestCancellation",
+        CanonicalOperation::PublishDirectRequestKeys => "signedDirectRequestKeysPublication",
+        CanonicalOperation::AcceptConversation => {
+            direct_request::direct_request_acceptance_endpoint_is_v2(raw)
+                .map_err(|e| TransportError::Serialization(e.to_string()))?;
+            return Ok(());
+        }
+        _ => return Ok(()),
+    };
+    if raw.len() > direct_request::MAX_PUBLISH_HTTP_BODY_BYTES {
+        return Err(TransportError::Serialization(
+            "direct request HTTP byte cap".into(),
+        ));
+    }
+    decode_strict_json(raw).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| TransportError::Serialization(e.to_string()))?;
+    if value
+        .as_object()
+        .is_none_or(|o| o.len() != 1 || !o.contains_key("signedRequest"))
+    {
+        return Err(TransportError::Serialization(
+            "direct request requires exactly signedRequest".into(),
+        ));
+    }
+    let strict = decode_strict_json(
+        &serde_json::to_vec(&value["signedRequest"])
+            .map_err(|e| TransportError::Serialization(e.to_string()))?,
+    )
+    .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    project_ref(schema, &strict, false)
+        .map_err(|e| TransportError::Serialization(e.to_string()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod raw_inventory_scope_tests {
+    use super::*;
+    #[test]
+    fn raw_inventory_scope_preserves_domains_sessions_and_continuations() {
+        for operation in [
+            CanonicalOperation::GetConversations,
+            CanonicalOperation::GetPendingWelcomes,
+            CanonicalOperation::GetLeafRecoveryInbox,
+        ] {
+            for supported in [false, true] {
+                for continuation in ["", "&pageCursor=opaque%2Bcursor%2F%3D"] {
+                    let path=format!("{}?actorDeviceId=device&inventorySessionId=exact%2Bsession&limit=100{continuation}",operation.path());
+                    let scoped = scope_inventory_read_path(operation, path.clone(), supported);
+                    assert!(scoped.starts_with(&path));
+                    assert_eq!(scoped.matches("supportedProtocolVersions=1").count(), 1);
+                    assert_eq!(
+                        scoped.matches("supportedProtocolVersions=2").count(),
+                        usize::from(supported)
+                    );
+                }
+            }
+        }
+        let raw = "/xrpc/blue.catbird.chat.getEntries?exact=bytes".to_owned();
+        assert_eq!(
+            scope_inventory_read_path(CanonicalOperation::GetEntries, raw.clone(), true),
+            raw
+        );
+    }
 }

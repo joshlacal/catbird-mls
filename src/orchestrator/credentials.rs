@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use super::credential_binding::{check_identity_claim, CredentialVerification};
-use super::error::Result;
+use super::error::{OrchestratorError, Result};
 
 /// Public signing result returned by a credential authority.
 ///
@@ -35,6 +35,30 @@ impl<T: ?Sized> CredentialStoreBounds for T {}
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait CredentialStore: CredentialStoreBounds {
+    /// Resolve the configured direct-request authority DID document through the
+    /// platform's authenticated DID resolver. Rust validates method uniqueness,
+    /// controller, P256 Multikey encoding, and immutable fingerprint itself.
+    /// Never resolve a receipt-supplied URL. None is unsupported and prohibits
+    /// new request reservation; retained trusted methods can verify exact replay.
+    async fn direct_request_receipt_authority_document(
+        &self,
+        _expected_authority_did: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    /// Resolve verified account-home chat declaration for an actor DID from authenticated PDS.
+    /// Returns:
+    /// - Ok(Some(did)) if verified blue.catbird.chat.declaration/self declares deliveryService: did
+    /// - Ok(None) ONLY when verified getRecord returns 404 RecordNotFound
+    /// - Err(OperationNotSupported) if declaration reader is unavailable / unimplemented (FAIL-CLOSED)
+    async fn get_chat_declaration_authority(&self, _user_did: &str) -> Result<Option<String>> {
+        Err(OrchestratorError::Mls(
+            crate::MLSError::OperationNotSupported {
+                reason: "Chat declaration resolution unavailable".into(),
+            },
+        ))
+    }
+
     /// Store a signing key for a user DID.
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()>;
 

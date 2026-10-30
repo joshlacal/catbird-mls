@@ -230,6 +230,68 @@ where
         })
     }
 
+    pub fn get_group_invitation_reference(
+        &self,
+        conversation_id: &str,
+        recipient_did: &str,
+    ) -> Result<Option<crate::GroupInvitationReference>> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(
+            self.orchestrator
+                .get_group_invitation_reference(conversation_id, recipient_did),
+        )
+    }
+    pub fn get_direct_request_delivery_enabled(&self) -> Result<Option<bool>> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.get_direct_request_delivery_enabled())
+    }
+    pub fn close_direct_request(&self, conversation_id: &str) -> Result<crate::DirectRequestView> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.close_direct_request(conversation_id))
+    }
+    pub fn set_direct_request_delivery_enabled(&self, enabled: bool) -> Result<()> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(
+            self.orchestrator
+                .set_direct_request_delivery_enabled(enabled),
+        )
+    }
+    pub fn list_direct_request_views(&self) -> Result<Vec<crate::DirectRequestView>> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.list_direct_request_views())
+    }
+    pub fn start_direct_request(
+        &self,
+        input: crate::DirectRequestInput,
+    ) -> Result<crate::DirectRequestOutcome> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.start_direct_request(input))
+    }
+    pub fn resume_direct_request(&self, draft_id: &str) -> Result<crate::DirectRequestOutcome> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.resume_direct_request(draft_id))
+    }
+    pub fn cancel_direct_request(&self, draft_id: &str) -> Result<crate::DirectRequestOutcome> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.cancel_direct_request(draft_id))
+    }
+    pub fn refresh_request_preview(
+        &self,
+        conversation_id: &str,
+    ) -> Result<crate::DirectRequestView> {
+        self.current_orchestrator_user_did()?
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        crate::async_runtime::block_on(self.orchestrator.refresh_request_preview(conversation_id))
+    }
+
     pub fn startup_reconcile(&self) -> Result<StartupReconcileReport> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
@@ -239,7 +301,7 @@ where
     pub fn run_deferred_recovery(&self, reason: &str) -> Result<DeferredRecoveryReport> {
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
-        crate::async_runtime::block_on(self.orchestrator.run_deferred_recovery(reason))
+        crate::async_runtime::block_on(Box::pin(self.orchestrator.run_deferred_recovery(reason)))
     }
 
     pub fn ensure_conversation_ready(&self, convo_id: &str) -> Result<ConversationReadyResult> {
@@ -342,14 +404,31 @@ where
     }
 
     pub fn process_server_event(&self, event_json: &str) -> Result<Vec<EngineEvent>> {
+        const MAX_EVENT_JSON_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+        if event_json.len() > MAX_EVENT_JSON_BYTES {
+            return Err(OrchestratorError::InvalidInput(
+                "server event JSON exceeds maximum allowed size of 16MiB".into(),
+            ));
+        }
         self.current_orchestrator_user_did()?
             .ok_or(OrchestratorError::NotAuthenticated)?;
         let value: serde_json::Value = serde_json::from_str(event_json).map_err(|err| {
             OrchestratorError::InvalidInput(format!("Failed to decode server event JSON: {err}"))
         })?;
+        if value.get("$type").and_then(|t| t.as_str())
+            == Some("blue.catbird.internal#inventoryHintBatch")
+        {
+            return crate::async_runtime::block_on(Box::pin(self.process_inventory_hint_batch(value)));
+        }
+        if let Some(events_arr) = value.as_array() {
+            let batch = serde_json::json!({
+                "events": events_arr,
+            });
+            return crate::async_runtime::block_on(Box::pin(self.process_inventory_hint_batch(batch)));
+        }
         if value.get("$type").is_some() || value.get("payload").is_some() {
             let hint = server_events::CanonicalHint::parse(value)?;
-            return crate::async_runtime::block_on(self.process_canonical_hint(hint));
+            return crate::async_runtime::block_on(Box::pin(self.process_canonical_hint(hint)));
         }
         let event: ServerEventEnvelope = serde_json::from_str(event_json).map_err(|err| {
             OrchestratorError::InvalidInput(format!("Failed to decode server event JSON: {err}"))
@@ -396,6 +475,51 @@ where
                 Ok(events_for_reset_outcome(&convo_id, outcome))
             }
         }
+    }
+
+    async fn process_inventory_hint_batch(
+        &self,
+        value: serde_json::Value,
+    ) -> Result<Vec<EngineEvent>> {
+        server_events::exact_fields(&value, &["events"])?;
+        let events_val = value
+            .get("events")
+            .ok_or_else(|| OrchestratorError::InvalidInput("batch missing events field".into()))?;
+        let events = events_val.as_array().ok_or_else(|| {
+            OrchestratorError::InvalidInput("batch events must be an array".into())
+        })?;
+        if events.len() > 10_000 {
+            return Err(OrchestratorError::InvalidInput(
+                "batch exceeds maximum limit of 10000 events".into(),
+            ));
+        }
+
+        // Validate all hints strictly before any inventory fetch or effect.
+        let hints: Vec<server_events::CanonicalHint> = events
+            .iter()
+            .cloned()
+            .map(server_events::CanonicalHint::parse)
+            .collect::<Result<Vec<_>>>()?;
+
+        if hints.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let snapshot = Arc::new(
+            self.orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await?,
+        );
+
+        crate::orchestrator::with_batch_inventory_scope(snapshot, Box::pin(async {
+            let mut all_events = Vec::new();
+            for hint in hints {
+                let events = self.process_canonical_hint(hint).await?;
+                all_events.extend(events);
+            }
+            Ok(all_events)
+        }))
+        .await
     }
 
     pub fn process_incoming_message(

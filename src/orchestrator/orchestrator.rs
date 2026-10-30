@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
@@ -107,6 +108,8 @@ where
     lifecycle_state: Mutex<OrchestratorLifecycleState>,
     /// Owns one complete initialize/resume/shutdown transition.
     lifecycle_operation: Mutex<()>,
+    /// Invalidates work across suspension, shutdown and same-account reinitialization.
+    lifecycle_generation: AtomicU64,
     /// In-memory conversation cache.
     conversations: Mutex<HashMap<ConversationId, ConversationView>>,
     /// In-memory group state cache.
@@ -136,12 +139,25 @@ where
     creation_generation: AtomicU64,
     /// Per-conversation join/rejoin locks to deduplicate concurrent attempts.
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
+    /// Labyrinth encrypted-history session for the current account
+    /// (feature `labyrinth`; see `crate::labyrinth`).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    labyrinth: crate::labyrinth::LabyrinthSlot,
+    /// The background Labyrinth archive worker (feature `labyrinth`).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    labyrinth_archive: std::sync::Arc<crate::labyrinth::ArchiveWorker>,
+    direct_request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) direct_request_reconcile_backoff: Mutex<HashMap<String, (u32, web_time::Instant)>>,
     /// Per-stable-conversation inbound locks. These serialize duplicate HTTP,
     /// push, and catch-up deliveries through their final crypto/application
     /// durability barrier without reusing the rejoin transition lock.
     inbound_processing_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
     /// Sync state lock.
     sync_in_progress: Mutex<bool>,
+    /// Fired whenever `sync_in_progress` clears (success, error, or cancel),
+    /// so a coalesced caller observes the in-flight pass's reconciled state.
+    sync_finished: tokio::sync::Notify,
     /// Consecutive sync failures (for circuit breaker).
     consecutive_sync_failures: Mutex<u32>,
     /// When the circuit breaker was last tripped (for cooldown recovery).
@@ -175,6 +191,8 @@ where
     /// Defaults off so existing clients keep dropping non-displayable control
     /// payloads. Catbird iOS enables this only in Rust-authoritative mode.
     store_control_messages: AtomicBool,
+    /// Unique instance identifier used to bind execution-local scopes.
+    pub(crate) instance_id: u64,
 }
 
 struct EpochCleanupTargets<'a> {
@@ -239,6 +257,46 @@ pub(crate) enum StagedCommitKindSummary {
     },
 }
 
+static NEXT_ORCHESTRATOR_INSTANCE_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+static NEXT_BATCH_EXECUTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn required_inventory_expiry(value: Option<&str>) -> Result<&str> {
+    let value = value.ok_or_else(|| {
+        OrchestratorError::InvalidInput("missing or non-string snapshotExpiresAt".into())
+    })?;
+    chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+        OrchestratorError::InvalidInput("invalid snapshotExpiresAt timestamp".into())
+    })?;
+    Ok(value)
+}
+
+tokio::task_local! {
+    pub(crate) static BATCH_INVENTORY_CONTEXT: Arc<AuthorizedInventorySnapshot>;
+}
+tokio::task_local! {
+    pub(crate) static BATCH_RECOVERY_INBOX_CONTEXT: Arc<AuthorizedRecoveryInboxSnapshot>;
+}
+
+pub(crate) async fn with_batch_inventory_scope<F, R>(
+    snapshot: Arc<AuthorizedInventorySnapshot>,
+    f: F,
+) -> R
+where
+    F: Future<Output = R>,
+{
+    BATCH_INVENTORY_CONTEXT.scope(snapshot, f).await
+}
+pub(crate) async fn with_batch_recovery_inbox_scope<F, R>(
+    snapshot: Arc<AuthorizedRecoveryInboxSnapshot>,
+    f: F,
+) -> R
+where
+    F: Future<Output = R>,
+{
+    BATCH_RECOVERY_INBOX_CONTEXT.scope(snapshot, f).await
+}
+
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -263,6 +321,7 @@ where
             config,
             lifecycle_state: Mutex::new(OrchestratorLifecycleState::Uninitialized),
             lifecycle_operation: Mutex::new(()),
+            lifecycle_generation: AtomicU64::new(0),
             conversations: Mutex::new(HashMap::new()),
             group_states: Mutex::new(HashMap::new()),
             conversation_states: Mutex::new(HashMap::new()),
@@ -273,8 +332,16 @@ where
             reissue_attempts_mem: Mutex::new(HashMap::new()),
             creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
+            #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+            labyrinth: Default::default(),
+            #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+            labyrinth_archive: Default::default(),
+            direct_request_locks: Mutex::new(HashMap::new()),
+            #[cfg(not(target_arch = "wasm32"))]
+            direct_request_reconcile_backoff: Mutex::new(HashMap::new()),
             inbound_processing_locks: Mutex::new(HashMap::new()),
             sync_in_progress: Mutex::new(false),
+            sync_finished: tokio::sync::Notify::new(),
             consecutive_sync_failures: Mutex::new(0),
             circuit_breaker_tripped_at: Mutex::new(None),
             circuit_breaker_cooldown_secs: Mutex::new(constants::SYNC_CIRCUIT_BREAKER_BASE_SECS),
@@ -288,6 +355,7 @@ where
             event_observer: Mutex::new(None),
             device_key_cache: Mutex::new(HashMap::new()),
             store_control_messages: AtomicBool::new(false),
+            instance_id: NEXT_ORCHESTRATOR_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -306,9 +374,313 @@ where
         self.event_observer.lock().await.clone()
     }
 
+    /// Return the currently scoped batch inventory snapshot, if any.
+    /// Fails closed if the snapshot belongs to a different orchestrator instance,
+    /// or if lifecycle state indicates user_did mismatch.
+    pub(crate) fn batch_inventory_snapshot(&self) -> Option<Arc<AuthorizedInventorySnapshot>> {
+        BATCH_INVENTORY_CONTEXT
+            .try_with(|snapshot| {
+                if snapshot.owner_instance_id != self.instance_id {
+                    return None;
+                }
+                let Ok(state) = self.lifecycle_state.try_lock() else {
+                    return None;
+                };
+                match &*state {
+                    OrchestratorLifecycleState::Ready { user_did } => {
+                        if user_did != &snapshot.user_did {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                Some(snapshot.clone())
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Return the currently scoped batch recovery inbox snapshot, if any.
+    pub(crate) fn batch_recovery_inbox_snapshot(
+        &self,
+    ) -> Option<Arc<AuthorizedRecoveryInboxSnapshot>> {
+        BATCH_RECOVERY_INBOX_CONTEXT
+            .try_with(|snapshot| {
+                if snapshot.owner_instance_id != self.instance_id {
+                    return None;
+                }
+                let Ok(state) = self.lifecycle_state.try_lock() else {
+                    return None;
+                };
+                match &*state {
+                    OrchestratorLifecycleState::Ready { user_did } => {
+                        if user_did != &snapshot.user_did {
+                            return None;
+                        }
+                    }
+                    _ => return None,
+                }
+                Some(snapshot.clone())
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Fetch an authorized inventory snapshot across all pages for the current device.
+    pub(crate) async fn fetch_authorized_inventory_snapshot(
+        &self,
+    ) -> Result<AuthorizedInventorySnapshot> {
+        self.check_shutdown().await?;
+        let did = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let mut page_cursor: Option<String> = None;
+        let mut pagination =
+            super::pagination::PaginationGuard::for_conversations("authorized inventory batch");
+        let mut inventory_items = Vec::new();
+        let mut session_id = String::new();
+        let mut event_cursor = String::new();
+        let mut expires_at = None;
+        let mut is_first_page = true;
+
+        loop {
+            let path = authorized_inventory_query(
+                &device,
+                page_cursor.as_deref(),
+                self.mls_context().supports_direct_request_bootstrap(),
+            );
+            let response = self
+                .api_client()
+                .submit_prepared_request(super::canonical_transport::PreparedRequest {
+                    operation: super::canonical_transport::CanonicalOperation::GetConversations,
+                    path,
+                    method: "GET".into(),
+                    body: None,
+                })
+                .await?;
+            if response.status != 200 {
+                return Err(OrchestratorError::ServerError {
+                    status: response.status,
+                    body: String::from_utf8_lossy(&response.body).into_owned(),
+                });
+            }
+            let page: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+
+            let session = page
+                .get("inventorySessionId")
+                .and_then(|v| v.as_str())
+                .filter(|s| (1..=512).contains(&s.len()))
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("missing or invalid inventorySessionId".into())
+                })?;
+            let fence = page
+                .get("snapshotEventCursor")
+                .and_then(|v| v.as_str())
+                .filter(|s| (1..=512).contains(&s.len()))
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("missing or invalid snapshotEventCursor".into())
+                })?;
+
+            let expiry = required_inventory_expiry(page["snapshotExpiresAt"].as_str())?;
+            if is_first_page {
+                session_id = session.to_string();
+                event_cursor = fence.to_string();
+                expires_at = Some(expiry.to_string());
+                is_first_page = false;
+            } else if session != session_id
+                || fence != event_cursor
+                || Some(expiry) != expires_at.as_deref()
+            {
+                return Err(OrchestratorError::InvalidInput(
+                    "inventory session changed during pagination".into(),
+                ));
+            }
+
+            let items = page["items"].as_array().ok_or_else(|| {
+                OrchestratorError::InvalidInput("Conversation inventory is missing items.".into())
+            })?;
+
+            let has_more = page
+                .get("hasMore")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("missing or non-boolean hasMore".into())
+                })?;
+
+            let next = match page.get("nextPageCursor") {
+                Some(serde_json::Value::String(s)) => {
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s.clone())
+                    }
+                }
+                Some(serde_json::Value::Null) | None => None,
+                Some(_) => {
+                    return Err(OrchestratorError::InvalidInput(
+                        "non-string nextPageCursor".into(),
+                    ));
+                }
+            };
+
+            if has_more != next.is_some() {
+                return Err(OrchestratorError::InvalidInput(
+                    "hasMore boolean does not match next-cursor presence".into(),
+                ));
+            }
+
+            pagination.observe_page(items.len(), next.as_deref())?;
+            inventory_items.extend(items.iter().cloned());
+
+            page_cursor = next;
+            if page_cursor.is_none() {
+                break;
+            }
+        }
+
+        let mut conversations = std::collections::HashMap::new();
+        for item in &inventory_items {
+            let state = item.get("state").unwrap_or(item);
+            if let Some(view) = super::admission::conversation_view_from_state_json(state) {
+                conversations.insert(view.conversation_id.clone(), view);
+            }
+        }
+
+        let execution_id = NEXT_BATCH_EXECUTION_ID.fetch_add(1, Ordering::Relaxed);
+
+        Ok(AuthorizedInventorySnapshot {
+            owner_instance_id: self.instance_id,
+            execution_id,
+            session_id,
+            event_cursor,
+            expires_at,
+            items: inventory_items,
+            conversations,
+            user_did: did,
+            device_id: device,
+        })
+    }
+
+    /// Fetch an authorized recovery inbox snapshot across all pages for the current device.
+    pub(crate) async fn fetch_authorized_recovery_inbox_snapshot(
+        &self,
+    ) -> Result<AuthorizedRecoveryInboxSnapshot> {
+        let (session, fence, expires_at) = if let Some(inv) = self.batch_inventory_snapshot() {
+            (
+                inv.session_id.clone(),
+                inv.event_cursor.clone(),
+                inv.expires_at.clone(),
+            )
+        } else {
+            let inv = self.fetch_authorized_inventory_snapshot().await?;
+            (inv.session_id, inv.event_cursor, inv.expires_at)
+        };
+        self.fetch_authorized_recovery_inbox_snapshot_with_session(
+            &session,
+            &fence,
+            expires_at.as_deref(),
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_authorized_recovery_inbox_snapshot_with_session(
+        &self,
+        session_id: &str,
+        event_cursor: &str,
+        expires_at: Option<&str>,
+    ) -> Result<AuthorizedRecoveryInboxSnapshot> {
+        self.check_shutdown().await?;
+        let did = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let expires_at = required_inventory_expiry(expires_at)?;
+        let mut page_cursor: Option<String> = None;
+        let mut pagination = super::pagination::PaginationGuard::for_conversations(
+            "authorized recovery inbox batch",
+        );
+        let mut inbox_items = Vec::new();
+
+        loop {
+            let mut path = format!(
+                "/xrpc/blue.catbird.chat.getLeafRecoveryInbox?actorDeviceId={}&inventorySessionId={}&limit=100",
+                super::canonical_transport::encode_query(&device),
+                super::canonical_transport::encode_query(session_id)
+            );
+            if let Some(cursor) = &page_cursor {
+                path.push_str("&pageCursor=");
+                path.push_str(&super::canonical_transport::encode_query(cursor));
+            }
+            let response = self
+                .api_client()
+                .submit_prepared_request(super::canonical_transport::PreparedRequest {
+                    operation: super::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox,
+                    path: super::canonical_transport::scope_inventory_read_path(
+                        super::canonical_transport::CanonicalOperation::GetLeafRecoveryInbox,
+                        path,
+                        self.mls_context().supports_direct_request_bootstrap(),
+                    ),
+                    method: "GET".into(),
+                    body: None,
+                })
+                .await?;
+            if response.status != 200 {
+                return Err(OrchestratorError::ServerError {
+                    status: response.status,
+                    body: String::from_utf8_lossy(&response.body).into_owned(),
+                });
+            }
+            let page: serde_json::Value = serde_json::from_slice(&response.body)
+                .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+
+            let page_expiry = required_inventory_expiry(page["snapshotExpiresAt"].as_str())?;
+            if page["inventorySessionId"].as_str() != Some(session_id)
+                || page["snapshotEventCursor"].as_str() != Some(event_cursor)
+                || page_expiry != expires_at
+            {
+                return Err(OrchestratorError::InvalidInput(
+                    "recovery inbox session mismatch during pagination".into(),
+                ));
+            }
+
+            let items = page["items"].as_array().ok_or_else(|| {
+                OrchestratorError::InvalidInput("recovery inbox missing items".into())
+            })?;
+
+            let next = match page.get("nextPageCursor") {
+                Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            };
+            pagination.observe_page(items.len(), next.as_deref())?;
+            inbox_items.extend(items.iter().cloned());
+
+            if page.get("hasMore").and_then(|v| v.as_bool()) == Some(true) && next.is_none() {
+                return Err(OrchestratorError::InvalidInput(
+                    "recovery inbox missing continuation".into(),
+                ));
+            }
+
+            page_cursor = next;
+            if page_cursor.is_none() {
+                break;
+            }
+        }
+
+        let execution_id = NEXT_BATCH_EXECUTION_ID.fetch_add(1, Ordering::Relaxed);
+        Ok(AuthorizedRecoveryInboxSnapshot {
+            owner_instance_id: self.instance_id,
+            execution_id,
+            session_id: session_id.to_string(),
+            event_cursor: event_cursor.to_string(),
+            expires_at: Some(expires_at.to_string()),
+            items: inbox_items,
+            user_did: did,
+            device_id: device,
+        })
+    }
+
     /// Initialize the orchestrator for a user.
     pub async fn initialize(&self, user_did: &str) -> Result<()> {
         let _lifecycle_owner = self.lifecycle_operation.lock().await;
+        self.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
         tracing::info!(user_did, "Initializing MLS orchestrator");
 
         // Recovery backoff is a security boundary, not a best-effort cache.
@@ -466,6 +838,11 @@ where
             return Err(error);
         }
 
+        if let Err(error) = self.hydrate_direct_request_ownership(user_did).await {
+            *self.lifecycle_state.lock().await = OrchestratorLifecycleState::FailedInitialization;
+            return Err(error);
+        }
+
         *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Ready {
             user_did: user_did.to_string(),
         };
@@ -515,6 +892,7 @@ where
                 }
                 _ => return Err(OrchestratorError::NotAuthenticated),
             };
+            self.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
             *lifecycle = OrchestratorLifecycleState::Suspended {
                 user_did: user_did.clone(),
             };
@@ -549,6 +927,7 @@ where
     /// Shut down the orchestrator, releasing resources.
     pub async fn shutdown(&self) {
         let _lifecycle_owner = self.lifecycle_operation.lock().await;
+        self.lifecycle_generation.fetch_add(1, Ordering::SeqCst);
         tracing::info!("Shutting down MLS orchestrator");
         *self.lifecycle_state.lock().await = OrchestratorLifecycleState::Shutdown;
         self.clear_runtime_state().await;
@@ -563,6 +942,11 @@ where
         self.own_commit_expectations.lock().await.clear();
         self.rejoin_locks.lock().await.clear();
         self.inbound_processing_locks.lock().await.clear();
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        {
+            self.labyrinth_archive.stop();
+            *self.labyrinth.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         if let Ok(mut fds) = self.fork_detection_states.lock() {
             fds.clear();
         }
@@ -575,6 +959,10 @@ where
             OrchestratorLifecycleState::Ready { user_did } => Ok(user_did.clone()),
             _ => Err(OrchestratorError::NotAuthenticated),
         }
+    }
+
+    pub(crate) fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation.load(Ordering::SeqCst)
     }
 
     /// Resolve the durable client-generated device ID used to scope every
@@ -616,6 +1004,18 @@ where
             | OrchestratorLifecycleState::Shutdown => Err(OrchestratorError::ShuttingDown),
             _ => Ok(()),
         }
+    }
+
+    /// The Labyrinth session slot (feature `labyrinth`).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    pub(crate) fn labyrinth_slot(&self) -> &crate::labyrinth::LabyrinthSlot {
+        &self.labyrinth
+    }
+
+    /// The background archive worker (feature `labyrinth`).
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    pub(crate) fn labyrinth_archive(&self) -> &crate::labyrinth::ArchiveWorker {
+        &self.labyrinth_archive
     }
 
     /// Access the MLS crypto context.
@@ -967,6 +1367,15 @@ where
         &self.creation_generation
     }
 
+    pub(crate) async fn direct_request_operation_lock(&self, draft_id: &str) -> Arc<Mutex<()>> {
+        self.direct_request_locks
+            .lock()
+            .await
+            .entry(draft_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Acquire the per-conversation join/rejoin lock object.
     pub(crate) async fn rejoin_lock(&self, conversation_id: &str) -> Arc<Mutex<()>> {
         let mut locks = self.rejoin_locks.lock().await;
@@ -993,6 +1402,11 @@ where
     /// Access the sync-in-progress flag.
     pub fn sync_in_progress(&self) -> &Mutex<bool> {
         &self.sync_in_progress
+    }
+
+    /// Signal fired after `sync_in_progress` is cleared.
+    pub(crate) fn sync_finished(&self) -> &tokio::sync::Notify {
+        &self.sync_finished
     }
 
     /// Access the consecutive sync failures counter.
@@ -1122,6 +1536,41 @@ where
             cutoff_epoch,
             current_epoch,
         );
+    }
+}
+
+fn authorized_inventory_query(
+    device: &str,
+    cursor: Option<&str>,
+    requests_supported: bool,
+) -> String {
+    let mut path = format!(
+        "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100&supportedProtocolVersions=1",
+        super::canonical_transport::encode_query(device)
+    );
+    if requests_supported {
+        path.push_str("&supportedProtocolVersions=2");
+    }
+    if let Some(cursor) = cursor {
+        path.push_str("&pageCursor=");
+        path.push_str(&super::canonical_transport::encode_query(cursor));
+    }
+    path
+}
+
+#[cfg(test)]
+mod authorized_inventory_query_tests {
+    use super::authorized_inventory_query;
+
+    #[test]
+    fn request_capability_selects_inventory_scope_on_every_page() {
+        let legacy = authorized_inventory_query("device", None, false);
+        assert!(legacy.ends_with("&supportedProtocolVersions=1"));
+        assert!(!legacy.contains("supportedProtocolVersions=2"));
+        let first = authorized_inventory_query("device", None, true);
+        assert!(first.ends_with("&supportedProtocolVersions=1&supportedProtocolVersions=2"));
+        let next = authorized_inventory_query("device", Some("cursor+/="), true);
+        assert_eq!(next, format!("{first}&pageCursor=cursor%2B%2F%3D"));
     }
 }
 

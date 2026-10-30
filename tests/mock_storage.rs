@@ -853,6 +853,136 @@ pub struct StorageProjectionCounts {
 
 #[async_trait]
 impl MLSStorageBackend for MockStorage {
+    async fn commit_conversation_projection(
+        &self,
+        request: &catbird_mls::orchestrator::ConversationProjectionCommitRequest,
+    ) -> Result<catbird_mls::orchestrator::ConversationProjectionCommitOutcome> {
+        use catbird_mls::orchestrator::{
+            ConversationProjectionCommitMode, ConversationProjectionCommitOutcome as Outcome,
+        };
+        let mut inner = self.inner.lock().unwrap();
+        let view = request.canonical.as_ref().ok_or_else(|| {
+            OrchestratorError::Storage(
+                "Mock replay requires explicit retained proof support".into(),
+            )
+        })?;
+        if request.mode != ConversationProjectionCommitMode::Live
+            || request.owner_user_did.is_empty()
+        {
+            return Err(OrchestratorError::Storage("Invalid mock projection".into()));
+        }
+        if inner.fail_next_ensure_conversation_exists {
+            inner.fail_next_ensure_conversation_exists = false;
+            return Err(OrchestratorError::Storage(
+                "injected ensure_conversation_exists failure".into(),
+            ));
+        }
+        if let Some(old) = inner.conversations.get(&view.conversation_id) {
+            let reset_authorized = match &old.state {
+                ConversationState::ResetPending {
+                    new_group_id,
+                    reset_generation,
+                    ..
+                } => {
+                    request.canonical_lifecycle.reset_generation == Some(*reset_generation)
+                        && request.canonical_lifecycle.reset_pending_target_group_id.as_deref()
+                            == Some(new_group_id)
+                        && &view.group_id == new_group_id
+                }
+                _ => false,
+            };
+            if old.user_did != request.owner_user_did
+                || matches!(
+                    old.state,
+                    ConversationState::Closed | ConversationState::DeviceRemoved
+                )
+                || (matches!(old.state, ConversationState::ResetPending { .. }) && !reset_authorized)
+            {
+                return Ok(Outcome::FenceMismatch { affected_rows: 0 });
+            }
+            if let (Some(a), Some(b)) = (&old.view.canonical_state, &view.canonical_state) {
+                if (a.coordinates.generation, a.coordinates.state_version)
+                    > (b.coordinates.generation, b.coordinates.state_version)
+                {
+                    return Ok(Outcome::FenceMismatch { affected_rows: 0 });
+                }
+            }
+        }
+        for claim in &request.aliases {
+            let Some(alias) = inner.conversations.get(&claim.alias_conversation_id) else {
+                return Ok(Outcome::FenceMismatch { affected_rows: 0 });
+            };
+            if matches!(
+                alias.state,
+                ConversationState::Closed
+                    | ConversationState::DeviceRemoved
+                    | ConversationState::ResetPending { .. }
+            ) || claim.alias_incarnation > claim.canonical_incarnation
+                || alias.user_did != request.owner_user_did
+                || claim.owner_user_did != request.owner_user_did
+                || alias.group_id != view.group_id
+                || claim.alias_group_id != view.group_id
+                || claim.alias_conversation_id != view.group_id
+                || claim.canonical_conversation_id != view.conversation_id
+                || claim.canonical_incarnation != view.epoch
+                || claim.alias_incarnation != alias.view.epoch
+            {
+                return Ok(Outcome::FenceMismatch { affected_rows: 0 });
+            }
+        }
+        let ids = inner
+            .conversations
+            .values()
+            .filter(|r| {
+                r.is_active
+                    && r.user_did == request.owner_user_did
+                    && r.group_id == view.group_id
+                    && r.conversation_id != view.conversation_id
+                    && r.conversation_id != view.group_id
+            })
+            .map(|r| r.conversation_id.clone())
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            return Ok(Outcome::Ambiguous {
+                canonical_ids: ids,
+                affected_rows: 0,
+            });
+        }
+        if let Some(old) = inner.conversations.get_mut(&view.conversation_id) {
+            old.view = view.clone();
+            old.group_id = view.group_id.clone();
+        } else {
+            inner.conversations.insert(
+                view.conversation_id.clone(),
+                ConversationRecord {
+                    conversation_id: view.conversation_id.clone(),
+                    user_did: request.owner_user_did.clone(),
+                    group_id: view.group_id.clone(),
+                    state: ConversationState::Initializing,
+                    needs_rejoin: false,
+                    join_method: None,
+                    join_epoch: None,
+                    view: view.clone(),
+                    is_active: true,
+                },
+            );
+        }
+        for claim in &request.aliases {
+            inner
+                .conversations
+                .get_mut(&claim.alias_conversation_id)
+                .unwrap()
+                .is_active = false;
+        }
+        Ok(if request.aliases.is_empty() {
+            Outcome::AlreadyAbsent { affected_rows: 1 }
+        } else {
+            Outcome::Retired {
+                affected_rows: request.aliases.len() as u32 + 1,
+            }
+        })
+    }
+
     // ── Conversations ────────────────────────────────────────────────────
 
     async fn ensure_conversation_exists(

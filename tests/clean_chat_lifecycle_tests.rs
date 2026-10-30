@@ -45,7 +45,9 @@ fn count(world: &TestWorld, op: CanonicalOperation) -> usize {
 }
 
 async fn setup(world: &mut TestWorld) -> (String, String, String) {
-    world.add_client("Alice").await;
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
     world.register_device("Alice").await.unwrap();
     let alice = world.client("Alice");
     let created = alice
@@ -68,7 +70,7 @@ async fn direct_close_from_new_device_uses_server_coordinates_without_mls_group(
             "direct",
             json!([
                 {"userDid": did, "role":"admin", "status":"active", "leafCount":1},
-                {"userDid":"did:plc:bob", "role":"admin", "status":"pending", "leafCount":0}
+                {"userDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "role":"admin", "status":"pending", "leafCount":0}
             ]),
         ),
     );
@@ -110,7 +112,7 @@ async fn durable_group_leave_preserves_keys_and_reuses_pending_request() {
             "group",
             json!([
                 {"userDid": did, "role":"member", "status":"active", "leafCount":2},
-                {"userDid":"did:plc:bob", "role":"admin", "status":"active", "leafCount":1}
+                {"userDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "role":"admin", "status":"active", "leafCount":1}
             ]),
         ),
     );
@@ -163,7 +165,7 @@ async fn zero_leaf_group_leave_removes_immediately_at_current_state_version() {
             "group",
             json!([
                 {"userDid": did, "role":"member", "status":"pending", "leafCount":0},
-                {"userDid":"did:plc:bob", "role":"admin", "status":"active", "leafCount":1}
+                {"userDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "role":"admin", "status":"active", "leafCount":1}
             ]),
         ),
     );
@@ -191,7 +193,7 @@ async fn last_admin_with_other_participants_must_handoff_and_preserves_local_sta
             "group",
             json!([
                 {"userDid": did, "role":"admin", "status":"active", "leafCount":1},
-                {"userDid":"did:plc:bob", "role":"member", "status":"active", "leafCount":1}
+                {"userDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "role":"member", "status":"active", "leafCount":1}
             ]),
         ),
     );
@@ -438,7 +440,7 @@ async fn expired_accepted_leave_is_not_reported_as_live_pending() {
             "group",
             json!([
                 {"userDid": did, "role":"member", "status":"active", "leafCount":1},
-                {"userDid":"did:plc:bob", "role":"admin", "status":"active", "leafCount":1}
+                {"userDid":"did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", "role":"admin", "status":"active", "leafCount":1}
             ]),
         ),
     );

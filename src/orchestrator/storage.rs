@@ -23,6 +23,7 @@ impl<T: ?Sized> MLSStorageBackendBounds for T {}
 /// Security-authority defaults fail closed; legacy best-effort methods may
 /// still no-op.
 pub const OPTIONAL_STORAGE_METHODS: &[&str] = &[
+    "commit_conversation_projection",
     "get_conversation_state",
     "get_welcome_reissue_attempt_log",
     "record_welcome_reissue_attempt",
@@ -94,6 +95,19 @@ pub(crate) fn require_recovery_persistence_capabilities<S: MLSStorageBackend + ?
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait MLSStorageBackend: MLSStorageBackendBounds {
     // -- Conversations --
+
+    /// Atomically update a canonical projection and retire only exact matching
+    /// aliases after rechecking account, identity and lifecycle fences. This
+    /// must preserve message history and reject unsupported fence dimensions.
+    /// An adapter without that transaction cannot claim a successful no-op.
+    async fn commit_conversation_projection(
+        &self,
+        _request: &ConversationProjectionCommitRequest,
+    ) -> Result<ConversationProjectionCommitOutcome> {
+        Err(super::error::OrchestratorError::Storage(
+            "atomic conversation projection is unsupported by this storage adapter".into(),
+        ))
+    }
 
     /// Ensure a conversation record exists, creating it if needed.
     async fn ensure_conversation_exists(

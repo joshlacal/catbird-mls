@@ -3,9 +3,9 @@
     "generator": "scripts/generate_chat_schema.py",
     "generatorVersion": 9,
     "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "aa0d0d489443d8a5622a86732e771d3116748b0e",
-    "sourceSha256": "dea9b6e72128d71d70f8c05036bf90889c2f91987c7a11fb82904a3e63df6caf",
-    "sourceTree": "c2ac511de9bda609af5155615c51d536b35a6c30"
+    "sourceRevision": "3fe103463e09d4c47077e433883df982ff9e2beb",
+    "sourceSha256": "e7a23bc2b8e383729d8046a33cd24d86ef6cf8261989692f327e816e10343938",
+    "sourceTree": "9feac29cb51cdf46cc92155bb7b56ed4d74e3e08"
   },
   "defs": {
     "accessEndedEvent": {
@@ -1186,7 +1186,9 @@
         "#leaveRequestEntry",
         "#zeroLeafLeaveEntry",
         "#leaveCancellationEntry",
-        "#leaveCommitFulfillmentEntry"
+        "#leaveCommitFulfillmentEntry",
+        "#directRequestEntry",
+        "#directRequestAcceptanceEntry"
       ],
       "type": "union"
     },
@@ -1201,6 +1203,10 @@
     },
     "conversationInventoryState": {
       "properties": {
+        "directRequest": {
+          "ref": "#directRequestState",
+          "type": "ref"
+        },
         "state": {
           "ref": "#conversationState",
           "type": "ref"
@@ -1272,6 +1278,10 @@
           "ref": "#conversationCoordinates",
           "type": "ref"
         },
+        "directRequest": {
+          "ref": "#directRequestState",
+          "type": "ref"
+        },
         "leaves": {
           "items": {
             "ref": "#deviceLeafView",
@@ -1293,6 +1303,15 @@
           "maxLength": 100,
           "minLength": 1,
           "type": "array"
+        },
+        "sequencerDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "sequencerTerm": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "snapshotSeq": {
           "maximum": 9007199254740991,
@@ -1452,7 +1471,7 @@
       "type": "object"
     },
     "deviceCapability": {
-      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; OpenMLS 0.8.1 GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy.",
+      "description": "Protocol v1 exact capability profile: suite 0x004D, BasicCredential, by-value Add/Remove and ordinary sender Update path. KeyPackage, LeafNode, and GroupContext extensions are empty; GroupInfo has exactly [ratchet_tree, external_pub]. External commits remain forbidden by protocol policy. Version 2 with directRequestProfile advertises parser support only; admission additionally requires active revisioned exact-package DirectRequestGrant signatures.",
       "properties": {
         "addByValue": {
           "const": "supported",
@@ -1477,6 +1496,10 @@
         "credentialType": {
           "const": "basic",
           "type": "string"
+        },
+        "directRequestProfile": {
+          "ref": "#directRequestProfile",
+          "type": "ref"
         },
         "externalPubGroupInfo": {
           "const": "presentButExternalCommitsForbidden",
@@ -1786,6 +1809,1775 @@
         "updatedAt",
         "availablePackageCount",
         "reservedPackageCount"
+      ],
+      "type": "object"
+    },
+    "directRequestAcceptanceBody": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "idempotencyKey": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "invitationProvenance": {
+          "ref": "#invitationProvenance",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "next": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "prior": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-DIRECT-REQUEST-ACCEPT\u0000",
+          "type": "string"
+        },
+        "signedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "transitionId": {
+          "ref": "#operationId",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "protocolVersion",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "requestId",
+        "transitionId",
+        "prior",
+        "next",
+        "invitationProvenance",
+        "idempotencyKey",
+        "signedAt"
+      ],
+      "type": "object"
+    },
+    "directRequestAcceptanceCommitReceiptBody": {
+      "properties": {
+        "acceptanceDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "authorityDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "entryHash": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#directRequestReceiptKeyId",
+          "type": "ref"
+        },
+        "next": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "prior": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "recordedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-DIRECT-REQUEST-ACCEPTANCE-COMMIT\u0000",
+          "type": "string"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "protocolVersion",
+        "authorityDid",
+        "keyId",
+        "requestId",
+        "acceptanceDigest",
+        "entryHash",
+        "prior",
+        "next",
+        "recordedAt"
+      ],
+      "type": "object"
+    },
+    "directRequestAcceptanceEntry": {
+      "properties": {
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "entryId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "receivedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "seq": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "signedRequest": {
+          "ref": "#signedDirectRequestAcceptance",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "entryId",
+        "conversationId",
+        "seq",
+        "signedRequest",
+        "receivedAt"
+      ],
+      "type": "object"
+    },
+    "directRequestAcceptanceProof": {
+      "properties": {
+        "entry": {
+          "ref": "#directRequestAcceptanceEntry",
+          "type": "ref"
+        },
+        "receipt": {
+          "ref": "#signedDirectRequestAcceptanceCommitReceipt",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "entry",
+        "receipt"
+      ],
+      "type": "object"
+    },
+    "directRequestApplicationAad": {
+      "properties": {
+        "contextHash": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "coordinates": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "messageId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "contextHash",
+        "coordinates",
+        "messageId"
+      ],
+      "type": "object"
+    },
+    "directRequestBootstrapArtifacts": {
+      "description": "Sum of decoded artifact bytes <=8388608. Hash every exact artifact byte sequence. Initial ciphertext is a single message with no blob binding.",
+      "properties": {
+        "addCommit": {
+          "ref": "#publicCommit",
+          "type": "ref"
+        },
+        "finalGroupInfo": {
+          "ref": "#groupInfoArtifact",
+          "type": "ref"
+        },
+        "genesisGroupInfo": {
+          "ref": "#groupInfoArtifact",
+          "type": "ref"
+        },
+        "initialCiphertext": {
+          "maxLength": 98304,
+          "minLength": 8,
+          "type": "bytes"
+        },
+        "metadataSnapshot": {
+          "ref": "#metadataSnapshot",
+          "type": "ref"
+        },
+        "welcome": {
+          "ref": "#directRequestWelcomeBundle",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "genesisGroupInfo",
+        "addCommit",
+        "finalGroupInfo",
+        "welcome",
+        "metadataSnapshot",
+        "initialCiphertext"
+      ],
+      "type": "object"
+    },
+    "directRequestCancellationBody": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "idempotencyKey": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-DIRECT-REQUEST-CANCEL\u0000",
+          "type": "string"
+        },
+        "signedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "protocolVersion",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "requestId",
+        "idempotencyKey",
+        "signedAt",
+        "recipientDid",
+        "preparationRequestDigest"
+      ],
+      "type": "object"
+    },
+    "directRequestCancelledReceipt": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "actorKeyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "recordedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "requestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "requestKind": {
+          "const": "cancel",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "requestDigest",
+        "recordedAt",
+        "preparationRequestDigest",
+        "actorDid",
+        "actorDeviceId",
+        "actorKeyId",
+        "authGeneration",
+        "requestKind"
+      ],
+      "type": "object"
+    },
+    "directRequestCommitAad": {
+      "properties": {
+        "contextHash": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "contextHash"
+      ],
+      "type": "object"
+    },
+    "directRequestContext": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "actorKeyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "firstMessageId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "origin": {
+          "ref": "#directRequestOrigin",
+          "type": "ref"
+        },
+        "preparationDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "firstMessageId",
+        "conversationId",
+        "origin",
+        "actorDid",
+        "actorDeviceId",
+        "actorKeyId",
+        "recipientDid",
+        "preparationDigest"
+      ],
+      "type": "object"
+    },
+    "directRequestCoverage": {
+      "description": "Return only to accountDid. Never disclose recipient missing-device diagnostics to the sender.",
+      "properties": {
+        "accountDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "includedDeviceIds": {
+          "items": {
+            "ref": "#deviceId",
+            "type": "ref"
+          },
+          "maxLength": 40,
+          "minLength": 1,
+          "type": "array"
+        },
+        "unavailableDeviceIds": {
+          "items": {
+            "ref": "#deviceId",
+            "type": "ref"
+          },
+          "maxLength": 40,
+          "minLength": 0,
+          "type": "array"
+        }
+      },
+      "required": [
+        "accountDid",
+        "includedDeviceIds",
+        "unavailableDeviceIds"
+      ],
+      "type": "object"
+    },
+    "directRequestCreator": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration"
+      ],
+      "type": "object"
+    },
+    "directRequestEntry": {
+      "properties": {
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "entryId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "receivedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "seq": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "signedRequest": {
+          "ref": "#signedDirectRequestPublication",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "entryId",
+        "conversationId",
+        "seq",
+        "signedRequest",
+        "receivedAt"
+      ],
+      "type": "object"
+    },
+    "directRequestErrorCode": {
+      "enum": [
+        "RecipientKeysUnavailable",
+        "RequestPolicyDenied",
+        "PreparationExpired",
+        "PreparationCancelled",
+        "PreparationRevoked",
+        "PreparationConflict",
+        "ExistingDirect",
+        "ArtifactTooLarge",
+        "CapacityUnavailable",
+        "InvalidBootstrap",
+        "ImportHorizonTooShort",
+        "StaleLegacyPrior",
+        "InvalidSignature",
+        "IdempotencyConflict",
+        "ProtocolUpgradeRequired",
+        "RequestNotAccepted",
+        "UnavailableIntroduction",
+        "RateLimited",
+        "RecipientAuthorityUnsupported"
+      ],
+      "type": "string"
+    },
+    "directRequestExistingDirectReceipt": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "actorKeyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "recordedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "requestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "requestKind": {
+          "enum": [
+            "prepare",
+            "publish"
+          ],
+          "type": "string"
+        },
+        "requiresAcceptance": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "requestId",
+        "requestDigest",
+        "recordedAt",
+        "conversationId",
+        "requiresAcceptance",
+        "preparationRequestDigest",
+        "actorDid",
+        "actorDeviceId",
+        "actorKeyId",
+        "authGeneration",
+        "requestKind"
+      ],
+      "type": "object"
+    },
+    "directRequestExpiredReceipt": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "actorKeyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "recordedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "requestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "requestKind": {
+          "const": "expiry",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "requestDigest",
+        "recordedAt",
+        "preparationRequestDigest",
+        "actorDid",
+        "actorDeviceId",
+        "actorKeyId",
+        "authGeneration",
+        "requestKind"
+      ],
+      "type": "object"
+    },
+    "directRequestGrantBody": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "expiresAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "grantId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "grantRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "idempotencyKey": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "keyPackageRef": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "keyPackageSha256": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "profile": {
+          "ref": "#directRequestProfile",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "purpose": {
+          "const": "direct-request-bootstrap",
+          "type": "string"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-DIRECT-REQUEST-GRANT\u0000",
+          "type": "string"
+        },
+        "signedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "protocolVersion",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "grantId",
+        "grantRevision",
+        "purpose",
+        "profile",
+        "keyPackageRef",
+        "keyPackageSha256",
+        "expiresAt",
+        "idempotencyKey",
+        "signedAt"
+      ],
+      "type": "object"
+    },
+    "directRequestIntroduction": {
+      "description": "Encrypted application plaintext only. Enforce text UTF-8 byte length <=16384 independently of Unicode character counts. No attachments, read state, edits, calls or reactions while pending.",
+      "properties": {
+        "invitation": {
+          "ref": "#groupInvitationReference",
+          "type": "ref"
+        },
+        "text": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "directRequestInventoryScope": {
+      "properties": {
+        "scopeDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "supportedProtocolVersions": {
+          "items": {
+            "ref": "#protocolVersion",
+            "type": "ref"
+          },
+          "maxLength": 2,
+          "minLength": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "supportedProtocolVersions",
+        "scopeDigest"
+      ],
+      "type": "object"
+    },
+    "directRequestKey": {
+      "properties": {
+        "grant": {
+          "ref": "#signedDirectRequestGrant",
+          "type": "ref"
+        },
+        "keyPackage": {
+          "ref": "#keyPackageArtifact",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "keyPackage",
+        "grant"
+      ],
+      "type": "object"
+    },
+    "directRequestKeyPoolStats": {
+      "description": "Replenishment hint for the authenticated actor device only, bound to the enclosing ownDeviceView device identity, keyId and authGeneration. Counts are not publication or preparation authority. usableUntil equals asOf plus seven days, 300 seconds import margin and 300 seconds preparation lease.",
+      "properties": {
+        "asOf": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "reservedCount": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "usableCount": {
+          "maximum": 1000,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "usableUntil": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "enabled",
+        "revision",
+        "usableCount",
+        "reservedCount",
+        "asOf",
+        "usableUntil"
+      ],
+      "type": "object"
+    },
+    "directRequestKeysPublicationBody": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "idempotencyKey": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "keys": {
+          "items": {
+            "ref": "#directRequestKey",
+            "type": "ref"
+          },
+          "maxLength": 128,
+          "minLength": 0,
+          "type": "array"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "revision": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-DIRECT-REQUEST-KEYS\u0000",
+          "type": "string"
+        },
+        "signedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "protocolVersion",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "revision",
+        "enabled",
+        "keys",
+        "idempotencyKey",
+        "signedAt"
+      ],
+      "type": "object"
+    },
+    "directRequestOrigin": {
+      "closed": true,
+      "refs": [
+        "#freshDirectOrigin",
+        "#legacyPendingDirectOrigin"
+      ],
+      "type": "union"
+    },
+    "directRequestOutcome": {
+      "closed": true,
+      "refs": [
+        "#directRequestUnknownOutcome",
+        "#directRequestPreparedOutcome",
+        "#signedDirectRequestReceipt"
+      ],
+      "type": "union"
+    },
+    "directRequestPreparationBody": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "firstMessageId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "idempotencyKey": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "origin": {
+          "ref": "#directRequestOrigin",
+          "type": "ref"
+        },
+        "profile": {
+          "ref": "#directRequestProfile",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-DIRECT-REQUEST-PREPARE\u0000",
+          "type": "string"
+        },
+        "signedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "protocolVersion",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "requestId",
+        "firstMessageId",
+        "conversationId",
+        "recipientDid",
+        "origin",
+        "profile",
+        "idempotencyKey",
+        "signedAt"
+      ],
+      "type": "object"
+    },
+    "directRequestPreparationSnapshot": {
+      "description": "Canonical untagged snapshot. preparationDigest=SHA256(CATBIRD-DIRECT-REQUEST-PREPARATION-RECEIPT\\0 || canonicalCBOR(snapshot)); preparationSignature=ES256 over those exact domain-prefixed bytes using the immutable versioned receiptKeyId. Includes exact SHA256 signed preparation transcript.",
+      "properties": {
+        "authorityDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "creator": {
+          "ref": "#directRequestCreator",
+          "type": "ref"
+        },
+        "firstMessageId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "leaseExpiresAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "minimumImportUntil": {
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated.",
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "origin": {
+          "ref": "#directRequestOrigin",
+          "type": "ref"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "preparedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "profile": {
+          "ref": "#directRequestProfile",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "receiptKeyId": {
+          "ref": "#directRequestReceiptKeyId",
+          "type": "ref"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "selectedDevices": {
+          "items": {
+            "ref": "#directRequestSelectedDevice",
+            "type": "ref"
+          },
+          "maxLength": 39,
+          "minLength": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "firstMessageId",
+        "conversationId",
+        "recipientDid",
+        "origin",
+        "profile",
+        "creator",
+        "selectedDevices",
+        "preparedAt",
+        "leaseExpiresAt",
+        "minimumImportUntil",
+        "preparationRequestDigest",
+        "authorityDid",
+        "receiptKeyId"
+      ],
+      "type": "object"
+    },
+    "directRequestPreparationView": {
+      "description": "Canonical untagged snapshot. preparationDigest=SHA256(CATBIRD-DIRECT-REQUEST-PREPARATION-RECEIPT\\0 || canonicalCBOR(snapshot)); preparationSignature=ES256 over those exact domain-prefixed bytes using the immutable versioned receiptKeyId. Includes exact SHA256 signed preparation transcript. View adds digest/signature, which are excluded from the snapshot projection.",
+      "properties": {
+        "authorityDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "creator": {
+          "ref": "#directRequestCreator",
+          "type": "ref"
+        },
+        "firstMessageId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "leaseExpiresAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "minimumImportUntil": {
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated.",
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "origin": {
+          "ref": "#directRequestOrigin",
+          "type": "ref"
+        },
+        "preparationDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "preparationSignature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        },
+        "preparedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "profile": {
+          "ref": "#directRequestProfile",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "receiptKeyId": {
+          "ref": "#directRequestReceiptKeyId",
+          "type": "ref"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "selectedDevices": {
+          "items": {
+            "ref": "#directRequestSelectedDevice",
+            "type": "ref"
+          },
+          "maxLength": 39,
+          "minLength": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "requestId",
+        "firstMessageId",
+        "conversationId",
+        "recipientDid",
+        "origin",
+        "profile",
+        "preparationDigest",
+        "preparationSignature",
+        "creator",
+        "selectedDevices",
+        "preparedAt",
+        "leaseExpiresAt",
+        "minimumImportUntil",
+        "preparationRequestDigest",
+        "authorityDid",
+        "receiptKeyId"
+      ],
+      "type": "object"
+    },
+    "directRequestPreparedOutcome": {
+      "properties": {
+        "preparation": {
+          "ref": "#directRequestPreparationView",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "preparation"
+      ],
+      "type": "object"
+    },
+    "directRequestProfile": {
+      "const": "encryptedIntroduction1",
+      "type": "string"
+    },
+    "directRequestPublicationBody": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "artifacts": {
+          "ref": "#directRequestBootstrapArtifacts",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "contextHash": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "firstMessageId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "idempotencyKey": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "importUntil": {
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated.",
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "next": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "origin": {
+          "ref": "#directRequestOrigin",
+          "type": "ref"
+        },
+        "preparationDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "profile": {
+          "ref": "#directRequestProfile",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-DIRECT-REQUEST-PUBLISH\u0000",
+          "type": "string"
+        },
+        "signedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "protocolVersion",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "requestId",
+        "firstMessageId",
+        "conversationId",
+        "recipientDid",
+        "origin",
+        "profile",
+        "preparationDigest",
+        "contextHash",
+        "next",
+        "importUntil",
+        "artifacts",
+        "idempotencyKey",
+        "signedAt",
+        "preparationRequestDigest"
+      ],
+      "type": "object"
+    },
+    "directRequestPublishedReceipt": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "actorKeyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "coordinates": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "firstMessageId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "recordedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "requestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "requestKind": {
+          "const": "publish",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "requestDigest",
+        "recordedAt",
+        "conversationId",
+        "firstMessageId",
+        "coordinates",
+        "preparationRequestDigest",
+        "actorDid",
+        "actorDeviceId",
+        "actorKeyId",
+        "authGeneration",
+        "requestKind"
+      ],
+      "type": "object"
+    },
+    "directRequestReceiptBody": {
+      "properties": {
+        "authorityDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#directRequestReceiptKeyId",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "const": "2",
+          "type": "string"
+        },
+        "receipt": {
+          "ref": "#directRequestTerminalReceipt",
+          "type": "ref"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-DIRECT-REQUEST-OUTCOME\u0000",
+          "type": "string"
+        }
+      },
+      "required": [
+        "signatureDomain",
+        "protocolVersion",
+        "authorityDid",
+        "keyId",
+        "receipt"
+      ],
+      "type": "object"
+    },
+    "directRequestReceiptKeyId": {
+      "description": "Exact expected coordinator authority DID plus #chat-request-receipt- and lowercase hex SHA256 of compressed P256 SEC1 public key. Resolve authenticated authority DID document unique method/controller/P256 Multikey. Retain historical verification methods across key rotation.",
+      "maxLength": 347,
+      "minLength": 98,
+      "type": "string"
+    },
+    "directRequestRejectedReceipt": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "actorKeyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "code": {
+          "ref": "#directRequestErrorCode",
+          "type": "ref"
+        },
+        "preparationRequestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "recordedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "requestDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "requestKind": {
+          "enum": [
+            "prepare",
+            "publish"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "requestDigest",
+        "recordedAt",
+        "code",
+        "preparationRequestDigest",
+        "actorDid",
+        "actorDeviceId",
+        "actorKeyId",
+        "authGeneration",
+        "requestKind"
+      ],
+      "type": "object"
+    },
+    "directRequestSelectedDevice": {
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "grant": {
+          "ref": "#signedDirectRequestGrant",
+          "type": "ref"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "keyPackage": {
+          "ref": "#keyPackageArtifact",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "keyPackage",
+        "grant"
+      ],
+      "type": "object"
+    },
+    "directRequestState": {
+      "properties": {
+        "acceptanceProof": {
+          "ref": "#directRequestAcceptanceProof",
+          "type": "ref"
+        },
+        "consent": {
+          "enum": [
+            "incomingPending",
+            "outgoingPending",
+            "accepted",
+            "closed"
+          ],
+          "type": "string"
+        },
+        "contextHash": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "firstMessageId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "importUntil": {
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated.",
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "preparationDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "senderDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "requestId",
+        "firstMessageId",
+        "senderDid",
+        "recipientDid",
+        "consent",
+        "importUntil",
+        "contextHash",
+        "preparationDigest"
+      ],
+      "type": "object"
+    },
+    "directRequestTerminalReceipt": {
+      "closed": true,
+      "refs": [
+        "#directRequestPublishedReceipt",
+        "#directRequestCancelledReceipt",
+        "#directRequestExpiredReceipt",
+        "#directRequestRejectedReceipt",
+        "#directRequestExistingDirectReceipt"
+      ],
+      "type": "union"
+    },
+    "directRequestUnknownOutcome": {
+      "properties": {
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "requestId"
+      ],
+      "type": "object"
+    },
+    "directRequestWelcomeBundle": {
+      "description": "One full immutable multi-secret Welcome. Deliveries exactly cover selected devices; never split or truncate secrets. importUntil is bounded by every lifetime-bearing final-tree leaf and included grant, not equal to target package expiry. Legacy recovery expiry equality remains unchanged.",
+      "properties": {
+        "deliveries": {
+          "items": {
+            "ref": "#directRequestWelcomeDelivery",
+            "type": "ref"
+          },
+          "maxLength": 39,
+          "minLength": 1,
+          "type": "array"
+        },
+        "opaqueWelcome": {
+          "maxLength": 8388608,
+          "minLength": 8,
+          "type": "bytes"
+        },
+        "sha256": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "opaqueWelcome",
+        "sha256",
+        "deliveries"
+      ],
+      "type": "object"
+    },
+    "directRequestWelcomeDelivery": {
+      "properties": {
+        "provenance": {
+          "ref": "#directRequestWelcomeProvenance",
+          "type": "ref"
+        },
+        "recipientDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "recipientDid",
+        "recipientDeviceId",
+        "provenance"
+      ],
+      "type": "object"
+    },
+    "directRequestWelcomeProvenance": {
+      "properties": {
+        "contextHash": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "grantId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "grantRevision": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "importUntil": {
+          "description": "Request-specific whole-second timestamp rendered with canonical .000Z. Nonzero fractional seconds are rejected as InvalidBootstrap; they are never truncated.",
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "keyPackageRef": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "preparationDigest": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "requestId": {
+          "ref": "#operationId",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "requestId",
+        "preparationDigest",
+        "contextHash",
+        "grantId",
+        "grantRevision",
+        "keyPackageRef",
+        "importUntil"
+      ],
+      "type": "object"
+    },
+    "directRequestWelcomeView": {
+      "properties": {
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "coordinates": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "opaqueWelcome": {
+          "maxLength": 8388608,
+          "minLength": 8,
+          "type": "bytes"
+        },
+        "provenance": {
+          "ref": "#directRequestWelcomeProvenance",
+          "type": "ref"
+        },
+        "recipientDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "sha256": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "status": {
+          "ref": "#welcomeStatus",
+          "type": "ref"
+        },
+        "transitionSeq": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "welcomeId": {
+          "ref": "#operationId",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "welcomeId",
+        "conversationId",
+        "transitionSeq",
+        "coordinates",
+        "status",
+        "opaqueWelcome",
+        "sha256",
+        "recipientDid",
+        "recipientDeviceId",
+        "provenance"
       ],
       "type": "object"
     },
@@ -2114,8 +3906,13 @@
       ],
       "type": "object"
     },
+    "freshDirectOrigin": {
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
     "groupInfoArtifact": {
-      "description": "Exactly one MLS 1.0 MLSMessage wire-format 4 wrapper. OpenMLS 0.8.1 GroupInfo extensions are frozen to exactly ratchet_tree followed by external_pub; every other GroupInfo extension is rejected. external_pub presence does not authorize external commits, which protocol policy forbids.",
+      "description": "Exactly one MLS 1.0 MLSMessage wire-format 4 wrapper. GroupInfo extensions are frozen to exactly ratchet_tree followed by external_pub; every other GroupInfo extension is rejected. external_pub presence does not authorize external commits, which protocol policy forbids.",
       "properties": {
         "bytes": {
           "maxLength": 1048576,
@@ -2140,6 +3937,43 @@
         "contentType",
         "bytes",
         "sha256"
+      ],
+      "type": "object"
+    },
+    "groupInvitationReference": {
+      "properties": {
+        "authorityDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "invitationTransitionId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "invitedByDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "invitedByDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "recipientDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "authorityDid",
+        "conversationId",
+        "invitationTransitionId",
+        "invitedByDid",
+        "invitedByDeviceId",
+        "recipientDid"
       ],
       "type": "object"
     },
@@ -3081,6 +4915,23 @@
       ],
       "type": "object"
     },
+    "legacyPendingDirectOrigin": {
+      "properties": {
+        "exactPrior": {
+          "ref": "#conversationCoordinates",
+          "type": "ref"
+        },
+        "originalInvitationProvenance": {
+          "ref": "#invitationProvenance",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "exactPrior",
+        "originalInvitationProvenance"
+      ],
+      "type": "object"
+    },
     "lifecycle": {
       "enum": [
         "active",
@@ -3849,6 +5700,11 @@
         "device": {
           "ref": "#deviceView",
           "type": "ref"
+        },
+        "directRequestKeyPool": {
+          "description": "Present only for the authenticated actorDeviceId when its request capability record exists; absent for all peer/other-device items. Counts include only current authorized request-purpose KeyPackages with valid enabled nonrevoked grants and the full indicated lifetime horizon.",
+          "ref": "#directRequestKeyPoolStats",
+          "type": "ref"
         }
       },
       "required": [
@@ -4198,7 +6054,8 @@
     },
     "protocolVersion": {
       "enum": [
-        "1"
+        "1",
+        "2"
       ],
       "type": "string"
     },
@@ -4228,6 +6085,111 @@
         "contentType",
         "bytes",
         "sha256"
+      ],
+      "type": "object"
+    },
+    "pushRegistrationBinding": {
+      "description": "The canonical service acknowledged this exact signed device binding. The gateway commits its token registry only after matching this digest and body to the authenticated request; this is not a client-supplied authorization flag.",
+      "properties": {
+        "bindingDigest": {
+          "maxLength": 32,
+          "minLength": 32,
+          "type": "bytes"
+        },
+        "body": {
+          "ref": "#pushRegistrationBody",
+          "type": "ref"
+        }
+      },
+      "required": [
+        "body",
+        "bindingDigest"
+      ],
+      "type": "object"
+    },
+    "pushRegistrationBody": {
+      "description": "Device-signed push binding for the canonical authority. Transcript is the literal UTF8 signatureDomain, then protocolVersion, authorityDid, actorDid as u32-big-endian length-prefixed UTF8, actorDeviceId as16 raw UUID bytes, keyId as length-prefixed UTF8, authGeneration u64 big-endian, registrationId as16 UUID bytes, provider and appId as length-prefixed UTF8, tokenGeneration u64 big-endian, tokenSha256 as32 bytes, enabled as one byte0or1, signedAt as length-prefixed UTF8. First execution checks current immutable key and authentication generation, signature, five-minute freshness and monotonic token generation. Exact current binding retry retains the same signature and receipt. Top-level token must hash to tokenSha256 when enabled; disable omits token and uses SHA256(empty). New registrations start at tokenGeneration1; rotation/rebind increments it. Devices never share registrations.",
+      "properties": {
+        "actorDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "actorDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "appId": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "authGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "authorityDid": {
+          "const": "did:web:chat.catbird.blue",
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "keyId": {
+          "ref": "#keyId",
+          "type": "ref"
+        },
+        "protocolVersion": {
+          "enum": [
+            "2"
+          ],
+          "type": "string"
+        },
+        "provider": {
+          "enum": [
+            "apns",
+            "fcm"
+          ],
+          "type": "string"
+        },
+        "registrationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "signatureDomain": {
+          "const": "CATBIRD-CHAT-PUSH-BINDING\u0000",
+          "type": "string"
+        },
+        "signedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "tokenGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "tokenSha256": {
+          "maxLength": 32,
+          "minLength": 32,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "signatureDomain",
+        "authorityDid",
+        "actorDid",
+        "actorDeviceId",
+        "keyId",
+        "authGeneration",
+        "registrationId",
+        "provider",
+        "appId",
+        "tokenGeneration",
+        "tokenSha256",
+        "enabled",
+        "signedAt"
       ],
       "type": "object"
     },
@@ -5115,6 +7077,174 @@
       ],
       "type": "object"
     },
+    "signedDirectRequestAcceptance": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#directRequestAcceptanceBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedDirectRequestAcceptanceCommitReceipt": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#directRequestAcceptanceCommitReceiptBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedDirectRequestCancellation": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#directRequestCancellationBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedDirectRequestGrant": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#directRequestGrantBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedDirectRequestKeysPublication": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#directRequestKeysPublicationBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedDirectRequestPreparation": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#directRequestPreparationBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedDirectRequestPublication": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#directRequestPublicationBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedDirectRequestReceipt": {
+      "properties": {
+        "body": {
+          "closed": true,
+          "refs": [
+            "#directRequestReceiptBody"
+          ],
+          "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
     "signedKeyPackageReplenishment": {
       "properties": {
         "body": {
@@ -5320,6 +7450,24 @@
             "#policyTransitionBody"
           ],
           "type": "union"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "body",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "signedPushRegistration": {
+      "properties": {
+        "body": {
+          "ref": "#pushRegistrationBody",
+          "type": "ref"
         },
         "signature": {
           "maxLength": 64,

@@ -798,7 +798,15 @@ where
                     if entry["signedRequest"]["body"]["transitionId"] == record.transition_id
                         || entry["signedRequest"]["body"]["idempotencyKey"] == record.transition_id
                     {
-                        let actual = serde_json::to_vec(entry)
+                        // Retain the canonical bare entry, independent of the
+                        // read presentation (as before lexicon `{"$bytes"}`).
+                        let mut canonical = entry.clone();
+                        crate::chat_v2::transcript::direct_request::normalize_read_bytes(
+                            "conversationEntry",
+                            &mut canonical,
+                        )
+                        .map_err(|_| invalid("invalid proof entry presentation"))?;
+                        let actual = serde_json::to_vec(&canonical)
                             .map_err(|_| invalid("cannot retain canonical entry"))?;
                         record.validate_entry(&actual)?;
                         record.confirmed_entry = Some(actual);

@@ -180,28 +180,26 @@ where
         parameters: Vec<(&str, String)>,
     ) -> Result<Value> {
         let route = super::canonical_transport::canonical_route(operation);
-        let encode = |value: &str| {
-            value
-                .bytes()
-                .map(|byte| {
-                    if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-                        (byte as char).to_string()
-                    } else {
-                        format!("%{byte:02X}")
-                    }
-                })
-                .collect::<String>()
-        };
         let query = parameters
             .into_iter()
-            .map(|(key, value)| format!("{}={}", encode(key), encode(&value)))
+            .map(|(key, value)| {
+                format!(
+                    "{}={}",
+                    super::canonical_transport::encode_query(key),
+                    super::canonical_transport::encode_query(&value)
+                )
+            })
             .collect::<Vec<_>>()
             .join("&");
         let response = self
             .api_client()
             .submit_prepared_request(PreparedRequest {
                 operation,
-                path: format!("{}?{}", route.path, query),
+                path: super::canonical_transport::scope_inventory_read_path(
+                    operation,
+                    format!("{}?{}", route.path, query),
+                    self.mls_context().supports_direct_request_bootstrap(),
+                ),
                 method: "GET".into(),
                 body: None,
             })
@@ -218,18 +216,76 @@ where
     pub(crate) async fn fetch_welcome_delivery(&self, cid: &str) -> Result<WelcomeDelivery> {
         let did = self.require_user_did().await?;
         let device = self.require_actor_device_id().await?;
-        let inventory = self
-            .welcome_read(
-                CanonicalOperation::GetConversations,
-                vec![("actorDeviceId", device.clone()), ("limit", "1".into())],
-            )
-            .await?;
-        let session = inventory["inventorySessionId"]
-            .as_str()
-            .ok_or_else(|| invalid("missing inventory session"))?;
-        let fence = inventory["snapshotEventCursor"]
-            .as_str()
-            .ok_or_else(|| invalid("missing inventory fence"))?;
+        if let Some(items) = super::authenticated_inventory::scoped_welcome_items() {
+            let snapshot = self
+                .batch_inventory_snapshot()
+                .ok_or_else(|| invalid("Welcome inventory has no bound conversation scope"))?;
+            if snapshot.user_did != did
+                || snapshot.device_id != device
+                || !snapshot.contains_conversation(cid)
+            {
+                return Err(invalid("Welcome inventory owner changed"));
+            }
+            let mut latest: Option<WelcomeDelivery> = None;
+            for item in items.iter().filter(|item| item["conversationId"] == cid) {
+                if item["$type"] == "blue.catbird.chat.defs#directRequestWelcomeView" {
+                    continue;
+                }
+                if item["recipientDid"] != did || item["recipientDeviceId"] != device {
+                    return Err(invalid("Welcome recipient mismatch"));
+                }
+                let delivery = WelcomeDelivery::from_value(item.clone())?;
+                if latest.as_ref().is_none_or(|old| {
+                    old.envelope["transitionSeq"].as_u64() < item["transitionSeq"].as_u64()
+                }) {
+                    latest = Some(delivery);
+                }
+            }
+            return latest.ok_or_else(|| OrchestratorError::ServerError {
+                status: 404,
+                body: "Welcome not found in exact snapshot".into(),
+            });
+        }
+        let (session, fence) = if let Some(snapshot) = self.batch_inventory_snapshot() {
+            if snapshot.user_did == did
+                && snapshot.device_id == device
+                && snapshot.contains_conversation(cid)
+            {
+                (snapshot.session_id.clone(), snapshot.event_cursor.clone())
+            } else {
+                let inventory = self
+                    .welcome_read(
+                        CanonicalOperation::GetConversations,
+                        vec![("actorDeviceId", device.clone()), ("limit", "1".into())],
+                    )
+                    .await?;
+                let session = inventory["inventorySessionId"]
+                    .as_str()
+                    .ok_or_else(|| invalid("missing inventory session"))?
+                    .to_string();
+                let fence = inventory["snapshotEventCursor"]
+                    .as_str()
+                    .ok_or_else(|| invalid("missing inventory fence"))?
+                    .to_string();
+                (session, fence)
+            }
+        } else {
+            let inventory = self
+                .welcome_read(
+                    CanonicalOperation::GetConversations,
+                    vec![("actorDeviceId", device.clone()), ("limit", "1".into())],
+                )
+                .await?;
+            let session = inventory["inventorySessionId"]
+                .as_str()
+                .ok_or_else(|| invalid("missing inventory session"))?
+                .to_string();
+            let fence = inventory["snapshotEventCursor"]
+                .as_str()
+                .ok_or_else(|| invalid("missing inventory fence"))?
+                .to_string();
+            (session, fence)
+        };
         let mut pagination =
             super::pagination::PaginationGuard::for_conversations("Welcome delivery");
         let mut cursor = None;
@@ -237,7 +293,7 @@ where
         loop {
             let mut params = vec![
                 ("actorDeviceId", device.clone()),
-                ("inventorySessionId", session.into()),
+                ("inventorySessionId", session.clone()),
                 ("limit", "100".into()),
             ];
             if let Some(value) = cursor {
@@ -246,8 +302,8 @@ where
             let page = self
                 .welcome_read(CanonicalOperation::GetPendingWelcomes, params)
                 .await?;
-            if page["inventorySessionId"].as_str() != Some(session)
-                || page["snapshotEventCursor"].as_str() != Some(fence)
+            if page["inventorySessionId"].as_str() != Some(&session)
+                || page["snapshotEventCursor"].as_str() != Some(&fence)
             {
                 return Err(invalid("inventory session changed"));
             }

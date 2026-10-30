@@ -29,6 +29,8 @@ struct CleanChatBindingSnapshot {
 /// In-memory `CredentialStore` with per-user isolation via `Arc<Mutex<...>>`.
 #[derive(Debug, Clone)]
 pub struct MockCredentials {
+    signer_pause: Arc<Mutex<Option<Arc<SignerPause>>>>,
+    request_authority_document: Arc<Mutex<Option<Vec<u8>>>>,
     state: Arc<Mutex<HashMap<String, UserCredentials>>>,
     /// WS-3 stage 2: configurable authorized-device-key sets per root DID.
     /// DID absent from the map → `get_authorized_device_keys` returns
@@ -41,15 +43,46 @@ pub struct MockCredentials {
     /// transient platform/network failures separately from `Ok(None)`, which
     /// means the resolver capability is unsupported.
     authorized_device_key_failures: Arc<Mutex<std::collections::HashSet<String>>>,
+    chat_declaration_authorities: Arc<Mutex<HashMap<String, Option<String>>>>,
+    chat_declaration_failures: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+/// A one-shot signing callback barrier. The captured authority is returned only
+/// after the test has changed lifecycle or credentials while the callback waits.
+#[derive(Debug, Default)]
+pub struct SignerPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+impl SignerPause {
+    pub async fn wait_entered(&self) {
+        self.entered.notified().await;
+    }
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl MockCredentials {
+    pub fn pause_next_signature(&self) -> Arc<SignerPause> {
+        let pause = Arc::new(SignerPause::default());
+        *self.signer_pause.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    pub fn set_request_authority_document(&self, document: Vec<u8>) {
+        *self.request_authority_document.lock().unwrap() = Some(document);
+    }
     pub fn new() -> Self {
         Self {
+            signer_pause: Arc::new(Mutex::new(None)),
+            request_authority_document: Arc::new(Mutex::new(None)),
             state: Arc::new(Mutex::new(HashMap::new())),
             authorized_device_keys: Arc::new(Mutex::new(HashMap::new())),
             device_key_lookup_counts: Arc::new(Mutex::new(HashMap::new())),
             authorized_device_key_failures: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            chat_declaration_authorities: Arc::new(Mutex::new(HashMap::new())),
+            chat_declaration_failures: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -87,6 +120,24 @@ impl MockCredentials {
             failures.insert(root_did.to_string());
         } else {
             failures.remove(root_did);
+        }
+    }
+    /// Set the verified chat declaration authority for a DID.
+    /// Some(auth) means declaration is present with deliveryService = auth.
+    /// None means confirmed 404 RecordNotFound on PDS.
+    pub fn set_chat_declaration_authority(&self, user_did: &str, authority: Option<&str>) {
+        self.chat_declaration_authorities
+            .lock()
+            .unwrap()
+            .insert(user_did.to_string(), authority.map(|s| s.to_string()));
+    }
+
+    pub fn set_chat_declaration_failure(&self, user_did: &str, fail: bool) {
+        let mut failures = self.chat_declaration_failures.lock().unwrap();
+        if fail {
+            failures.insert(user_did.to_string());
+        } else {
+            failures.remove(user_did);
         }
     }
 
@@ -129,6 +180,27 @@ impl Default for MockCredentials {
 
 #[async_trait]
 impl CredentialStore for MockCredentials {
+    async fn direct_request_receipt_authority_document(
+        &self,
+        _expected_authority_did: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        Ok(self.request_authority_document.lock().unwrap().clone())
+    }
+    async fn get_chat_declaration_authority(&self, user_did: &str) -> Result<Option<String>> {
+        if self.chat_declaration_failures.lock().unwrap().contains(user_did) {
+            return Err(OrchestratorError::Mls(
+                catbird_mls::MLSError::OperationNotSupported {
+                    reason: "Chat declaration resolution unavailable".into(),
+                },
+            ));
+        }
+        let map = self.chat_declaration_authorities.lock().unwrap();
+        if let Some(entry) = map.get(user_did) {
+            Ok(entry.clone())
+        } else {
+            Ok(None)
+        }
+    }
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
         let mut map = self.state.lock().unwrap();
         map.entry(user_did.to_string()).or_default().signing_key = Some(key_data.to_vec());
@@ -164,6 +236,11 @@ impl CredentialStore for MockCredentials {
                 map.get(user_did).and_then(|c| c.device_uuid.clone()),
             )
         };
+        let pause = self.signer_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
         if let Some(authority) = explicit {
             return Ok(Some(authority));
         }
@@ -210,6 +287,15 @@ impl CredentialStore for MockCredentials {
         let mut map = self.state.lock().unwrap();
         map.entry(user_did.to_string()).or_default().device_uuid = Some(uuid.to_string());
         Ok(())
+    }
+
+    async fn get_auth_generation(&self, user_did: &str) -> Result<Option<i64>> {
+        let map = self.state.lock().unwrap();
+        Ok(map
+            .get(user_did)
+            .and_then(|c| c.clean_chat_binding.as_ref())
+            .map(|b| b.auth_generation)
+            .unwrap_or(Some(1)))
     }
 
     async fn get_device_uuid(&self, user_did: &str) -> Result<Option<String>> {

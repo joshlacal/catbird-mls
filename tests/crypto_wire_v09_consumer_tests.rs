@@ -33,6 +33,64 @@ use catbird_mls::chat_v2::transcript::{
     EntryRow, SignedMutationError, SignedMutationKind, SignedWrapper, StrictJson, VerifiedMutation,
 };
 
+static PINNED_TIME: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+#[no_mangle]
+pub unsafe extern "C" fn clock_gettime(clk_id: i32, tp: *mut timespec_compat) -> i32 {
+    let pinned = PINNED_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    if pinned != 0 && clk_id == 0 && !tp.is_null() {
+        (*tp).tv_sec = pinned;
+        (*tp).tv_nsec = 0;
+        return 0;
+    }
+    static REAL: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let mut real_ptr = REAL.load(std::sync::atomic::Ordering::Relaxed);
+    if real_ptr.is_null() {
+        real_ptr = dlsym(RTLD_NEXT, b"clock_gettime\0".as_ptr() as *const _);
+        REAL.store(real_ptr, std::sync::atomic::Ordering::Relaxed);
+    }
+    let real_fn: unsafe extern "C" fn(i32, *mut timespec_compat) -> i32 = std::mem::transmute(real_ptr);
+    real_fn(clk_id, tp)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gettimeofday(tp: *mut timeval_compat, tzp: *mut std::ffi::c_void) -> i32 {
+    let pinned = PINNED_TIME.load(std::sync::atomic::Ordering::Relaxed);
+    if pinned != 0 && !tp.is_null() {
+        (*tp).tv_sec = pinned;
+        (*tp).tv_usec = 0;
+        return 0;
+    }
+    static REAL: std::sync::atomic::AtomicPtr<std::ffi::c_void> =
+        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    let mut real_ptr = REAL.load(std::sync::atomic::Ordering::Relaxed);
+    if real_ptr.is_null() {
+        real_ptr = dlsym(RTLD_NEXT, b"gettimeofday\0".as_ptr() as *const _);
+        REAL.store(real_ptr, std::sync::atomic::Ordering::Relaxed);
+    }
+    let real_fn: unsafe extern "C" fn(*mut timeval_compat, *mut std::ffi::c_void) -> i32 =
+        std::mem::transmute(real_ptr);
+    real_fn(tp, tzp)
+}
+
+const RTLD_NEXT: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
+
+extern "C" {
+    fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+}
+
+#[repr(C)]
+pub struct timespec_compat {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+#[repr(C)]
+pub struct timeval_compat {
+    pub tv_sec: i64,
+    pub tv_usec: i32,
+}
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 
 const ALICE_ACTOR_DID: &str = "did:plc:alicefixtureaaaaaaaaaaaa";
@@ -435,11 +493,24 @@ fn v09_fixture_dir() -> PathBuf {
     if root_path.is_dir() {
         return root_path;
     }
+    let canonical = PathBuf::from("/Users/joshlacalamito/Developer/Catbird+Petrel/docs/generated-artifacts/mls-chat-v1/crypto-wire-v09");
+    if canonical.is_dir() {
+        return canonical;
+    }
     root.join("mls-ds/server/tests/fixtures/crypto-wire-v09")
 }
 
 #[test]
 fn native_crypto_wire_v09_committed_corpus_replay_and_verification() {
+    struct PinnedTimeGuard;
+    impl Drop for PinnedTimeGuard {
+        fn drop(&mut self) {
+            PINNED_TIME.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    PINNED_TIME.store(1788070000, std::sync::atomic::Ordering::Relaxed);
+    let _time_guard = PinnedTimeGuard;
+
     let fixture_dir = v09_fixture_dir();
     assert!(
         fixture_dir.is_dir(),

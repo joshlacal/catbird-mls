@@ -4,7 +4,7 @@ use web_time::Instant;
 use super::api_client::MLSAPIClient;
 use super::constants;
 use super::credentials::CredentialStore;
-use super::error::Result;
+use super::error::{OrchestratorError, Result};
 use super::mls_provider::MlsCryptoContext;
 use super::orchestrator::MLSOrchestrator;
 use super::pagination::PaginationGuard;
@@ -25,6 +25,23 @@ fn conversation_contains_user_root_exact(
         .members
         .iter()
         .any(|member| member_matches_user_root_exact(&member.did, expected_root_did))
+}
+
+/// Outcome of committing a conversation projection during server sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SyncProjectionOutcome {
+    Committed { retired_aliases: Vec<String> },
+    FencedByReset,
+}
+
+impl SyncProjectionOutcome {
+    #[cfg(test)]
+    pub(crate) fn unwrap_retired(self) -> Vec<String> {
+        match self {
+            Self::Committed { retired_aliases } => retired_aliases,
+            Self::FencedByReset => panic!("expected Committed projection, got FencedByReset"),
+        }
+    }
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -68,7 +85,7 @@ where
     /// Confirm retained signed control operations before sync can replace or
     /// recover their local group. Uncertain conversations remain isolated from
     /// this pass while unrelated conversations continue syncing.
-    async fn resume_prepared_controls(&self) -> Result<HashSet<String>> {
+    pub(crate) async fn resume_prepared_controls(&self) -> Result<HashSet<String>> {
         let records = self.mls_context().list_prepared_controls()?;
         let mut blocked = HashSet::new();
         for record in records {
@@ -246,6 +263,8 @@ where
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        Box::pin(self.reconcile_direct_request_outcomes()).await;
         Ok(report)
     }
 
@@ -289,6 +308,12 @@ where
     /// 4. Rejects uncorroborated server roster/listing omissions
     /// 5. Reconciles local state
     pub async fn sync_with_server(&self, full_sync: bool) -> Result<()> {
+        // Generated request entries carry a complete bootstrap. Keep the
+        // deeply nested reconciliation future off callers' thread stacks.
+        Box::pin(self.sync_with_server_inner(full_sync)).await
+    }
+
+    async fn sync_with_server_inner(&self, full_sync: bool) -> Result<()> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
 
@@ -331,28 +356,42 @@ where
             }
         }
 
-        // Acquire sync lock
+        // Acquire sync lock. A caller that finds a pass in flight coalesces
+        // onto it: it waits for that pass to finish instead of returning Ok
+        // at once, so its own follow-up reads (e.g. request hydration) see
+        // the reconciled state. The waiter registers before the flag lock is
+        // released, so a completion signal cannot be missed; dropping the
+        // caller's future still cancels only the wait.
         {
             let mut syncing = self.sync_in_progress().lock().await;
             if *syncing {
-                tracing::debug!("Sync already in progress, skipping");
+                let finished = self.sync_finished().notified();
+                drop(syncing);
+                tracing::debug!("Sync already in progress, awaiting it");
+                finished.await;
                 return Ok(());
             }
             *syncing = true;
         }
 
-        // Ensure sync_in_progress is always reset, even on panic
+        // Ensure sync_in_progress is always reset and waiters released, even
+        // on panic or cancellation of this pass.
         let sync_flag = self.sync_in_progress();
+        let sync_finished = self.sync_finished();
         let _sync_guard = scopeguard::guard((), |_| {
             if let Ok(mut syncing) = sync_flag.try_lock() {
                 *syncing = false;
             }
+            sync_finished.notify_waiters();
         });
 
         let result = self.do_sync(&user_did, full_sync).await;
-
-        // Release sync lock (guard handles this on panic/early return too)
-        *self.sync_in_progress().lock().await = false;
+        let mut syncing = self.sync_in_progress().lock().await;
+        // A waiter may start a new pass as soon as this flag clears.
+        scopeguard::ScopeGuard::into_inner(_sync_guard);
+        *syncing = false;
+        drop(syncing);
+        self.sync_finished().notify_waiters();
 
         match &result {
             Ok(_) => {
@@ -379,6 +418,8 @@ where
             }
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        Box::pin(self.reconcile_direct_request_outcomes()).await;
         result
     }
 
@@ -506,11 +547,212 @@ where
             }
         }
 
-        // Update local state from server
+        let any_needs_recovery = {
+            let mut needed = false;
+            for c in &all_convos {
+                if self
+                    .storage()
+                    .needs_rejoin(&c.conversation_id)
+                    .await
+                    .unwrap_or(false)
+                {
+                    needed = true;
+                    break;
+                }
+                if let Ok(gid_bytes) = hex::decode(&c.group_id) {
+                    if self.mls_context().get_epoch(gid_bytes).is_err() {
+                        needed = true;
+                        break;
+                    }
+                }
+            }
+            needed
+        };
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if any_needs_recovery {
+            // Each task-local scope retains its inner future. Box the batch
+            // before wrapping it so nested scopes do not multiply the large
+            // reconciliation state on the thread stack.
+            if self.batch_inventory_snapshot().is_none() {
+                if let Ok(inv) = self.fetch_authorized_inventory_snapshot().await {
+                    let inv = std::sync::Arc::new(inv);
+                    if let Ok(inbox) = self
+                        .fetch_authorized_recovery_inbox_snapshot_with_session(
+                            &inv.session_id,
+                            &inv.event_cursor,
+                            inv.expires_at.as_deref(),
+                        )
+                        .await
+                    {
+                        let inbox = std::sync::Arc::new(inbox);
+                        return super::with_batch_inventory_scope(
+                            inv,
+                            super::with_batch_recovery_inbox_scope(
+                                inbox,
+                                Box::pin(self.reconcile_server_conversations_batch(
+                                    user_did,
+                                    all_convos,
+                                    blocked_controls,
+                                    false,
+                                )),
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            } else if self.batch_recovery_inbox_snapshot().is_none() {
+                if let Ok(inbox) = self.fetch_authorized_recovery_inbox_snapshot().await {
+                    let inbox = std::sync::Arc::new(inbox);
+                    return super::with_batch_recovery_inbox_scope(
+                        inbox,
+                        Box::pin(self.reconcile_server_conversations_batch(
+                            user_did,
+                            all_convos,
+                            blocked_controls,
+                            false,
+                        )),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        Box::pin(self.reconcile_server_conversations_batch(
+            user_did,
+            all_convos,
+            blocked_controls,
+            false,
+        ))
+        .await
+    }
+
+    /// Commit canonical presentation and exact raw-group alias retirement before
+    /// exposing a newly authenticated inventory mapping to readers.
+    pub(crate) async fn persist_sync_conversation_projection(
+        &self,
+        user_did: &str,
+        canonical: &ConversationView,
+    ) -> Result<SyncProjectionOutcome> {
+        if self.require_user_did().await? != user_did {
+            return Err(OrchestratorError::NotAuthenticated);
+        }
+        // Legacy noncanonical host records keep their original durable path;
+        // a stable protocol conversation always uses the atomic contract.
+        if crate::chat_v2::ids::CanonicalUuid::parse(&canonical.conversation_id).is_err() {
+            self.storage()
+                .ensure_conversation_exists(
+                    user_did,
+                    &canonical.conversation_id,
+                    &canonical.group_id,
+                )
+                .await?;
+            return Ok(SyncProjectionOutcome::Committed {
+                retired_aliases: Vec::new(),
+            });
+        }
+        let aliases = self
+            .storage()
+            .list_conversations(user_did)
+            .await?
+            .into_iter()
+            .filter(|view| {
+                view.conversation_id == canonical.group_id
+                    && view.conversation_id != canonical.conversation_id
+            })
+            .collect::<Vec<_>>();
+        let mut claims = Vec::with_capacity(aliases.len());
+        for alias in &aliases {
+            let group = hex::decode(&canonical.group_id).map_err(|_| {
+                OrchestratorError::InvalidInput("Invalid alias group identity".into())
+            })?;
+            let native_epoch = self.mls_context().get_epoch(group)?;
+            if alias.group_id != canonical.group_id
+                || alias.epoch > native_epoch
+                || canonical.epoch < native_epoch
+            {
+                return Err(OrchestratorError::Storage(
+                    "Alias incarnation differs from authenticated canonical/native state".into(),
+                ));
+            }
+            // A newer server snapshot permits catch-up, but cannot retire the
+            // old local incarnation until its commits have been processed.
+            if canonical.epoch > native_epoch {
+                continue;
+            }
+            claims.push(AliasRetirementAuthority::from_views(
+                user_did, canonical, alias,
+            )?);
+        }
+        let retired = claims
+            .iter()
+            .map(|claim| claim.alias_conversation_id.clone())
+            .collect();
+        let mut request =
+            ConversationProjectionCommitRequest::live(user_did, canonical.clone(), claims);
+        if let Some(payload) = self
+            .reset_pending_payload_result(&canonical.conversation_id)
+            .await?
+        {
+            if payload.new_group_id == canonical.group_id {
+                request.canonical_lifecycle.reset_generation = Some(payload.reset_generation);
+                request.canonical_lifecycle.reset_pending_target_group_id =
+                    Some(payload.new_group_id.clone());
+            }
+        }
+        match self
+            .storage()
+            .commit_conversation_projection(&request)
+            .await?
+        {
+            ConversationProjectionCommitOutcome::Retired { .. }
+            | ConversationProjectionCommitOutcome::AlreadyAbsent { .. } => {}
+            ConversationProjectionCommitOutcome::FenceMismatch { .. } => {
+                let is_reset_pending = self
+                    .reset_blocks_non_reset_transition_locked(&canonical.conversation_id)
+                    .await?
+                    || self
+                        .storage()
+                        .get_conversation_state(&canonical.conversation_id)
+                        .await?
+                        .is_some_and(|s| matches!(s, ConversationState::ResetPending { .. }));
+                if is_reset_pending {
+                    return Ok(SyncProjectionOutcome::FencedByReset);
+                }
+                return Err(OrchestratorError::Storage(
+                    "Canonical projection transaction rejected its durable fences".into(),
+                ));
+            }
+            ConversationProjectionCommitOutcome::Ambiguous { canonical_ids, .. } => {
+                return Err(OrchestratorError::Storage(format!(
+                    "Canonical projection transaction rejected ambiguous projection for canonical IDs: {:?}",
+                    canonical_ids
+                )));
+            }
+        }
+        if self.require_user_did().await? != user_did {
+            return Err(OrchestratorError::NotAuthenticated);
+        }
+        Ok(SyncProjectionOutcome::Committed {
+            retired_aliases: retired,
+        })
+    }
+
+    pub(crate) async fn reconcile_server_conversations_batch(
+        &self,
+        user_did: &str,
+        all_convos: Vec<ConversationView>,
+        blocked_controls: HashSet<String>,
+        strict: bool,
+    ) -> Result<()> {
         let mut sync_rejoin_attempted = HashSet::new();
         for convo in &all_convos {
             if !*self.sync_in_progress().lock().await {
-                // Check if shutdown happened during processing
+                if strict {
+                    return Err(OrchestratorError::InvalidInput(
+                        "Inventory application interrupted".into(),
+                    ));
+                }
                 break;
             }
 
@@ -521,50 +763,75 @@ where
                 .get(&convo.conversation_id)
                 .cloned();
             let convo = self.restore_conversation_policy(user_did, convo.clone())?;
-            let convo = super::admission::merge_conversation_view(previous_view.as_ref(), convo)?;
+            let mut convo =
+                super::admission::merge_conversation_view(previous_view.as_ref(), convo)?;
+            if let Ok(group) = hex::decode(&convo.group_id) {
+                if let Ok(epoch) = self.mls_context().get_epoch(group) {
+                    convo.epoch = convo.epoch.max(epoch);
+                }
+            }
             let conversation_id = convo.conversation_id.as_str();
-            self.conversations()
-                .lock()
-                .await
-                .insert(conversation_id.to_string(), convo.clone());
             if blocked_controls.contains(conversation_id) {
+                if strict {
+                    return Err(OrchestratorError::InvalidInput(
+                        "Inventory has unresolved controls".into(),
+                    ));
+                }
                 continue;
             }
             if self.is_local_conversation_terminal(conversation_id).await? {
                 continue;
             }
             let group_id = convo.group_id.as_str();
-            // A successful reset recovery may resolve this stale list item to
-            // a different, authoritative group before the item finishes. All
-            // post-recovery projections in this iteration must use that
-            // effective view rather than normalizing the captured page again.
             let mut effective_convo = convo.clone();
 
-            // Every write and recovery probe below (sequencer mapping, group
-            // state, join/accept) resolves through this conversation row, so
-            // materialize it before any of them run.
-            self.storage()
-                .ensure_conversation_exists(user_did, conversation_id, group_id)
+            let outcome = self
+                .persist_sync_conversation_projection(user_did, &convo)
                 .await?;
+            let retired_aliases = match outcome {
+                SyncProjectionOutcome::Committed { retired_aliases } => retired_aliases,
+                SyncProjectionOutcome::FencedByReset => {
+                    crate::warn_log!(
+                        "[sync] convo={} projection fenced by in-flight ResetPending; skipping loop body to preserve memory/durable integrity and avoid non-target rejoin",
+                        conversation_id
+                    );
+                    continue;
+                }
+            };
+            {
+                let mut conversations = self.conversations().lock().await;
+                for alias in retired_aliases {
+                    conversations.remove(&alias);
+                }
+                conversations.insert(conversation_id.to_string(), convo.clone());
+            }
 
+            if convo
+                .canonical_state
+                .as_ref()
+                .is_some_and(|state| state.direct_request.is_some())
+            {
+                if let Err(error) = Box::pin(self.refresh_request_preview(conversation_id)).await {
+                    if strict {
+                        return Err(error);
+                    }
+                    // Platform-visible: tracing never reaches Android/iOS logs.
+                    crate::warn_log!(
+                        "[sync] request preview refresh deferred convo={}: {}",
+                        conversation_id,
+                        error
+                    );
+                }
+            }
             if self.pending_conversation_admission(conversation_id).await? {
                 continue;
             }
 
-            // ADR-010 D4: record the conversation→sequencer mapping. Routing
-            // does NOT consult this yet (WS-4 rung 3); every sync refresh
-            // overwrites the mapping, which trivially satisfies the D4 rule-4
-            // invalidation requirement for rung 2.
             let sequencer_changed = previous_view
                 .as_ref()
                 .map(|prev| prev.sequencer_did != convo.sequencer_did)
                 .unwrap_or(convo.sequencer_did.is_some());
-            crate::info_log!(
-                "[sync] convo={} sequencer_did={:?}{}",
-                conversation_id,
-                convo.sequencer_did,
-                if sequencer_changed { " (CHANGED)" } else { "" }
-            );
+            tracing::trace!(conversation_id, ?convo.sequencer_did, sequencer_changed, "reconcile: conversation sequencer");
             if sequencer_changed {
                 if let Some(sequencer_did) = convo.sequencer_did.as_deref() {
                     if let Err(e) = self
@@ -572,8 +839,6 @@ where
                         .set_conversation_sequencer(conversation_id, sequencer_did)
                         .await
                     {
-                        // Log-and-continue: recovery-critical-write escalation
-                        // is WS-5 territory, but never silently drop the error.
                         crate::warn_log!(
                             "[sync] convo={} failed to persist sequencer mapping: {}",
                             conversation_id,
@@ -631,10 +896,13 @@ where
                 Ok(gid_bytes) => match self.mls_context().get_epoch(gid_bytes) {
                     Ok(_) => true,
                     Err(crate::MLSError::ContextClosed) => {
-                        crate::info_log!(
-                            "[sync] convo={} group={} SKIP: MLS context closed (transient iOS suspension) — not stale, not rejoining",
+                        if strict {
+                            return Err(crate::MLSError::ContextClosed.into());
+                        }
+                        tracing::debug!(
                             conversation_id,
-                            group_id
+                            group_id,
+                            "SKIP: MLS context closed (transient iOS suspension) — not stale, not rejoining"
                         );
                         continue;
                     }
@@ -652,12 +920,12 @@ where
                 .is_some()
             };
 
-            crate::info_log!(
-                "[sync] convo={} group={} has_state_record={} ffi_has_group={}",
+            tracing::trace!(
                 conversation_id,
                 group_id,
                 has_state_record,
-                ffi_has_group
+                ffi_has_group,
+                "reconcile: state record check"
             );
 
             if has_state_record && !ffi_has_group {
@@ -667,34 +935,26 @@ where
                     "Persisted GroupState exists but MLS context has no group — \
                      stale state, falling through to join_or_rejoin"
                 );
-                crate::info_log!(
-                    "[sync] convo={} group={} stale state detected, entering init path",
+                tracing::debug!(
                     conversation_id,
-                    group_id
+                    group_id,
+                    "stale state detected, entering init path"
                 );
             }
 
             // Initialize group state if missing OR if the persisted record is stale.
             if !has_state_record || !ffi_has_group {
-                crate::info_log!(
-                    "[sync] convo={} group={} entering init block",
-                    conversation_id,
-                    group_id
-                );
+                tracing::trace!(conversation_id, group_id, "entering init block");
                 // Try to get epoch from FFI — if group doesn't exist locally, join it
                 let epoch = if let Ok(gid_bytes) = hex::decode(group_id) {
-                    crate::info_log!(
-                        "[sync] convo={} group={} pre-get_epoch call",
-                        conversation_id,
-                        group_id
-                    );
+                    tracing::trace!(conversation_id, group_id, "pre-get_epoch call");
                     match self.mls_context().get_epoch(gid_bytes) {
                         Ok(e) => {
-                            crate::info_log!(
-                                "[sync] convo={} group={} FFI get_epoch Ok: {} (surprising — skipping join_or_rejoin)",
+                            tracing::trace!(
                                 conversation_id,
                                 group_id,
-                                e
+                                epoch = e,
+                                "FFI get_epoch Ok (skipping join_or_rejoin)"
                             );
                             e
                         }
@@ -702,25 +962,25 @@ where
                         // (race with a concurrent suspension). Transient — keep the
                         // server epoch and DON'T engage the rejoin gate.
                         Err(crate::MLSError::ContextClosed) => {
-                            crate::info_log!(
-                                "[sync] convo={} group={} SKIP: MLS context closed mid-init (transient) — keeping epoch, not rejoining",
+                            if strict {
+                                return Err(crate::MLSError::ContextClosed.into());
+                            }
+                            tracing::debug!(
                                 conversation_id,
-                                group_id
+                                group_id,
+                                "SKIP: MLS context closed mid-init (transient)"
                             );
                             convo.epoch
                         }
                         Err(e) => {
-                            crate::info_log!(
-                                "[sync] convo={} group={} FFI get_epoch Err: {}",
+                            tracing::trace!(
                                 conversation_id,
                                 group_id,
-                                e
+                                error = %e,
+                                "FFI get_epoch Err"
                             );
                             if !sync_rejoin_attempted.insert(conversation_id.to_string()) {
-                                crate::info_log!(
-                                    "[sync] convo={} SKIP: duplicate in cycle",
-                                    conversation_id
-                                );
+                                tracing::debug!(conversation_id, "SKIP: duplicate in cycle");
                                 tracing::debug!(
                                     conversation_id = %conversation_id,
                                     group_id = %group_id,
@@ -728,10 +988,6 @@ where
                                 );
                                 convo.epoch
                             } else if !self.should_attempt_sync_rejoin(conversation_id).await {
-                                crate::info_log!(
-                                    "[sync] convo={} SKIP: eligibility gate rejected",
-                                    conversation_id
-                                );
                                 tracing::debug!(
                                     conversation_id = %conversation_id,
                                     group_id = %group_id,
@@ -739,10 +995,10 @@ where
                                 );
                                 convo.epoch
                             } else {
-                                crate::info_log!(
-                                    "[sync] convo={} group={} CALLING join_or_rejoin",
+                                tracing::debug!(
                                     conversation_id,
-                                    group_id
+                                    group_id,
+                                    "CALLING join_or_rejoin"
                                 );
                                 // Group not in FFI — try Welcome first, fall back to External Commit
                                 tracing::info!(
@@ -775,21 +1031,36 @@ where
                                         epoch
                                     }
                                     Err(e) => {
-                                        tracing::warn!(
-                                            conversation_id = %conversation_id,
-                                            group_id = %group_id,
-                                            error = %e,
-                                            "Failed to join group via join_or_rejoin; falling back to requesting leaf recovery"
-                                        );
-                                        if let Err(rec_err) =
-                                            self.accept_conversation(conversation_id).await
-                                        {
+                                        if strict {
+                                            return Err(e);
+                                        }
+                                        let msg = e.to_string();
+                                        if msg.contains("leaf recovery pending") {
+                                            tracing::debug!(
+                                                conversation_id = %conversation_id,
+                                                group_id = %group_id,
+                                                "Leaf recovery pending for conversation; awaiting peer fulfillment"
+                                            );
+                                        } else {
                                             tracing::warn!(
                                                 conversation_id = %conversation_id,
                                                 group_id = %group_id,
-                                                error = %rec_err,
-                                                "Failed to request leaf recovery/accept after join_or_rejoin failure"
+                                                error = %e,
+                                                "Failed to join group via join_or_rejoin"
                                             );
+                                            let _ =
+                                                self.record_rejoin_failure(conversation_id).await;
+                                            if let Ok(Some(convo_state)) = self
+                                                .storage()
+                                                .get_conversation_state(conversation_id)
+                                                .await
+                                            {
+                                                if convo_state == ConversationState::Initializing {
+                                                    let _ = self
+                                                        .accept_conversation(conversation_id)
+                                                        .await;
+                                                }
+                                            }
                                         }
                                         convo.epoch
                                     }
@@ -903,6 +1174,11 @@ where
                             .unwrap_or(0)
                         };
                         if server_epoch > new_local {
+                            if strict {
+                                return Err(OrchestratorError::InvalidInput(
+                                    "Inventory epoch catch-up incomplete".into(),
+                                ));
+                            }
                             tracing::warn!(
                                 conversation_id = %conversation_id,
                                 group_id = %group_id,
@@ -915,6 +1191,9 @@ where
                         }
                     }
                     Err(e) => {
+                        if strict {
+                            return Err(e);
+                        }
                         tracing::warn!(
                             conversation_id = %conversation_id,
                             group_id = %group_id,
@@ -952,6 +1231,9 @@ where
             {
                 Some(Ok(epoch)) => epoch.min(u32::MAX as u64) as u32,
                 Some(Err(e)) => {
+                    if strict {
+                        return Err(e.into());
+                    }
                     tracing::debug!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -961,6 +1243,11 @@ where
                     continue;
                 }
                 None => {
+                    if strict {
+                        return Err(OrchestratorError::InvalidInput(
+                            "Inventory group ID malformed".into(),
+                        ));
+                    }
                     tracing::debug!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -984,6 +1271,9 @@ where
                     }
                 }
                 Err(e) => {
+                    if strict {
+                        return Err(e);
+                    }
                     tracing::warn!(
                         conversation_id = %conversation_id,
                         group_id = %group_id,
@@ -1039,6 +1329,15 @@ where
                     {
                         Ok(super::recovery::DeferredRecoveryOutcome::ClearedStale) => continue,
                         Ok(super::recovery::DeferredRecoveryOutcome::Skipped) => {}
+                        Ok(super::recovery::DeferredRecoveryOutcome::Waiting { retry_after }) => {
+                            sync_rejoin_attempted.insert(conversation_id.to_string());
+                            tracing::info!(
+                                conversation_id = %conversation_id,
+                                group_id = %group_id,
+                                retry_after_secs = retry_after.as_secs(),
+                                "Sync rejoin waiting for recovery / peer fulfillment"
+                            );
+                        }
                         Ok(super::recovery::DeferredRecoveryOutcome::Recovered(epoch)) => {
                             sync_rejoin_attempted.insert(conversation_id.to_string());
                             tracing::info!(
@@ -1049,6 +1348,9 @@ where
                             );
                         }
                         Err(e) => {
+                            if strict {
+                                return Err(e);
+                            }
                             sync_rejoin_attempted.insert(conversation_id.to_string());
                             tracing::warn!(
                                 conversation_id = %conversation_id,
@@ -1060,6 +1362,10 @@ where
                     }
                 }
             }
+        }
+
+        if strict {
+            return Ok(());
         }
 
         // Fulfill any pending leaf recovery requests for conversations we are active in.
@@ -1216,6 +1522,466 @@ mod tests {
         assert_eq!(
             diff, 0,
             "saturating_sub should clamp to 0 even with u64::MAX local epoch"
+        );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod projection_ingestion_tests {
+    use super::*;
+    use crate::recovery_e2e_harness::TestWorld;
+    const CID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    async fn fixture() -> (TestWorld, ConversationView) {
+        let mut world = TestWorld::new();
+        world.add_client("Alice").await;
+        let alice = world.client("Alice");
+        alice.orchestrator.initialize(&alice.did).await.unwrap();
+        let group = "ab".repeat(32);
+        alice
+            .orchestrator
+            .mls_context()
+            .create_group_with_id(
+                alice.did.as_bytes().to_vec(),
+                hex::decode(&group).unwrap(),
+                None,
+            )
+            .unwrap();
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &group, &group)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_group_state(&GroupState {
+                group_id: group.clone(),
+                conversation_id: group.clone(),
+                epoch: 0,
+                members: vec![alice.did.clone()],
+            })
+            .await
+            .unwrap();
+        let mut view = alice
+            .storage
+            .get_conversation(&alice.did, &group)
+            .await
+            .unwrap()
+            .unwrap();
+        view.conversation_id = CID.into();
+        (world, view)
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn canonical_projection_retires_only_exact_owned_native_alias() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        let retired = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap()
+            .unwrap_retired();
+        assert_eq!(retired, vec![view.group_id.clone()]);
+        let rows = alice.storage.list_conversations(&alice.did).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_id, CID);
+        assert!(alice
+            .orchestrator
+            .persist_sync_conversation_projection("did:plc:other", &view)
+            .await
+            .is_err());
+        assert_eq!(
+            alice
+                .storage
+                .list_conversations(&alice.did)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_incarnation_failure_never_publishes_canonical_mapping() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        let mut alias = alice
+            .storage
+            .get_conversation(&alice.did, &view.group_id)
+            .await
+            .unwrap()
+            .unwrap();
+        alias.epoch = 1;
+        alice
+            .storage
+            .set_conversation_view_for_test(&view.group_id, alias);
+        assert!(alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, CID)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            alice.storage.list_conversations(&alice.did).await.unwrap()[0].conversation_id,
+            view.group_id
+        );
+        assert!(!alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .contains_key(CID));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn newer_inventory_preserves_alias_until_native_catches_up() {
+        let (world, mut view) = fixture().await;
+        let alice = world.client("Alice");
+        view.epoch = 1;
+        let retired = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap()
+            .unwrap_retired();
+        assert!(retired.is_empty());
+        assert_eq!(
+            alice
+                .storage
+                .list_conversations(&alice.did)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, &view.group_id)
+            .await
+            .unwrap()
+            .is_some());
+        let history = Message {
+            id: "preserved-alias-history".into(),
+            conversation_id: view.group_id.clone(),
+            sender_did: alice.did.clone(),
+            text: "protected history".into(),
+            timestamp: chrono::Utc::now(),
+            epoch: 0,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        };
+        alice.storage.store_message(&history).await.unwrap();
+        // Advance real native MLS state; do not rewrite the durable alias row.
+        let group = hex::decode(&view.group_id).unwrap();
+        alice
+            .orchestrator
+            .mls_context()
+            .self_update(group.clone())
+            .unwrap();
+        alice
+            .orchestrator
+            .mls_context()
+            .merge_pending_commit(group)
+            .unwrap();
+        alice
+            .storage
+            .set_group_state(&GroupState {
+                group_id: view.group_id.clone(),
+                conversation_id: CID.into(),
+                epoch: 1,
+                members: vec![alice.did.clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            alice
+                .storage
+                .get_conversation(&alice.did, &view.group_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            0
+        );
+        let retired = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap()
+            .unwrap_retired();
+        assert_eq!(retired, vec![view.group_id.clone()]);
+        assert_eq!(
+            alice.storage.get_conversation_messages(&view.group_id)[0].id,
+            history.id
+        );
+        assert_eq!(
+            alice
+                .storage
+                .list_conversations(&alice.did)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_pending_alias_rejects_transaction_without_projection() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        alice
+            .storage
+            .set_conversation_state(
+                &view.group_id,
+                ConversationState::ResetPending {
+                    new_group_id: "cd".repeat(32),
+                    reset_generation: 2,
+                    notified_at_ms: 123,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, CID)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, &view.group_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn projection_rejects_mismatched_alias_group_without_retirement() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        alice
+            .storage
+            .set_conversation_group_id_for_test(&view.group_id, &"cd".repeat(32));
+        assert!(alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .is_err());
+        assert!(alice
+            .storage
+            .get_conversation(&alice.did, CID)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            alice
+                .storage
+                .list_conversations(&alice.did)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_pending_canonical_rejects_non_target_group_projection() {
+        let (world, view) = fixture().await;
+        let alice = world.client("Alice");
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, CID, &view.group_id)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_conversation_state(
+                CID,
+                ConversationState::ResetPending {
+                    new_group_id: "73".repeat(32),
+                    reset_generation: 5,
+                    notified_at_ms: 456,
+                },
+            )
+            .await
+            .unwrap();
+        alice
+            .storage
+            .mark_reset_pending(CID, &"73".repeat(32), 5, 456)
+            .await
+            .unwrap();
+        let outcome = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap();
+        assert_eq!(outcome, SyncProjectionOutcome::FencedByReset);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reset_pending_canonical_accepts_target_group_projection() {
+        let (world, mut view) = fixture().await;
+        let alice = world.client("Alice");
+        let target_group = "73".repeat(32);
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, CID, &view.group_id)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_conversation_state(
+                CID,
+                ConversationState::ResetPending {
+                    new_group_id: target_group.clone(),
+                    reset_generation: 5,
+                    notified_at_ms: 456,
+                },
+            )
+            .await
+            .unwrap();
+        alice
+            .storage
+            .mark_reset_pending(CID, &target_group, 5, 456)
+            .await
+            .unwrap();
+        view.group_id = target_group;
+        let outcome = alice
+            .orchestrator
+            .persist_sync_conversation_projection(&alice.did, &view)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SyncProjectionOutcome::Committed { .. }));
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sync_batch_continues_for_other_conversations_when_one_fenced_by_reset() {
+        let (mut world, view1) = fixture().await;
+        world.register_device("Alice").await.unwrap();
+        let alice = world.client("Alice");
+        let convo1_id = view1.conversation_id.clone();
+        let old_group1 = view1.group_id.clone();
+        let target_group1 = "73".repeat(32);
+
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &convo1_id, &old_group1)
+            .await
+            .unwrap();
+        alice
+            .storage
+            .set_conversation_state(
+                &convo1_id,
+                ConversationState::ResetPending {
+                    new_group_id: target_group1.clone(),
+                    reset_generation: 7,
+                    notified_at_ms: 100,
+                },
+            )
+            .await
+            .unwrap();
+        alice
+            .storage
+            .mark_reset_pending(&convo1_id, &target_group1, 7, 100)
+            .await
+            .unwrap();
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(convo1_id.clone(), view1.clone());
+
+        let convo2_id = "00000000-0000-4000-8000-000000000002".to_string();
+        let group2 = "22".repeat(32);
+        let view2 = ConversationView {
+            conversation_id: convo2_id.clone(),
+            group_id: group2.clone(),
+            epoch: 3,
+            members: vec![],
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+            canonical_state: None,
+        };
+        alice
+            .storage
+            .ensure_conversation_exists(&alice.did, &convo2_id, &group2)
+            .await
+            .unwrap();
+        alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .insert(convo2_id.clone(), view2.clone());
+
+        let stale_non_target_group = "99".repeat(32);
+        let mut server_convo1 = view1.clone();
+        server_convo1.group_id = stale_non_target_group.clone();
+
+        let mut server_convo2 = view2.clone();
+        server_convo2.epoch = 4;
+
+        let batch = vec![server_convo1, server_convo2];
+        let baseline_submits = world.delivery_service().submitted_prepared_requests().len();
+
+        *alice.orchestrator.sync_in_progress().lock().await = true;
+        alice
+            .orchestrator
+            .reconcile_server_conversations_batch(
+                &alice.did,
+                batch,
+                std::collections::HashSet::new(),
+                false,
+            )
+            .await
+            .expect("sync batch must not fail when one conversation is fenced by reset");
+
+        // (a) Sync batch continued: convo2 was updated in memory
+        let in_memory_convo2 = alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .get(&convo2_id)
+            .cloned()
+            .expect("convo2 must be present in memory");
+        assert_eq!(
+            in_memory_convo2.epoch, 4,
+            "convo2 must have been processed and updated by sync"
+        );
+
+        // (b) No join/rejoin transport call targeted the non-target group
+        let requests = world.delivery_service().submitted_prepared_requests();
+        let new_requests = &requests[baseline_submits..];
+        for req in new_requests {
+            if let Some(body) = &req.body {
+                let text = String::from_utf8_lossy(body);
+                assert!(
+                    !text.contains(&stale_non_target_group),
+                    "no transport request may target the non-target group"
+                );
+            }
+        }
+
+        // (c) The in-memory view for convo1 stays the durable one (old_group1), NOT the rejected server view
+        let in_memory_convo1 = alice
+            .orchestrator
+            .conversations()
+            .lock()
+            .await
+            .get(&convo1_id)
+            .cloned()
+            .expect("convo1 must remain in memory");
+        assert_eq!(
+            in_memory_convo1.group_id, old_group1,
+            "in-memory view must remain the durable one, not the rejected server view"
         );
     }
 }

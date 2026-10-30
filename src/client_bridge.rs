@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::api::MLSContext;
 use crate::client::{CatbirdClient, ChatMessage, Conversation};
-use crate::orchestrator::OrchestratorConfig;
+use crate::orchestrator::{OrchestratorConfig, OrchestratorError};
 use crate::orchestrator_bridge::{
     FFIOrchestratorConfig, OrchestratorAPICallback, OrchestratorBridgeError,
     OrchestratorCredentialCallback, OrchestratorStorageCallback,
@@ -183,6 +183,26 @@ fn join_method_to_string(jm: JoinMethod) -> String {
 
 #[async_trait::async_trait]
 impl MLSStorageBackend for ClientStorageAdapter {
+    async fn commit_conversation_projection(
+        &self,
+        request: &crate::orchestrator::ConversationProjectionCommitRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::ConversationProjectionCommitOutcome> {
+        let json = serde_json::to_string(request)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        let response = self
+            .0
+            .commit_conversation_projection_json(json)
+            .map_err(bridge_err)?;
+        if response.len() > 65536 {
+            return Err(OrchestratorError::Storage(
+                "Projection callback response exceeds limit".into(),
+            ));
+        }
+        serde_json::from_str(&response).map_err(|e| {
+            OrchestratorError::Storage(format!("Invalid projection callback result: {e}"))
+        })
+    }
+
     async fn ensure_conversation_exists(
         &self,
         user_did: &str,
@@ -888,6 +908,23 @@ impl MLSAPIClient for ClientAPIAdapter {
 
 #[async_trait::async_trait]
 impl CredentialStore for ClientCredentialAdapter {
+    async fn direct_request_receipt_authority_document(
+        &self,
+        expected_authority_did: &str,
+    ) -> crate::orchestrator::Result<Option<Vec<u8>>> {
+        self.0
+            .direct_request_receipt_authority_document(expected_authority_did.to_string())
+            .map_err(bridge_err)
+    }
+    async fn get_chat_declaration_authority(
+        &self,
+        user_did: &str,
+    ) -> crate::orchestrator::Result<Option<String>> {
+        self.0
+            .get_chat_declaration_authority(user_did.to_string())
+            .map_err(bridge_err)
+    }
+
     async fn store_signing_key(
         &self,
         user_did: &str,
@@ -1081,6 +1118,75 @@ impl CatbirdClientBridge {
     /// List all conversations.
     pub fn conversations(&self) -> Result<Vec<Conversation>, OrchestratorBridgeError> {
         crate::async_runtime::block_on(self.inner.conversations())
+            .map_err(OrchestratorBridgeError::from)
+    }
+
+    pub fn get_group_invitation_reference(
+        &self,
+        conversation_id: String,
+        recipient_did: String,
+    ) -> Result<Option<crate::GroupInvitationReference>, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(
+            self.inner
+                .get_group_invitation_reference(&conversation_id, &recipient_did),
+        )
+        .map_err(OrchestratorBridgeError::from)
+    }
+    pub fn get_direct_request_delivery_enabled(
+        &self,
+    ) -> Result<Option<bool>, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.get_direct_request_delivery_enabled())
+            .map_err(OrchestratorBridgeError::from)
+    }
+    pub fn close_direct_request(
+        &self,
+        conversation_id: String,
+    ) -> Result<crate::DirectRequestView, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.close_direct_request(&conversation_id))
+            .map_err(OrchestratorBridgeError::from)
+    }
+    pub fn set_direct_request_delivery_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<(), OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.set_direct_request_delivery_enabled(enabled))
+            .map_err(OrchestratorBridgeError::from)
+    }
+    pub fn list_direct_request_views(
+        &self,
+    ) -> Result<Vec<crate::DirectRequestView>, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.list_direct_request_views())
+            .map_err(OrchestratorBridgeError::from)
+    }
+    pub fn start_direct_request(
+        &self,
+        input: crate::DirectRequestInput,
+    ) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.start_direct_request(input))
+            .map_err(OrchestratorBridgeError::from)
+    }
+
+    pub fn resume_direct_request(
+        &self,
+        draft_id: String,
+    ) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.resume_direct_request(&draft_id))
+            .map_err(OrchestratorBridgeError::from)
+    }
+
+    pub fn cancel_direct_request(
+        &self,
+        draft_id: String,
+    ) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.cancel_direct_request(&draft_id))
+            .map_err(OrchestratorBridgeError::from)
+    }
+
+    pub fn refresh_request_preview(
+        &self,
+        conversation_id: String,
+    ) -> Result<crate::DirectRequestView, OrchestratorBridgeError> {
+        crate::async_runtime::block_on(self.inner.refresh_request_preview(&conversation_id))
             .map_err(OrchestratorBridgeError::from)
     }
 

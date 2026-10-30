@@ -18,6 +18,9 @@ where
     /// Creates a key package locally via FFI, then uploads it.
     pub async fn publish_key_package(&self) -> Result<()> {
         self.check_shutdown().await?;
+        if let Err(error) = Box::pin(self.replenish_direct_request_keys_if_needed()).await {
+            tracing::warn!(%error, "Request key-pool maintenance deferred");
+        }
         let user_did = self.require_user_did().await?;
 
         tracing::debug!("Publishing key package");
@@ -131,8 +134,13 @@ where
                 )
             })?;
         let identity_bytes = format!("{user_did}#{device_uuid}").into_bytes();
-        let expires_at = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
-
+        let intent_identity = String::from_utf8_lossy(&identity_bytes);
+        if let Err(e) = self
+            .mls_context()
+            .record_replenish_intent(needed, &intent_identity)
+        {
+            tracing::warn!(error = %e, "Failed to record replenish intent");
+        }
         let mut batch: Vec<crate::types::KeyPackageResult> = Vec::with_capacity(needed as usize);
         for i in 0..needed {
             match self
@@ -160,6 +168,9 @@ where
                 );
                 break;
             }
+        }
+        if let Err(e) = self.mls_context().clear_replenish_intent() {
+            tracing::warn!(error = %e, "Failed to clear replenish intent");
         }
         Ok(())
     }

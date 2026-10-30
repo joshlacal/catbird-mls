@@ -14,7 +14,7 @@ use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::lifecycle::lifecycle_coordinates;
 use super::mls_provider::MlsCryptoContext;
-use super::orchestrator::MLSOrchestrator;
+use super::orchestrator::{required_inventory_expiry, MLSOrchestrator};
 use super::pagination::PaginationGuard;
 use super::reset_flow::ServerConversationState;
 use super::storage::MLSStorageBackend;
@@ -43,15 +43,7 @@ fn invalid(message: &str) -> OrchestratorError {
 }
 
 fn query_value(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                (byte as char).to_string()
-            }
-            _ => format!("%{byte:02X}"),
-        })
-        .collect()
+    super::canonical_transport::encode_query(value)
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -81,6 +73,18 @@ where
             return Err(invalid("leaf recovery requires active account membership"));
         }
         let coordinate = lifecycle_coordinates(&state.coordinates, &state.conversation_id)?;
+        if let Some(inbox) = self.batch_recovery_inbox_snapshot() {
+            if inbox.user_did == did && inbox.device_id == device {
+                required_inventory_expiry(inbox.expires_at.as_deref())?;
+                return Ok(inbox.find_open_request(
+                    &state.conversation_id,
+                    &did,
+                    &device,
+                    kind,
+                    Some(&coordinate),
+                ));
+            }
+        }
         for attempt in 0..2 {
             match self
                 .own_open_leaf_recovery_attempt(
@@ -108,7 +112,11 @@ where
             .api_client()
             .submit_prepared_request(PreparedRequest {
                 operation,
-                path,
+                path: super::canonical_transport::scope_inventory_read_path(
+                    operation,
+                    path,
+                    self.mls_context().supports_direct_request_bootstrap(),
+                ),
                 method: "GET".into(),
                 body: None,
             })
@@ -131,26 +139,65 @@ where
         device: &str,
         kind: &str,
     ) -> Result<Option<Value>> {
-        let inventory = self
-            .recovery_read_json(
-                CanonicalOperation::GetConversations,
-                format!(
-                    "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={device}&limit=100"
-                ),
-            )
-            .await?;
-        let session = inventory["inventorySessionId"]
-            .as_str()
-            .filter(|value| (32..=512).contains(&value.len()))
-            .ok_or_else(|| invalid("invalid recovery inventory session"))?;
-        let event_cursor = inventory["snapshotEventCursor"]
-            .as_str()
-            .filter(|value| (1..=512).contains(&value.len()))
-            .ok_or_else(|| invalid("invalid recovery inventory event cursor"))?;
+        let (session, event_cursor, expires_at) =
+            if let Some(snapshot) = self.batch_inventory_snapshot() {
+                if snapshot.user_did == did && snapshot.device_id == device {
+                    (
+                        snapshot.session_id.clone(),
+                        snapshot.event_cursor.clone(),
+                        snapshot.expires_at.clone(),
+                    )
+                } else {
+                    let inventory = self
+                        .recovery_read_json(
+                            CanonicalOperation::GetConversations,
+                            format!(
+                            "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
+                            query_value(device)
+                        ),
+                        )
+                        .await?;
+                    let session = inventory["inventorySessionId"]
+                        .as_str()
+                        .filter(|value| (32..=512).contains(&value.len()))
+                        .ok_or_else(|| invalid("invalid recovery inventory session"))?
+                        .to_string();
+                    let event_cursor = inventory["snapshotEventCursor"]
+                        .as_str()
+                        .filter(|value| (1..=512).contains(&value.len()))
+                        .ok_or_else(|| invalid("invalid recovery inventory event cursor"))?
+                        .to_string();
+                    let expires_at = inventory["snapshotExpiresAt"].as_str().map(str::to_string);
+                    (session, event_cursor, expires_at)
+                }
+            } else {
+                let inventory = self
+                    .recovery_read_json(
+                        CanonicalOperation::GetConversations,
+                        format!(
+                            "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
+                            query_value(device)
+                        ),
+                    )
+                    .await?;
+                let session = inventory["inventorySessionId"]
+                    .as_str()
+                    .filter(|value| (32..=512).contains(&value.len()))
+                    .ok_or_else(|| invalid("invalid recovery inventory session"))?
+                    .to_string();
+                let event_cursor = inventory["snapshotEventCursor"]
+                    .as_str()
+                    .filter(|value| (1..=512).contains(&value.len()))
+                    .ok_or_else(|| invalid("invalid recovery inventory event cursor"))?
+                    .to_string();
+                let expires_at = inventory["snapshotExpiresAt"].as_str().map(str::to_string);
+                (session, event_cursor, expires_at)
+            };
+        let expires_at = required_inventory_expiry(expires_at.as_deref())?;
         let mut cursor: Option<String> = None;
         let mut pages = PaginationGuard::for_conversations("own leaf recovery inbox");
         loop {
-            let mut path = format!("/xrpc/blue.catbird.chat.getLeafRecoveryInbox?actorDeviceId={device}&inventorySessionId={}&limit=100", query_value(session));
+            let mut path = format!("/xrpc/blue.catbird.chat.getLeafRecoveryInbox?actorDeviceId={}&inventorySessionId={}&limit=100", query_value(device), query_value(&session));
             if let Some(cursor) = &cursor {
                 path.push_str("&pageCursor=");
                 path.push_str(&query_value(cursor));
@@ -158,9 +205,10 @@ where
             let page = self
                 .recovery_read_json(CanonicalOperation::GetLeafRecoveryInbox, path)
                 .await?;
-            if page["inventorySessionId"].as_str() != Some(session)
-                || page["snapshotEventCursor"].as_str() != Some(event_cursor)
-                || page["snapshotExpiresAt"] != inventory["snapshotExpiresAt"]
+            let page_expiry = required_inventory_expiry(page["snapshotExpiresAt"].as_str())?;
+            if page["inventorySessionId"].as_str() != Some(&session)
+                || page["snapshotEventCursor"].as_str() != Some(&event_cursor)
+                || page_expiry != expires_at
             {
                 return Err(invalid("recovery inbox changed inventory session"));
             }

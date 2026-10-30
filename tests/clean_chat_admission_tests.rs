@@ -330,7 +330,11 @@ async fn fulfill_bob_recovery(f: &AdmissionFixture) -> (CanonicalState, Value) {
 async fn adopt_bob_welcome(f: &AdmissionFixture, next: &CanonicalState, welcome: &Value) {
     assert_eq!(welcome["recipientDid"], BOB);
     let bytes = STANDARD
-        .decode(welcome["opaqueWelcome"].as_str().unwrap())
+        .decode(
+            welcome["opaqueWelcome"]["$bytes"]
+                .as_str()
+                .expect("submitTransition presents lexicon bytes"),
+        )
         .unwrap();
     let joined = f
         .world
@@ -553,6 +557,7 @@ async fn authenticated_departure_reopens_as_pending_only_after_new_invitation_th
         .find(|body| body["$type"] == "blue.catbird.chat.defs#leaveCommitFulfillmentBody")
         .unwrap();
     let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: f.cid.clone(),
         sender_did: ALICE.into(),
         ciphertext: STANDARD
@@ -902,6 +907,7 @@ async fn real_reinvitation_requires_signed_departure_anchor_after_raw_removal_re
         .find(|body| body["$type"] == "blue.catbird.chat.defs#leaveCommitFulfillmentBody")
         .unwrap();
     let envelope = catbird_mls::orchestrator::IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: f.cid.clone(),
         sender_did: ALICE.into(),
         ciphertext: STANDARD
@@ -1353,9 +1359,9 @@ async fn real_native_welcome_at_newer_epoch_supersedes_a_retained_pending_gate()
     assert_eq!(bob.orchestrator.mls_context().get_conversation_policy(BOB, &f.cid).unwrap(), Some(f.state.clone()), "direct signed consent must leave the old retained policy available for this native-proof regression");
     let reserved_package = STANDARD
         .decode(
-            accepted["recovery"]["reservation"]["keyPackage"]["bytes"]
+            accepted["recovery"]["reservation"]["keyPackage"]["bytes"]["$bytes"]
                 .as_str()
-                .unwrap(),
+                .expect("acceptConversation presents lexicon bytes"),
         )
         .unwrap();
     let added = alice

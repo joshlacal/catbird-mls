@@ -353,6 +353,7 @@ async fn process_incoming_message_catches_up_missing_commits_before_decrypting()
     let result = bob
         .orchestrator
         .process_incoming_message(&IncomingEnvelope {
+            canonical_entry_json: None,
             server_epoch: Some(sent.epoch),
             ..envelope
         })

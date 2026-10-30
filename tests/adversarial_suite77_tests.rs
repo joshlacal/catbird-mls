@@ -80,6 +80,7 @@ impl ForeignPlaintextGroup {
 
 fn envelope(convo_id: &str, ciphertext: Vec<u8>, msg_id: &str) -> IncomingEnvelope {
     IncomingEnvelope {
+        canonical_entry_json: None,
         conversation_id: convo_id.to_string(),
         sender_did: "did:plc:mallory".to_string(),
         ciphertext,

@@ -18,10 +18,12 @@ use super::pagination::PaginationGuard;
 use super::storage::MLSStorageBackend;
 use super::types::*;
 
-pub(crate) enum DeferredRecoveryOutcome {
+#[derive(Debug)]
+pub enum DeferredRecoveryOutcome {
     ClearedStale,
     Skipped,
     Recovered(u64),
+    Waiting { retry_after: Duration },
 }
 
 fn credential_root_matches_exact(identity: &str, expected_root: &str) -> bool {
@@ -365,8 +367,8 @@ pub struct RecoveryTracker {
     /// When this device last opened an `add` leaf-recovery request per
     /// conversation. Re-requesting before the server TTL lapses only earns a
     /// `LeafRecoveryAlreadyOpen`; once it has lapsed unfulfilled, nobody is
-    /// coming and the caller escalates to a reset.
     leaf_recovery_requested_at: HashMap<String, Instant>,
+    leaf_recovery_expires_at: HashMap<String, Instant>,
 }
 
 /// In-memory quarantine snapshot, mirroring ConversationState::Quarantined.
@@ -386,17 +388,28 @@ impl RecoveryTracker {
             peer_bad_commits: HashMap::new(),
             quarantined: HashMap::new(),
             leaf_recovery_requested_at: HashMap::new(),
+            leaf_recovery_expires_at: HashMap::new(),
         }
     }
+    pub fn note_leaf_recovery_requested(&mut self, convo_id: &str) {
+        self.note_leaf_recovery_requested_with_ttl(convo_id, super::reset_flow::LEAF_RECOVERY_TTL);
+    }
 
-    pub(crate) fn note_leaf_recovery_requested(&mut self, convo_id: &str) {
-        self.note_leaf_recovery_requested_at(convo_id, Instant::now());
+    pub fn note_leaf_recovery_requested_with_ttl(&mut self, convo_id: &str, ttl: Duration) {
+        let now = Instant::now();
+        self.note_leaf_recovery_requested_at(convo_id, now);
+        self.leaf_recovery_expires_at
+            .insert(convo_id.to_string(), now + ttl);
     }
 
     /// Test hook: pretend the request was opened at `at`.
     pub fn note_leaf_recovery_requested_at(&mut self, convo_id: &str, at: Instant) {
         self.leaf_recovery_requested_at
             .insert(convo_id.to_string(), at);
+        self.leaf_recovery_expires_at.insert(
+            convo_id.to_string(),
+            at + super::reset_flow::LEAF_RECOVERY_TTL,
+        );
     }
 
     /// `Some(elapsed)` while a leaf-recovery request opened by this device
@@ -407,8 +420,28 @@ impl RecoveryTracker {
             .map(|at| at.elapsed())
     }
 
-    pub(crate) fn clear_leaf_recovery_wait(&mut self, convo_id: &str) {
+    /// Remaining cooldown on a live leaf recovery request. Expiry releases
+    /// the cooldown immediately.
+    pub fn leaf_recovery_cooldown_remaining(&mut self, convo_id: &str) -> Option<Duration> {
+        let now = Instant::now();
+        if let Some(expires_at) = self.leaf_recovery_expires_at.get(convo_id) {
+            if now < *expires_at {
+                return Some(*expires_at - now);
+            }
+        }
+        // Expiry releases the cooldown immediately
+        if let Some(waited) = self.leaf_recovery_wait(convo_id) {
+            if waited >= super::reset_flow::LEAF_RECOVERY_TTL {
+                self.leaf_recovery_requested_at.remove(convo_id);
+                self.leaf_recovery_expires_at.remove(convo_id);
+            }
+        }
+        None
+    }
+
+    pub fn clear_leaf_recovery_wait(&mut self, convo_id: &str) {
         self.leaf_recovery_requested_at.remove(convo_id);
+        self.leaf_recovery_expires_at.remove(convo_id);
     }
 
     pub fn cooldown_for_attempts(&self, attempts: u32) -> Duration {
@@ -576,6 +609,8 @@ impl RecoveryTracker {
     pub fn clear(&mut self, convo_id: &str) {
         let now = Instant::now();
         self.failed_rejoins.remove(convo_id);
+        self.leaf_recovery_requested_at.remove(convo_id);
+        self.leaf_recovery_expires_at.remove(convo_id);
         self.successful_rejoins.insert(convo_id.to_string(), now);
         // Record the current time globally so the MIN_REJOIN_INTERVAL applies across all convos
         self.last_global_rejoin_at = Some(now);
@@ -614,7 +649,8 @@ impl RecoveryTracker {
             }
         }
         self.failed_rejoins.remove(convo_id);
-        // Intentionally do NOT touch `successful_rejoins` or
+        self.leaf_recovery_requested_at.remove(convo_id);
+        self.leaf_recovery_expires_at.remove(convo_id);
         // `last_global_rejoin_at`. See doc comment above for rationale.
     }
 
@@ -635,7 +671,8 @@ impl RecoveryTracker {
     /// [`clear`]: RecoveryTracker::clear
     pub fn clear_stale_flag(&mut self, convo_id: &str) {
         self.failed_rejoins.remove(convo_id);
-        // Intentionally do NOT touch `successful_rejoins` or
+        self.leaf_recovery_requested_at.remove(convo_id);
+        self.leaf_recovery_expires_at.remove(convo_id);
         // `last_global_rejoin_at` — no rejoin happened here.
     }
 
@@ -649,6 +686,7 @@ impl RecoveryTracker {
         self.peer_bad_commits.remove(convo_id);
         self.quarantined.remove(convo_id);
         self.leaf_recovery_requested_at.remove(convo_id);
+        self.leaf_recovery_expires_at.remove(convo_id);
     }
 
     /// Hydrate backoff state from storage on startup (WS-5.4, invariant E7).
@@ -1194,7 +1232,7 @@ where
             .decrypt_current_metadata_snapshot(&resolved.conversation_id, &gid)
             .await
         {
-            Ok(metadata) => metadata,
+            Ok(opened) => (opened.metadata, opened.version),
             Err(error) => {
                 self.escalate_fork_to_rejoin(convo_id).await;
                 return Err(error);
@@ -1507,7 +1545,8 @@ where
         }
     }
 
-    pub(crate) async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
+    pub async fn should_attempt_sync_rejoin(&self, convo_id: &str) -> bool {
+        let short_id = &convo_id[..convo_id.len().min(8)];
         if self
             .is_local_conversation_terminal(convo_id)
             .await
@@ -1529,9 +1568,24 @@ where
                 convo_id,
                 "Skipping sync rejoin: conversation quarantined (Layer 3)"
             );
-            crate::info_log!("[gate] convo={} REJECT: quarantined (Layer 3)", convo_id);
+            crate::info_log!("[rejoin] skipped convo={} reason=quarantined", short_id);
             return false;
         }
+
+        // Live recovery request cooldown: skip while an unexpired request is outstanding
+        {
+            let mut tracker = self.recovery_tracker().lock().await;
+            if let Some(remaining) = tracker.leaf_recovery_cooldown_remaining(convo_id) {
+                drop(tracker);
+                crate::info_log!(
+                    "[rejoin] skipped convo={} reason=liveRequest retryAfter={}",
+                    short_id,
+                    remaining.as_secs()
+                );
+                return false;
+            }
+        }
+
         let rejoin_lock = self.rejoin_lock(convo_id).await;
         let lock_guard = match rejoin_lock.try_lock() {
             Ok(guard) => guard,
@@ -1540,10 +1594,7 @@ where
                     convo_id,
                     "Skipping sync-triggered join/rejoin: attempt already in-flight"
                 );
-                crate::info_log!(
-                    "[gate] convo={} REJECT: attempt already in-flight (rejoin_lock held)",
-                    convo_id
-                );
+                crate::info_log!("[rejoin] skipped convo={} reason=inFlight", short_id);
                 return false;
             }
         };
@@ -1551,12 +1602,6 @@ where
 
         // Epoch-inflation spiral guard: if we SUCCESSFULLY rejoined this
         // conversation recently and sync still thinks we need to rejoin
-        // (e.g. `ffi_has_group=false`), something is dropping our MLS state
-        // after a successful external commit. Each re-rejoin advances the
-        // server epoch, 409-ing every other device's `sendMessage`. Suppress
-        // sync-path rejoins until the cooldown elapses. Decrypt-triggered
-        // rejoins in `process_incoming_message` still go through — those have
-        // a real incoming message and a real epoch gap to close.
         if let Some(remaining) = self
             .recovery_tracker()
             .lock()
@@ -1569,8 +1614,8 @@ where
                 "Skipping sync-triggered join/rejoin: recently succeeded (spiral protection)"
             );
             crate::info_log!(
-                "[gate] convo={} REJECT: success cooldown ({}s remaining, spiral protection)",
-                convo_id,
+                "[rejoin] skipped convo={} reason=successCooldown retryAfter={}",
+                short_id,
                 remaining.as_secs()
             );
             return false;
@@ -1582,11 +1627,10 @@ where
                 error = %err,
                 "Skipping sync-triggered join/rejoin: recovery backoff active"
             );
-            crate::info_log!("[gate] convo={} REJECT: backoff active ({})", convo_id, err);
             return false;
         }
 
-        crate::info_log!("[gate] convo={} ACCEPT: proceeding with rejoin", convo_id);
+        crate::info_log!("[rejoin] proceeding convo={}", short_id);
 
         true
     }
@@ -1598,7 +1642,7 @@ where
         )
     }
 
-    pub(crate) async fn consume_deferred_recovery_for_conversation(
+    pub async fn consume_deferred_recovery_for_conversation(
         &self,
         convo_id: &str,
         server_epoch: Option<u64>,
@@ -1656,19 +1700,45 @@ where
             }
         }
 
+        {
+            let mut tracker = self.recovery_tracker().lock().await;
+            if let Some(remaining) = tracker.leaf_recovery_cooldown_remaining(convo_id) {
+                return Ok(DeferredRecoveryOutcome::Waiting {
+                    retry_after: remaining,
+                });
+            }
+            if let Some(remaining) = tracker.cooldown_remaining(convo_id) {
+                return Ok(DeferredRecoveryOutcome::Waiting {
+                    retry_after: remaining,
+                });
+            }
+        }
+
         if !self.should_attempt_sync_rejoin(convo_id).await {
             return Ok(DeferredRecoveryOutcome::Skipped);
         }
 
-        let epoch = self.join_or_rejoin(convo_id).await?;
-        Ok(DeferredRecoveryOutcome::Recovered(epoch))
+        match Box::pin(self.join_or_rejoin(convo_id)).await {
+            Ok(epoch) => Ok(DeferredRecoveryOutcome::Recovered(epoch)),
+            Err(err) if err.to_string().contains("leaf recovery pending") => {
+                let mut tracker = self.recovery_tracker().lock().await;
+                let retry_after = tracker
+                    .leaf_recovery_cooldown_remaining(convo_id)
+                    .unwrap_or(super::reset_flow::LEAF_RECOVERY_TTL);
+                Ok(DeferredRecoveryOutcome::Waiting { retry_after })
+            }
+            Err(err) => {
+                let _ = self.record_rejoin_failure(convo_id).await;
+                Err(err)
+            }
+        }
     }
 
     pub async fn run_deferred_recovery(&self, reason: &str) -> Result<DeferredRecoveryReport> {
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
         let conversations = self.storage().list_conversations(&user_did).await?;
-        let mut report = DeferredRecoveryReport {
+        let report = DeferredRecoveryReport {
             scanned: conversations.len() as u32,
             ..DeferredRecoveryReport::default()
         };
@@ -1678,7 +1748,79 @@ where
             scanned = report.scanned,
             "Starting Rust-owned deferred recovery sweep"
         );
+        let mut any_needs_recovery = false;
+        for convo in &conversations {
+            let convo_id = &convo.conversation_id;
+            let persisted_state = self
+                .storage()
+                .get_conversation_state(convo_id)
+                .await
+                .ok()
+                .flatten();
+            let needs_rejoin = self.storage().needs_rejoin(convo_id).await.unwrap_or(false);
+            let in_memory_state = if persisted_state.is_none() {
+                self.conversation_states()
+                    .lock()
+                    .await
+                    .get(convo_id)
+                    .cloned()
+            } else {
+                None
+            };
+            if needs_rejoin
+                || persisted_state
+                    .as_ref()
+                    .is_some_and(Self::state_requires_deferred_recovery)
+                || in_memory_state
+                    .as_ref()
+                    .is_some_and(Self::state_requires_deferred_recovery)
+            {
+                any_needs_recovery = true;
+                break;
+            }
+        }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        if any_needs_recovery {
+            if self.batch_inventory_snapshot().is_none() {
+                let inv = std::sync::Arc::new(self.fetch_authorized_inventory_snapshot().await?);
+                let inbox = std::sync::Arc::new(
+                    self.fetch_authorized_recovery_inbox_snapshot_with_session(
+                        &inv.session_id,
+                        &inv.event_cursor,
+                        inv.expires_at.as_deref(),
+                    )
+                    .await?,
+                );
+                return super::with_batch_inventory_scope(
+                    inv,
+                    Box::pin(super::with_batch_recovery_inbox_scope(
+                        inbox,
+                        Box::pin(self.run_deferred_recovery_inner(reason, conversations, report)),
+                    )),
+                )
+                .await;
+            } else if self.batch_recovery_inbox_snapshot().is_none() {
+                let inbox =
+                    std::sync::Arc::new(self.fetch_authorized_recovery_inbox_snapshot().await?);
+                return super::with_batch_recovery_inbox_scope(
+                    inbox,
+                    Box::pin(self.run_deferred_recovery_inner(reason, conversations, report)),
+                )
+                .await;
+            }
+        }
+
+        Box::pin(self.run_deferred_recovery_inner(reason, conversations, report))
+            .await
+    }
+
+    async fn run_deferred_recovery_inner(
+        &self,
+        reason: &str,
+        conversations: Vec<ConversationView>,
+        mut report: DeferredRecoveryReport,
+    ) -> Result<DeferredRecoveryReport> {
         for convo in conversations {
             let convo_id = convo.conversation_id;
             let persisted_state = match self.storage().get_conversation_state(&convo_id).await {
@@ -1730,12 +1872,16 @@ where
                 continue;
             }
 
-            match self
-                .consume_deferred_recovery_for_conversation(&convo_id, None, None)
-                .await
-            {
+            let outcome = Box::pin(self
+                .consume_deferred_recovery_for_conversation(&convo_id, None, None))
+                .await;
+            match outcome {
                 Ok(DeferredRecoveryOutcome::ClearedStale | DeferredRecoveryOutcome::Skipped) => {
                     report.skipped += 1;
+                }
+                Ok(DeferredRecoveryOutcome::Waiting { .. }) => {
+                    report.attempted += 1;
+                    report.waiting += 1;
                 }
                 Ok(DeferredRecoveryOutcome::Recovered(epoch)) => {
                     report.attempted += 1;
@@ -1818,9 +1964,9 @@ where
                 max_attempts = self.config().max_rejoin_attempts,
                 "Rejoin suppressed: max attempts reached, reporting recovery failure"
             );
-            crate::info_log!(
-                "[gate] convo={} REJECT: max attempts ({}) reached, reporting recovery failure",
-                convo_id,
+            crate::warn_log!(
+                "[rejoin] refused convo={} reason=maxAttempts maxAttempts={}",
+                &convo_id[..convo_id.len().min(8)],
                 self.config().max_rejoin_attempts
             );
             // Drop lock before async call
@@ -1853,10 +1999,9 @@ where
                 "Rejoin suppressed: cooldown active"
             );
             crate::info_log!(
-                "[gate] convo={} REJECT: per-convo backoff active ({}s remaining, after {} failures)",
-                convo_id,
-                remaining.as_secs(),
-                tracker.failed_attempts(convo_id)
+                "[rejoin] skipped convo={} reason=backoff retryAfter={}",
+                &convo_id[..convo_id.len().min(8)],
+                remaining.as_secs()
             );
             return Err(OrchestratorError::RecoveryFailed(format!(
                 "Rejoin suppressed for {convo_id}: cooldown active ({}s remaining)",
@@ -1875,8 +2020,8 @@ where
                     "Rejoin suppressed: minimum interval not elapsed"
                 );
                 crate::info_log!(
-                    "[gate] convo={} REJECT: global MIN_REJOIN_INTERVAL ({}s remaining)",
-                    convo_id,
+                    "[rejoin] skipped convo={} reason=minInterval retryAfter={}",
+                    &convo_id[..convo_id.len().min(8)],
                     remaining.as_secs()
                 );
                 return Err(OrchestratorError::RecoveryFailed(format!(
@@ -2157,18 +2302,18 @@ where
     async fn clear_needs_rejoin_if_locally_healthy_unlocked(&self, convo_id: &str) -> bool {
         match self.reset_pending_payload_result(convo_id).await {
             Ok(Some(_)) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} reset authority present -> keeping NeedsRejoin",
-                    convo_id
+                tracing::debug!(
+                    convo_id,
+                    "stored=NeedsRejoin reset authority present -> keeping NeedsRejoin"
                 );
                 return false;
             }
             Ok(None) => {}
             Err(err) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} reset authority read FAILED ({}) -> keeping NeedsRejoin",
+                tracing::debug!(
                     convo_id,
-                    err
+                    ?err,
+                    "stored=NeedsRejoin reset authority read FAILED -> keeping NeedsRejoin"
                 );
                 return false;
             }
@@ -2177,18 +2322,20 @@ where
         let resolved = match self.resolve_conversation_context(convo_id).await {
             Ok(resolved) => resolved,
             Err(err) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin group resolution FAILED ({}) -> keeping NeedsRejoin",
-                    convo_id, err
+                tracing::debug!(
+                    convo_id,
+                    ?err,
+                    "stored=NeedsRejoin group resolution FAILED -> keeping NeedsRejoin"
                 );
                 return false;
             }
         };
         let group_id_bytes = match resolved.group_id_bytes() {
             Err(err) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin group id invalid ({}) -> keeping NeedsRejoin",
-                    convo_id, err
+                tracing::debug!(
+                    convo_id,
+                    ?err,
+                    "stored=NeedsRejoin group id invalid -> keeping NeedsRejoin"
                 );
                 return false;
             }
@@ -2197,16 +2344,17 @@ where
         let local_epoch = match self.mls_context().get_epoch(group_id_bytes.clone()) {
             Ok(epoch) => epoch,
             Err(crate::MLSError::GroupNotFound { .. }) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin local_group=ABSENT -> keeping NeedsRejoin",
-                    convo_id
+                tracing::debug!(
+                    convo_id,
+                    "stored=NeedsRejoin local_group=ABSENT -> keeping NeedsRejoin"
                 );
                 return false;
             }
             Err(err) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin local epoch probe FAILED ({}) -> keeping NeedsRejoin",
-                    convo_id, err
+                tracing::debug!(
+                    convo_id,
+                    ?err,
+                    "stored=NeedsRejoin local epoch probe FAILED -> keeping NeedsRejoin"
                 );
                 return false;
             }
@@ -2215,16 +2363,17 @@ where
         let durable_group_state = match self.storage().get_group_state(&resolved.group_id).await {
             Ok(Some(state)) => state,
             Ok(None) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin durable group projection=ABSENT -> keeping NeedsRejoin",
-                    convo_id
+                tracing::debug!(
+                    convo_id,
+                    "stored=NeedsRejoin durable group projection=ABSENT -> keeping NeedsRejoin"
                 );
                 return false;
             }
             Err(err) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin durable group projection read FAILED ({}) -> keeping NeedsRejoin",
-                    convo_id, err
+                tracing::debug!(
+                    convo_id,
+                    ?err,
+                    "stored=NeedsRejoin durable group projection read FAILED -> keeping NeedsRejoin"
                 );
                 return false;
             }
@@ -2233,21 +2382,22 @@ where
             || durable_group_state.conversation_id != resolved.conversation_id
             || durable_group_state.epoch != local_epoch
         {
-            crate::warn_log!(
-                "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin durable projection does not match resolved crypto state (durable_epoch={} crypto_epoch={}) -> keeping NeedsRejoin",
+            tracing::debug!(
                 convo_id,
-                durable_group_state.epoch,
-                local_epoch
+                durable_epoch = durable_group_state.epoch,
+                local_epoch,
+                "stored=NeedsRejoin durable projection does not match resolved crypto state -> keeping NeedsRejoin"
             );
-            return false;
         }
 
         let members = match self.mls_context().group_member_identities(group_id_bytes) {
             Ok(members) => members,
             Err(err) => {
-                crate::warn_log!(
-                    "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin epoch={} member probe FAILED ({}) -> keeping NeedsRejoin",
-                    convo_id, local_epoch, err
+                tracing::debug!(
+                    convo_id,
+                    local_epoch,
+                    ?err,
+                    "stored=NeedsRejoin member probe FAILED -> keeping NeedsRejoin"
                 );
                 return false;
             }
@@ -2262,9 +2412,12 @@ where
         };
 
         if members.is_empty() || !self_is_member {
-            crate::warn_log!(
-                "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin epoch={} members={} self_is_member={} -> NOT locally healthy, keeping NeedsRejoin",
-                convo_id, local_epoch, members.len(), self_is_member
+            tracing::debug!(
+                convo_id,
+                local_epoch,
+                members = members.len(),
+                self_is_member,
+                "stored=NeedsRejoin NOT locally healthy, keeping NeedsRejoin"
             );
             return false;
         }
@@ -2295,14 +2448,16 @@ where
         }
         self.clear_stale_rejoin_state(convo_id).await;
 
-        crate::warn_log!(
-            "[NEEDSREJOIN-DIAG] convo={} stored=NeedsRejoin but LOCAL HEALTHY (epoch={} members={} self_is_member=true) -> cleared stale flag, projected Active (NO force_rejoin)",
-            convo_id, local_epoch, members.len()
+        tracing::debug!(
+            convo_id,
+            local_epoch,
+            members = members.len(),
+            "stored=NeedsRejoin but LOCAL HEALTHY -> cleared stale flag, projected Active"
         );
         true
     }
 
-    async fn record_rejoin_failure(&self, convo_id: &str) -> Result<()> {
+    pub(crate) async fn record_rejoin_failure(&self, convo_id: &str) -> Result<()> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         let (count, max_attempts) = {
             let mut tracker = self.recovery_tracker().lock().await;
@@ -2710,9 +2865,10 @@ where
             )));
         }
         let current_group_id = resolved.group_id_bytes()?;
-        let (metadata_plaintext, metadata_version) = self
+        let opened = self
             .decrypt_current_metadata_snapshot(&resolved.conversation_id, &current_group_id)
             .await?;
+        let (metadata_plaintext, metadata_version) = (opened.metadata, opened.version);
 
         // Fetch a fresh key package for the recipient and stage the swap. Same
         // body shape as `swap_members`, but ships through
@@ -3092,6 +3248,18 @@ where
             return Err(OrchestratorError::RecoveryFailed(format!(
                 "GroupInfo group binding mismatch for conversation {convo_id}"
             )));
+        }
+
+        if self.mls_context().supports_direct_request_bootstrap()
+            && self
+                .mls_context()
+                .list_direct_request_journal()?
+                .iter()
+                .any(|journal| journal.conversation_id == convo_id)
+        {
+            return Err(OrchestratorError::RecoveryFailed(
+                "Legacy force rejoin cannot replace request-owned custody".into(),
+            ));
         }
 
         // GroupInfo fetched successfully — now delete old local group state.
@@ -3892,10 +4060,10 @@ where
                 .await
         {
             let epoch = self.local_group_epoch(convo_id).await.unwrap_or(0);
-            crate::warn_log!(
-                "[REJOIN-DIAG] convo={} join_or_rejoin SHORT-CIRCUIT: local group already healthy (epoch={}) — NO Welcome/ExternalCommit",
+            tracing::debug!(
                 convo_id,
-                epoch
+                epoch,
+                "join_or_rejoin short-circuit: local group already healthy"
             );
             return Ok(epoch);
         }
@@ -3906,9 +4074,9 @@ where
             convo_id,
             "Attempting to join group (Welcome first, External Commit fallback)"
         );
-        crate::warn_log!(
-            "[REJOIN-DIAG] convo={} START join_or_rejoin (Welcome first, EC fallback)",
-            convo_id
+        tracing::debug!(
+            convo_id,
+            "START join_or_rejoin (Welcome first, EC fallback)"
         );
 
         // The caller already tried the full canonical Welcome envelope.
@@ -4030,6 +4198,9 @@ where
             return Ok(epoch);
         }
         self.storage().mark_needs_rejoin(convo_id).await?;
+        let _ = self
+            .project_non_reset_state_locked(convo_id, ConversationState::NeedsRejoin)
+            .await;
         // This reaches platform error UI. Retain the stable classification
         // prefix, but never embed signed control data or reserved KeyPackages.
         let request_id = outcome
@@ -4082,6 +4253,21 @@ where
 
         // 2. Clear local credentials
         self.credentials().clear_all(&user_did).await?;
+        // The Labyrinth state is bound to the old chat key, which is gone:
+        // erase it (the device restores with a recovery code later).
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        {
+            self.labyrinth_stop_archive_worker();
+            self.labyrinth_close();
+            let vault = crate::labyrinth::MlsStateVault(self.mls_context().clone());
+            if let Err(error) = crate::labyrinth::StateVault::delete(&vault, &user_did) {
+                tracing::warn!(%error, "labyrinth: erasing saved state during silent recovery failed");
+            }
+            let placements = crate::labyrinth::MlsPlacementVault(self.mls_context().clone());
+            if let Err(error) = crate::labyrinth::StateVault::delete(&placements, &user_did) {
+                tracing::warn!(%error, "labyrinth: erasing mailbox placement during silent recovery failed");
+            }
+        }
 
         // 3. Re-register device
         let _new_mls_did = self.ensure_device_registered().await?;
@@ -5280,6 +5466,18 @@ where
         &self,
         convo_id: &str,
     ) -> Result<ConversationView> {
+        let did = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        if let Some(snapshot) = self.batch_inventory_snapshot() {
+            if snapshot.user_did == did && snapshot.device_id == device {
+                if let Some(view) = snapshot.conversations.get(convo_id) {
+                    return self.restore_conversation_policy(&did, view.clone());
+                }
+                return Err(OrchestratorError::ConversationNotFound(format!(
+                    "Server did not return convo {convo_id} in inventory snapshot"
+                )));
+            }
+        }
         let mut cursor: Option<String> = None;
         let mut pagination = PaginationGuard::for_conversations("reset conversation lookup");
         loop {
@@ -5290,8 +5488,7 @@ where
             pagination.observe_page(page.conversations.len(), page.cursor.as_deref())?;
             for cv in &page.conversations {
                 if cv.conversation_id == convo_id {
-                    return self
-                        .restore_conversation_policy(&self.require_user_did().await?, cv.clone());
+                    return self.restore_conversation_policy(&did, cv.clone());
                 }
             }
             cursor = page.cursor;

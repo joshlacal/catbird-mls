@@ -1,6 +1,50 @@
 use crate::error::MLSError;
 use crate::types::*;
 
+/// Read only public TLS framing for lookup of an independently retained proof.
+/// Parsing is not authentication; callers must still match the exact ciphertext
+/// digest, owner, conversation and server entry against protected proof storage.
+pub(crate) fn private_application_echo_metadata(
+    ciphertext: &[u8],
+) -> Result<(Vec<u8>, u64, [u8; 32]), MLSError> {
+    use openmls::prelude::{ContentType, MlsMessageBodyIn, MlsMessageIn, ProtocolMessage};
+    use sha2::{Digest, Sha256};
+    use tls_codec::Deserialize as _;
+    crate::message_limits::validate_inbound_mls_message_len(ciphertext.len(), "own echo")?;
+    let parse = |raw: &[u8]| MlsMessageIn::tls_deserialize_exact(raw);
+    let message = match parse(ciphertext) {
+        Ok(message) => message,
+        Err(_) => {
+            // Historical native sends used an exact length prefix and zero
+            // bucket padding. Never infer an empty AAD from a parse failure.
+            let length = ciphertext.get(..4).ok_or(MLSError::SerializationError)?;
+            let length = u32::from_be_bytes(length.try_into().unwrap()) as usize;
+            let end = length.checked_add(4).ok_or(MLSError::SerializationError)?;
+            let raw = ciphertext.get(4..end).ok_or(MLSError::SerializationError)?;
+            if ciphertext
+                .get(end..)
+                .is_none_or(|tail| tail.iter().any(|byte| *byte != 0))
+            {
+                return Err(MLSError::SerializationError);
+            }
+            parse(raw).map_err(|_| MLSError::SerializationError)?
+        }
+    };
+    let MlsMessageBodyIn::PrivateMessage(private) = message.extract() else {
+        return Err(MLSError::SerializationError);
+    };
+    let aad_sha256 = Sha256::digest(private.aad()).into();
+    let protocol = ProtocolMessage::from(private);
+    if protocol.content_type() != ContentType::Application {
+        return Err(MLSError::SerializationError);
+    }
+    Ok((
+        protocol.group_id().as_slice().to_vec(),
+        protocol.epoch().as_u64(),
+        aad_sha256,
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnEchoProof {
     pub canonical_entry_sha256: [u8; 32],
@@ -116,8 +160,198 @@ impl<T> MlsCryptoContextBounds for T {}
 ///
 /// All methods are synchronous since the underlying crypto is CPU-bound.
 pub trait MlsCryptoContext: MlsCryptoContextBounds {
+    fn decrypt_direct_request_introduction(
+        &self,
+        _input: &super::direct_request_bootstrap::DirectRequestWelcomeInput,
+    ) -> Result<super::direct_request_bootstrap::DirectRequestIntroductionResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request introduction unavailable".into(),
+        })
+    }
+    fn process_direct_request_welcome(
+        &self,
+        _input: &super::direct_request_bootstrap::DirectRequestWelcomeInput,
+    ) -> Result<WelcomeResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request Welcome unavailable".into(),
+        })
+    }
+    fn supports_direct_request_bootstrap(&self) -> bool {
+        false
+    }
+    fn prepare_direct_request_bootstrap(
+        &self,
+        _input: &super::direct_request_bootstrap::DirectRequestBootstrapInput,
+    ) -> Result<super::direct_request_journal::DirectRequestJournal, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request bootstrap unavailable".into(),
+        })
+    }
+    fn list_direct_request_journal(
+        &self,
+    ) -> Result<Vec<super::direct_request_journal::DirectRequestJournal>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request journal unavailable".into(),
+        })
+    }
+    fn persist_direct_request_publish(
+        &self,
+        _request_id: &str,
+        _exact_signed_bytes: &[u8],
+    ) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request publication unavailable".into(),
+        })
+    }
+    fn confirm_published_bootstrap(
+        &self,
+        _request_id: &str,
+        _receipt: &[u8],
+        _pinned_authority_key: &[u8],
+    ) -> Result<super::direct_request_journal::DirectRequestJournal, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request adoption unavailable".into(),
+        })
+    }
+    fn abandon_rejected_bootstrap(
+        &self,
+        _request_id: &str,
+        _receipt: &[u8],
+        _pinned_authority_key: &[u8],
+    ) -> Result<super::direct_request_journal::DirectRequestJournal, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request rejection unavailable".into(),
+        })
+    }
+    fn mark_direct_request_projected(&self, _request_id: &str) -> Result<(), MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request projection unavailable".into(),
+        })
+    }
+    fn read_direct_request_intent(&self, _draft_id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request intent unavailable".into(),
+        })
+    }
+    fn compare_exchange_direct_request_intent(
+        &self,
+        _draft_id: &str,
+        _expected: Option<&[u8]>,
+        _next: &[u8],
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request intent unavailable".into(),
+        })
+    }
+    fn list_direct_request_intents(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request intent unavailable".into(),
+        })
+    }
+    fn read_direct_request_projection(
+        &self,
+        _conversation_id: &str,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request projection unavailable".into(),
+        })
+    }
+    fn compare_exchange_direct_request_projection(
+        &self,
+        _conversation_id: &str,
+        _expected: Option<&[u8]>,
+        _next: &[u8],
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request projection unavailable".into(),
+        })
+    }
+    fn commit_closed_direct_request_projection(
+        &self,
+        _cid: &str,
+        _expected: &[u8],
+        _next: &[u8],
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "atomic request close custody unavailable".into(),
+        })
+    }
+    fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request projection unavailable".into(),
+        })
+    }
+
+    fn read_request_value(&self, _namespace: &str, _id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+    fn compare_exchange_request_value(
+        &self,
+        _namespace: &str,
+        _id: &str,
+        _expected: Option<&[u8]>,
+        _next: &[u8],
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+    fn list_request_values(&self, _namespace: &str) -> Result<Vec<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+    /// Deletes one request value; `Ok(false)` if it did not exist.
+    fn delete_request_value(&self, _namespace: &str, _id: &str) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+    fn request_values_total_bytes(&self, _namespace: &str) -> Result<u64, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "request value storage unavailable".into(),
+        })
+    }
+
+    fn read_direct_request_key_publication(
+        &self,
+        _device: &str,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request key publication unavailable".into(),
+        })
+    }
+    fn prepare_direct_request_key_publication(
+        &self,
+        _input: &super::direct_request_keys::DirectRequestKeyPublicationInput,
+        _expected: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "atomic request key custody unavailable".into(),
+        })
+    }
+    fn acknowledge_direct_request_key_publication(
+        &self,
+        _device: &str,
+        _expected: &[u8],
+        _next: &[u8],
+    ) -> Result<bool, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "durable request key publication unavailable".into(),
+        })
+    }
+
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError>;
 
+    fn record_replenish_intent(&self, _needed: u32, _identity: &str) -> Result<String, MLSError> {
+        Ok(String::new())
+    }
+
+    fn clear_replenish_intent(&self) -> Result<(), MLSError> {
+        Ok(())
+    }
     fn create_last_resort_key_package(
         &self,
         _identity: Vec<u8>,
@@ -404,6 +638,21 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         group_id: Vec<u8>,
         plaintext: Vec<u8>,
     ) -> Result<EncryptResult, MLSError>;
+
+    /// Encrypt a canonical application artifact with its already-bound metadata.
+    /// Check the expected epoch under the same crypto mutation lock; return raw
+    /// MLS TLS framing, never the legacy length-prefixed padding envelope.
+    fn encrypt_message_with_aad(
+        &self,
+        _group_id: Vec<u8>,
+        _plaintext: Vec<u8>,
+        _aad: Vec<u8>,
+        _expected_epoch: u64,
+    ) -> Result<EncryptResult, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "canonical application encryption is unavailable".into(),
+        })
+    }
 
     fn decrypt_message(
         &self,
@@ -806,6 +1055,28 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
     ) -> Result<Vec<u8>, MLSError> {
         Err(MLSError::OperationNotSupported {
             reason: "export_metadata_key_from_pending not available on this platform".to_string(),
+        })
+    }
+    /// Canonical (request-bootstrap) metadata key at the group's current
+    /// epoch, for the metadata coordinate `coordinates`.
+    fn export_canonical_metadata_key(
+        &self,
+        _group_id: Vec<u8>,
+        _coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "export_canonical_metadata_key not available on this platform".to_string(),
+        })
+    }
+    /// Canonical metadata key of the successor epoch a pending commit creates.
+    fn export_canonical_metadata_key_from_pending(
+        &self,
+        _group_id: Vec<u8>,
+        _coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        Err(MLSError::OperationNotSupported {
+            reason: "export_canonical_metadata_key_from_pending not available on this platform"
+                .to_string(),
         })
     }
 

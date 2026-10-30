@@ -697,9 +697,10 @@ mod tests {
         .expect("encrypt metadata snapshot");
         let mut metadata_snapshot = alice
             .orchestrator
-            .fetch_current_metadata_snapshot(&conversation.conversation_id)
+            .fetch_current_metadata_state(&conversation.conversation_id)
             .await
-            .expect("fetch metadata snapshot");
+            .expect("fetch metadata snapshot")["metadataSnapshot"]
+            .clone();
         metadata_snapshot["coordinate"]["epoch"] = serde_json::json!(1);
         metadata_snapshot["nonce"] =
             serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&nonce));
@@ -827,9 +828,10 @@ mod tests {
         .expect("encrypt metadata snapshot");
         let mut metadata_snapshot = alice
             .orchestrator
-            .fetch_current_metadata_snapshot(&conversation.conversation_id)
+            .fetch_current_metadata_state(&conversation.conversation_id)
             .await
-            .expect("fetch metadata snapshot");
+            .expect("fetch metadata snapshot")["metadataSnapshot"]
+            .clone();
         metadata_snapshot["coordinate"]["epoch"] = serde_json::json!(local_epoch);
         metadata_snapshot["nonce"] =
             serde_json::json!(base64::engine::general_purpose::STANDARD.encode(nonce));
@@ -873,9 +875,10 @@ mod tests {
             .set_conversation_epoch_for_test(&conversation.conversation_id, local_epoch);
         let mut metadata_snapshot = alice
             .orchestrator
-            .fetch_current_metadata_snapshot(&conversation.conversation_id)
+            .fetch_current_metadata_state(&conversation.conversation_id)
             .await
-            .expect("fetch metadata snapshot");
+            .expect("fetch metadata snapshot")["metadataSnapshot"]
+            .clone();
         metadata_snapshot["ciphertext"] = serde_json::json!("not-base64");
         world
             .delivery_service()
@@ -2314,9 +2317,9 @@ mod tests {
         let welcome = STANDARD
             .decode(
                 initial["entry"]["signedRequest"]["body"]["manifest"]["welcomeBundle"]
-                    ["opaqueWelcome"]
+                    ["opaqueWelcome"]["$bytes"]
                     .as_str()
-                    .unwrap(),
+                    .expect("submitTransition presents lexicon bytes"),
             )
             .unwrap();
         world
@@ -4142,6 +4145,12 @@ where
     /// creation transition ID and submits it to `blue.catbird.chat.acceptConversation`.
     pub async fn accept_conversation(&self, conversation_id: &str) -> Result<serde_json::Value> {
         self.check_shutdown().await?;
+        if Box::pin(self.known_direct_request(conversation_id)).await? {
+            Box::pin(self.refresh_request_preview(conversation_id)).await?;
+            if let Some(result) = Box::pin(self.try_accept_direct_request(conversation_id)).await? {
+                return Ok(result);
+            }
+        }
         let user_did = self.require_user_did().await?;
         let actor_device_id = self.require_actor_device_id().await?;
 
@@ -4180,6 +4189,17 @@ where
         let state_obj = state_val.get("state").ok_or_else(|| {
             OrchestratorError::Api("getConversationState response missing state".into())
         })?;
+        if state_obj
+            .get("directRequest")
+            .is_some_and(|value| !value.is_null())
+        {
+            Box::pin(self.refresh_request_preview(&convo_uuid_str)).await?;
+            return Box::pin(self.try_accept_direct_request(&convo_uuid_str))
+                .await?
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("Request publication proof unavailable".into())
+                });
+        }
         let latest_coord = state_obj.get("coordinates").cloned().ok_or_else(|| {
             OrchestratorError::Api("conversation state missing coordinates".into())
         })?;
@@ -4274,6 +4294,14 @@ where
         prior_coord: serde_json::Value,
     ) -> Result<serde_json::Value> {
         self.check_shutdown().await?;
+        if Box::pin(self.known_direct_request(conversation_id)).await? {
+            Box::pin(self.refresh_request_preview(conversation_id)).await?;
+            return Box::pin(self.try_accept_direct_request(conversation_id))
+                .await?
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput("Request acceptance proof unavailable".into())
+                });
+        }
         let user_did = self.require_user_did().await?;
         let actor_device_id = self.require_actor_device_id().await?;
         let auth_generation = self
@@ -4380,6 +4408,29 @@ where
         let key_id = super::canonical_transport::derive_key_id(&public_key);
         let prior_coord = state.prior_json()?;
 
+        // Before minting a new recovery request, consult the recovery inbox
+        // the pass already holds and reuse any live, unexpired request.
+        if let Some(inbox) = self.batch_recovery_inbox_snapshot() {
+            if let Some(existing) = inbox.find_open_request(
+                &state.conversation_id,
+                &user_did,
+                &actor_device_id,
+                recovery_kind,
+                None,
+            ) {
+                let req_id = existing
+                    .get("recoveryRequestId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                crate::info_log!(
+                    "[rejoin] reused convo={} outcome=liveRequestReused request={}",
+                    &state.conversation_id[..state.conversation_id.len().min(8)],
+                    &req_id[..req_id.len().min(8)]
+                );
+                return Ok(serde_json::json!({ "recovery": existing }));
+            }
+        }
+
         let recovery_request_id = uuid::Uuid::new_v4().to_string();
         let body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#leafRecoveryRequestBody",
@@ -4421,6 +4472,11 @@ where
 
         let output: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))?;
+        crate::info_log!(
+            "[rejoin] requested convo={} outcome=leafRecoveryRequested request={}",
+            &state.conversation_id[..state.conversation_id.len().min(8)],
+            &recovery_request_id[..recovery_request_id.len().min(8)]
+        );
         Ok(output)
     }
     pub async fn fulfill_leaf_recovery(&self, conversation_id: &str) -> Result<serde_json::Value> {
@@ -4658,8 +4714,12 @@ where
         })?;
         let avatar_binding = pm.get("avatarBinding").cloned();
 
-        let metadata_plaintext =
-            self.decrypt_metadata_snapshot_value(&pm, &group_id_bytes, metadata_version as u64)?;
+        let opened_metadata = self.open_metadata_snapshot(
+            &pm,
+            &super::metadata_snapshot::MetadataScheme::recorded(state),
+            &resolved.conversation_id,
+            &group_id_bytes,
+        )?;
 
         let mut aad_prior = prior.clone();
         if let Some(obj) = aad_prior.as_object_mut() {
@@ -4731,28 +4791,21 @@ where
             "lifecycle": "active"
         });
 
-        let metadata_key = self
-            .mls_context()
-            .export_metadata_key_from_pending(group_id_bytes.clone(), target_epoch)?;
-        let metadata_key_arr: [u8; 32] = metadata_key.as_slice().try_into().map_err(|_| {
-            OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
-        })?;
         use rand::RngCore;
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
-        let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
-            &metadata_key_arr,
+        let ciphertext = self.reseal_metadata_from_pending(
+            &opened_metadata,
             &group_id_bytes,
-            target_epoch,
-            metadata_version as u64,
+            &super::metadata_snapshot::SuccessorCoordinate {
+                conversation_id: &resolved.conversation_id,
+                generation: generation as u64,
+                epoch: target_epoch,
+                group_context_hash: &next_gch,
+                confirmation_tag: &next_tag,
+            },
             &nonce,
-            &metadata_plaintext,
-        )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt metadata snapshot: {e:?}"
-            )))
-        })?;
+        )?;
         tracing::debug!(
             ciphertext_len = ciphertext.len(),
             "Re-encrypted metadata ciphertext"
@@ -5531,15 +5584,14 @@ where
 
         use base64::Engine as _;
         use sha2::Digest;
-        let prior_snapshot = self
-            .fetch_current_metadata_snapshot(conversation_id)
-            .await?;
-        let prior_version = prior_snapshot
-            .get("metadataVersion")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| {
-                OrchestratorError::InvalidInput("metadataSnapshot.metadataVersion missing".into())
-            })?;
+        let prior_state = self.fetch_current_metadata_state(conversation_id).await?;
+        let prior_snapshot = prior_state["metadataSnapshot"].clone();
+        let opened_metadata = self.open_metadata_snapshot(
+            &prior_snapshot,
+            &super::metadata_snapshot::MetadataScheme::recorded(&prior_state),
+            conversation_id,
+            &group_id_bytes,
+        )?;
         let decode_bytes = |value: Option<&serde_json::Value>| -> Result<Vec<u8>> {
             let encoded = value
                 .and_then(|v| {
@@ -5554,32 +5606,11 @@ where
                 .decode(encoded)
                 .map_err(|e| OrchestratorError::Serialization(e.to_string()))
         };
-        let prior_nonce: [u8; 12] = decode_bytes(prior_snapshot.get("nonce"))?
-            .try_into()
-            .map_err(|_| {
-                OrchestratorError::InvalidInput("metadataSnapshot.nonce must be 12 bytes".into())
-            })?;
+        let prior_nonce = decode_bytes(prior_snapshot.get("nonce"))?;
         let prior_ciphertext = decode_bytes(prior_snapshot.get("ciphertext"))?;
-        let prior_key: [u8; 32] = self
-            .mls_context()
-            .export_metadata_key(group_id_bytes.clone(), current_epoch)?
-            .try_into()
-            .map_err(|_| {
-                OrchestratorError::Mls(MLSError::Internal("metadata key length mismatch".into()))
-            })?;
-        let metadata = crate::metadata::decrypt_metadata_snapshot(
-            &prior_key,
-            &group_id_bytes,
-            current_epoch,
-            prior_version,
-            &prior_nonce,
-            &prior_ciphertext,
-        )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "decrypt current metadata: {e:?}"
-            )))
-        })?;
+        let generation = prior_snapshot["coordinate"]["generation"]
+            .as_u64()
+            .unwrap_or(0);
 
         let member_identities: Vec<Vec<u8>> = member_dids
             .iter()
@@ -5605,31 +5636,21 @@ where
         use rand::RngCore;
         let mut next_nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut next_nonce);
-        if next_nonce == prior_nonce {
+        if next_nonce.as_slice() == prior_nonce.as_slice() {
             next_nonce[0] ^= 1;
         }
-        let pending_key: [u8; 32] = self
-            .mls_context()
-            .export_metadata_key_from_pending(group_id_bytes.clone(), target_epoch)?
-            .try_into()
-            .map_err(|_| {
-                OrchestratorError::Mls(MLSError::Internal(
-                    "pending metadata key length mismatch".into(),
-                ))
-            })?;
-        let next_ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
-            &pending_key,
+        let next_ciphertext = self.reseal_metadata_from_pending(
+            &opened_metadata,
             &group_id_bytes,
-            target_epoch,
-            prior_version,
+            &super::metadata_snapshot::SuccessorCoordinate {
+                conversation_id,
+                generation,
+                epoch: target_epoch,
+                group_context_hash: &next_gch,
+                confirmation_tag: &next_tag,
+            },
             &next_nonce,
-            &metadata,
-        )
-        .map_err(|e| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "encrypt removal metadata: {e:?}"
-            )))
-        })?;
+        )?;
         if next_ciphertext.len() != prior_ciphertext.len() {
             let _ = self
                 .mls_context()
@@ -5651,7 +5672,7 @@ where
             "confirmationTag": base64::engine::general_purpose::STANDARD.encode(&next_tag),
             "conversationId": base64::engine::general_purpose::STANDARD.encode(aad_ctx.convo_uuid.as_bytes()),
             "epoch": target_epoch,
-            "generation": 0,
+            "generation": generation,
             "groupContextHash": base64::engine::general_purpose::STANDARD.encode(&next_gch),
             "groupId": base64::engine::general_purpose::STANDARD.encode(&group_id_bytes)
         });
@@ -5886,34 +5907,10 @@ where
         self.leave_group(convo_id).await
     }
 
-    /// Leave a group via self-remove: propose own removal, send to group, then
-    /// notify the server and clean up locally.
+    /// Compatibility entrypoint for the canonical authenticated leave flow.
+    /// A private MLS proposal is not an application message and must never be
+    /// wrapped in the signed application-send endpoint.
     pub async fn leave_via_self_remove(&self, convo_id: &str) -> Result<()> {
-        self.check_shutdown().await?;
-        let _user_did = self.require_user_did().await?;
-
-        tracing::info!(convo_id, "Leaving group via self-remove proposal");
-
-        let resolved = self.resolve_conversation_context(convo_id).await?;
-        let group_id_bytes = resolved.group_id_bytes()?;
-
-        let proposal_bytes = self
-            .mls_context()
-            .propose_self_remove(group_id_bytes.clone())?;
-
-        let epoch = {
-            let states = self.group_states().lock().await;
-            resolved
-                .group_state(&states)
-                .map(|gs| gs.epoch)
-                .unwrap_or(0)
-        };
-
-        let message_id = uuid::Uuid::new_v4().to_string();
-        let _ = self
-            .send_message_prepared(convo_id, &proposal_bytes, epoch, &message_id)
-            .await;
-
         self.leave_group(convo_id).await
     }
 
@@ -7178,9 +7175,10 @@ where
             if let (Some(ct), Some(mv)) = (custom_metadata_ciphertext, custom_metadata_version) {
                 (ct, mv)
             } else {
-                let (metadata_plaintext, target_mv) = self
+                let opened = self
                     .decrypt_current_metadata_snapshot(conversation_id, group_id)
                     .await?;
+                let (metadata_plaintext, target_mv) = (opened.metadata, opened.version);
                 let metadata_key_arr: [u8; 32] = self
                     .mls_context()
                     .export_metadata_key_from_pending(group_id.to_vec(), target_epoch)?
@@ -7685,16 +7683,19 @@ where
         }
         Ok(())
     }
-    pub(crate) async fn fetch_current_metadata_snapshot(
+    /// Current inventory state of `conversation_id`, which carries both its
+    /// `metadataSnapshot` and the record of the scheme that sealed it.
+    pub(crate) async fn fetch_current_metadata_state(
         &self,
         conversation_id: &str,
     ) -> Result<serde_json::Value> {
         let actor_device_id = self.require_actor_device_id().await?;
         let request = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={actor_device_id}&limit=50"
-            ),
+            path: super::canonical_transport::scope_inventory_read_path(
+                super::canonical_transport::CanonicalOperation::GetConversations,
+                format!("/xrpc/blue.catbird.chat.getConversations?actorDeviceId={actor_device_id}&limit=50"),
+                self.mls_context().supports_direct_request_bootstrap()),
             method: "GET".to_string(),
             body: None,
         };
@@ -7714,12 +7715,9 @@ where
                         == Some(conversation_id)
                 })
             })
-            .and_then(|item| {
-                item.get("state")
-                    .unwrap_or(item)
-                    .get("metadataSnapshot")
-                    .cloned()
-            })
+            .map(|item| item.get("state").unwrap_or(item))
+            .filter(|state| state.get("metadataSnapshot").is_some())
+            .cloned()
             .ok_or_else(|| {
                 OrchestratorError::Api(
                     "metadataSnapshot missing from current conversation state".into(),
@@ -7727,88 +7725,19 @@ where
             })
     }
 
-    /// Decrypt a canonical `metadataSnapshot` (12-byte nonce carried beside
-    /// `ciphertext || tag`) with the metadata key of the epoch it was sealed at.
-    pub(crate) fn decrypt_metadata_snapshot_value(
-        &self,
-        snapshot: &serde_json::Value,
-        group_id: &[u8],
-        metadata_version: u64,
-    ) -> Result<crate::metadata::GroupMetadataV1> {
-        let metadata_epoch = snapshot
-            .pointer("/coordinate/epoch")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| {
-                OrchestratorError::InvalidInput(
-                    "prior metadataSnapshot.coordinate.epoch missing".into(),
-                )
-            })?;
-        let decode_bytes = |field: &str| -> Result<Vec<u8>> {
-            let value = snapshot.get(field).ok_or_else(|| {
-                OrchestratorError::InvalidInput(format!("prior metadataSnapshot.{field} missing"))
-            })?;
-            let encoded = value
-                .get("$bytes")
-                .and_then(|bytes| bytes.as_str())
-                .or_else(|| value.as_str())
-                .ok_or_else(|| {
-                    OrchestratorError::InvalidInput(format!(
-                        "prior metadataSnapshot.{field} is not bytes"
-                    ))
-                })?;
-            STANDARD.decode(encoded).map_err(|error| {
-                OrchestratorError::Serialization(format!(
-                    "invalid prior metadataSnapshot.{field}: {error}"
-                ))
-            })
-        };
-        let nonce: [u8; 12] = decode_bytes("nonce")?.try_into().map_err(|_| {
-            OrchestratorError::InvalidInput("prior metadataSnapshot.nonce must be 12 bytes".into())
-        })?;
-        let ciphertext = decode_bytes("ciphertext")?;
-        let key: [u8; 32] = self
-            .mls_context()
-            .export_metadata_key(group_id.to_vec(), metadata_epoch)?
-            .try_into()
-            .map_err(|_| {
-                OrchestratorError::Mls(MLSError::Internal(
-                    "prior metadata key length mismatch".into(),
-                ))
-            })?;
-        crate::metadata::decrypt_metadata_snapshot(
-            &key,
-            group_id,
-            metadata_epoch,
-            metadata_version,
-            &nonce,
-            &ciphertext,
-        )
-        .map_err(|error| {
-            OrchestratorError::Mls(MLSError::Internal(format!(
-                "decrypt prior metadata snapshot: {error:?}"
-            )))
-        })
-    }
-
+    /// Open the current snapshot of `conversation_id` with its recorded scheme.
     pub(crate) async fn decrypt_current_metadata_snapshot(
         &self,
         conversation_id: &str,
         group_id: &[u8],
-    ) -> Result<(crate::metadata::GroupMetadataV1, u64)> {
-        let snapshot = self
-            .fetch_current_metadata_snapshot(conversation_id)
-            .await?;
-        let metadata_version = snapshot
-            .get("metadataVersion")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| {
-                OrchestratorError::InvalidInput(
-                    "prior metadataSnapshot.metadataVersion missing".into(),
-                )
-            })?;
-        let metadata =
-            self.decrypt_metadata_snapshot_value(&snapshot, group_id, metadata_version)?;
-        Ok((metadata, metadata_version))
+    ) -> Result<super::metadata_snapshot::OpenedMetadata> {
+        let state = self.fetch_current_metadata_state(conversation_id).await?;
+        self.open_metadata_snapshot(
+            &state["metadataSnapshot"],
+            &super::metadata_snapshot::MetadataScheme::recorded(&state),
+            conversation_id,
+            group_id,
+        )
     }
 
     pub(crate) async fn fetch_current_conversation_state_and_coordinates(
@@ -7818,9 +7747,13 @@ where
         let actor_device_id = self.require_actor_device_id().await?;
         let convos_req = super::canonical_transport::PreparedRequest {
             operation: super::canonical_transport::CanonicalOperation::GetConversations,
-            path: format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
-                actor_device_id
+            path: super::canonical_transport::scope_inventory_read_path(
+                super::canonical_transport::CanonicalOperation::GetConversations,
+                format!(
+                    "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
+                    actor_device_id
+                ),
+                self.mls_context().supports_direct_request_bootstrap(),
             ),
             method: "GET".to_string(),
             body: None,

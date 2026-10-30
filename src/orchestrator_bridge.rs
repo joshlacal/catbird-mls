@@ -42,6 +42,19 @@ pub(crate) mod bridge_mappers;
 /// can use actors/dispatch internally.
 #[uniffi::export(callback_interface)]
 pub trait OrchestratorStorageCallback: Send + Sync {
+    /// Commit an account-scoped canonical projection and exact alias retirement
+    /// in one durable host transaction. See ConversationProjectionCommitRequest
+    /// and ConversationProjectionCommitOutcome for the strict JSON contract.
+    fn commit_conversation_projection_json(
+        &self,
+        request_json: String,
+    ) -> Result<String, OrchestratorBridgeError> {
+        let _ = request_json;
+        Err(OrchestratorBridgeError::Storage {
+            message: "Atomic conversation projection callback is unavailable".into(),
+        })
+    }
+
     fn ensure_conversation_exists(
         &self,
         user_did: String,
@@ -268,6 +281,14 @@ pub struct FFIGatewayResponse {
     pub body: Vec<u8>,
 }
 
+/// One extra HTTP header of a Labyrinth request
+/// ([`OrchestratorAPICallback::submit_labyrinth_request`]).
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FFILabyrinthHeader {
+    pub name: String,
+    pub value: String,
+}
+
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct FFIDeliveryStatusPair {
     pub message_id: String,
@@ -339,11 +360,144 @@ pub trait OrchestratorAPICallback: Send + Sync {
         group_id_hex: String,
         blob_locator: String,
     ) -> Result<Vec<u8>, OrchestratorBridgeError>;
+
+    // ── Labyrinth history backup (feature `labyrinth`) ──────────────────
+    //
+    // Rust never holds the account's atproto session, so every Labyrinth
+    // request leaves through the platform. Each method has a refusing
+    // default so platforms that have not adopted Labyrinth fail closed.
+    // These methods are not feature-gated: UniFFI's callback-interface
+    // scaffolding cannot carry `#[cfg]` on a method, so they are part of
+    // every build's FFI surface (only the `labyrinth` feature calls them).
+
+    /// Send one `blue.catbird.labyrinth.*` XRPC to the account's mls-ds.
+    ///
+    /// Attach an atproto service-auth JWT whose `lxm` is `nsid` and whose
+    /// `aud` is the delivery service, exactly as for
+    /// `submit_prepared_request`. `path` is `/xrpc/{nsid}` plus the
+    /// already-encoded query string (it carries `actorDeviceId`); send it
+    /// verbatim. Send every `headers` entry unchanged: on procedures they
+    /// are `catbird-labyrinth-write` and `catbird-labyrinth-write-signature`,
+    /// the device-signed write body mls-ds verifies. `body` is the JSON
+    /// body of a procedure (`method` = `POST`), absent on queries (`GET`).
+    /// Return the raw response, including non-2xx statuses with their
+    /// atproto error body: Rust maps the error names.
+    fn submit_labyrinth_request(
+        &self,
+        method: String,
+        nsid: String,
+        path: String,
+        body: Option<Vec<u8>>,
+        headers: Vec<FFILabyrinthHeader>,
+    ) -> Result<FFIGatewayResponse, OrchestratorBridgeError> {
+        let _ = (method, path, body, headers);
+        Err(OrchestratorBridgeError::Api {
+            message: format!("this gateway does not implement Labyrinth requests ({nsid})"),
+        })
+    }
+
+    /// True once the platform implements the three `*_labyrinth_mailbox_keys`
+    /// methods below. Rust then publishes every epoch to the PDS as well and
+    /// cross-checks peers' PDS records against mls-ds ([CB-28], [CB-29]).
+    fn labyrinth_pds_enabled(&self) -> bool {
+        false
+    }
+
+    /// `com.atproto.repo.putRecord` of `record` (JSON, `$type` included) into
+    /// the signed-in account's repo, collection
+    /// `blue.catbird.labyrinth.mailboxKeys`, rkey `rkey` (`self` or a
+    /// 12-digit epoch number). Create or replace.
+    fn put_labyrinth_mailbox_keys(
+        &self,
+        rkey: String,
+        record: Vec<u8>,
+    ) -> Result<(), OrchestratorBridgeError> {
+        let _ = (rkey, record);
+        Err(OrchestratorBridgeError::Api {
+            message: "PDS mailboxKeys publication is not implemented".into(),
+        })
+    }
+
+    /// `com.atproto.repo.getRecord` of `blue.catbird.labyrinth.mailboxKeys`
+    /// / `rkey` from `did`'s repo (resolve its PDS). Return the record value
+    /// JSON, or `None` when the record (or the repo) does not exist.
+    fn get_labyrinth_mailbox_keys(
+        &self,
+        did: String,
+        rkey: String,
+    ) -> Result<Option<Vec<u8>>, OrchestratorBridgeError> {
+        let _ = (did, rkey);
+        Err(OrchestratorBridgeError::Api {
+            message: "PDS mailboxKeys lookup is not implemented".into(),
+        })
+    }
+
+    /// Delete every `blue.catbird.labyrinth.mailboxKeys` record in the
+    /// signed-in account's repo (account deletion).
+    fn delete_labyrinth_mailbox_keys(&self) -> Result<(), OrchestratorBridgeError> {
+        Err(OrchestratorBridgeError::Api {
+            message: "PDS mailboxKeys deletion is not implemented".into(),
+        })
+    }
+
+    /// True once the platform implements owner OAuth Space operations and
+    /// verified foreign conversation getRecord. This is adapter capability,
+    /// not a claim that the current host supports Spaces. Rust probes the
+    /// host and pins placement; unavailable adapters report false.
+    fn labyrinth_space_enabled(&self) -> bool {
+        false
+    }
+
+    /// Send one allowlisted `com.atproto.space.*` XRPC. Owner operations use
+    /// the account's OAuth session. Foreign conversation getRecord must
+    /// verify the credential response MAC, requested URI and CID before
+    /// returning success. `nsid` always starts with
+    /// `com.atproto.space.`; `path` is `/xrpc/{nsid}` plus the
+    /// already-encoded query string, sent verbatim; `body` is the JSON body
+    /// of a procedure (`method` = `POST`), absent on queries (`GET`).
+    /// Return the raw response, including non-2xx statuses with their
+    /// atproto error body.
+    fn submit_labyrinth_space_request(
+        &self,
+        method: String,
+        nsid: String,
+        path: String,
+        body: Option<Vec<u8>>,
+    ) -> Result<FFIGatewayResponse, OrchestratorBridgeError> {
+        let _ = (method, path, body);
+        Err(OrchestratorBridgeError::Api {
+            message: format!("this gateway does not reach the account's PDS Space ({nsid})"),
+        })
+    }
 }
 
 /// Credential store callback interface for Swift/Kotlin.
 #[uniffi::export(callback_interface)]
 pub trait OrchestratorCredentialCallback: Send + Sync {
+    /// Authenticated resolution of the expected authority DID document.
+    /// Rust checks the receipt method and persists the trusted historical method.
+    fn direct_request_receipt_authority_document(
+        &self,
+        expected_authority_did: String,
+    ) -> Result<Option<Vec<u8>>, OrchestratorBridgeError> {
+        let _ = expected_authority_did;
+        Ok(None)
+    }
+    /// Resolve verified account-home chat declaration for an actor DID from authenticated PDS.
+    /// Returns:
+    /// - Ok(Some(did)) if verified blue.catbird.chat.declaration/self declares deliveryService: did
+    /// - Ok(None) ONLY when verified getRecord returns 404 RecordNotFound
+    /// - Err(Credential) if declaration resolution is unavailable or failed (FAIL-CLOSED)
+    fn get_chat_declaration_authority(
+        &self,
+        user_did: String,
+    ) -> Result<Option<String>, OrchestratorBridgeError> {
+        let _ = user_did;
+        Err(OrchestratorBridgeError::Credential {
+            message: "Chat declaration resolution unavailable".into(),
+        })
+    }
+
     fn store_signing_key(
         &self,
         user_did: String,
@@ -579,6 +733,7 @@ pub struct FFIMessagesPage {
 
 #[derive(uniffi::Record, Clone)]
 pub struct FFIIncomingEnvelope {
+    pub canonical_entry_json: Option<String>,
     pub conversation_id: String,
     pub sender_did: String,
     pub ciphertext: Vec<u8>,
@@ -590,6 +745,7 @@ pub struct FFIIncomingEnvelope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum FFIEngineEventKind {
+    RequestReceived,
     ConversationUpdated,
     MessageInserted,
     RecoveryStateChanged,
@@ -1342,6 +1498,7 @@ pub(crate) fn ffi_incoming_envelope_to_internal(
             )
         })?;
     let result = IncomingEnvelope {
+        canonical_entry_json: envelope.canonical_entry_json,
         conversation_id: envelope.conversation_id,
         sender_did: envelope.sender_did,
         ciphertext: envelope.ciphertext,
@@ -1356,6 +1513,15 @@ pub(crate) fn ffi_incoming_envelope_to_internal(
 
 fn engine_event_to_ffi(event: &EngineEvent) -> FFIEngineEvent {
     match event {
+        EngineEvent::RequestReceived {
+            convo_id,
+            message_id,
+        } => FFIEngineEvent {
+            kind: FFIEngineEventKind::RequestReceived,
+            conversation_id: convo_id.clone(),
+            message_id: message_id.clone(),
+            recovery_state: None,
+        },
         EngineEvent::ConversationUpdated { convo_id } => FFIEngineEvent {
             kind: FFIEngineEventKind::ConversationUpdated,
             conversation_id: convo_id.clone(),
@@ -1513,6 +1679,26 @@ fn bridge_err(e: OrchestratorBridgeError) -> OrchestratorError {
 
 #[async_trait::async_trait]
 impl MLSStorageBackend for StorageAdapter {
+    async fn commit_conversation_projection(
+        &self,
+        request: &crate::orchestrator::ConversationProjectionCommitRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::ConversationProjectionCommitOutcome> {
+        let json = serde_json::to_string(request)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        let response = self
+            .0
+            .commit_conversation_projection_json(json)
+            .map_err(bridge_err)?;
+        if response.len() > 65536 {
+            return Err(OrchestratorError::Storage(
+                "Projection callback response exceeds limit".into(),
+            ));
+        }
+        serde_json::from_str(&response).map_err(|e| {
+            OrchestratorError::Storage(format!("Invalid projection callback result: {e}"))
+        })
+    }
+
     async fn ensure_conversation_exists(
         &self,
         user_did: &str,
@@ -2207,6 +2393,93 @@ impl MLSAPIClient for APIAdapter {
             )
             .map_err(bridge_err)
     }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn submit_labyrinth_request(
+        &self,
+        request: crate::labyrinth::LabyrinthRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse>
+    {
+        let headers = request
+            .headers
+            .into_iter()
+            .map(|(name, value)| FFILabyrinthHeader { name, value })
+            .collect();
+        let r = self
+            .0
+            .submit_labyrinth_request(
+                request.method,
+                request.nsid,
+                request.path,
+                request.body,
+                headers,
+            )
+            .map_err(bridge_err)?;
+        Ok(crate::orchestrator::canonical_transport::GatewayResponse {
+            status: r.status,
+            content_type: r.content_type,
+            body: r.body,
+        })
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn labyrinth_pds_enabled(&self) -> bool {
+        self.0.labyrinth_pds_enabled()
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn put_labyrinth_mailbox_keys(
+        &self,
+        rkey: &str,
+        record: &[u8],
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .put_labyrinth_mailbox_keys(rkey.to_owned(), record.to_vec())
+            .map_err(bridge_err)
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn get_labyrinth_mailbox_keys(
+        &self,
+        did: &str,
+        rkey: &str,
+    ) -> crate::orchestrator::Result<Option<Vec<u8>>> {
+        self.0
+            .get_labyrinth_mailbox_keys(did.to_owned(), rkey.to_owned())
+            .map_err(bridge_err)
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn delete_labyrinth_mailbox_keys(&self) -> crate::orchestrator::Result<()> {
+        self.0.delete_labyrinth_mailbox_keys().map_err(bridge_err)
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn labyrinth_space_enabled(&self) -> bool {
+        self.0.labyrinth_space_enabled()
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn submit_labyrinth_space_request(
+        &self,
+        request: crate::labyrinth::LabyrinthSpaceRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::canonical_transport::GatewayResponse>
+    {
+        let r = self
+            .0
+            .submit_labyrinth_space_request(
+                request.method,
+                request.nsid,
+                request.path,
+                request.body,
+            )
+            .map_err(bridge_err)?;
+        Ok(crate::orchestrator::canonical_transport::GatewayResponse {
+            status: r.status,
+            content_type: r.content_type,
+            body: r.body,
+        })
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2215,6 +2488,23 @@ impl MLSAPIClient for APIAdapter {
 
 #[async_trait::async_trait]
 impl CredentialStore for CredentialAdapter {
+    async fn direct_request_receipt_authority_document(
+        &self,
+        expected_authority_did: &str,
+    ) -> crate::orchestrator::Result<Option<Vec<u8>>> {
+        self.0
+            .direct_request_receipt_authority_document(expected_authority_did.to_string())
+            .map_err(bridge_err)
+    }
+    async fn get_chat_declaration_authority(
+        &self,
+        user_did: &str,
+    ) -> crate::orchestrator::Result<Option<String>> {
+        self.0
+            .get_chat_declaration_authority(user_did.to_string())
+            .map_err(bridge_err)
+    }
+
     async fn store_signing_key(
         &self,
         user_did: &str,
@@ -2338,6 +2628,11 @@ impl CredentialStore for CredentialAdapter {
 
 type ConcreteOrchestrator =
     MLSOrchestrator<StorageAdapter, APIAdapter, CredentialAdapter, MLSContext>;
+
+/// Labyrinth history-backup methods on [`OrchestratorBridge`].
+#[cfg(feature = "labyrinth")]
+#[path = "labyrinth/ffi.rs"]
+mod labyrinth_ffi;
 type ConcreteEngine = MlsEngine<StorageAdapter, APIAdapter, CredentialAdapter, MLSContext>;
 
 /// UniFFI-exported MLS Orchestrator object.
@@ -3110,6 +3405,65 @@ impl OrchestratorBridge {
             .iter()
             .map(convo_view_to_ffi)
             .collect::<crate::orchestrator::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_group_invitation_reference(
+        &self,
+        conversation_id: String,
+        recipient_did: String,
+    ) -> Result<Option<crate::GroupInvitationReference>, OrchestratorBridgeError> {
+        Ok(self
+            .engine
+            .get_group_invitation_reference(&conversation_id, &recipient_did)?)
+    }
+    pub fn get_direct_request_delivery_enabled(
+        &self,
+    ) -> Result<Option<bool>, OrchestratorBridgeError> {
+        Ok(self.engine.get_direct_request_delivery_enabled()?)
+    }
+    pub fn close_direct_request(
+        &self,
+        conversation_id: String,
+    ) -> Result<crate::DirectRequestView, OrchestratorBridgeError> {
+        Ok(self.engine.close_direct_request(&conversation_id)?)
+    }
+    pub fn set_direct_request_delivery_enabled(
+        &self,
+        enabled: bool,
+    ) -> Result<(), OrchestratorBridgeError> {
+        Ok(self.engine.set_direct_request_delivery_enabled(enabled)?)
+    }
+    pub fn list_direct_request_views(
+        &self,
+    ) -> Result<Vec<crate::DirectRequestView>, OrchestratorBridgeError> {
+        Ok(self.engine.list_direct_request_views()?)
+    }
+    pub fn start_direct_request(
+        &self,
+        input: crate::DirectRequestInput,
+    ) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        Ok(self.engine.start_direct_request(input)?)
+    }
+
+    pub fn resume_direct_request(
+        &self,
+        draft_id: String,
+    ) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        Ok(self.engine.resume_direct_request(&draft_id)?)
+    }
+
+    pub fn cancel_direct_request(
+        &self,
+        draft_id: String,
+    ) -> Result<crate::DirectRequestOutcome, OrchestratorBridgeError> {
+        Ok(self.engine.cancel_direct_request(&draft_id)?)
+    }
+
+    pub fn refresh_request_preview(
+        &self,
+        conversation_id: String,
+    ) -> Result<crate::DirectRequestView, OrchestratorBridgeError> {
+        Ok(self.engine.refresh_request_preview(&conversation_id)?)
     }
 
     pub fn startup_reconcile(&self) -> Result<FFIStartupReconcileReport, OrchestratorBridgeError> {

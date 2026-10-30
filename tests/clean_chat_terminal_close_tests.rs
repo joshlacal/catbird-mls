@@ -243,6 +243,17 @@ async fn terminal_close_rejects_malformed_outer_identity_and_variant() {
 async fn delayed_own_closed_event_acknowledges_only_exact_fresh_terminal_sequence() {
     let (world, cid, _) = closed_pair().await;
     let alice = world.client("Alice");
+    // Closing retains authenticated history. Construct the missing-host-row
+    // replay case explicitly rather than expecting close to delete that history.
+    assert_eq!(
+        alice.storage.get_conversation_state(&cid).await.unwrap(),
+        Some(ConversationState::Closed)
+    );
+    alice
+        .storage
+        .delete_conversations(&alice.did, &[&cid])
+        .await
+        .unwrap();
     assert!(alice
         .storage
         .get_conversation(&alice.did, &cid)
@@ -305,4 +316,42 @@ async fn active_inventory_successor_does_not_acknowledge_or_project_old_close() 
         .reconcile_terminal_conversation_hint(&cid, 20, true)
         .await
         .unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ds_only_close_signer_cannot_retire_an_authorized_conversation() {
+    let (world, cid, group) = closed_pair().await;
+    let bob = world.client("Bob");
+    let alice = world.client("Alice");
+    for keys in [None, Some(vec![]), Some(vec![vec![91; 32]])] {
+        match keys {
+            Some(keys) => bob.credentials.set_authorized_device_keys(&alice.did, keys),
+            None => bob.credentials.clear_authorized_device_keys(&alice.did),
+        }
+        bob.orchestrator.invalidate_device_key_cache().await;
+        assert!(
+            bob.orchestrator
+                .reconcile_terminal_conversation(&cid)
+                .await
+                .is_err(),
+            "the DS retains the true signing key but is not account authority"
+        );
+        assert_ne!(
+            bob.storage.get_conversation_state(&cid).await.unwrap(),
+            Some(ConversationState::Closed)
+        );
+        assert!(bob
+            .storage
+            .get_conversation(&bob.did, &cid)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            bob.orchestrator
+                .mls_context()
+                .get_epoch(group.clone())
+                .unwrap(),
+            1
+        );
+    }
 }

@@ -14,6 +14,9 @@ pub enum MLSError {
     #[error("Group not found: {message}")]
     GroupNotFound { message: String },
 
+    #[error("Direct request Welcome import deadline has passed")]
+    RequestImportExpired,
+
     #[error("Invalid key package")]
     InvalidKeyPackage,
 
@@ -50,7 +53,7 @@ pub enum MLSError {
     #[error("Context not initialized")]
     ContextNotInitialized,
 
-    #[error("Context closed - database connections have been released for iOS suspension")]
+    #[error("Context closed - database connections were released (app suspension or account switch); reopen the context for the active account")]
     ContextClosed,
 
     #[error("Wire format policy violation: {message}")]

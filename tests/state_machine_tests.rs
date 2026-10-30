@@ -636,14 +636,14 @@ async fn test_concurrent_sync_not_blocked() {
         .await
         .expect("create_group failed");
 
-    // Run two syncs concurrently. One should proceed, the other should
-    // return Ok(()) immediately (already syncing).
+    // Run two syncs concurrently. One runs; the other coalesces onto it and
+    // returns when that pass finishes.
     let sync1 = alice.orchestrator.sync_with_server(false);
     let sync2 = alice.orchestrator.sync_with_server(false);
 
     let (r1, r2): (OrcResult<()>, OrcResult<()>) = tokio::join!(sync1, sync2);
 
-    // Both should complete without error (one runs, one skips)
+    // Both should complete without error (one runs, one awaits it)
     assert!(r1.is_ok(), "First sync failed: {:?}", r1.err());
     assert!(r2.is_ok(), "Second sync failed: {:?}", r2.err());
 
@@ -655,6 +655,64 @@ async fn test_concurrent_sync_not_blocked() {
         "Sync after concurrent syncs should work, but sync_in_progress \
          may be stuck: {:?}",
         r3.err()
+    );
+}
+
+/// A sync that finds another pass in flight must wait for that pass instead
+/// of returning Ok at once: its caller's very next read (e.g. request
+/// hydration after a startup sync) must see the reconciled state.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_skipped_sync_awaits_in_flight_pass() {
+    use std::time::Duration;
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    let bob_mls_did = world.register_device("Bob").await.unwrap();
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let convo = alice
+        .orchestrator
+        .create_group("Coalesced sync", None, None)
+        .await
+        .expect("create_group failed");
+    alice
+        .orchestrator
+        .swap_members(&convo.conversation_id, &[], &[bob_mls_did])
+        .await
+        .expect("add bob");
+
+    // Hold Bob's first ("startup") pass at its server listing.
+    let gate = world.delivery_service().pause_next_get_conversations();
+    let mut startup = Box::pin(bob.orchestrator.sync_with_server(true));
+    tokio::select! {
+        _ = gate.wait_until_reached() => {}
+        result = &mut startup => panic!("startup sync finished before its listing: {result:?}"),
+    }
+
+    let mut coalesced = Box::pin(bob.orchestrator.sync_with_server(true));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut coalesced)
+            .await
+            .is_err(),
+        "a sync that finds a pass in flight must wait for it, not return Ok at once"
+    );
+    gate.release();
+
+    let caller = async {
+        coalesced.await.expect("coalesced sync");
+        // The caller's first read after its own sync() returns.
+        MLSStorageBackend::list_conversations(&bob.storage, &bob.did)
+            .await
+            .expect("list conversations")
+            .iter()
+            .any(|view| view.conversation_id == convo.conversation_id)
+    };
+    let (startup_result, reconciled_on_first_read) = tokio::join!(startup, caller);
+    startup_result.expect("startup sync");
+    assert!(
+        reconciled_on_first_read,
+        "the coalesced caller's first read must include the conversation reconciled by the in-flight pass"
     );
 }
 
@@ -861,7 +919,7 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
     }
     alice
         .storage
-        .delete_conversations(&alice.did, &[&group_id])
+        .delete_conversations(&alice.did, &[&convo.conversation_id])
         .await
         .expect("retire superseded conversation projection");
     alice
@@ -869,8 +927,7 @@ async fn test_sync_rejoin_uses_stable_conversation_id_when_group_id_differs() {
         .conversations()
         .lock()
         .await
-        .remove(&group_id);
-
+        .remove(&convo.conversation_id);
     let group_id_bytes = hex::decode(&group_id).expect("invalid group id hex");
     alice
         .orchestrator

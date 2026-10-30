@@ -336,16 +336,29 @@ where
             return Ok(false);
         }
         let device = self.require_actor_device_id().await?;
+        if let Some(snapshot) = self.batch_inventory_snapshot() {
+            if snapshot.user_did == did && snapshot.device_id == device {
+                return self.evaluate_terminal_hint_items(
+                    &snapshot.items,
+                    conversation_id,
+                    terminal_seq,
+                    closed,
+                    &did,
+                    &device,
+                );
+            }
+        }
         let mut cursor: Option<String> = None;
         let mut pages = PaginationGuard::for_conversations("terminal event acknowledgement");
         let mut found = false;
         loop {
             let mut path = format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={device}&limit=100"
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
+                super::canonical_transport::encode_query(&device)
             );
             if let Some(cursor) = &cursor {
                 path.push_str("&pageCursor=");
-                path.push_str(cursor);
+                path.push_str(&super::canonical_transport::encode_query(cursor));
             }
             let page = self
                 .terminal_read_json(CanonicalOperation::GetConversations, path)
@@ -355,41 +368,24 @@ where
                 .ok_or_else(|| terminal_invalid("Terminal inventory is missing items."))?;
             let next = page["nextPageCursor"].as_str().map(str::to_owned);
             pages.observe_page(items.len(), next.as_deref())?;
-            for item in items {
-                let state = item.get("state").unwrap_or(item);
-                if state["coordinates"]["conversationId"].as_str() == Some(conversation_id)
-                    && state["coordinates"]["lifecycle"] == "active"
-                {
-                    return Ok(false);
-                }
-                if item["conversationId"].as_str() != Some(conversation_id)
-                    || item["terminalSeq"].as_u64() != Some(terminal_seq)
-                {
-                    continue;
-                }
-                if closed && item["$type"] == "blue.catbird.chat.defs#conversationCloseTombstone" {
-                    let retired =
-                        super::lifecycle::lifecycle_coordinates(&item["retired"], conversation_id)?;
-                    found |= retired["lifecycle"] == "superseded"
-                        && item["closedAt"]
-                            .as_str()
-                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                            .is_some();
-                } else if !closed
-                    && item["$type"] == "blue.catbird.chat.defs#conversationRemovalTombstone"
-                {
-                    found |= item["userDid"].as_str() == Some(&did)
-                        && item["deviceId"].as_str() == Some(&device)
-                        && item["membershipIntervalId"]
-                            .as_str()
-                            .and_then(|id| uuid::Uuid::parse_str(id).ok())
-                            .is_some()
-                        && item["removedAt"]
-                            .as_str()
-                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                            .is_some();
-                }
+            let found_in_page = self.evaluate_terminal_hint_items(
+                items,
+                conversation_id,
+                terminal_seq,
+                closed,
+                &did,
+                &device,
+            )?;
+            if !found_in_page
+                && items.iter().any(|item| {
+                    let state = item.get("state").unwrap_or(item);
+                    state["coordinates"]["conversationId"].as_str() == Some(conversation_id)
+                        && state["coordinates"]["lifecycle"] == "active"
+                })
+            {
+                return Ok(false);
             }
+            found |= found_in_page;
             if page["hasMore"] == true && next.is_none() {
                 return Err(terminal_invalid(
                     "Terminal inventory has no continuation cursor.",
@@ -415,7 +411,11 @@ where
             .api_client()
             .submit_prepared_request(PreparedRequest {
                 operation,
-                path,
+                path: super::canonical_transport::scope_inventory_read_path(
+                    operation,
+                    path,
+                    self.mls_context().supports_direct_request_bootstrap(),
+                ),
                 method: "GET".into(),
                 body: None,
             })
@@ -430,20 +430,66 @@ where
             .map_err(|e| OrchestratorError::Serialization(e.to_string()))
     }
 
-    async fn reconcile_terminal_inventory(&self, target: Option<&str>) -> Result<usize> {
-        self.check_shutdown().await?;
-        let did = self.require_user_did().await?;
-        let device = self.require_actor_device_id().await?;
+    fn evaluate_terminal_hint_items(
+        &self,
+        items: &[Value],
+        conversation_id: &str,
+        terminal_seq: u64,
+        closed: bool,
+        did: &str,
+        device: &str,
+    ) -> Result<bool> {
+        let mut found = false;
+        for item in items {
+            let state = item.get("state").unwrap_or(item);
+            if state["coordinates"]["conversationId"].as_str() == Some(conversation_id)
+                && state["coordinates"]["lifecycle"] == "active"
+            {
+                return Ok(false);
+            }
+            if item["conversationId"].as_str() != Some(conversation_id)
+                || item["terminalSeq"].as_u64() != Some(terminal_seq)
+            {
+                continue;
+            }
+            if closed && item["$type"] == "blue.catbird.chat.defs#conversationCloseTombstone" {
+                let retired =
+                    super::lifecycle::lifecycle_coordinates(&item["retired"], conversation_id)?;
+                found |= retired["lifecycle"] == "superseded"
+                    && item["closedAt"]
+                        .as_str()
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .is_some();
+            } else if !closed
+                && item["$type"] == "blue.catbird.chat.defs#conversationRemovalTombstone"
+            {
+                found |= item["userDid"].as_str() == Some(did)
+                    && item["deviceId"].as_str() == Some(device)
+                    && item["membershipIntervalId"]
+                        .as_str()
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                        .is_some()
+                    && item["removedAt"]
+                        .as_str()
+                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                        .is_some();
+            }
+        }
+        Ok(found)
+    }
+
+    async fn fetch_terminal_inventory_items(&self, device: &str) -> Result<Vec<Value>> {
         let mut page_cursor: Option<String> = None;
         let mut pagination = PaginationGuard::for_conversations("terminal conversation inventory");
         let mut inventory_items = Vec::new();
         loop {
             let mut path = format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={device}&limit=100"
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
+                super::canonical_transport::encode_query(device)
             );
             if let Some(cursor) = &page_cursor {
                 path.push_str("&pageCursor=");
-                path.push_str(cursor);
+                path.push_str(&super::canonical_transport::encode_query(cursor));
             }
             let page = self
                 .terminal_read_json(CanonicalOperation::GetConversations, path)
@@ -464,6 +510,26 @@ where
                 break;
             }
         }
+        Ok(inventory_items)
+    }
+
+    async fn reconcile_terminal_inventory(&self, target: Option<&str>) -> Result<usize> {
+        self.check_shutdown().await?;
+        let did = self.require_user_did().await?;
+        let device = self.require_actor_device_id().await?;
+        let snapshot = self.batch_inventory_snapshot();
+        let fallback_items: Vec<Value>;
+        let inventory_items: &[Value] = if let Some(snapshot) = snapshot.as_ref() {
+            if snapshot.user_did == did && snapshot.device_id == device {
+                &snapshot.items
+            } else {
+                fallback_items = self.fetch_terminal_inventory_items(&device).await?;
+                &fallback_items
+            }
+        } else {
+            fallback_items = self.fetch_terminal_inventory_items(&device).await?;
+            &fallback_items
+        };
         let active_ids: std::collections::HashSet<&str> = inventory_items
             .iter()
             .filter_map(|item| {
@@ -474,7 +540,7 @@ where
             })
             .collect();
         let mut completed = 0;
-        for item in &inventory_items {
+        for item in inventory_items {
             let Some(cid) = item["conversationId"].as_str() else {
                 continue;
             };
@@ -533,7 +599,7 @@ where
         Ok(completed)
     }
 
-    async fn verify_terminal_signed_body(&self, entry: &Value) -> Result<()> {
+    pub(crate) async fn verify_terminal_signed_body(&self, entry: &Value) -> Result<Vec<u8>> {
         use crate::chat_v2::transcript::{
             decode_strict_json, project_signed_body, SignedMutationKind, VerifiedMutation,
         };
@@ -588,6 +654,22 @@ where
         let actor = body["actorDid"]
             .as_str()
             .ok_or_else(|| terminal_invalid("Terminal entry has no actor."))?;
+        if kind == SignedMutationKind::ConversationClose {
+            let key = self
+                .request_authorized_device_key(
+                    actor,
+                    body["actorDeviceId"]
+                        .as_str()
+                        .ok_or_else(|| terminal_invalid("Close device missing"))?,
+                    body["keyId"]
+                        .as_str()
+                        .ok_or_else(|| terminal_invalid("Close key missing"))?,
+                )
+                .await?;
+            VerifiedMutation::verify(projected, signature, &key)
+                .map_err(|_| terminal_invalid("Close signature invalid"))?;
+            return Ok(key);
+        }
         let (mut lookup, cached) = self
             .lookup_authorized_device_keys_with_origin(actor, false)
             .await?;
@@ -602,21 +684,17 @@ where
         {
             lookup = self.refresh_authorized_device_keys(actor).await?;
         }
-        let valid = match lookup {
+        let key = match lookup {
             super::credential_binding::DeviceKeyLookup::Keys(keys) => keys
                 .iter()
-                .any(|key| VerifiedMutation::verify(projected.clone(), signature, key).is_ok()),
-            super::credential_binding::DeviceKeyLookup::Unsupported => false,
+                .find(|key| VerifiedMutation::verify(projected.clone(), signature, key).is_ok())
+                .cloned(),
+            super::credential_binding::DeviceKeyLookup::Unsupported => None,
         };
-        if !valid {
-            return Err(terminal_invalid(
-                "Terminal conversation signature is not authorized.",
-            ));
-        }
-        Ok(())
+        key.ok_or_else(|| terminal_invalid("Terminal conversation signature is not authorized."))
     }
 
-    async fn consume_verified_conversation_close(
+    pub(crate) async fn consume_verified_conversation_close(
         &self,
         conversation_id: &str,
         group_id: &str,
@@ -656,7 +734,18 @@ where
                 "The signed close does not retire this exact conversation generation.",
             ));
         }
-        self.verify_terminal_signed_body(entry).await?;
+        let canonical = super::direct_requests::normalized_close_entry(entry.clone())?;
+        if self
+            .replay_verified_request_close(conversation_id, &canonical)
+            .await?
+        {
+            let transition_lock = self.rejoin_lock(conversation_id).await;
+            let _guard = transition_lock.lock().await;
+            return self
+                .project_verified_close_entry_locked(conversation_id, &canonical)
+                .await;
+        }
+        let close_key = self.verify_terminal_signed_body(entry).await?;
         let actor = body["actorDid"]
             .as_str()
             .ok_or_else(|| terminal_invalid("Signed close actor is missing."))?;
@@ -708,10 +797,26 @@ where
                 "Sync the preceding conversation Commits before applying its signed close.",
             ));
         }
+        self.retain_verified_request_close(conversation_id, &canonical, &close_key)
+            .await?;
+        self.project_verified_close_entry_locked(conversation_id, &canonical)
+            .await
+    }
+
+    async fn project_verified_close_entry_locked(
+        &self,
+        conversation_id: &str,
+        entry: &Value,
+    ) -> Result<bool> {
+        let body = &entry["signedRequest"]["body"];
+        let prior = &body["prior"];
+        let actor = body["actorDid"]
+            .as_str()
+            .ok_or_else(|| terminal_invalid("Close actor missing"))?;
         let timestamp = entry["receivedAt"]
             .as_str()
             .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .ok_or_else(|| terminal_invalid("Close entry timestamp is invalid."))?
+            .ok_or_else(|| terminal_invalid("Close timestamp invalid"))?
             .with_timezone(&Utc);
         self.project_non_reset_state_locked(conversation_id, ConversationState::Closed)
             .await?;
@@ -891,6 +996,7 @@ where
                     .ok_or_else(|| terminal_invalid("Terminal entry timestamp is invalid."))?
                     .with_timezone(&Utc);
                 self.process_incoming(&super::IncomingEnvelope {
+                    canonical_entry_json: None,
                     conversation_id: conversation_id.into(),
                     sender_did: actor.into(),
                     ciphertext: commit,

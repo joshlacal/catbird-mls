@@ -252,3 +252,154 @@ async fn typed_duplicate_without_local_keys_requests_device_access_and_stays_rec
         .unwrap()
         .is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_400_with_one_peer_discovers_and_reuses_healthy_conversation() {
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let initial = alice
+        .orchestrator
+        .create_group("existing", Some(&[bob.did.clone()]), None)
+        .await
+        .unwrap();
+    let inventory_before = count(&world, CanonicalOperation::GetConversations);
+    let groups_before = alice
+        .orchestrator
+        .mls_context()
+        .list_local_group_ids()
+        .unwrap();
+    world.delivery_service().set_next_create_custom_response(
+        400,
+        json!({"error":"ConversationAlreadyExists","message":"ConversationAlreadyExists"}),
+    );
+
+    let reopened = alice
+        .orchestrator
+        .create_group("reopen", Some(&[bob.did.clone()]), None)
+        .await
+        .expect("duplicate response must discover the authorized existing direct");
+
+    assert_eq!(reopened.conversation_id, initial.conversation_id);
+    assert_eq!(reopened.group_id, initial.group_id);
+    assert_eq!(
+        count(&world, CanonicalOperation::GetConversations),
+        inventory_before + 1
+    );
+    assert_eq!(count(&world, CanonicalOperation::AcceptConversation), 0);
+    assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 0);
+    assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
+    assert_eq!(
+        alice
+            .storage
+            .get_conversation_state(&initial.conversation_id)
+            .await
+            .unwrap(),
+        Some(ConversationState::Active)
+    );
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap(),
+        groups_before,
+        "duplicate temporary group must be discarded without deleting the original"
+    );
+    assert_eq!(alice.storage.pending_local_delete_count(), 0);
+}
+
+async fn assert_duplicate_inventory_rate_limit_is_preserved(callback_failure: bool) {
+    use catbird_mls::orchestrator::canonical_transport::GatewayResponse;
+    use catbird_mls::orchestrator::OrchestratorError;
+
+    let mut world = TestWorld::new();
+    world.add_client("Alice").await;
+    world.add_client("Bob").await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+    let alice = world.client("Alice");
+    let bob = world.client("Bob");
+    let initial = alice
+        .orchestrator
+        .create_group("existing", Some(&[bob.did.clone()]), None)
+        .await
+        .unwrap();
+    let groups_before = alice
+        .orchestrator
+        .mls_context()
+        .list_local_group_ids()
+        .unwrap();
+    let body = if callback_failure {
+        "Rate limited. Retry after 240 seconds".to_owned()
+    } else {
+        json!({"error":"RateLimitExceeded","message":"Retry after 240 seconds"}).to_string()
+    };
+    let denied = if callback_failure {
+        Err(OrchestratorError::ServerError {
+            status: 429,
+            body: body.clone(),
+        })
+    } else {
+        Ok(GatewayResponse {
+            status: 429,
+            content_type: Some("application/json".into()),
+            body: body.as_bytes().to_vec(),
+        })
+    };
+    world
+        .delivery_service()
+        .set_next_inventory_result_for_test(denied);
+    world
+        .delivery_service()
+        .set_next_create_custom_response(400, json!({"error":"ConversationAlreadyExists"}));
+
+    let error = alice
+        .orchestrator
+        .create_group("reopen", Some(&[bob.did.clone()]), None)
+        .await
+        .expect_err("inventory cooldown must not claim successful adoption");
+    match error {
+        OrchestratorError::ServerError {
+            status,
+            body: actual,
+        } => {
+            assert_eq!(status, 429);
+            assert_eq!(actual, body);
+        }
+        other => panic!("inventory failure was obscured: {other:?}"),
+    }
+    assert_eq!(
+        alice
+            .orchestrator
+            .mls_context()
+            .list_local_group_ids()
+            .unwrap(),
+        groups_before,
+        "failed duplicate must clean speculative group and retain original keys"
+    );
+    assert!(alice
+        .storage
+        .get_conversation(&alice.did, &initial.conversation_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(alice.storage.pending_local_delete_count(), 0);
+    assert_eq!(count(&world, CanonicalOperation::AcceptConversation), 0);
+    assert_eq!(count(&world, CanonicalOperation::RequestLeafRecovery), 0);
+    assert_eq!(count(&world, CanonicalOperation::RequestReset), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_400_preserves_inventory_http_429_and_cleans_speculative_group() {
+    assert_duplicate_inventory_rate_limit_is_preserved(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_400_preserves_inventory_callback_429_and_cleans_speculative_group() {
+    assert_duplicate_inventory_rate_limit_is_preserved(true).await;
+}

@@ -36,6 +36,7 @@
 //!    with the server rather than reimplemented.
 
 pub mod contract;
+pub mod direct_request;
 pub mod entry;
 pub mod fingerprint;
 pub mod signed;
@@ -44,6 +45,7 @@ pub mod value;
 pub mod witness;
 
 pub use contract::{project_ref, project_signed_body, ProjectionError, TYPE_PREFIX};
+pub use direct_request::normalize_read_presentation;
 pub use entry::{
     outer_actor_of, signed_body_conversation_id, EntryError, SenderBoundApplicationEntry,
     VerifiedApplicationEntry, DIRECT_CONVERSATION_KINDS,

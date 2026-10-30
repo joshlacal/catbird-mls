@@ -12,6 +12,7 @@ use super::entry::*;
 use super::strict_json::{decode_strict_json, encode_standard_base64};
 use super::*;
 use crate::chat_v2::ids::{BareDid, BasicCredential, CanonicalUuid, DeviceId, KeyId};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
 
@@ -125,6 +126,55 @@ fn good_row() -> Value {
 }
 
 // ---- the happy path ---------------------------------------------------------
+
+#[test]
+fn an_application_entry_with_lexicon_dollar_bytes_normalizes_and_verifies() {
+    let mut presented = good_row();
+    // Wrap declared bytes into lexicon `{"$bytes": ...}` presentation:
+    fn wrap(val: &mut Value) {
+        match val {
+            Value::String(s) if s.len() >= 4 && s.len() % 4 == 0 && STANDARD.decode(&s).is_ok() => {
+                *val = json!({ "$bytes": s });
+            }
+            Value::Object(map) => {
+                for v in map.values_mut() {
+                    wrap(v);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr.iter_mut() {
+                    wrap(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Only wrap the declared byte fields:
+    let body = presented["signedRequest"]["body"].as_object_mut().unwrap();
+    wrap(&mut body["prior"]["groupId"]);
+    wrap(&mut body["prior"]["groupContextHash"]);
+    wrap(&mut body["prior"]["confirmationTag"]);
+    wrap(&mut body["aad"]["prior"]["groupId"]);
+    wrap(&mut body["aad"]["prior"]["groupContextHash"]);
+    wrap(&mut body["aad"]["prior"]["confirmationTag"]);
+    wrap(&mut body["applicationMessage"]["bytes"]);
+    wrap(&mut body["applicationMessage"]["sha256"]);
+    wrap(&mut presented["signedRequest"]["signature"]);
+
+    // Raw presented entry cannot verify directly under strict JSON because
+    // it carries `{"$bytes": ...}` objects where strings are required:
+    assert!(VerifiedApplicationEntry::verify(&strict(&presented), &public_key()).is_err());
+
+    // Once normalized via the schema-directed normalizer, it verifies byte-identically:
+    let raw = serde_json::to_vec(&presented).unwrap();
+    let mut normalized = super::direct_request::normalize_read_presentation(&raw, "applicationEntry", false)
+        .expect("applicationEntry normalizes cleanly");
+    normalized.as_object_mut().unwrap().remove("$type");
+    let verified = VerifiedApplicationEntry::verify(&strict(&normalized), &public_key())
+        .expect("normalized application entry must verify end-to-end");
+    assert_eq!(verified.seq(), 42);
+    assert_eq!(verified.mutation().kind(), SignedMutationKind::ApplicationSend);
+}
 
 #[test]
 fn a_well_formed_signed_entry_verifies_end_to_end() {

@@ -43,7 +43,7 @@ fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .ok_or_else(|| invalid(format!("missing string {field}")))
 }
 
-fn exact_fields(value: &Value, fields: &[&str]) -> Result<()> {
+pub(super) fn exact_fields(value: &Value, fields: &[&str]) -> Result<()> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid("expected object"))?;
@@ -205,11 +205,31 @@ where
         &self,
         hint: CanonicalHint,
     ) -> Result<Vec<EngineEvent>> {
-        let Some(conversation_id) = hint.conversation_id.as_deref() else {
+        if hint.conversation_id.is_none() {
             // Transport owns cursor continuity. Disposition has no CID, so it
             // cannot authorize conversation lookup, joining, or a global sweep.
             return Ok(Vec::new());
-        };
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.orchestrator.batch_inventory_snapshot().is_none() {
+            let snapshot = std::sync::Arc::new(
+                self.orchestrator
+                    .fetch_authorized_inventory_snapshot()
+                    .await?,
+            );
+            return crate::orchestrator::with_batch_inventory_scope(
+                snapshot,
+                Box::pin(self.process_canonical_hint_inner(hint)),
+            )
+            .await;
+        }
+
+        Box::pin(self.process_canonical_hint_inner(hint)).await
+    }
+
+    async fn process_canonical_hint_inner(&self, hint: CanonicalHint) -> Result<Vec<EngineEvent>> {
+        let conversation_id = hint.conversation_id.as_deref().unwrap();
         let orch = &self.orchestrator;
         let user_did = orch.require_user_did().await?;
         let device = orch.require_actor_device_id().await?;
@@ -399,6 +419,20 @@ where
     }
 
     async fn catch_up_event_conversation(&self, conversation_id: &str) -> Result<Vec<EngineEvent>> {
+        if self
+            .orchestrator
+            .known_direct_request(conversation_id)
+            .await?
+        {
+            let request =
+                Box::pin(self.orchestrator.refresh_request_preview(conversation_id)).await?;
+            if request.consent != crate::orchestrator::RequestConsent::Accepted {
+                return Ok(vec![EngineEvent::RequestReceived {
+                    convo_id: conversation_id.into(),
+                    message_id: request.first_message_id,
+                }]);
+            }
+        }
         let mut cursor = None;
         let mut pagination = PaginationGuard::for_messages("canonical event entries");
         let mut events = Vec::new();
@@ -491,12 +525,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestrator::canonical_transport::CanonicalOperation;
+    use crate::orchestrator::canonical_transport::{CanonicalOperation, GatewayResponse};
+    use crate::orchestrator::error::OrchestratorError;
     use crate::recovery_e2e_harness::{
         mock_api_client::MockDeliveryService, mock_credentials::MockCredentials,
         mock_storage::MockStorage, TestWorld,
     };
     use serde_json::json;
+    use sha2::{Digest, Sha256};
 
     const ID: &str = "00000000-0000-4000-8000-000000000001";
     const DID: &str = "did:plc:abcdefghijklmnopqrstuvwx";
@@ -1127,6 +1163,1446 @@ mod tests {
                     .filter(|request| request.operation == CanonicalOperation::GetPendingWelcomes)
                     .count(),
                 0
+            );
+        });
+    }
+
+    #[test]
+    fn batch_succeeds_with_single_inventory_allocation_and_preserves_ordering() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("batch group 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("batch group 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g3 = alice
+                .orchestrator
+                .create_group("batch group 3", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+            let start = world.delivery_service().submitted_prepared_requests().len();
+
+            let batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                    event("conversationChangedEvent", json!({"conversationId": g2.conversation_id})),
+                    event("conversationChangedEvent", json!({"conversationId": g3.conversation_id})),
+                ]
+            });
+
+            let events = bob_engine.process_server_event(&batch.to_string()).unwrap();
+            assert!(!events.is_empty(), "batch should emit engine events");
+
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start),
+                1,
+                "batch of 3 hints must use exactly ONE fresh inventory allocation"
+            );
+            assert_eq!(
+                world.delivery_service().inventory_pages_since(start),
+                0,
+                "batch of 3 hints has no pagination pages"
+            );
+
+            fn convo_of(e: &EngineEvent) -> &str {
+                match e {
+                    EngineEvent::ConversationUpdated { convo_id }
+                    | EngineEvent::MessageInserted { convo_id, .. }
+                    | EngineEvent::RequestReceived { convo_id, .. }
+                    | EngineEvent::RecoveryStateChanged { convo_id, .. }
+                    | EngineEvent::NeedsUiRefresh { convo_id } => convo_id.as_str(),
+                }
+            }
+            let idx_g1 = events
+                .iter()
+                .position(|e| convo_of(e) == g1.conversation_id)
+                .expect("g1 in events");
+            let idx_g2 = events
+                .iter()
+                .position(|e| convo_of(e) == g2.conversation_id)
+                .expect("g2 in events");
+            let idx_g3 = events
+                .iter()
+                .position(|e| convo_of(e) == g3.conversation_id)
+                .expect("g3 in events");
+            assert!(
+                idx_g1 < idx_g2,
+                "g1 must precede g2 in returned engine events"
+            );
+            assert!(
+                idx_g2 < idx_g3,
+                "g2 must precede g3 in returned engine events"
+            );
+        });
+    }
+
+    #[test]
+    fn batch_pagination_within_single_session() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("page 1 group", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("page 2 group", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+
+            let item1 = json!({
+                "state": {
+                    "conversationKind": "group",
+                    "coordinates": {
+                        "conversationId": g1.conversation_id,
+                        "groupId": base64::engine::general_purpose::STANDARD.encode(hex::decode(&g1.group_id).unwrap()),
+                        "epoch": 0, "generation": 0, "stateVersion": 0, "lifecycle": "active",
+                        "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                        "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+                    },
+                    "participants": [
+                        {"userDid": alice_did, "role": "admin", "status": "active"},
+                        {"userDid": bob_did, "role": "member", "status": "active"}
+                    ],
+                    "snapshotSeq": 1
+                }
+            });
+            let item2 = json!({
+                "state": {
+                    "conversationKind": "group",
+                    "coordinates": {
+                        "conversationId": g2.conversation_id,
+                        "groupId": base64::engine::general_purpose::STANDARD.encode(hex::decode(&g2.group_id).unwrap()),
+                        "epoch": 0, "generation": 0, "stateVersion": 0, "lifecycle": "active",
+                        "groupContextHash": base64::engine::general_purpose::STANDARD.encode([0u8; 32]),
+                        "confirmationTag": base64::engine::general_purpose::STANDARD.encode([0u8; 32])
+                    },
+                    "participants": [
+                        {"userDid": alice_did, "role": "admin", "status": "active"},
+                        {"userDid": bob_did, "role": "member", "status": "active"}
+                    ],
+                    "snapshotSeq": 1
+                }
+            });
+
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [item1],
+                        "inventorySessionId": "session-12345678-1234-1234-1234-123456789012",
+                        "snapshotEventCursor": "cursor-fence-001",
+                        "hasMore": true,
+                        "nextPageCursor": "page-2-cursor"
+                    }))
+                    .unwrap(),
+                }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [item2],
+                        "inventorySessionId": "session-12345678-1234-1234-1234-123456789012",
+                        "snapshotEventCursor": "cursor-fence-001",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
+
+            let start = world.delivery_service().submitted_prepared_requests().len();
+            let batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                    event("conversationChangedEvent", json!({"conversationId": g2.conversation_id})),
+                ]
+            });
+
+            let events = bob_engine.process_server_event(&batch.to_string()).unwrap();
+            assert!(!events.is_empty());
+
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start),
+                1,
+                "multi-page inventory batch must use exactly ONE fresh allocation"
+            );
+            assert_eq!(
+                world.delivery_service().inventory_pages_since(start),
+                1,
+                "one continuation page fetched with pageCursor"
+            );
+        });
+    }
+
+    #[test]
+    fn subsequent_batches_and_live_calls_obtain_fresh_inventory() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("freshness group 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("freshness group 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+
+            // Batch 1
+            let start = world.delivery_service().submitted_prepared_requests().len();
+            let batch1 = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                ]
+            });
+            bob_engine
+                .process_server_event(&batch1.to_string())
+                .unwrap();
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start),
+                1,
+                "batch 1 obtains 1 fresh allocation"
+            );
+            assert_eq!(world.delivery_service().inventory_pages_since(start), 0);
+
+            // Batch 2
+            let start2 = world.delivery_service().submitted_prepared_requests().len();
+            let batch2 = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g2.conversation_id})),
+                ]
+            });
+            bob_engine
+                .process_server_event(&batch2.to_string())
+                .unwrap();
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start2),
+                1,
+                "batch 2 obtains its own fresh allocation (no stale reuse from batch 1)"
+            );
+            assert_eq!(world.delivery_service().inventory_pages_since(start2), 0);
+
+            // Live call (single event)
+            let start3 = world.delivery_service().submitted_prepared_requests().len();
+            let single = event(
+                "conversationChangedEvent",
+                json!({"conversationId": g1.conversation_id}),
+            );
+            bob_engine
+                .process_server_event(&single.to_string())
+                .unwrap();
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start3),
+                1,
+                "live call obtains fresh inventory, proving batch snapshot did not leak"
+            );
+            assert_eq!(world.delivery_service().inventory_pages_since(start3), 0);
+        });
+    }
+
+    #[test]
+    fn oversized_and_over_limit_batches_rejected_before_effects() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world.register_device("Alice").await.unwrap();
+            let engine = engine_for(&world, "Alice").await;
+
+            let start = world.delivery_service().submitted_prepared_requests().len();
+
+            // 1. > 16MiB
+            let mut huge = "{\"padding\":\"".to_string();
+            huge.push_str(&"x".repeat(16 * 1024 * 1024));
+            huge.push_str("\"}");
+            let err = engine.process_server_event(&huge).unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput for oversized payload, got {err:?}"
+            );
+            assert_eq!(
+                world.delivery_service().submitted_prepared_requests().len(),
+                start
+            );
+
+            // 2. > 10,000 hints
+            let hints: Vec<Value> = (0..10_001)
+                .map(|_| {
+                    event(
+                        "watermarkEvent",
+                        json!({"issuedAt": "2026-09-05T01:00:00.000Z"}),
+                    )
+                })
+                .collect();
+            let batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": hints
+            });
+            let err2 = engine.process_server_event(&batch.to_string()).unwrap_err();
+            assert!(
+                matches!(err2, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput for over-limit hints, got {err2:?}"
+            );
+            assert_eq!(
+                world.delivery_service().submitted_prepared_requests().len(),
+                start
+            );
+        });
+    }
+
+    #[test]
+    fn malformed_batch_and_invalid_hints_rejected_before_effects() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world.register_device("Alice").await.unwrap();
+            let engine = engine_for(&world, "Alice").await;
+
+            let start = world.delivery_service().submitted_prepared_requests().len();
+
+            // Extra field on batch envelope
+            let bad_envelope = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [],
+                "untrustedAuthority": "injection"
+            });
+            let err = engine
+                .process_server_event(&bad_envelope.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput for unexpected batch envelope field, got {err:?}"
+            );
+            assert_eq!(
+                world.delivery_service().submitted_prepared_requests().len(),
+                start
+            );
+
+            // events is not an array
+            let bad_events = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": "not_an_array"
+            });
+            let err_events = engine
+                .process_server_event(&bad_events.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(err_events, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput when events is not an array, got {err_events:?}"
+            );
+            assert_eq!(
+                world.delivery_service().submitted_prepared_requests().len(),
+                start
+            );
+
+            // Valid hint followed by an invalid hint: entire batch fails before any effect
+            let mixed = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": ID})),
+                    json!({"$type": "blue.catbird.chat.defs#conversationChangedEvent", "conversationId": "invalid-uuid"}),
+                ]
+            });
+            let err_mixed = engine.process_server_event(&mixed.to_string()).unwrap_err();
+            assert!(
+                matches!(err_mixed, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput when batch has invalid hint, got {err_mixed:?}"
+            );
+            assert_eq!(
+                world.delivery_service().submitted_prepared_requests().len(),
+                start,
+                "no inventory or network calls when batch contains invalid hint"
+            );
+        });
+    }
+
+    #[test]
+    fn pagination_session_fence_mismatch_and_missing_continuation_fail_closed() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world.register_device("Alice").await.unwrap();
+            let engine = engine_for(&world, "Alice").await;
+
+            let valid_hint = event("conversationChangedEvent", json!({"conversationId": ID}));
+            let batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [valid_hint]
+            });
+
+            // 1. Session mismatch between page 1 and page 2
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-AAA",
+                        "snapshotEventCursor": "fence-AAA",
+                        "hasMore": true,
+                        "nextPageCursor": "cursor-2"
+                    }))
+                    .unwrap(),
+                }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-BBB-MISMATCH",
+                        "snapshotEventCursor": "fence-AAA",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
+
+            let err = engine.process_server_event(&batch.to_string()).unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput for session mismatch, got {err:?}"
+            );
+            // 2. hasMore = true but nextPageCursor is missing
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-CCC",
+                        "snapshotEventCursor": "fence-CCC",
+                        "hasMore": true
+                    }))
+                    .unwrap(),
+                }));
+
+            let err2 = engine.process_server_event(&batch.to_string()).unwrap_err();
+            assert!(
+                matches!(err2, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput for missing continuation cursor, got {err2:?}"
+            );
+        });
+    }
+    #[test]
+    fn pagination_strict_contracts_and_subsequent_fresh_batch() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("pagination strict group", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+            let valid_hint = event(
+                "conversationChangedEvent",
+                json!({"conversationId": g1.conversation_id}),
+            );
+            let batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [valid_hint]
+            });
+
+            // 1. "false-with-next": hasMore is false, but nextPageCursor is present
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-false-with-next",
+                        "snapshotEventCursor": "fence-1",
+                        "hasMore": false,
+                        "nextPageCursor": "unexpected-page-cursor"
+                    }))
+                    .unwrap(),
+                }));
+            let err = bob_engine
+                .process_server_event(&batch.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput when hasMore is false but nextPageCursor is present, got {err:?}"
+            );
+
+            // 2. Missing hasMore
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-missing-has-more",
+                        "snapshotEventCursor": "fence-1"
+                    }))
+                    .unwrap(),
+                }));
+            let err = bob_engine
+                .process_server_event(&batch.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput when hasMore is missing, got {err:?}"
+            );
+
+            // 3. Non-boolean hasMore (e.g. string "false")
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-string-has-more",
+                        "snapshotEventCursor": "fence-1",
+                        "hasMore": "false"
+                    }))
+                    .unwrap(),
+                }));
+            let err = bob_engine
+                .process_server_event(&batch.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput when hasMore is non-boolean string, got {err:?}"
+            );
+
+            // 4. Non-string nextPageCursor (e.g. integer 12345)
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-int-cursor",
+                        "snapshotEventCursor": "fence-1",
+                        "hasMore": true,
+                        "nextPageCursor": 12345
+                    }))
+                    .unwrap(),
+                }));
+            let err = bob_engine
+                .process_server_event(&batch.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput when nextPageCursor is non-string, got {err:?}"
+            );
+
+            // 5. Snapshot fence mismatch between page 1 and page 2
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-fence-test",
+                        "snapshotEventCursor": "fence-alpha",
+                        "hasMore": true,
+                        "nextPageCursor": "page-2"
+                    }))
+                    .unwrap(),
+                }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-fence-test",
+                        "snapshotEventCursor": "fence-beta-MISMATCH",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
+            let err = bob_engine
+                .process_server_event(&batch.to_string())
+                .unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "expected InvalidInput when snapshotEventCursor changes between pages, got {err:?}"
+            );
+
+            // 6. Later fresh successful batch after failed processing
+            let start = world.delivery_service().submitted_prepared_requests().len();
+            let events = bob_engine.process_server_event(&batch.to_string()).unwrap();
+            assert!(
+                !events.is_empty(),
+                "later batch must succeed after pagination rejections"
+            );
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start), 1,
+                "fresh successful batch after failed processing must obtain exactly ONE fresh inventory allocation"
+            );
+            assert_eq!(
+                world.delivery_service().inventory_pages_since(start),
+                0,
+                "no continuation pages for standard single-page inventory"
+            );
+        });
+    }
+
+    #[test]
+    fn concurrent_interleaved_batches_cannot_lend_or_lose_inventory_on_same_orchestrator() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("interleave group 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("interleave group 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g3 = alice
+                .orchestrator
+                .create_group("interleave group 3", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = std::sync::Arc::new(engine_for(&world, "Bob").await);
+
+            let start = world.delivery_service().submitted_prepared_requests().len();
+
+            // Arm the gate on GetConversationState so Batch A pauses during processing of its first hint
+            let gate = world.delivery_service().pause_next_get_conversation_state();
+
+            // Batch A has 2 hints: g1 and g2
+            let batch_a = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                    event("conversationChangedEvent", json!({"conversationId": g2.conversation_id})),
+                ]
+            });
+
+            // Spawn Batch A on a background task
+            let engine_a = std::sync::Arc::clone(&bob_engine);
+            let batch_a_str = batch_a.to_string();
+            let batch_a_handle =
+                tokio::spawn(async move { engine_a.process_server_event(&batch_a_str) });
+
+            // Wait until Batch A has fetched its inventory snapshot and reached GetConversationState in hint 1
+            gate.wait_until_reached().await;
+
+            // At this point, Batch A is actively paused inside its batch inventory scope.
+            // Check fresh allocations so far: exactly 1 (Batch A's initial inventory fetch)
+            let allocs_so_far = world.delivery_service().inventory_allocations_since(start);
+            assert_eq!(
+                allocs_so_far, 1,
+                "Batch A must have performed 1 inventory allocation"
+            );
+
+            // 1. Execute an unrelated LIVE call on the SAME engine while Batch A is paused.
+            // Under an ambient cache bug, this call would borrow Batch A's snapshot and NOT fetch inventory.
+            // Under correct execution-local context, it cannot see Batch A's snapshot and must fetch its own!
+            let live_start = world.delivery_service().submitted_prepared_requests().len();
+            let live_hint = event(
+                "conversationChangedEvent",
+                json!({"conversationId": g3.conversation_id}),
+            );
+            let live_events = bob_engine
+                .process_server_event(&live_hint.to_string())
+                .unwrap();
+            assert!(!live_events.is_empty());
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(live_start), 1,
+                "unrelated live call must obtain its own fresh inventory (cannot borrow from paused Batch A)"
+            );
+
+            // 2. Execute a concurrent Batch B on the SAME engine while Batch A is still paused.
+            // Under an ambient cache bug, Batch B would overwrite or borrow Batch A's snapshot,
+            // and Batch B's completion would wipe the cache to None.
+            let batch_b_start = world.delivery_service().submitted_prepared_requests().len();
+            let batch_b = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g3.conversation_id})),
+                ]
+            });
+            let batch_b_events = bob_engine
+                .process_server_event(&batch_b.to_string())
+                .unwrap();
+            assert!(!batch_b_events.is_empty());
+            assert_eq!(
+                world
+                    .delivery_service()
+                    .inventory_allocations_since(batch_b_start),
+                1,
+                "concurrent Batch B must obtain its own fresh inventory allocation"
+            );
+
+            // 3. Now release Batch A's gate.
+            // Batch A resumes processing hint 1 and hint 2.
+            // Under an ambient cache bug, Batch A would have LOST its inventory because Batch B completed
+            // and cleared the shared cache!
+            // Under correct execution-local context, Batch A still holds its own snapshot and needs NO extra inventory fetches.
+            gate.release();
+
+            let batch_a_events = batch_a_handle.await.unwrap().unwrap();
+            assert!(!batch_a_events.is_empty());
+
+            // Total fresh inventory allocations across the entire test:
+            // Exactly 3: Batch A (1) + Live Call (1) + Batch B (1).
+            // Batch A must NOT have made a second allocation when resuming!
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start), 3,
+                "total inventory allocations must be exactly 3 (Batch A, live call, Batch B) - no lending, no loss"
+            );
+            assert_eq!(
+                world.delivery_service().inventory_pages_since(start),
+                0,
+                "no continuation pages were involved"
+            );
+        });
+    }
+
+    #[test]
+    fn cancelled_or_errored_batch_releases_execution_context_allowing_subsequent_fresh_batch() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("cancel group 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("cancel group 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = std::sync::Arc::new(engine_for(&world, "Bob").await);
+
+            // --- Scenario 1: Cancellation (dropped/aborted future) releases context ---
+            let gate = world.delivery_service().pause_next_get_conversation_state();
+            let batch_cancel = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                ]
+            });
+
+            let engine_cancel = std::sync::Arc::clone(&bob_engine);
+            let batch_cancel_str = batch_cancel.to_string();
+            let cancel_handle =
+                tokio::spawn(async move { engine_cancel.process_server_event(&batch_cancel_str) });
+
+            // Wait until it enters batch scope and reaches GetConversationState
+            gate.wait_until_reached().await;
+
+            // Abort / cancel the background task mid-flight
+            cancel_handle.abort();
+            // Release the gate so the worker task unblocks and terminates cleanly
+            gate.release();
+            let _ = cancel_handle.await;
+
+            // Verify subsequent batch runs cleanly with its own fresh allocation
+            let start_after_cancel = world.delivery_service().submitted_prepared_requests().len();
+            let fresh_batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g2.conversation_id})),
+                ]
+            });
+            let events = bob_engine
+                .process_server_event(&fresh_batch.to_string())
+                .unwrap();
+            assert!(!events.is_empty());
+            assert_eq!(
+                world
+                    .delivery_service()
+                    .inventory_allocations_since(start_after_cancel),
+                1,
+                "fresh batch after cancellation must obtain exactly ONE fresh inventory allocation"
+            );
+            assert_eq!(
+                world
+                    .delivery_service()
+                    .inventory_pages_since(start_after_cancel),
+                0
+            );
+
+            // --- Scenario 2: Processing error releases context ---
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 500,
+                    content_type: Some("application/json".into()),
+                    body: b"error".to_vec(),
+                }));
+
+            let err_batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                ]
+            });
+            let err = bob_engine
+                .process_server_event(&err_batch.to_string())
+                .unwrap_err();
+            assert!(matches!(
+                err,
+                OrchestratorError::ServerError { status: 500, .. }
+            ));
+
+            // Subsequent batch on the same engine succeeds cleanly with a fresh allocation
+            let start_after_err = world.delivery_service().submitted_prepared_requests().len();
+            let fresh_batch2 = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                ]
+            });
+            let events2 = bob_engine
+                .process_server_event(&fresh_batch2.to_string())
+                .unwrap();
+            assert!(!events2.is_empty());
+            assert_eq!(
+                world
+                    .delivery_service()
+                    .inventory_allocations_since(start_after_err),
+                1,
+                "fresh batch after error must obtain exactly ONE fresh inventory allocation"
+            );
+            assert_eq!(
+                world
+                    .delivery_service()
+                    .inventory_pages_since(start_after_err),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn inventory_server_error_propagates_cleanly() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world.register_device("Alice").await.unwrap();
+            let engine = engine_for(&world, "Alice").await;
+
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 500,
+                    content_type: Some("application/json".into()),
+                    body: b"internal server error".to_vec(),
+                }));
+
+            let batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": ID}))
+                ]
+            });
+
+            let err = engine.process_server_event(&batch.to_string()).unwrap_err();
+            assert!(matches!(
+                err,
+                OrchestratorError::ServerError { status: 500, .. }
+            ));
+        });
+    }
+
+    #[test]
+    fn empty_batch_succeeds_without_allocations() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            world
+                .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+                .await;
+            world.register_device("Alice").await.unwrap();
+            let engine = engine_for(&world, "Alice").await;
+
+            let start = world.delivery_service().submitted_prepared_requests().len();
+            let batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": []
+            });
+
+            let events = engine.process_server_event(&batch.to_string()).unwrap();
+            assert!(events.is_empty());
+            assert_eq!(
+                world.delivery_service().submitted_prepared_requests().len(),
+                start
+            );
+        });
+    }
+
+    #[test]
+    fn reconciliation_pass_over_multiple_hints_allocates_single_inventory_snapshot() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("recon pass 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("recon pass 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g3 = alice
+                .orchestrator
+                .create_group("recon pass 3", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+            let start = world.delivery_service().submitted_prepared_requests().len();
+
+            // Send batch as bare JSON array [hint1, hint2, hint3]
+            let batch = json!([
+                event(
+                    "conversationChangedEvent",
+                    json!({"conversationId": g1.conversation_id})
+                ),
+                event(
+                    "conversationChangedEvent",
+                    json!({"conversationId": g2.conversation_id})
+                ),
+                event(
+                    "conversationChangedEvent",
+                    json!({"conversationId": g3.conversation_id})
+                ),
+            ]);
+
+            let events = bob_engine.process_server_event(&batch.to_string()).unwrap();
+            assert!(!events.is_empty(), "batch should emit engine events");
+
+            let allocations = world.delivery_service().inventory_allocations_since(start);
+            assert_eq!(
+                allocations, 1,
+                "reconciliation pass over 3 hints must allocate exactly ONE inventory snapshot (was {allocations})"
+            );
+        });
+    }
+
+    #[test]
+    fn single_hint_allocates_single_snapshot_for_all_its_phases() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g = alice
+                .orchestrator
+                .create_group("single hint group", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+            let start = world.delivery_service().submitted_prepared_requests().len();
+
+            let single = event(
+                "conversationChangedEvent",
+                json!({"conversationId": g.conversation_id}),
+            );
+            let events = bob_engine
+                .process_server_event(&single.to_string())
+                .unwrap();
+            assert!(!events.is_empty());
+
+            let allocations = world.delivery_service().inventory_allocations_since(start);
+            assert_eq!(
+                allocations, 1,
+                "single hint with terminal recon + lookup + welcome delivery must allocate exactly ONE snapshot (was {allocations})"
+            );
+        });
+    }
+
+    #[test]
+    fn failure_mid_pass_discards_shared_state_and_subsequent_allocates_fresh() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("fail discard 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("fail discard 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+
+            // 1. Pass with an invalid hint that fails mid-pass
+            let bad_batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                    // Malformed hint: unexpected field causes parse error
+                    json!({
+                        "$type": "blue.catbird.chat.defs#conversationChangedEvent",
+                        "conversationId": g2.conversation_id,
+                        "untrustedExtraField": "malicious"
+                    }),
+                ]
+            });
+            let err = bob_engine
+                .process_server_event(&bad_batch.to_string())
+                .unwrap_err();
+            assert!(matches!(err, OrchestratorError::InvalidInput(_)));
+
+            // Shared state MUST be discarded after failure
+            assert!(bob_engine.orchestrator.batch_inventory_snapshot().is_none());
+
+            // 2. Subsequent valid pass MUST allocate its own fresh snapshot
+            let start2 = world.delivery_service().submitted_prepared_requests().len();
+            let good_batch = json!({
+                "$type": "blue.catbird.internal#inventoryHintBatch",
+                "events": [
+                    event("conversationChangedEvent", json!({"conversationId": g1.conversation_id})),
+                ]
+            });
+            bob_engine
+                .process_server_event(&good_batch.to_string())
+                .unwrap();
+            assert_eq!(
+                world.delivery_service().inventory_allocations_since(start2),
+                1,
+                "subsequent pass allocates its own fresh snapshot"
+            );
+            assert!(bob_engine.orchestrator.batch_inventory_snapshot().is_none());
+        });
+    }
+
+    #[test]
+    fn malformed_pagination_and_fence_data_fails_closed() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.register_device("Alice").await.unwrap();
+            let engine = engine_for(&world, "Alice").await;
+
+            // 1. Session ID changes during pagination
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-1",
+                        "snapshotEventCursor": "fence-1",
+                        "hasMore": true,
+                        "nextPageCursor": "cursor-2"
+                    }))
+                    .unwrap(),
+                }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-MUTATED",
+                        "snapshotEventCursor": "fence-1",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
+
+            let err = engine
+                .orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, OrchestratorError::InvalidInput(_)),
+                "mutated session ID must fail closed: {err:?}"
+            );
+
+            // 2. Fence changes during pagination
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-2",
+                        "snapshotEventCursor": "fence-original",
+                        "hasMore": true,
+                        "nextPageCursor": "cursor-2"
+                    }))
+                    .unwrap(),
+                }));
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-2",
+                        "snapshotEventCursor": "fence-CHANGED",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
+
+            let err2 = engine
+                .orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err2, OrchestratorError::InvalidInput(_)),
+                "mutated fence must fail closed: {err2:?}"
+            );
+
+            // 3. hasMore == true but nextPageCursor is missing/empty
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [],
+                        "inventorySessionId": "session-3",
+                        "snapshotEventCursor": "fence-3",
+                        "hasMore": true,
+                        "nextPageCursor": null
+                    }))
+                    .unwrap(),
+                }));
+
+            let err3 = engine
+                .orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err3, OrchestratorError::InvalidInput(_)),
+                "inconsistent hasMore must fail closed: {err3:?}"
+            );
+
+            // 4. Missing items field
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "inventorySessionId": "session-4",
+                        "snapshotEventCursor": "fence-4",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
+
+            let err4 = engine
+                .orchestrator
+                .fetch_authorized_inventory_snapshot()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err4, OrchestratorError::InvalidInput(_)),
+                "missing items field must fail closed: {err4:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn welcome_delivery_satisfies_from_snapshot_when_present_and_falls_back_when_absent() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("welcome snapshot group 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+
+            // Fetch snapshot that includes g1
+            let snapshot = std::sync::Arc::new(
+                bob_engine
+                    .orchestrator
+                    .fetch_authorized_inventory_snapshot()
+                    .await
+                    .unwrap(),
+            );
+            let bob_device = bob_engine
+                .orchestrator
+                .require_actor_device_id()
+                .await
+                .unwrap();
+            let dummy_welcome = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+            let coords_g1 = json!({
+                "conversationId": g1.conversation_id,
+                "groupId": STANDARD.encode(hex::decode(&g1.group_id).unwrap()),
+                "epoch": 0, "generation": 0, "stateVersion": 0, "lifecycle": "active",
+                "groupContextHash": STANDARD.encode([0u8; 32]),
+                "confirmationTag": STANDARD.encode([0u8; 32])
+            });
+            world.delivery_service().set_welcome_delivery_for_test(json!({
+                "welcomeId": uuid::Uuid::new_v4().to_string(),
+                "conversationId": g1.conversation_id,
+                "transitionSeq": 1,
+                "coordinates": coords_g1,
+                "status": "pending",
+                "opaqueWelcome": STANDARD.encode(&dummy_welcome),
+                "sha256": STANDARD.encode(Sha256::digest(&dummy_welcome)),
+                "recipientDid": bob_did,
+                "recipientDeviceId": bob_device,
+                "provenance": {"recoveryRequestId": uuid::Uuid::new_v4().to_string(), "keyPackageRef": STANDARD.encode([0u8; 32])},
+                "expiresAt": "2099-01-01T00:00:00.000Z",
+            }));
+
+            // Alice creates g2 AFTER Bob's snapshot was taken, so g2 is absent from snapshot
+            let g2 = alice
+                .orchestrator
+                .create_group(
+                    "welcome snapshot group 2 (post-snapshot)",
+                    Some(&[bob_did.into()]),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!snapshot.contains_conversation(&g2.conversation_id));
+
+            let coords_g2 = json!({
+                "conversationId": g2.conversation_id,
+                "groupId": STANDARD.encode(hex::decode(&g2.group_id).unwrap()),
+                "epoch": 0, "generation": 0, "stateVersion": 0, "lifecycle": "active",
+                "groupContextHash": STANDARD.encode([0u8; 32]),
+                "confirmationTag": STANDARD.encode([0u8; 32])
+            });
+            world.delivery_service().set_welcome_delivery_for_test(json!({
+                "welcomeId": uuid::Uuid::new_v4().to_string(),
+                "conversationId": g2.conversation_id,
+                "transitionSeq": 1,
+                "coordinates": coords_g2,
+                "status": "pending",
+                "opaqueWelcome": STANDARD.encode(&dummy_welcome),
+                "sha256": STANDARD.encode(Sha256::digest(&dummy_welcome)),
+                "recipientDid": bob_did,
+                "recipientDeviceId": bob_device,
+                "provenance": {"recoveryRequestId": uuid::Uuid::new_v4().to_string(), "keyPackageRef": STANDARD.encode([0u8; 32])},
+                "expiresAt": "2099-01-01T00:00:00.000Z",
+            }));
+
+            crate::orchestrator::with_batch_inventory_scope(snapshot, async {
+                // g1 is in snapshot: fetch_welcome_delivery satisfies from snapshot (0 fresh GetConversations allocations!)
+                let start_g1 = world.delivery_service().submitted_prepared_requests().len();
+                let delivery_g1 = bob_engine
+                    .orchestrator
+                    .fetch_welcome_delivery(&g1.conversation_id)
+                    .await
+                    .unwrap();
+                assert_eq!(delivery_g1.conversation_id(), g1.conversation_id);
+                assert_eq!(
+                    world.delivery_service().inventory_allocations_since(start_g1),
+                    0,
+                    "present conversation must satisfy Welcome delivery from shared snapshot with 0 allocations"
+                );
+
+                // g2 is NOT in snapshot: fetch_welcome_delivery falls back to fresh authorized GetConversations?limit=1
+                let start_g2 = world.delivery_service().submitted_prepared_requests().len();
+                let delivery_g2 = bob_engine
+                    .orchestrator
+                    .fetch_welcome_delivery(&g2.conversation_id)
+                    .await
+                    .unwrap();
+                assert_eq!(delivery_g2.conversation_id(), g2.conversation_id);
+                assert_eq!(
+                    world.delivery_service().inventory_allocations_since(start_g2),
+                    1,
+                    "absent conversation must fall back to fresh authorized limit=1 allocation"
+                );
+            })
+            .await;
+        });
+    }
+
+    #[test]
+    fn deferred_recovery_allocates_single_snapshot_for_multiple_conversations() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice = world.client("Alice");
+            let g1 = alice
+                .orchestrator
+                .create_group("recovery group 1", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g2 = alice
+                .orchestrator
+                .create_group("recovery group 2", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+            let g3 = alice
+                .orchestrator
+                .create_group("recovery group 3", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            let bob_engine = engine_for(&world, "Bob").await;
+
+            // Ensure all 3 conversations are in Bob's storage with needs_rejoin = true
+            for gid in [
+                &g1.conversation_id,
+                &g2.conversation_id,
+                &g3.conversation_id,
+            ] {
+                bob_engine
+                    .orchestrator
+                    .storage()
+                    .ensure_conversation_exists(bob_did, gid, "00")
+                    .await
+                    .unwrap();
+                bob_engine
+                    .orchestrator
+                    .storage()
+                    .mark_needs_rejoin(gid)
+                    .await
+                    .unwrap();
+            }
+
+            let start = world.delivery_service().submitted_prepared_requests().len();
+            let report = bob_engine
+                .orchestrator
+                .run_deferred_recovery("test_multi_recon")
+                .await
+                .unwrap();
+            assert!(
+                report.attempted >= 3,
+                "should attempt recovery on all 3 conversations"
+            );
+
+            let allocations = world.delivery_service().inventory_allocations_since(start);
+            assert_eq!(
+                allocations, 1,
+                "deferred recovery over multiple conversations must allocate exactly ONE inventory snapshot (was {allocations})"
             );
         });
     }

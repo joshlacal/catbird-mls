@@ -945,6 +945,7 @@ async fn fork_readd_key_package_fetch_warns_on_mismatch() {
     // and the mismatch warns; recovery behavior is unchanged.
     for i in 0..2 {
         let envelope = IncomingEnvelope {
+            canonical_entry_json: None,
             conversation_id: group_id.clone(),
             sender_did: bob_did.clone(),
             ciphertext: format!("not-an-mls-message-{i}").into_bytes(),

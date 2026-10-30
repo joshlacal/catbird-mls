@@ -59,7 +59,66 @@ pub struct AccountExitRecord {
     pub reset_evidence: Option<AccountExitResetEvidence>,
 }
 
+/// Validated routing for a durable account-exit record. Storage implementations
+/// use this scope while holding their database transaction; it conveys no
+/// authorization beyond the signed proof already checked by the orchestrator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountExitStorageIdentity {
+    pub transition_id: String,
+    pub conversation_id: String,
+    pub actor_did: String,
+    pub actor_device_id: String,
+}
+
 impl AccountExitRecord {
+    pub fn storage_identity(&self) -> Result<AccountExitStorageIdentity> {
+        self.validate()?;
+        let wrapper = self.wrapper()?;
+        let body = &wrapper["signedRequest"]["body"];
+        Ok(AccountExitStorageIdentity {
+            transition_id: body["transitionId"].as_str().unwrap().to_owned(),
+            conversation_id: body["prior"]["conversationId"].as_str().unwrap().to_owned(),
+            actor_did: body["actorDid"].as_str().unwrap().to_owned(),
+            actor_device_id: body["actorDeviceId"].as_str().unwrap().to_owned(),
+        })
+    }
+
+    /// Validate immutable intent and monotonic proof/completion before storage.
+    /// `latest_operation` must come from the latest inserted record in this
+    /// exact account/device/conversation scope, in the same write transaction.
+    pub fn validate_storage_update(
+        &self,
+        old: Option<&Self>,
+        latest_operation: Option<&str>,
+    ) -> Result<()> {
+        self.validate()?;
+        if let Some(old) = old {
+            old.validate()?;
+            if old.request_body != self.request_body
+                || old.replaces_operation != self.replaces_operation
+                || old
+                    .reset_evidence
+                    .as_ref()
+                    .is_some_and(|reset| Some(reset) != self.reset_evidence.as_ref())
+                || old.local_completion && old.reset_evidence != self.reset_evidence
+                || old.local_completion && !self.local_completion
+                || old
+                    .accepted_response
+                    .as_ref()
+                    .is_some_and(|response| Some(response) != self.accepted_response.as_ref())
+            {
+                return Err(invalid("stored exit evidence is immutable"));
+            }
+        } else if self.accepted_response.is_some()
+            || self.local_completion
+            || self.replaces_operation.as_deref() != latest_operation
+        {
+            return Err(invalid(
+                "new exit does not extend the durable operation lineage",
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn wrapper(&self) -> Result<Value> {
         serde_json::from_slice(&self.request_body).map_err(|_| invalid("invalid saved request"))
     }
@@ -403,6 +462,14 @@ where
                 }
             }
         }
+        if close {
+            let entry = super::direct_requests::normalized_close_entry(
+                record.accepted_response.as_ref().unwrap()["result"]["entry"].clone(),
+            )?;
+            let key = self.verify_terminal_signed_body(&entry).await?;
+            self.retain_verified_request_close(cid, &entry, &key)
+                .await?;
+        }
         self.mls_context().ensure_storage_durable()?;
         if stored.is_none() {
             self.storage()
@@ -612,28 +679,8 @@ pub(crate) mod native {
             .map(|raw| serde_json::from_str(&raw))
             .transpose()
             .map_err(failed)?;
-        if let Some(old) = old {
-            old.validate().map_err(failed)?;
-            if old.request_body != record.request_body
-                || old.replaces_operation != record.replaces_operation
-                || old
-                    .reset_evidence
-                    .as_ref()
-                    .is_some_and(|reset| Some(reset) != record.reset_evidence.as_ref())
-                || old.local_completion && old.reset_evidence != record.reset_evidence
-                || old.local_completion && !record.local_completion
-                || old
-                    .accepted_response
-                    .as_ref()
-                    .is_some_and(|response| Some(response) != record.accepted_response.as_ref())
-            {
-                return Err(MLSError::StorageFailed);
-            }
-        } else {
-            if record.accepted_response.is_some() || record.local_completion {
-                return Err(MLSError::StorageFailed);
-            }
-            let body = &wrapper["signedRequest"]["body"];
+        let latest = if old.is_none() {
+            let identity = record.storage_identity().map_err(failed)?;
             let mut latest = None;
             let mut query = tx.prepare("SELECT value FROM mls_manifests WHERE key LIKE 'account_exit_v1:%' ORDER BY rowid DESC").map_err(failed)?;
             let rows = query
@@ -642,26 +689,111 @@ pub(crate) mod native {
             for raw in rows {
                 let previous: AccountExitRecord =
                     serde_json::from_str(&raw.map_err(failed)?).map_err(failed)?;
-                previous.validate().map_err(failed)?;
-                let previous_wrapper = previous.wrapper().map_err(failed)?;
-                let previous_body = &previous_wrapper["signedRequest"]["body"];
-                if previous_body["prior"]["conversationId"] == body["prior"]["conversationId"]
-                    && previous_body["actorDid"] == body["actorDid"]
-                    && previous_body["actorDeviceId"] == body["actorDeviceId"]
+                let previous = previous.storage_identity().map_err(failed)?;
+                if previous.conversation_id == identity.conversation_id
+                    && previous.actor_did == identity.actor_did
+                    && previous.actor_device_id == identity.actor_device_id
                 {
-                    latest = previous_body["transitionId"].as_str().map(str::to_owned);
+                    latest = Some(previous.transition_id);
                     break;
                 }
             }
-            // The predecessor must be the already durable latest operation in
-            // this exact device/account/CID scope. A new ID cannot form a cycle.
-            if record.replaces_operation != latest {
-                return Err(MLSError::StorageFailed);
-            }
-        }
+            latest
+        } else {
+            None
+        };
+        record
+            .validate_storage_update(old.as_ref(), latest.as_deref())
+            .map_err(failed)?;
         tx.execute("INSERT INTO mls_manifests(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             [&key, &serde_json::to_string(record).map_err(failed)?]).map_err(failed)?;
         tx.commit().map_err(failed)?;
         storage.flush_database()
+    }
+}
+
+#[cfg(test)]
+mod storage_contract_tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde_json::json;
+
+    fn pending(transition: &str) -> AccountExitRecord {
+        let cid = "018f3f6a-7b2c-4d91-8a5e-0f123456789a";
+        let prior = json!({"conversationId":cid,"groupId":STANDARD.encode([1;32]),"generation":1,"epoch":1,"stateVersion":3,"confirmationTag":STANDARD.encode([2;32]),"groupContextHash":STANDARD.encode([3;32]),"lifecycle":"active"});
+        let mut retired = prior.clone();
+        retired["lifecycle"] = json!("superseded");
+        retired["stateVersion"] = json!(4);
+        let body = json!({"$type":"blue.catbird.chat.defs#conversationCloseBody","signatureDomain":"CATBIRD-CHAT-CLOSE\0","transitionId":transition,"idempotencyKey":transition,"actorDid":"did:plc:aaaaaaaaaaaaaaaaaaaaaaaa","actorDeviceId":"018f3f6a-7b2c-4d91-8a5e-0f123456789b","signedAt":"2026-09-19T12:00:00.000Z","authGeneration":7,"prior":prior,"retired":retired,"conversationKind":"direct"});
+        AccountExitRecord {
+            request_body: serde_json::to_vec(
+                &json!({"signedRequest":{"body":body,"signature":STANDARD.encode([4;64])}}),
+            )
+            .unwrap(),
+            accepted_response: None,
+            local_completion: false,
+            replaces_operation: None,
+            reset_evidence: None,
+        }
+    }
+    fn accepted(mut record: AccountExitRecord) -> AccountExitRecord {
+        let wrapper = record.wrapper().unwrap();
+        let body = &wrapper["signedRequest"]["body"];
+        let tombstone = json!({"conversationId":body["prior"]["conversationId"],"conversationKind":"direct","retired":body["retired"],"closedByDid":body["actorDid"],"closedByDeviceId":body["actorDeviceId"],"terminalSeq":3,"closedAt":body["signedAt"]});
+        record.accepted_response = Some(
+            json!({"result":{"entry":{"entryId":"018f3f6a-7b2c-4d91-8a5e-0f123456789c","conversationId":body["prior"]["conversationId"],"seq":3,"signedRequest":wrapper["signedRequest"],"receivedAt":body["signedAt"],"tombstone":tombstone},"tombstone":tombstone}}),
+        );
+        record
+    }
+    #[test]
+    fn exact_intent_and_accepted_evidence_advance_monotonically() {
+        let initial = pending("018f3f6a-7b2c-4d91-8a5e-0f123456789d");
+        assert!(initial.validate_storage_update(None, None).is_ok());
+        let accepted = accepted(initial.clone());
+        assert!(accepted
+            .validate_storage_update(Some(&initial), None)
+            .is_ok());
+        assert!(accepted.validate_storage_update(None, None).is_err());
+        assert!(initial
+            .validate_storage_update(Some(&accepted), None)
+            .is_err());
+        let mut complete = accepted.clone();
+        complete.local_completion = true;
+        assert!(complete
+            .validate_storage_update(Some(&accepted), None)
+            .is_ok());
+        assert!(accepted
+            .validate_storage_update(Some(&complete), None)
+            .is_err());
+        let mut changed = initial.clone();
+        changed.request_body.push(b' ');
+        assert!(changed
+            .validate_storage_update(Some(&initial), None)
+            .is_err());
+        let mut changed = accepted.clone();
+        changed.accepted_response.as_mut().unwrap()["result"]["entry"]["entryId"] =
+            json!("018f3f6a-7b2c-4d91-8a5e-0f123456789e");
+        assert!(changed
+            .validate_storage_update(Some(&accepted), None)
+            .is_err());
+    }
+    #[test]
+    fn new_operation_must_extend_exact_latest_scope_and_cannot_cycle() {
+        let previous = pending("018f3f6a-7b2c-4d91-8a5e-0f123456789d")
+            .storage_identity()
+            .unwrap();
+        let mut next = pending("018f3f6a-7b2c-4d91-8a5e-0f123456789e");
+        assert!(next
+            .validate_storage_update(None, Some(&previous.transition_id))
+            .is_err());
+        next.replaces_operation = Some(previous.transition_id.clone());
+        assert!(next
+            .validate_storage_update(None, Some(&previous.transition_id))
+            .is_ok());
+        assert!(next.validate_storage_update(None, None).is_err());
+        next.replaces_operation = Some(next.storage_identity().unwrap().transition_id);
+        assert!(next
+            .validate_storage_update(None, next.replaces_operation.as_deref())
+            .is_err());
     }
 }

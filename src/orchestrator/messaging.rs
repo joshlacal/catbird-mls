@@ -1,12 +1,12 @@
 use crate::error::MLSError;
 use chrono::Utc;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::collections::{HashMap, HashSet};
 
 use super::api_client::MLSAPIClient;
 use super::canonical_transport::CleanChatSigningContext;
 use super::constants;
-use super::credentials::{CleanChatSigningAuthority, CredentialStore};
+use super::credentials::CredentialStore;
 use super::error::{OrchestratorError, Result};
 use super::mls_provider::{
     IncomingCommitMergeOutcome, MlsCryptoContext, MlsDecryptOutcome, OwnEchoProof,
@@ -19,6 +19,28 @@ use super::types::*;
 enum SendSyncCursorProgress {
     Complete,
     Continue(String),
+}
+
+struct SendActor {
+    did: String,
+    device_id: String,
+    auth_generation: i64,
+    lifecycle_generation: u64,
+}
+
+/// Only this explicit refusal is known to precede durable message publication.
+/// A conflict or unknown transport outcome cannot authorize new ciphertext.
+fn is_stale_send_coordinates(error: &OrchestratorError) -> bool {
+    let OrchestratorError::ServerError {
+        status: 400 | 409,
+        body,
+    } = error
+    else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|value| value["error"].as_str() == Some("StaleCoordinates"))
 }
 
 /// Bound duplicate-proof reads so an attacker-controlled server ID cannot
@@ -56,6 +78,26 @@ fn next_send_sync_cursor(
     Ok(SendSyncCursorProgress::Continue(next_cursor))
 }
 
+/// Convert between hyphenated UUID string and base64-encoded 16-byte UUID representation.
+///
+/// In the clean chat protocol, messageId is a UUIDv4 on the application body, but its
+/// representation in AAD is a base64-encoded 16-byte buffer (e.g. `92P8tePiRyeTgPnVSCCsAw==`).
+/// This helper produces the alternate representation so lookup can match either form.
+fn alternate_uuid_representation(id: &str) -> Option<String> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    if let Ok(u) = uuid::Uuid::parse_str(id) {
+        return Some(STANDARD.encode(u.as_bytes()));
+    }
+    if let Ok(bytes) = STANDARD.decode(id) {
+        if bytes.len() == 16 {
+            if let Ok(u) = uuid::Uuid::from_slice(&bytes) {
+                return Some(u.to_string());
+            }
+        }
+    }
+    None
+}
+
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
 where
     S: MLSStorageBackend + 'static,
@@ -71,15 +113,27 @@ where
         conversation_id: &str,
         message_id: &str,
     ) -> Result<bool> {
-        if !self.storage().message_exists(message_id).await? {
-            return Ok(false);
+        if self.storage().message_exists(message_id).await? {
+            let messages = self
+                .storage()
+                .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
+                .await?;
+            if messages.iter().any(|message| message.id == message_id) {
+                return Ok(true);
+            }
         }
-        Ok(self
-            .storage()
-            .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
-            .await?
-            .iter()
-            .any(|message| message.id == message_id))
+        if let Some(alternate_id) = alternate_uuid_representation(message_id) {
+            if self.storage().message_exists(&alternate_id).await? {
+                let messages = self
+                    .storage()
+                    .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
+                    .await?;
+                if messages.iter().any(|message| message.id == alternate_id) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     async fn catch_up_pending_commits_for_send(
@@ -401,11 +455,40 @@ where
     ) -> Result<ConversationReadyResult> {
         self.check_shutdown().await?;
         self.require_user_did().await?;
-        if self.pending_conversation_admission(convo_id).await? {
-            return Ok(Self::ready_result(
-                ConversationRecoveryState::Recovering,
-                None,
-            ));
+        match self.pending_conversation_admission(convo_id).await {
+            Ok(true) => {
+                return Ok(Self::ready_result(
+                    ConversationRecoveryState::Recovering,
+                    None,
+                ));
+            }
+            Ok(false) => {}
+            Err(OrchestratorError::Mls(crate::error::MLSError::ContextClosed)) => {
+                // A suspended context cannot prove admission; only a known
+                // non-ready projection may answer, and never by joining.
+                let projected = self
+                    .project_conversation_recovery_state_result(convo_id)
+                    .await?;
+                if !matches!(
+                    projected,
+                    ConversationRecoveryState::NeedsRejoin
+                        | ConversationRecoveryState::ResetPending
+                        | ConversationRecoveryState::EpochBehind
+                        | ConversationRecoveryState::UnrecoverableLocal
+                        | ConversationRecoveryState::Recovering
+                ) {
+                    return Err(OrchestratorError::Mls(
+                        crate::error::MLSError::ContextClosed,
+                    ));
+                }
+                tracing::debug!(
+                    convo_id,
+                    ?projected,
+                    "ensure_conversation_ready: context closed during admission probe; bailing with known non-ready projection"
+                );
+                return Ok(Self::ready_result(projected, None));
+            }
+            Err(err) => return Err(err),
         }
 
         let had_in_memory_reset_authority = matches!(
@@ -415,10 +498,10 @@ where
         let projected = self
             .project_conversation_recovery_state_result(convo_id)
             .await?;
-        crate::warn_log!(
-            "[REJOIN-DIAG] convo={} ensure_conversation_ready ENTRY projected={:?}",
+        tracing::debug!(
             convo_id,
-            projected
+            ?projected,
+            "ensure_conversation_ready: checking readiness"
         );
 
         if matches!(
@@ -427,20 +510,20 @@ where
         ) || (projected == ConversationRecoveryState::ResetPending
             && !had_in_memory_reset_authority)
         {
-            crate::warn_log!(
-                "[REJOIN-DIAG] convo={} ensure_conversation_ready EARLY-RETURN {:?} (Recovering/UnrecoverableLocal) — NOT calling join_or_rejoin",
+            tracing::debug!(
                 convo_id,
-                projected
+                ?projected,
+                "ensure_conversation_ready: early-return without join_or_rejoin"
             );
             return Ok(Self::ready_result(projected, None));
         }
 
         let local_epoch = match self.local_group_epoch_result(convo_id).await {
             Ok(epoch) => {
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} ensure_conversation_ready local_group_epoch_result Ok(epoch={:?})",
+                tracing::debug!(
                     convo_id,
-                    epoch
+                    ?epoch,
+                    "ensure_conversation_ready: local_group_epoch_result Ok"
                 );
                 epoch
             }
@@ -452,11 +535,11 @@ where
                         | ConversationRecoveryState::EpochBehind
                 ) =>
             {
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} ensure_conversation_ready BAILING to {:?} WITHOUT join_or_rejoin — local_group_epoch_result Err: {:?}",
+                tracing::debug!(
                     convo_id,
-                    projected,
-                    err
+                    ?projected,
+                    ?err,
+                    "ensure_conversation_ready: bailing without join_or_rejoin"
                 );
                 return Ok(Self::ready_result(projected, None));
             }
@@ -487,10 +570,10 @@ where
                 .local_group_epoch_result(convo_id)
                 .await?
                 .or(local_epoch);
-            crate::warn_log!(
-                "[REJOIN-DIAG] convo={} stale NeedsRejoin on locally-healthy group — cleared, returning {:?} (NO force_rejoin)",
+            tracing::debug!(
                 convo_id,
-                projected
+                ?projected,
+                "ensure_conversation_ready: stale NeedsRejoin cleared on locally-healthy group"
             );
             return Ok(Self::ready_result(projected, epoch));
         }
@@ -500,10 +583,10 @@ where
                 // join_or_rejoin owns the transition gate through its final
                 // fail-closed Active projection. Never repeat that write after
                 // the gate is released: a newer reset may already own authority.
-                crate::warn_log!(
-                    "[REJOIN-DIAG] convo={} rejoin succeeded — cleared NeedsRejoin -> Active (epoch={})",
+                tracing::debug!(
                     convo_id,
-                    epoch
+                    epoch,
+                    "ensure_conversation_ready: rejoin succeeded"
                 );
                 let projected = self
                     .project_conversation_recovery_state_result(convo_id)
@@ -593,8 +676,32 @@ where
         payload: MLSMessagePayload,
     ) -> Result<Message> {
         self.check_shutdown().await?;
-        let user_did = self.require_user_did().await?;
+        let actor = self.capture_send_actor().await?;
+        let user_did = actor.did.clone();
 
+        if let Some(reference) = payload
+            .checked_group_invitation()
+            .map_err(|_| OrchestratorError::InvalidInput("Invalid group invitation note".into()))?
+        {
+            let destination = self.fetch_conversation_lifecycle(conversation_id).await?;
+            validate_group_note_destination(
+                &destination["state"],
+                conversation_id,
+                &user_did,
+                &reference,
+            )?;
+            let fresh = self
+                .get_group_invitation_reference(
+                    &reference.conversation_id,
+                    &reference.recipient_did,
+                )
+                .await?;
+            if fresh.as_ref() != Some(&reference) {
+                return Err(OrchestratorError::InvalidInput(
+                    "The group invitation changed; no note was sent".into(),
+                ));
+            }
+        }
         self.reject_send_if_reset_pending(conversation_id).await?;
         if self.is_local_conversation_closed(conversation_id).await? {
             return Err(OrchestratorError::InvalidInput(
@@ -662,58 +769,26 @@ where
         let transition_guard = transition_lock.lock().await;
         self.reject_send_if_reset_pending(conversation_id).await?;
 
-        // Encrypt via MLS.
-        //
-        // Task #43: `send` no longer self-heals via `join_or_rejoin` when the group
-        // is missing locally. Auto-External-Commits on send were a major source of
-        // production epoch inflation (hot path, runs on every send failure). Instead
-        // we surface `NotJoined` to the caller; the platform decides whether to
-        // trigger recovery (Welcome replay, S1 reset request, UI prompt, etc.).
-        let encrypt_result = match self
+        // Bind metadata and message identity before encryption. The provider
+        // checks this epoch under its mutation lock and emits raw MLS framing.
+        self.validate_send_actor(&actor).await?;
+        let epoch = self
             .mls_context()
-            .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())
-        {
-            Ok(r) => r,
-            Err(crate::MLSError::GroupNotFound { .. }) => {
-                tracing::warn!(
-                    conversation_id,
-                    "send_payload_message: group not found locally; NOT auto-rejoining (task #43). Caller must handle."
-                );
-                return Err(OrchestratorError::NotJoined {
+            .get_epoch(group_id_bytes.clone())
+            .map_err(|error| match error {
+                MLSError::GroupNotFound { .. } => OrchestratorError::NotJoined {
                     convo_id: conversation_id.to_string(),
-                });
-            }
-            Err(e) => return Err(OrchestratorError::from(e)),
-        };
-
-        // Get current epoch from MLS FFI (authoritative source).
-        // The in-memory group_states cache can be stale or missing after
-        // session restore, so always query the FFI layer.
-        let epoch = match self.mls_context().get_epoch(group_id_bytes.clone()) {
-            Ok(e) => {
-                tracing::info!(conversation_id, epoch = e, "FFI epoch for send_message");
-                e
-            }
-            Err(err) => {
-                tracing::warn!(conversation_id, error = %err, "FFI get_epoch failed, using cached group state");
-                let states = self.group_states().lock().await;
-                resolved
-                    .group_state(&states)
-                    .map(|state| state.epoch)
-                    .unwrap_or(0)
-            }
-        };
-
-        // Generate the client message ID before send so local storage and server ACK state
-        // refer to the same identifier.
+                },
+                other => OrchestratorError::Mls(other),
+            })?;
         let message_id = uuid::Uuid::new_v4().to_string();
-
         let send_result = self
-            .send_message_prepared(
+            .encrypt_and_send_message_prepared(
                 &resolved.conversation_id,
-                &encrypt_result.ciphertext,
+                &payload_bytes,
                 epoch,
                 &message_id,
+                &actor,
             )
             .await;
         drop(transition_guard);
@@ -740,12 +815,13 @@ where
                 }
                 return Err(send_result.unwrap_err());
             }
-            Err(OrchestratorError::ServerError {
-                status: 409,
-                ref body,
-            }) => {
-                // Approach B: lightweight sync + single retry on 409 (epoch mismatch).
-                // NO External Commit — only catch up on pending commits and re-encrypt.
+            Err(ref error) if is_stale_send_coordinates(error) => {
+                self.validate_send_actor(&actor).await?;
+                let OrchestratorError::ServerError { body, .. } = error else {
+                    unreachable!()
+                };
+                // The canonical server explicitly refused stale coordinates before
+                // publication. Catch up and re-encrypt once with the same message ID.
                 let remote = serde_json::from_str::<serde_json::Value>(body)
                     .ok()
                     .and_then(|v| v["serverEpoch"].as_u64())
@@ -754,7 +830,7 @@ where
                     conversation_id,
                     local_epoch = epoch,
                     remote_epoch = remote,
-                    "Epoch mismatch (409) — attempting Approach B lightweight sync"
+                    "Stale send coordinates; attempting one lightweight sync"
                 );
 
                 // Lightweight sync: fetch pending commits to advance local epoch.
@@ -762,13 +838,16 @@ where
                 // messages, so cursor progression is handled independently of
                 // the returned message vector.
                 if let Err(error) = self
-                    .catch_up_pending_commits_for_send(conversation_id, "retry_after_409")
+                    .catch_up_pending_commits_for_send(
+                        conversation_id,
+                        "retry_after_stale_coordinates",
+                    )
                     .await
                 {
                     tracing::error!(
                         conversation_id,
                         error = %error,
-                        "409 recovery: commit catch-up failed — flagging NEEDS_REJOIN"
+                        "Stale-coordinate recovery: commit catch-up failed"
                     );
                     self.mark_needs_rejoin_critical(conversation_id).await;
                     return Err(error);
@@ -789,30 +868,15 @@ where
                 let retry_transition_lock = self.rejoin_lock(conversation_id).await;
                 let retry_transition_guard = retry_transition_lock.lock().await;
                 self.reject_send_if_reset_pending(conversation_id).await?;
-
-                let retry_encrypt = match self
-                    .mls_context()
-                    .encrypt_message(group_id_bytes.clone(), payload_bytes.clone())
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        drop(retry_transition_guard);
-                        tracing::error!(
-                            conversation_id,
-                            error = %e,
-                            "409 recovery: re-encryption failed — flagging NEEDS_REJOIN"
-                        );
-                        self.mark_needs_rejoin_critical(conversation_id).await;
-                        return Err(OrchestratorError::from(e));
-                    }
-                };
+                self.validate_send_actor(&actor).await?;
 
                 let retry_send_result = self
-                    .send_message_prepared(
-                        conversation_id,
-                        &retry_encrypt.ciphertext,
+                    .encrypt_and_send_message_prepared(
+                        &resolved.conversation_id,
+                        &payload_bytes,
                         retry_epoch,
                         &message_id,
+                        &actor,
                     )
                     .await;
                 drop(retry_transition_guard);
@@ -826,15 +890,14 @@ where
                         tracing::info!(
                             conversation_id,
                             retry_epoch,
-                            "409 recovery: retry succeeded after lightweight sync"
+                            "Stale-coordinate retry succeeded after lightweight sync"
                         );
                         Some(resp)
                     }
-                    Err(OrchestratorError::ServerError { status: 409, .. }) => {
-                        // Second 409: flag conversation NEEDS_REJOIN, return error
+                    Err(ref error) if is_stale_send_coordinates(error) => {
                         tracing::error!(
                             conversation_id,
-                            "409 recovery: second 409 after sync — flagging NEEDS_REJOIN"
+                            "Send coordinates remain stale after bounded sync"
                         );
                         self.mark_needs_rejoin_critical(conversation_id).await;
                         return Err(OrchestratorError::EpochMismatch {
@@ -853,6 +916,7 @@ where
             }
         };
 
+        self.validate_send_actor(&actor).await?;
         // Use server values when available, fall back to local
         let (msg_epoch, msg_seq) = match &send_response {
             Some(resp) => (resp.epoch, resp.seq),
@@ -866,6 +930,7 @@ where
             .insert(message_id.clone());
 
         // Persist pending message for dedup across app restarts
+        self.validate_send_actor(&actor).await?;
         if let Err(e) = self
             .storage()
             .store_pending_message(conversation_id, &message_id)
@@ -876,6 +941,30 @@ where
                 message_id = %message_id,
                 "Failed to persist pending message for dedup"
             );
+        }
+
+        // When the server assigned an entryId distinct from the client messageId,
+        // also persist the server-assigned message ID as pending so future echoes
+        // carrying server_message_id are recognized immediately.
+        if let Some(ref resp) = send_response {
+            if resp.message_id != message_id {
+                self.validate_send_actor(&actor).await?;
+                self.pending_messages()
+                    .lock()
+                    .await
+                    .insert(resp.message_id.clone());
+                if let Err(e) = self
+                    .storage()
+                    .store_pending_message(conversation_id, &resp.message_id)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        server_message_id = %resp.message_id,
+                        "Failed to persist server message id for pending dedup"
+                    );
+                }
+            }
         }
 
         let mut message = Message {
@@ -896,7 +985,19 @@ where
             .await;
 
         // Store locally
+        self.validate_send_actor(&actor).await?;
         self.storage().store_message(&message).await?;
+        self.validate_send_actor(&actor).await?;
+
+        // Labyrinth history backup (best effort: the send already succeeded).
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        self.labyrinth_archive_sent(
+            &resolved.conversation_id,
+            &message.id,
+            u64::try_from(message.timestamp.timestamp_millis()).unwrap_or(0),
+            &payload_bytes,
+        )
+        .await;
 
         tracing::debug!(conversation_id, "Message sent successfully");
         Ok(message)
@@ -912,6 +1013,9 @@ where
         self.check_shutdown().await?;
         let user_did = self.require_user_did().await?;
         envelope.validate_server_metadata()?;
+        if envelope.canonical_entry_json.is_some() {
+            return Box::pin(self.consume_request_control(envelope)).await;
+        }
 
         crate::message_limits::validate_inbound_mls_message_len(
             envelope.ciphertext.len(),
@@ -937,6 +1041,14 @@ where
             }
             Err(error) => return Err(error),
         };
+
+        if self.known_direct_request(&resolved.conversation_id).await?
+            && self
+                .pending_conversation_admission(&resolved.conversation_id)
+                .await?
+        {
+            return Err(OrchestratorError::InvalidInput("RequestNotAccepted".into()));
+        }
 
         // HTTP polling, push delivery, and send catch-up can all present the
         // same ordered frame concurrently. Serialize by stable conversation
@@ -1232,11 +1344,88 @@ where
             Err(e) if e.is_secret_reuse() => {
                 let has_durable_evidence = match envelope.server_message_id.as_deref() {
                     Some(server_id) => {
-                        self.durable_message_exists_in_conversation(
-                            &resolved.conversation_id,
-                            server_id,
-                        )
-                        .await?
+                        // 1. Direct or alternate-UUID durable message existence
+                        if self
+                            .durable_message_exists_in_conversation(
+                                &resolved.conversation_id,
+                                server_id,
+                            )
+                            .await?
+                        {
+                            true
+                        } else {
+                            // 2. Pending message evidence (in-memory fast path and durable outbox)
+                            let alternate = alternate_uuid_representation(server_id);
+                            let mut pending = self.pending_messages().lock().await;
+                            let in_memory_pending = pending.remove(server_id)
+                                || alternate.as_ref().is_some_and(|alt| pending.remove(alt));
+                            drop(pending);
+                            let in_storage_pending = if in_memory_pending {
+                                let _ = self.storage().remove_pending_message(server_id).await;
+                                if let Some(alt) = &alternate {
+                                    let _ = self.storage().remove_pending_message(alt).await;
+                                }
+                                true
+                            } else {
+                                let direct = self
+                                    .storage()
+                                    .remove_pending_message(server_id)
+                                    .await
+                                    .unwrap_or(false);
+                                let alt = match &alternate {
+                                    Some(alt) => self
+                                        .storage()
+                                        .remove_pending_message(alt)
+                                        .await
+                                        .unwrap_or(false),
+                                    None => false,
+                                };
+                                direct || alt
+                            };
+
+                            if in_storage_pending {
+                                true
+                            } else {
+                                // 3. Match the actual public MLS framing against
+                                // independently retained protected evidence.
+                                match super::mls_provider::private_application_echo_metadata(
+                                    &envelope.ciphertext,
+                                ) {
+                                    Ok((wire_group, epoch, aad_sha256))
+                                        if wire_group == group_id_bytes
+                                            && envelope
+                                                .server_epoch
+                                                .is_none_or(|expected| expected == epoch) =>
+                                    {
+                                        let ciphertext_sha256: [u8; 32] =
+                                            sha2::Sha256::digest(&envelope.ciphertext).into();
+                                        let direct = self.mls_context().has_own_echo_proof(
+                                            &resolved.conversation_id,
+                                            &group_id_bytes,
+                                            server_id,
+                                            epoch,
+                                            &aad_sha256,
+                                            &ciphertext_sha256,
+                                        )?;
+                                        if direct {
+                                            true
+                                        } else if let Some(alt) = &alternate {
+                                            self.mls_context().has_own_echo_proof(
+                                                &resolved.conversation_id,
+                                                &group_id_bytes,
+                                                alt,
+                                                epoch,
+                                                &aad_sha256,
+                                                &ciphertext_sha256,
+                                            )?
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    _ => false,
+                                }
+                            }
+                        }
                     }
                     None => false,
                 };
@@ -1676,6 +1865,20 @@ where
 
         let (plaintext, payload_json) = match MLSMessagePayload::decode(&decrypt_result.plaintext) {
             Ok(payload) => {
+                if let Some(reference) = payload.checked_group_invitation().map_err(|_| {
+                    OrchestratorError::InvalidInput("Invalid group invitation note".into())
+                })? {
+                    let sender = super::credential_binding::credential_root_did(&sender_did);
+                    let receiver = super::credential_binding::credential_root_did(&user_did);
+                    if reference.invited_by_did != sender
+                        || (!is_own && reference.recipient_did != receiver)
+                    {
+                        tracing::warn!(
+                            "Ignoring group invitation note with mismatched authenticated parties"
+                        );
+                        return Ok(None);
+                    }
+                }
                 if !payload.is_displayable() {
                     if !(self.store_control_messages() && payload.is_known_control()) {
                         tracing::debug!(
@@ -1788,6 +1991,30 @@ where
         envelope: &IncomingEnvelope,
     ) -> Result<MessageProcessingResult> {
         envelope.validate_server_metadata()?;
+        if envelope.canonical_entry_json.is_some() {
+            let message = Box::pin(self.consume_request_control(envelope)).await?;
+            let events = message
+                .as_ref()
+                .map(|m| {
+                    vec![crate::orchestrator::EngineEvent::MessageInserted {
+                        message_id: m.id.clone(),
+                        convo_id: m.conversation_id.clone(),
+                    }]
+                })
+                .unwrap_or_else(|| {
+                    vec![crate::orchestrator::EngineEvent::ConversationUpdated {
+                        convo_id: envelope.conversation_id.clone(),
+                    }]
+                });
+            return Ok(MessageProcessingResult { message, events });
+        }
+        if self.known_direct_request(&envelope.conversation_id).await?
+            && self
+                .pending_conversation_admission(&envelope.conversation_id)
+                .await?
+        {
+            return Err(OrchestratorError::InvalidInput("RequestNotAccepted".into()));
+        }
         if let Some(server_epoch) = envelope.server_epoch {
             let local_epoch = self
                 .local_group_epoch_result(&envelope.conversation_id)
@@ -1855,7 +2082,9 @@ where
         to_epoch: Option<u32>,
     ) -> Result<(Vec<Message>, Option<String>)> {
         self.check_shutdown().await?;
-        if self.pending_conversation_admission(conversation_id).await? {
+        if self.pending_conversation_admission(conversation_id).await?
+            && !self.known_direct_request(conversation_id).await?
+        {
             return Ok((Vec::new(), None));
         }
 
@@ -1957,27 +2186,65 @@ where
         changed
     }
 
-    pub(crate) async fn send_message_prepared(
+    async fn capture_send_actor(&self) -> Result<SendActor> {
+        let lifecycle_generation = self.lifecycle_generation();
+        let did = self.require_user_did().await?;
+        let device_id = self
+            .credentials()
+            .get_device_uuid(&did)
+            .await?
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| OrchestratorError::Credential("device not registered".into()))?;
+        let auth_generation = self
+            .credentials()
+            .get_auth_generation(&did)
+            .await?
+            .filter(|value| *value >= 1)
+            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
+        let actor = SendActor {
+            did,
+            device_id,
+            auth_generation,
+            lifecycle_generation,
+        };
+        self.validate_send_actor(&actor).await?;
+        Ok(actor)
+    }
+
+    async fn validate_send_actor(&self, actor: &SendActor) -> Result<()> {
+        if self.lifecycle_generation() != actor.lifecycle_generation
+            || self.require_user_did().await? != actor.did
+            || self
+                .credentials()
+                .get_device_uuid(&actor.did)
+                .await?
+                .as_deref()
+                != Some(&actor.device_id)
+            || self.credentials().get_auth_generation(&actor.did).await?
+                != Some(actor.auth_generation)
+            || !self.api_client().is_authenticated_as(&actor.did).await
+            || self.lifecycle_generation() != actor.lifecycle_generation
+            || self.require_user_did().await? != actor.did
+        {
+            return Err(OrchestratorError::NotAuthenticated);
+        }
+        Ok(())
+    }
+
+    async fn encrypt_and_send_message_prepared(
         &self,
         conversation_id: &str,
-        ciphertext: &[u8],
+        plaintext: &[u8],
         epoch: u64,
         message_id: &str,
+        actor: &SendActor,
     ) -> Result<SendMessageResponse> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use sha2::Sha256;
-        let user_did = self.require_user_did().await?;
-        let actor_device_id = self.require_actor_device_id().await?;
-        let auth_generation = self
-            .credentials()
-            .get_auth_generation(&user_did)
-            .await?
-            .ok_or_else(|| OrchestratorError::Credential("missing auth generation".into()))?;
-        if auth_generation < 1 {
-            return Err(OrchestratorError::Credential(
-                "auth_generation must be >= 1".into(),
-            ));
-        }
+        self.validate_send_actor(actor).await?;
+        let user_did = &actor.did;
+        let actor_device_id = &actor.device_id;
+        let auth_generation = actor.auth_generation;
         let key_id = {
             let identity_bytes = format!("{user_did}#{actor_device_id}").into_bytes();
             let pk = self.mls_context().identity_public_key(identity_bytes)?;
@@ -2011,48 +2278,45 @@ where
                 group_context_hash.len()
             ))));
         }
+        // Bind the send to the authoritative point read for this conversation.
+        // A listing lookup that silently defaulted to (0, 0) made the server
+        // reject the send as StaleCoordinates whenever the listing failed,
+        // was rate limited, or paginated the conversation out of range, and
+        // the client then retried the same doomed coordinates forever.
         let (generation, state_version) = {
-            let convos_req = super::canonical_transport::PreparedRequest {
-                operation: super::canonical_transport::CanonicalOperation::GetConversations,
-                path: format!(
-                    "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=50",
-                    actor_device_id
-                ),
-                method: "GET".to_string(),
-                body: None,
-            };
-            let convos_val: Option<serde_json::Value> =
-                if let Ok(resp) = self.api_client().submit_prepared_request(convos_req).await {
-                    serde_json::from_slice(&resp.body).ok()
-                } else {
-                    None
-                };
-            convos_val
-                .as_ref()
-                .and_then(|v| v.get("items").and_then(|i| i.as_array()))
-                .and_then(|items| {
-                    items.iter().find_map(|item| {
-                        let state = item.get("state").unwrap_or(item);
-                        let coords = state.get("coordinates")?;
-                        let cid = coords.get("conversationId").and_then(|c| c.as_str())?;
-                        if cid == convo_id {
-                            let g = coords
-                                .get("generation")
-                                .and_then(|g| g.as_i64())
-                                .unwrap_or(0);
-                            let sv = coords
-                                .get("stateVersion")
-                                .and_then(|sv| sv.as_i64())
-                                .unwrap_or(0);
-                            Some((g, sv))
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or((0, 0))
+            let state = self.fetch_conversation_lifecycle(convo_id).await?;
+            let coords = state
+                .get("state")
+                .and_then(|s| s.get("coordinates"))
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput(format!(
+                        "conversation {convo_id} state carries no coordinates"
+                    ))
+                })?;
+            if coords.get("conversationId").and_then(|c| c.as_str()) != Some(convo_id.as_str()) {
+                return Err(OrchestratorError::InvalidInput(format!(
+                    "conversation {convo_id} coordinates identify a different conversation"
+                )));
+            }
+            let generation = coords
+                .get("generation")
+                .and_then(|g| g.as_i64())
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput(format!(
+                        "conversation {convo_id} coordinates carry no generation"
+                    ))
+                })?;
+            let state_version = coords
+                .get("stateVersion")
+                .and_then(|sv| sv.as_i64())
+                .ok_or_else(|| {
+                    OrchestratorError::InvalidInput(format!(
+                        "conversation {convo_id} coordinates carry no state version"
+                    ))
+                })?;
+            (generation, state_version)
         };
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "$type": "blue.catbird.chat.defs#applicationSendBody",
             "aad": {
                 "conversationId": STANDARD.encode(convo_uuid.as_bytes()),
@@ -2073,10 +2337,10 @@ where
             "actorDeviceId": actor_device_id,
             "actorDid": user_did,
             "applicationMessage": {
-                "bytes": { "$bytes": STANDARD.encode(ciphertext) },
+                "bytes": { "$bytes": "" },
                 "contentType": "privateMessageApplication",
                 "framing": "mlsMessage",
-                "sha256": { "$bytes": STANDARD.encode(Sha256::digest(ciphertext)) }
+                "sha256": { "$bytes": "" }
             },
             "authGeneration": auth_generation,
             "blobBindings": [],
@@ -2084,7 +2348,7 @@ where
             "messageId": message_id,
             "prior": {
                 "confirmationTag": { "$bytes": STANDARD.encode(&confirmation_tag) },
-                "conversationId": conversation_id,
+                "conversationId": convo_id,
                 "epoch": epoch,
                 "generation": generation,
                 "groupContextHash": { "$bytes": STANDARD.encode(&group_context_hash) },
@@ -2095,6 +2359,23 @@ where
             "signatureDomain": "CATBIRD-CHAT-MESSAGE\0",
             "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         });
+
+        let aad_bytes = super::canonical_transport::canonical_application_aad_bytes(&body["aad"])
+            .map_err(|error| OrchestratorError::Serialization(error.to_string()))?;
+        self.validate_send_actor(actor).await?;
+        // The signed body below carries this exact AAD. No state fetch or
+        // coordinate regeneration may occur between encryption and submission.
+        let encrypted = self.mls_context().encrypt_message_with_aad(
+            group_id_bytes.clone(),
+            plaintext.to_vec(),
+            aad_bytes.clone(),
+            epoch,
+        )?;
+        let ciphertext = encrypted.ciphertext;
+        body["applicationMessage"]["bytes"]["$bytes"] =
+            serde_json::json!(STANDARD.encode(&ciphertext));
+        body["applicationMessage"]["sha256"]["$bytes"] =
+            serde_json::json!(STANDARD.encode(Sha256::digest(&ciphertext)));
 
         let binding = CleanChatSigningContext {
             actor_did: user_did.clone(),
@@ -2110,6 +2391,7 @@ where
             )
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        self.validate_send_actor(actor).await?;
 
         let submitted_bytes = prepared_request.body.as_deref().unwrap_or_default();
         let submitted_val: serde_json::Value =
@@ -2123,18 +2405,14 @@ where
             .await?;
 
         if response.status != 200 {
-            if response.status == 409 {
-                return Err(OrchestratorError::ServerError {
-                    status: 409,
-                    body: String::from_utf8_lossy(&response.body).to_string(),
-                });
-            }
-            return Err(OrchestratorError::Api(format!(
-                "send_message failed with status {}: {}",
-                response.status,
-                String::from_utf8_lossy(&response.body)
-            )));
+            return Err(OrchestratorError::ServerError {
+                status: response.status,
+                body: String::from_utf8_lossy(&response.body).to_string(),
+            });
         }
+        // An account transition after submission is an uncertain delivery for
+        // the original actor. Never apply its acknowledgment to a new session.
+        self.validate_send_actor(actor).await?;
 
         let resp_json: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|e| OrchestratorError::Serialization(format!("send_message response: {e}")))?;
@@ -2222,20 +2500,37 @@ where
             OrchestratorError::Serialization("send_message response missing signedRequest".into())
         })?;
 
-        if submitted_signed_request != resp_signed_request {
+        // The submitted wire and the response presentation may spell declared
+        // bytes differently (bare base64 or lexicon `{"$bytes"}`). Compare and
+        // hash the one canonical bare form; the submitted request is unchanged.
+        // Equality with the submitted request is the acceptance check, so only
+        // the declared byte spelling is normalized here.
+        let canonical_signed = |value: &serde_json::Value, what: &str| {
+            let mut value = value.clone();
+            crate::chat_v2::transcript::direct_request::normalize_read_bytes(
+                "signedApplicationSend",
+                &mut value,
+            )
+            .map_err(|e| {
+                OrchestratorError::Serialization(format!("invalid {what} signedRequest: {e}"))
+            })?;
+            Ok::<_, OrchestratorError>(value)
+        };
+        let accepted_signed_request = canonical_signed(resp_signed_request, "send_message response")?;
+        if canonical_signed(submitted_signed_request, "submitted")? != accepted_signed_request {
             return Err(OrchestratorError::Serialization(
                 "send_message response signedRequest does not match submitted signedRequest".into(),
             ));
         }
 
-        let accepted_request_bytes = serde_json::to_vec(resp_signed_request).map_err(|e| {
+        let accepted_request_bytes = serde_json::to_vec(&accepted_signed_request).map_err(|e| {
             OrchestratorError::Serialization(format!("serialize accepted signedRequest: {e}"))
         })?;
         let accepted_request_sha256: [u8; 32] =
             sha2::Sha256::digest(&accepted_request_bytes).into();
 
-        let aad_sha256: [u8; 32] = sha2::Sha256::digest(b"").into();
-        let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(ciphertext).into();
+        let aad_sha256: [u8; 32] = sha2::Sha256::digest(&aad_bytes).into();
+        let ciphertext_sha256: [u8; 32] = sha2::Sha256::digest(&ciphertext).into();
         let proof = OwnEchoProof::new(
             accepted_request_sha256,
             resolved.conversation_id.clone(),
@@ -2245,6 +2540,7 @@ where
             aad_sha256,
             ciphertext_sha256,
         );
+        self.validate_send_actor(actor).await?;
         self.mls_context().store_own_echo_proof(&proof)?;
 
         Ok(SendMessageResponse {
@@ -2291,5 +2587,88 @@ mod tests {
         let error = next_send_sync_cursor(None, Some(String::new()), &mut seen)
             .expect_err("an empty delivery-service cursor must fail closed");
         assert!(error.to_string().contains("empty cursor"));
+    }
+}
+
+/// The typed invitation may only be sent to its exact recipient in an accepted
+/// direct conversation. This check supplements, never replaces, ordinary send gates.
+fn validate_group_note_destination(
+    state: &serde_json::Value,
+    conversation_id: &str,
+    owner: &str,
+    reference: &super::GroupInvitationReference,
+) -> Result<()> {
+    let valid = || -> Option<()> {
+        let typed =
+            super::canonical_transport::decode_conversation_state(&serde_json::to_vec(state).ok()?)
+                .ok()?;
+        if typed.coordinates.conversation_id.as_str() != conversation_id
+            || typed.conversation_kind.as_str() != "direct"
+            || typed.coordinates.lifecycle.as_str() != "active"
+            || owner != reference.invited_by_did
+            || typed.participants.len() != 2
+            || !typed
+                .participants
+                .iter()
+                .all(|p| p.status.as_str() == "active")
+            || !typed
+                .participants
+                .iter()
+                .any(|p| p.user_did.as_str() == owner)
+            || !typed
+                .participants
+                .iter()
+                .any(|p| p.user_did.as_str() == reference.recipient_did)
+            || state
+                .get("directRequest")
+                .is_some_and(|r| r["consent"] != "accepted")
+        {
+            return None;
+        }
+        Some(())
+    };
+    valid().ok_or_else(|| {
+        OrchestratorError::InvalidInput(
+            "Accept the exact recipient's direct conversation before sending an invitation note"
+                .into(),
+        )
+    })
+}
+
+#[cfg(test)]
+mod group_invitation_note_destination_tests {
+    use super::*;
+    #[test]
+    fn group_note_destination_requires_exact_accepted_direct_recipient() {
+        let mut state: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/group-invitation-note-state.json"
+        ))
+        .unwrap();
+        let owner = state["participants"][0]["userDid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cid = state["coordinates"]["conversationId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let reference = super::super::GroupInvitationReference {
+            authority_did: "did:web:chat.catbird.blue".into(),
+            conversation_id: "22222222-2222-4222-9222-222222222222".into(),
+            invitation_transition_id: "33333333-3333-4333-9333-333333333333".into(),
+            invited_by_did: owner.clone(),
+            invited_by_device_id: "44444444-4444-4444-9444-444444444444".into(),
+            recipient_did: state["participants"][1]["userDid"].as_str().unwrap().into(),
+        };
+        assert!(validate_group_note_destination(&state, &cid, &owner, &reference).is_ok());
+        assert!(validate_group_note_destination(&state, "other", &owner, &reference).is_err());
+        let mut wrong = reference.clone();
+        wrong.recipient_did = "did:plc:cccccccccccccccccccccccc".into();
+        assert!(validate_group_note_destination(&state, &cid, &owner, &wrong).is_err());
+        state["participants"][1]["status"] = serde_json::json!("pending");
+        assert!(validate_group_note_destination(&state, &cid, &owner, &reference).is_err());
+        state["participants"][1]["status"] = serde_json::json!("active");
+        state["conversationKind"] = serde_json::json!("group");
+        assert!(validate_group_note_destination(&state, &cid, &owner, &reference).is_err());
     }
 }

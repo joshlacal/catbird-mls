@@ -1,0 +1,725 @@
+{
+ "blue.catbird.chat.acceptConversation": {
+  "properties": {
+   "acceptanceProof": {
+    "ref": "blue.catbird.chat.defs#directRequestAcceptanceProof",
+    "type": "ref"
+   },
+   "coordinates": {
+    "ref": "blue.catbird.chat.defs#conversationCoordinates",
+    "type": "ref"
+   },
+   "entry": {
+    "ref": "blue.catbird.chat.defs#participantAcceptanceEntry",
+    "type": "ref"
+   },
+   "recovery": {
+    "ref": "blue.catbird.chat.defs#leafRecoveryView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "coordinates"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.acknowledgeWelcome": {
+  "properties": {
+   "acknowledgedAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   },
+   "status": {
+    "const": "acknowledged",
+    "type": "string"
+   }
+  },
+  "required": [
+   "status",
+   "acknowledgedAt"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.activateReset": {
+  "properties": {
+   "entry": {
+    "ref": "blue.catbird.chat.defs#resetActivationEntry",
+    "type": "ref"
+   },
+   "retiredCoordinates": {
+    "ref": "blue.catbird.chat.defs#conversationCoordinates",
+    "type": "ref"
+   },
+   "successorCoordinates": {
+    "ref": "blue.catbird.chat.defs#conversationCoordinates",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "retiredCoordinates",
+   "successorCoordinates",
+   "entry"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.cancelDirectRequestPreparation": {
+  "properties": {
+   "outcome": {
+    "ref": "blue.catbird.chat.defs#directRequestOutcome",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "outcome"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.cancelLeafRecovery": {
+  "properties": {
+   "recovery": {
+    "ref": "blue.catbird.chat.defs#leafRecoveryView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "recovery"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.cancelLeave": {
+  "properties": {
+   "entry": {
+    "ref": "blue.catbird.chat.defs#leaveCancellationEntry",
+    "type": "ref"
+   },
+   "leaveRequest": {
+    "ref": "blue.catbird.chat.defs#leaveRequestView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "leaveRequest",
+   "entry"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.closeConversation": {
+  "properties": {
+   "result": {
+    "ref": "blue.catbird.chat.defs#conversationCloseResult",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "result"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.createConversation": {
+  "properties": {
+   "result": {
+    "ref": "blue.catbird.chat.defs#conversationCreationResult",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "result"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.deleteBlob": {
+  "properties": {
+   "blobId": {
+    "ref": "blue.catbird.chat.defs#operationId",
+    "type": "ref"
+   },
+   "deletedAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "blobId",
+   "deletedAt"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.enrollDevice": {
+  "properties": {
+   "device": {
+    "ref": "blue.catbird.chat.defs#deviceView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "device"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getBlobUsage": {
+  "properties": {
+   "usage": {
+    "ref": "blue.catbird.chat.defs#blobUsageView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "usage"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getConversationState": {
+  "properties": {
+   "pendingLeafRecoveryRequests": {
+    "description": "Open unexpired leaf recoveries bound to the current coordinate, visible only to an active concrete device leaf that may fulfill them. Excludes the requesting exact device, but includes other devices of the same DID. Ordered oldest first; successful fulfillment changes the coordinate and stale requests must be renewed. Absent on older servers; empty for logical participants without a current concrete leaf. This is separate from the exact-target-device getLeafRecoveryInbox and grants no additional application history.",
+    "items": {
+     "ref": "blue.catbird.chat.defs#leafRecoveryView",
+     "type": "ref"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   },
+   "pendingLeaveRequests": {
+    "items": {
+     "ref": "blue.catbird.chat.defs#leaveRequestView",
+     "type": "ref"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   },
+   "pendingResetRequests": {
+    "items": {
+     "ref": "blue.catbird.chat.defs#resetRequestView",
+     "type": "ref"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   },
+   "state": {
+    "ref": "blue.catbird.chat.defs#conversationState",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "state",
+   "pendingResetRequests",
+   "pendingLeaveRequests"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getConversations": {
+  "properties": {
+   "hasMore": {
+    "type": "boolean"
+   },
+   "inventoryScope": {
+    "ref": "blue.catbird.chat.defs#directRequestInventoryScope",
+    "type": "ref"
+   },
+   "inventorySessionId": {
+    "maxLength": 512,
+    "minLength": 32,
+    "type": "string"
+   },
+   "items": {
+    "items": {
+     "ref": "blue.catbird.chat.defs#conversationInventoryItem",
+     "type": "ref"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   },
+   "nextPageCursor": {
+    "maxLength": 512,
+    "minLength": 1,
+    "type": "string"
+   },
+   "snapshotEventCursor": {
+    "maxLength": 512,
+    "minLength": 1,
+    "type": "string"
+   },
+   "snapshotExpiresAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "items",
+   "inventorySessionId",
+   "snapshotEventCursor",
+   "hasMore",
+   "snapshotExpiresAt"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getDeviceKey": {
+  "properties": {
+   "deviceId": {
+    "ref": "blue.catbird.chat.defs#deviceId",
+    "type": "ref"
+   },
+   "keyId": {
+    "ref": "blue.catbird.chat.defs#keyId",
+    "type": "ref"
+   },
+   "ownerDid": {
+    "ref": "blue.catbird.chat.defs#bareDid",
+    "type": "ref"
+   },
+   "signaturePublicKey": {
+    "maxLength": 32,
+    "minLength": 32,
+    "type": "bytes"
+   }
+  },
+  "required": [
+   "ownerDid",
+   "deviceId",
+   "keyId",
+   "signaturePublicKey"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getDevices": {
+  "properties": {
+   "devices": {
+    "items": {
+     "ref": "blue.catbird.chat.defs#addressableDevice",
+     "type": "ref"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   }
+  },
+  "required": [
+   "devices"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getDirectRequestOutcome": {
+  "properties": {
+   "outcome": {
+    "ref": "blue.catbird.chat.defs#directRequestOutcome",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "outcome"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getEntries": {
+  "properties": {
+   "entries": {
+    "items": {
+     "ref": "blue.catbird.chat.defs#conversationEntry",
+     "type": "ref"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   },
+   "hasMore": {
+    "type": "boolean"
+   },
+   "nextAfterSeq": {
+    "maximum": 9007199254740991,
+    "minimum": 0,
+    "type": "integer"
+   }
+  },
+  "required": [
+   "entries",
+   "nextAfterSeq",
+   "hasMore"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getLeafRecoveryInbox": {
+  "properties": {
+   "hasMore": {
+    "type": "boolean"
+   },
+   "inventoryScope": {
+    "ref": "blue.catbird.chat.defs#directRequestInventoryScope",
+    "type": "ref"
+   },
+   "inventorySessionId": {
+    "maxLength": 512,
+    "minLength": 32,
+    "type": "string"
+   },
+   "items": {
+    "items": {
+     "ref": "blue.catbird.chat.defs#leafRecoveryInboxItem",
+     "type": "ref"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   },
+   "nextPageCursor": {
+    "maxLength": 512,
+    "minLength": 1,
+    "type": "string"
+   },
+   "snapshotEventCursor": {
+    "maxLength": 512,
+    "minLength": 1,
+    "type": "string"
+   },
+   "snapshotExpiresAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "items",
+   "inventorySessionId",
+   "snapshotEventCursor",
+   "hasMore",
+   "snapshotExpiresAt"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getOwnDevices": {
+  "properties": {
+   "hasMore": {
+    "type": "boolean"
+   },
+   "items": {
+    "items": {
+     "ref": "blue.catbird.chat.defs#ownDeviceView",
+     "type": "ref"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   },
+   "nextPageCursor": {
+    "maxLength": 512,
+    "minLength": 1,
+    "type": "string"
+   },
+   "snapshotExpiresAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "items",
+   "hasMore",
+   "snapshotExpiresAt"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getPendingWelcomes": {
+  "properties": {
+   "hasMore": {
+    "type": "boolean"
+   },
+   "inventoryScope": {
+    "ref": "blue.catbird.chat.defs#directRequestInventoryScope",
+    "type": "ref"
+   },
+   "inventorySessionId": {
+    "maxLength": 512,
+    "minLength": 32,
+    "type": "string"
+   },
+   "items": {
+    "items": {
+     "closed": true,
+     "refs": [
+      "blue.catbird.chat.defs#welcomeView",
+      "blue.catbird.chat.defs#directRequestWelcomeView"
+     ],
+     "type": "union"
+    },
+    "maxLength": 100,
+    "minLength": 0,
+    "type": "array"
+   },
+   "nextPageCursor": {
+    "maxLength": 512,
+    "minLength": 1,
+    "type": "string"
+   },
+   "snapshotEventCursor": {
+    "maxLength": 512,
+    "minLength": 1,
+    "type": "string"
+   },
+   "snapshotExpiresAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "items",
+   "inventorySessionId",
+   "snapshotEventCursor",
+   "hasMore",
+   "snapshotExpiresAt"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.getSubscriptionTicket": {
+  "properties": {
+   "endpoint": {
+    "format": "uri",
+    "maxLength": 2048,
+    "minLength": 1,
+    "type": "string"
+   },
+   "expiresAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   },
+   "inventoryScope": {
+    "ref": "blue.catbird.chat.defs#directRequestInventoryScope",
+    "type": "ref"
+   },
+   "ticket": {
+    "maxLength": 4096,
+    "minLength": 32,
+    "type": "string"
+   }
+  },
+  "required": [
+   "ticket",
+   "endpoint",
+   "expiresAt"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.prepareBlobUpload": {
+  "properties": {
+   "upload": {
+    "ref": "blue.catbird.chat.defs#blobUploadView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "upload"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.prepareDirectRequest": {
+  "properties": {
+   "outcome": {
+    "ref": "blue.catbird.chat.defs#directRequestOutcome",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "outcome"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.publishDirectRequest": {
+  "properties": {
+   "outcome": {
+    "ref": "blue.catbird.chat.defs#directRequestOutcome",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "outcome"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.publishDirectRequestKeys": {
+  "properties": {
+   "enabled": {
+    "type": "boolean"
+   },
+   "revision": {
+    "maximum": 9007199254740991,
+    "minimum": 1,
+    "type": "integer"
+   }
+  },
+  "required": [
+   "revision",
+   "enabled"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.publishTyping": {
+  "properties": {
+   "typing": {
+    "ref": "blue.catbird.chat.defs#typingEvent",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "typing"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.rejectWelcome": {
+  "properties": {
+   "rejectedAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   },
+   "status": {
+    "const": "rejected",
+    "type": "string"
+   }
+  },
+  "required": [
+   "status",
+   "rejectedAt"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.replenishKeyPackages": {
+  "properties": {
+   "device": {
+    "ref": "blue.catbird.chat.defs#deviceView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "device"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.requestLeafRecovery": {
+  "properties": {
+   "recovery": {
+    "ref": "blue.catbird.chat.defs#leafRecoveryView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "recovery"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.requestLeave": {
+  "properties": {
+   "result": {
+    "ref": "blue.catbird.chat.defs#leaveOperationResult",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "result"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.requestReset": {
+  "properties": {
+   "entry": {
+    "ref": "blue.catbird.chat.defs#resetRequestEntry",
+    "type": "ref"
+   },
+   "resetRequest": {
+    "ref": "blue.catbird.chat.defs#resetRequestView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "resetRequest",
+   "entry"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.revokeDevice": {
+  "properties": {
+   "device": {
+    "ref": "blue.catbird.chat.defs#deviceView",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "device"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.sendMessage": {
+  "properties": {
+   "entry": {
+    "ref": "blue.catbird.chat.defs#applicationEntry",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "entry"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.submitTransition": {
+  "properties": {
+   "coordinates": {
+    "ref": "blue.catbird.chat.defs#conversationCoordinates",
+    "type": "ref"
+   },
+   "entry": {
+    "ref": "blue.catbird.chat.defs#conversationEntry",
+    "type": "ref"
+   },
+   "welcomes": {
+    "items": {
+     "ref": "blue.catbird.chat.defs#welcomeView",
+     "type": "ref"
+    },
+    "maxLength": 1,
+    "minLength": 0,
+    "type": "array"
+   }
+  },
+  "required": [
+   "coordinates",
+   "entry",
+   "welcomes"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.subscribeEvents": {
+  "ref": "blue.catbird.chat.defs#subscriptionMessage",
+  "type": "ref"
+ },
+ "blue.catbird.chat.updatePushToken": {
+  "properties": {
+   "device": {
+    "ref": "blue.catbird.chat.defs#deviceView",
+    "type": "ref"
+   },
+   "pushBinding": {
+    "ref": "blue.catbird.chat.defs#pushRegistrationBinding",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "device"
+  ],
+  "type": "object"
+ },
+ "blue.catbird.chat.uploadBlob": {
+  "properties": {
+   "binding": {
+    "ref": "blue.catbird.chat.defs#uploadedBlobBinding",
+    "type": "ref"
+   },
+   "uploadedAt": {
+    "ref": "blue.catbird.chat.defs#canonicalDatetime",
+    "type": "ref"
+   }
+  },
+  "required": [
+   "binding",
+   "uploadedAt"
+  ],
+  "type": "object"
+ }
+}

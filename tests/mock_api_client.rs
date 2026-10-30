@@ -149,6 +149,7 @@ struct FailureFlags {
     fail_next_commit_group_change: bool,
     /// When > 0, fail the next N get_conversations calls.
     fail_get_conversations_count: u32,
+    fail_next_get_conversation_state: bool,
     /// When true, next add_members returns success=false (server rejection).
     reject_next_add_members: bool,
     /// When true, next add_members reports success with a stale zero epoch
@@ -158,6 +159,11 @@ struct FailureFlags {
 
 #[derive(Debug, Default)]
 struct MockState {
+    incoming_pages: Vec<(Vec<IncomingEnvelope>, Option<String>)>,
+    request_operation_responses: Vec<(
+        catbird_mls::orchestrator::canonical_transport::CanonicalOperation,
+        catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+    )>,
     /// The DID this client is authenticated as.
     authenticated_did: Option<String>,
 
@@ -172,8 +178,23 @@ struct MockState {
     /// Custom raw GatewayResponse for the next createConversation call.
     next_create_custom_response:
         Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    /// One-shot canonical inventory response or callback failure.
+    next_inventory_result: Option<
+        catbird_mls::orchestrator::Result<
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+        >,
+    >,
+    inventory_results_queue: std::collections::VecDeque<
+        catbird_mls::orchestrator::Result<
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+        >,
+    >,
+    /// Present successful responses with lexicon `{"$bytes"}` byte fields.
+    present_lexicon_bytes: bool,
     /// Custom raw GatewayResponse for the next sendMessage call.
     next_send_custom_response:
+        Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
+    next_get_conversation_state_custom_response:
         Option<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
     device_directory_responses:
         Vec<catbird_mls::orchestrator::canonical_transport::GatewayResponse>,
@@ -291,6 +312,14 @@ struct MockState {
     /// Call count for get_key_packages
     get_key_packages_call_count: usize,
 
+    /// When true, every `MLSAPIClient` transport method fails with the same
+    /// transport-unavailable error before doing any work. Models a genuinely
+    /// unreachable delivery service, as distinct from a single injected
+    /// operation response. Off by default so no existing test is affected.
+    transport_offline: bool,
+    /// Transport calls refused while `transport_offline` was set.
+    transport_refused_calls: usize,
+
     /// Failure injection flags.
     failures: FailureFlags,
 }
@@ -303,14 +332,44 @@ struct MockState {
 ///
 /// Wrap in `Arc` and share across orchestrator instances to simulate a real
 /// server where all participants see the same state.
+/// Test stand-in for the platform's Labyrinth gateway (feature `labyrinth`).
+#[cfg(feature = "labyrinth")]
+pub type LabyrinthHandlerFn = Arc<
+    dyn Fn(
+            catbird_mls::labyrinth::LabyrinthRequest,
+        ) -> std::result::Result<
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+            String,
+        > + Send
+        + Sync,
+>;
+
+/// Shared slot for [`LabyrinthHandlerFn`]; every `clone_as` view sees it.
+#[cfg(feature = "labyrinth")]
+#[derive(Clone, Default)]
+pub struct LabyrinthHandler(Arc<Mutex<Option<LabyrinthHandlerFn>>>);
+
+#[cfg(feature = "labyrinth")]
+impl std::fmt::Debug for LabyrinthHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LabyrinthHandler")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MockDeliveryService {
     state: Arc<Mutex<MockState>>,
     publish_group_info_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     get_conversations_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
+    get_conversation_state_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     get_messages_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
+    send_ack_gate: Arc<Mutex<Option<Arc<PublishGroupInfoGate>>>>,
     /// Per-instance DID override (allows multiple clients to share one mock server).
     instance_did: Option<String>,
+    /// Set on the internal handle that produces the unpresented response.
+    raw_dispatch: bool,
+    #[cfg(feature = "labyrinth")]
+    labyrinth: LabyrinthHandler,
 }
 
 #[derive(Debug, Default)]
@@ -330,19 +389,60 @@ impl PublishGroupInfoGate {
 }
 
 impl MockDeliveryService {
+    pub fn queue_incoming_page(&self, envelopes: Vec<IncomingEnvelope>, cursor: Option<String>) {
+        self.state
+            .lock()
+            .unwrap()
+            .incoming_pages
+            .push((envelopes, cursor));
+    }
+
+    pub fn queue_request_operation_response(
+        &self,
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .request_operation_responses
+            .push((
+                operation,
+                catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                    status,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&body).unwrap(),
+                },
+            ));
+    }
+
     /// Create a new mock service with the given DID pre-authenticated.
     pub fn new(authenticated_did: &str) -> Self {
         let state = MockState {
             authenticated_did: Some(authenticated_did.to_string()),
+            // Mirror the production DS: responses present lexicon bytes.
+            present_lexicon_bytes: true,
             ..Default::default()
         };
         Self {
             state: Arc::new(Mutex::new(state)),
             publish_group_info_gate: Arc::new(Mutex::new(None)),
             get_conversations_gate: Arc::new(Mutex::new(None)),
+            get_conversation_state_gate: Arc::new(Mutex::new(None)),
             get_messages_gate: Arc::new(Mutex::new(None)),
+            send_ack_gate: Arc::new(Mutex::new(None)),
             instance_did: None,
+            raw_dispatch: false,
+            #[cfg(feature = "labyrinth")]
+            labyrinth: LabyrinthHandler::default(),
         }
+    }
+
+    /// Route every `submit_labyrinth_request` to `handler`.
+    #[cfg(feature = "labyrinth")]
+    pub fn set_labyrinth_handler(&self, handler: LabyrinthHandlerFn) {
+        *self.labyrinth.0.lock().unwrap() = Some(handler);
     }
 
     /// Create a new mock that shares the same backing state but is
@@ -352,9 +452,21 @@ impl MockDeliveryService {
             state: Arc::clone(&self.state),
             publish_group_info_gate: Arc::clone(&self.publish_group_info_gate),
             get_conversations_gate: Arc::clone(&self.get_conversations_gate),
+            get_conversation_state_gate: Arc::clone(&self.get_conversation_state_gate),
             get_messages_gate: Arc::clone(&self.get_messages_gate),
+            send_ack_gate: Arc::clone(&self.send_ack_gate),
             instance_did: Some(did.to_string()),
+            raw_dispatch: false,
+            #[cfg(feature = "labyrinth")]
+            labyrinth: self.labyrinth.clone(),
         }
+    }
+
+    /// Present every successful response the way the production DS does:
+    /// each schema-declared bytes field, including echoed signed requests, as
+    /// lexicon `{"$bytes"}` (existing `{"$bytes"}` objects are kept).
+    pub fn present_lexicon_bytes(&self, enabled: bool) {
+        self.state.lock().unwrap().present_lexicon_bytes = enabled;
     }
 
     pub fn set_next_create_conversation_id(&self, conversation_id: &str) {
@@ -514,8 +626,45 @@ impl MockDeliveryService {
             },
         );
     }
+    pub fn set_next_inventory_result_for_test(
+        &self,
+        result: catbird_mls::orchestrator::Result<
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+        >,
+    ) {
+        self.state.lock().unwrap().next_inventory_result = Some(result);
+    }
+    pub fn queue_inventory_result_for_test(
+        &self,
+        result: catbird_mls::orchestrator::Result<
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse,
+        >,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .inventory_results_queue
+            .push_back(result);
+    }
+
     pub fn set_next_send_custom_response(&self, status: u16, body: serde_json::Value) {
         self.state.lock().unwrap().next_send_custom_response = Some(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type: Some("application/json".into()),
+                body: serde_json::to_vec(&body).unwrap(),
+            },
+        );
+    }
+    pub fn set_next_get_conversation_state_custom_response(
+        &self,
+        status: u16,
+        body: serde_json::Value,
+    ) {
+        self.state
+            .lock()
+            .unwrap()
+            .next_get_conversation_state_custom_response = Some(
             catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                 status,
                 content_type: Some("application/json".into()),
@@ -529,6 +678,19 @@ impl MockDeliveryService {
             .unwrap()
             .lifecycle_state_overrides
             .insert(conversation_id.into(), state);
+    }
+    pub fn lifecycle_state(&self, conversation_id: &str) -> Option<serde_json::Value> {
+        let guard = self.state.lock().unwrap();
+        guard
+            .lifecycle_state_overrides
+            .get(conversation_id)
+            .cloned()
+            .or_else(|| {
+                guard
+                    .conversations
+                    .get(conversation_id)
+                    .map(conversation_state_json)
+            })
     }
     pub fn set_next_leave_custom_response(&self, status: u16, body: serde_json::Value) {
         self.state.lock().unwrap().next_leave_custom_response = Some(
@@ -673,6 +835,18 @@ impl MockDeliveryService {
         *self.get_conversations_gate.lock().unwrap() = Some(Arc::clone(&gate));
         gate
     }
+    pub fn pause_next_get_conversation_state(&self) -> Arc<PublishGroupInfoGate> {
+        let gate = Arc::new(PublishGroupInfoGate::default());
+        *self.get_conversation_state_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// Pause after the mock server persists a send and before returning its ACK.
+    pub fn pause_next_send_ack(&self) -> Arc<PublishGroupInfoGate> {
+        let gate = Arc::new(PublishGroupInfoGate::default());
+        *self.send_ack_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
 
     pub fn pause_next_get_messages(&self) -> Arc<PublishGroupInfoGate> {
         let gate = Arc::new(PublishGroupInfoGate::default());
@@ -689,6 +863,39 @@ impl MockDeliveryService {
         }
     }
 
+    // -- transport availability -----------------------------------------------
+
+    /// Make every transport call fail until [`Self::allow_transport`] is
+    /// called. Local session queries (`is_authenticated_as`, `current_did`)
+    /// stay answerable because they are not transport calls.
+    pub fn refuse_all_transport(&self) {
+        self.state.lock().unwrap().transport_offline = true;
+    }
+
+    /// Restore transport availability after [`Self::refuse_all_transport`].
+    pub fn allow_transport(&self) {
+        self.state.lock().unwrap().transport_offline = false;
+    }
+
+    /// Number of transport calls refused since the last counter reset.
+    pub fn refused_transport_calls(&self) -> usize {
+        self.state.lock().unwrap().transport_refused_calls
+    }
+
+    /// The single check every transport method runs first. Returns the
+    /// product's typed transport-unavailable error while the switch is set,
+    /// counting the refusal; otherwise `None` and the method proceeds.
+    fn refuse_when_offline(&self) -> Option<OrchestratorError> {
+        let mut guard = self.state.lock().unwrap();
+        if !guard.transport_offline {
+            return None;
+        }
+        guard.transport_refused_calls += 1;
+        Some(OrchestratorError::Api(
+            "transport unavailable: delivery service is unreachable".into(),
+        ))
+    }
+
     // -- failure injection ----------------------------------------------------
 
     pub fn fail_next_send(&self) {
@@ -701,6 +908,13 @@ impl MockDeliveryService {
 
     pub fn fail_next_get_messages(&self) {
         self.state.lock().unwrap().failures.fail_next_get_messages = true;
+    }
+    pub fn fail_next_get_conversation_state(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .failures
+            .fail_next_get_conversation_state = true;
     }
 
     pub fn fail_next_get_entries(&self) {
@@ -1290,6 +1504,45 @@ impl MockDeliveryService {
     pub fn get_key_packages_call_count(&self) -> usize {
         self.state.lock().unwrap().get_key_packages_call_count
     }
+    /// Count of GetConversations requests since `start` that are fresh initial allocations (no pageCursor).
+    pub fn inventory_allocations_since(&self, start: usize) -> usize {
+        let reqs = self.submitted_prepared_requests();
+        if start >= reqs.len() {
+            return 0;
+        }
+        reqs[start..]
+            .iter()
+            .filter(|r| {
+                r.operation
+                    == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversations
+                    && !r.path.contains("pageCursor=")
+            })
+            .count()
+    }
+
+    /// Count of GetConversations requests since `start` that are pagination requests (contain pageCursor).
+    pub fn inventory_pages_since(&self, start: usize) -> usize {
+        let reqs = self.submitted_prepared_requests();
+        if start >= reqs.len() {
+            return 0;
+        }
+        reqs[start..]
+            .iter()
+            .filter(|r| {
+                r.operation
+                    == catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversations
+                    && r.path.contains("pageCursor=")
+            })
+            .count()
+    }
+
+    pub fn get_conversations_allocation_count(&self) -> usize {
+        self.inventory_allocations_since(0)
+    }
+
+    pub fn get_conversations_page_count(&self) -> usize {
+        self.inventory_pages_since(0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,7 +1624,7 @@ impl MockDeliveryService {
         };
 
         let conversation_kind = "group".to_string();
-        let stored = StoredConversation {
+        let mut stored = StoredConversation {
             view: view.clone(),
             members: members.clone(),
             conversation_kind,
@@ -1379,7 +1632,12 @@ impl MockDeliveryService {
             participants: None,
             leaves: None,
         };
-
+        let state_val = conversation_state_json(&stored);
+        stored.view.canonical_state =
+            catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+                &serde_json::to_vec(&state_val).unwrap(),
+            )
+            .ok();
         guard.conversations.insert(conversation_id.clone(), stored);
         guard.messages.entry(conversation_id.clone()).or_default();
         // Fan out the Welcome (if provided) to each initial member so they can
@@ -1985,6 +2243,17 @@ impl MockDeliveryService {
 
 #[async_trait]
 impl MLSAPIClient for MockDeliveryService {
+    #[cfg(feature = "labyrinth")]
+    async fn submit_labyrinth_request(
+        &self,
+        request: catbird_mls::labyrinth::LabyrinthRequest,
+    ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        let handler = self.labyrinth.0.lock().unwrap().clone().ok_or_else(|| {
+            catbird_mls::orchestrator::OrchestratorError::Api("no Labyrinth handler".into())
+        })?;
+        handler(request).map_err(catbird_mls::orchestrator::OrchestratorError::Api)
+    }
+
     async fn is_authenticated_as(&self, did: &str) -> bool {
         let guard = self.state.lock().unwrap();
         self.effective_did_from_guard(&guard).as_deref() == Some(did)
@@ -1996,6 +2265,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         {
             let mut guard = self.state.lock().unwrap();
             guard
@@ -2011,6 +2283,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn publish_welcome(&self, convo_id: &str, welcome_data: &[u8]) -> Result<()> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let did = self.current_did().await.unwrap_or_default();
         let mut guard = self.state.lock().unwrap();
         let group_id_opt = guard
@@ -2040,11 +2315,48 @@ impl MLSAPIClient for MockDeliveryService {
         &self,
         request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
     ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        // `raw_dispatch` is the internal recursion that strips lexicon
+        // presentation; it is not a second transport call, so the refusal is
+        // counted once at the outer entry.
+        if !self.raw_dispatch {
+            if let Some(error) = self.refuse_when_offline() {
+                return Err(error);
+            }
+        }
+        if !self.raw_dispatch && self.state.lock().unwrap().present_lexicon_bytes {
+            let nsid = request
+                .operation
+                .path()
+                .trim_start_matches("/xrpc/")
+                .to_owned();
+            let mut raw = self.clone();
+            raw.raw_dispatch = true;
+            let mut response = Box::pin(raw.submit_prepared_request(request)).await?;
+            if response.status == 200 {
+                if let Some(schema) = lexicon_presentation::output_schema(&nsid) {
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&response.body).expect("mock JSON response");
+                    lexicon_presentation::present(schema, &mut value);
+                    response.body = serde_json::to_vec(&value).unwrap();
+                }
+            }
+            return Ok(response);
+        }
         self.state
             .lock()
             .unwrap()
             .submitted_prepared_requests
             .push(request.clone());
+        {
+            let mut state = self.state.lock().unwrap();
+            if let Some(index) = state
+                .request_operation_responses
+                .iter()
+                .position(|(operation, _)| *operation == request.operation)
+            {
+                return Ok(state.request_operation_responses.remove(index).1);
+            }
+        }
         let body_bytes = request.body.as_deref().unwrap_or(&[]);
         let body_val: serde_json::Value = if !body_bytes.is_empty()
             && request.operation
@@ -2087,6 +2399,63 @@ impl MLSAPIClient for MockDeliveryService {
                 return Err(OrchestratorError::Api(
                     "authorized-device-key resolution is required but unsupported by this test directory".into(),
                 ));
+            }
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetDeviceKey => {
+                let query_str = request.path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                let mut owner_did = String::new();
+                let mut device_id = String::new();
+                let mut key_id = String::new();
+                for part in query_str.split('&') {
+                    if let Some((k, v)) = part.split_once('=') {
+                        let decoded = v.replace("%3A", ":");
+                        match k {
+                            "ownerDid" => owner_did = decoded,
+                            "deviceId" => device_id = decoded,
+                            "keyId" => key_id = decoded,
+                            _ => {}
+                        }
+                    }
+                }
+                let guard = self.state.lock().unwrap();
+                let device = guard
+                    .devices
+                    .get(&owner_did)
+                    .and_then(|devs| {
+                        devs.iter().find(|d| {
+                            d.info.device_id == device_id
+                                && d.info.key_id.as_deref() == Some(&key_id)
+                        })
+                    })
+                    .or_else(|| {
+                        guard.devices.values().flatten().find(|d| {
+                            d.info.device_id == device_id
+                                && d.info.key_id.as_deref() == Some(&key_id)
+                        })
+                    });
+
+                if let Some(dev) = device {
+                    let sig_key = dev.info.signature_public_key.as_ref().unwrap();
+                    let body = serde_json::json!({
+                        "ownerDid": owner_did,
+                        "deviceId": device_id,
+                        "keyId": key_id,
+                        "signaturePublicKey": base64::engine::general_purpose::STANDARD.encode(sig_key),
+                    });
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 200,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&body).unwrap(),
+                    });
+                } else {
+                    return Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                        status: 404,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&serde_json::json!({
+                            "error": "DeviceNotFound",
+                            "message": "device key not found"
+                        })).unwrap(),
+                    });
+                }
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::CreateConversation => {
                 if let Some(resp) = self.state.lock().unwrap().next_create_custom_response.take() {
@@ -2260,6 +2629,7 @@ impl MLSAPIClient for MockDeliveryService {
                     .and_then(|m| m.as_str())
                     .unwrap_or_default();
 
+                let response = {
                 let mut guard = self.state.lock().unwrap();
                 check_fail(&mut guard.failures.fail_next_send, "injected send failure")?;
                 let did = self
@@ -2304,11 +2674,18 @@ impl MLSAPIClient for MockDeliveryService {
                         }
                     }
                 });
-                Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
                     body: serde_json::to_vec(&output).unwrap(),
-                })
+                }
+                };
+                let gate = self.send_ack_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.reached.notify_one();
+                    gate.release.notified().await;
+                }
+                Ok(response)
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::ReplenishKeyPackages => {
                 let packages = inner_body
@@ -2555,6 +2932,9 @@ impl MLSAPIClient for MockDeliveryService {
                 let reply = |status, value: serde_json::Value| catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status, content_type: Some("application/json".into()), body:serde_json::to_vec(&value).unwrap()
                 };
+                if std::mem::take(&mut guard.failures.fail_next_commit_group_change) {
+                    return Ok(reply(500, serde_json::json!({"error":"CommitGroupChangeFailed"})));
+                }
                 if let Some(entry) = guard.entries.iter().find(|entry| entry["entryId"] == inner_body["transitionId"] && entry["conversationId"] == cid) {
                     assert_eq!(entry["signedRequest"], body_val["signedRequest"]);
                     return Ok(reply(200, serde_json::json!({"coordinates":inner_body["next"],"entry":entry})));
@@ -2602,6 +2982,7 @@ impl MLSAPIClient for MockDeliveryService {
                 stored.participants = Some(participants.clone());
                 stored.members = participants.iter().map(|p| p["userDid"].as_str().unwrap().to_string()).collect();
                 stored.view.members = participants.iter().map(|p| MemberView { did:p["userDid"].as_str().unwrap().into(), role:if p["role"] == "admin" { MemberRole::Admin } else { MemberRole::Member } }).collect();
+                stored.view.canonical_state = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(&serde_json::to_vec(&current).unwrap()).ok();
                 guard.lifecycle_state_overrides.insert(cid.to_string(), current);
                 let entry = serde_json::json!({"$type":"blue.catbird.chat.defs#policyTransitionEntry","entryId":inner_body["transitionId"],"conversationId":cid,"seq":seq,"signedRequest":body_val["signedRequest"],"receivedAt":Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)});
                 guard.entries.push(entry.clone());
@@ -3309,6 +3690,15 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversationState => {
+                let gate = self.get_conversation_state_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.reached.notify_one();
+                    gate.release.notified().await;
+                }
+                if let Some(resp) = self.state.lock().unwrap().next_get_conversation_state_custom_response.take() {
+                    return Ok(resp);
+                }
+                check_fail(&mut self.state.lock().unwrap().failures.fail_next_get_conversation_state, "injected getConversationState failure")?;
                 let query = request.path.split_once('?').map_or("", |(_, query)| query);
                 let conversation_id = query
                     .split('&')
@@ -3378,7 +3768,18 @@ impl MLSAPIClient for MockDeliveryService {
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::GetConversations => {
-                let guard = self.state.lock().unwrap();
+                let gate = self.get_conversations_gate.lock().unwrap().take();
+                if let Some(gate) = gate {
+                    gate.reached.notify_one();
+                    gate.release.notified().await;
+                }
+                let mut guard = self.state.lock().unwrap();
+                if let Some(result) = guard.inventory_results_queue.pop_front() {
+                    return result;
+                }
+                if let Some(result) = guard.next_inventory_result.take() {
+                    return result;
+                }
                 let own_did = self.effective_did_from_guard(&guard);
                 let actor_device_id = request.path.split_once('?').map(|(_,query)| query)
                     .and_then(|query| query.split('&').find_map(|pair| pair.strip_prefix("actorDeviceId=")));
@@ -3518,6 +3919,9 @@ impl MLSAPIClient for MockDeliveryService {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let result = {
             let mut guard = self.state.lock().unwrap();
             check_fail(
@@ -3543,7 +3947,30 @@ impl MLSAPIClient for MockDeliveryService {
                             .hidden_conversation_ids
                             .contains(&c.view.conversation_id)
                 })
-                .map(|c| c.view.clone())
+                .map(|c| {
+                    let mut view = c.view.clone();
+                    if view.canonical_state.is_none() {
+                        let state = guard
+                            .lifecycle_state_overrides
+                            .get(&view.conversation_id)
+                            .cloned()
+                            .unwrap_or_else(|| conversation_state_json(c));
+                        view.canonical_state =
+                            catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+                                &serde_json::to_vec(&state).unwrap(),
+                            )
+                            .ok()
+                            .filter(|snapshot| {
+                                // A test may deliberately replace only the
+                                // unverified host group mapping. Do not graft
+                                // a different generation's policy onto it.
+                                snapshot.coordinates.conversation_id.as_str() == view.conversation_id
+                                    && hex::encode(&snapshot.coordinates.group_id) == view.group_id
+                                    && snapshot.coordinates.epoch as u64 <= view.epoch
+                            });
+                    }
+                    view
+                })
                 .collect();
             all.sort_by_key(|c| c.created_at);
 
@@ -3578,6 +4005,9 @@ impl MLSAPIClient for MockDeliveryService {
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let gate = self.get_messages_gate.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.reached.notify_one();
@@ -3592,6 +4022,9 @@ impl MLSAPIClient for MockDeliveryService {
 
         if message_type == Some("app") {
             guard.app_message_epoch_ranges.push((from_epoch, to_epoch));
+        }
+        if !guard.incoming_pages.is_empty() {
+            return Ok(guard.incoming_pages.remove(0));
         }
 
         let all_messages = guard
@@ -3643,6 +4076,7 @@ impl MLSAPIClient for MockDeliveryService {
         let page: Vec<IncomingEnvelope> = filtered_messages[start..end]
             .iter()
             .map(|m| IncomingEnvelope {
+                canonical_entry_json: None,
                 conversation_id: m.conversation_id.clone(),
                 sender_did: guard
                     .envelope_sender_relabels
@@ -3671,6 +4105,9 @@ impl MLSAPIClient for MockDeliveryService {
         _actor_device_id: &str,
         dids: &[String],
     ) -> Result<Vec<KeyPackageRef>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let mut guard = self.state.lock().unwrap();
         guard.get_key_packages_call_count += 1;
         check_fail(
@@ -3711,6 +4148,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let guard = self.state.lock().unwrap();
         let did = self
             .effective_did_from_guard(&guard)
@@ -3729,6 +4169,9 @@ impl MLSAPIClient for MockDeliveryService {
         local_hashes: &[String],
         _device_id: &str,
     ) -> Result<KeyPackageSyncResult> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         Ok(KeyPackageSyncResult {
             orphaned_count: 0,
             deleted_count: local_hashes.len() as u32,
@@ -3736,6 +4179,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let guard = self.state.lock().unwrap();
         let did = self
             .effective_did_from_guard(&guard)
@@ -3754,6 +4200,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let mut guard = self.state.lock().unwrap();
         *guard
             .get_group_info_calls
@@ -3771,6 +4220,9 @@ impl MLSAPIClient for MockDeliveryService {
     }
 
     async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         let mut guard = self.state.lock().unwrap();
         *guard
             .get_welcome_calls
@@ -3823,6 +4275,9 @@ impl MLSAPIClient for MockDeliveryService {
         _convo_id: &str,
         _message_ids: &[String],
     ) -> Result<Vec<(String, DeliveryStatus)>> {
+        if let Some(error) = self.refuse_when_offline() {
+            return Err(error);
+        }
         Ok(vec![])
     }
 }
@@ -4007,6 +4462,90 @@ mod tests {
         assert_eq!(data, b"group-info-blob");
     }
 
+    /// The offline switch must refuse every transport method, not a subset:
+    /// a single unguarded method would let a caller's "offline" assertions
+    /// pass while still reaching the service.
+    ///
+    /// Calls go through `MLSAPIClient` explicitly: `MockDeliveryService` also
+    /// has inherent methods with these names (`publish_group_info`,
+    /// `get_delivery_status`), and inherent resolution would silently test the
+    /// wrong function. The orchestrator is generic over the trait, so the
+    /// trait method is the one product code actually reaches.
+    #[tokio::test]
+    async fn refuse_all_transport_covers_every_transport_method() {
+        use catbird_mls::orchestrator::canonical_transport::{
+            CanonicalOperation, PreparedRequest,
+        };
+
+        let svc = MockDeliveryService::new("did:plc:alice");
+        svc.create_conversation("conv-1", Some(&["did:plc:bob".to_string()]), None, None, None)
+            .await
+            .unwrap();
+        svc.publish_group_info("conv-1", b"gi").await.unwrap();
+        svc.publish_key_package(b"kp", "suite", "2099-01-01", None)
+            .await
+            .unwrap();
+
+        svc.refuse_all_transport();
+
+        let prepared = PreparedRequest {
+            operation: CanonicalOperation::GetConversations,
+            method: "GET".into(),
+            path: CanonicalOperation::GetConversations.path().into(),
+            body: None,
+        };
+        // Every transport method on the trait, in trait order. `is_authenticated_as`
+        // and `current_did` are absent deliberately: they read local session state.
+        let refused: Vec<std::result::Result<(), OrchestratorError>> = vec![
+            MLSAPIClient::submit_prepared_request(&svc, prepared)
+                .await
+                .map(|_| ()),
+            MLSAPIClient::publish_group_info(&svc, "conv-1", b"gi2").await,
+            MLSAPIClient::publish_welcome(&svc, "conv-1", b"w").await,
+            MLSAPIClient::get_conversations(&svc, 10, None).await.map(|_| ()),
+            MLSAPIClient::get_messages(&svc, "conv-1", None, 10, None, None, None)
+                .await
+                .map(|_| ()),
+            MLSAPIClient::get_key_packages(&svc, "dev", &["did:plc:alice".to_string()])
+                .await
+                .map(|_| ()),
+            MLSAPIClient::get_key_package_stats(&svc).await.map(|_| ()),
+            MLSAPIClient::sync_key_packages(&svc, &["h".to_string()], "dev")
+                .await
+                .map(|_| ()),
+            MLSAPIClient::list_devices(&svc, "dev").await.map(|_| ()),
+            MLSAPIClient::get_group_info(&svc, "conv-1").await.map(|_| ()),
+            MLSAPIClient::get_welcome(&svc, "conv-1").await.map(|_| ()),
+            MLSAPIClient::get_delivery_status(&svc, "conv-1", &["m".to_string()])
+                .await
+                .map(|_| ()),
+        ];
+        for (index, outcome) in refused.iter().enumerate() {
+            let error = outcome
+                .as_ref()
+                .err()
+                .unwrap_or_else(|| panic!("transport method #{index} was not refused offline"));
+            assert!(
+                error.to_string().contains("transport unavailable"),
+                "method #{index} failed with an unrelated error: {error}"
+            );
+        }
+        assert_eq!(svc.refused_transport_calls(), refused.len());
+
+        // Local session state is not transport and must keep answering.
+        assert!(MLSAPIClient::is_authenticated_as(&svc, "did:plc:alice").await);
+        assert_eq!(
+            MLSAPIClient::current_did(&svc).await,
+            Some("did:plc:alice".to_string())
+        );
+
+        // Restoring transport must return the service to normal operation.
+        svc.allow_transport();
+        let page = MLSAPIClient::get_conversations(&svc, 10, None).await.unwrap();
+        assert_eq!(page.conversations.len(), 1);
+        assert_eq!(svc.refused_transport_calls(), refused.len());
+    }
+
     #[tokio::test]
     async fn test_leave_conversation() {
         let svc = MockDeliveryService::new("did:plc:alice");
@@ -4043,5 +4582,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(svc.members_of("conv-1").len(), 1);
+    }
+}
+
+/// Schema-directed mirror of the production DS response presentation
+/// (mls-ds `present_endpoint_output`), driven by the vendored lexicon.
+mod lexicon_presentation {
+    use base64::Engine as _;
+    use serde_json::Value;
+    use std::sync::OnceLock;
+
+    fn defs() -> &'static Value {
+        static DEFS: OnceLock<Value> = OnceLock::new();
+        DEFS.get_or_init(|| {
+            serde_json::from_str::<Value>(include_str!(
+                "../src/chat_v2/transcript/vectors/blue.catbird.chat.defs.json"
+            ))
+            .unwrap()["defs"]
+                .clone()
+        })
+    }
+
+    pub(super) fn output_schema(nsid: &str) -> Option<&'static Value> {
+        static OUTPUTS: OnceLock<Value> = OnceLock::new();
+        OUTPUTS
+            .get_or_init(|| {
+                serde_json::from_str(include_str!("fixtures/chat_endpoint_output_schemas.json"))
+                    .unwrap()
+            })
+            .get(nsid)
+    }
+
+    fn definition(reference: &str) -> &'static Value {
+        let name = reference.rsplit('#').next().unwrap();
+        &defs()[name]
+    }
+
+    pub(super) fn present(schema: &Value, value: &mut Value) {
+        match schema["type"].as_str() {
+            Some("ref") => present(definition(schema["ref"].as_str().unwrap()), value),
+            Some("bytes") => {
+                // Deliberately malformed test fixtures stay as authored.
+                let canonical = value.as_str().filter(|text| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(text)
+                        .is_ok_and(|bytes| {
+                            base64::engine::general_purpose::STANDARD.encode(bytes) == *text
+                        })
+                });
+                if let Some(text) = canonical {
+                    *value = serde_json::json!({ "$bytes": text });
+                }
+            }
+            Some("object") => {
+                if let Some(object) = value.as_object_mut() {
+                    for (field, item) in object {
+                        if let Some(property) = schema["properties"].get(field) {
+                            present(property, item);
+                        }
+                    }
+                }
+            }
+            Some("array") => {
+                if let Some(items) = value.as_array_mut() {
+                    for item in items {
+                        present(&schema["items"], item);
+                    }
+                }
+            }
+            Some("union") => {
+                if let Some(tag) = value.get("$type").and_then(Value::as_str) {
+                    present(definition(tag), value);
+                }
+            }
+            _ => {}
+        }
     }
 }

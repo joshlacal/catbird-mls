@@ -318,8 +318,8 @@ mod isolation {
             .unwrap_or_else(|| panic!("glob source `{module}` must have a source file"));
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
-            for (index, line) in source.lines().enumerate() {
-                if let UseParse::Decl(decl) = parse_use_decl(line) {
+            for (index, line) in super::gate_support::source_declarations(&source) {
+                if let UseParse::Decl(decl) = parse_use_decl(&line) {
                     if decl.is_pub && decl.targets.contains(&PubUseTarget::Glob) {
                         violations.push(format!(
                             "{}:{} — `{module}` globs `{}`; the crate root hoists that \

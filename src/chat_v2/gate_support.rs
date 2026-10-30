@@ -257,8 +257,8 @@ pub fn crate_root_glob_exports() -> Vec<CrateRootName> {
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
 
     let mut found = Vec::new();
-    for (index, line) in lib.lines().enumerate() {
-        match parse_use_decl(line) {
+    for (index, line) in source_declarations(&lib) {
+        match parse_use_decl(&line) {
             UseParse::NotAUse => {}
             UseParse::Unparseable { .. } => panic!(
                 "lib.rs:{} is a use declaration in a shape the derivation cannot \
@@ -300,8 +300,8 @@ pub fn crate_root_glob_modules() -> Vec<String> {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let lib = std::fs::read_to_string(src.join("lib.rs")).expect("lib.rs must be readable");
     let mut modules = Vec::new();
-    for (index, line) in lib.lines().enumerate() {
-        match parse_use_decl(line) {
+    for (index, line) in source_declarations(&lib) {
+        match parse_use_decl(&line) {
             UseParse::NotAUse => {}
             UseParse::Unparseable { .. } => panic!(
                 "lib.rs:{} is a use declaration in a shape the guard cannot \
@@ -396,11 +396,12 @@ pub fn parse_use_decl(line: &str) -> UseParse {
 
     // The brace form, one level only: `use m::{A, B, sub::C, self};`.
     if let Some(open) = body.find('{') {
+        let prefix = body[..open].trim();
         let (Some(list), Some(module)) = (
             body[open..]
                 .strip_prefix('{')
-                .and_then(|t| t.strip_suffix('}')),
-            body[..open].strip_suffix("::"),
+                .and_then(|t| t.trim_end().strip_suffix('}')),
+            prefix.strip_suffix("::"),
         ) else {
             return UseParse::Unparseable { is_pub };
         };
@@ -510,8 +511,8 @@ fn module_pub_items(src: &Path, module: &str) -> Vec<String> {
         "struct ", "enum ", "trait ", "type ", "fn ", "const ", "static ", "union ", "mod ",
     ];
     let mut names = Vec::new();
-    for (index, line) in source.lines().enumerate() {
-        match parse_use_decl(line) {
+    for (index, line) in source_declarations(&source) {
+        match parse_use_decl(&line) {
             UseParse::Decl(decl) if decl.is_pub && !decl.indented => {
                 for target in &decl.targets {
                     if let PubUseTarget::Named(name) = target {
@@ -529,7 +530,7 @@ fn module_pub_items(src: &Path, module: &str) -> Vec<String> {
             ),
             _ => {}
         }
-        let code = code_only(line);
+        let code = code_only(&line);
         let trimmed = code.trim();
         let Some(rest) = trimmed.strip_prefix("pub ") else {
             continue;
@@ -595,12 +596,53 @@ pub fn code_only(line: &str) -> String {
             }
         }
         if ch == '/' && chars.get(index + 1) == Some(&'/') {
-            break;
+            while index < chars.len() && chars[index] != '\n' {
+                index += 1;
+            }
+            continue;
         }
         out.push(ch);
         index += 1;
     }
     out
+}
+
+/// Iterates over logical lines/declarations in Rust source code, joining
+/// multi-line `use` declarations (e.g. multi-line grouped `pub use path::{...};`)
+/// while preserving the 0-based starting line index of each item.
+pub fn source_declarations(source: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let code = code_only(line);
+        let trimmed = code.trim();
+        let is_use_start = (trimmed.starts_with("use ")
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("pub("))
+            && (trimmed.contains("use ") || trimmed.starts_with("use "));
+        if is_use_start && !trimmed.ends_with(';') {
+            let start_idx = i;
+            let mut combined = String::from(line);
+            i += 1;
+            while i < lines.len() {
+                combined.push('\n');
+                combined.push_str(lines[i]);
+                let curr_code = code_only(lines[i]);
+                if curr_code.trim().ends_with(';') {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            result.push((start_idx, combined));
+        } else {
+            result.push((i, line.to_string()));
+            i += 1;
+        }
+    }
+    result
 }
 
 /// The index just past a closing `"`, starting from inside the string.

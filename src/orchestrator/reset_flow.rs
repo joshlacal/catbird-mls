@@ -234,21 +234,44 @@ where
         convo_id: &str,
     ) -> Result<ServerConversationState> {
         let actor_device_id = self.require_actor_device_id().await?;
+        let user_did = self.require_user_did().await?;
+        if let Some(snapshot) = self.batch_inventory_snapshot() {
+            if snapshot.user_did == user_did && snapshot.device_id == actor_device_id {
+                for item in &snapshot.items {
+                    let state = item.get("state").unwrap_or(item);
+                    let id = state
+                        .get("coordinates")
+                        .and_then(|c| c.get("conversationId"))
+                        .and_then(|v| v.as_str());
+                    if id == Some(convo_id) {
+                        return ServerConversationState::from_state_json(convo_id, state);
+                    }
+                }
+                return Err(OrchestratorError::ConversationNotFound(format!(
+                    "server inventory does not contain {convo_id}"
+                )));
+            }
+        }
         let mut cursor: Option<String> = None;
         let mut pagination = PaginationGuard::for_conversations("reset state lookup");
         loop {
             let mut path = format!(
-                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={actor_device_id}&limit=100"
+                "/xrpc/blue.catbird.chat.getConversations?actorDeviceId={}&limit=100",
+                super::canonical_transport::encode_query(&actor_device_id)
             );
             if let Some(cursor) = &cursor {
                 path.push_str("&pageCursor=");
-                path.push_str(cursor);
+                path.push_str(&super::canonical_transport::encode_query(cursor));
             }
             let response = self
                 .api_client()
                 .submit_prepared_request(PreparedRequest {
                     operation: CanonicalOperation::GetConversations,
-                    path,
+                    path: super::canonical_transport::scope_inventory_read_path(
+                        CanonicalOperation::GetConversations,
+                        path,
+                        self.mls_context().supports_direct_request_bootstrap(),
+                    ),
                     method: "GET".to_string(),
                     body: None,
                 })
@@ -409,7 +432,19 @@ where
         let result = self.request_leaf_recovery(state, kind).await;
         let mut tracker = self.recovery_tracker().lock().await;
         match &result {
-            Ok(_) => tracker.note_leaf_recovery_requested(convo_id),
+            Ok(output) => {
+                let ttl = output
+                    .pointer("/recovery/expiresAt")
+                    .or_else(|| output.get("expiresAt"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .and_then(|expires| {
+                        let remaining = expires.signed_duration_since(chrono::Utc::now());
+                        remaining.to_std().ok()
+                    })
+                    .unwrap_or(LEAF_RECOVERY_TTL);
+                tracker.note_leaf_recovery_requested_with_ttl(convo_id, ttl);
+            }
             Err(_) => {}
         }
         result

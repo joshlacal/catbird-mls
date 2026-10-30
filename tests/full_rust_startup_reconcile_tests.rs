@@ -13,7 +13,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use catbird_mls::orchestrator::{
-    ConversationState, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig, OrchestratorError,
+    ConversationState, CredentialStore, MLSOrchestrator, MLSStorageBackend, OrchestratorConfig,
+    OrchestratorError,
 };
 use catbird_mls::{EngineLifecycle, KeychainAccess, MLSContext, MLSError, MlsEngine};
 
@@ -256,11 +257,16 @@ async fn conversation_inventory_read_failure_keeps_persisted_quarantine_unavaila
         )
         .await;
     fixture.storage.fail_next_list_conversations();
+    let credentials = Arc::new(MockCredentials::new());
+    credentials
+        .store_device_uuid(fixture.did, &uuid::Uuid::new_v4().to_string())
+        .await
+        .unwrap();
     let restarted = MLSOrchestrator::new(
         Arc::clone(&fixture.context),
         Arc::clone(&fixture.storage),
         Arc::new(MockDeliveryService::new(fixture.did)),
-        Arc::new(MockCredentials::new()),
+        credentials,
         OrchestratorConfig::default(),
     );
 

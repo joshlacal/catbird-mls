@@ -260,10 +260,12 @@ impl<
             .filter(|n| *n <= 9_007_199_254_740_991)
             .ok_or_else(|| invalid("Group state version limit reached."))?;
         let mut snapshot = state["metadataSnapshot"].clone();
-        let version = snapshot["metadataVersion"]
-            .as_u64()
-            .ok_or_else(|| invalid("Group metadata version is missing."))?;
-        let metadata = self.decrypt_metadata_snapshot_value(&snapshot, &group, version)?;
+        let opened = self.open_metadata_snapshot(
+            &snapshot,
+            &super::metadata_snapshot::MetadataScheme::recorded(&state),
+            conversation_id,
+            &group,
+        )?;
         let prior_nonce = bytes(&snapshot["nonce"])?;
         let cid = uuid::Uuid::parse_str(conversation_id)
             .map_err(|_| invalid("Conversation ID is invalid."))?;
@@ -307,20 +309,25 @@ impl<
         next["stateVersion"] = json!(next_version);
         next["confirmationTag"] = json!(STANDARD.encode(&tag));
         next["groupContextHash"] = json!(STANDARD.encode(&context_hash));
-        let key: [u8; 32] = self
-            .mls_context()
-            .export_metadata_key_from_pending(group.clone(), next_epoch)?
-            .try_into()
-            .map_err(|_| invalid("Pending metadata key length is invalid."))?;
         let mut nonce = [0; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
         if prior_nonce == nonce {
             nonce[0] ^= 1;
         }
-        let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
-            &key, &group, next_epoch, version, &nonce, &metadata,
-        )
-        .map_err(|e| invalid(&format!("Could not encrypt group metadata: {e:?}")))?;
+        let ciphertext = self.reseal_metadata_from_pending(
+            &opened,
+            &group,
+            &super::metadata_snapshot::SuccessorCoordinate {
+                conversation_id,
+                generation: prior["generation"]
+                    .as_u64()
+                    .ok_or_else(|| invalid("Group generation is missing."))?,
+                epoch: next_epoch,
+                group_context_hash: &context_hash,
+                confirmation_tag: &tag,
+            },
+            &nonce,
+        )?;
         if ciphertext.len() != bytes(&snapshot["ciphertext"])?.len() {
             return Err(invalid("Removal unexpectedly changed group metadata."));
         }

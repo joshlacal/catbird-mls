@@ -38,6 +38,7 @@ tls_codec = "=0.5.0"
 thiserror = "1.0"
 zeroize = { version = "1.7", features = ["derive"] }
 base64 = "0.22"
+multibase = "0.9"
 hex = "0.4"
 sha2 = "0.10"
 # Promoted from transitive to direct for the clean-chat (`chat_v2`) signing
@@ -99,6 +100,13 @@ reqwest = { version = "0.12", features = ["json"], optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
+# Labyrinth 1.1 encrypted chat history (feature `labyrinth`, off by default).
+# Pinned by git rev on joshlacal/labyrinth (decision D1, amended 2026-10-14:
+# the repo is public). Bump the rev to pick up labyrinth changes. To build
+# against a local checkout, use a `[patch."https://github.com/joshlacal/labyrinth"]`
+# override in your own `.cargo/config.toml` rather than editing this line.
+labyrinth = { git = "https://github.com/joshlacal/labyrinth", rev = "385d1ee40ce1c3924c6a02234282e27b29607f2d", features = ["space"], optional = true }
+
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
 
@@ -123,6 +131,9 @@ storage-driver-prototype = []
 # In-process AAD emitters for cross-repository container tests; never UniFFI-exported.
 e2e-aad = []
 test-utils = ["openmls/test-utils", "openmls_rust_crypto/test-utils", "openmls_memory_storage/test-utils"]
+# Labyrinth 1.1 encrypted history backup over the mls-ds
+# `blue.catbird.labyrinth.*` endpoints (src/labyrinth/). Native targets only.
+labyrinth = ["dep:labyrinth"]
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
 openmls_sqlite_storage = { version = "=0.3.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
@@ -141,7 +152,7 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 ogg = "0.9"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt"] }
 wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = ["Window", "Performance", "console"] }
 # WASM-compatible getrandom feature unification across transitive semver lines.

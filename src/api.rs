@@ -743,6 +743,17 @@ struct MetadataReseal {
     avatar_content_type: Option<String>,
 }
 
+thread_local! {
+    static POST_BUILD_KEY_PACKAGE_HOOK: std::cell::RefCell<Option<Arc<dyn Fn() + Send + Sync>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[doc(hidden)]
+pub fn set_post_build_key_package_hook<F: Fn() + Send + Sync + 'static>(hook: Option<F>) {
+    POST_BUILD_KEY_PACKAGE_HOOK.with(|h| {
+        *h.borrow_mut() = hook.map(|f| Arc::new(f) as Arc<dyn Fn() + Send + Sync>);
+    });
+}
+
 #[uniffi::export]
 impl MLSContext {
     /// Create a new context with per-DID SQLite storage
@@ -3598,6 +3609,7 @@ impl MLSContext {
         Ok(result)
     }
 
+
     /// Create `count` key packages with a SINGLE persistence pass: one bundle-row
     /// transaction and one WAL checkpoint at the end of the batch, instead of a
     /// full manifest rewrite + checkpoint per package.
@@ -3622,7 +3634,7 @@ impl MLSContext {
             .inner
             .lock()
             .map_err(|_| MLSError::ContextNotInitialized)?;
-        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let mut inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
 
         let identity = String::from_utf8(identity_bytes)
             .map_err(|_| MLSError::invalid_input("Invalid UTF-8"))?;
@@ -3662,6 +3674,14 @@ impl MLSContext {
         if results.is_empty() {
             return Err(MLSError::ContextClosed);
         }
+        let hook = POST_BUILD_KEY_PACKAGE_HOOK.with(|h| h.borrow().clone());
+        if let Some(hook) = hook {
+            drop(guard);
+            hook();
+            guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+            inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        }
+
 
         // Single persistence pass for the whole batch (one small transaction —
         // per-row inserts, NOT a rewrite of every stored bundle).
@@ -4199,8 +4219,10 @@ impl MLSContext {
     }
 
     pub fn get_epoch(&self, group_id: Vec<u8>) -> Result<u64, MLSError> {
-        crate::debug_log!("[MLS-FFI] get_epoch: Starting");
-        crate::debug_log!("[MLS-FFI] Group ID: {}", hex::encode(&group_id));
+        tracing::trace!(
+            "[MLS-FFI] get_epoch: Starting, Group ID: {}",
+            hex::encode(&group_id)
+        );
 
         let _storage_operation = self.begin_storage_operation("get_epoch");
         let guard = self.inner.lock().map_err(|e| {
@@ -4213,7 +4235,7 @@ impl MLSContext {
 
         inner.with_group_ref(&gid, |group, _provider| {
             let epoch = group.epoch().as_u64();
-            crate::debug_log!("[MLS-FFI] Current epoch: {}", epoch);
+            tracing::trace!("[MLS-FFI] Current epoch: {}", epoch);
             Ok(epoch)
         })
     }
@@ -6438,6 +6460,54 @@ impl MLSContext {
         result
     }
 
+    /// Canonical application encryption used by every shipping orchestrator.
+    /// This Rust provider method is deliberately outside the UniFFI export.
+    pub fn encrypt_message_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+        expected_epoch: u64,
+    ) -> Result<EncryptResult, MLSError> {
+        self.check_suspended()?;
+        if aad.is_empty() || aad.len() > 16 * 1024 {
+            return Err(MLSError::invalid_input(
+                "Invalid canonical application AAD length",
+            ));
+        }
+        let _operation = self.begin_storage_operation("encrypt_message_with_aad");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        let ciphertext = inner.with_group(&gid, |group, provider, signer| {
+            if group.epoch().as_u64() != expected_epoch {
+                return Err(MLSError::invalid_input(
+                    "Canonical application epoch changed before encryption",
+                ));
+            }
+            group.set_aad(aad);
+            let result = group
+                .create_message(provider, signer, &plaintext)
+                .map_err(|_| MLSError::EncryptionFailed)
+                .and_then(|message| {
+                    message
+                        .tls_serialize_detached()
+                        .map_err(|_| MLSError::SerializationError)
+                });
+            group.set_aad(Vec::new());
+            result
+        })?;
+        let padded_size =
+            u32::try_from(ciphertext.len()).map_err(|_| MLSError::SerializationError)?;
+        Ok(EncryptResult {
+            ciphertext,
+            padded_size,
+        })
+    }
+
     #[cfg(any(feature = "test-utils", feature = "e2e-aad"))]
     pub fn encrypt_message_with_aad_for_test(
         &self,
@@ -7823,8 +7893,392 @@ pub fn mls_hash_psk(psk: Vec<u8>) -> String {
 // ---------------------------------------------------------------------------
 
 impl MlsCryptoContext for MLSContext {
+    fn decrypt_direct_request_introduction(
+        &self,
+        input: &crate::orchestrator::direct_request_bootstrap::DirectRequestWelcomeInput,
+    ) -> Result<
+        crate::orchestrator::direct_request_bootstrap::DirectRequestIntroductionResult,
+        MLSError,
+    > {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("decrypt_direct_request_introduction");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_bootstrap::decrypt_introduction(inner, input)
+    }
+    fn process_direct_request_welcome(
+        &self,
+        input: &crate::orchestrator::direct_request_bootstrap::DirectRequestWelcomeInput,
+    ) -> Result<WelcomeResult, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("process_direct_request_welcome");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_bootstrap::adopt_request_welcome(inner, input)
+    }
+    fn supports_direct_request_bootstrap(&self) -> bool {
+        true
+    }
+
+    fn prepare_direct_request_bootstrap(
+        &self,
+        input: &crate::orchestrator::direct_request_bootstrap::DirectRequestBootstrapInput,
+    ) -> Result<crate::orchestrator::direct_request_journal::DirectRequestJournal, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("prepare_direct_request_bootstrap");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::prepare(inner, input)
+    }
+
+    fn list_direct_request_journal(
+        &self,
+    ) -> Result<Vec<crate::orchestrator::direct_request_journal::DirectRequestJournal>, MLSError>
+    {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("list_direct_request_journal");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::native::list(&inner.manifest_storage)
+    }
+
+    fn persist_direct_request_publish(
+        &self,
+        request_id: &str,
+        exact_signed_bytes: &[u8],
+    ) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("persist_direct_request_publish");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::persist_publish(
+            inner,
+            request_id,
+            exact_signed_bytes,
+        )
+    }
+
+    fn confirm_published_bootstrap(
+        &self,
+        request_id: &str,
+        receipt: &[u8],
+        pinned_authority_key: &[u8],
+    ) -> Result<crate::orchestrator::direct_request_journal::DirectRequestJournal, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("confirm_published_bootstrap");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::resolve(
+            inner,
+            request_id,
+            receipt,
+            pinned_authority_key,
+            true,
+        )
+    }
+
+    fn abandon_rejected_bootstrap(
+        &self,
+        request_id: &str,
+        receipt: &[u8],
+        pinned_authority_key: &[u8],
+    ) -> Result<crate::orchestrator::direct_request_journal::DirectRequestJournal, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("abandon_rejected_bootstrap");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::resolve(
+            inner,
+            request_id,
+            receipt,
+            pinned_authority_key,
+            false,
+        )
+    }
+
+    fn mark_direct_request_projected(&self, request_id: &str) -> Result<(), MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("mark_direct_request_projected");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::projected(inner, request_id)
+    }
+
+    fn read_direct_request_intent(&self, draft_id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("read_direct_request_intent");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::intent_read(&inner.manifest_storage, draft_id)
+    }
+
+    fn compare_exchange_direct_request_intent(
+        &self,
+        draft_id: &str,
+        expected: Option<&[u8]>,
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("compare_exchange_direct_request_intent");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::intent_cas(
+            &inner.manifest_storage,
+            draft_id,
+            expected,
+            next,
+        )
+    }
+
+    fn list_direct_request_intents(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("list_direct_request_intents");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::intent_list(&inner.manifest_storage)
+    }
+    fn read_direct_request_projection(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("read_direct_request_projection");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::projection_read(
+            &inner.manifest_storage,
+            conversation_id,
+        )
+    }
+
+    fn compare_exchange_direct_request_projection(
+        &self,
+        conversation_id: &str,
+        expected: Option<&[u8]>,
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("compare_exchange_direct_request_projection");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::projection_cas(
+            &inner.manifest_storage,
+            conversation_id,
+            expected,
+            next,
+        )
+    }
+
+    fn commit_closed_direct_request_projection(
+        &self,
+        cid: &str,
+        expected: &[u8],
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("commit_closed_direct_request_projection");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::commit_closed_projection(
+            inner, cid, expected, next,
+        )
+    }
+    fn list_direct_request_projections(&self) -> Result<Vec<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("list_direct_request_projections");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_journal::projection_list(&inner.manifest_storage)
+    }
+
+    fn read_request_value(&self, namespace: &str, id: &str) -> Result<Option<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("read_request_value");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_value_read(
+            &inner.manifest_storage,
+            namespace,
+            id,
+        )
+    }
+
+    fn compare_exchange_request_value(
+        &self,
+        namespace: &str,
+        id: &str,
+        expected: Option<&[u8]>,
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("compare_exchange_request_value");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_value_cas(
+            &inner.manifest_storage,
+            namespace,
+            id,
+            expected,
+            next,
+        )
+    }
+
+    fn list_request_values(&self, namespace: &str) -> Result<Vec<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("list_request_values");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_values_list(
+            &inner.manifest_storage,
+            namespace,
+        )
+    }
+
+    fn delete_request_value(&self, namespace: &str, id: &str) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("delete_request_value");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_value_delete(
+            &inner.manifest_storage,
+            namespace,
+            id,
+        )
+    }
+
+    fn request_values_total_bytes(&self, namespace: &str) -> Result<u64, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("request_values_total_bytes");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_values_total_bytes(
+            &inner.manifest_storage,
+            namespace,
+        )
+    }
+
+    fn read_direct_request_key_publication(
+        &self,
+        device: &str,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("read_direct_request_key_publication");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_keys::native::read(&inner.manifest_storage, device)
+    }
+    fn prepare_direct_request_key_publication(
+        &self,
+        input: &crate::orchestrator::direct_request_keys::DirectRequestKeyPublicationInput,
+        expected: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("prepare_direct_request_key_publication");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_keys::native::prepare(inner, input, expected)
+    }
+    fn acknowledge_direct_request_key_publication(
+        &self,
+        device: &str,
+        expected: &[u8],
+        next: &[u8],
+    ) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("acknowledge_direct_request_key_publication");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::direct_request_keys::native::cas(
+            &inner.manifest_storage,
+            device,
+            expected,
+            next,
+        )
+    }
+
     fn create_key_package(&self, identity: Vec<u8>) -> Result<KeyPackageResult, MLSError> {
         self.create_key_package(identity)
+    }
+
+    fn record_replenish_intent(&self, needed: u32, identity: &str) -> Result<String, MLSError> {
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.record_replenish_intent(needed, identity)
+    }
+
+    fn clear_replenish_intent(&self) -> Result<(), MLSError> {
+        let guard = self.inner.lock().map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        inner.clear_replenish_intent()
     }
 
     fn create_last_resort_key_package(
@@ -7880,6 +8334,49 @@ impl MlsCryptoContext for MLSContext {
         target_epoch: u64,
     ) -> Result<Vec<u8>, MLSError> {
         MLSContext::export_metadata_key_from_pending(self, group_id, target_epoch)
+    }
+    fn export_canonical_metadata_key(
+        &self,
+        group_id: Vec<u8>,
+        coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        inner.with_group(&GroupId::from_slice(&group_id), |group, provider, _signer| {
+            Ok(crate::orchestrator::direct_request_bootstrap::request_metadata_key(
+                group,
+                provider,
+                coordinates,
+            )?
+            .to_vec())
+        })
+    }
+    fn export_canonical_metadata_key_from_pending(
+        &self,
+        group_id: Vec<u8>,
+        coordinates: &serde_json::Value,
+    ) -> Result<Vec<u8>, MLSError> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        inner.with_group(&GroupId::from_slice(&group_id), |group, provider, _signer| {
+            let staged = group
+                .pending_commit()
+                .ok_or_else(|| MLSError::Internal("no pending commit".into()))?;
+            Ok(
+                crate::orchestrator::direct_request_bootstrap::request_metadata_key_from_staged(
+                    staged,
+                    provider.crypto(),
+                    coordinates,
+                )?
+                .to_vec(),
+            )
+        })
     }
 
     fn get_current_metadata(
@@ -8114,6 +8611,16 @@ impl MlsCryptoContext for MLSContext {
         plaintext: Vec<u8>,
     ) -> Result<EncryptResult, MLSError> {
         self.encrypt_message(group_id, plaintext)
+    }
+
+    fn encrypt_message_with_aad(
+        &self,
+        group_id: Vec<u8>,
+        plaintext: Vec<u8>,
+        aad: Vec<u8>,
+        expected_epoch: u64,
+    ) -> Result<EncryptResult, MLSError> {
+        self.encrypt_message_with_aad(group_id, plaintext, aad, expected_epoch)
     }
 
     fn decrypt_message(
