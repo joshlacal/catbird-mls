@@ -2501,7 +2501,7 @@ dependencies = [
 [[package]]
 name = "labyrinth"
 version = "0.1.0"
-source = "git+https://github.com/joshlacal/labyrinth?rev=385d1ee40ce1c3924c6a02234282e27b29607f2d#385d1ee40ce1c3924c6a02234282e27b29607f2d"
+source = "git+https://github.com/joshlacal/labyrinth?rev=30f259e31cd679155b73f710b5fd411c7a81c555#30f259e31cd679155b73f710b5fd411c7a81c555"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
@@ -4678,7 +4678,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
