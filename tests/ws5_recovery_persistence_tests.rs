@@ -1012,14 +1012,11 @@ async fn quarantine_entry_projection_serializes_with_reset_authority() {
     .expect("quarantine entry race timed out");
     assert_eq!(
         reset_result.expect("record reset"),
-        ResetRecordOutcome::Recorded
+        ResetRecordOutcome::StaleOrDuplicate
     );
-    assert_eq!(
-        storage
-            .get_persisted_reset_pending(&convo_id)
-            .expect("reset remains authoritative")
-            .reset_generation,
-        20
+    assert!(
+        storage.get_persisted_quarantine(&convo_id).is_some(),
+        "F-03: quarantine must remain authoritative after unverified server reset"
     );
 }
 
@@ -1336,9 +1333,8 @@ async fn server_reset_exits_quarantine_even_when_the_backstop_clear_fails() {
         "quarantine entry must have persisted a row (test precondition)"
     );
 
-    // The exact minting path: the authority commit lands, the separate
-    // backstop clear fails.
-    storage.fail_next_clear_quarantine();
+    // F-03: An unverified server reset hint must NOT lift Layer-3 peer-poison
+    // quarantine in memory or on disk.
     let new_group_id = vec![0x5a; 32];
     orchestrator
         .record_group_reset(&convo_id, new_group_id.clone(), 9)
@@ -1346,42 +1342,27 @@ async fn server_reset_exits_quarantine_even_when_the_backstop_clear_fails() {
         .expect("record_group_reset failed");
 
     assert!(
-        storage.get_persisted_quarantine(&convo_id).is_none(),
-        "RULING 2a REGRESSION: a failed backstop clear minted a row that is \
-         both reset-pending and quarantined"
+        storage.get_persisted_quarantine(&convo_id).is_some(),
+        "F-03: persisted quarantine must survive unverified server reset"
     );
     assert!(
         orchestrator
             .get_conversation_quarantine_state(&convo_id)
             .await
-            .is_none(),
-        "server reset must exit quarantine in memory too"
+            .is_some(),
+        "F-03: in-memory quarantine must survive unverified server reset"
     );
-    match storage
-        .get_conversation_state(&convo_id)
-        .await
-        .expect("read durable state")
-    {
-        Some(ConversationState::ResetPending {
-            new_group_id: target,
-            reset_generation,
-            ..
-        }) => {
-            assert_eq!(target, hex::encode(&new_group_id));
-            assert_eq!(reset_generation, 9);
-        }
-        other => panic!("expected durable ResetPending, got {other:?}"),
-    }
-
-    // The backstop still escalates rather than warning, so a pre-amendment
-    // backend that leaves residue is visible instead of silent.
-    let escalations = observer.storage_failures.lock().unwrap().clone();
     assert!(
-        escalations
-            .iter()
-            .any(|(cid, op, _)| cid == &convo_id && op == "clear_quarantine"),
-        "failing backstop clear_quarantine must escalate, got {escalations:?}"
+        matches!(
+            storage
+                .get_conversation_state(&convo_id)
+                .await
+                .expect("read durable state"),
+            Some(ConversationState::Quarantined { .. })
+        ),
+        "F-03: durable ConversationState::Quarantined must survive unverified server reset"
     );
+    let _ = observer;
 }
 
 /// FIX-8: entries future-dated by a backward wall-clock step are invalid

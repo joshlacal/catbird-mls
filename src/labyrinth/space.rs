@@ -36,7 +36,7 @@ use labyrinth::store::xrpc::{XrpcError, XrpcMailboxStore, XrpcTransport};
 use labyrinth::store::{MailboxStore, Stored, TimeRange};
 
 use super::state::StateVault;
-use super::transport::decode_response;
+use super::transport::{decode_response, validate_nsid};
 use crate::orchestrator::canonical_transport::{encode_query, GatewayResponse};
 use crate::orchestrator::mls_provider::MlsCryptoContext;
 use crate::MLSError;
@@ -89,6 +89,7 @@ fn refuse(message: String) -> XrpcError {
 }
 
 fn check_nsid(nsid: &str) -> Result<(), XrpcError> {
+    validate_nsid(nsid)?;
     if nsid.starts_with(SPACE_NSID_PREFIX) {
         Ok(())
     } else {

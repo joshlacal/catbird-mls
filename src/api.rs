@@ -97,6 +97,87 @@ fn strip_padding(data: &[u8]) -> Vec<u8> {
     }
 }
 
+pub(crate) fn deserialize_exact_mls_message(bytes: &[u8]) -> Result<MlsMessageIn, MLSError> {
+    use openmls::prelude::tls_codec::DeserializeBytes;
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        MlsMessageIn::tls_deserialize_bytes(bytes)
+    }))
+    .map_err(|_| MLSError::SerializationError)?;
+    let (mls_msg, remaining) = parsed.map_err(|_| MLSError::SerializationError)?;
+    if !remaining.is_empty() {
+        return Err(MLSError::SerializationError);
+    }
+    Ok(mls_msg)
+}
+
+pub(crate) fn deserialize_exact_key_package_in(bytes: &[u8]) -> Result<KeyPackageIn, MLSError> {
+    use openmls::prelude::tls_codec::DeserializeBytes;
+    let wrapped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        MlsMessageIn::tls_deserialize_bytes(bytes)
+    }));
+    match wrapped {
+        Ok(Ok((mls_msg, remaining))) => {
+            if !remaining.is_empty() {
+                return Err(MLSError::SerializationError);
+            }
+            match mls_msg.extract() {
+                MlsMessageBodyIn::KeyPackage(kp_in) => Ok(kp_in),
+                _ => Err(MLSError::SerializationError),
+            }
+        }
+        Ok(Err(_)) | Err(_) => {
+            let raw = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                KeyPackageIn::tls_deserialize_bytes(bytes)
+            }))
+            .map_err(|_| MLSError::SerializationError)?;
+            let (kp_in, remaining) = raw.map_err(|_| MLSError::SerializationError)?;
+            if !remaining.is_empty() {
+                return Err(MLSError::SerializationError);
+            }
+            Ok(kp_in)
+        }
+    }
+}
+
+fn build_update_proposal_info(
+    group: &MlsGroup,
+    sender: &Sender,
+    update_proposal: &UpdateProposal,
+) -> Result<UpdateProposalInfo, MLSError> {
+    let Sender::Member(sender_leaf_idx) = sender else {
+        return Err(MLSError::invalid_input(
+            "Update proposal sender must be an active group member",
+        ));
+    };
+    let sender_member = group
+        .members()
+        .find(|m| m.index == *sender_leaf_idx)
+        .ok_or_else(|| {
+            MLSError::invalid_input("Update proposal sender leaf not found in active group")
+        })?;
+    let old_credential = CredentialData {
+        credential_type: format!("{:?}", sender_member.credential.credential_type()),
+        identity: sender_member.credential.serialized_content().to_vec(),
+    };
+    let new_cred = update_proposal.leaf_node().credential();
+    let new_credential = CredentialData {
+        credential_type: format!("{:?}", new_cred.credential_type()),
+        identity: new_cred.serialized_content().to_vec(),
+    };
+    if old_credential.credential_type != new_credential.credential_type
+        || old_credential.identity != new_credential.identity
+    {
+        return Err(MLSError::invalid_input(
+            "Update proposal cannot change member credential identity",
+        ));
+    }
+    Ok(UpdateProposalInfo {
+        leaf_index: sender_leaf_idx.u32(),
+        old_credential,
+        new_credential,
+    })
+}
+
 /// Re-flatten N38 typed decrypt error classes for the FFI surface.
 ///
 /// `decrypt_message_classified` surfaces typed OpenMLS process-failure
@@ -411,6 +492,9 @@ struct PendingOutgoingCommitMeta {
 
 struct PendingIncomingCommit {
     staged: Option<Box<StagedCommit>>,
+    /// Authenticated `(credential_identity, signature_public_key)` of the
+    /// current member leaf that signed this commit (when `Sender::Member`).
+    sender_leaf_binding: Option<(Vec<u8>, Vec<u8>)>,
     /// SHA-256 of the normalized MLS wire message that produced `staged`.
     /// The epoch alone is not an authorization handle: two different valid
     /// commits can target the same next epoch. Preserve the first object and
@@ -546,6 +630,7 @@ fn stage_pending_incoming_commit(
     target_epoch: u64,
     wire_fingerprint: [u8; 32],
     staged: Box<StagedCommit>,
+    sender_leaf_binding: Option<(Vec<u8>, Vec<u8>)>,
     context: &str,
 ) -> Result<(), MLSError> {
     use std::collections::hash_map::Entry;
@@ -561,6 +646,7 @@ fn stage_pending_incoming_commit(
             entry.insert(PendingIncomingCommit {
                 self_removed: staged.self_removed(),
                 staged: Some(staged),
+                sender_leaf_binding,
                 wire_fingerprint,
                 merge_started: false,
             });
@@ -569,6 +655,9 @@ fn stage_pending_incoming_commit(
         Entry::Occupied(mut entry) if entry.get().wire_fingerprint == wire_fingerprint => {
             if entry.get().staged.is_none() && !entry.get().merge_started {
                 entry.get_mut().staged = Some(staged);
+                if entry.get().sender_leaf_binding.is_none() {
+                    entry.get_mut().sender_leaf_binding = sender_leaf_binding;
+                }
                 crate::debug_log!(
                     "[{}] Exact retransmission reinstalled staged commit payload for group {} epoch {}",
                     context,
@@ -1361,39 +1450,14 @@ impl MLSContext {
                     kp_data.data.len()
                 );
 
-                // First try: MlsMessage-wrapped format (server might send this)
-                if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data) {
-                    if remaining.is_empty() {
-                        crate::debug_log!("[MLS] Key package {} deserialized as MlsMessage", idx);
-                        match mls_msg.extract() {
-                            MlsMessageBodyIn::KeyPackage(kp_in) => {
-                                crate::debug_log!("[MLS] Extracted KeyPackage from MlsMessage");
-                                return kp_in.validate(inner.provider_crypto(), ProtocolVersion::default())
-                                    .map_err(|e| {
-                                        crate::error_log!("[MLS] Key package {} validation failed: {:?}", idx, e);
-                                        MLSError::InvalidKeyPackage
-                                    });
-                            }
-                            other => {
-                                crate::debug_log!("[MLS] MlsMessage contained unexpected type: {:?}, trying raw format",
-                                    std::mem::discriminant(&other));
-                            }
-                        }
-                    }
-                }
-
-                // Second try: Raw KeyPackage format
-                crate::debug_log!("[MLS] Trying raw KeyPackage deserialization for key package {}", idx);
-                let (kp_in, remaining) = KeyPackageIn::tls_deserialize_bytes(&kp_data.data)
-                    .map_err(|e| {
-                        crate::error_log!("[MLS] Both deserialization methods failed for key package {}: {:?}", idx, e);
-                        MLSError::SerializationError
-                    })?;
-
-                crate::debug_log!("[MLS] Key package {} deserialized as raw KeyPackage ({} bytes remaining)", idx, remaining.len());
+                let kp_in = deserialize_exact_key_package_in(&kp_data.data).map_err(|e| {
+                    crate::error_log!("[MLS] Key package {} deserialization failed: {:?}", idx, e);
+                    e
+                })?;
 
                 // Validate the key package
-                kp_in.validate(inner.provider_crypto(), ProtocolVersion::default())
+                kp_in
+                    .validate(inner.provider_crypto(), ProtocolVersion::default())
                     .map_err(|e| {
                         crate::error_log!("[MLS] Key package {} validation failed: {:?}", idx, e);
                         MLSError::InvalidKeyPackage
@@ -1885,31 +1949,10 @@ impl MLSContext {
             .iter()
             .enumerate()
             .map(|(idx, kp_data)| {
-                if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&kp_data.data)
-                {
-                    if remaining.is_empty() {
-                        match mls_msg.extract() {
-                            MlsMessageBodyIn::KeyPackage(kp_in) => {
-                                return kp_in
-                                    .validate(inner.provider_crypto(), ProtocolVersion::default())
-                                    .map_err(|e| {
-                                        crate::error_log!(
-                                            "[MLS-FFI] swap kp {} validate: {:?}",
-                                            idx,
-                                            e
-                                        );
-                                        MLSError::InvalidKeyPackage
-                                    });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                let (kp_in, _) =
-                    KeyPackageIn::tls_deserialize_bytes(&kp_data.data).map_err(|e| {
-                        crate::error_log!("[MLS-FFI] swap kp {} deser: {:?}", idx, e);
-                        MLSError::SerializationError
-                    })?;
+                let kp_in = deserialize_exact_key_package_in(&kp_data.data).map_err(|e| {
+                    crate::error_log!("[MLS-FFI] swap kp {} deser: {:?}", idx, e);
+                    e
+                })?;
                 kp_in
                     .validate(inner.provider_crypto(), ProtocolVersion::default())
                     .map_err(|e| {
@@ -2181,26 +2224,7 @@ impl MLSContext {
             let kps: Vec<KeyPackage> = key_packages
                 .iter()
                 .map(|kp_data| {
-                    // Try MlsMessage-wrapped format first
-                    if let Ok((mls_msg, remaining)) =
-                        MlsMessageIn::tls_deserialize_bytes(&kp_data.data)
-                    {
-                        if remaining.is_empty() {
-                            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-                                return kp_in
-                                    .validate(
-                                        inner_ctx.provider_crypto(),
-                                        ProtocolVersion::default(),
-                                    )
-                                    .map_err(|_| MLSError::InvalidKeyPackage);
-                            }
-                        }
-                    }
-
-                    // Try raw KeyPackage format
-                    let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(&kp_data.data)
-                        .map_err(|_| MLSError::SerializationError)?;
-
+                    let kp_in = deserialize_exact_key_package_in(&kp_data.data)?;
                     kp_in
                         .validate(inner_ctx.provider_crypto(), ProtocolVersion::default())
                         .map_err(|_| MLSError::InvalidKeyPackage)
@@ -2791,10 +2815,10 @@ impl MLSContext {
 
                     let ciphertext = strip_padding(&ciphertext);
 
-                    let (mls_msg, _) =
-                        MlsMessageIn::tls_deserialize_bytes(&ciphertext).map_err(|e| {
+                    let mls_msg =
+                        deserialize_exact_mls_message(&ciphertext).map_err(|e| {
                             crate::error_log!("[DECRYPT-ASYNC] ❌ Failed to deserialize: {:?}", e);
-                            MLSError::SerializationError
+                            e
                         })?;
 
                     let protocol_msg: ProtocolMessage = mls_msg.try_into().map_err(|e| {
@@ -2946,6 +2970,7 @@ impl MLSContext {
                     epoch,
                     wire_fingerprint,
                     staged,
+                    None,
                     "DECRYPT-ASYNC",
                 )?;
             }
@@ -3019,12 +3044,12 @@ impl MLSContext {
             crate::debug_log!("[MLS-FFI]   Group members count: {}", group.members().count());
 
             crate::debug_log!("[MLS-FFI] Deserializing MlsMessage...");
-            let (mls_msg, remaining) = MlsMessageIn::tls_deserialize_bytes(&message_data)
+            let mls_msg = deserialize_exact_mls_message(&message_data)
                 .map_err(|e| {
                     crate::error_log!("[MLS-FFI] ERROR: Failed to deserialize MlsMessage: {:?}", e);
-                    MLSError::SerializationError
+                    e
                 })?;
-            crate::debug_log!("[MLS-FFI] MlsMessage deserialized ({} bytes remaining)", remaining.len());
+            crate::debug_log!("[MLS-FFI] MlsMessage deserialized (0 bytes remaining)");
 
             crate::debug_log!("[MLS-FFI] Converting to ProtocolMessage...");
             let protocol_msg: ProtocolMessage = mls_msg.try_into()
@@ -3167,24 +3192,13 @@ impl MLSContext {
                         },
                         Proposal::Update(update_proposal) => {
                             crate::debug_log!("[MLS-FFI] Update proposal detected");
-                            let leaf_node = update_proposal.leaf_node();
-                            let credential = leaf_node.credential();
-
-                            let credential_info = CredentialData {
-                                credential_type: format!("{:?}", credential.credential_type()),
-                                identity: credential.serialized_content().to_vec(),
-                            };
-
-                            let leaf_index = group.own_leaf_index().u32();
-                            crate::debug_log!("[MLS-FFI] Update proposal leaf index: {}", leaf_index);
-
-                            ProposalInfo::Update {
-                                info: UpdateProposalInfo {
-                                    leaf_index,
-                                    old_credential: credential_info.clone(),
-                                    new_credential: credential_info,
-                                }
-                            }
+                            let info = build_update_proposal_info(
+                                group,
+                                proposal_msg.sender(),
+                                update_proposal,
+                            )?;
+                            crate::debug_log!("[MLS-FFI] Update proposal leaf index: {}", info.leaf_index);
+                            ProposalInfo::Update { info }
                         },
                         _ => {
                             crate::error_log!("[MLS-FFI] ERROR: Unsupported proposal type");
@@ -3303,6 +3317,7 @@ impl MLSContext {
                         target_epoch,
                         wire_fingerprint,
                         staged,
+                        None,
                         "MLS-FFI",
                     )?;
                 }
@@ -3353,10 +3368,10 @@ impl MLSContext {
                 // Strip padding envelope before MLS deserialization
                 let message_data = strip_padding(&message_data);
 
-                let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(&message_data)
+                let mls_msg = deserialize_exact_mls_message(&message_data)
                     .map_err(|e| {
                         crate::error_log!("[MLS-FFI-ASYNC] ERROR: Failed to deserialize: {:?}", e);
-                        MLSError::SerializationError
+                        e
                     })?;
 
                 let protocol_msg: ProtocolMessage = mls_msg.try_into()
@@ -3434,22 +3449,12 @@ impl MLSContext {
                                 }
                             },
                             Proposal::Update(update_proposal) => {
-                                let leaf_node = update_proposal.leaf_node();
-                                let credential = leaf_node.credential();
-                                let leaf_index = group.own_leaf_index().u32();
-                                ProposalInfo::Update {
-                                    info: UpdateProposalInfo {
-                                        leaf_index,
-                                        old_credential: CredentialData {
-                                            credential_type: format!("{:?}", credential.credential_type()),
-                                            identity: credential.serialized_content().to_vec(),
-                                        },
-                                        new_credential: CredentialData {
-                                            credential_type: format!("{:?}", credential.credential_type()),
-                                            identity: credential.serialized_content().to_vec(),
-                                        },
-                                    }
-                                }
+                                let info = build_update_proposal_info(
+                                    group,
+                                    proposal_msg.sender(),
+                                    update_proposal,
+                                )?;
+                                ProposalInfo::Update { info }
                             },
                             _ => {
                                 return Err(MLSError::invalid_input("Unsupported proposal type"));
@@ -3557,6 +3562,7 @@ impl MLSContext {
                             target_epoch,
                             wire_fingerprint,
                             staged,
+                            None,
                             "MLS-FFI-ASYNC",
                         )?;
                     }
@@ -3751,12 +3757,12 @@ impl MLSContext {
             return Err(MLSError::StorageFailed);
         }
 
-        let (mls_msg, _) = MlsMessageIn::tls_deserialize_bytes(&welcome_bytes).map_err(|e| {
+        let mls_msg = deserialize_exact_mls_message(&welcome_bytes).map_err(|e| {
             crate::error_log!(
                 "[MLS-FFI] ERROR: Failed to deserialize Welcome message: {:?}",
                 e
             );
-            MLSError::SerializationError
+            e
         })?;
         crate::debug_log!("[MLS-FFI] process_welcome: Welcome message deserialized successfully");
 
@@ -4618,13 +4624,13 @@ impl MLSContext {
             target_epoch,
             staged_commit_opt,
         ): IncomingProcessCommitStage = inner.with_group(&gid, |group, provider, _signer| {
-                let (mls_msg, _) =
-                    MlsMessageIn::tls_deserialize_bytes(&commit_data).map_err(|e| {
+                let mls_msg =
+                    deserialize_exact_mls_message(&commit_data).map_err(|e| {
                         crate::error_log!(
                             "[MLS-FFI] ❌ process_commit: TLS deserialization failed: {:?}",
                             e
                         );
-                        MLSError::SerializationError
+                        e
                     })?;
 
                 let protocol_msg: ProtocolMessage = mls_msg.try_into().map_err(|e| {
@@ -4839,6 +4845,7 @@ impl MLSContext {
                 target_epoch,
                 wire_fingerprint,
                 staged,
+                None,
                 "MLS-FFI process_commit",
             )?;
         }
@@ -6099,26 +6106,7 @@ impl MLSContext {
         let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
 
         let crypto = inner.provider_crypto();
-
-        // Try MlsMessage-wrapped format first
-        if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-            if remaining.is_empty() {
-                if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-                    let kp = kp_in
-                        .validate(crypto, ProtocolVersion::default())
-                        .map_err(|_| MLSError::InvalidKeyPackage)?;
-                    return Ok(kp
-                        .hash_ref(crypto)
-                        .map_err(|_| MLSError::OpenMLSError)?
-                        .as_slice()
-                        .to_vec());
-                }
-            }
-        }
-
-        // Fallback: raw KeyPackage format
-        let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
-            .map_err(|_| MLSError::SerializationError)?;
+        let kp_in = deserialize_exact_key_package_in(&key_package_bytes)?;
         let kp = kp_in
             .validate(crypto, ProtocolVersion::default())
             .map_err(|_| MLSError::InvalidKeyPackage)?;
@@ -6802,15 +6790,11 @@ impl MLSContext {
         let ciphertext = strip_padding(&ciphertext);
 
         // Deserialize to peek at message epoch for diagnostics (outside with_group)
-        let (mls_msg, remaining) =
-            MlsMessageIn::tls_deserialize_bytes(&ciphertext).map_err(|e| {
-                crate::error_log!("[DECRYPT] ❌ Failed to deserialize MlsMessage: {:?}", e);
-                MLSError::SerializationError
-            })?;
-        crate::debug_log!(
-            "[DECRYPT] MlsMessage deserialized ({} bytes remaining)",
-            remaining.len()
-        );
+        let mls_msg = deserialize_exact_mls_message(&ciphertext).map_err(|e| {
+            crate::error_log!("[DECRYPT] ❌ Failed to deserialize MlsMessage: {:?}", e);
+            e
+        })?;
+        crate::debug_log!("[DECRYPT] MlsMessage deserialized (0 bytes remaining)");
 
         let protocol_msg: ProtocolMessage = mls_msg.try_into().map_err(|e| {
             crate::error_log!("[DECRYPT] ❌ Failed to convert to ProtocolMessage: {:?}", e);
@@ -6926,6 +6910,13 @@ impl MLSContext {
             }
 
             // Extract sender credential BEFORE consuming the processed message
+            let sender_leaf_binding = match processed.sender() {
+                Sender::Member(leaf_index) => group
+                    .members()
+                    .find(|m| m.index == *leaf_index)
+                    .map(|m| (m.credential.serialized_content().to_vec(), m.signature_key)),
+                _ => None,
+            };
             let sender_cred = processed.credential().clone();
             let sender_credential = CredentialData {
                 credential_type: format!("{:?}", sender_cred.credential_type()),
@@ -6944,6 +6935,7 @@ impl MLSContext {
                         DecryptContentType::Application,
                         None,
                         None,
+                        sender_leaf_binding,
                     )))
                 },
                 ProcessedMessageContent::ProposalMessage(prop) => {
@@ -6955,6 +6947,7 @@ impl MLSContext {
                         DecryptContentType::Proposal,
                         Some(*prop),
                         None,
+                        sender_leaf_binding,
                     )))
                 },
                 ProcessedMessageContent::ExternalJoinProposalMessage(_) => {
@@ -6989,6 +6982,7 @@ impl MLSContext {
                         DecryptContentType::Commit,
                         None,
                         Some(staged),
+                        sender_leaf_binding,
                     )))
                 },
                 ProcessedMessageContent::OwnPrivateMessage
@@ -7012,6 +7006,7 @@ impl MLSContext {
             content_type,
             queued_proposal_opt,
             staged_commit_opt,
+            sender_leaf_binding,
         ) = match stage {
             ControlFlow::Continue(stage) => stage,
             ControlFlow::Break(outcome) => return Ok(outcome),
@@ -7038,6 +7033,7 @@ impl MLSContext {
                 epoch,
                 wire_fingerprint,
                 staged,
+                sender_leaf_binding,
                 "DECRYPT",
             )?;
         }
@@ -7576,26 +7572,7 @@ pub fn mls_compute_key_package_hash(key_package_bytes: Vec<u8>) -> Result<Vec<u8
     use openmls_libcrux_crypto::Provider as LibcruxProvider;
 
     let provider = LibcruxProvider::default();
-
-    // Try MlsMessage-wrapped format first
-    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-        if remaining.is_empty() {
-            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-                let kp = kp_in
-                    .validate(provider.crypto(), ProtocolVersion::default())
-                    .map_err(|_| MLSError::InvalidKeyPackage)?;
-                return Ok(kp
-                    .hash_ref(provider.crypto())
-                    .map_err(|_| MLSError::OpenMLSError)?
-                    .as_slice()
-                    .to_vec());
-            }
-        }
-    }
-
-    // Fallback: raw KeyPackage format
-    let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
-        .map_err(|_| MLSError::SerializationError)?;
+    let kp_in = deserialize_exact_key_package_in(&key_package_bytes)?;
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
         .map_err(|_| MLSError::InvalidKeyPackage)?;
@@ -7757,25 +7734,7 @@ pub fn mls_extract_key_package_identity(key_package_bytes: Vec<u8>) -> Result<St
     use openmls_libcrux_crypto::Provider as LibcruxProvider;
 
     let provider = LibcruxProvider::default();
-
-    // Try MlsMessage-wrapped format first
-    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-        if remaining.is_empty() {
-            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-                let kp = kp_in
-                    .validate(provider.crypto(), ProtocolVersion::default())
-                    .map_err(|_| MLSError::InvalidKeyPackage)?;
-                let identity_bytes = kp.leaf_node().credential().serialized_content();
-                return String::from_utf8(identity_bytes.to_vec()).map_err(|_| {
-                    MLSError::invalid_input("Credential identity is not valid UTF-8")
-                });
-            }
-        }
-    }
-
-    // Fallback: raw KeyPackage format
-    let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
-        .map_err(|_| MLSError::SerializationError)?;
+    let kp_in = deserialize_exact_key_package_in(&key_package_bytes)?;
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
         .map_err(|_| MLSError::InvalidKeyPackage)?;
@@ -7795,22 +7754,7 @@ pub fn mls_extract_key_package_signature_public_key(
     use openmls_libcrux_crypto::Provider as LibcruxProvider;
 
     let provider = LibcruxProvider::default();
-
-    // Try MlsMessage-wrapped format first
-    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-        if remaining.is_empty() {
-            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-                let kp = kp_in
-                    .validate(provider.crypto(), ProtocolVersion::default())
-                    .map_err(|_| MLSError::InvalidKeyPackage)?;
-                return Ok(kp.leaf_node().signature_key().as_slice().to_vec());
-            }
-        }
-    }
-
-    // Fallback: raw KeyPackage format
-    let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
-        .map_err(|_| MLSError::SerializationError)?;
+    let kp_in = deserialize_exact_key_package_in(&key_package_bytes)?;
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
         .map_err(|_| MLSError::InvalidKeyPackage)?;
@@ -7839,22 +7783,7 @@ pub fn mls_extract_key_package_signature_algorithm(
     }
 
     let provider = LibcruxProvider::default();
-
-    // Try MlsMessage-wrapped format first
-    if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(&key_package_bytes) {
-        if remaining.is_empty() {
-            if let MlsMessageBodyIn::KeyPackage(kp_in) = mls_msg.extract() {
-                let kp = kp_in
-                    .validate(provider.crypto(), ProtocolVersion::default())
-                    .map_err(|_| MLSError::InvalidKeyPackage)?;
-                return Ok(normalize_alg_label(&format!("{:?}", kp.ciphersuite())));
-            }
-        }
-    }
-
-    // Fallback: raw KeyPackage format
-    let (kp_in, _remaining) = KeyPackageIn::tls_deserialize_bytes(&key_package_bytes)
-        .map_err(|_| MLSError::SerializationError)?;
+    let kp_in = deserialize_exact_key_package_in(&key_package_bytes)?;
     let kp = kp_in
         .validate(provider.crypto(), ProtocolVersion::default())
         .map_err(|_| MLSError::InvalidKeyPackage)?;
@@ -8145,6 +8074,21 @@ impl MlsCryptoContext for MLSContext {
             .map_err(|_| MLSError::ContextNotInitialized)?;
         let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
         crate::orchestrator::subscription::request_value_read(
+            &inner.manifest_storage,
+            namespace,
+            id,
+        )
+    }
+
+    fn has_request_value(&self, namespace: &str, id: &str) -> Result<bool, MLSError> {
+        self.check_suspended()?;
+        let _operation = self.begin_storage_operation("has_request_value");
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        crate::orchestrator::subscription::request_value_exists(
             &inner.manifest_storage,
             namespace,
             id,
@@ -8941,34 +8885,10 @@ impl MlsCryptoContext for MLSContext {
         inner.with_group(&gid, |group, provider, signer| {
             let mut validated_by_identity = std::collections::HashMap::<Vec<u8>, KeyPackage>::new();
             for (idx, kp_bytes) in key_packages.iter().enumerate() {
-                let kp = if let Ok((mls_msg, remaining)) = MlsMessageIn::tls_deserialize_bytes(kp_bytes) {
-                    if remaining.is_empty() {
-                        match mls_msg.extract() {
-                            MlsMessageBodyIn::KeyPackage(kp_in) => kp_in
-                                .validate(provider.crypto(), ProtocolVersion::default())
-                                .map_err(|_| MLSError::InvalidKeyPackage)?,
-                            _ => {
-                                let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
-                                    .map_err(|_| MLSError::SerializationError)?;
-                                kp_in
-                                    .validate(provider.crypto(), ProtocolVersion::default())
-                                    .map_err(|_| MLSError::InvalidKeyPackage)?
-                            }
-                        }
-                    } else {
-                        let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
-                            .map_err(|_| MLSError::SerializationError)?;
-                        kp_in
-                            .validate(provider.crypto(), ProtocolVersion::default())
-                            .map_err(|_| MLSError::InvalidKeyPackage)?
-                    }
-                } else {
-                    let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(kp_bytes)
-                        .map_err(|_| MLSError::SerializationError)?;
-                    kp_in
-                        .validate(provider.crypto(), ProtocolVersion::default())
-                        .map_err(|_| MLSError::InvalidKeyPackage)?
-                };
+                let kp_in = deserialize_exact_key_package_in(kp_bytes)?;
+                let kp = kp_in
+                    .validate(provider.crypto(), ProtocolVersion::default())
+                    .map_err(|_| MLSError::InvalidKeyPackage)?;
 
                 let identity = kp.leaf_node().credential().serialized_content().to_vec();
                 if validated_by_identity.insert(identity.clone(), kp).is_some() {
@@ -9081,6 +9001,244 @@ impl MlsCryptoContext for MLSContext {
             aad_sha256,
             ciphertext_sha256,
         )
+    }
+
+    fn preview_welcome_leaf_bindings(
+        &self,
+        welcome_data: Vec<u8>,
+        config: Option<GroupConfig>,
+    ) -> Result<Option<crate::orchestrator::mls_provider::LeafBindingPairs>, MLSError> {
+        self.check_suspended()?;
+        let _storage_operation = self.begin_storage_operation("preview_welcome_leaf_bindings");
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let clean = strip_padding(&welcome_data);
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            use openmls::prelude::tls_codec::DeserializeBytes;
+            MlsMessageIn::tls_deserialize_bytes(&clean)
+        }))
+        .map_err(|_| MLSError::SerializationError)?;
+        let Ok((mls_msg, remainder)) = parsed else {
+            return Ok(None);
+        };
+        if !remainder.is_empty() {
+            return Err(MLSError::SerializationError);
+        }
+        let MlsMessageBodyIn::Welcome(welcome) = mls_msg.extract() else {
+            return Ok(None);
+        };
+
+        struct PreviewWelcomeProvider<'a> {
+            storage: openmls_memory_storage::MemoryStorage,
+            crypto: &'a openmls_libcrux_crypto::CryptoProvider,
+        }
+        impl OpenMlsProvider for PreviewWelcomeProvider<'_> {
+            type CryptoProvider = openmls_libcrux_crypto::CryptoProvider;
+            type RandProvider = openmls_libcrux_crypto::CryptoProvider;
+            type StorageProvider = openmls_memory_storage::MemoryStorage;
+            fn storage(&self) -> &Self::StorageProvider {
+                &self.storage
+            }
+            fn crypto(&self) -> &Self::CryptoProvider {
+                self.crypto
+            }
+            fn rand(&self) -> &Self::RandProvider {
+                self.crypto
+            }
+        }
+
+        let mem_storage = openmls_memory_storage::MemoryStorage::default();
+        for secret in welcome.secrets() {
+            let member_ref = secret.new_member();
+            let bundle: Option<KeyPackageBundle> = inner
+                .provider
+                .storage()
+                .key_package(&member_ref)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    inner
+                        .key_package_bundles()
+                        .get(member_ref.as_slice())
+                        .cloned()
+                });
+            if let Some(bundle) = bundle {
+                let _ = mem_storage.write_key_package(&member_ref, &bundle);
+            }
+        }
+        let preview_provider = PreviewWelcomeProvider {
+            storage: mem_storage,
+            crypto: inner.provider_crypto(),
+        };
+
+        let group_config = config.unwrap_or_default();
+        let join_config = MlsGroupJoinConfig::builder()
+            .max_past_epochs(group_config.max_past_epochs as usize)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::new(
+                group_config.out_of_order_tolerance,
+                group_config.maximum_forward_distance,
+            ))
+            .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .use_ratchet_tree_extension(true)
+            .build();
+        let Ok(staged) =
+            StagedWelcome::build_from_welcome(&preview_provider, &join_config, welcome)
+                .and_then(|builder| builder.build())
+        else {
+            return Ok(None);
+        };
+        let bindings = staged
+            .members()
+            .map(|m| (m.credential.serialized_content().to_vec(), m.signature_key))
+            .collect();
+        Ok(Some(bindings))
+    }
+
+    fn group_member_leaf_bindings(
+        &self,
+        group_id: Vec<u8>,
+    ) -> Result<Option<crate::orchestrator::mls_provider::LeafBindingPairs>, MLSError> {
+        self.check_suspended()?;
+        let _storage_operation = self.begin_storage_operation("group_member_leaf_bindings");
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let gid = GroupId::from_slice(&group_id);
+        inner.with_group_ref(&gid, |group, _provider| {
+            let bindings = group
+                .members()
+                .map(|m| (m.credential.serialized_content().to_vec(), m.signature_key))
+                .collect();
+            Ok(Some(bindings))
+        })
+    }
+
+    fn staged_incoming_commit_leaf_bindings(
+        &self,
+        group_id: Vec<u8>,
+        target_epoch: u64,
+    ) -> Result<Option<crate::orchestrator::mls_provider::LeafBindingPairs>, MLSError> {
+        self.check_suspended()?;
+        let _storage_operation =
+            self.begin_storage_operation("staged_incoming_commit_leaf_bindings");
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let pending = self
+            .pending_incoming_merges
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let Some(entry) = pending.get(&(group_id.clone(), target_epoch)) else {
+            return Err(MLSError::invalid_input(format!(
+                "no pending staged commit for epoch {target_epoch}"
+            )));
+        };
+        let Some(staged) = entry.staged.as_ref() else {
+            return Ok(Some(entry.sender_leaf_binding.iter().cloned().collect()));
+        };
+        let gid = GroupId::from_slice(&group_id);
+        inner.with_group_ref(&gid, |group, _provider| {
+            let mut bindings = Vec::new();
+            if let Some(sender_binding) = &entry.sender_leaf_binding {
+                bindings.push(sender_binding.clone());
+            }
+            for queued in staged.add_proposals() {
+                let ln = queued.add_proposal().key_package().leaf_node();
+                bindings.push((
+                    ln.credential().serialized_content().to_vec(),
+                    ln.signature_key().as_slice().to_vec(),
+                ));
+            }
+            for queued in staged.update_proposals() {
+                let ln = queued.update_proposal().leaf_node();
+                let new_id = ln.credential().serialized_content().to_vec();
+                if let Sender::Member(leaf_idx) = queued.sender() {
+                    if let Some(old_member) = group.members().find(|m| m.index == *leaf_idx) {
+                        if old_member.credential.serialized_content() != new_id.as_slice() {
+                            return Err(MLSError::InvalidCommit);
+                        }
+                    } else {
+                        return Err(MLSError::InvalidCommit);
+                    }
+                } else {
+                    return Err(MLSError::InvalidCommit);
+                }
+                bindings.push((new_id, ln.signature_key().as_slice().to_vec()));
+            }
+            if let Some(ln) = staged.update_path_leaf_node() {
+                bindings.push((
+                    ln.credential().serialized_content().to_vec(),
+                    ln.signature_key().as_slice().to_vec(),
+                ));
+            }
+            Ok(Some(bindings))
+        })
+    }
+
+    fn staged_incoming_proposal_leaf_bindings(
+        &self,
+        group_id: Vec<u8>,
+        proposal_ref: Vec<u8>,
+    ) -> Result<Option<crate::orchestrator::mls_provider::LeafBindingPairs>, MLSError> {
+        self.check_suspended()?;
+        let _storage_operation =
+            self.begin_storage_operation("staged_incoming_proposal_leaf_bindings");
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        let pending = self
+            .pending_incoming_proposals
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let Some(queued) = pending.get(&(group_id.clone(), proposal_ref)) else {
+            return Err(MLSError::InvalidProposalRef);
+        };
+        let gid = GroupId::from_slice(&group_id);
+        inner.with_group_ref(&gid, |group, _provider| {
+            let mut bindings = Vec::new();
+            let Sender::Member(sender_idx) = queued.sender() else {
+                return Err(MLSError::invalid_input(
+                    "standalone proposal sender must be an active member",
+                ));
+            };
+            let Some(sender_member) = group.members().find(|m| m.index == *sender_idx) else {
+                return Err(MLSError::invalid_input(
+                    "standalone proposal sender leaf is not in the group",
+                ));
+            };
+            let sender_identity = sender_member.credential.serialized_content().to_vec();
+            bindings.push((sender_identity.clone(), sender_member.signature_key));
+            match queued.proposal() {
+                Proposal::Add(add) => {
+                    let ln = add.key_package().leaf_node();
+                    bindings.push((
+                        ln.credential().serialized_content().to_vec(),
+                        ln.signature_key().as_slice().to_vec(),
+                    ));
+                }
+                Proposal::Update(upd) => {
+                    let ln = upd.leaf_node();
+                    let new_identity = ln.credential().serialized_content().to_vec();
+                    if new_identity != sender_identity {
+                        return Err(MLSError::invalid_input(
+                            "Update proposal cannot change credential identity",
+                        ));
+                    }
+                    bindings.push((new_identity, ln.signature_key().as_slice().to_vec()));
+                }
+                _ => {}
+            }
+            Ok(Some(bindings))
+        })
     }
 }
 
@@ -9480,5 +9638,322 @@ mod incoming_removal_receipt_tests {
         assert!(confirmed.proves_removal(&[1, 2], [3; 32], 4, false, [8; 32]));
         assert!(!confirmed.proves_removal(&[1, 2], [3; 32], 4, true, [8; 32]));
         assert!(!confirmed.proves_removal(&[1, 2], [3; 32], 6, false, [8; 32]));
+    }
+}
+
+#[cfg(test)]
+mod f11_f12_security_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct MemKeychain(Mutex<HashMap<String, Vec<u8>>>);
+
+    #[async_trait::async_trait]
+    impl crate::keychain::KeychainAccess for MemKeychain {
+        async fn read(&self, key: String) -> Result<Option<Vec<u8>>, MLSError> {
+            Ok(self.0.lock().unwrap().get(&key).cloned())
+        }
+        async fn write(&self, key: String, value: Vec<u8>) -> Result<(), MLSError> {
+            self.0.lock().unwrap().insert(key, value);
+            Ok(())
+        }
+        async fn delete(&self, key: String) -> Result<(), MLSError> {
+            self.0.lock().unwrap().remove(&key);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemEpochStorage(Mutex<HashMap<(String, u64), Vec<u8>>>);
+
+    #[async_trait::async_trait]
+    impl crate::types::EpochSecretStorage for MemEpochStorage {
+        async fn store_epoch_secret(
+            &self,
+            conversation_id: String,
+            epoch: u64,
+            secret_data: Vec<u8>,
+        ) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .insert((conversation_id, epoch), secret_data);
+            true
+        }
+        async fn get_epoch_secret(&self, conversation_id: String, epoch: u64) -> Option<Vec<u8>> {
+            self.0
+                .lock()
+                .unwrap()
+                .get(&(conversation_id, epoch))
+                .cloned()
+        }
+        async fn delete_epoch_secret(&self, conversation_id: String, epoch: u64) -> bool {
+            self.0
+                .lock()
+                .unwrap()
+                .remove(&(conversation_id, epoch))
+                .is_some()
+        }
+        async fn delete_epochs_before(&self, conversation_id: String, cutoff_epoch: u64) -> u32 {
+            let mut guard = self.0.lock().unwrap();
+            let before = guard.len();
+            guard.retain(|(cid, ep), _| !(cid == &conversation_id && *ep < cutoff_epoch));
+            (before - guard.len()) as u32
+        }
+    }
+
+    fn make_ctx(dir: &std::path::Path, name: &str) -> Arc<MLSContext> {
+        let db = dir.join(format!("{name}.db")).to_string_lossy().to_string();
+        let ctx = MLSContext::new(
+            db,
+            "test-key-1234567890123456".to_string(),
+            Box::new(MemKeychain::default()),
+        )
+        .unwrap();
+        ctx.set_epoch_secret_storage(Box::new(MemEpochStorage::default()))
+            .unwrap();
+        ctx
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f11_process_message_update_proposal_uses_sender_leaf_and_rejects_identity_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice_ctx = make_ctx(dir.path(), "alice");
+        let bob_ctx = make_ctx(dir.path(), "bob");
+
+        let alice_id = b"did:plc:alice#dev1".to_vec();
+        let bob_id = b"did:plc:bob#dev1".to_vec();
+
+        alice_ctx.create_key_package(alice_id.clone()).unwrap();
+        let group = alice_ctx.create_group(alice_id.clone(), None).unwrap();
+        let bob_kp = bob_ctx.create_key_package(bob_id.clone()).unwrap();
+        let add_res = alice_ctx
+            .add_members(
+                group.group_id.clone(),
+                vec![KeyPackageData {
+                    data: bob_kp.key_package_data,
+                }],
+            )
+            .unwrap();
+        alice_ctx
+            .merge_pending_commit(group.group_id.clone())
+            .unwrap();
+        bob_ctx
+            .process_welcome(add_res.welcome_data, bob_id.clone(), None)
+            .unwrap();
+
+        // Bob (leaf 1) sends a self-update proposal to Alice (leaf 0).
+        let update_prop_sync = bob_ctx.propose_self_update(group.group_id.clone()).unwrap();
+        let processed_sync = alice_ctx
+            .process_message(group.group_id.clone(), update_prop_sync.proposal_message)
+            .unwrap();
+        match processed_sync {
+            ProcessedContent::Proposal {
+                proposal: ProposalInfo::Update { info },
+                ..
+            } => {
+                assert_eq!(
+                    info.leaf_index, 1,
+                    "UpdateProposalInfo.leaf_index must be sender Bob's leaf (1), not receiver Alice's own_leaf_index (0)"
+                );
+                assert_eq!(info.old_credential.identity, bob_id);
+                assert_eq!(info.new_credential.identity, bob_id);
+            }
+            _ => panic!("expected Proposal::Update"),
+        }
+
+        // Also verify `process_message_async` on a second update proposal from Bob.
+        let alice_ctx_2 = make_ctx(dir.path(), "alice2");
+        let bob_ctx_2 = make_ctx(dir.path(), "bob2");
+        alice_ctx_2.create_key_package(alice_id.clone()).unwrap();
+        let group_2 = alice_ctx_2.create_group(alice_id, None).unwrap();
+        let bob_kp_2 = bob_ctx_2.create_key_package(bob_id.clone()).unwrap();
+        let add_res_2 = alice_ctx_2
+            .add_members(
+                group_2.group_id.clone(),
+                vec![KeyPackageData {
+                    data: bob_kp_2.key_package_data,
+                }],
+            )
+            .unwrap();
+        alice_ctx_2
+            .merge_pending_commit(group_2.group_id.clone())
+            .unwrap();
+        bob_ctx_2
+            .process_welcome(add_res_2.welcome_data, bob_id.clone(), None)
+            .unwrap();
+
+        let update_prop_async = bob_ctx_2
+            .propose_self_update(group_2.group_id.clone())
+            .unwrap();
+        let processed_async = alice_ctx_2
+            .process_message_async(group_2.group_id.clone(), update_prop_async.proposal_message)
+            .await
+            .unwrap();
+        match processed_async {
+            ProcessedContent::Proposal {
+                proposal: ProposalInfo::Update { info },
+                ..
+            } => {
+                assert_eq!(
+                    info.leaf_index, 1,
+                    "process_message_async UpdateProposalInfo.leaf_index must be sender Bob's leaf (1)"
+                );
+                assert_eq!(info.old_credential.identity, bob_id);
+                assert_eq!(info.new_credential.identity, bob_id);
+            }
+            _ => panic!("expected Proposal::Update"),
+        }
+
+        // Verify `build_update_proposal_info` rejects credential identity change
+        // (e.g., if leaf 0 / Alice attempted to update leaf 0's credential to Bob's identity)
+        // and rejects non-member senders.
+        {
+            let guard = alice_ctx_2.inner.lock().unwrap();
+            let inner = guard.as_ref().unwrap();
+            let pending_props = alice_ctx_2.pending_incoming_proposals.lock().unwrap();
+            let group_state = inner.groups.get(&group_2.group_id).expect("group loaded");
+            let mls_group = &group_state.group;
+            let queued_update = pending_props
+                .values()
+                .find_map(|qp| match qp.proposal() {
+                    Proposal::Update(up) => Some(up),
+                    _ => None,
+                })
+                .expect("Bob's UpdateProposal should be staged in pending_incoming_proposals");
+
+            // Bob's UpdateProposal carries `bob_id`, while leaf 0 is `alice_id`:
+            assert!(matches!(
+                build_update_proposal_info(
+                    mls_group,
+                    &Sender::Member(LeafNodeIndex::new(0)),
+                    queued_update,
+                ),
+                Err(MLSError::InvalidInput { .. })
+            ));
+
+            assert!(matches!(
+                build_update_proposal_info(mls_group, &Sender::NewMemberProposal, queued_update),
+                Err(MLSError::InvalidInput { .. })
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f12_mls_message_and_key_package_reject_trailing_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice_ctx = make_ctx(dir.path(), "alice");
+        let bob_ctx = make_ctx(dir.path(), "bob");
+        let carol_ctx = make_ctx(dir.path(), "carol");
+
+        let alice_id = b"did:plc:alice#dev1".to_vec();
+        let bob_id = b"did:plc:bob#dev1".to_vec();
+        let carol_id = b"did:plc:carol#dev1".to_vec();
+
+        // 1. KeyPackage with trailing bytes must be rejected across all extractors + add_members.
+        let bob_kp_trailing = {
+            let kp = bob_ctx.create_key_package(bob_id.clone()).unwrap();
+            let mut bytes = kp.key_package_data;
+            bytes.extend_from_slice(&[0xde, 0xad]);
+            bytes
+        };
+        assert!(matches!(
+            mls_extract_key_package_identity(bob_kp_trailing.clone()),
+            Err(MLSError::SerializationError)
+        ));
+        assert!(matches!(
+            mls_extract_key_package_signature_public_key(bob_kp_trailing.clone()),
+            Err(MLSError::SerializationError)
+        ));
+        assert!(matches!(
+            mls_extract_key_package_signature_algorithm(bob_kp_trailing.clone()),
+            Err(MLSError::SerializationError)
+        ));
+        assert!(matches!(
+            mls_compute_key_package_hash(bob_kp_trailing.clone()),
+            Err(MLSError::SerializationError)
+        ));
+        assert!(matches!(
+            alice_ctx.compute_key_package_hash(bob_kp_trailing.clone()),
+            Err(MLSError::SerializationError)
+        ));
+
+        alice_ctx.create_key_package(alice_id.clone()).unwrap();
+        let group = alice_ctx.create_group(alice_id, None).unwrap();
+        assert!(matches!(
+            alice_ctx.add_members(
+                group.group_id.clone(),
+                vec![KeyPackageData {
+                    data: bob_kp_trailing
+                }],
+            ),
+            Err(MLSError::SerializationError)
+        ));
+
+        // 2. Welcome with trailing bytes must be rejected before consuming KeyPackage.
+        let bob_kp_valid = bob_ctx.create_key_package(bob_id.clone()).unwrap();
+        let add_res = alice_ctx
+            .add_members(
+                group.group_id.clone(),
+                vec![KeyPackageData {
+                    data: bob_kp_valid.key_package_data,
+                }],
+            )
+            .unwrap();
+        alice_ctx
+            .merge_pending_commit(group.group_id.clone())
+            .unwrap();
+
+        let mut welcome_trailing = add_res.welcome_data.clone();
+        welcome_trailing.extend_from_slice(&[0xde, 0xad]);
+        assert!(matches!(
+            bob_ctx.process_welcome(welcome_trailing, bob_id.clone(), None),
+            Err(MLSError::SerializationError)
+        ));
+
+        // Clean Welcome still succeeds because KeyPackage was not consumed on deserialization error!
+        bob_ctx
+            .process_welcome(add_res.welcome_data, bob_id, None)
+            .unwrap();
+
+        // 3. Application ciphertext (unpadded raw MLS wire format) with trailing bytes must be rejected.
+        let enc = alice_ctx
+            .encrypt_message(group.group_id.clone(), b"hello".to_vec())
+            .unwrap();
+        let mut raw_ct_trailing = strip_padding(&enc.ciphertext).to_vec();
+        raw_ct_trailing.extend_from_slice(&[0xde, 0xad]);
+        assert!(matches!(
+            bob_ctx.process_message(group.group_id.clone(), raw_ct_trailing.clone()),
+            Err(MLSError::SerializationError)
+        ));
+        assert!(matches!(
+            bob_ctx
+                .process_message_async(group.group_id.clone(), raw_ct_trailing.clone())
+                .await,
+            Err(MLSError::SerializationError)
+        ));
+        assert!(matches!(
+            bob_ctx.decrypt_message(group.group_id.clone(), raw_ct_trailing),
+            Err(MLSError::SerializationError)
+        ));
+
+        // 4. Commit with trailing bytes must be rejected in `process_commit`.
+        let carol_kp = carol_ctx.create_key_package(carol_id).unwrap();
+        let add_carol = alice_ctx
+            .add_members(
+                group.group_id.clone(),
+                vec![KeyPackageData {
+                    data: carol_kp.key_package_data,
+                }],
+            )
+            .unwrap();
+        let mut commit_trailing = add_carol.commit_data.clone();
+        commit_trailing.extend_from_slice(&[0xde, 0xad]);
+        assert!(matches!(
+            bob_ctx.process_commit(group.group_id.clone(), commit_trailing),
+            Err(MLSError::SerializationError)
+        ));
     }
 }

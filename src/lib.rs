@@ -127,12 +127,23 @@ pub(crate) mod async_runtime {
 
     /// Execute an async operation from synchronous code.
     /// Handles the case where we're already inside a tokio runtime
-    /// (e.g., when called from catmos/Tauri which has its own runtime).
-    pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    /// (both multi-thread and current-thread flavors).
+    pub fn block_on<F>(f: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            // We're already inside a tokio runtime — use block_in_place
-            // to avoid "Cannot start a runtime from within a runtime" panic
-            tokio::task::block_in_place(|| handle.block_on(f))
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(f))
+                }
+                _ => std::thread::scope(|s| {
+                    s.spawn(|| RUNTIME.block_on(f))
+                        .join()
+                        .expect("async_runtime::block_on worker panicked")
+                }),
+            }
         } else {
             // Not inside a runtime — use our own
             RUNTIME.block_on(f)
@@ -149,3 +160,12 @@ extern crate self as catbird_mls;
 #[cfg(test)]
 #[path = "../tests/e2e_harness.rs"]
 mod recovery_e2e_harness;
+
+#[cfg(test)]
+mod runtime_tests {
+    #[tokio::test]
+    async fn f10_async_runtime_block_on_succeeds_inside_current_thread_tokio_runtime() {
+        let out = crate::async_runtime::block_on(async { 42usize });
+        assert_eq!(out, 42);
+    }
+}

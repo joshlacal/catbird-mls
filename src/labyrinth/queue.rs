@@ -76,6 +76,16 @@ pub struct PendingArchive {
     /// [`retry_quarantined`].
     #[serde(default)]
     pub quarantined: bool,
+    /// Hex-encoded local OpenMLS group ID at send time.
+    #[serde(default)]
+    pub group_id_hex: Option<String>,
+    /// Local OpenMLS epoch at send time.
+    #[serde(default)]
+    pub mls_epoch: Option<u64>,
+    /// Sorted, deduplicated root account DIDs of active local OpenMLS ratchet-tree
+    /// leaves at the exact moment this message was encrypted.
+    #[serde(default)]
+    pub expected_member_dids: Option<Vec<String>>,
 }
 
 /// Non-transient failures after which a row is quarantined.
@@ -96,7 +106,24 @@ impl PendingArchive {
             failures: 0,
             last_error: None,
             quarantined: false,
+            group_id_hex: None,
+            mls_epoch: None,
+            expected_member_dids: None,
         }
+    }
+
+    pub fn with_mls_snapshot(
+        mut self,
+        group_id_hex: impl Into<String>,
+        mls_epoch: u64,
+        mut expected_member_dids: Vec<String>,
+    ) -> Self {
+        expected_member_dids.sort();
+        expected_member_dids.dedup();
+        self.group_id_hex = Some(group_id_hex.into());
+        self.mls_epoch = Some(mls_epoch);
+        self.expected_member_dids = Some(expected_member_dids);
+        self
     }
 
     pub(crate) fn frame_bytes(&self) -> Result<Vec<u8>> {
@@ -131,6 +158,15 @@ pub trait ArchiveQueueStore: Send + Sync {
             self.save_status(did, &s)?;
         }
         Ok(())
+    }
+    /// Clears per-conversation status metadata (`excluded_members`, `dropped`)
+    /// on sign-out or account removal while preserving any
+    /// `pending_remote_deletion` retry intent.
+    fn clear_status_preserving_deletion(&self, did: &str) -> Result<()> {
+        self.update_status(did, &mut |s| {
+            s.excluded_members.clear();
+            s.dropped.clear();
+        })
     }
 }
 
@@ -210,6 +246,23 @@ impl<M: MlsCryptoContext + 'static> ArchiveQueueStore for MlsArchiveQueue<M> {
             .compare_exchange_request_value(STATUS_NAMESPACE, did, old.as_deref(), &next)?
         {
             return Err(storage("concurrent status write"));
+        }
+        Ok(())
+    }
+
+    fn clear_status_preserving_deletion(&self, did: &str) -> Result<()> {
+        let current = self.load_status(did)?;
+        if let Some(pending) = current.pending_remote_deletion.clone() {
+            let preserved = ArchiveStatus {
+                pending_remote_deletion: Some(pending),
+                excluded_members: Vec::new(),
+                dropped: Vec::new(),
+            };
+            if preserved != current {
+                self.save_status(did, &preserved)?;
+            }
+        } else {
+            self.0.delete_request_value(STATUS_NAMESPACE, did)?;
         }
         Ok(())
     }

@@ -1,6 +1,9 @@
 use crate::error::MLSError;
 use crate::types::*;
 
+/// `(credential_identity, signature_public_key)` pairs extracted from MLS leaves.
+pub type LeafBindingPairs = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Read only public TLS framing for lookup of an independently retained proof.
 /// Parsing is not authentication; callers must still match the exact ciphertext
 /// digest, owner, conversation and server entry against protected proof storage.
@@ -286,6 +289,12 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         Err(MLSError::OperationNotSupported {
             reason: "request value storage unavailable".into(),
         })
+    }
+    fn has_request_value(&self, namespace: &str, id: &str) -> Result<bool, MLSError> {
+        Ok(self
+            .read_request_value(namespace, id)?
+            .map(zeroize::Zeroizing::new)
+            .is_some())
     }
     fn compare_exchange_request_value(
         &self,
@@ -1104,5 +1113,44 @@ pub trait MlsCryptoContext: MlsCryptoContextBounds {
         _ciphertext_sha256: &[u8; 32],
     ) -> Result<bool, MLSError> {
         Ok(false)
+    }
+
+    /// Preview `(credential_identity, signature_public_key)` pairs of all leaves
+    /// in a `Welcome` message without mutating storage or consuming key packages.
+    fn preview_welcome_leaf_bindings(
+        &self,
+        _welcome_data: Vec<u8>,
+        _config: Option<GroupConfig>,
+    ) -> Result<Option<LeafBindingPairs>, MLSError> {
+        Ok(None)
+    }
+
+    /// Return `(credential_identity, signature_public_key)` pairs for all current
+    /// active ratchet-tree members of `group_id`.
+    fn group_member_leaf_bindings(
+        &self,
+        _group_id: Vec<u8>,
+    ) -> Result<Option<LeafBindingPairs>, MLSError> {
+        Ok(None)
+    }
+
+    /// Return `(credential_identity, signature_public_key)` pairs introduced,
+    /// rotated, or used to sign the staged incoming commit at `(group_id, target_epoch)`.
+    fn staged_incoming_commit_leaf_bindings(
+        &self,
+        _group_id: Vec<u8>,
+        _target_epoch: u64,
+    ) -> Result<Option<LeafBindingPairs>, MLSError> {
+        Ok(None)
+    }
+
+    /// Return `(credential_identity, signature_public_key)` pairs introduced,
+    /// rotated, or used to sign the staged incoming proposal `(group_id, proposal_ref)`.
+    fn staged_incoming_proposal_leaf_bindings(
+        &self,
+        _group_id: Vec<u8>,
+        _proposal_ref: Vec<u8>,
+    ) -> Result<Option<LeafBindingPairs>, MLSError> {
+        Ok(None)
     }
 }

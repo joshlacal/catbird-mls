@@ -521,3 +521,113 @@ fn the_space_transport_sends_only_space_requests() {
     );
     assert_eq!(PLACEMENT_NAMESPACE, "labyrinthMailboxPlacement");
 }
+
+#[test]
+fn space_not_found_with_failing_list_spaces_preserves_pending_remote_deletion() {
+    use super::super::hooks_status::retry_deletion_blocking;
+    use super::super::queue::ArchiveQueueStore;
+    use super::super::status::PendingDeletion;
+    use super::queue_tests::MemQueue;
+
+    struct ScopeMissingSpaceGateway;
+    impl LabyrinthSpaceGateway for ScopeMissingSpaceGateway {
+        fn submit_space(&self, req: LabyrinthSpaceRequest) -> Result<GatewayResponse, String> {
+            match req.nsid.as_str() {
+                "com.atproto.space.deleteSpace" => Ok(GatewayResponse {
+                    status: 400,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "error": "SpaceNotFound",
+                        "message": "space not visible without scope"
+                    }))
+                    .unwrap(),
+                }),
+                "com.atproto.space.listSpaces" => Ok(GatewayResponse {
+                    status: 403,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "error": "Forbidden",
+                        "message": "missing transition:space OAuth scope"
+                    }))
+                    .unwrap(),
+                }),
+                other => Ok(GatewayResponse {
+                    status: 400,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&serde_json::json!({
+                        "error": "SpaceNotFound",
+                        "message": format!("unexpected {other}")
+                    }))
+                    .unwrap(),
+                }),
+            }
+        }
+    }
+
+    let net = Net::new();
+    let mut alice = net.space_device(ALICE, A1, 1);
+    let _session = alice.deps.clone().enable().unwrap();
+    alice.deps.space = Some(Arc::new(SpaceXrpcTransport::new(Arc::new(
+        ScopeMissingSpaceGateway,
+    ))));
+
+    let q = MemQueue::default();
+    q.update_status(ALICE, &mut |s| {
+        s.pending_remote_deletion = Some(PendingDeletion {
+            last_error: "initial failure".into(),
+            attempts: 1,
+            since_ms: 1_791_000_000_000,
+            mailbox_placement: Some("space".into()),
+            conversation_spaces: vec![],
+            space_cleanup_required: false,
+        });
+    })
+    .unwrap();
+
+    let completed = retry_deletion_blocking(&alice.deps, &q).unwrap();
+    assert!(
+        !completed,
+        "400 SpaceNotFound with failing listSpaces must NOT clear pending_remote_deletion"
+    );
+    let status = q.load_status(ALICE).unwrap();
+    assert!(
+        status.pending_remote_deletion.is_some(),
+        "pending_remote_deletion must remain persisted for retry"
+    );
+
+    // Once Space OAuth scope is granted and the mailbox Space is genuinely absent,
+    // `SpaceNotFound` + `200 listSpaces([])` completes the pending deletion.
+    struct ScopeGrantedEmptySpaceGateway;
+    impl LabyrinthSpaceGateway for ScopeGrantedEmptySpaceGateway {
+        fn submit_space(&self, req: LabyrinthSpaceRequest) -> Result<GatewayResponse, String> {
+            match req.nsid.as_str() {
+                "com.atproto.space.listRecords" | "com.atproto.space.deleteSpace" => {
+                    Ok(GatewayResponse {
+                        status: 400,
+                        content_type: Some("application/json".into()),
+                        body: serde_json::to_vec(&serde_json::json!({
+                            "error": "SpaceNotFound",
+                            "message": "already deleted"
+                        }))
+                        .unwrap(),
+                    })
+                }
+                "com.atproto.space.listSpaces" => Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&serde_json::json!({ "spaces": [] })).unwrap(),
+                }),
+                other => panic!("unexpected space call {other}"),
+            }
+        }
+    }
+    alice.deps.space = Some(Arc::new(SpaceXrpcTransport::new(Arc::new(
+        ScopeGrantedEmptySpaceGateway,
+    ))));
+    assert!(retry_deletion_blocking(&alice.deps, &q).unwrap());
+    assert!(q
+        .load_status(ALICE)
+        .unwrap()
+        .pending_remote_deletion
+        .is_none());
+}

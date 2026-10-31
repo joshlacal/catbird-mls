@@ -186,6 +186,13 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         )))
     }
 
+    /// Sequencer DS DID and Ed25519 verifying key (`[CB-38]`) trusted to sign
+    /// server `accountDeleted` redactions, when configured by the gateway.
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    async fn labyrinth_sequencer_key(&self) -> Option<(String, [u8; 32])> {
+        None
+    }
+
     /// Download an encrypted metadata blob from the DS via `blue.catbird.chat.getBlob`.
     async fn get_group_metadata_blob(
         &self,

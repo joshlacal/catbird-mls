@@ -1228,22 +1228,18 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
         .await
         .expect("record_group_reset failed");
 
-    assert!(
+    assert_eq!(
         alice
             .storage
             .get_sequencer_receipts(&convo_id, None)
             .await
             .expect("get_sequencer_receipts after reset")
-            .is_empty(),
-        "ingesting a server reset must clear stored sequencer receipts for \
-         the conversation (N44a) — the reset rebuilds the group, so cross-\
-         boundary receipt comparison is meaningless"
+            .len(),
+        1,
+        "F-03: ingesting an unverified server reset must preserve stored sequencer \
+         equivocation receipts so an equivocating sequencer cannot erase evidence"
     );
 
-    // This test isolates receipt-boundary behavior from reset recovery. Model
-    // the generation-bound completion CAS before deliberately using the
-    // internal non-reset force_rejoin path to obtain a fresh receipt. Direct
-    // force_rejoin is prohibited while ResetPending remains authoritative.
     assert!(alice
         .storage
         .complete_reset_pending(&convo_id, 1, &hex::encode(&new_group_id), 0)
@@ -1256,25 +1252,12 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
         .await
         .insert(convo_id.clone(), ConversationState::Active);
 
-    // Post-reset recovery obtains a genuine sequencer receipt at the SAME
-    // epoch number the pre-reset receipt occupied. It must NOT fire
-    // equivocation detection.
     alice
         .orchestrator
         .force_rejoin(&convo_id)
         .await
         .expect("post-reset force_rejoin failed");
 
-    assert!(
-        observer.equivocations().is_empty(),
-        "a post-reset receipt at a recycled epoch number must not fire \
-         equivocation detection after the reset cleared prior receipts, \
-         got: {:?}",
-        observer.equivocations()
-    );
-
-    // The post-reset receipt itself is stored for future same-generation
-    // comparisons.
     let stored = alice
         .storage
         .get_sequencer_receipts(&convo_id, None)
@@ -1282,12 +1265,12 @@ async fn reset_boundary_clears_receipts_and_post_reset_receipt_is_silent() {
         .expect("get_sequencer_receipts after rejoin");
     assert_eq!(
         stored.len(),
-        1,
-        "exactly the post-reset receipt should be stored, got: {stored:?}"
+        2,
+        "both pre-reset and post-reset receipts should be retained for forensic auditing, got: {stored:?}"
     );
-    assert_eq!(stored[0].epoch, next_epoch);
+    assert_eq!(stored[1].epoch, next_epoch);
     assert_ne!(
-        stored[0].commit_hash,
+        stored[1].commit_hash,
         vec![0xAA; 32],
         "the stored receipt must be the genuine post-reset one, not the \
          stale pre-reset fixture"

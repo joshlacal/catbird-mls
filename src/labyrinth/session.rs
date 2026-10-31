@@ -6,14 +6,17 @@ use std::sync::Arc;
 
 use labyrinth::client::{
     delete_account_remote, Backends, CompositeDirectory, Labyrinth, LoadedMessage, PurgeReport,
-    RedactedMessage, RepinProposal, RosterExclusion, SystemClock, ThreadList,
+    RedactedMessage, RepinProposal, RosterExclusion, SystemClock, ThreadCursor, ThreadList,
 };
 use labyrinth::sign::XVerifyingKey;
 use labyrinth::store::pds::{PdsDirectory, PdsPublisher, PdsRecords};
 use labyrinth::store::space::thread::SequencedSpaceThreadStore;
-use labyrinth::store::space::SpaceMailboxStore;
+use labyrinth::store::space::{SpaceMailboxStore, SpaceRef};
 use labyrinth::store::xrpc::{XrpcDirectory, XrpcMailboxStore, XrpcOrf, XrpcTransport};
-use labyrinth::store::{KeyPublisher, MailboxDirectory, MailboxStore, TimeRange};
+use labyrinth::store::{
+    ChatDeviceKey, KeyPublisher, MailboxDirectory, MailboxStore, MemberDeviceKey, SequencerKey,
+    TimeRange,
+};
 use labyrinth::virtual_device::Mechanism;
 use zeroize::Zeroizing;
 
@@ -22,6 +25,25 @@ use super::signer::{ChatKeySigner, LatchedTransportSigner, SignerFault};
 use super::space::{thread_placement_key, AccountThreadPlacementPins, Placement, SpaceMailbox};
 use super::state::StateVault;
 use crate::orchestrator::error::{OrchestratorError, Result};
+
+/// Authenticated local OpenMLS snapshot of a conversation's group state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalGroupSnapshot {
+    pub group_id_hex: String,
+    pub epoch: u64,
+    pub member_dids: Vec<String>,
+}
+
+/// Local OpenMLS / storage authority consulted during background archive flushes.
+pub trait LocalConversationAuthority: Send + Sync {
+    /// Returns `Ok(Some(snapshot))` when the conversation still exists in local
+    /// OpenMLS or durable conversation storage, or `Ok(None)` when locally gone.
+    fn current_group_snapshot(
+        &self,
+        conversation_id: &str,
+        queued_group_id_hex: Option<&str>,
+    ) -> Result<Option<LocalGroupSnapshot>>;
+}
 
 /// Everything needed to open a session for one account and chat device.
 #[derive(Clone)]
@@ -44,6 +66,46 @@ pub struct SessionDeps {
     /// Which backend holds the account's mailbox, saved on this device
     /// ([`super::space::MlsPlacementVault`]).
     pub placements: Arc<dyn StateVault>,
+    /// Local OpenMLS/storage authority for cross-checking `mls-ds` state.
+    pub local_authority: Option<Arc<dyn LocalConversationAuthority>>,
+    /// Sequencer DS DID and Ed25519 verifying key (`[CB-38]`) trusted to sign
+    /// server `accountDeleted` redactions, when configured by the gateway.
+    pub sequencer_key: Option<SequencerKey>,
+}
+
+struct DsDirectory {
+    inner: XrpcDirectory,
+    sequencer_key: Option<SequencerKey>,
+}
+
+impl MailboxDirectory for DsDirectory {
+    fn latest(&self, did: &str) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        self.inner.latest(did)
+    }
+
+    fn epoch(
+        &self,
+        did: &str,
+        seq: u64,
+    ) -> labyrinth::Result<Option<labyrinth::mailbox::EpochPublic>> {
+        self.inner.epoch(did, seq)
+    }
+
+    fn device_transport_keys(&self, did: &str) -> labyrinth::Result<Vec<ChatDeviceKey>> {
+        self.inner.device_transport_keys(did)
+    }
+
+    fn member_device_keys(
+        &self,
+        thread_id: &str,
+        did: &str,
+    ) -> labyrinth::Result<Option<Vec<MemberDeviceKey>>> {
+        self.inner.member_device_keys(thread_id, did)
+    }
+
+    fn sequencer_key(&self, _thread_id: &str) -> labyrinth::Result<Option<SequencerKey>> {
+        Ok(self.sequencer_key.clone())
+    }
 }
 
 /// One page of decrypted history (`load_thread` over a time range).
@@ -100,7 +162,10 @@ impl SessionDeps {
 
     fn backends(&self, placement: Placement) -> Result<Backends> {
         let t = self.transport.clone();
-        let ds = Box::new(XrpcDirectory::new(t.clone()));
+        let ds: Box<dyn MailboxDirectory + Send> = Box::new(DsDirectory {
+            inner: XrpcDirectory::new(t.clone()),
+            sequencer_key: self.sequencer_key.clone(),
+        });
         let (directory, mut publishers): (Box<dyn MailboxDirectory + Send>, Vec<_>) =
             match &self.pds {
                 Some(pds) => (
@@ -306,14 +371,59 @@ impl SessionDeps {
             pds.iter().map(|p| p as &dyn KeyPublisher).collect();
         delete_account_remote(&mailbox, &publishers)?;
         match self.space_store().map(|s| s.purge_mailbox()) {
-            None | Some(Ok(())) | Some(Err(labyrinth::Error::NotFound("space"))) => Ok(()),
+            None | Some(Ok(())) => Ok(()),
+            Some(Err(labyrinth::Error::NotFound("space"))) => self.verify_mailbox_space_absent(),
             Some(Err(e)) => Err(e),
         }
     }
 
+    /// Probes `com.atproto.space.listSpaces` after `delete_space` returns
+    /// `SpaceNotFound` so a missing Space OAuth scope (`400/401/403`) is not
+    /// mistaken for a completed remote Space deletion.
+    fn verify_mailbox_space_absent(&self) -> labyrinth::Result<()> {
+        let Some(space) = self.space.as_ref() else {
+            return Ok(());
+        };
+        let body = space
+            .query("com.atproto.space.listSpaces", &[])
+            .map_err(|e| {
+                let detail = match (&e.error, &e.message) {
+                    (Some(err), Some(msg)) => format!("{err}: {msg}"),
+                    (Some(err), None) => err.clone(),
+                    (None, Some(msg)) => msg.clone(),
+                    (None, None) => "listSpaces failed".into(),
+                };
+                labyrinth::Error::Backend(format!("space {}: {detail}", e.status))
+            })?;
+        let parsed: serde_json::Value = serde_json::from_slice(&body)
+            .map_err(|_| labyrinth::Error::Malformed("listSpaces response is not JSON"))?;
+        let spaces = parsed["spaces"]
+            .as_array()
+            .ok_or(labyrinth::Error::Malformed(
+                "listSpaces spaces array is missing",
+            ))?;
+        let expected_mailbox = SpaceRef::mailbox(&self.did).to_string();
+        let still_present = spaces.iter().any(|entry| {
+            let uri = entry
+                .as_str()
+                .or_else(|| entry["uri"].as_str())
+                .or_else(|| entry["space"].as_str());
+            uri.is_some_and(|u| {
+                u == expected_mailbox || u.contains("/space/blue.catbird.labyrinth.mailbox")
+            })
+        });
+        if still_present {
+            return Err(labyrinth::Error::Backend(
+                "space mailbox still present in listSpaces after SpaceNotFound".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// With a PDS directory: makes sure the account's PDS carries its
     /// latest epoch (an account enabled before PDS publication, or a
-    /// publish that failed after its epoch was created).
+    /// publish that failed after its epoch was created). Never backfills a
+    /// stale local epoch when `mls-ds` already advertises a newer head.
     fn backfill_pds(&self, s: &mut LabyrinthSession) -> Result<()> {
         let Some(pds) = &self.pds else {
             return Ok(());
@@ -323,7 +433,12 @@ impl SessionDeps {
             .latest(&self.did)
             .map_err(map_error)?;
         if published.is_none_or(|p| p.seq < latest.seq) {
-            s.run(|lab| lab.publish_latest_keys())?;
+            let ds_latest = XrpcDirectory::new(self.transport.clone())
+                .latest(&self.did)
+                .map_err(map_error)?;
+            if ds_latest.as_ref().is_none_or(|d| d.seq <= latest.seq) {
+                s.run(|lab| lab.publish_latest_keys())?;
+            }
         }
         Ok(())
     }
@@ -339,7 +454,7 @@ impl SessionDeps {
         self,
         lab: Labyrinth,
         fault: SignerFault,
-        persisted: Option<Vec<u8>>,
+        persisted: Option<Zeroizing<Vec<u8>>>,
     ) -> LabyrinthSession {
         LabyrinthSession {
             did: self.did.clone(),
@@ -348,14 +463,18 @@ impl SessionDeps {
             fault,
             vault: self.vault,
             placements: self.placements,
-            persisted: persisted.map(Zeroizing::new),
+            persisted,
         }
     }
 
     /// The saved session, caught up with the mailbox; `None` if this
     /// device never enabled Labyrinth for the account.
     pub fn open(self) -> Result<Option<LabyrinthSession>> {
-        let Some(saved) = self.vault.load(&self.did).map_err(OrchestratorError::Mls)? else {
+        let Some(saved) = self
+            .vault
+            .load_zeroizing(&self.did)
+            .map_err(OrchestratorError::Mls)?
+        else {
             return Ok(None);
         };
         let fault = SignerFault::default();
@@ -368,6 +487,7 @@ impl SessionDeps {
         surface(&fault)?;
         let lab = lab.map_err(map_error)?;
         let mut s = self.clone().session(lab, fault, Some(saved));
+        self.backfill_pds(&mut s)?;
         s.run(|lab| lab.sync_epochs().map(|_| ()))?;
         self.backfill_pds(&mut s)?;
         Ok(Some(s))
@@ -409,7 +529,10 @@ impl SessionDeps {
         surface(&fault)?;
         let (lab, _enrollment) = restored.map_err(map_error)?;
         self.save_placement(placement)?;
-        let existing = self.vault.load(&self.did).map_err(OrchestratorError::Mls)?;
+        let existing = self
+            .vault
+            .load_zeroizing(&self.did)
+            .map_err(OrchestratorError::Mls)?;
         let mut s = self.session(lab, fault, existing);
         s.save()?;
         Ok(s)
@@ -673,6 +796,32 @@ impl LabyrinthSession {
             messages: h.messages,
             redacted: h.redacted,
         })
+    }
+
+    /// Decrypts up to `limit` newest distinct `(timestamp, messageId)` positions
+    /// of `conversation_id` older than `before`.
+    pub fn load_history_page(
+        &mut self,
+        conversation_id: &str,
+        before: Option<&ThreadCursor>,
+        limit: usize,
+        sync: bool,
+    ) -> Result<(HistoryPage, Option<ThreadCursor>)> {
+        let p = self.run(|lab| {
+            if sync {
+                lab.sync_epochs()?;
+            }
+            lab.load_thread_page(conversation_id, before, limit)
+        })?;
+        Ok((
+            HistoryPage {
+                undecryptable: p.history.undecryptable.len(),
+                space_readable: p.history.space_readable,
+                messages: p.history.messages,
+                redacted: p.history.redacted,
+            },
+            p.next,
+        ))
     }
 
     /// Revokes another device of the account by its Labyrinth device key

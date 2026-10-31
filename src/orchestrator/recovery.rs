@@ -2388,6 +2388,7 @@ where
                 local_epoch,
                 "stored=NeedsRejoin durable projection does not match resolved crypto state -> keeping NeedsRejoin"
             );
+            return false;
         }
 
         let members = match self.mls_context().group_member_identities(group_id_bytes) {
@@ -3860,6 +3861,23 @@ where
                     "The Welcome belongs to another conversation generation.".into(),
                 ));
             }
+            // F-02: Verify peer leaf device-key bindings before committing
+            // Welcome adoption or consuming one-time KeyPackages.
+            let raw_welcome = super::welcome_ack::bytes(&delivery.envelope["opaqueWelcome"])?;
+            if let Some(preview_bindings) = self.mls_context().preview_welcome_leaf_bindings(
+                raw_welcome,
+                Some(self.config().group_config.clone()),
+            )? {
+                self.verify_inbound_peer_leaf_bindings(
+                    Some(convo_id),
+                    "welcome",
+                    "join_or_rejoin_from_delivery",
+                    identity.as_bytes(),
+                    &preview_bindings,
+                )
+                .await?;
+            }
+            let existed_before = self.mls_context().group_exists(group.clone());
             // Only an exact native receipt can reuse an already imported
             // group. Membership alone never acknowledges another envelope.
             let result = self.mls_context().process_welcome_delivery(
@@ -3871,6 +3889,26 @@ where
                 return Err(OrchestratorError::InvalidInput(
                     "The Welcome belongs to another conversation generation.".into(),
                 ));
+            }
+            if let Some(member_bindings) = self
+                .mls_context()
+                .group_member_leaf_bindings(group.clone())?
+            {
+                if let Err(binding_error) = self
+                    .verify_inbound_peer_leaf_bindings(
+                        Some(convo_id),
+                        "welcome",
+                        "join_or_rejoin_from_delivery",
+                        identity.as_bytes(),
+                        &member_bindings,
+                    )
+                    .await
+                {
+                    if !existed_before {
+                        let _ = self.mls_context().delete_group(group);
+                    }
+                    return Err(binding_error);
+                }
             }
             let epoch = self.mls_context().get_epoch(group.clone())?;
             if epoch > coordinate["epoch"].as_u64().unwrap()
@@ -4214,6 +4252,8 @@ where
             .unwrap_or_default();
         let guidance = if outcome["reset"] == "requested" {
             "Waiting for an administrator to complete conversation recovery."
+        } else if outcome["reset"] == "skipped" {
+            "Explicit administrator confirmation is required to reset this conversation."
         } else {
             "Keep another current device online to finish adding this device."
         };
@@ -4372,6 +4412,15 @@ where
         // it. A malformed target fails closed here and never reaches the
         // destructive delete in `persist_reset_pending_state`.
         let validated_target = ValidatedResetTarget::parse(&new_group_id_hex)?;
+        if self.is_conversation_quarantined(convo_id).await? {
+            tracing::warn!(
+                convo_id,
+                new_group_id = %new_group_id_hex,
+                reset_generation,
+                "[F-03] preserving peer-poison quarantine across unverified GroupResetEvent"
+            );
+            return Ok(ResetRecordOutcome::StaleOrDuplicate);
+        }
         tracing::info!(
             convo_id,
             new_group_id = %new_group_id_hex,
@@ -4604,6 +4653,17 @@ where
         // it. A malformed server-supplied `expectedNewMlsGroupId` fails closed
         // here and never reaches the destructive delete.
         let validated_target = ValidatedResetTarget::parse(&new_group_id_hex)?;
+        if self.is_conversation_quarantined(convo_id).await? {
+            tracing::warn!(
+                convo_id,
+                crypto_session_id,
+                reset_generation,
+                trigger,
+                request_event_id,
+                "[F-03] preserving peer-poison quarantine across unverified resetRequestedEvent"
+            );
+            return Ok(ResetRecordOutcome::StaleOrDuplicate);
+        }
 
         if existing_pending.is_none()
             && self
@@ -4662,6 +4722,14 @@ where
         // unreachable for an unvalidated target — the type is the gate — and it
         // additionally runs only after the durable `mark_reset_pending`
         // publication succeeds, so `delete_group` cannot precede durable intent.
+        if self.is_conversation_quarantined(convo_id).await? {
+            tracing::warn!(
+                convo_id,
+                reset_generation,
+                "[F-03] refusing persist_reset_pending_state while conversation is quarantined"
+            );
+            return Ok(());
+        }
         let new_group_id_hex = target.hex();
         let resuming_committed_generation = committed.is_some();
         let notified_at_ms = committed
@@ -4813,46 +4881,18 @@ where
         // does NOT arm `last_global_rejoin_at`: that gate gates OUR rejoin
         // attempts, and a server-pushed reset is not such an attempt. See
         // `RecoveryTracker::clear_for_fresh_reset` for the bug history.
-        let was_quarantined = {
+        // F-03: Never clear Layer-3 peer-poison quarantine or stored sequencer
+        // equivocation receipts from an unverified server reset hint.
+        {
             let mut tracker = self.recovery_tracker().lock().await;
             tracker.clear_for_fresh_reset(convo_id);
-            tracker.clear_quarantine(convo_id)
-        };
+        }
         // WS-5.4 write-through: a server reset wipes the persisted backoff
         // entry too, mirroring `clear_for_fresh_reset` (no global-gate write —
         // a server-pushed reset is not an attempt by this client).
         if let Err(e) = self.storage().clear_recovery_backoff(convo_id).await {
             self.report_recovery_storage_failure(convo_id, "clear_recovery_backoff", &e)
                 .await;
-        }
-        // WS-3 stage 2 (backlog N44a): a server reset also wipes stored
-        // sequencer receipts for this conversation. The reset rebuilds the
-        // MLS group — epochs restart — so comparing receipts across the reset
-        // boundary is meaningless and would false-positive the ADR-009 D8
-        // equivocation check (stale pre-reset receipt at epoch N vs genuine
-        // post-reset receipt at the same N). A failed clear leaves those
-        // false-positive-producing rows behind, so escalate like the
-        // recovery-critical writes above.
-        if let Err(e) = self.storage().clear_sequencer_receipts(convo_id).await {
-            self.report_recovery_storage_failure(convo_id, "clear_sequencer_receipts", &e)
-                .await;
-        }
-        if was_quarantined {
-            // Server reset trumps client-side quarantine (ruling 2a). The
-            // authority commit in `mark_reset_pending` is now contractually
-            // required to clear the persisted quarantine itself; this call
-            // remains as a backstop for backends written before that
-            // amendment. Warn-only here used to mint the both-set row on its
-            // own — a plain failed clear, no crash needed — and such a row
-            // rehydrates quarantined forever because the replayed reset takes
-            // the same-generation dedupe path above and never returns here.
-            // Escalate like the other recovery-critical writes in this
-            // function.
-            if let Err(e) = self.storage().clear_quarantine(convo_id).await {
-                self.report_recovery_storage_failure(convo_id, "clear_quarantine", &e)
-                    .await;
-            }
-            tracing::info!(convo_id, "[QUARANTINE-CLEAR] via server reset");
         }
         self.groupinfo_404_tracker().lock().await.clear(convo_id);
 
@@ -5585,6 +5625,21 @@ where
             }
         }
         None
+    }
+
+    /// True if `convo_id` is quarantined in memory or in durable conversation state.
+    pub(crate) async fn is_conversation_quarantined(&self, convo_id: &str) -> Result<bool> {
+        if self
+            .get_conversation_quarantine_state(convo_id)
+            .await
+            .is_some()
+        {
+            return Ok(true);
+        }
+        Ok(matches!(
+            self.storage().get_conversation_state(convo_id).await?,
+            Some(ConversationState::Quarantined { .. })
+        ))
     }
 
     /// Internal: mark a conversation quarantined and persist the transition.

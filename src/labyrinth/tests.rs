@@ -135,6 +135,8 @@ struct RefGateway {
     fail_nsid: Arc<Mutex<Option<String>>>,
     /// Requests to this NSID are refused with 403 and this error name.
     refuse_nsid: Arc<Mutex<Option<(String, String)>>>,
+    /// Optional per-conversation overrides for `blue.catbird.chat.getConversationState`.
+    state_overrides: Arc<Mutex<HashMap<String, GatewayResponse>>>,
 }
 
 fn reply(r: Result<Vec<u8>, XrpcError>) -> GatewayResponse {
@@ -165,6 +167,7 @@ impl RefGateway {
             log: Arc::default(),
             fail_nsid: Arc::default(),
             refuse_nsid: Arc::default(),
+            state_overrides: Arc::default(),
         }
     }
 
@@ -249,7 +252,35 @@ impl RefGateway {
             .iter()
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect();
-        reply(self.server.transport(&did, key).query(nsid, &p))
+        if nsid == "blue.catbird.chat.getConversationState" {
+            if let Some(conv) = params
+                .iter()
+                .find(|(k, _)| k == "conversationId")
+                .map(|(_, v)| v.as_str())
+            {
+                if let Some(override_resp) = self.state_overrides.lock().unwrap().get(conv).cloned()
+                {
+                    return override_resp;
+                }
+            }
+        }
+        let mut resp = reply(self.server.transport(&did, key).query(nsid, &p));
+        if nsid == "blue.catbird.chat.getConversationState" && resp.status == 200 {
+            if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&resp.body) {
+                if let Some(participants) = json["state"]["participants"].as_array_mut() {
+                    for p_obj in participants {
+                        if let Some(obj) = p_obj.as_object_mut() {
+                            obj.entry("status")
+                                .or_insert_with(|| serde_json::json!("active"));
+                            obj.entry("leafCount")
+                                .or_insert_with(|| serde_json::json!(1));
+                        }
+                    }
+                    resp.body = serde_json::to_vec(&json).unwrap();
+                }
+            }
+        }
+        resp
     }
 
     fn procedure(&self, req: &LabyrinthRequest) -> GatewayResponse {
@@ -359,6 +390,8 @@ impl Device {
                 pds: None,
                 space: None,
                 placements: Arc::new(MemVault::default()),
+                local_authority: None,
+                sequencer_key: None,
             },
         }
     }
@@ -659,9 +692,26 @@ fn roster_keeps_active_members_only() {
         {"userDid": "did:plc:a", "status": "active", "leafCount": 2},
         {"userDid": "did:plc:b", "status": "pending", "leafCount": 0},
         {"userDid": "did:plc:c", "status": "active", "leafCount": 0},
-        {"userDid": "did:plc:d"},
     ]}});
-    assert_eq!(roster_members(&state), vec!["did:plc:a", "did:plc:d"]);
+    assert_eq!(roster_members(&state).unwrap(), vec!["did:plc:a"]);
+
+    for participant in [
+        serde_json::json!({"userDid": "did:plc:d"}),
+        serde_json::json!({"userDid": "did:plc:e", "status": "active"}),
+        serde_json::json!({"userDid": "did:plc:f", "leafCount": 1}),
+        serde_json::json!({"userDid": "did:plc:g", "status": true, "leafCount": 1}),
+        serde_json::json!({"userDid": "did:plc:h", "status": "active", "leafCount": "1"}),
+        serde_json::json!({"status": "active", "leafCount": 1}),
+    ] {
+        let malformed = serde_json::json!({"state": {"participants": [participant]}});
+        assert!(roster_members(&malformed).is_err());
+    }
+
+    let duplicate = serde_json::json!({"state": {"participants": [
+        {"userDid": "did:plc:a", "status": "active", "leafCount": 1},
+        {"userDid": "did:plc:a", "status": "active", "leafCount": 2},
+    ]}});
+    assert!(roster_members(&duplicate).is_err());
 }
 
 /// The chat device key and device id of a registered harness client.
@@ -828,4 +878,343 @@ async fn orchestrator_archives_a_send_and_a_restored_device_imports_it() {
             .unwrap()
             >= 1
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn f04_imported_history_colliding_message_id_does_not_suppress_live_mls_decryption() {
+    use crate::orchestrator::MLSAPIClient as _;
+    use crate::orchestrator::MLSStorageBackend as _;
+    use crate::recovery_e2e_harness::TestWorld;
+
+    let gw = RefGateway::new();
+    let mut world = TestWorld::new();
+    let handler = gw.clone();
+    world
+        .api_service
+        .set_labyrinth_handler(Arc::new(move |req| handler.submit_labyrinth(req)));
+
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world
+        .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+        .await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let alice_did = world.client("Alice").did.clone();
+    let bob_did = world.client("Bob").did.clone();
+    let (a_dev, a_key) = chat_device(&world.client("Alice").orchestrator, &alice_did).await;
+    let (b_dev, b_key) = chat_device(&world.client("Bob").orchestrator, &bob_did).await;
+    gw.register(&alice_did, &a_dev, a_key);
+    gw.register(&bob_did, &b_dev, b_key);
+
+    let convo = world
+        .client("Alice")
+        .orchestrator
+        .create_group("f04-group", None, None)
+        .await
+        .unwrap();
+    world
+        .client("Alice")
+        .orchestrator
+        .swap_members(&convo.conversation_id, &[], std::slice::from_ref(&bob_did))
+        .await
+        .unwrap();
+    let thread = convo.conversation_id.clone();
+    let welcome = world
+        .client("Bob")
+        .orchestrator
+        .api_client()
+        .get_welcome(&convo.group_id)
+        .await
+        .unwrap();
+    world
+        .client("Bob")
+        .orchestrator
+        .join_group(&welcome)
+        .await
+        .unwrap();
+    gw.net().add_leaf(&thread, &alice_did, a_key);
+    gw.net().add_leaf(&thread, &bob_did, b_key);
+
+    world
+        .client("Alice")
+        .orchestrator
+        .labyrinth_enable()
+        .await
+        .unwrap();
+    world
+        .client("Bob")
+        .orchestrator
+        .labyrinth_enable()
+        .await
+        .unwrap();
+
+    // Disable automatic archiving on Alice so we can inject a colliding history
+    // row with the exact same `message_id` before Bob decrypts the live MLS message.
+    world
+        .client("Alice")
+        .orchestrator
+        .labyrinth_set_archive_policy(super::QueueConfig {
+            max_batch: 1000,
+            max_delay: std::time::Duration::from_secs(3600),
+        });
+    let sent = world
+        .client("Alice")
+        .orchestrator
+        .send_message(&thread, "authentic live mls message")
+        .await
+        .unwrap();
+
+    // Inject a colliding Labyrinth archive frame under `sent.id` BEFORE Bob
+    // processes the live MLS message.
+    let spoofed_frame =
+        crate::orchestrator::types::MLSMessagePayload::text("spoofed restored text")
+            .encode()
+            .unwrap();
+    let alice_deps = world
+        .client("Alice")
+        .orchestrator
+        .labyrinth_deps()
+        .await
+        .unwrap();
+    let thread_for_archive = thread.clone();
+    let alice_for_archive = alice_did.clone();
+    let bob_for_archive = bob_did.clone();
+    let sent_id_for_archive = sent.id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut alice_lab = alice_deps.open().unwrap().unwrap();
+        alice_lab
+            .archive_sent(
+                &thread_for_archive,
+                &[alice_for_archive, bob_for_archive],
+                &sent_id_for_archive,
+                1_791_000_000_500,
+                &spoofed_frame,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    // Bob imports Labyrinth history first (`epoch == 0, sequence_number == 0`).
+    let import_report = world
+        .client("Bob")
+        .orchestrator
+        .labyrinth_import_history(&thread)
+        .await
+        .unwrap();
+    assert_eq!(import_report.imported, 1);
+
+    // Now Bob syncs/processes the live OpenMLS message with the same `server_message_id`!
+    world
+        .client("Bob")
+        .orchestrator
+        .fetch_messages(&thread, None, 50, None, None, None)
+        .await
+        .unwrap();
+
+    let bob_msgs = world
+        .client("Bob")
+        .storage
+        .get_messages(&thread, 10, None)
+        .await
+        .unwrap();
+    let stored = bob_msgs
+        .iter()
+        .find(|m| m.id == sent.id)
+        .expect("live message must be stored");
+    assert_eq!(
+        stored.text, "authentic live mls message",
+        "restored epoch==0 Labyrinth row must NOT suppress authentic OpenMLS message decryption"
+    );
+    assert!(
+        stored.epoch > 0 || stored.sequence_number > 0,
+        "live MLS message must supersede epoch==0 restored row"
+    );
+
+    // Re-importing history must NOT overwrite the authenticated live row.
+    let reimport = world
+        .client("Bob")
+        .orchestrator
+        .labyrinth_import_history(&thread)
+        .await
+        .unwrap();
+    assert_eq!((reimport.imported, reimport.already_present), (0, 1));
+    let bob_msgs_after = world
+        .client("Bob")
+        .storage
+        .get_messages(&thread, 10, None)
+        .await
+        .unwrap();
+    let stored_after = bob_msgs_after.iter().find(|m| m.id == sent.id).unwrap();
+    assert_eq!(stored_after.text, "authentic live mls message");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn f04_import_history_rejects_forged_group_invitation_control_payloads_and_bad_ids() {
+    use crate::orchestrator::types::{MLSEmbedData, MLSMessagePayload, MLSMessageType};
+    use crate::orchestrator::GroupInvitationReference;
+    use crate::orchestrator::MLSStorageBackend as _;
+    use crate::recovery_e2e_harness::TestWorld;
+
+    let gw = RefGateway::new();
+    let mut world = TestWorld::new();
+    let handler = gw.clone();
+    world
+        .api_service
+        .set_labyrinth_handler(Arc::new(move |req| handler.submit_labyrinth(req)));
+
+    world
+        .add_client_with_did("Alice", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa")
+        .await;
+    world
+        .add_client_with_did("Bob", "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb")
+        .await;
+    world.register_device("Alice").await.unwrap();
+    world.register_device("Bob").await.unwrap();
+
+    let alice_did = world.client("Alice").did.clone();
+    let bob_did = world.client("Bob").did.clone();
+    let (a_dev, a_key) = chat_device(&world.client("Alice").orchestrator, &alice_did).await;
+    let (b_dev, b_key) = chat_device(&world.client("Bob").orchestrator, &bob_did).await;
+    gw.register(&alice_did, &a_dev, a_key);
+    gw.register(&bob_did, &b_dev, b_key);
+
+    let convo = world
+        .client("Alice")
+        .orchestrator
+        .create_group("f04-filter", Some(std::slice::from_ref(&bob_did)), None)
+        .await
+        .unwrap();
+    let thread = convo.conversation_id.clone();
+    world
+        .client("Bob")
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .unwrap();
+    gw.net().add_leaf(&thread, &alice_did, a_key);
+    gw.net().add_leaf(&thread, &bob_did, b_key);
+
+    world
+        .client("Alice")
+        .orchestrator
+        .labyrinth_enable()
+        .await
+        .unwrap();
+    world
+        .client("Bob")
+        .orchestrator
+        .labyrinth_enable()
+        .await
+        .unwrap();
+
+    let members = vec![alice_did.clone(), bob_did.clone()];
+    let alice_deps = world
+        .client("Alice")
+        .orchestrator
+        .labyrinth_deps()
+        .await
+        .unwrap();
+    let thread_for_archive = thread.clone();
+    let bob_for_archive = bob_did.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut alice_lab = alice_deps.open().unwrap().unwrap();
+
+        // 1. Non-displayable AdminAction control frame
+        let admin_frame = MLSMessagePayload {
+            version: 1,
+            message_type: MLSMessageType::AdminAction,
+            text: Some("promote bob".into()),
+            embed: None,
+            reaction: None,
+            delivery_ack: None,
+            recovery_request: None,
+        }
+        .encode()
+        .unwrap();
+        alice_lab
+            .archive_sent(
+                &thread_for_archive,
+                &members,
+                "ctrl-admin-1",
+                1_791_000_001_001,
+                &admin_frame,
+            )
+            .unwrap();
+
+        // 2. Forged groupInvitation embed claiming `invited_by_did` is a third party
+        let forged_embed = MLSEmbedData::group_invitation(GroupInvitationReference {
+            authority_did: "did:web:chat.catbird.blue".into(),
+            conversation_id: "11111111-2222-4333-8444-555555555555".into(),
+            invitation_transition_id: "22222222-3333-4444-8555-666666666666".into(),
+            invited_by_did: "did:plc:cccccccccccccccccccccccc".into(),
+            invited_by_device_id: "33333333-4444-4555-8666-777777777777".into(),
+            recipient_did: bob_for_archive,
+        })
+        .unwrap();
+        let forged_invite = MLSMessagePayload::text_with_embed("join our group", forged_embed)
+            .encode()
+            .unwrap();
+        alice_lab
+            .archive_sent(
+                &thread_for_archive,
+                &members,
+                "forged-inv-1",
+                1_791_000_001_002,
+                &forged_invite,
+            )
+            .unwrap();
+
+        // 3. Invalid message_id (> 128 chars)
+        let valid_text = MLSMessagePayload::text("valid text").encode().unwrap();
+        let oversized_id = "x".repeat(129);
+        alice_lab
+            .archive_sent(
+                &thread_for_archive,
+                &members,
+                &oversized_id,
+                1_791_000_001_003,
+                &valid_text,
+            )
+            .unwrap();
+
+        // 4. Legitimate displayable text message
+        let legit_frame = MLSMessagePayload::text("hello from history")
+            .encode()
+            .unwrap();
+        alice_lab
+            .archive_sent(
+                &thread_for_archive,
+                &members,
+                "legit-msg-1",
+                1_791_000_001_004,
+                &legit_frame,
+            )
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let report = world
+        .client("Bob")
+        .orchestrator
+        .labyrinth_import_history(&thread)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.imported, 1,
+        "only the legitimate displayable message may be imported, got {report:?}"
+    );
+    let stored = world
+        .client("Bob")
+        .storage
+        .get_messages(&thread, 10, None)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id, "legit-msg-1");
+    assert_eq!(stored[0].text, "hello from history");
 }

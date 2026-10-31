@@ -86,13 +86,16 @@ pub(super) fn appends(gw: &RefGateway) -> usize {
 }
 
 fn queue(q: &MemQueue, n: u8) {
-    q.put(&PendingArchive::new(
-        ALICE,
-        THREAD,
-        &format!("m-{n}"),
-        1_791_000_000_000 + u64::from(n),
-        &[n; 4],
-    ))
+    q.put(
+        &PendingArchive::new(
+            ALICE,
+            THREAD,
+            &format!("m-{n}"),
+            1_791_000_000_000 + u64::from(n),
+            &[n; 4],
+        )
+        .with_mls_snapshot("aa11", 1, vec![ALICE.into(), BOB.into()]),
+    )
     .unwrap();
 }
 
@@ -303,8 +306,17 @@ fn revoking_a_chat_device_revokes_its_labyrinth_device() {
 #[test]
 fn forgetting_and_purging_erase_the_saved_state() {
     let gw = RefGateway::new();
+    gw.net()
+        .set_sequencer("did:web:ds.example", Some([0x5e; 32]));
+    let ds_vk = ed25519_dalek::SigningKey::from_bytes(&[0x5e; 32])
+        .verifying_key()
+        .to_bytes();
     let alice = Device::new(&gw, ALICE, A1, 1);
-    let bob = Device::new(&gw, BOB, B1, 2);
+    let mut bob = Device::new(&gw, BOB, B1, 2);
+    bob.deps.sequencer_key = Some(labyrinth::store::SequencerKey {
+        did: "did:web:ds.example".into(),
+        key: ds_vk,
+    });
     let mut a = alice.deps.clone().enable().unwrap();
     let mut b = bob.deps.clone().enable().unwrap();
     let members = vec![ALICE.to_owned(), BOB.to_owned()];
@@ -323,6 +335,8 @@ fn forgetting_and_purging_erase_the_saved_state() {
     assert!(alice.deps.vault.load(ALICE).unwrap().is_none());
     let h = b.load_history(THREAD, TimeRange::ALL).unwrap();
     assert!(h.messages.is_empty());
+    assert_eq!(h.redacted.len(), 1);
+    assert!(h.redacted[0].account_deleted && !h.redacted[0].by_author);
 }
 
 /// The orchestrator's worker: off the send path, batched by size, and

@@ -2134,7 +2134,7 @@ fn validate_existing_sqlite_storage(
             MLSError::invalid_input(format!("Failed to query openmls_key_packages: {e}"))
         })?;
 
-        let mut unmanifested_orphans: Vec<(i64, Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut unmanifested_orphans: Vec<(i64, Vec<u8>, zeroize::Zeroizing<Vec<u8>>)> = Vec::new();
         while let Some(row) = kp_rows.next().map_err(|e| {
             MLSError::invalid_input(format!("Corrupt openmls_key_packages row: {e}"))
         })? {
@@ -2144,12 +2144,12 @@ fn validate_existing_sqlite_storage(
             let kp_ref: Vec<u8> = row
                 .get(1)
                 .map_err(|e| MLSError::invalid_input(e.to_string()))?;
-            let kp_blob: Vec<u8> = row
-                .get(2)
-                .map_err(|e| MLSError::invalid_input(e.to_string()))?;
 
             if !manifested_serialized_refs.contains_key(&kp_ref) {
-                unmanifested_orphans.push((pv, kp_ref, kp_blob));
+                let kp_blob: Vec<u8> = row
+                    .get(2)
+                    .map_err(|e| MLSError::invalid_input(e.to_string()))?;
+                unmanifested_orphans.push((pv, kp_ref, zeroize::Zeroizing::new(kp_blob)));
             }
         }
         drop(kp_rows);
@@ -2178,16 +2178,20 @@ fn validate_existing_sqlite_storage(
                 let now = unix_now_secs();
 
                 for (pv, kp_ref, kp_blob) in &unmanifested_orphans {
+                    use sha2::{Digest, Sha256};
                     let hex_ref = hex::encode(kp_ref);
+                    let blob_sha256 = hex::encode(Sha256::digest(kp_blob));
                     let quarantine_key =
                         format!("quarantined_key_package:openmls_orphan:{hex_ref}");
                     let quarantine_val = serde_json::json!({
                         "key_package_ref": hex_ref,
-                        "key_package_b64": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, kp_blob),
+                        "blob_byte_len": kp_blob.len(),
+                        "blob_sha256": blob_sha256,
                         "provider_version": pv,
                         "quarantined_at": now,
                         "reason": "unmanifested_openmls_orphan"
-                    }).to_string();
+                    })
+                    .to_string();
 
                     conn.execute(
                         "INSERT OR REPLACE INTO mls_manifests (key, value) VALUES (?1, ?2)",
@@ -4877,46 +4881,11 @@ impl MLSContext {
 
         self.with_group(&gid, |group, provider, signer| {
             // Deserialize and validate key package
-            let kp_in = if let Ok((mls_msg, remaining)) =
-                MlsMessageIn::tls_deserialize_bytes(key_package_data)
-            {
-                if remaining.is_empty() {
-                    match mls_msg.extract() {
-                        MlsMessageBodyIn::KeyPackage(kp_in) => kp_in,
-                        _ => {
-                            let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
-                                .map_err(|e| {
-                                    crate::error_log!(
-                                        "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
-                                        e
-                                    );
-                                    MLSError::SerializationError
-                                })?;
-                            kp_in
-                        }
-                    }
-                } else {
-                    let (kp_in, _) = KeyPackageIn::tls_deserialize_bytes(key_package_data)
-                        .map_err(|e| {
-                            crate::error_log!(
-                                "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
-                                e
-                            );
-                            MLSError::SerializationError
-                        })?;
-                    kp_in
-                }
-            } else {
-                let (kp_in, _) =
-                    KeyPackageIn::tls_deserialize_bytes(key_package_data).map_err(|e| {
-                        crate::error_log!(
-                            "[MLS-CONTEXT] Failed to deserialize key package: {:?}",
-                            e
-                        );
-                        MLSError::SerializationError
-                    })?;
-                kp_in
-            };
+            let kp_in =
+                crate::api::deserialize_exact_key_package_in(key_package_data).map_err(|e| {
+                    crate::error_log!("[MLS-CONTEXT] Failed to deserialize key package: {:?}", e);
+                    e
+                })?;
 
             let key_package = kp_in
                 .validate(provider.crypto(), ProtocolVersion::default())
@@ -5452,5 +5421,95 @@ mod manifest_bundle_storage_tests {
         // Verify atomic rollback: manifest bundle row still exists
         assert_eq!(storage.count_bundles(), 1);
         assert!(storage.contains_bundle("aa11"));
+    }
+
+    #[test]
+    fn f14_orphan_key_package_quarantine_omits_raw_secret_blob() {
+        fn open_sqlcipher(path: &std::path::Path, encryption_key: &str) -> rusqlite::Connection {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.pragma_update(None, "cipher_memory_security", "OFF")
+                .unwrap();
+            conn.pragma_update(None, "key", encryption_key).unwrap();
+            conn.pragma_update(None, "cipher_plaintext_header_size", 32)
+                .unwrap();
+            let salt = hex::encode(&Sha256::digest(encryption_key.as_bytes())[..16]);
+            conn.pragma_update(None, "cipher_salt", format!("x'{salt}'"))
+                .unwrap();
+            conn.pragma_update(None, "cipher_page_size", 4096).unwrap();
+            conn.pragma_update(None, "kdf_iter", 256000).unwrap();
+            conn.pragma_update(None, "cipher_hmac_algorithm", "HMAC_SHA512")
+                .unwrap();
+            conn.pragma_update(None, "cipher_kdf_algorithm", "PBKDF2_HMAC_SHA512")
+                .unwrap();
+            conn
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("orphan_kp.db");
+        let enc_key = "test-key-1234567890123456";
+
+        // First initialize the database cleanly, then inject an unmanifested OpenMLS KeyPackage row
+        // containing recognizable private-key material.
+        {
+            let _api_ctx = crate::api::MLSContext::new(
+                db_path.to_string_lossy().to_string(),
+                enc_key.to_string(),
+                Box::new(NoopKeychain),
+            )
+            .unwrap();
+        }
+
+        let secret_kp_blob = b"RAW_UNREDACTED_KEY_PACKAGE_BUNDLE_PRIVATE_KEY_MATERIAL_999";
+        {
+            let conn = open_sqlcipher(&db_path, enc_key);
+            conn.execute(
+                "INSERT INTO openmls_key_packages (provider_version, key_package_ref, key_package) VALUES (?1, ?2, ?3)",
+                rusqlite::params![1i64, vec![0xdeu8, 0xad, 0xbe, 0xef], secret_kp_blob.as_slice()],
+            )
+            .unwrap();
+        }
+
+        // Re-open via FFI `crate::api::MLSContext::new` which runs `reconcile_key_package_bundles()`.
+        let api_ctx = crate::api::MLSContext::new(
+            db_path.to_string_lossy().to_string(),
+            enc_key.to_string(),
+            Box::new(NoopKeychain),
+        )
+        .unwrap();
+
+        #[cfg(feature = "labyrinth")]
+        {
+            use crate::labyrinth::state::{MlsStateVault, StateVault};
+            let vault = MlsStateVault(api_ctx.clone());
+            assert!(!vault.has_state("did:plc:alice").unwrap());
+            vault
+                .compare_exchange("did:plc:alice", None, b"secret-labyrinth-state")
+                .unwrap();
+            assert!(vault.has_state("did:plc:alice").unwrap());
+            vault.delete("did:plc:alice").unwrap();
+            assert!(!vault.has_state("did:plc:alice").unwrap());
+        }
+
+        let conn = open_sqlcipher(&db_path, enc_key);
+        let quarantine_json: String = conn
+            .query_row(
+                "SELECT value FROM mls_manifests WHERE key = 'quarantined_key_package:openmls_orphan:deadbeef'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("orphan quarantine entry should be recorded");
+
+        let secret_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret_kp_blob);
+        assert!(
+            !quarantine_json.contains("key_package_b64") && !quarantine_json.contains(&secret_b64),
+            "quarantined orphan record must NEVER retain raw private-key kp_blob bytes: {quarantine_json}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&quarantine_json).unwrap();
+        assert_eq!(parsed["key_package_ref"], "deadbeef");
+        assert_eq!(parsed["blob_byte_len"], secret_kp_blob.len());
+        assert!(parsed["blob_sha256"]
+            .as_str()
+            .is_some_and(|h| h.len() == 64));
     }
 }

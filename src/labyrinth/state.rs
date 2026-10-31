@@ -21,6 +21,15 @@ pub const STATE_NAMESPACE: &str = "labyrinthClientState";
 /// Secure storage for one blob per account.
 pub trait StateVault: Send + Sync {
     fn load(&self, did: &str) -> Result<Option<Vec<u8>>, MLSError>;
+    /// Checks whether a state blob exists for `did` without leaving an
+    /// unzeroized copy of secret key material on the heap.
+    fn has_state(&self, did: &str) -> Result<bool, MLSError> {
+        Ok(self.load_zeroizing(did)?.is_some())
+    }
+    /// Loads the account's secret blob wrapped in [`zeroize::Zeroizing`].
+    fn load_zeroizing(&self, did: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, MLSError> {
+        Ok(self.load(did)?.map(zeroize::Zeroizing::new))
+    }
     /// Writes `next` if the stored value is still `expected`; false if not.
     fn compare_exchange(
         &self,
@@ -35,9 +44,19 @@ pub trait StateVault: Send + Sync {
 /// [`StateVault`] in the encrypted MLS database.
 pub struct MlsStateVault<M>(pub Arc<M>);
 
+impl<M: MlsCryptoContext + 'static> MlsStateVault<M> {
+    pub fn has_state(&self, did: &str) -> Result<bool, MLSError> {
+        self.0.has_request_value(STATE_NAMESPACE, did)
+    }
+}
+
 impl<M: MlsCryptoContext + 'static> StateVault for MlsStateVault<M> {
     fn load(&self, did: &str) -> Result<Option<Vec<u8>>, MLSError> {
         self.0.read_request_value(STATE_NAMESPACE, did)
+    }
+
+    fn has_state(&self, did: &str) -> Result<bool, MLSError> {
+        self.0.has_request_value(STATE_NAMESPACE, did)
     }
 
     fn compare_exchange(
@@ -51,6 +70,8 @@ impl<M: MlsCryptoContext + 'static> StateVault for MlsStateVault<M> {
     }
 
     fn delete(&self, did: &str) -> Result<(), MLSError> {
-        self.0.delete_request_value(STATE_NAMESPACE, did).map(|_| ())
+        self.0
+            .delete_request_value(STATE_NAMESPACE, did)
+            .map(|_| ())
     }
 }

@@ -76,11 +76,11 @@ impl EpochSecretManager {
     /// even after the group has advanced to a new epoch.
     /// Uses the deterministic RFC 9420 exporter so retries produce the same
     /// durable value for a given group and epoch.
-    pub async fn export_current_epoch_secret<Provider: OpenMlsProvider>(
-        &self,
+    pub fn export_current_epoch_secret<'a, Provider: OpenMlsProvider>(
+        &'a self,
         group: &mut MlsGroup,
         provider: &Provider,
-    ) -> Result<Vec<u8>, MLSError> {
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, MLSError>> + Send + 'a {
         let group_id_hex = hex::encode(group.group_id().as_slice());
         let current_epoch = group.epoch().as_u64();
 
@@ -92,7 +92,7 @@ impl EpochSecretManager {
 
         let label = format!("epoch_secret_{}", current_epoch);
         let context = group_id_hex.as_bytes();
-        let secret = group
+        let export_result = group
             .export_secret(provider.crypto(), &label, context, 32)
             .map_err(|e| {
                 crate::error_log!(
@@ -100,17 +100,20 @@ impl EpochSecretManager {
                     e
                 );
                 MLSError::SecretExportFailed
-            })?;
+            });
 
-        crate::debug_log!(
-            "[EPOCH-STORAGE] Exported {} bytes for epoch {}",
-            secret.len(),
-            current_epoch
-        );
+        async move {
+            let secret = export_result?;
+            crate::debug_log!(
+                "[EPOCH-STORAGE] Exported {} bytes for epoch {}",
+                secret.len(),
+                current_epoch
+            );
 
-        self.persist_epoch_secret(group_id_hex, current_epoch, secret.clone())
-            .await?;
-        Ok(secret)
+            self.persist_epoch_secret(group_id_hex, current_epoch, secret.clone())
+                .await?;
+            Ok(secret)
+        }
     }
 
     /// Delete epoch secrets older than the retention window.

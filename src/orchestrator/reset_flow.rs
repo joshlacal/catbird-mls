@@ -124,17 +124,18 @@ impl ServerConversationState {
     /// Missing or unrecognized fields never authorize an automatic reset.
     pub(crate) fn nobody_else_can_add(&self, user_did: &str, device_id: &str) -> bool {
         self.leaves.as_ref().is_some_and(|leaves| {
-            leaves.iter().all(|leaf| {
-                let leaf_did = leaf.get("userDid").and_then(|v| v.as_str());
-                let leaf_device = leaf.get("deviceId").and_then(|v| v.as_str());
-                (leaf_did == Some(user_did) && leaf_device == Some(device_id))
-                    || leaf.get("deviceStatus").and_then(|v| v.as_str()) == Some("revoked")
-                    || leaf_did
-                        .and_then(|did| self.participant(did))
-                        .and_then(|participant| participant.get("status"))
-                        .and_then(|status| status.as_str())
-                        == Some("pending")
-            })
+            !leaves.is_empty()
+                && leaves.iter().all(|leaf| {
+                    let leaf_did = leaf.get("userDid").and_then(|v| v.as_str());
+                    let leaf_device = leaf.get("deviceId").and_then(|v| v.as_str());
+                    (leaf_did == Some(user_did) && leaf_device == Some(device_id))
+                        || leaf.get("deviceStatus").and_then(|v| v.as_str()) == Some("revoked")
+                        || leaf_did
+                            .and_then(|did| self.participant(did))
+                            .and_then(|participant| participant.get("status"))
+                            .and_then(|status| status.as_str())
+                            == Some("pending")
+                })
         })
     }
 
@@ -384,6 +385,16 @@ where
         state: &ServerConversationState,
         user_did: &str,
     ) -> Result<serde_json::Value> {
+        self.recover_leaf_or_reset_with_policy(state, user_did, false)
+            .await
+    }
+
+    pub(crate) async fn recover_leaf_or_reset_with_policy(
+        &self,
+        state: &ServerConversationState,
+        user_did: &str,
+        allow_autonomous_reset: bool,
+    ) -> Result<serde_json::Value> {
         let convo_id = state.conversation_id.as_str();
         // Known peer-poisoned state requires the existing explicit recovery
         // path. Another device on our account is not evidence that poison
@@ -408,6 +419,17 @@ where
             .leaf_recovery_wait(convo_id);
         let nobody_can_add_us = state.nobody_else_can_add(user_did, &actor_device_id);
         if role == "admin" && nobody_can_add_us {
+            if !allow_autonomous_reset {
+                crate::warn_log!(
+                    "[RESET] convo={} passive recovery refusing autonomous reset without explicit admin confirmation (waited={:?})",
+                    convo_id,
+                    waited
+                );
+                return Ok(serde_json::json!({
+                    "reset": "skipped",
+                    "reason": "explicitAdminActionRequired"
+                }));
+            }
             crate::warn_log!(
                 "[RESET] convo={} leaf recovery cannot succeed (nobody_else_can_add={}, waited={:?}); resetting",
                 convo_id,

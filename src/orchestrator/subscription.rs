@@ -257,6 +257,25 @@ pub(crate) fn request_value_read(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn request_value_exists(
+    storage: &crate::mls_context::ManifestStorage,
+    namespace: &str,
+    id: &str,
+) -> std::result::Result<bool, MLSError> {
+    checked_namespace(namespace)?;
+    checked_id(id)?;
+    let key = format!("direct_request_value_v2:{namespace}:{id}");
+    storage
+        .welcome_ack_connection()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM mls_manifests WHERE key=?1)",
+            [&key],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|_| MLSError::StorageFailed)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn request_value_cas(
     storage: &crate::mls_context::ManifestStorage,
     namespace: &str,
@@ -275,15 +294,16 @@ pub(crate) fn request_value_cas(
         .welcome_ack_connection()
         .unchecked_transaction()
         .map_err(|_| MLSError::StorageFailed)?;
-    let old: Option<Vec<u8>> = tx
+    let old: Option<zeroize::Zeroizing<Vec<u8>>> = tx
         .query_row(
             "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
             [&key],
-            |r| r.get(0),
+            |r| r.get::<_, Vec<u8>>(0),
         )
         .optional()
-        .map_err(|_| MLSError::StorageFailed)?;
-    if old.as_deref() != expected {
+        .map_err(|_| MLSError::StorageFailed)?
+        .map(zeroize::Zeroizing::new);
+    if old.as_deref().map(Vec::as_slice) != expected {
         return Ok(false);
     }
     tx.execute(

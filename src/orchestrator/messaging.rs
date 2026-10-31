@@ -108,7 +108,7 @@ where
     /// Prove that a globally indexed server message ID belongs to this stable
     /// conversation. `message_exists` alone is insufficient because an
     /// attacker-controlled DS can reuse an ID from another conversation.
-    async fn durable_message_exists_in_conversation(
+    pub(crate) async fn durable_message_exists_in_conversation(
         &self,
         conversation_id: &str,
         message_id: &str,
@@ -129,6 +129,45 @@ where
                     .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
                     .await?;
                 if messages.iter().any(|message| message.id == alternate_id) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Prove that an authenticated live MLS message (`epoch > 0 || sequence_number > 0`)
+    /// already exists for `message_id` in this conversation. Unverified restored
+    /// history placeholders (`epoch == 0 && sequence_number == 0`) must never
+    /// short-circuit live OpenMLS decryption.
+    async fn authenticated_durable_message_exists_in_conversation(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<bool> {
+        let is_authenticated = |m: &Message| m.epoch > 0 || m.sequence_number > 0;
+        if self.storage().message_exists(message_id).await? {
+            let messages = self
+                .storage()
+                .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
+                .await?;
+            if messages
+                .iter()
+                .any(|message| message.id == message_id && is_authenticated(message))
+            {
+                return Ok(true);
+            }
+        }
+        if let Some(alternate_id) = alternate_uuid_representation(message_id) {
+            if self.storage().message_exists(&alternate_id).await? {
+                let messages = self
+                    .storage()
+                    .get_messages(conversation_id, INBOUND_DEDUP_PROOF_LOOKBACK, None)
+                    .await?;
+                if messages
+                    .iter()
+                    .any(|message| message.id == alternate_id && is_authenticated(message))
+                {
                     return Ok(true);
                 }
             }
@@ -781,6 +820,11 @@ where
                 },
                 other => OrchestratorError::Mls(other),
             })?;
+        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        let mut labyrinth_mls_snapshot = self
+            .snapshot_group_root_member_dids(&group_id_bytes)
+            .ok()
+            .map(|dids| (resolved.group_id.clone(), epoch, dids));
         let message_id = uuid::Uuid::new_v4().to_string();
         let send_result = self
             .encrypt_and_send_message_prepared(
@@ -869,6 +913,13 @@ where
                 let retry_transition_guard = retry_transition_lock.lock().await;
                 self.reject_send_if_reset_pending(conversation_id).await?;
                 self.validate_send_actor(&actor).await?;
+                #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+                {
+                    labyrinth_mls_snapshot = self
+                        .snapshot_group_root_member_dids(&group_id_bytes)
+                        .ok()
+                        .map(|dids| (resolved.group_id.clone(), retry_epoch, dids));
+                }
 
                 let retry_send_result = self
                     .encrypt_and_send_message_prepared(
@@ -991,16 +1042,53 @@ where
 
         // Labyrinth history backup (best effort: the send already succeeded).
         #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
-        self.labyrinth_archive_sent(
-            &resolved.conversation_id,
-            &message.id,
-            u64::try_from(message.timestamp.timestamp_millis()).unwrap_or(0),
-            &payload_bytes,
-        )
-        .await;
+        {
+            let canonical_id = send_response
+                .as_ref()
+                .map(|r| r.message_id.as_str())
+                .filter(|id| !id.is_empty())
+                .unwrap_or(&message.id);
+            self.labyrinth_archive_sent(
+                &resolved.conversation_id,
+                canonical_id,
+                u64::try_from(message.timestamp.timestamp_millis()).unwrap_or(0),
+                &payload_bytes,
+                labyrinth_mls_snapshot,
+            )
+            .await;
+        }
 
         tracing::debug!(conversation_id, "Message sent successfully");
         Ok(message)
+    }
+
+    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    pub(crate) fn snapshot_group_root_member_dids(
+        &self,
+        group_id_bytes: &[u8],
+    ) -> Result<Vec<String>> {
+        let identities = self
+            .mls_context()
+            .group_member_identities(group_id_bytes.to_vec())
+            .map_err(OrchestratorError::Mls)?;
+        let mut dids = Vec::with_capacity(identities.len());
+        for raw in identities {
+            let ident = std::str::from_utf8(&raw).map_err(|_| {
+                OrchestratorError::Credential(
+                    "MLS leaf credential identity is not valid UTF-8".into(),
+                )
+            })?;
+            let root = super::credential_binding::credential_root_did(ident);
+            if root.is_empty() {
+                return Err(OrchestratorError::Credential(
+                    "MLS leaf credential root DID is empty".into(),
+                ));
+            }
+            dids.push(root.to_owned());
+        }
+        dids.sort();
+        dids.dedup();
+        Ok(dids)
     }
 
     /// Process an incoming encrypted message envelope.
@@ -1081,10 +1169,14 @@ where
         };
         let group_id_bytes = resolved.group_id_bytes()?;
 
-        // Dedup check
+        // Dedup check: only short-circuit before OpenMLS decryption when an
+        // authenticated live row (`epoch > 0 || sequence_number > 0`) exists.
         if let Some(ref msg_id) = envelope.server_message_id {
             if self
-                .durable_message_exists_in_conversation(&resolved.conversation_id, msg_id)
+                .authenticated_durable_message_exists_in_conversation(
+                    &resolved.conversation_id,
+                    msg_id,
+                )
                 .await?
             {
                 tracing::debug!(message_id = %msg_id, "Duplicate message, skipping");
@@ -1555,20 +1647,71 @@ where
         let sender_did = String::from_utf8(decrypt_result.sender_credential.identity.clone())
             .unwrap_or_else(|_| envelope.sender_did.clone());
 
-        // ADR-009 D4: enforce the available DID-root binding between the MLS
-        // sender credential and the envelope's claimed sender DID. The
-        // envelope is a routing hint, not proof. This covers application
-        // messages and inbound commit frames (including External-Commit
-        // joiners), since both pass through this decrypt path before the
-        // empty-plaintext branch below.
-        if let Err(binding_error) = self
-            .verify_inbound_sender_credential(
+        // ADR-009 D4 + F-02: enforce both the DID-root binding between the MLS
+        // sender credential and the envelope's claimed sender DID, and Stage-2
+        // ATProto device-key verification on peer leaves introduced, rotated,
+        // or signing inbound Commit and Proposal frames.
+        let inbound_binding_check: Result<()> = async {
+            self.verify_inbound_sender_credential(
                 &envelope.conversation_id,
                 &envelope.sender_did,
                 &decrypt_result.sender_credential.identity,
             )
-            .await
-        {
+            .await?;
+
+            if decrypt_result.content_type == crate::DecryptContentType::Commit {
+                if let Some(bindings) = self
+                    .mls_context()
+                    .staged_incoming_commit_leaf_bindings(
+                        group_id_bytes.clone(),
+                        decrypt_result.epoch,
+                    )
+                    .map_err(OrchestratorError::from)?
+                {
+                    let own_scoped = self
+                        .require_scoped_identity()
+                        .await
+                        .unwrap_or_else(|_| user_did.clone());
+                    self.verify_inbound_peer_leaf_bindings(
+                        Some(&envelope.conversation_id),
+                        "commit",
+                        "process_incoming",
+                        own_scoped.as_bytes(),
+                        &bindings,
+                    )
+                    .await?;
+                }
+            } else if decrypt_result.content_type == crate::DecryptContentType::Proposal {
+                if let Some(ref proposal_ref) = decrypt_result.proposal_ref {
+                    if let Some(bindings) = self
+                        .mls_context()
+                        .staged_incoming_proposal_leaf_bindings(
+                            group_id_bytes.clone(),
+                            proposal_ref.clone(),
+                        )
+                        .map_err(OrchestratorError::from)?
+                    {
+                        let own_scoped = self
+                            .require_scoped_identity()
+                            .await
+                            .unwrap_or_else(|_| user_did.clone());
+                        self.verify_inbound_peer_leaf_bindings(
+                            Some(&envelope.conversation_id),
+                            "proposal",
+                            "process_incoming",
+                            own_scoped.as_bytes(),
+                            &bindings,
+                        )
+                        .await?;
+                    }
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(binding_error) = inbound_binding_check {
             // `decrypt_message` stages incoming commits before returning the
             // sender credential. A rejected credential must not leave that
             // staged commit available for a later envelope to merge.

@@ -16,7 +16,10 @@ use serde_json::Value;
 use super::queue::{
     enqueue, flush_in_slot, ArchiveQueueStore, MlsArchiveQueue, PendingArchive, QueueConfig,
 };
-use super::session::{HistoryPage, ImportReport, LabyrinthSession, SessionDeps};
+use super::session::{
+    HistoryPage, ImportReport, LabyrinthSession, LocalConversationAuthority, LocalGroupSnapshot,
+    SessionDeps,
+};
 use super::signer::{ChatKeySigner, OrchestratorChatSigner};
 use super::space::{MlsPlacementVault, SpaceXrpcTransport};
 use super::state::MlsStateVault;
@@ -32,23 +35,132 @@ use crate::orchestrator::types::{MLSMessagePayload, Message};
 use crate::orchestrator::MLSOrchestrator;
 
 /// The member DIDs Labyrinth addresses for a conversation ([CB-16]): the
-/// participants of `getConversationState` that are active MLS members.
+/// participants of `getConversationState` that are unambiguously active
+/// MLS members. Missing or wrongly typed fields reject the whole response:
+/// silently filtering an incomplete backend response would let a storage
+/// authority omit an MLS member from the archive roster.
 /// `labyrinthHead` is not required here: the directory lookup in
 /// `resolve_roster` decides enrollment, so a server without the Labyrinth
 /// schema still yields the right roster.
-pub(crate) fn roster_members(conversation_state: &Value) -> Vec<String> {
-    conversation_state["state"]["participants"]
+pub(crate) fn roster_members(conversation_state: &Value) -> labyrinth::Result<Vec<String>> {
+    let participants = conversation_state["state"]["participants"]
         .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|p| p["status"].as_str().is_none_or(|s| s == "active"))
-        .filter(|p| p["leafCount"].as_u64().is_none_or(|n| n > 0))
-        .filter_map(|p| p["userDid"].as_str().map(str::to_owned))
-        .collect()
+        .ok_or(labyrinth::Error::Malformed(
+            "conversation participants are missing",
+        ))?;
+    let mut active = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for participant in participants {
+        let did = participant["userDid"]
+            .as_str()
+            .ok_or(labyrinth::Error::Malformed("participant DID is missing"))?;
+        let status = participant["status"]
+            .as_str()
+            .ok_or(labyrinth::Error::Malformed("participant status is missing"))?;
+        let leaves = participant["leafCount"]
+            .as_u64()
+            .ok_or(labyrinth::Error::Malformed(
+                "participant leaf count is missing",
+            ))?;
+        if status == "active" && leaves > 0 {
+            if !seen.insert(did) {
+                return Err(labyrinth::Error::Malformed("duplicate active participant"));
+            }
+            active.push(did.to_owned());
+        }
+    }
+    Ok(active)
 }
 
 pub(super) fn join_error(e: tokio::task::JoinError) -> OrchestratorError {
     OrchestratorError::Api(format!("labyrinth task failed: {e}"))
+}
+
+struct OrchestratorLocalAuthority<S, M> {
+    storage: Arc<S>,
+    mls_context: Arc<M>,
+    user_did: String,
+    runtime: tokio::runtime::Handle,
+}
+
+impl<S, M> LocalConversationAuthority for OrchestratorLocalAuthority<S, M>
+where
+    S: MLSStorageBackend + 'static,
+    M: MlsCryptoContext + 'static,
+{
+    fn current_group_snapshot(
+        &self,
+        conversation_id: &str,
+        queued_group_id_hex: Option<&str>,
+    ) -> Result<Option<LocalGroupSnapshot>> {
+        let conv_view = self.runtime.block_on(
+            self.storage
+                .get_conversation(&self.user_did, conversation_id),
+        )?;
+        let candidate_hex = conv_view
+            .as_ref()
+            .map(|v| v.group_id.as_str())
+            .filter(|s| !s.is_empty())
+            .or(queued_group_id_hex);
+        let Some(group_id_hex) = candidate_hex else {
+            return Ok(None);
+        };
+        let group_bytes =
+            hex::decode(group_id_hex).unwrap_or_else(|_| group_id_hex.as_bytes().to_vec());
+        match self.mls_context.get_epoch(group_bytes.clone()) {
+            Ok(epoch) => {
+                let raw_identities = self
+                    .mls_context
+                    .group_member_identities(group_bytes)
+                    .map_err(OrchestratorError::Mls)?;
+                let mut member_dids = Vec::with_capacity(raw_identities.len());
+                for raw in raw_identities {
+                    let ident = std::str::from_utf8(&raw).map_err(|_| {
+                        OrchestratorError::Credential(
+                            "MLS leaf credential identity is not valid UTF-8".into(),
+                        )
+                    })?;
+                    let root = crate::orchestrator::credential_binding::credential_root_did(ident);
+                    if root.is_empty() {
+                        return Err(OrchestratorError::Credential(
+                            "MLS leaf credential root DID is empty".into(),
+                        ));
+                    }
+                    member_dids.push(root.to_owned());
+                }
+                member_dids.sort();
+                member_dids.dedup();
+                Ok(Some(LocalGroupSnapshot {
+                    group_id_hex: group_id_hex.to_owned(),
+                    epoch,
+                    member_dids,
+                }))
+            }
+            Err(crate::MLSError::GroupNotFound { .. }) => {
+                if let Some(view) = conv_view {
+                    let mut member_dids: Vec<String> = view
+                        .members
+                        .iter()
+                        .map(|m| {
+                            crate::orchestrator::credential_binding::credential_root_did(&m.did)
+                                .to_owned()
+                        })
+                        .filter(|d| !d.is_empty())
+                        .collect();
+                    member_dids.sort();
+                    member_dids.dedup();
+                    Ok(Some(LocalGroupSnapshot {
+                        group_id_hex: view.group_id,
+                        epoch: view.epoch,
+                        member_dids,
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(other) => Err(OrchestratorError::Mls(other)),
+        }
+    }
 }
 
 impl<S, A, C, M> MLSOrchestrator<S, A, C, M>
@@ -79,6 +191,13 @@ where
             public_key,
             runtime: runtime.clone(),
         });
+        let local_authority: Arc<dyn LocalConversationAuthority> =
+            Arc::new(OrchestratorLocalAuthority {
+                storage: self.storage().clone(),
+                mls_context: self.mls_context().clone(),
+                user_did: did.clone(),
+                runtime: runtime.clone(),
+            });
         let gateway = Arc::new(ApiGateway::new(self.api_client().clone(), runtime));
         let pds: Option<Arc<dyn labyrinth::store::pds::PdsRecords>> =
             if self.api_client().labyrinth_pds_enabled().await {
@@ -92,6 +211,11 @@ where
             } else {
                 None
             };
+        let sequencer_key = self
+            .api_client()
+            .labyrinth_sequencer_key()
+            .await
+            .map(|(did, key)| labyrinth::store::SequencerKey { did, key });
         Ok(SessionDeps {
             pds,
             space,
@@ -105,6 +229,8 @@ where
             vault: Arc::new(MlsStateVault(self.mls_context().clone())),
             signer,
             did,
+            local_authority: Some(local_authority),
+            sequencer_key,
         })
     }
 
@@ -242,52 +368,112 @@ where
         .ok_or_else(not_enabled)
     }
 
-    /// Loads a conversation's whole history and stores every attributable
-    /// message this device does not have yet (a new or restored device).
+    /// Loads a conversation's history in bounded pages and stores every
+    /// attributable displayable message this device does not have yet.
     pub async fn labyrinth_import_history(&self, conversation_id: &str) -> Result<ImportReport> {
+        const IMPORT_HISTORY_PAGE_SIZE: usize = 200;
+        const IMPORT_HISTORY_MAX_PAGES: usize = 500;
+        const MAX_IMPORTED_MESSAGE_ID_LEN: usize = 128;
+
         let user_did = self.require_user_did().await?;
-        let page = self
-            .labyrinth_load_history(conversation_id, None, None)
-            .await?;
-        let mut report = ImportReport {
-            undecryptable: page.undecryptable,
-            ..ImportReport::default()
-        };
-        for m in page.messages {
-            if m.conflict {
-                report.skipped_conflicts += 1;
-                continue;
+        let receiver_root =
+            crate::orchestrator::credential_binding::credential_root_did(&user_did).to_owned();
+        let mut report = ImportReport::default();
+        let mut before: Option<labyrinth::client::ThreadCursor> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+
+        for page_idx in 0..IMPORT_HISTORY_MAX_PAGES {
+            let cid = conversation_id.to_owned();
+            let cursor = before.clone();
+            let sync = page_idx == 0;
+            let (page, next_cursor) = self
+                .with_labyrinth(SessionDeps::open, move |s| {
+                    s.load_history_page(&cid, cursor.as_ref(), IMPORT_HISTORY_PAGE_SIZE, sync)
+                })
+                .await?
+                .ok_or_else(not_enabled)?;
+
+            report.undecryptable = report.undecryptable.saturating_add(page.undecryptable);
+
+            for m in page.messages {
+                if m.conflict {
+                    report.skipped_conflicts += 1;
+                    continue;
+                }
+                let (MessageSource::Sender, Some(sender)) = (m.source, m.sender.clone()) else {
+                    report.skipped_unattributed += 1;
+                    continue;
+                };
+                if m.message_id.is_empty()
+                    || m.message_id.len() > MAX_IMPORTED_MESSAGE_ID_LEN
+                    || m.message_id.chars().any(char::is_control)
+                {
+                    report.skipped_undecodable += 1;
+                    continue;
+                }
+                let Ok(payload) = MLSMessagePayload::decode(&m.frame) else {
+                    report.skipped_undecodable += 1;
+                    continue;
+                };
+                if !payload.is_displayable() {
+                    report.skipped_undecodable += 1;
+                    continue;
+                }
+                let sender_root =
+                    crate::orchestrator::credential_binding::credential_root_did(&sender);
+                let is_own = sender_root == receiver_root;
+                match payload.checked_group_invitation() {
+                    Ok(Some(reference)) => {
+                        if reference.invited_by_did != sender_root
+                            || (!is_own && reference.recipient_did != receiver_root)
+                        {
+                            report.skipped_undecodable += 1;
+                            continue;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        report.skipped_undecodable += 1;
+                        continue;
+                    }
+                }
+                if self
+                    .durable_message_exists_in_conversation(conversation_id, &m.message_id)
+                    .await?
+                    || self.storage().message_exists(&m.message_id).await?
+                {
+                    report.already_present += 1;
+                    continue;
+                }
+                let timestamp = Utc
+                    .timestamp_millis_opt(i64::try_from(m.timestamp).unwrap_or(i64::MAX))
+                    .single()
+                    .unwrap_or_else(Utc::now);
+                let message = Message {
+                    id: m.message_id,
+                    conversation_id: conversation_id.to_owned(),
+                    is_own,
+                    sender_did: sender,
+                    text: payload.display_text(),
+                    timestamp,
+                    epoch: 0,
+                    sequence_number: 0,
+                    delivery_status: None,
+                    payload_json: String::from_utf8(m.frame).ok(),
+                };
+                self.storage().store_message(&message).await?;
+                report.imported += 1;
             }
-            let (MessageSource::Sender, Some(sender)) = (m.source, m.sender.clone()) else {
-                report.skipped_unattributed += 1;
-                continue;
+
+            let Some(next) = next_cursor else {
+                break;
             };
-            let Ok(payload) = MLSMessagePayload::decode(&m.frame) else {
-                report.skipped_undecodable += 1;
-                continue;
-            };
-            if self.storage().message_exists(&m.message_id).await? {
-                report.already_present += 1;
-                continue;
+            if !seen_cursors.insert((next.timestamp, next.message_id.clone())) {
+                return Err(OrchestratorError::Api(
+                    "labyrinth history pagination returned a repeated cursor".into(),
+                ));
             }
-            let timestamp = Utc
-                .timestamp_millis_opt(i64::try_from(m.timestamp).unwrap_or(i64::MAX))
-                .single()
-                .unwrap_or_else(Utc::now);
-            let message = Message {
-                id: m.message_id,
-                conversation_id: conversation_id.to_owned(),
-                is_own: sender == user_did,
-                sender_did: sender,
-                text: payload.display_text(),
-                timestamp,
-                epoch: 0,
-                sequence_number: 0,
-                delivery_status: None,
-                payload_json: String::from_utf8(m.frame).ok(),
-            };
-            self.storage().store_message(&message).await?;
-            report.imported += 1;
+            before = Some(next);
         }
         Ok(report)
     }
@@ -336,11 +522,7 @@ where
         tokio::task::spawn_blocking(move || {
             let _lifecycle = lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            let had = deps
-                .vault
-                .load(&did)
-                .map_err(OrchestratorError::Mls)?
-                .is_some();
+            let had = deps.vault.has_state(&did).map_err(OrchestratorError::Mls)?;
             deps.vault.delete(&did).map_err(OrchestratorError::Mls)?;
             deps.placements
                 .delete(&did)
@@ -349,6 +531,7 @@ where
                 .delete(&super::space::thread_placement_key(&did))
                 .map_err(OrchestratorError::Mls)?;
             queue.clear(&did)?;
+            queue.clear_status_preserving_deletion(&did)?;
             Ok(had)
         })
         .await
@@ -435,10 +618,13 @@ where
                 Some(s) if s.is_for(&deps.did, &key) => Ok(Some(s)),
                 _ => deps.clone().open(),
             };
-            let saved = deps.vault.load(&deps.did).map_err(OrchestratorError::Mls)?;
+            let had_saved = deps
+                .vault
+                .has_state(&deps.did)
+                .map_err(OrchestratorError::Mls)?;
             let mut report = match open {
                 Ok(Some(mut s)) => s.purge_account()?,
-                Ok(None) if saved.is_none() => PurgeReport {
+                Ok(None) if !had_saved => PurgeReport {
                     remote_pending: deps.delete_account_remote_at(parsed_placement).err(),
                     ..PurgeReport::default()
                 },
@@ -476,7 +662,11 @@ where
             queue.update_status(&deps.did, &mut |s| {
                 s.pending_remote_deletion = pending.clone();
                 s.excluded_members.clear();
+                s.dropped.clear();
             })?;
+            if pending.is_none() {
+                queue.clear_status_preserving_deletion(&deps.did)?;
+            }
             Ok(report)
         })
         .await
@@ -548,21 +738,34 @@ where
         message_id: &str,
         timestamp_ms: u64,
         frame: &[u8],
+        mls_snapshot: Option<(String, u64, Vec<String>)>,
     ) {
         let result = async {
             let deps = self.labyrinth_deps().await?;
-            let row =
-                PendingArchive::new(&deps.did, conversation_id, message_id, timestamp_ms, frame);
             // Enabled on this device = a saved state exists.
             let (vault, did) = (deps.vault.clone(), deps.did.clone());
-            let enabled = tokio::task::spawn_blocking(move || vault.load(&did))
+            let enabled = tokio::task::spawn_blocking(move || vault.has_state(&did))
                 .await
                 .map_err(join_error)?
-                .map_err(OrchestratorError::Mls)?
-                .is_some();
+                .map_err(OrchestratorError::Mls)?;
             if !enabled {
                 return Ok(());
             }
+            let (group_id_hex, mls_epoch, expected_member_dids) =
+                mls_snapshot.ok_or_else(|| {
+                    OrchestratorError::Storage(
+                    "labyrinth: cannot archive sent message without local OpenMLS roster snapshot"
+                        .into(),
+                )
+                })?;
+            if expected_member_dids.is_empty() {
+                return Err(OrchestratorError::Storage(
+                    "labyrinth: local OpenMLS roster snapshot is empty".into(),
+                ));
+            }
+            let row =
+                PendingArchive::new(&deps.did, conversation_id, message_id, timestamp_ms, frame)
+                    .with_mls_snapshot(group_id_hex, mls_epoch, expected_member_dids);
             // Start (or keep) the worker first: it counts the rows already
             // pending, and this one is counted by `enqueued`.
             self.labyrinth_start_archive_worker(deps).await?;

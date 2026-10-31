@@ -54,9 +54,18 @@ impl FlushReport {
 /// not count towards quarantine.
 pub(crate) fn is_transient(e: &labyrinth::Error) -> bool {
     match e {
-        labyrinth::Error::Backend(m) => ["xrpc 0:", "xrpc 5", "xrpc 429", "xrpc 408"]
-            .iter()
-            .any(|p| m.starts_with(p)),
+        labyrinth::Error::Backend(m) => [
+            "xrpc 0:",
+            "xrpc 5",
+            "xrpc 429",
+            "xrpc 408",
+            "space 0:",
+            "space 5",
+            "space 429",
+            "space 408",
+        ]
+        .iter()
+        .any(|p| m.starts_with(p)),
         labyrinth::Error::Rng => true,
         _ => false,
     }
@@ -103,9 +112,28 @@ fn flush_conversation(
     rows: Vec<PendingArchive>,
     report: &mut FlushReport,
 ) -> Result<labyrinth::Result<()>> {
+    use std::collections::BTreeSet;
+
     let did = session.did().to_owned();
     let mut todo = Vec::with_capacity(rows.len());
+    let mut quarantined_legacy = false;
     for mut row in rows {
+        let has_snapshot = row
+            .expected_member_dids
+            .as_ref()
+            .is_some_and(|members| !members.is_empty());
+        if !has_snapshot {
+            row.last_error =
+                Some("labyrinth: missing local MLS roster snapshot on queued archive".to_owned());
+            row.failures = MAX_FAILURES.max(row.failures.saturating_add(1));
+            if !row.quarantined {
+                row.quarantined = true;
+                report.quarantined += 1;
+            }
+            store.put(&row)?;
+            quarantined_legacy = true;
+            continue;
+        }
         if row.inflight {
             match session.has_archived(conversation, &row.message_id)? {
                 Ok(true) => {
@@ -123,11 +151,28 @@ fn flush_conversation(
         todo.push(row);
     }
     if todo.is_empty() {
+        if quarantined_legacy {
+            report.failed_conversations += 1;
+        }
         return Ok(Ok(()));
     }
-    let members = match conversation_roster(deps, conversation) {
+
+    let first_group_id_hex = todo.first().and_then(|r| r.group_id_hex.as_deref());
+    let local_snapshot = deps
+        .local_authority
+        .as_ref()
+        .map(|auth| auth.current_group_snapshot(conversation, first_group_id_hex))
+        .transpose()?
+        .flatten();
+
+    let ds_members = match conversation_roster(deps, conversation) {
         Ok(m) => m,
         Err(labyrinth::Error::NotFound("conversation")) => {
+            if local_snapshot.is_some() {
+                return Ok(Err(labyrinth::Error::Backend(
+                    "xrpc 503: conversation missing on mls-ds while local MLS group exists".into(),
+                )));
+            }
             drop_rows(
                 store,
                 &did,
@@ -139,39 +184,85 @@ fn flush_conversation(
         }
         Err(e) => return Ok(Err(e)),
     };
-    let items = todo
-        .iter()
-        .map(|r| Ok((r.message_id.clone(), r.timestamp_ms, r.frame_bytes()?)))
-        .collect::<Result<Vec<_>>>()?;
-    let excluded = match session.archive_conversation(conversation, &members, &items)? {
-        Ok(x) => x,
-        Err(e) => return Ok(Err(e)),
-    };
-    for row in &todo {
-        store.remove(&did, &row.message_id)?;
-        report.archived += 1;
+    let ds_set: BTreeSet<&str> = ds_members.iter().map(String::as_str).collect();
+
+    // Partition contiguous rows by `(group_id_hex, mls_epoch, expected_member_dids)`
+    // so pre-join/post-join or pre-removal/post-removal messages never share a
+    // roster batch or MEK.
+    type ChunkKey = (Option<String>, Option<u64>, Vec<String>);
+    let mut chunks: Vec<(ChunkKey, Vec<PendingArchive>)> = Vec::new();
+    for row in todo {
+        let mut expected = row.expected_member_dids.clone().unwrap_or_default();
+        expected.sort();
+        expected.dedup();
+        let key: ChunkKey = (row.group_id_hex.clone(), row.mls_epoch, expected);
+        match chunks.last_mut() {
+            Some((last_key, batch)) if *last_key == key => batch.push(row),
+            _ => chunks.push((key, vec![row])),
+        }
     }
-    report.excluded_members += excluded.len();
-    let at_ms = now_ms();
-    store.update_status(&did, &mut |s| {
-        for m in members
+
+    for ((chunk_group_id_hex, chunk_epoch, expected_members), chunk_rows) in chunks {
+        let expected_set: BTreeSet<&str> = expected_members.iter().map(String::as_str).collect();
+        let authoritative_ds_set: BTreeSet<&str> = match (&local_snapshot, chunk_epoch) {
+            (Some(snap), Some(row_epoch))
+                if chunk_group_id_hex
+                    .as_deref()
+                    .is_none_or(|gid| gid == snap.group_id_hex)
+                    && snap.epoch > row_epoch
+                    && !snap.member_dids.is_empty() =>
+            {
+                snap.member_dids.iter().map(String::as_str).collect()
+            }
+            _ => expected_set.clone(),
+        };
+
+        if ds_set.iter().any(|d| !authoritative_ds_set.contains(*d)) {
+            return Ok(Err(labyrinth::Error::Malformed(
+                "ds roster contains non-mls participant",
+            )));
+        }
+        if authoritative_ds_set.iter().any(|d| !ds_set.contains(*d)) {
+            return Ok(Err(labyrinth::Error::Malformed(
+                "ds roster omits mls participant",
+            )));
+        }
+
+        let items = chunk_rows
             .iter()
-            .filter(|m| !excluded.iter().any(|x| x.did == **m))
-        {
-            s.readmit(conversation, m);
+            .map(|r| Ok((r.message_id.clone(), r.timestamp_ms, r.frame_bytes()?)))
+            .collect::<Result<Vec<_>>>()?;
+        let excluded =
+            match session.archive_conversation(conversation, &expected_members, &items)? {
+                Ok(x) => x,
+                Err(e) => return Ok(Err(e)),
+            };
+        for row in &chunk_rows {
+            store.remove(&did, &row.message_id)?;
+            report.archived += 1;
         }
+        report.excluded_members += excluded.len();
+        let at_ms = now_ms();
+        store.update_status(&did, &mut |s| {
+            for m in expected_members
+                .iter()
+                .filter(|m| !excluded.iter().any(|x| x.did == **m))
+            {
+                s.readmit(conversation, m);
+            }
+            for x in &excluded {
+                s.exclude(MemberExclusion {
+                    conversation_id: conversation.to_owned(),
+                    did: x.did.clone(),
+                    reason: x.error.to_string(),
+                    needs_repin: matches!(x.error, labyrinth::Error::EpochRollback { .. }),
+                    at_ms,
+                });
+            }
+        })?;
         for x in &excluded {
-            s.exclude(MemberExclusion {
-                conversation_id: conversation.to_owned(),
-                did: x.did.clone(),
-                reason: x.error.to_string(),
-                needs_repin: matches!(x.error, labyrinth::Error::EpochRollback { .. }),
-                at_ms,
-            });
+            tracing::warn!(conversation, did = %x.did, error = %x.error, "labyrinth: member excluded from the archive roster");
         }
-    })?;
-    for x in &excluded {
-        tracing::warn!(conversation, did = %x.did, error = %x.error, "labyrinth: member excluded from the archive roster");
     }
     Ok(Ok(()))
 }
@@ -248,5 +339,5 @@ fn conversation_roster(deps: &SessionDeps, conversation: &str) -> labyrinth::Res
         .map_err(labyrinth::store::xrpc::map_error)?;
     let state: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| labyrinth::Error::Backend(format!("conversation state: {e}")))?;
-    Ok(roster_members(&state))
+    roster_members(&state)
 }

@@ -4248,7 +4248,9 @@ where
                 &convo_uuid_str,
                 state_obj,
             )?;
-            return self.recover_leaf_or_reset(&server_state, &user_did).await;
+            return self
+                .recover_leaf_or_reset_with_policy(&server_state, &user_did, true)
+                .await;
         }
 
         let prov = my_participant.get("invitationProvenance").ok_or_else(|| {
@@ -5118,12 +5120,49 @@ where
         let identity_bytes = scoped_identity.into_bytes();
         let welcome_result = self.mls_context().process_welcome(
             welcome_data.to_vec(),
-            identity_bytes,
+            identity_bytes.clone(),
             Some(self.config().group_config.clone()),
         )?;
         let group_id_hex = hex::encode(&welcome_result.group_id);
 
         tracing::debug!(group_id = %group_id_hex, "Processed Welcome message");
+
+        // F-02: Enforce Stage-2 ATProto device-key authorization on every peer
+        // leaf in the imported Welcome ratchet tree before looking up or
+        // persisting any local conversation state.
+        let welcome_leaf_check: Result<()> = match self
+            .mls_context()
+            .group_member_leaf_bindings(welcome_result.group_id.clone())
+        {
+            Ok(Some(bindings)) => {
+                self.verify_inbound_peer_leaf_bindings(
+                    None,
+                    "welcome",
+                    "join_group",
+                    &identity_bytes,
+                    &bindings,
+                )
+                .await
+            }
+            Ok(None) => Ok(()),
+            Err(err) => Err(err.into()),
+        };
+        if let Err(binding_error) = welcome_leaf_check {
+            return Err(self
+                .rollback_failed_welcome_join(
+                    WelcomeJoinRollback {
+                        user_did: &user_did,
+                        conversation_id: None,
+                        group_id_hex: &group_id_hex,
+                        group_id: welcome_result.group_id,
+                        group_state_write_attempted: false,
+                        prior_group_state: None,
+                        remove_new_conversation: false,
+                    },
+                    binding_error,
+                )
+                .await);
+        }
 
         // Fetch the stable conversation mapping from a bounded traversal. A
         // Welcome may target a conversation beyond the first 100 rows; the DS

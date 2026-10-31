@@ -1300,12 +1300,9 @@ impl MLSStorageBackend for MockStorage {
                 .entry(conversation_id.into())
                 .and_modify(|high| *high = (*high).max(reset_generation))
                 .or_insert(reset_generation);
-            // Ruling 2a: the authority commit is also the quarantine exit, so
-            // the persisted quarantine row goes away in this same critical
-            // section. A backend that waits for the orchestrator's separate
-            // `clear_quarantine` backstop can mint a row that is both
-            // reset-pending and quarantined whenever that call fails.
-            inner.quarantines.remove(conversation_id);
+            // F-03: Never clear persisted Layer-3 peer-poison quarantine inside
+            // `mark_reset_pending` — unverified server reset hints must not lift
+            // quarantine without explicit `UserConfirmedReset` or healthy peer commit.
             *inner
                 .mark_reset_pending_calls
                 .entry(conversation_id.to_string())
@@ -1771,11 +1768,15 @@ impl MLSStorageBackend for MockStorage {
                 "injected store_message failure".to_string(),
             ));
         }
-        inner
+        let conv_messages = inner
             .messages
             .entry(message.conversation_id.clone())
-            .or_default()
-            .push(message.clone());
+            .or_default();
+        if let Some(existing) = conv_messages.iter_mut().find(|m| m.id == message.id) {
+            *existing = message.clone();
+        } else {
+            conv_messages.push(message.clone());
+        }
         Ok(())
     }
 

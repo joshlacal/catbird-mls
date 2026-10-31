@@ -280,7 +280,24 @@ where
             .map(|view| view.group_id.as_str());
         let changed_group = previous_group.is_some_and(|previous| previous != group_hex);
         let removed = orch.is_local_device_removed(conversation_id).await?;
+        let quarantined = orch.is_conversation_quarantined(conversation_id).await?;
         let mut events = Vec::new();
+
+        // F-03: Never allow an unauthenticated ConversationHint to clear Layer-3
+        // peer-poison quarantine, record an unverified group reset, auto-adopt a
+        // Welcome, or sign recovery/leave control commits on a quarantined group.
+        if quarantined {
+            if changed_group {
+                tracing::warn!(
+                    convo_id = conversation_id,
+                    "[F-03] ignoring unauthenticated ConversationHint group change while conversation is quarantined"
+                );
+                return Ok(refresh_events(conversation_id));
+            }
+            if hint.kind == HintKind::ResetRequested {
+                return Ok(refresh_events(conversation_id));
+            }
+        }
 
         // A request merely asks an administrator to act. Only independently
         // read activated coordinates can establish a successor MLS group.
@@ -341,6 +358,9 @@ where
                         .any(|member| member == identity.as_bytes())
                 });
         if !has_local_leaf {
+            if quarantined {
+                return Ok(refresh_events(conversation_id));
+            }
             match orch.fetch_welcome_delivery(conversation_id).await {
                 Ok(delivery) => {
                     orch.join_or_rejoin_from_delivery(delivery).await?;
@@ -385,7 +405,7 @@ where
         }
 
         events.extend(self.catch_up_event_conversation(conversation_id).await?);
-        if matches!(hint.kind, HintKind::Changed | HintKind::LeafRecovery) {
+        if !quarantined && matches!(hint.kind, HintKind::Changed | HintKind::LeafRecovery) {
             // Each fulfillment re-reads state and validates the reserved exact
             // device package. Processing an account's sibling is allowed.
             let current = orch.fetch_conversation_lifecycle(conversation_id).await?;
@@ -407,7 +427,8 @@ where
                 .await?;
             }
         }
-        if matches!(hint.kind, HintKind::Changed | HintKind::LeaveRequest)
+        if !quarantined
+            && matches!(hint.kind, HintKind::Changed | HintKind::LeaveRequest)
             && fresh["pendingLeaveRequests"]
                 .as_array()
                 .is_some_and(|requests| !requests.is_empty())
@@ -1322,6 +1343,7 @@ mod tests {
                         "items": [item1],
                         "inventorySessionId": "session-12345678-1234-1234-1234-123456789012",
                         "snapshotEventCursor": "cursor-fence-001",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
                         "hasMore": true,
                         "nextPageCursor": "page-2-cursor"
                     }))
@@ -1336,6 +1358,7 @@ mod tests {
                         "items": [item2],
                         "inventorySessionId": "session-12345678-1234-1234-1234-123456789012",
                         "snapshotEventCursor": "cursor-fence-001",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
                         "hasMore": false
                     }))
                     .unwrap(),
@@ -1674,6 +1697,7 @@ mod tests {
                         "items": [],
                         "inventorySessionId": "session-false-with-next",
                         "snapshotEventCursor": "fence-1",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
                         "hasMore": false,
                         "nextPageCursor": "unexpected-page-cursor"
                     }))
@@ -1696,7 +1720,8 @@ mod tests {
                     body: serde_json::to_vec(&json!({
                         "items": [],
                         "inventorySessionId": "session-missing-has-more",
-                        "snapshotEventCursor": "fence-1"
+                        "snapshotEventCursor": "fence-1",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z"
                     }))
                     .unwrap(),
                 }));
@@ -1718,6 +1743,7 @@ mod tests {
                         "items": [],
                         "inventorySessionId": "session-string-has-more",
                         "snapshotEventCursor": "fence-1",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
                         "hasMore": "false"
                     }))
                     .unwrap(),
@@ -1740,6 +1766,7 @@ mod tests {
                         "items": [],
                         "inventorySessionId": "session-int-cursor",
                         "snapshotEventCursor": "fence-1",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
                         "hasMore": true,
                         "nextPageCursor": 12345
                     }))
@@ -1763,6 +1790,7 @@ mod tests {
                         "items": [],
                         "inventorySessionId": "session-fence-test",
                         "snapshotEventCursor": "fence-alpha",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
                         "hasMore": true,
                         "nextPageCursor": "page-2"
                     }))
@@ -1777,6 +1805,7 @@ mod tests {
                         "items": [],
                         "inventorySessionId": "session-fence-test",
                         "snapshotEventCursor": "fence-beta-MISMATCH",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
                         "hasMore": false
                     }))
                     .unwrap(),
@@ -2603,6 +2632,98 @@ mod tests {
             assert_eq!(
                 allocations, 1,
                 "deferred recovery over multiple conversations must allocate exactly ONE inventory snapshot (was {allocations})"
+            );
+        });
+    }
+
+    #[test]
+    fn f03_peer_poison_quarantine_survives_unauthenticated_conversation_hint() {
+        crate::async_runtime::block_on(async {
+            let mut world = TestWorld::new();
+            let alice_did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
+            let bob_did = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
+            world.add_client_with_did("Alice", alice_did).await;
+            world.add_client_with_did("Bob", bob_did).await;
+            world.register_device("Alice").await.unwrap();
+            world.register_device("Bob").await.unwrap();
+
+            let alice_engine = engine_for(&world, "Alice").await;
+            let g1 = alice_engine
+                .orchestrator
+                .create_group("quarantined group", Some(&[bob_did.into()]), None)
+                .await
+                .unwrap();
+
+            // Place conversation into Layer-3 PeerBadCommit quarantine.
+            alice_engine
+                .orchestrator
+                .enter_quarantine(
+                    &g1.conversation_id,
+                    crate::orchestrator::types::QuarantineReason::PeerBadCommit,
+                )
+                .await;
+            assert!(alice_engine
+                .orchestrator
+                .get_conversation_quarantine_state(&g1.conversation_id)
+                .await
+                .is_some());
+
+            // Server sends an unauthenticated conversationChangedEvent claiming a reset
+            // to a new groupId at generation 2.
+            let mut rotated_state = world
+                .delivery_service()
+                .lifecycle_state(&g1.conversation_id)
+                .expect("existing conversation state");
+            rotated_state["coordinates"]["groupId"] =
+                json!(base64::engine::general_purpose::STANDARD.encode([0x77u8; 32]));
+            rotated_state["coordinates"]["generation"] = json!(2);
+            rotated_state["snapshotSeq"] = json!(2);
+            let rotated_item = json!({ "state": rotated_state });
+            world
+                .delivery_service()
+                .set_lifecycle_state_for_test(&g1.conversation_id, rotated_item["state"].clone());
+            world
+                .delivery_service()
+                .queue_inventory_result_for_test(Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: serde_json::to_vec(&json!({
+                        "items": [rotated_item],
+                        "inventorySessionId": "session-f03-quarantine",
+                        "snapshotEventCursor": "cursor-f03-001",
+                        "snapshotExpiresAt": "2099-01-01T00:00:00.000Z",
+                        "hasMore": false
+                    }))
+                    .unwrap(),
+                }));
+
+            let hint_payload = event(
+                "conversationChangedEvent",
+                json!({ "conversationId": g1.conversation_id }),
+            );
+            alice_engine
+                .process_server_event(&hint_payload.to_string())
+                .expect("hint on quarantined conversation must not crash event loop");
+
+            assert!(
+                alice_engine
+                    .orchestrator
+                    .get_conversation_quarantine_state(&g1.conversation_id)
+                    .await
+                    .is_some(),
+                "F-03: unauthenticated ConversationHint must NOT clear peer-poison quarantine"
+            );
+            assert!(
+                matches!(
+                    alice_engine
+                        .orchestrator
+                        .storage()
+                        .get_conversation_state(&g1.conversation_id)
+                        .await
+                        .unwrap(),
+                    Some(ConversationState::Quarantined { .. })
+                ),
+                "F-03: durable Quarantined state must remain intact after unauthenticated ConversationHint"
             );
         });
     }

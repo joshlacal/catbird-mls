@@ -1,7 +1,12 @@
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::AeadCore;
 use aes_gcm::{Aes256Gcm, Nonce};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+const KEY_LEN: usize = 32;
+const NONCE_LEN: usize = 12;
 
 #[derive(Debug, Clone)]
 pub struct EncryptedBlob {
@@ -22,8 +27,10 @@ pub enum BlobCryptoError {
 }
 
 pub fn encrypt_blob(plaintext: &[u8]) -> Result<EncryptedBlob, BlobCryptoError> {
-    let key = Aes256Gcm::generate_key(&mut OsRng);
-    let cipher = Aes256Gcm::new(&key);
+    let mut raw_key = Zeroizing::new([0u8; KEY_LEN]);
+    OsRng.fill_bytes(&mut *raw_key);
+    let cipher =
+        Aes256Gcm::new_from_slice(&*raw_key).map_err(|_| BlobCryptoError::EncryptionFailed)?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let ciphertext = cipher
         .encrypt(&nonce, plaintext)
@@ -32,7 +39,7 @@ pub fn encrypt_blob(plaintext: &[u8]) -> Result<EncryptedBlob, BlobCryptoError> 
     Ok(EncryptedBlob {
         sha256: sha256_hex(&ciphertext),
         ciphertext,
-        key: key.to_vec(),
+        key: raw_key.to_vec(),
         iv: nonce.to_vec(),
     })
 }
@@ -46,8 +53,14 @@ pub fn decrypt_blob(
     if sha256_hex(ciphertext) != expected_sha256 {
         return Err(BlobCryptoError::IntegrityCheckFailed);
     }
+    if key.len() != KEY_LEN || iv.len() != NONCE_LEN {
+        return Err(BlobCryptoError::DecryptionFailed);
+    }
 
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| BlobCryptoError::DecryptionFailed)?;
+    let mut raw_key = Zeroizing::new([0u8; KEY_LEN]);
+    raw_key.copy_from_slice(key);
+    let cipher =
+        Aes256Gcm::new_from_slice(&*raw_key).map_err(|_| BlobCryptoError::DecryptionFailed)?;
     let nonce = Nonce::from_slice(iv);
 
     cipher
@@ -76,5 +89,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(decrypted, b"hello image");
+    }
+
+    #[test]
+    fn decrypt_blob_rejects_non_12_byte_iv_without_panicking() {
+        let encrypted = encrypt_blob(b"hello image").unwrap();
+        for bad_len in [0usize, 11, 13, 32] {
+            let bad_iv = vec![0x42u8; bad_len];
+            let err = decrypt_blob(
+                &encrypted.ciphertext,
+                &encrypted.key,
+                &bad_iv,
+                &encrypted.sha256,
+            )
+            .expect_err("non-12-byte IV must return DecryptionFailed without panicking");
+            assert!(
+                matches!(err, BlobCryptoError::DecryptionFailed),
+                "unexpected error for iv len {bad_len}: {err:?}"
+            );
+        }
     }
 }

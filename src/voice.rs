@@ -5,7 +5,7 @@ use audiopus::{
 };
 use ogg::reading::PacketReader;
 use ogg::writing::PacketWriter;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 const OPUS_SAMPLE_RATE: u32 = 48_000;
 const OPUS_FRAME_SIZE: usize = 960; // 20ms at 48kHz
@@ -440,13 +440,41 @@ pub fn prepare_voice_message(
     pcm_path: &str,
     sample_rate: u32,
 ) -> Result<VoicePrepareResult, VoiceError> {
-    if ![8000, 16000, 24000, 44100, 48000].contains(&sample_rate) {
+    if !matches!(sample_rate, 8000 | 12000 | 16000 | 24000 | 44100 | 48000) {
         return Err(VoiceError::UnsupportedSampleRate(sample_rate));
     }
 
-    let raw_bytes = std::fs::read(pcm_path)?;
+    let meta = std::fs::symlink_metadata(pcm_path)?;
+    if !meta.file_type().is_file() {
+        return Err(VoiceError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PCM path must be a regular file",
+        )));
+    }
+    if meta.len() == 0 {
+        return Err(VoiceError::EmptyInput);
+    }
+    let max_pcm_bytes = MAX_DURATION_SECS
+        .saturating_mul(u64::from(sample_rate))
+        .saturating_mul(2);
+    if meta.len() > max_pcm_bytes {
+        return Err(VoiceError::TooLong);
+    }
+
+    let file = std::fs::File::open(pcm_path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(VoiceError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "opened PCM handle is not a regular file",
+        )));
+    }
+    let mut raw_bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    std::io::Read::take(file, max_pcm_bytes.saturating_add(1)).read_to_end(&mut raw_bytes)?;
     if raw_bytes.is_empty() {
         return Err(VoiceError::EmptyInput);
+    }
+    if raw_bytes.len() as u64 > max_pcm_bytes {
+        return Err(VoiceError::TooLong);
     }
 
     // Convert bytes to i16 samples
@@ -1042,5 +1070,52 @@ mod tests {
         let decoded = decode_opus_to_pcm(&opus_data).unwrap();
         assert!(!decoded.is_empty());
         assert!(decoded.len() / 2 <= MAX_DECODED_SAMPLES);
+    }
+
+    #[test]
+    fn f10_prepare_voice_message_rejects_invalid_sample_rate_oversized_and_non_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("does-not-exist.pcm");
+
+        // 1. Sample rate must be validated BEFORE touching the filesystem.
+        let bad_rate = prepare_voice_message(missing_path.to_str().unwrap(), 44_099);
+        assert!(matches!(
+            bad_rate,
+            Err(VoiceError::UnsupportedSampleRate(44_099))
+        ));
+
+        // 2. Opus standard 12_000 Hz sample rate must be accepted.
+        let pcm_12k = generate_sine_pcm(440.0, 0.5, 12_000);
+        let file_12k = write_pcm_file(&pcm_12k);
+        let res_12k = prepare_voice_message(file_12k.path().to_str().unwrap(), 12_000)
+            .expect("12 kHz valid PCM file should be accepted");
+        assert!(!res_12k.opus_data.is_empty());
+
+        // 3. Symlink to a valid PCM file must be rejected via symlink_metadata.
+        #[cfg(unix)]
+        {
+            let link_path = dir.path().join("symlink.pcm");
+            std::os::unix::fs::symlink(file_12k.path(), &link_path).unwrap();
+            let link_err = prepare_voice_message(link_path.to_str().unwrap(), 12_000);
+            assert!(
+                matches!(link_err, Err(VoiceError::IoError(_))),
+                "symlink must be rejected as non-regular file, got {link_err:?}"
+            );
+        }
+
+        // 4. Directory path must be rejected.
+        let dir_err = prepare_voice_message(dir.path().to_str().unwrap(), 48_000);
+        assert!(matches!(dir_err, Err(VoiceError::IoError(_))));
+
+        // 5. Oversized sparse file (> MAX_DURATION_SECS * sample_rate * 2 bytes) must fail with TooLong.
+        let huge_path = dir.path().join("oversized.pcm");
+        let huge_file = std::fs::File::create(&huge_path).unwrap();
+        let max_bytes = MAX_DURATION_SECS * 48_000 * 2;
+        huge_file.set_len(max_bytes + 2).unwrap();
+        let huge_err = prepare_voice_message(huge_path.to_str().unwrap(), 48_000);
+        assert!(
+            matches!(huge_err, Err(VoiceError::TooLong)),
+            "oversized PCM file must fail with TooLong, got {huge_err:?}"
+        );
     }
 }

@@ -74,19 +74,71 @@ impl<A: MLSAPIClient + 'static> super::space::LabyrinthSpaceGateway for ApiGatew
     }
 }
 
+/// Maximum response payload accepted from a Labyrinth or Space XRPC call (4 MiB).
+pub const MAX_LABYRINTH_XRPC_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Maximum size of a PDS `mailboxKeys` repository record (256 KiB).
+pub const MAX_PDS_RECORD_BYTES: usize = 256 * 1024;
+
+pub(crate) fn enforce_pds_record_cap(record: &[u8]) -> Result<(), String> {
+    if record.len() > MAX_PDS_RECORD_BYTES {
+        return Err(format!(
+            "PDS record exceeds {} byte limit ({} bytes)",
+            MAX_PDS_RECORD_BYTES,
+            record.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Validates ATProto NSID syntax (`[A-Za-z0-9-]` segments separated by `.`,
+/// >= 3 non-empty segments, no `/`, `?`, `#`, `%`, or `..`) before formatting `/xrpc/{nsid}`.
+pub(crate) fn validate_nsid(nsid: &str) -> Result<(), XrpcError> {
+    if nsid.is_empty() || nsid.len() > 317 {
+        return Err(transport_error(format!(
+            "invalid XRPC NSID length: {}",
+            nsid.len()
+        )));
+    }
+    let mut segments = 0usize;
+    for seg in nsid.split('.') {
+        segments += 1;
+        if seg.is_empty()
+            || seg.len() > 63
+            || seg.starts_with('-')
+            || seg.ends_with('-')
+            || !seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(transport_error(format!("invalid XRPC NSID syntax: {nsid}")));
+        }
+    }
+    if segments < 3 {
+        return Err(transport_error(format!(
+            "invalid XRPC NSID segments: {nsid}"
+        )));
+    }
+    Ok(())
+}
+
 /// The PDS half of the Labyrinth directory ([CB-19]) through the
 /// platform's `*_labyrinth_mailbox_keys` gateway methods.
 impl<A: MLSAPIClient + 'static> labyrinth::store::pds::PdsRecords for ApiGateway<A> {
     fn put_mailbox_keys(&self, rkey: &str, record: &[u8]) -> Result<(), String> {
+        enforce_pds_record_cap(record)?;
         self.runtime
             .block_on(self.api.put_labyrinth_mailbox_keys(rkey, record))
             .map_err(|e| e.to_string())
     }
 
     fn get_mailbox_keys(&self, did: &str, rkey: &str) -> Result<Option<Vec<u8>>, String> {
-        self.runtime
+        let out = self
+            .runtime
             .block_on(self.api.get_labyrinth_mailbox_keys(did, rkey))
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        if let Some(ref bytes) = out {
+            enforce_pds_record_cap(bytes)?;
+        }
+        Ok(out)
     }
 
     fn delete_all_mailbox_keys(&self) -> Result<(), String> {
@@ -182,6 +234,13 @@ pub(crate) fn decode_response(
     response: Result<GatewayResponse, String>,
 ) -> Result<Vec<u8>, XrpcError> {
     let response = response.map_err(transport_error)?;
+    if response.body.len() > MAX_LABYRINTH_XRPC_RESPONSE_BYTES {
+        return Err(transport_error(format!(
+            "XRPC response body exceeds {} byte limit ({} bytes)",
+            MAX_LABYRINTH_XRPC_RESPONSE_BYTES,
+            response.body.len()
+        )));
+    }
     if (200..300).contains(&response.status) {
         return Ok(response.body);
     }
@@ -206,12 +265,18 @@ impl XrpcTransport for GatewayXrpcTransport {
         params: &[(&str, String)],
         headers: &[(String, String)],
     ) -> Result<Vec<u8>, XrpcError> {
-        let params = self.wire_params(params);
-        let path = Self::query_path(nsid, &params);
+        validate_nsid(nsid)?;
         let canonical = CanonicalOperation::ALL
             .iter()
             .copied()
             .find(|op| op.nsid() == nsid);
+        if canonical.is_none() && !nsid.starts_with(labyrinth::store::xrpc::NSID_PREFIX) {
+            return Err(transport_error(format!(
+                "refusing a non-Labyrinth query: {nsid}"
+            )));
+        }
+        let params = self.wire_params(params);
+        let path = Self::query_path(nsid, &params);
         let response = match canonical {
             Some(operation) => self.gateway.submit_canonical(PreparedRequest {
                 operation,
@@ -240,6 +305,7 @@ impl XrpcTransport for GatewayXrpcTransport {
         payload: &[u8],
         operation_id: [u8; 16],
     ) -> Result<Vec<u8>, XrpcError> {
+        validate_nsid(nsid)?;
         if !nsid.starts_with(labyrinth::store::xrpc::NSID_PREFIX) {
             return Err(transport_error(format!(
                 "refusing a non-Labyrinth procedure: {nsid}"
@@ -286,5 +352,138 @@ mod tests {
             assert_eq!(err.status, 400);
             assert_eq!(err.error.as_deref(), Some(name));
         }
+    }
+
+    #[test]
+    fn f13_xrpc_and_pds_responses_exceeding_byte_caps_are_rejected_before_json_parse() {
+        const FOUR_MIB: usize = 4 * 1024 * 1024;
+        // 2xx response exceeding 4 MiB must fail closed.
+        let err_200 = decode_response(Ok(GatewayResponse {
+            status: 200,
+            content_type: Some("application/json".into()),
+            body: vec![b'a'; FOUR_MIB + 1],
+        }))
+        .expect_err("200 response > 4 MiB must be rejected");
+        assert_eq!(err_200.status, 0);
+
+        // Non-2xx response exceeding 4 MiB must also fail closed without serde_json parsing.
+        let err_500 = decode_response(Ok(GatewayResponse {
+            status: 500,
+            content_type: Some("application/json".into()),
+            body: vec![b' '; FOUR_MIB + 1],
+        }))
+        .expect_err("500 response > 4 MiB must be rejected");
+        assert!(err_500.error.is_none());
+
+        // PDS record cap (256 KiB) must accept exact bound and reject +1 byte.
+        assert!(enforce_pds_record_cap(&vec![0u8; MAX_PDS_RECORD_BYTES]).is_ok());
+        assert!(enforce_pds_record_cap(&vec![0u8; MAX_PDS_RECORD_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn f13_invalid_nsid_syntax_is_rejected_before_path_formatting() {
+        use crate::labyrinth::space::{
+            LabyrinthSpaceGateway, LabyrinthSpaceRequest, SpaceXrpcTransport,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CountingGateway {
+            calls: AtomicUsize,
+        }
+        impl LabyrinthGateway for CountingGateway {
+            fn submit_labyrinth(&self, _req: LabyrinthRequest) -> Result<GatewayResponse, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: b"{}".to_vec(),
+                })
+            }
+            fn submit_canonical(&self, _req: PreparedRequest) -> Result<GatewayResponse, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: b"{}".to_vec(),
+                })
+            }
+        }
+        impl LabyrinthSpaceGateway for CountingGateway {
+            fn submit_space(&self, _req: LabyrinthSpaceRequest) -> Result<GatewayResponse, String> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(GatewayResponse {
+                    status: 200,
+                    content_type: Some("application/json".into()),
+                    body: b"{}".to_vec(),
+                })
+            }
+        }
+
+        struct DummySigner;
+        impl ChatKeySigner for DummySigner {
+            fn public_key(&self) -> [u8; 32] {
+                [7u8; 32]
+            }
+            fn sign(&self, _msg: &[u8]) -> Result<[u8; 64], String> {
+                Ok([0u8; 64])
+            }
+        }
+
+        let gw = Arc::new(CountingGateway::default());
+        let transport = GatewayXrpcTransport::new(
+            gw.clone(),
+            Arc::new(DummySigner),
+            "did:plc:alice".into(),
+            "11111111-1111-4111-8111-111111111111".into(),
+        );
+        let space_transport = SpaceXrpcTransport::new(gw.clone());
+
+        for bad_lab_nsid in [
+            "blue.catbird.labyrinth.foo/../bar",
+            "blue.catbird.labyrinth.foo?admin=1",
+            "blue.catbird.labyrinth.foo#frag",
+            "blue.catbird.labyrinth..bad",
+            "blue.catbird.labyrinth.-bad",
+            "blue.catbird",
+            "",
+        ] {
+            assert!(
+                transport
+                    .query_with_headers(bad_lab_nsid, &[], &[])
+                    .is_err(),
+                "expected query error for malformed NSID {bad_lab_nsid:?}"
+            );
+            assert!(
+                transport.procedure(bad_lab_nsid, b"{}", [0u8; 16]).is_err(),
+                "expected procedure error for malformed NSID {bad_lab_nsid:?}"
+            );
+        }
+
+        for bad_space_nsid in [
+            "com.atproto.space.getRecord/../deleteSpace",
+            "com.atproto.space.getRecord?repo=did:plc:evil",
+            "com.atproto.space.getRecord#frag",
+            "com.atproto.space..getRecord",
+        ] {
+            assert!(
+                space_transport
+                    .query_with_headers(bad_space_nsid, &[], &[])
+                    .is_err(),
+                "expected Space query error for malformed NSID {bad_space_nsid:?}"
+            );
+            assert!(
+                space_transport
+                    .procedure(bad_space_nsid, b"{}", [0u8; 16])
+                    .is_err(),
+                "expected Space procedure error for malformed NSID {bad_space_nsid:?}"
+            );
+        }
+
+        assert_eq!(
+            gw.calls.load(Ordering::SeqCst),
+            0,
+            "malformed NSIDs must be rejected before invoking any gateway"
+        );
     }
 }
