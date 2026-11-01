@@ -892,3 +892,684 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
         conversation_id: conv_id.to_string(),
     }));
 }
+
+#[test]
+fn flush_labyrinth_queue_partial_batch_retry_preserves_deterministic_rkeys_without_duplicates() {
+    use labyrinth::store::space::SpaceRpc as _;
+
+    struct CommitThenFailOnceTransport {
+        inner: MemorySpacePlatformTransport,
+        fail_next_batch_after_commit: std::sync::atomic::AtomicBool,
+        fail_next_owner_batch_after_commit: std::sync::atomic::AtomicBool,
+        batch_call_count: std::sync::atomic::AtomicUsize,
+        owner_batch_call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PlatformTransport for CommitThenFailOnceTransport {
+        fn execute_http(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformHttpResponse, MLSError> {
+            let mut is_second_batch = false;
+            let mut is_second_owner_batch = false;
+            if request.url.ends_with("/xrpc/com.atproto.space.applyWrites") {
+                if let Some(ref body) = request.body {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
+                        let coll = val["writes"][0]["collection"].as_str().unwrap_or_default();
+                        if coll == labyrinth::records::nsid::BATCH {
+                            let idx = self.batch_call_count.fetch_add(1, Ordering::SeqCst);
+                            if idx == 1 {
+                                is_second_batch = true;
+                            }
+                        } else if coll == labyrinth::records::nsid::OWNER_BATCH {
+                            let idx = self.owner_batch_call_count.fetch_add(1, Ordering::SeqCst);
+                            if idx == 1 {
+                                is_second_owner_batch = true;
+                            }
+                        }
+                    }
+                }
+            }
+            let real_resp = self.inner.execute_http(request)?;
+            if is_second_batch
+                && self
+                    .fail_next_batch_after_commit
+                    .swap(false, Ordering::SeqCst)
+            {
+                assert_eq!(real_resp.status, 200);
+                return Ok(PlatformHttpResponse {
+                    status: 502,
+                    headers: Vec::new(),
+                    body: br#"{"error":"BadGateway","message":"dropped response after commit"}"#
+                        .to_vec(),
+                });
+            }
+            if is_second_owner_batch
+                && self
+                    .fail_next_owner_batch_after_commit
+                    .swap(false, Ordering::SeqCst)
+            {
+                assert_eq!(real_resp.status, 200);
+                return Ok(PlatformHttpResponse {
+                    status: 502,
+                    headers: Vec::new(),
+                    body: br#"{"error":"BadGateway","message":"dropped fallback response after commit"}"#
+                        .to_vec(),
+                });
+            }
+            Ok(real_resp)
+        }
+
+        fn connect_realtime_stream(&self, _: String, _: Option<i64>) -> Result<(), MLSError> {
+            Ok(())
+        }
+        fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+            Ok(())
+        }
+    }
+
+    let space_host = labyrinth::store::space::host::MemorySpaceHost::new();
+    let alice = "did:plc:alicerkeyretry000000";
+    let ds_did = "did:web:chat.catbird.blue";
+    let conv_primary = "convo-rkey-primary";
+    let conv_fallback = "convo-rkey-fallback";
+    let primary_space_uri =
+        format!("at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_primary}-0");
+    let primary_space_ref = labyrinth::store::space::SpaceRef::parse(&primary_space_uri).unwrap();
+    space_host.grant_space_member(&primary_space_ref, alice);
+
+    let all_scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let tmp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(CommitThenFailOnceTransport {
+        inner: MemorySpacePlatformTransport::new(&space_host, alice),
+        fail_next_batch_after_commit: std::sync::atomic::AtomicBool::new(true),
+        fail_next_owner_batch_after_commit: std::sync::atomic::AtomicBool::new(true),
+        batch_call_count: std::sync::atomic::AtomicUsize::new(0),
+        owner_batch_call_count: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let client = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "dev-rkey-1".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        transport.clone(),
+        None,
+    )
+    .unwrap();
+    client.enroll_device(&all_scopes).unwrap();
+    client
+        .create_group(conv_primary, ds_did, None, None)
+        .unwrap();
+    for i in 1..=3 {
+        client
+            .send_message(
+                conv_primary,
+                &format!("p-msg-{i}"),
+                &format!("primary #{i}"),
+            )
+            .unwrap();
+    }
+
+    // 1st flush: item 1 commits & dequeues; item 2 commits on Space then returns 502; item 3 untouched.
+    assert!(client.flush_labyrinth_queue().is_err());
+    assert_eq!(
+        client
+            .list_pending_labyrinth_queue(Some(conv_primary), 10)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // 2nd flush: item 2 is now at slice index 0 instead of 1 -> must produce identical rkey (`RecordAlreadyExists`)!
+    assert_eq!(client.flush_labyrinth_queue().unwrap(), 2);
+    assert!(client
+        .list_pending_labyrinth_queue(Some(conv_primary), 10)
+        .unwrap()
+        .is_empty());
+
+    let listed_primary = transport
+        .inner
+        .rt
+        .block_on(transport.inner.space_client.query(
+            "com.atproto.space.listRecords",
+            &[
+                ("space", primary_space_uri),
+                ("repo", alice.to_string()),
+                ("collection", labyrinth::records::nsid::BATCH.to_string()),
+                ("limit", "100".to_string()),
+            ],
+        ))
+        .unwrap();
+    let parsed_primary: serde_json::Value = serde_json::from_slice(&listed_primary).unwrap();
+    assert_eq!(
+        parsed_primary["records"].as_array().unwrap().len(),
+        3,
+        "partial-batch retry must deduplicate via deterministic rkey without writing a 4th duplicate Batch"
+    );
+
+    // Repeat for 403 kick OwnerBatch fallback!
+    let fallback_space_uri =
+        format!("at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_fallback}-0");
+    let fallback_space_ref = labyrinth::store::space::SpaceRef::parse(&fallback_space_uri).unwrap();
+    space_host.grant_space_member(&fallback_space_ref, alice);
+    space_host.revoke_space_member(&fallback_space_ref, alice);
+
+    client
+        .create_group(conv_fallback, ds_did, None, None)
+        .unwrap();
+    for i in 1..=3 {
+        client
+            .send_message(
+                conv_fallback,
+                &format!("fb-msg-{i}"),
+                &format!("fallback #{i}"),
+            )
+            .unwrap();
+    }
+    // Alice was revoked from conv_fallback's Space -> MemorySpaceHost returns 403 -> OwnerBatch fallback!
+    assert!(client.flush_labyrinth_queue().is_err());
+    assert_eq!(
+        client
+            .list_pending_labyrinth_queue(Some(conv_fallback), 10)
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(client.flush_labyrinth_queue().unwrap(), 2);
+
+    let listed_fb = transport
+        .inner
+        .rt
+        .block_on(transport.inner.space_client.query(
+            "com.atproto.space.listRecords",
+            &[
+                ("space", personal_mailbox_space_uri(alice)),
+                ("repo", alice.to_string()),
+                (
+                    "collection",
+                    labyrinth::records::nsid::OWNER_BATCH.to_string(),
+                ),
+                ("limit", "100".to_string()),
+            ],
+        ))
+        .unwrap();
+    let parsed_fb: serde_json::Value = serde_json::from_slice(&listed_fb).unwrap();
+    assert_eq!(
+        parsed_fb["records"].as_array().unwrap().len(),
+        3,
+        "partial-batch OwnerBatch fallback retry must deduplicate via deterministic rkey without writing a 4th duplicate OwnerBatch"
+    );
+}
+
+#[test]
+fn flush_labyrinth_queue_isolates_per_conversation_503_across_120_rows() {
+    struct SelectiveStallTransport {
+        inner: MemorySpacePlatformTransport,
+        stalled_space_substring: String,
+        stall_enabled: std::sync::atomic::AtomicBool,
+    }
+
+    impl PlatformTransport for SelectiveStallTransport {
+        fn execute_http(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformHttpResponse, MLSError> {
+            if self.stall_enabled.load(Ordering::SeqCst)
+                && request.url.ends_with("/xrpc/com.atproto.space.applyWrites")
+            {
+                if let Some(ref body) = request.body {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
+                        if val["space"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains(&self.stalled_space_substring)
+                        {
+                            return Ok(PlatformHttpResponse {
+                                status: 503,
+                                headers: Vec::new(),
+                                body: br#"{"error":"ServiceUnavailable"}"#.to_vec(),
+                            });
+                        }
+                    }
+                }
+            }
+            self.inner.execute_http(request)
+        }
+
+        fn connect_realtime_stream(&self, _: String, _: Option<i64>) -> Result<(), MLSError> {
+            Ok(())
+        }
+        fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+            Ok(())
+        }
+    }
+
+    let space_host = labyrinth::store::space::host::MemorySpaceHost::new();
+    let alice = "did:plc:alicehol000000000000";
+    let ds_did = "did:web:chat.catbird.blue";
+    let convo_stalled = "convo-stalled-120";
+    let convo_healthy = "convo-healthy-15";
+
+    for cid in [convo_stalled, convo_healthy] {
+        let sref = labyrinth::store::space::SpaceRef::parse(&format!(
+            "at://{ds_did}/space/blue.catbird.labyrinth.conversation/{cid}-0"
+        ))
+        .unwrap();
+        space_host.grant_space_member(&sref, alice);
+    }
+
+    let all_scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let tmp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(SelectiveStallTransport {
+        inner: MemorySpacePlatformTransport::new(&space_host, alice),
+        stalled_space_substring: convo_stalled.to_string(),
+        stall_enabled: std::sync::atomic::AtomicBool::new(true),
+    });
+    let client = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "dev-hol-1".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        transport.clone(),
+        None,
+    )
+    .unwrap();
+    client.enroll_device(&all_scopes).unwrap();
+    client
+        .create_group(convo_stalled, ds_did, None, None)
+        .unwrap();
+    client
+        .create_group(convo_healthy, ds_did, None, None)
+        .unwrap();
+
+    // Enqueue 120 rows (> 100 SQL page cap!) in convo_stalled FIRST, then 15 rows in convo_healthy.
+    for i in 1..=120 {
+        client
+            .send_message(
+                convo_stalled,
+                &format!("stalled-{i:03}"),
+                &format!("stalled #{i}"),
+            )
+            .unwrap();
+    }
+    for j in 1..=15 {
+        client
+            .send_message(
+                convo_healthy,
+                &format!("healthy-{j:03}"),
+                &format!("healthy #{j}"),
+            )
+            .unwrap();
+    }
+
+    // Flush while convo_stalled returns 503: convo_healthy MUST still drain completely!
+    assert!(
+        client.flush_labyrinth_queue().is_err(),
+        "stalled conversation 503 must still report error"
+    );
+    assert!(
+        client
+            .list_pending_labyrinth_queue(Some(convo_healthy), 50)
+            .unwrap()
+            .is_empty(),
+        "healthy conversation must NOT suffer head-of-line starvation behind 120 stalled rows"
+    );
+    let stalled_remaining = client
+        .list_pending_labyrinth_queue(Some(convo_stalled), 200)
+        .unwrap();
+    assert_eq!(stalled_remaining.len(), 120);
+    let seqs: Vec<i64> = stalled_remaining.iter().map(|p| p.seq).collect();
+    let expected_seqs: Vec<i64> = (2..=121).collect();
+    assert_eq!(
+        seqs, expected_seqs,
+        "stalled conversation queue must preserve strict causal seq order"
+    );
+
+    // Heal 503 -> all 120 stalled rows drain cleanly across 2 pages!
+    transport.stall_enabled.store(false, Ordering::SeqCst);
+    assert_eq!(client.flush_labyrinth_queue().unwrap(), 120);
+    assert!(client
+        .list_pending_labyrinth_queue(None, 200)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn flush_labyrinth_queue_aborts_in_flight_loop_immediately_when_handle_closes() {
+    struct CloseOnFirstWriteTransport {
+        inner: MemorySpacePlatformTransport,
+        batch_writes_seen: std::sync::atomic::AtomicUsize,
+        first_write_entered_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        resume_first_write_rx: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl PlatformTransport for CloseOnFirstWriteTransport {
+        fn execute_http(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformHttpResponse, MLSError> {
+            let mut is_batch = false;
+            if request.url.ends_with("/xrpc/com.atproto.space.applyWrites") {
+                if let Some(ref body) = request.body {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body) {
+                        if val["writes"][0]["collection"].as_str()
+                            == Some(labyrinth::records::nsid::BATCH)
+                        {
+                            is_batch = true;
+                        }
+                    }
+                }
+            }
+            if is_batch {
+                let n = self.batch_writes_seen.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    if let Some(tx) = self.first_write_entered_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = self.resume_first_write_rx.lock().unwrap().take() {
+                        let _ = rx.recv();
+                    }
+                }
+            }
+            self.inner.execute_http(request)
+        }
+
+        fn connect_realtime_stream(&self, _: String, _: Option<i64>) -> Result<(), MLSError> {
+            Ok(())
+        }
+        fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+            Ok(())
+        }
+    }
+
+    let space_host = labyrinth::store::space::host::MemorySpaceHost::new();
+    let alice = "did:plc:aliceclose0000000000";
+    let ds_did = "did:web:chat.catbird.blue";
+    let conv_id = "convo-close-mid-flush";
+    let sref = labyrinth::store::space::SpaceRef::parse(&format!(
+        "at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_id}-0"
+    ))
+    .unwrap();
+    space_host.grant_space_member(&sref, alice);
+
+    let all_scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+    let tmp = TempDir::new().expect("tempdir");
+    let transport = Arc::new(CloseOnFirstWriteTransport {
+        inner: MemorySpacePlatformTransport::new(&space_host, alice),
+        batch_writes_seen: std::sync::atomic::AtomicUsize::new(0),
+        first_write_entered_tx: Mutex::new(Some(entered_tx)),
+        resume_first_write_rx: Mutex::new(Some(resume_rx)),
+    });
+    let client = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "dev-close-1".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        transport.clone(),
+        None,
+    )
+    .unwrap();
+    client.enroll_device(&all_scopes).unwrap();
+    client.create_group(conv_id, ds_did, None, None).unwrap();
+    for i in 1..=10 {
+        client
+            .send_message(conv_id, &format!("close-msg-{i}"), &format!("body #{i}"))
+            .unwrap();
+    }
+
+    let flush_client = Arc::clone(&client);
+    let flush_handle = std::thread::spawn(move || flush_client.flush_labyrinth_queue());
+
+    // Wait until flush_labyrinth_queue is inside the 1st applyWrites HTTP call, then suspend to background!
+    entered_rx.recv().unwrap();
+    client
+        .prepare_for_background()
+        .expect("prepare_for_background while HTTP write is in flight");
+    assert!(client.is_handle_closed());
+    resume_tx.send(()).unwrap();
+
+    let res = flush_handle.join().unwrap();
+    assert!(
+        matches!(res, Err(MLSError::ContextClosed)),
+        "in-flight flush must abort with ContextClosed once handle closes, got {res:?}"
+    );
+    assert_eq!(
+        transport.batch_writes_seen.load(Ordering::SeqCst),
+        1,
+        "flush loop must stop immediately after the in-flight HTTP request instead of issuing remaining 9 HTTP writes"
+    );
+
+    // Resume from background and drain remaining items cleanly with deterministic rkey deduplication!
+    client.resume_from_background().unwrap();
+    assert_eq!(client.flush_labyrinth_queue().unwrap(), 10);
+    assert!(client
+        .list_pending_labyrinth_queue(Some(conv_id), 20)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches() {
+    let space_host = labyrinth::store::space::host::MemorySpaceHost::new();
+    let alice = "did:plc:alicemultiepoch00000";
+    let bob = "did:plc:bobmultiepoch0000000";
+    let ds_did = "did:web:chat.catbird.blue";
+
+    let all_scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    // -------------------------------------------------------------------------
+    // Device 1:
+    // - Epoch 1: rescue `convo-ep1` (BEFORE setup_recovery_code and BEFORE OTC!)
+    // - OTC pairing -> rotates Space 1 -> 2: rescue `convo-ep2`
+    // - setup_recovery_code() at Epoch 2 -> generates 40-char `recovery_code`
+    // - revoke_labyrinth_device -> rotates Space 2 -> 3: rescue `convo-ep3`
+    // -------------------------------------------------------------------------
+    let recovery_code = {
+        let tmp1 = TempDir::new().expect("tmp1");
+        let client1 = CatbirdMlsClient::open(
+            CatbirdMlsClientConfig {
+                storage_root: tmp1.path().display().to_string(),
+                account_did: alice.to_string(),
+                device_id: "dev-chain-1".to_string(),
+                home_ds_did: ds_did.to_string(),
+                home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+                pds_endpoint: "https://swan.place".to_string(),
+            },
+            Arc::new(TestKeystore::default()),
+            Arc::new(MemorySpacePlatformTransport::new(&space_host, alice)),
+            None,
+        )
+        .unwrap();
+        client1.enroll_device(&all_scopes).unwrap();
+        assert_eq!(client1.labyrinth_status().unwrap().epoch_seq, 1);
+
+        let c1 = client1
+            .create_group("convo-ep1", ds_did, None, None)
+            .unwrap();
+        client1
+            .import_conversation_history(
+                "convo-ep1",
+                vec![MessageRow {
+                    message_id: "ep1-bob-msg".to_string(),
+                    conversation_id: "convo-ep1".to_string(),
+                    group_id: c1.group_id,
+                    epoch: 0,
+                    seq: 1,
+                    sender_did: bob.to_string(),
+                    sender_device_id: "bob-dev".to_string(),
+                    plaintext_json: r#"{"text":"bob at epoch 1"}"#.to_string(),
+                    created_at_ms: 1_700_300_000_001,
+                    is_own: false,
+                }],
+            )
+            .unwrap();
+        assert_eq!(client1.rescue_conversation_on_kick("convo-ep1").unwrap(), 1);
+
+        // Rotate 1 -> 2 via hybrid PQ OTC pairing!
+        let offer = client1.initiate_otc_pairing().unwrap();
+        let otc_done = client1.complete_otc_pairing(&offer.six_digit_code).unwrap();
+        assert_eq!(otc_done.new_epoch_seq, 2);
+
+        client1
+            .create_group("convo-ep2", ds_did, None, None)
+            .unwrap();
+        client1
+            .send_message("convo-ep2", "ep2-alice-msg", "alice at epoch 2")
+            .unwrap();
+        assert_eq!(client1.rescue_conversation_on_kick("convo-ep2").unwrap(), 1);
+
+        // Setup 40-char recovery code at Epoch 2!
+        let code = client1.setup_recovery_code().unwrap();
+
+        // Rotate 2 -> 3 via device revocation AFTER setup_recovery_code!
+        let rev_status = client1
+            .revoke_labyrinth_device("stale-peer-device")
+            .unwrap();
+        assert_eq!(rev_status.epoch_seq, 3);
+
+        client1
+            .create_group("convo-ep3", ds_did, None, None)
+            .unwrap();
+        client1
+            .send_message("convo-ep3", "ep3-alice-msg", "alice at epoch 3 post-revoke")
+            .unwrap();
+        assert_eq!(client1.rescue_conversation_on_kick("convo-ep3").unwrap(), 1);
+
+        code
+    };
+
+    // -------------------------------------------------------------------------
+    // Device 2 (fresh keystore + DB):
+    // - Restores with `recovery_code` -> chains backward (2->1->0), forward (2->3),
+    //   and publishes atomic rotation 3 -> 4!
+    // - Recovers `convo-ep1`, `convo-ep2`, AND `convo-ep3`!
+    // - Rescues `convo-ep4` at Epoch 4, then Device 2 is also lost!
+    // -------------------------------------------------------------------------
+    {
+        let tmp2 = TempDir::new().expect("tmp2");
+        let client2 = CatbirdMlsClient::open(
+            CatbirdMlsClientConfig {
+                storage_root: tmp2.path().display().to_string(),
+                account_did: alice.to_string(),
+                device_id: "dev-chain-2".to_string(),
+                home_ds_did: ds_did.to_string(),
+                home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+                pds_endpoint: "https://swan.place".to_string(),
+            },
+            Arc::new(TestKeystore::default()),
+            Arc::new(MemorySpacePlatformTransport::new(&space_host, alice)),
+            None,
+        )
+        .unwrap();
+        let st2 = client2
+            .restore_with_recovery_code(&recovery_code)
+            .expect("Device 2 restore_with_recovery_code across multi-epoch history");
+        assert_eq!(st2.epoch_seq, 4);
+
+        assert_eq!(
+            client2
+                .restore_conversation_from_owner_mailbox("convo-ep1")
+                .expect("recover epoch 1 via backward_chain"),
+            1
+        );
+        assert_eq!(
+            client2
+                .restore_conversation_from_owner_mailbox("convo-ep2")
+                .expect("recover epoch 2 from bundle epoch"),
+            1
+        );
+        assert_eq!(
+            client2
+                .restore_conversation_from_owner_mailbox("convo-ep3")
+                .expect("recover epoch 3 via forward_chain"),
+            1
+        );
+
+        let ep1_msgs = client2.list_messages("convo-ep1", None, 10).unwrap();
+        assert_eq!(ep1_msgs[0].sender_did, bob);
+        assert!(ep1_msgs[0].plaintext_json.contains("bob at epoch 1"));
+
+        // Rescue a new conversation at Epoch 4 on Device 2!
+        client2
+            .create_group("convo-ep4", ds_did, None, None)
+            .unwrap();
+        client2
+            .send_message("convo-ep4", "ep4-dev2-msg", "sent on device 2 at epoch 4")
+            .unwrap();
+        assert_eq!(client2.rescue_conversation_on_kick("convo-ep4").unwrap(), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Device 3 (another fresh keystore + DB):
+    // - Restores using the EXACT SAME 40-char `recovery_code` from Device 1!
+    // - Chains backward (2->1->0) and forward (2->3->4, across Device 2's enrollment
+    //   rotation!) and rotates 4 -> 5!
+    // - Recovers ALL FOUR conversations (`convo-ep1`..`convo-ep4`)!
+    // -------------------------------------------------------------------------
+    let tmp3 = TempDir::new().expect("tmp3");
+    let client3 = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp3.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "dev-chain-3".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        Arc::new(MemorySpacePlatformTransport::new(&space_host, alice)),
+        None,
+    )
+    .unwrap();
+    let st3 = client3
+        .restore_with_recovery_code(&recovery_code)
+        .expect("Device 3 restore_with_recovery_code with original 40-char code");
+    assert_eq!(st3.epoch_seq, 5);
+
+    for cid in ["convo-ep1", "convo-ep2", "convo-ep3", "convo-ep4"] {
+        assert_eq!(
+            client3
+                .restore_conversation_from_owner_mailbox(cid)
+                .unwrap_or_else(|e| panic!("Device 3 failed to restore {cid}: {e}")),
+            1
+        );
+    }
+    let ep4_msgs = client3.list_messages("convo-ep4", None, 10).unwrap();
+    assert_eq!(ep4_msgs[0].sender_did, alice);
+    assert!(ep4_msgs[0]
+        .plaintext_json
+        .contains("sent on device 2 at epoch 4"));
+}

@@ -1143,7 +1143,7 @@ impl<'a> SqlReadTx<'a> {
                 .conn
                 .prepare(
                     "SELECT item_id, conversation_id, group_id_hex, seq, payload_bytes, created_at_ms \
-                     FROM labyrinth_queue WHERE conversation_id = ?1 ORDER BY seq ASC LIMIT ?2",
+                     FROM labyrinth_queue WHERE conversation_id = ?1 ORDER BY seq ASC, item_id ASC LIMIT ?2",
                 )
                 .map_err(|e| map_rusqlite_err("list_labyrinth_queue.prepare", &e))?;
             let rows = stmt
@@ -1156,7 +1156,7 @@ impl<'a> SqlReadTx<'a> {
                 .conn
                 .prepare(
                     "SELECT item_id, conversation_id, group_id_hex, seq, payload_bytes, created_at_ms \
-                     FROM labyrinth_queue ORDER BY created_at_ms ASC LIMIT ?1",
+                     FROM labyrinth_queue ORDER BY created_at_ms ASC, seq ASC, item_id ASC LIMIT ?1",
                 )
                 .map_err(|e| map_rusqlite_err("list_labyrinth_queue.prepare", &e))?;
             let rows = stmt
@@ -1165,6 +1165,24 @@ impl<'a> SqlReadTx<'a> {
             rows.collect::<Result<Vec<_>, _>>()
                 .map_err(|e| map_rusqlite_err("list_labyrinth_queue.collect", &e))
         }
+    }
+
+    /// Return distinct pending `conversation_id`s in oldest-first order so transient
+    /// errors on one conversation Space never head-of-line block healthy conversations.
+    pub fn list_labyrinth_queue_conversations(&self) -> Result<Vec<String>, MLSError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT conversation_id FROM labyrinth_queue \
+                 GROUP BY conversation_id \
+                 ORDER BY MIN(created_at_ms) ASC, conversation_id ASC",
+            )
+            .map_err(|e| map_rusqlite_err("list_labyrinth_queue_conversations.prepare", &e))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| map_rusqlite_err("list_labyrinth_queue_conversations.query", &e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| map_rusqlite_err("list_labyrinth_queue_conversations.collect", &e))
     }
 }
 

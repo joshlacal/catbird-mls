@@ -521,6 +521,17 @@ mod native_client {
             .unwrap_or(0)
     }
 
+    #[cfg(feature = "labyrinth")]
+    struct RemoteMailboxEpochState {
+        epochs: std::collections::BTreeMap<u64, labyrinth::epoch::EpochRecord>,
+        members_by_epoch: std::collections::BTreeMap<u64, Vec<labyrinth::epoch::EpochMemberRecord>>,
+        physical_devices:
+            std::collections::HashMap<[u8; 32], (labyrinth::device::DevicePublic, bool)>,
+        virtual_devices: std::collections::HashMap<[u8; 32], labyrinth::device::DevicePublic>,
+        vdev_bundles:
+            std::collections::HashMap<[u8; 16], labyrinth::virtual_device::VirtualDeviceRecord>,
+    }
+
     /// Unified per-account MLS + Labyrinth SDK client (`Spec §6.3`).
     #[derive(uniffi::Object)]
     pub struct CatbirdMlsClient {
@@ -1289,31 +1300,705 @@ mod native_client {
             })
         }
 
+        #[cfg(feature = "labyrinth")]
+        fn fetch_remote_mailbox_epoch_state(
+            &self,
+            mailbox_space_uri: &str,
+        ) -> Result<Option<RemoteMailboxEpochState>, MLSError> {
+            let Some(epoch_vals) = self.list_space_records_if_supported(
+                mailbox_space_uri,
+                labyrinth::records::nsid::EPOCH,
+            )?
+            else {
+                return Ok(None);
+            };
+            let member_vals = self
+                .list_space_records_if_supported(
+                    mailbox_space_uri,
+                    labyrinth::records::nsid::EPOCH_MEMBER,
+                )?
+                .unwrap_or_default();
+            let device_vals = self
+                .list_space_records_if_supported(
+                    mailbox_space_uri,
+                    labyrinth::records::nsid::DEVICE,
+                )?
+                .unwrap_or_default();
+            let vdev_vals = self
+                .list_space_records_if_supported(
+                    mailbox_space_uri,
+                    labyrinth::records::nsid::VIRTUAL_DEVICE,
+                )?
+                .unwrap_or_default();
+
+            let mut epochs = std::collections::BTreeMap::new();
+            for val in epoch_vals {
+                if let Ok(doc) = serde_json::from_value::<labyrinth::records::Epoch>(val) {
+                    if let Ok(rec) = doc.to_record() {
+                        epochs.insert(rec.public.seq, rec);
+                    }
+                }
+            }
+
+            let mut members_by_epoch: std::collections::BTreeMap<
+                u64,
+                Vec<labyrinth::epoch::EpochMemberRecord>,
+            > = std::collections::BTreeMap::new();
+            for val in member_vals {
+                if let Ok(doc) = serde_json::from_value::<labyrinth::records::EpochMember>(val) {
+                    if let Ok(rec) = doc.to_record() {
+                        let bucket = members_by_epoch.entry(rec.seq).or_default();
+                        if !bucket
+                            .iter()
+                            .any(|m| m.device_key_pub == rec.device_key_pub)
+                        {
+                            bucket.push(rec);
+                        }
+                    }
+                }
+            }
+
+            let mut physical_devices = std::collections::HashMap::new();
+            for val in device_vals {
+                if let Ok(doc) = serde_json::from_value::<labyrinth::records::Device>(val) {
+                    let is_revoked = doc.revoked_at.is_some();
+                    if let Ok(pub_dev) = doc.to_public() {
+                        if !pub_dev.is_virtual && pub_dev.verify().is_ok() {
+                            physical_devices
+                                .insert(pub_dev.device_key_pub.0, (pub_dev, is_revoked));
+                        }
+                    }
+                }
+            }
+
+            let mut virtual_devices = std::collections::HashMap::new();
+            let mut vdev_bundles = std::collections::HashMap::new();
+            for val in vdev_vals {
+                if let Ok(doc) = serde_json::from_value::<labyrinth::records::VirtualDevice>(val) {
+                    if let Ok((bundle, _)) = doc.to_bundle() {
+                        virtual_devices
+                            .insert(bundle.public.device_key_pub.0, bundle.public.clone());
+                        vdev_bundles.insert(bundle.vdevice_id, bundle);
+                    }
+                }
+            }
+
+            Ok(Some(RemoteMailboxEpochState {
+                epochs,
+                members_by_epoch,
+                physical_devices,
+                virtual_devices,
+                vdev_bundles,
+            }))
+        }
+
+        #[cfg(feature = "labyrinth")]
+        fn publish_physical_device_if_needed(
+            &self,
+            mailbox_space_uri: &str,
+            me_secrets: &labyrinth::device::DeviceSecrets,
+            remote: &mut RemoteMailboxEpochState,
+            now_ms: i64,
+        ) -> Result<(), MLSError> {
+            let dk = me_secrets.public().device_key_pub.0;
+            if remote.physical_devices.contains_key(&dk) {
+                return Ok(());
+            }
+            let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
+            let phys_dev_doc =
+                labyrinth::records::Device::from_public(me_secrets.public(), created_at);
+            let phys_dev_rkey = hex::encode(dk);
+            let phys_dev_val = serde_json::to_value(&phys_dev_doc)
+                .map_err(|e| MLSError::Internal(format!("serialize Device: {e}")))?;
+            let resp = self.apply_space_writes(
+                mailbox_space_uri,
+                &[serde_json::json!({
+                    "$type": "com.atproto.space.applyWrites#create",
+                    "collection": labyrinth::records::nsid::DEVICE,
+                    "rkey": phys_dev_rkey,
+                    "value": phys_dev_val,
+                })],
+            )?;
+            if !is_space_write_committed(&resp) {
+                return Err(MLSError::Internal(format!(
+                    "publish_physical_device_if_needed applyWrites returned HTTP {}",
+                    resp.status
+                )));
+            }
+            remote
+                .physical_devices
+                .insert(dk, (me_secrets.public().clone(), false));
+            Ok(())
+        }
+
+        #[cfg(feature = "labyrinth")]
+        fn ensure_local_epoch_chain_published(
+            &self,
+            mailbox_space_uri: &str,
+            target_seq: u64,
+            me_secrets: &labyrinth::device::DeviceSecrets,
+            transport_signer: &ClientTransportSigner,
+            remote: &mut RemoteMailboxEpochState,
+            now_ms: i64,
+        ) -> Result<(), MLSError> {
+            use labyrinth::epoch::EpochKeys as _;
+
+            self.publish_physical_device_if_needed(mailbox_space_uri, me_secrets, remote, now_ms)?;
+            let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
+
+            for seq in 0..=target_seq {
+                if remote.epochs.contains_key(&seq) {
+                    continue;
+                }
+                let root = self
+                    .db
+                    .write_tx(|tx| ensure_owner_epoch_root(tx, seq, now_ms))?;
+                let cur_secret = labyrinth::epoch::EpochSecret::from_parts(
+                    seq,
+                    labyrinth::epoch::space_epoch_id(seq),
+                    *root,
+                );
+                let members_hash = labyrinth::mailbox::members_hash_for_devices(
+                    std::slice::from_ref(me_secrets.public()),
+                )
+                .map_err(|e| MLSError::Cryptography(format!("members_hash_for_devices: {e}")))?;
+
+                let (public, encrypted_prev_seq, encrypted_prev_root) = if seq == 0 {
+                    let pub0 = labyrinth::mailbox::EpochPublic::sign(
+                        &self.normalized_did,
+                        0,
+                        &cur_secret.mailbox_keys(),
+                        members_hash,
+                        None,
+                        None,
+                        transport_signer,
+                    )
+                    .map_err(|e| MLSError::Cryptography(format!("EpochPublic::sign(0): {e}")))?;
+                    (pub0, None, None)
+                } else {
+                    let prev_seq = seq - 1;
+                    let prev_root = self
+                        .db
+                        .write_tx(|tx| ensure_owner_epoch_root(tx, prev_seq, now_ms))?;
+                    let prev_secret = labyrinth::epoch::EpochSecret::from_parts(
+                        prev_seq,
+                        labyrinth::epoch::space_epoch_id(prev_seq),
+                        *prev_root,
+                    );
+                    let prev_head = remote
+                        .epochs
+                        .get(&prev_seq)
+                        .map(|r| r.public.head)
+                        .ok_or_else(|| {
+                            MLSError::InvalidState(format!(
+                                "missing predecessor Space epoch {prev_seq} head"
+                            ))
+                        })?;
+                    let prev_keys = prev_secret.mailbox_keys();
+                    let pub_n = labyrinth::mailbox::EpochPublic::sign(
+                        &self.normalized_did,
+                        seq,
+                        &cur_secret.mailbox_keys(),
+                        members_hash,
+                        Some(prev_head),
+                        Some(&prev_keys.sig_secret),
+                        transport_signer,
+                    )
+                    .map_err(|e| {
+                        MLSError::Cryptography(format!("EpochPublic::sign({seq}): {e}"))
+                    })?;
+                    let data_key = cur_secret.data_key();
+                    let enc_prev_seq = labyrinth::aead::seal(
+                        &data_key,
+                        b"epoch_data_metadata",
+                        prev_seq.to_string().as_bytes(),
+                    )
+                    .map_err(|e| MLSError::Cryptography(format!("seal prev_seq: {e}")))?;
+                    let enc_prev_root = labyrinth::aead::seal(
+                        &data_key,
+                        b"epoch_data_metadata",
+                        prev_secret.root(),
+                    )
+                    .map_err(|e| MLSError::Cryptography(format!("seal prev_root: {e}")))?;
+                    (pub_n, Some(enc_prev_seq), Some(enc_prev_root))
+                };
+
+                let epoch_rec = labyrinth::epoch::EpochRecord {
+                    public,
+                    encrypted_prev_seq,
+                    encrypted_prev_root,
+                    opened_by: me_secrets.public().device_key_pub,
+                };
+                let member_rec = labyrinth::epoch::add_device_mac(&cur_secret, me_secrets.public())
+                    .map_err(|e| MLSError::Cryptography(format!("add_device_mac({seq}): {e}")))?;
+
+                let epoch_doc =
+                    labyrinth::records::Epoch::from_record(&epoch_rec, created_at.clone());
+                let epoch_val = serde_json::to_value(&epoch_doc)
+                    .map_err(|e| MLSError::Internal(format!("serialize Epoch({seq}): {e}")))?;
+                let member_doc =
+                    labyrinth::records::EpochMember::from_record(&member_rec, created_at.clone());
+                let member_rkey = member_doc.rkey();
+                let member_val = serde_json::to_value(&member_doc).map_err(|e| {
+                    MLSError::Internal(format!("serialize EpochMember({seq}): {e}"))
+                })?;
+
+                let resp = self.apply_space_writes(
+                    mailbox_space_uri,
+                    &[
+                        serde_json::json!({
+                            "$type": "com.atproto.space.applyWrites#create",
+                            "collection": labyrinth::records::nsid::EPOCH,
+                            "rkey": labyrinth::epoch::space_epoch_id(seq),
+                            "value": epoch_val,
+                        }),
+                        serde_json::json!({
+                            "$type": "com.atproto.space.applyWrites#create",
+                            "collection": labyrinth::records::nsid::EPOCH_MEMBER,
+                            "rkey": member_rkey,
+                            "value": member_val,
+                        }),
+                    ],
+                )?;
+                if !is_space_write_committed(&resp) {
+                    return Err(MLSError::Internal(format!(
+                        "ensure_local_epoch_chain_published({seq}) returned HTTP {}",
+                        resp.status
+                    )));
+                }
+                remote.epochs.insert(seq, epoch_rec);
+                remote
+                    .members_by_epoch
+                    .entry(seq)
+                    .or_default()
+                    .push(member_rec);
+            }
+            Ok(())
+        }
+
+        #[cfg(feature = "labyrinth")]
+        fn catch_up_physical_epoch_roots_from_remote(
+            &self,
+            me_secrets: &labyrinth::device::DeviceSecrets,
+            remote: &RemoteMailboxEpochState,
+            now_ms: i64,
+        ) -> Result<Option<(u64, Zeroizing<[u8; 32]>)>, MLSError> {
+            use labyrinth::epoch::EpochKeys as _;
+
+            let Some(&latest_seq) = remote.epochs.keys().next_back() else {
+                return Ok(None);
+            };
+
+            let mut anchor: Option<(u64, Zeroizing<[u8; 32]>)> = None;
+            for seq in (0..=latest_seq).rev() {
+                let maybe_bytes = self
+                    .db
+                    .read_tx(|tx| tx.get_labyrinth_state(&owner_epoch_root_key(seq)))?;
+                if let Some(bytes) = maybe_bytes {
+                    if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                        anchor = Some((seq, Zeroizing::new(arr)));
+                        break;
+                    }
+                }
+            }
+            let Some((start_seq, start_root)) = anchor else {
+                return Ok(None);
+            };
+            if start_seq == latest_seq {
+                return Ok(Some((latest_seq, start_root)));
+            }
+
+            let Some(start_rec) = remote.epochs.get(&start_seq) else {
+                return Ok(None);
+            };
+            let mut cur_secret = labyrinth::epoch::EpochSecret::from_parts(
+                start_seq,
+                labyrinth::epoch::space_epoch_id(start_seq),
+                *start_root,
+            );
+            let mut cur_public = start_rec.public.clone();
+            let mut newly_derived: Vec<(u64, Zeroizing<[u8; 32]>)> = Vec::new();
+
+            for next_seq in (start_seq + 1)..=latest_seq {
+                let next_rec = remote.epochs.get(&next_seq).ok_or_else(|| {
+                    MLSError::InvalidState(format!("missing Space epoch {next_seq}"))
+                })?;
+                let next_members = remote.members_by_epoch.get(&next_seq).ok_or_else(|| {
+                    MLSError::InvalidState(format!("missing Space epochMember set for {next_seq}"))
+                })?;
+                let my_member = next_members
+                    .iter()
+                    .find(|m| m.device_key_pub == me_secrets.public().device_key_pub)
+                    .ok_or_else(|| {
+                        MLSError::insufficient_permissions(format!(
+                            "device is not a member of mailbox epoch {next_seq}"
+                        ))
+                    })?;
+                let opener = remote
+                    .physical_devices
+                    .get(&next_rec.opened_by.0)
+                    .map(|(d, _)| d)
+                    .ok_or_else(|| {
+                        MLSError::InvalidState(format!(
+                            "missing Space Device record for opener of epoch {next_seq}"
+                        ))
+                    })?;
+                let opener_prev_member = remote
+                    .members_by_epoch
+                    .get(&(next_seq - 1))
+                    .and_then(|ms| ms.iter().find(|m| m.device_key_pub == next_rec.opened_by));
+                let next_id = labyrinth::epoch::space_epoch_id(next_seq);
+                let opened = labyrinth::epoch::OpenedEpoch {
+                    epoch_id: &next_id,
+                    record: next_rec,
+                    my_member,
+                    opener,
+                    opener_prev_member,
+                };
+                let derived = labyrinth::epoch::forward_chain(
+                    &self.normalized_did,
+                    &cur_secret,
+                    &cur_public,
+                    &opened,
+                    &me_secrets.storage,
+                    false,
+                )
+                .map_err(|e| {
+                    MLSError::Cryptography(format!("forward_chain physical epoch {next_seq}: {e}"))
+                })?;
+                newly_derived.push((next_seq, Zeroizing::new(*derived.root())));
+                cur_public = next_rec.public.clone();
+                cur_secret = derived;
+            }
+
+            let final_root = Zeroizing::new(*cur_secret.root());
+            if !newly_derived.is_empty() {
+                self.db.write_tx(|tx| {
+                    for (seq, root) in &newly_derived {
+                        tx.put_labyrinth_state(
+                            &owner_epoch_root_key(*seq),
+                            root.as_slice(),
+                            now_ms,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(Some((latest_seq, final_root)))
+        }
+
+        #[cfg(feature = "labyrinth")]
+        fn collect_continuing_epoch_devices(
+            prev_secret: &labyrinth::epoch::EpochSecret,
+            prev_members: &[labyrinth::epoch::EpochMemberRecord],
+            remote: &RemoteMailboxEpochState,
+            exclude_device_key_pub: Option<&[u8; 32]>,
+        ) -> Vec<labyrinth::device::DevicePublic> {
+            let mut out: Vec<labyrinth::device::DevicePublic> = Vec::new();
+            for m in prev_members {
+                if exclude_device_key_pub == Some(&m.device_key_pub.0) {
+                    continue;
+                }
+                if out.iter().any(|d| d.device_key_pub == m.device_key_pub) {
+                    continue;
+                }
+                if let Some(vdev_pub) = remote.virtual_devices.get(&m.device_key_pub.0) {
+                    if labyrinth::epoch::verify_member(prev_secret, m, true).is_ok()
+                        && vdev_pub.verify().is_ok()
+                    {
+                        out.push(vdev_pub.clone());
+                    }
+                } else if let Some((pdev_pub, is_revoked)) =
+                    remote.physical_devices.get(&m.device_key_pub.0)
+                {
+                    if !*is_revoked
+                        && labyrinth::epoch::verify_member(prev_secret, m, false).is_ok()
+                        && pdev_pub.verify().is_ok()
+                    {
+                        out.push(pdev_pub.clone());
+                    }
+                }
+            }
+            out
+        }
+
+        #[cfg(feature = "labyrinth")]
+        fn publish_opened_epoch(
+            &self,
+            mailbox_space_uri: &str,
+            opened: &labyrinth::epoch::NewEpoch,
+            now_ms: i64,
+        ) -> Result<(), MLSError> {
+            let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
+            let seq = opened.record.public.seq;
+            let epoch_doc =
+                labyrinth::records::Epoch::from_record(&opened.record, created_at.clone());
+            let epoch_val = serde_json::to_value(&epoch_doc)
+                .map_err(|e| MLSError::Internal(format!("serialize Epoch({seq}): {e}")))?;
+            let mut writes = Vec::with_capacity(1 + opened.members.len());
+            writes.push(serde_json::json!({
+                "$type": "com.atproto.space.applyWrites#create",
+                "collection": labyrinth::records::nsid::EPOCH,
+                "rkey": labyrinth::epoch::space_epoch_id(seq),
+                "value": epoch_val,
+            }));
+            for member in &opened.members {
+                let member_doc =
+                    labyrinth::records::EpochMember::from_record(member, created_at.clone());
+                let member_rkey = member_doc.rkey();
+                let member_val = serde_json::to_value(&member_doc).map_err(|e| {
+                    MLSError::Internal(format!("serialize EpochMember({seq}): {e}"))
+                })?;
+                writes.push(serde_json::json!({
+                    "$type": "com.atproto.space.applyWrites#create",
+                    "collection": labyrinth::records::nsid::EPOCH_MEMBER,
+                    "rkey": member_rkey,
+                    "value": member_val,
+                }));
+            }
+            let resp = self.apply_space_writes(mailbox_space_uri, &writes)?;
+            if !is_space_write_committed(&resp) {
+                return Err(MLSError::Internal(format!(
+                    "publish_opened_epoch({seq}) applyWrites returned HTTP {}",
+                    resp.status
+                )));
+            }
+            Ok(())
+        }
+
+        #[cfg(feature = "labyrinth")]
+        fn rotate_mailbox_epoch_if_supported(
+            &self,
+            exclude_device_key_pub: Option<&[u8; 32]>,
+            now_ms: i64,
+        ) -> Result<Option<(u64, Zeroizing<[u8; 32]>)>, MLSError> {
+            use labyrinth::epoch::EpochKeys as _;
+
+            let (st_snapshot, me_secrets) = self.db.write_tx(|tx| {
+                let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                    MLSError::InvalidState("Labyrinth status not initialized".to_string())
+                })?;
+                let st: LabyrinthBackupStatus =
+                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
+                let (me, _) = ensure_device_secrets_and_salt(tx, now_ms)?;
+                Ok((st, me))
+            })?;
+
+            let Some(mut remote) =
+                self.fetch_remote_mailbox_epoch_state(&st_snapshot.mailbox_space_uri)?
+            else {
+                return Ok(None);
+            };
+
+            let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
+            let (prev_seq, prev_root) = match remote.epochs.keys().next_back().copied() {
+                None => {
+                    self.ensure_local_epoch_chain_published(
+                        &st_snapshot.mailbox_space_uri,
+                        st_snapshot.epoch_seq,
+                        &me_secrets,
+                        &transport_signer,
+                        &mut remote,
+                        now_ms,
+                    )?;
+                    let root = self.db.write_tx(|tx| {
+                        ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms)
+                    })?;
+                    (st_snapshot.epoch_seq, root)
+                }
+                Some(remote_max) if st_snapshot.epoch_seq > remote_max => {
+                    self.ensure_local_epoch_chain_published(
+                        &st_snapshot.mailbox_space_uri,
+                        st_snapshot.epoch_seq,
+                        &me_secrets,
+                        &transport_signer,
+                        &mut remote,
+                        now_ms,
+                    )?;
+                    let root = self.db.write_tx(|tx| {
+                        ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms)
+                    })?;
+                    (st_snapshot.epoch_seq, root)
+                }
+                Some(_) => {
+                    self.publish_physical_device_if_needed(
+                        &st_snapshot.mailbox_space_uri,
+                        &me_secrets,
+                        &mut remote,
+                        now_ms,
+                    )?;
+                    if let Some(caught_up) = self.catch_up_physical_epoch_roots_from_remote(
+                        &me_secrets,
+                        &remote,
+                        now_ms,
+                    )? {
+                        caught_up
+                    } else {
+                        let root = self.db.write_tx(|tx| {
+                            ensure_owner_epoch_root(tx, st_snapshot.epoch_seq, now_ms)
+                        })?;
+                        (st_snapshot.epoch_seq, root)
+                    }
+                }
+            };
+
+            let prev_rec = remote.epochs.get(&prev_seq).ok_or_else(|| {
+                MLSError::InvalidState(format!("missing Space epoch {prev_seq} before rotation"))
+            })?;
+            let prev_members = remote
+                .members_by_epoch
+                .get(&prev_seq)
+                .cloned()
+                .unwrap_or_default();
+            let prev_secret = labyrinth::epoch::EpochSecret::from_parts(
+                prev_seq,
+                labyrinth::epoch::space_epoch_id(prev_seq),
+                *prev_root,
+            );
+            let mut continuing = Self::collect_continuing_epoch_devices(
+                &prev_secret,
+                &prev_members,
+                &remote,
+                exclude_device_key_pub,
+            );
+            let me_in_prev = prev_members.iter().any(|m| {
+                m.device_key_pub == me_secrets.public().device_key_pub
+                    && labyrinth::epoch::verify_member(&prev_secret, m, false).is_ok()
+            });
+
+            let (pending_next, opened_next) = if me_in_prev {
+                labyrinth::epoch::open_next(
+                    &self.normalized_did,
+                    &prev_secret,
+                    &prev_rec.public,
+                    &prev_members,
+                    &continuing,
+                    &me_secrets,
+                    &transport_signer,
+                )
+                .map_err(|e| MLSError::Cryptography(format!("epoch::open_next: {e}")))?
+            } else {
+                continuing.retain(|d| d.device_key_pub != me_secrets.public().device_key_pub);
+                labyrinth::epoch::open_next_enrolling(
+                    &self.normalized_did,
+                    &prev_secret,
+                    &prev_rec.public,
+                    &prev_members,
+                    &continuing,
+                    &me_secrets,
+                    &transport_signer,
+                )
+                .map_err(|e| MLSError::Cryptography(format!("epoch::open_next_enrolling: {e}")))?
+            };
+
+            self.publish_opened_epoch(&st_snapshot.mailbox_space_uri, &opened_next, now_ms)?;
+            Ok(Some((
+                pending_next.seq(),
+                Zeroizing::new(*pending_next.root()),
+            )))
+        }
+
         /// Generate and bind a GF(32) 40-character recovery code (`Spec §2 D4`, `Spec §6.7`),
         /// sealing the account's `owner_epoch_root` and `mailbox_root_salt` into a canonical
         /// `blue.catbird.labyrinth.virtualDevice` record in the personal mailbox Space (`com.atproto.space.applyWrites`).
         #[cfg(feature = "labyrinth")]
         pub fn setup_recovery_code(&self) -> Result<String, MLSError> {
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
             let code = labyrinth::recovery_code::RecoveryCode::generate()
                 .map_err(|e| MLSError::Cryptography(format!("generate RecoveryCode: {e}")))?;
             let grouped = code.format_grouped();
             let now_ms = unix_now_ms();
             let created_at = labyrinth::records::datetime_from_ms(now_ms.max(0) as u64);
 
-            let (st_snapshot, owner_root, me_secrets, salt) = self.db.write_tx(|tx| {
-                let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
-                    MLSError::InvalidState("Labyrinth status not initialized".to_string())
+            let (st_snapshot, mut active_seq, mut owner_root, me_secrets, salt) =
+                self.db.write_tx(|tx| {
+                    let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                        MLSError::InvalidState("Labyrinth status not initialized".to_string())
+                    })?;
+                    let st: LabyrinthBackupStatus = serde_json::from_slice(&raw)
+                        .map_err(|e| MLSError::Internal(e.to_string()))?;
+                    let seq = st.epoch_seq;
+                    let root = ensure_owner_epoch_root(tx, seq, now_ms)?;
+                    let (me, salt) = ensure_device_secrets_and_salt(tx, now_ms)?;
+                    Ok((st, seq, root, me, salt))
                 })?;
-                let st: LabyrinthBackupStatus =
-                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
-                let root = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
-                let (me, salt) = ensure_device_secrets_and_salt(tx, now_ms)?;
-                Ok((st, root, me, salt))
-            })?;
+
+            if let Some(mut remote) =
+                self.fetch_remote_mailbox_epoch_state(&st_snapshot.mailbox_space_uri)?
+            {
+                let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
+                match remote.epochs.keys().next_back().copied() {
+                    None => {
+                        self.ensure_local_epoch_chain_published(
+                            &st_snapshot.mailbox_space_uri,
+                            active_seq,
+                            &me_secrets,
+                            &transport_signer,
+                            &mut remote,
+                            now_ms,
+                        )?;
+                    }
+                    Some(remote_max) if active_seq > remote_max => {
+                        self.ensure_local_epoch_chain_published(
+                            &st_snapshot.mailbox_space_uri,
+                            active_seq,
+                            &me_secrets,
+                            &transport_signer,
+                            &mut remote,
+                            now_ms,
+                        )?;
+                    }
+                    Some(_) => {
+                        self.publish_physical_device_if_needed(
+                            &st_snapshot.mailbox_space_uri,
+                            &me_secrets,
+                            &mut remote,
+                            now_ms,
+                        )?;
+                        if let Some((caught_seq, caught_root)) = self
+                            .catch_up_physical_epoch_roots_from_remote(
+                                &me_secrets,
+                                &remote,
+                                now_ms,
+                            )?
+                        {
+                            active_seq = caught_seq;
+                            owner_root = caught_root;
+                        }
+                    }
+                }
+            } else {
+                // Stub transport compatibility path: still emit physical Device write idempotently.
+                let phys_dev_doc = labyrinth::records::Device::from_public(
+                    me_secrets.public(),
+                    created_at.clone(),
+                );
+                let phys_dev_rkey = hex::encode(me_secrets.public().device_key_pub.0);
+                let phys_dev_val = serde_json::to_value(&phys_dev_doc)
+                    .map_err(|e| MLSError::Internal(format!("serialize Device: {e}")))?;
+                let dev_resp = self.apply_space_writes(
+                    &st_snapshot.mailbox_space_uri,
+                    &[serde_json::json!({
+                        "$type": "com.atproto.space.applyWrites#create",
+                        "collection": labyrinth::records::nsid::DEVICE,
+                        "rkey": phys_dev_rkey,
+                        "value": phys_dev_val,
+                    })],
+                )?;
+                if !is_space_write_committed(&dev_resp) {
+                    return Err(MLSError::Internal(format!(
+                        "setup_recovery_code device applyWrites returned HTTP {}",
+                        dev_resp.status
+                    )));
+                }
+            }
 
             let current_epoch = labyrinth::epoch::EpochSecret::from_parts(
-                st_snapshot.epoch_seq,
-                format!("{:012}", st_snapshot.epoch_seq),
+                active_seq,
+                labyrinth::epoch::space_epoch_id(active_seq),
                 *owner_root,
             );
             let (vdev_bundle, member_rec) = labyrinth::virtual_device::create(
@@ -1325,12 +2010,6 @@ mod native_client {
                 labyrinth::virtual_device::Mechanism::Code,
             )
             .map_err(|e| MLSError::Cryptography(format!("virtual_device::create: {e}")))?;
-
-            let phys_dev_doc =
-                labyrinth::records::Device::from_public(me_secrets.public(), created_at.clone());
-            let phys_dev_rkey = hex::encode(me_secrets.public().device_key_pub.0);
-            let phys_dev_val = serde_json::to_value(&phys_dev_doc)
-                .map_err(|e| MLSError::Internal(format!("serialize Device: {e}")))?;
 
             let vdev_doc = labyrinth::records::VirtualDevice::from_bundle(
                 &vdev_bundle,
@@ -1348,23 +2027,6 @@ mod native_client {
             let epoch_member_rkey = epoch_member_doc.rkey();
             let epoch_member_val = serde_json::to_value(&epoch_member_doc)
                 .map_err(|e| MLSError::Internal(format!("serialize EpochMember: {e}")))?;
-
-            // Publish physical device (idempotent) + virtual device bundle + epochMember outside write_tx.
-            let dev_resp = self.apply_space_writes(
-                &st_snapshot.mailbox_space_uri,
-                &[serde_json::json!({
-                    "$type": "com.atproto.space.applyWrites#create",
-                    "collection": labyrinth::records::nsid::DEVICE,
-                    "rkey": phys_dev_rkey,
-                    "value": phys_dev_val,
-                })],
-            )?;
-            if !is_space_write_committed(&dev_resp) {
-                return Err(MLSError::Internal(format!(
-                    "setup_recovery_code device applyWrites returned HTTP {}",
-                    dev_resp.status
-                )));
-            }
 
             let bundle_resp = self.apply_space_writes(
                 &st_snapshot.mailbox_space_uri,
@@ -1396,6 +2058,7 @@ mod native_client {
                 })?;
                 let mut st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+                st.epoch_seq = st.epoch_seq.max(active_seq);
                 st.has_recovery_code = true;
                 tx.put_labyrinth_state("recovery_vdevice_id", &vdev_bundle.vdevice_id, now_ms)?;
                 tx.put_labyrinth_state("recovery_vdev_doc_json", &vdev_doc_bytes, now_ms)?;
@@ -1416,7 +2079,8 @@ mod native_client {
         /// Restore mailbox using a 40-character GF(32) recovery code (with up to 3-character
         /// erasure/typo correction), decrypting the enrolled `blue.catbird.labyrinth.virtualDevice`
         /// bundle from the personal mailbox Space to recover `owner_epoch_root` across devices
-        /// and journaling epoch rotation `E -> E+1` (`Gate 3`, `Gate 4`).
+        /// (chaining backward to genesis and forward to the latest Space epoch) and publishing
+        /// atomic epoch rotation `E -> E+1` (`Gate 3`, `Gate 4`).
         #[cfg(feature = "labyrinth")]
         pub fn restore_with_recovery_code(
             &self,
@@ -1424,39 +2088,35 @@ mod native_client {
         ) -> Result<LabyrinthBackupStatus, MLSError> {
             use labyrinth::epoch::EpochKeys as _;
 
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
+
             let _ = labyrinth::recovery_code::RecoveryCode::candidates(recovery_code_input)
                 .map_err(|_| {
                     MLSError::invalid_input("invalid 40-character Labyrinth recovery code")
                 })?;
 
-            let (mailbox_space_uri, local_vdev_doc) = self.db.read_tx(|tx| {
+            let now_ms = unix_now_ms();
+            let (st_before, local_vdev_doc, me_secrets) = self.db.write_tx(|tx| {
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())
                 })?;
                 let st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 let local_doc = tx.get_labyrinth_state("recovery_vdev_doc_json")?;
-                Ok((st.mailbox_space_uri, local_doc))
+                let (me, _) = ensure_device_secrets_and_salt(tx, now_ms)?;
+                Ok((st, local_doc, me))
             })?;
 
+            let remote_opt = self.fetch_remote_mailbox_epoch_state(&st_before.mailbox_space_uri)?;
             let mut bundles: std::collections::HashMap<
                 [u8; 16],
                 labyrinth::virtual_device::VirtualDeviceRecord,
             > = std::collections::HashMap::new();
 
-            if let Some(remote_records) = self.list_space_records_if_supported(
-                &mailbox_space_uri,
-                labyrinth::records::nsid::VIRTUAL_DEVICE,
-            )? {
-                for rec_val in remote_records {
-                    if let Ok(vdev_doc) =
-                        serde_json::from_value::<labyrinth::records::VirtualDevice>(rec_val)
-                    {
-                        if let Ok((bundle, _)) = vdev_doc.to_bundle() {
-                            bundles.insert(bundle.vdevice_id, bundle);
-                        }
-                    }
-                }
+            if let Some(ref remote) = remote_opt {
+                bundles.extend(remote.vdev_bundles.iter().map(|(k, v)| (*k, v.clone())));
             } else if let Some(raw_doc) = local_vdev_doc {
                 // Stub transport compatibility fallback when HTTP listRecords returns `{}` without `"records"`.
                 if let Ok(vdev_doc) =
@@ -1501,22 +2161,224 @@ mod native_client {
             let recovered_root = Zeroizing::new(*restored.epoch.root());
             let recovered_salt = restored.mailbox_root_salt;
 
-            let now_ms = unix_now_ms();
+            let mut recovered_roots: std::collections::BTreeMap<u64, Zeroizing<[u8; 32]>> =
+                std::collections::BTreeMap::new();
+            recovered_roots.insert(recovered_seq, recovered_root.clone());
+
+            let new_epoch_seq = if let Some(mut remote) = remote_opt {
+                let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
+                self.publish_physical_device_if_needed(
+                    &st_before.mailbox_space_uri,
+                    &me_secrets,
+                    &mut remote,
+                    now_ms,
+                )?;
+
+                if remote.epochs.is_empty() {
+                    // Upgrade Space if VirtualDevice was created before any Epoch records existed.
+                    self.db.write_tx(|tx| {
+                        tx.put_labyrinth_state(
+                            &owner_epoch_root_key(recovered_seq),
+                            recovered_root.as_slice(),
+                            now_ms,
+                        )
+                    })?;
+                    self.ensure_local_epoch_chain_published(
+                        &st_before.mailbox_space_uri,
+                        recovered_seq,
+                        &me_secrets,
+                        &transport_signer,
+                        &mut remote,
+                        now_ms,
+                    )?;
+                }
+
+                if remote.epochs.contains_key(&recovered_seq) {
+                    let recovered_secret = labyrinth::epoch::EpochSecret::from_parts(
+                        recovered_seq,
+                        labyrinth::epoch::space_epoch_id(recovered_seq),
+                        *recovered_root,
+                    );
+
+                    // 1. Walk backward from recovered_seq down to genesis (epoch 0).
+                    let mut back_cur = recovered_secret.clone();
+                    for s in (1..=recovered_seq).rev() {
+                        let cur_rec = remote.epochs.get(&s).ok_or_else(|| {
+                            MLSError::InvalidState(format!(
+                                "missing Space epoch record for epoch {s}"
+                            ))
+                        })?;
+                        let prev_id = labyrinth::epoch::space_epoch_id(s - 1);
+                        let prev_secret =
+                            labyrinth::epoch::backward_chain(&back_cur, cur_rec, &prev_id)
+                                .map_err(|e| {
+                                    MLSError::Cryptography(format!(
+                                        "backward_chain({s} -> {}): {e}",
+                                        s - 1
+                                    ))
+                                })?;
+                        recovered_roots.insert(s - 1, Zeroizing::new(*prev_secret.root()));
+                        back_cur = prev_secret;
+                    }
+
+                    // 2. Walk forward from recovered_seq to latest Space epoch using the VirtualDevice's Hawk key.
+                    let latest_seq = *remote.epochs.keys().next_back().unwrap_or(&recovered_seq);
+                    let mut fwd_cur = recovered_secret;
+                    let mut fwd_pub = remote
+                        .epochs
+                        .get(&recovered_seq)
+                        .ok_or_else(|| {
+                            MLSError::InvalidState(format!(
+                                "missing Space epoch record for recovered epoch {recovered_seq}"
+                            ))
+                        })?
+                        .public
+                        .clone();
+
+                    for next_seq in (recovered_seq + 1)..=latest_seq {
+                        let next_rec = remote.epochs.get(&next_seq).ok_or_else(|| {
+                            MLSError::InvalidState(format!(
+                                "missing Space epoch record for epoch {next_seq}"
+                            ))
+                        })?;
+                        let next_members =
+                            remote.members_by_epoch.get(&next_seq).ok_or_else(|| {
+                                MLSError::InvalidState(format!(
+                                    "missing Space epochMember records for epoch {next_seq}"
+                                ))
+                            })?;
+                        let my_member = next_members
+                            .iter()
+                            .find(|m| m.device_key_pub == restored.device.public().device_key_pub)
+                            .ok_or_else(|| {
+                                MLSError::InvalidState(format!(
+                                    "virtual device missing EpochMember in epoch {next_seq}"
+                                ))
+                            })?;
+                        let opener = remote
+                            .physical_devices
+                            .get(&next_rec.opened_by.0)
+                            .map(|(d, _)| d)
+                            .ok_or_else(|| {
+                                MLSError::InvalidState(format!(
+                                    "missing Space Device record for opener of epoch {next_seq}"
+                                ))
+                            })?;
+                        let opener_prev_member =
+                            remote.members_by_epoch.get(&(next_seq - 1)).and_then(|ms| {
+                                ms.iter().find(|m| m.device_key_pub == next_rec.opened_by)
+                            });
+                        let next_id = labyrinth::epoch::space_epoch_id(next_seq);
+                        let opened = labyrinth::epoch::OpenedEpoch {
+                            epoch_id: &next_id,
+                            record: next_rec,
+                            my_member,
+                            opener,
+                            opener_prev_member,
+                        };
+                        let next_secret = labyrinth::epoch::forward_chain(
+                            &self.normalized_did,
+                            &fwd_cur,
+                            &fwd_pub,
+                            &opened,
+                            &restored.device.storage,
+                            true,
+                        )
+                        .map_err(|e| {
+                            MLSError::Cryptography(format!(
+                                "forward_chain({} -> {next_seq}): {e}",
+                                next_seq - 1
+                            ))
+                        })?;
+                        recovered_roots.insert(next_seq, Zeroizing::new(*next_secret.root()));
+                        fwd_pub = next_rec.public.clone();
+                        fwd_cur = next_secret;
+                    }
+
+                    // 3. Publish atomic Gate 3 / Gate 4 epoch rotation latest_seq -> latest_seq + 1.
+                    let mut latest_members = remote
+                        .members_by_epoch
+                        .get(&latest_seq)
+                        .cloned()
+                        .unwrap_or_default();
+                    if !latest_members
+                        .iter()
+                        .any(|m| m.device_key_pub == restored.device.public().device_key_pub)
+                    {
+                        let vdev_mem = labyrinth::epoch::EpochMemberRecord {
+                            seq: latest_seq,
+                            device_key_pub: restored.device.public().device_key_pub,
+                            device_mac: fwd_cur
+                                .device_mac(&restored.device.public().device_key_pub, true),
+                            encrypted_entropy: None,
+                        };
+                        latest_members.push(vdev_mem);
+                    }
+                    let mut continuing = Self::collect_continuing_epoch_devices(
+                        &fwd_cur,
+                        &latest_members,
+                        &remote,
+                        None,
+                    );
+                    let me_in_latest = latest_members.iter().any(|m| {
+                        m.device_key_pub == me_secrets.public().device_key_pub
+                            && labyrinth::epoch::verify_member(&fwd_cur, m, false).is_ok()
+                    });
+                    let (pending_next, opened_next) = if me_in_latest {
+                        labyrinth::epoch::open_next(
+                            &self.normalized_did,
+                            &fwd_cur,
+                            &fwd_pub,
+                            &latest_members,
+                            &continuing,
+                            &me_secrets,
+                            &transport_signer,
+                        )
+                        .map_err(|e| {
+                            MLSError::Cryptography(format!("restore epoch::open_next: {e}"))
+                        })?
+                    } else {
+                        continuing
+                            .retain(|d| d.device_key_pub != me_secrets.public().device_key_pub);
+                        labyrinth::epoch::open_next_enrolling(
+                            &self.normalized_did,
+                            &fwd_cur,
+                            &fwd_pub,
+                            &latest_members,
+                            &continuing,
+                            &me_secrets,
+                            &transport_signer,
+                        )
+                        .map_err(|e| {
+                            MLSError::Cryptography(format!(
+                                "restore epoch::open_next_enrolling: {e}"
+                            ))
+                        })?
+                    };
+                    self.publish_opened_epoch(&st_before.mailbox_space_uri, &opened_next, now_ms)?;
+                    let rotated_seq = pending_next.seq();
+                    recovered_roots.insert(rotated_seq, Zeroizing::new(*pending_next.root()));
+                    rotated_seq
+                } else {
+                    st_before.epoch_seq.max(recovered_seq).saturating_add(1)
+                }
+            } else {
+                st_before.epoch_seq.max(recovered_seq).saturating_add(1)
+            };
+
             let status = self.db.write_tx(|tx| {
                 tx.put_labyrinth_state("recovery_vdevice_id", &matched_vdev_id, now_ms)?;
                 tx.put_labyrinth_state("mailbox_root_salt", &recovered_salt, now_ms)?;
-                tx.put_labyrinth_state(
-                    &owner_epoch_root_key(recovered_seq),
-                    recovered_root.as_slice(),
-                    now_ms,
-                )?;
+                for (seq, root) in &recovered_roots {
+                    tx.put_labyrinth_state(&owner_epoch_root_key(*seq), root.as_slice(), now_ms)?;
+                }
 
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())
                 })?;
                 let mut st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
-                st.epoch_seq = st.epoch_seq.max(recovered_seq).saturating_add(1);
+                st.epoch_seq = new_epoch_seq;
                 st.has_recovery_code = true;
                 if !st.active_device_ids.contains(&self.config.device_id) {
                     st.active_device_ids.push(self.config.device_id.clone());
@@ -1606,6 +2468,9 @@ mod native_client {
             &self,
             six_digit_code: &str,
         ) -> Result<OtcPairingCompletion, MLSError> {
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
             let parsed = labyrinth::otc::OneTimeCode::parse(six_digit_code)
                 .map_err(|_| MLSError::invalid_input("invalid 6-digit OTC code"))?;
 
@@ -1642,17 +2507,31 @@ mod native_client {
             }
 
             let now_ms = unix_now_ms();
+            #[cfg(feature = "labyrinth")]
+            let rotated_remote = self.rotate_mailbox_epoch_if_supported(None, now_ms)?;
+            #[cfg(not(feature = "labyrinth"))]
+            let rotated_remote: Option<(u64, Zeroizing<[u8; 32]>)> = None;
+
             let new_epoch_seq = self.db.write_tx(|tx| {
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())
                 })?;
                 let mut st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
-                st.epoch_seq = st.epoch_seq.saturating_add(1);
+                if let Some((remote_seq, ref remote_root)) = rotated_remote {
+                    st.epoch_seq = remote_seq;
+                    tx.put_labyrinth_state(
+                        &owner_epoch_root_key(remote_seq),
+                        remote_root.as_slice(),
+                        now_ms,
+                    )?;
+                } else {
+                    st.epoch_seq = st.epoch_seq.saturating_add(1);
+                    let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
+                }
                 if !st.active_device_ids.contains(&self.config.device_id) {
                     st.active_device_ids.push(self.config.device_id.clone());
                 }
-                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
                 tx.upsert_mutation_journal(&MutationJournalRow {
                     journal_id: format!("otc-epoch-{}", st.epoch_seq),
                     op_type: "epoch_rotation".to_string(),
@@ -1691,7 +2570,20 @@ mod native_client {
                     "target_device_id must not be empty",
                 ));
             }
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
             let now_ms = unix_now_ms();
+            #[cfg(feature = "labyrinth")]
+            let rotated_remote = {
+                let maybe_target_pk: Option<[u8; 32]> = hex::decode(target_device_id.trim())
+                    .ok()
+                    .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
+                self.rotate_mailbox_epoch_if_supported(maybe_target_pk.as_ref(), now_ms)?
+            };
+            #[cfg(not(feature = "labyrinth"))]
+            let rotated_remote: Option<(u64, Zeroizing<[u8; 32]>)> = None;
+
             let status = self.db.write_tx(|tx| {
                 let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
                     MLSError::InvalidState("Labyrinth status not initialized".to_string())
@@ -1699,8 +2591,17 @@ mod native_client {
                 let mut st: LabyrinthBackupStatus =
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 st.active_device_ids.retain(|d| d != target_device_id);
-                st.epoch_seq = st.epoch_seq.saturating_add(1);
-                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
+                if let Some((remote_seq, ref remote_root)) = rotated_remote {
+                    st.epoch_seq = remote_seq;
+                    tx.put_labyrinth_state(
+                        &owner_epoch_root_key(remote_seq),
+                        remote_root.as_slice(),
+                        now_ms,
+                    )?;
+                } else {
+                    st.epoch_seq = st.epoch_seq.saturating_add(1);
+                    let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
+                }
                 tx.upsert_mutation_journal(&MutationJournalRow {
                     journal_id: format!("revoke-{target_device_id}-{}", st.epoch_seq),
                     op_type: "device_revocation".to_string(),
@@ -1868,6 +2769,9 @@ mod native_client {
             let mut saw_records_array = false;
 
             loop {
+                if self.is_handle_closed() {
+                    return Err(MLSError::ContextClosed);
+                }
                 let mut url = format!(
                     "{base}/xrpc/com.atproto.space.listRecords?space={}&repo={}&collection={}&limit=100",
                     percent_encode_query_component(space_uri),
@@ -1922,11 +2826,13 @@ mod native_client {
         ///
         /// Seals canonical `blue.catbird.labyrinth.batch` records via `com.atproto.space.applyWrites`
         /// with `<16-hex-seq>-<tid>` rkeys and `frame_nonce` preserved inside AEAD plaintext.
-        /// If the conversation Space rejects the write with `401`/`403`/`404` (e.g. involuntary
-        /// MLS kick or closed Space per `[CB-22]`), seals a canonical `v5` `OwnerBatch`
-        /// (`KIND_ATTRIBUTED_FRAME = 0x03`, preserving `sender_did`) into the account's personal
-        /// mailbox Space (`at://{did}/space/blue.catbird.labyrinth.mailbox/self`) and deletes
-        /// committed rows idempotently (`200..300`, `409`, or `400 RecordAlreadyExists`).
+        /// Drains conversations independently so a transient failure (`5xx`/network) on one
+        /// conversation preserves causal sequence order within that conversation without starving
+        /// other conversations. If a conversation Space rejects the write with `401`/`403`/`404`
+        /// (e.g. involuntary MLS kick or closed Space per `[CB-22]`), seals a canonical `v5`
+        /// `OwnerBatch` (`KIND_ATTRIBUTED_FRAME = 0x03`, preserving `sender_did`) into the account's
+        /// personal mailbox Space (`at://{did}/space/blue.catbird.labyrinth.mailbox/self`) and
+        /// deletes committed rows idempotently (`200..300`, `409`, or `400 RecordAlreadyExists`).
         #[cfg(feature = "labyrinth")]
         pub fn flush_labyrinth_queue(&self) -> Result<u32, MLSError> {
             use labyrinth::sign::TransportSigner as _;
@@ -1945,232 +2851,273 @@ mod native_client {
                 return Ok(0);
             }
 
+            let pending_convos = self
+                .db
+                .read_tx(|tx| tx.list_labyrinth_queue_conversations())?;
+            if pending_convos.is_empty() {
+                return Ok(0);
+            }
+
             let now_ms = unix_now_ms();
             let transport_signer = load_or_create_transport_signer(&self.db, now_ms)?;
             let mut mek_cache: std::collections::HashMap<String, labyrinth::mek::Mek> =
                 std::collections::HashMap::new();
             let mut total_committed: u32 = 0;
+            let mut first_err: Option<MLSError> = None;
 
-            loop {
-                if self.is_handle_closed() {
-                    return Err(MLSError::ContextClosed);
-                }
-                let rows = self.db.read_tx(|tx| tx.list_labyrinth_queue(None, 100))?;
-                if rows.is_empty() {
-                    break;
-                }
+            for convo_id in pending_convos {
+                loop {
+                    if self.is_handle_closed() {
+                        return Err(MLSError::ContextClosed);
+                    }
+                    let rows = self
+                        .db
+                        .read_tx(|tx| tx.list_labyrinth_queue(Some(&convo_id), 100))?;
+                    if rows.is_empty() {
+                        break;
+                    }
 
-                let mut committed_ids: Vec<String> = Vec::with_capacity(rows.len());
-                let mut first_err: Option<MLSError> = None;
+                    let mut committed_ids: Vec<String> = Vec::with_capacity(rows.len());
+                    let mut convo_err: Option<MLSError> = None;
 
-                for (idx, row) in rows.iter().enumerate() {
-                    let payload = match self.decode_queue_row(row) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            first_err = Some(e);
+                    for row in &rows {
+                        if self.is_handle_closed() {
+                            convo_err = Some(MLSError::ContextClosed);
                             break;
                         }
-                    };
-                    let convo_space = payload.space_uri.clone().unwrap_or_else(|| {
-                        format!(
-                            "at://{}/space/blue.catbird.labyrinth.conversation/{}-0",
-                            payload.sequencer_did, payload.conversation_id
-                        )
-                    });
+                        let payload = match self.decode_queue_row(row) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                convo_err = Some(e);
+                                break;
+                            }
+                        };
+                        let convo_space = payload.space_uri.clone().unwrap_or_else(|| {
+                            format!(
+                                "at://{}/space/blue.catbird.labyrinth.conversation/{}-0",
+                                payload.sequencer_did, payload.conversation_id
+                            )
+                        });
 
-                    let mek = if let Some(m) = mek_cache.get(&payload.conversation_id) {
-                        m.clone()
-                    } else {
-                        let m = ensure_convo_sender_mek(
-                            &self.db,
-                            &payload.conversation_id,
-                            transport_signer.transport_public_key(),
-                            now_ms,
-                        )?;
-                        mek_cache.insert(payload.conversation_id.clone(), m.clone());
-                        m
-                    };
+                        let mek = if let Some(m) = mek_cache.get(&payload.conversation_id) {
+                            m.clone()
+                        } else {
+                            let m = ensure_convo_sender_mek(
+                                &self.db,
+                                &payload.conversation_id,
+                                transport_signer.transport_public_key(),
+                                now_ms,
+                            )?;
+                            mek_cache.insert(payload.conversation_id.clone(), m.clone());
+                            m
+                        };
 
-                    let ts_ms = payload.created_at_ms.max(0) as u64;
-                    let sender_data: Zeroizing<Vec<u8>> = if let Some(ref nonce_b64) =
-                        payload.frame_nonce_b64
-                    {
-                        if let Ok(decoded) = BASE64_STANDARD.decode(nonce_b64.as_bytes()) {
-                            if decoded.len() == 32 {
-                                let mut combined =
-                                    Vec::with_capacity(32 + payload.labyrinth_frame_json.len());
-                                combined.extend_from_slice(&decoded);
-                                combined.extend_from_slice(payload.labyrinth_frame_json.as_bytes());
-                                Zeroizing::new(combined)
+                        let ts_ms = payload.created_at_ms.max(0) as u64;
+                        let sender_data: Zeroizing<Vec<u8>> = if let Some(ref nonce_b64) =
+                            payload.frame_nonce_b64
+                        {
+                            if let Ok(decoded) = BASE64_STANDARD.decode(nonce_b64.as_bytes()) {
+                                if decoded.len() == 32 {
+                                    let mut combined =
+                                        Vec::with_capacity(32 + payload.labyrinth_frame_json.len());
+                                    combined.extend_from_slice(&decoded);
+                                    combined
+                                        .extend_from_slice(payload.labyrinth_frame_json.as_bytes());
+                                    Zeroizing::new(combined)
+                                } else {
+                                    Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
+                                }
                             } else {
                                 Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
                             }
                         } else {
                             Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
-                        }
-                    } else {
-                        Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
-                    };
+                        };
 
-                    let mut sealed_msg = match labyrinth::message::seal_sender(
-                        &mek,
-                        &payload.conversation_id,
-                        &payload.message_id,
-                        ts_ms,
-                        &sender_data,
-                        &transport_signer,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            first_err = Some(MLSError::Cryptography(format!(
-                                "seal_sender conversation Batch: {e}"
-                            )));
-                            break;
-                        }
-                    };
-                    sealed_msg.seq = Some(payload.seq.max(0) as u64);
-
-                    let sender_batch = match labyrinth::records::Batch::from_messages(
-                        &payload.conversation_id,
-                        &[sealed_msg],
-                        labyrinth::records::datetime_from_ms(ts_ms),
-                    ) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            first_err =
-                                Some(MLSError::Internal(format!("Batch::from_messages: {e}")));
-                            break;
-                        }
-                    };
-                    let batch_val = match serde_json::to_value(&sender_batch) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            first_err = Some(MLSError::Internal(format!("serialize Batch: {e}")));
-                            break;
-                        }
-                    };
-                    let tid = deterministic_tid(
-                        payload.created_at_ms,
-                        idx as u64,
-                        &format!("batch:{}:{}", payload.conversation_id, row.item_id),
-                    );
-                    let rkey = format!("{:016x}-{tid}", payload.seq.max(0) as u64);
-
-                    let primary_resp = match self.apply_space_writes(
-                        &convo_space,
-                        &[serde_json::json!({
-                            "$type": "com.atproto.space.applyWrites#create",
-                            "collection": labyrinth::records::nsid::BATCH,
-                            "rkey": rkey,
-                            "value": batch_val,
-                        })],
-                    ) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            first_err = Some(e);
-                            break;
-                        }
-                    };
-
-                    if is_space_write_committed(&primary_resp) {
-                        committed_ids.push(row.item_id.clone());
-                        continue;
-                    }
-
-                    if matches!(primary_resp.status, 401 | 403 | 404) {
-                        // Involuntary kick / Space access revoked ([CB-22]): seal into personal mailbox Space
-                        // using v5 KIND_ATTRIBUTED_FRAME so sender attribution survives restore.
-                        let owner_msg = match labyrinth::message::seal_owner_attributed(
-                            &owner_root,
-                            status.epoch_seq,
+                        let mut sealed_msg = match labyrinth::message::seal_sender(
+                            &mek,
                             &payload.conversation_id,
                             &payload.message_id,
                             ts_ms,
-                            &payload.sender_did,
-                            payload.labyrinth_frame_json.as_bytes(),
+                            &sender_data,
+                            &transport_signer,
                         ) {
-                            Ok(m) => m,
+                            Ok(s) => s,
                             Err(e) => {
-                                first_err = Some(MLSError::Cryptography(format!(
-                                    "seal_owner_attributed fallback: {e}"
+                                convo_err = Some(MLSError::Cryptography(format!(
+                                    "seal_sender conversation Batch: {e}"
                                 )));
                                 break;
                             }
                         };
-                        let owner_batch = match labyrinth::records::OwnerBatch::from_messages(
-                            &[owner_msg],
+                        let item_seq_u64 = payload.seq.max(0) as u64;
+                        let item_sub_seq = item_seq_u64 % 1_000;
+                        sealed_msg.seq = Some(item_seq_u64);
+
+                        let sender_batch = match labyrinth::records::Batch::from_messages(
+                            &payload.conversation_id,
+                            &[sealed_msg],
                             labyrinth::records::datetime_from_ms(ts_ms),
                         ) {
                             Ok(b) => b,
                             Err(e) => {
-                                first_err = Some(MLSError::Internal(format!(
-                                    "OwnerBatch::from_messages: {e}"
-                                )));
+                                convo_err =
+                                    Some(MLSError::Internal(format!("Batch::from_messages: {e}")));
                                 break;
                             }
                         };
-                        let owner_batch_val = match serde_json::to_value(&owner_batch) {
+                        let batch_val = match serde_json::to_value(&sender_batch) {
                             Ok(v) => v,
                             Err(e) => {
-                                first_err =
-                                    Some(MLSError::Internal(format!("serialize OwnerBatch: {e}")));
+                                convo_err =
+                                    Some(MLSError::Internal(format!("serialize Batch: {e}")));
                                 break;
                             }
                         };
-                        let fb_rkey = deterministic_tid(
+                        let tid = deterministic_tid(
                             payload.created_at_ms,
-                            idx as u64,
-                            &format!("fb:{}:{}", payload.conversation_id, row.item_id),
+                            item_sub_seq,
+                            &format!("batch:{}:{}", payload.conversation_id, row.item_id),
                         );
-                        match self.apply_space_writes(
-                            &status.mailbox_space_uri,
+                        let rkey = format!("{item_seq_u64:016x}-{tid}");
+
+                        if self.is_handle_closed() {
+                            convo_err = Some(MLSError::ContextClosed);
+                            break;
+                        }
+                        let primary_resp = match self.apply_space_writes(
+                            &convo_space,
                             &[serde_json::json!({
                                 "$type": "com.atproto.space.applyWrites#create",
-                                "collection": labyrinth::records::nsid::OWNER_BATCH,
-                                "rkey": fb_rkey,
-                                "value": owner_batch_val,
+                                "collection": labyrinth::records::nsid::BATCH,
+                                "rkey": rkey,
+                                "value": batch_val,
                             })],
                         ) {
-                            Ok(fb_resp) if is_space_write_committed(&fb_resp) => {
-                                committed_ids.push(row.item_id.clone());
-                            }
-                            Ok(fb_resp) => {
-                                first_err = Some(MLSError::Internal(format!(
-                                    "personal mailbox OwnerBatch fallback returned HTTP {}",
-                                    fb_resp.status
-                                )));
-                                break;
-                            }
+                            Ok(r) => r,
                             Err(e) => {
-                                first_err = Some(e);
+                                convo_err = Some(e);
                                 break;
                             }
+                        };
+
+                        if is_space_write_committed(&primary_resp) {
+                            committed_ids.push(row.item_id.clone());
+                            continue;
                         }
-                    } else {
-                        first_err = Some(MLSError::Internal(format!(
-                            "conversation Space applyWrites returned HTTP {}",
-                            primary_resp.status
-                        )));
+
+                        if matches!(primary_resp.status, 401 | 403 | 404) {
+                            if self.is_handle_closed() {
+                                convo_err = Some(MLSError::ContextClosed);
+                                break;
+                            }
+                            // Involuntary kick / Space access revoked ([CB-22]): seal into personal mailbox Space
+                            // using v5 KIND_ATTRIBUTED_FRAME so sender attribution survives restore.
+                            let owner_msg = match labyrinth::message::seal_owner_attributed(
+                                &owner_root,
+                                status.epoch_seq,
+                                &payload.conversation_id,
+                                &payload.message_id,
+                                ts_ms,
+                                &payload.sender_did,
+                                payload.labyrinth_frame_json.as_bytes(),
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    convo_err = Some(MLSError::Cryptography(format!(
+                                        "seal_owner_attributed fallback: {e}"
+                                    )));
+                                    break;
+                                }
+                            };
+                            let owner_batch = match labyrinth::records::OwnerBatch::from_messages(
+                                &[owner_msg],
+                                labyrinth::records::datetime_from_ms(ts_ms),
+                            ) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    convo_err = Some(MLSError::Internal(format!(
+                                        "OwnerBatch::from_messages: {e}"
+                                    )));
+                                    break;
+                                }
+                            };
+                            let owner_batch_val = match serde_json::to_value(&owner_batch) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    convo_err = Some(MLSError::Internal(format!(
+                                        "serialize OwnerBatch: {e}"
+                                    )));
+                                    break;
+                                }
+                            };
+                            let fb_rkey = deterministic_tid(
+                                payload.created_at_ms,
+                                item_sub_seq,
+                                &format!("fb:{}:{}", payload.conversation_id, row.item_id),
+                            );
+                            match self.apply_space_writes(
+                                &status.mailbox_space_uri,
+                                &[serde_json::json!({
+                                    "$type": "com.atproto.space.applyWrites#create",
+                                    "collection": labyrinth::records::nsid::OWNER_BATCH,
+                                    "rkey": fb_rkey,
+                                    "value": owner_batch_val,
+                                })],
+                            ) {
+                                Ok(fb_resp) if is_space_write_committed(&fb_resp) => {
+                                    committed_ids.push(row.item_id.clone());
+                                }
+                                Ok(fb_resp) => {
+                                    convo_err = Some(MLSError::Internal(format!(
+                                        "personal mailbox OwnerBatch fallback returned HTTP {}",
+                                        fb_resp.status
+                                    )));
+                                    break;
+                                }
+                                Err(e) => {
+                                    convo_err = Some(e);
+                                    break;
+                                }
+                            }
+                        } else {
+                            convo_err = Some(MLSError::Internal(format!(
+                                "conversation Space applyWrites returned HTTP {}",
+                                primary_resp.status
+                            )));
+                            break;
+                        }
+                    }
+
+                    if !committed_ids.is_empty() && !self.is_handle_closed() {
+                        self.db.write_tx(|tx| {
+                            for id in &committed_ids {
+                                tx.dequeue_labyrinth_item(id)?;
+                            }
+                            Ok(())
+                        })?;
+                        total_committed =
+                            total_committed.saturating_add(committed_ids.len() as u32);
+                    }
+
+                    if matches!(convo_err, Some(MLSError::ContextClosed)) || self.is_handle_closed()
+                    {
+                        return Err(MLSError::ContextClosed);
+                    }
+                    if let Some(err) = convo_err {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                        break;
+                    }
+                    if committed_ids.is_empty() {
                         break;
                     }
                 }
+            }
 
-                if !committed_ids.is_empty() {
-                    self.db.write_tx(|tx| {
-                        for id in &committed_ids {
-                            tx.dequeue_labyrinth_item(id)?;
-                        }
-                        Ok(())
-                    })?;
-                    total_committed = total_committed.saturating_add(committed_ids.len() as u32);
-                }
-
-                if let Some(err) = first_err {
-                    return Err(err);
-                }
-                if committed_ids.is_empty() {
-                    break;
-                }
+            if let Some(err) = first_err {
+                return Err(err);
             }
 
             Ok(total_committed)
@@ -2331,6 +3278,9 @@ mod native_client {
                 .chunks(labyrinth::records::MAX_BATCH_ITEMS)
                 .enumerate()
             {
+                if self.is_handle_closed() {
+                    return Err(MLSError::ContextClosed);
+                }
                 let first_ts = chunk.first().map(|m| m.timestamp as i64).unwrap_or(now_ms);
                 let first_id = chunk.first().map(|m| m.message_id.as_str()).unwrap_or("0");
                 let rkey = deterministic_tid(
@@ -2362,6 +3312,9 @@ mod native_client {
                 }
             }
 
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
             self.db.write_tx(|tx| {
                 for row in &queued_rows {
                     tx.dequeue_labyrinth_item(&row.item_id)?;
@@ -2446,6 +3399,9 @@ mod native_client {
             &self,
             conversation_id: &str,
         ) -> Result<u32, MLSError> {
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
             let status = self.labyrinth_status()?;
             let Some(records) = self.list_space_records_if_supported(
                 &status.mailbox_space_uri,
@@ -2459,6 +3415,9 @@ mod native_client {
             let mut seen_ids = std::collections::HashSet::new();
 
             for rec_val in records {
+                if self.is_handle_closed() {
+                    return Err(MLSError::ContextClosed);
+                }
                 let batch: labyrinth::records::OwnerBatch = serde_json::from_value(rec_val)
                     .map_err(|e| MLSError::Internal(format!("parse OwnerBatch: {e}")))?;
                 let msgs = batch
@@ -2524,6 +3483,9 @@ mod native_client {
             }
             recovered_items.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
             let now_ms = unix_now_ms();
             let imported = self.db.write_tx(|tx| {
                 let existing_convo = tx.get_conversation(conversation_id)?;
