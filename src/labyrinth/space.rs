@@ -129,6 +129,41 @@ impl SpaceXrpcTransport {
         self
     }
 
+    /// Fetch and Gate-7-MAC-verify a single record via `com.atproto.space.getRecord`.
+    pub async fn get_record(
+        &self,
+        space: &str,
+        repo: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> core::result::Result<Option<serde_json::Value>, SpaceError> {
+        let res = self
+            .query(
+                "com.atproto.space.getRecord",
+                &[
+                    ("space", space.to_owned()),
+                    ("repo", repo.to_owned()),
+                    ("collection", collection.to_owned()),
+                    ("rkey", rkey.to_owned()),
+                ],
+            )
+            .await;
+        match res {
+            Ok(bytes) => {
+                let parsed: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|e| refuse_space(format!("getRecord invalid JSON: {e}")))?;
+                Ok(Some(parsed))
+            }
+            Err(err)
+                if err.status == 404
+                    || matches!(err.error.as_deref(), Some("RecordNotFound" | "NotFound")) =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn send_checked(&self, req: LabyrinthSpaceRequest) -> Result<Vec<u8>, SpaceError> {
         let resp = self
             .gateway

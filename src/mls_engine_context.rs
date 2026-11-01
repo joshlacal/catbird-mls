@@ -1822,6 +1822,7 @@ impl MLSContext {
                         description: reseal.description.clone().unwrap_or_default(),
                         avatar_blob_locator: reseal.avatar_blob_locator.clone(),
                         avatar_content_type: reseal.avatar_content_type.clone(),
+                        space_avatar: None,
                     };
                     let ciphertext = crate::metadata::encrypt_metadata_blob(
                         &metadata_key,

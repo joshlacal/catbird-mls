@@ -10,6 +10,8 @@
 pub mod flush;
 pub mod hooks;
 pub mod hooks_status;
+pub mod journal;
+pub mod mac_gate;
 pub mod queue;
 pub mod session;
 pub mod signer;
@@ -18,6 +20,9 @@ pub mod state;
 pub mod status;
 pub mod transport;
 pub mod write_auth;
+
+pub use mac_gate as mac_guard;
+pub use mac_gate as mek_scope;
 
 #[cfg(test)]
 mod tests;

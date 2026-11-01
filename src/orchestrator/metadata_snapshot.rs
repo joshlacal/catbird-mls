@@ -391,6 +391,7 @@ mod tests {
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         };
         let key: [u8; 32] = ctx.export_metadata_key(gid.clone(), epoch).unwrap().try_into().unwrap();
         let nonce = [3; 12];

@@ -8,12 +8,14 @@ pub mod engine;
 mod epoch_storage;
 mod error;
 pub mod field_encryption;
+pub mod groups;
 #[cfg(not(target_arch = "wasm32"))]
 mod keychain;
 #[cfg(feature = "labyrinth")]
 pub mod labyrinth;
 pub mod logging;
 mod message_limits;
+pub mod messaging;
 pub mod metadata;
 #[cfg(not(target_arch = "wasm32"))]
 mod mls_context;
@@ -22,7 +24,11 @@ mod mls_engine_context;
 pub mod orchestrator;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod platform_lifecycle;
+pub mod recovery;
+pub mod requests;
+pub mod routing;
 pub mod storage;
+pub mod sync;
 mod types;
 // Voice depends on audiopus which has no wasm32 sysroot.
 #[cfg(not(target_arch = "wasm32"))]

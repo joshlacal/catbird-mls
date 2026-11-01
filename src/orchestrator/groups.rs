@@ -684,6 +684,7 @@ mod tests {
             description: "".to_string(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         };
         let nonce = [1u8; 12];
         let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
@@ -815,6 +816,7 @@ mod tests {
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         };
         let nonce = [1u8; 12];
         let ciphertext = crate::metadata::encrypt_metadata_snapshot_with_nonce(
@@ -3553,6 +3555,7 @@ where
             description: _description.unwrap_or("").to_string(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         };
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -6207,6 +6210,7 @@ where
             description: description.unwrap_or_default().to_string(),
             avatar_blob_locator: avatar_blob_locator.map(|s| s.to_string()),
             avatar_content_type: avatar_content_type.map(|s| s.to_string()),
+            space_avatar: None,
         };
 
         use rand::RngCore;

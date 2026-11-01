@@ -615,6 +615,7 @@ pub fn decode_request_metadata(plaintext: &[u8]) -> Result<crate::metadata::Grou
         description: signed.content.description.unwrap_or_default(),
         avatar_blob_locator: None,
         avatar_content_type: None,
+        space_avatar: None,
     })
 }
 pub fn encrypt_request_metadata<P: OpenMlsProvider>(
@@ -627,7 +628,10 @@ pub fn encrypt_request_metadata<P: OpenMlsProvider>(
     nonce: &[u8; 12],
 ) -> Result<Vec<u8>, MLSError> {
     use openmls_traits::signatures::Signer;
-    if metadata.avatar_blob_locator.is_some() || metadata.avatar_content_type.is_some() {
+    if metadata.avatar_blob_locator.is_some()
+        || metadata.avatar_content_type.is_some()
+        || metadata.space_avatar.is_some()
+    {
         return Err(invalid("Request bootstrap has no avatar binding"));
     }
     let request_id = ctx["requestId"]

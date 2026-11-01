@@ -546,6 +546,7 @@ fn build_state_metadata_transition(
         description: String::new(),
         avatar_blob_locator: None,
         avatar_content_type: None,
+        space_avatar: None,
     };
 
     let exporter_context_json = json!({
@@ -842,6 +843,7 @@ fn build_alice_creation_artifact(
         description: String::new(),
         avatar_blob_locator: None,
         avatar_content_type: None,
+        space_avatar: None,
     };
     let mut exporter_key_arr = [0u8; 32];
     exporter_key_arr.copy_from_slice(&exporter_key);

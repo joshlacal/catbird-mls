@@ -240,6 +240,7 @@ fn corpus_variant(count: usize, legacy: bool) {
         description: "Encrypted first contact".into(),
         avatar_blob_locator: None,
         avatar_content_type: None,
+        space_avatar: None,
     };
     let metadata_key = request_metadata_key(&group, &provider, &coordinates).unwrap();
     let metadata_nonce = [7; 12];
@@ -490,6 +491,7 @@ fn native_unpublished_journal_survives_reopen_without_live_inventory() {
             description: String::new(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         },
     };
     assert!(alice

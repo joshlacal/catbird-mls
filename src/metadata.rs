@@ -73,6 +73,9 @@ pub struct GroupMetadataV1 {
     /// MIME type of the avatar image, e.g. `"image/jpeg"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_content_type: Option<String>,
+    /// `1A` encrypted avatar blob pointer in `setter_did`'s conversation Space repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_avatar: Option<crate::groups::metadata_v1::SpaceAvatarPointer>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -465,6 +468,7 @@ mod tests {
             description: "The engineering team chat".to_string(),
             avatar_blob_locator: None,
             avatar_content_type: None,
+            space_avatar: None,
         }
     }
 
@@ -475,6 +479,7 @@ mod tests {
             description: "UI/UX design discussions".to_string(),
             avatar_blob_locator: Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string()),
             avatar_content_type: Some("image/jpeg".to_string()),
+            space_avatar: None,
         }
     }
 

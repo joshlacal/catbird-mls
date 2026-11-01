@@ -2792,6 +2792,7 @@ impl MLSContext {
                         description: config.group_description.clone().unwrap_or_default(),
                         avatar_blob_locator: None,
                         avatar_content_type: None,
+                        space_avatar: None,
                     };
                     let metadata_version: u64 = 1;
 
@@ -3427,6 +3428,7 @@ impl MLSContext {
                 description: description.unwrap_or_default(),
                 avatar_blob_locator,
                 avatar_content_type,
+                space_avatar: None,
             };
             let ciphertext = metadata::encrypt_metadata_blob(
                 &metadata_key,
