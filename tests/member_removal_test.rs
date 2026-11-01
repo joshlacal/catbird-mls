@@ -159,19 +159,16 @@ fn key_package_for(context: &MLSContext, identity: &[u8]) -> KeyPackageData {
 }
 
 fn open_test_manifest(path: &std::path::Path) -> rusqlite::Connection {
-    use sha2::{Digest, Sha256};
     let key = "test-key-1234567890123456";
+    let key_32 = catbird_mls::storage::derive_db_key_32_from_str(key);
+    let key_spec = catbird_mls::storage::derive_sqlcipher_96hex_key_spec(&key_32);
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.pragma_update(None, "cipher_memory_security", "OFF")
-        .unwrap();
-    conn.pragma_update(None, "key", key).unwrap();
-    conn.pragma_update(None, "cipher_plaintext_header_size", 32)
-        .unwrap();
-    conn.pragma_update(
-        None,
-        "cipher_salt",
-        format!("x'{}'", hex::encode(&Sha256::digest(key)[..16])),
-    )
+    conn.execute_batch(&format!(
+        "PRAGMA cipher_memory_security = OFF;\n\
+         PRAGMA key = \"{key_spec}\";\n\
+         PRAGMA cipher_plaintext_header_size = 32;\n\
+         PRAGMA journal_mode = WAL;"
+    ))
     .unwrap();
     conn
 }
@@ -574,7 +571,7 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
         let db = open_test_manifest(&path);
         let encoded: String = db
             .query_row(
-                "SELECT value FROM mls_manifests WHERE key = ?1",
+                "SELECT value_json FROM account_meta WHERE key = ?1",
                 [&receipt_key],
                 |row| row.get(0),
             )
@@ -593,7 +590,7 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
         {
             let db = open_test_manifest(&path);
             db.execute(
-                "UPDATE mls_manifests SET value = ?1 WHERE key = ?2",
+                "UPDATE account_meta SET value_json = ?1 WHERE key = ?2",
                 [
                     serde_json::to_string(&receipt).unwrap(),
                     receipt_key.clone(),
@@ -623,7 +620,7 @@ fn incoming_self_removal_completes_without_deadlock_and_preserves_sibling_member
     let db = open_test_manifest(&path);
     let encoded: String = db
         .query_row(
-            "SELECT value FROM mls_manifests WHERE key = ?1",
+            "SELECT value_json FROM account_meta WHERE key = ?1",
             [&receipt_key],
             |row| row.get(0),
         )

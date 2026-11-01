@@ -1,16 +1,14 @@
 //! Where a device keeps its Labyrinth client state ([CB-30]).
 //!
 //! `Labyrinth::export_state` returns the device's private keys, epoch
-//! secrets, MEKs, revoked set and peer pins, so the blob must live in
-//! secure storage. catbird-mls already keeps secret per-account values
-//! (direct-request keys, subscription cursors) in the SQLCipher-encrypted
-//! MLS database through [`MlsCryptoContext::compare_exchange_request_value`];
-//! the Labyrinth state uses the same store under [`STATE_NAMESPACE`], keyed
-//! by the account DID. That database is already per-account, and the
-//! compare-and-swap stops two processes (app and notification extension)
-//! from silently overwriting each other's epoch progress.
+//! secrets, MEKs, revoked set and peer pins, so the blob lives in the
+//! encrypted per-account SQLite database (`account_meta` via
+//! [`MlsCryptoContext::compare_exchange_request_value`]) under
+//! [`STATE_NAMESPACE`], keyed by the account DID.
 
 use std::sync::Arc;
+
+use labyrinth::store::{MaybeSend, MaybeSync};
 
 use crate::orchestrator::mls_provider::MlsCryptoContext;
 use crate::MLSError;
@@ -19,7 +17,7 @@ use crate::MLSError;
 pub const STATE_NAMESPACE: &str = "labyrinthClientState";
 
 /// Secure storage for one blob per account.
-pub trait StateVault: Send + Sync {
+pub trait StateVault: MaybeSend + MaybeSync {
     fn load(&self, did: &str) -> Result<Option<Vec<u8>>, MLSError>;
     /// Checks whether a state blob exists for `did` without leaving an
     /// unzeroized copy of secret key material on the heap.

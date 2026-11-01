@@ -141,10 +141,10 @@ where
     rejoin_locks: Mutex<HashMap<ConversationId, Arc<Mutex<()>>>>,
     /// Labyrinth encrypted-history session for the current account
     /// (feature `labyrinth`; see `crate::labyrinth`).
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     labyrinth: crate::labyrinth::LabyrinthSlot,
-    /// The background Labyrinth archive worker (feature `labyrinth`).
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    /// The cooperative Labyrinth archive queue state (feature `labyrinth`).
+    #[cfg(feature = "labyrinth")]
     labyrinth_archive: std::sync::Arc<crate::labyrinth::ArchiveWorker>,
     direct_request_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -332,9 +332,9 @@ where
             reissue_attempts_mem: Mutex::new(HashMap::new()),
             creation_generation: AtomicU64::new(0),
             rejoin_locks: Mutex::new(HashMap::new()),
-            #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+            #[cfg(feature = "labyrinth")]
             labyrinth: Default::default(),
-            #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+            #[cfg(feature = "labyrinth")]
             labyrinth_archive: Default::default(),
             direct_request_locks: Mutex::new(HashMap::new()),
             #[cfg(not(target_arch = "wasm32"))]
@@ -942,10 +942,10 @@ where
         self.own_commit_expectations.lock().await.clear();
         self.rejoin_locks.lock().await.clear();
         self.inbound_processing_locks.lock().await.clear();
-        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        #[cfg(feature = "labyrinth")]
         {
             self.labyrinth_archive.stop();
-            *self.labyrinth.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *self.labyrinth.lock().await = None;
         }
         if let Ok(mut fds) = self.fork_detection_states.lock() {
             fds.clear();
@@ -1007,13 +1007,13 @@ where
     }
 
     /// The Labyrinth session slot (feature `labyrinth`).
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     pub(crate) fn labyrinth_slot(&self) -> &crate::labyrinth::LabyrinthSlot {
         &self.labyrinth
     }
 
-    /// The background archive worker (feature `labyrinth`).
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    /// The cooperative archive worker state (feature `labyrinth`).
+    #[cfg(feature = "labyrinth")]
     pub(crate) fn labyrinth_archive(&self) -> &crate::labyrinth::ArchiveWorker {
         &self.labyrinth_archive
     }

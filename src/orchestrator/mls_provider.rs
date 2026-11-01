@@ -158,8 +158,8 @@ impl<T> MlsCryptoContextBounds for T {}
 /// Platform-agnostic MLS cryptographic operations.
 ///
 /// Implemented by:
-/// - `MLSContext` (native, via rusqlite/openmls_sqlite_storage)
-/// - `WasmMLSContext` (browser, via sqlite-wasm-rs/OPFS)
+/// - `MLSContext` (native, via `rusqlite` SQLCipher + `openmls_kv`)
+/// - `WasmMLSContext` (browser, via `sqlite-wasm-rs` `sqlite3mc` + `openmls_kv`)
 ///
 /// All methods are synchronous since the underlying crypto is CPU-bound.
 pub trait MlsCryptoContext: MlsCryptoContextBounds {

@@ -272,10 +272,10 @@ mod isolation {
         assert_eq!(
             modules,
             [
-                "api",
                 "engine",
                 "error",
                 "keychain",
+                "mls_engine_context",
                 "platform_lifecycle",
                 "types"
             ],
@@ -460,7 +460,7 @@ mod isolation {
         // covering these, it has stopped reading the re-export surface.
         let derived = forbidden_crate_root_names();
         for (name, module) in [
-            (["MLS", "Context"].concat(), "api"),
+            (["MLS", "Context"].concat(), "mls_engine_context"),
             (["Mls", "Engine"].concat(), "engine"),
         ] {
             let needle = format!("crate::{name}");

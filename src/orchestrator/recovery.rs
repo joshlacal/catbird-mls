@@ -4295,10 +4295,10 @@ where
         self.credentials().clear_all(&user_did).await?;
         // The Labyrinth state is bound to the old chat key, which is gone:
         // erase it (the device restores with a recovery code later).
-        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        #[cfg(feature = "labyrinth")]
         {
             self.labyrinth_stop_archive_worker();
-            self.labyrinth_close();
+            self.labyrinth_close_async().await;
             let vault = crate::labyrinth::MlsStateVault(self.mls_context().clone());
             if let Err(error) = crate::labyrinth::StateVault::delete(&vault, &user_did) {
                 tracing::warn!(%error, "labyrinth: erasing saved state during silent recovery failed");

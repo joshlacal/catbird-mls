@@ -7611,116 +7611,17 @@ where
 
     pub async fn put_group_metadata_blob(
         &self,
-        conversation_id: &str,
+        _conversation_id: &str,
         _group_id_hex: &str,
-        blob_locator: &str,
-        ciphertext: &[u8],
+        _blob_locator: &str,
+        _ciphertext: &[u8],
         _kind: &str,
         _metadata_version: u64,
         _reset_generation: Option<i32>,
     ) -> Result<()> {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
-        use sha2::{Digest, Sha256};
-        let user_did = self.require_user_did().await?;
-        let actor_device_id = self.require_actor_device_id().await?;
-        let auth_generation = self
-            .credentials()
-            .get_auth_generation(&user_did)
-            .await?
-            .unwrap_or(1);
-        let scoped_identity = self.require_scoped_identity().await?;
-        let public_key = self
-            .mls_context()
-            .identity_public_key(scoped_identity.as_bytes().to_vec())?;
-        let key_id = super::canonical_transport::derive_key_id(&public_key);
-
-        let resolved = self.resolve_conversation_context(conversation_id).await?;
-        let group_id_bytes = resolved.group_id_bytes()?;
-        let epoch = self.mls_context().get_epoch(group_id_bytes.clone())?;
-        let tag_bytes = self
-            .mls_context()
-            .get_confirmation_tag(group_id_bytes.clone())?;
-        if tag_bytes.len() != 32 {
-            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
-                "confirmation tag must be exactly 32 bytes, got {}",
-                tag_bytes.len()
-            ))));
-        }
-        let gc_hash = self
-            .mls_context()
-            .get_group_context_hash(group_id_bytes.clone())?;
-        if gc_hash.len() != 32 {
-            return Err(OrchestratorError::Mls(MLSError::Internal(format!(
-                "group context hash must be exactly 32 bytes, got {}",
-                gc_hash.len()
-            ))));
-        }
-        let plain_size = ciphertext.len().saturating_sub(16).max(1);
-        let cipher_size = ciphertext.len().max(17);
-
-        let body = serde_json::json!({
-            "$type": "blue.catbird.chat.defs#blobUploadPreparationBody",
-            "actorDeviceId": actor_device_id,
-            "actorDid": user_did,
-            "authGeneration": auth_generation,
-            "blobId": blob_locator,
-            "ciphertextSha256": STANDARD.encode(Sha256::digest(ciphertext)),
-            "ciphertextSize": cipher_size,
-            "conversationId": conversation_id,
-            "idempotencyKey": uuid::Uuid::new_v4().to_string(),
-            "keyId": key_id,
-            "mediaType": "application/octet-stream",
-            "plaintextSize": plain_size,
-            "prior": match self.fetch_current_conversation_coordinates(conversation_id).await {
-                Ok((c, _, _)) => c,
-                Err(_) => serde_json::json!({
-                    "confirmationTag": { "$bytes": STANDARD.encode(&tag_bytes) },
-                    "conversationId": conversation_id,
-                    "epoch": epoch,
-                    "generation": 0,
-                    "groupContextHash": { "$bytes": STANDARD.encode(&gc_hash) },
-                    "groupId": { "$bytes": STANDARD.encode(&group_id_bytes) },
-                    "lifecycle": "active",
-                    "stateVersion": 0
-                }),
-            },
-            "purpose": "metadata",
-            "signatureDomain": "CATBIRD-CHAT-BLOB-PREPARE\0",
-            "signedAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        });
-        let response = self
-            .submit_signed_clean_chat_request(
-                super::canonical_transport::CanonicalOperation::PrepareBlobUpload,
-                serde_json::to_vec(&body)
-                    .map_err(|e| OrchestratorError::Serialization(e.to_string()))?,
-            )
-            .await?;
-        if response.status != 200 {
-            return Err(OrchestratorError::Api(format!(
-                "prepare_blob_upload failed: {}",
-                response.status
-            )));
-        }
-
-        let upload_req = super::canonical_transport::PreparedRequest {
-            operation: super::canonical_transport::CanonicalOperation::UploadBlob,
-            method: "POST".into(),
-            path: format!(
-                "/xrpc/blue.catbird.chat.uploadBlob?blobId={blob_locator}&convoId={conversation_id}"
-            ),
-            body: Some(ciphertext.to_vec()),
-        };
-        let upload_resp = self
-            .api_client()
-            .submit_prepared_request(upload_req)
-            .await?;
-        if upload_resp.status != 200 {
-            return Err(OrchestratorError::Api(format!(
-                "upload_blob failed: {}",
-                upload_resp.status
-            )));
-        }
-        Ok(())
+        Err(OrchestratorError::InvalidInput(
+            "mls-ds blob upload retired (G6/I14); group metadata snapshots use SubmitTransition metadataTransitionBody (1A) and Space blobs".into(),
+        ))
     }
     /// Current inventory state of `conversation_id`, which carries both its
     /// `metadataSnapshot` and the record of the scheme that sealed it.

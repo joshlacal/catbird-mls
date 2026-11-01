@@ -29,8 +29,7 @@ use crate::orchestrator::mls_provider::{
 use crate::types::*;
 
 use crate::keychain::KeychainAccess;
-#[cfg(feature = "storage-driver-prototype")]
-use crate::storage_driver_prototype::OpenMlsStorageDriver;
+use crate::storage::{BackgroundCheckpointReport, MlsAccountDb};
 
 const DEFAULT_EPOCH_SECRET_RETENTION: u64 = 5;
 /// Standalone proposals remain in this short-lived authorization staging area
@@ -212,7 +211,7 @@ fn flatten_decrypt_error_for_ffi(e: MLSError) -> MLSError {
     }
 }
 
-#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FfiKeyPackageBindingStatus {
     Verified,
     IdentityMismatch,
@@ -221,7 +220,7 @@ pub enum FfiKeyPackageBindingStatus {
     Unverifiable,
 }
 
-#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FfiKeyPackageBindingClassification {
     pub status: FfiKeyPackageBindingStatus,
     pub identity_matches: bool,
@@ -234,7 +233,7 @@ pub struct FfiKeyPackageBindingClassification {
     pub reason: Option<String>,
 }
 
-#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FfiMlsErrorKind {
     InvalidCommit,
     WireFormatPolicyViolation,
@@ -246,7 +245,7 @@ pub enum FfiMlsErrorKind {
     Other,
 }
 
-#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FfiPeerBadErrorClassification {
     pub peer_bad: bool,
     pub quarantine_trigger_eligible: bool,
@@ -296,29 +295,6 @@ fn pad_ciphertext(ciphertext: &[u8]) -> (Vec<u8>, u32) {
 
 fn current_metadata_reference_json(group: &MlsGroup) -> Option<Vec<u8>> {
     crate::metadata::current_metadata_reference_json(group)
-}
-
-#[cfg(feature = "storage-driver-prototype")]
-#[uniffi::export]
-impl MLSContext {
-    /// Experimental constructor for host-owned OpenMLS storage drivers.
-    ///
-    /// This constructor is compiled only with `storage-driver-prototype` and is
-    /// intentionally not wired to production storage. It exists so Swift/Kotlin
-    /// fixture work can generate bindings against the target API shape while
-    /// the default `new(storage_path, encryption_key, keychain)` path continues
-    /// to use `openmls_sqlite_storage` and `HybridStorageProvider`.
-    #[uniffi::constructor]
-    pub fn new_with_storage_driver(
-        driver: Box<dyn OpenMlsStorageDriver>,
-        keychain: Box<dyn KeychainAccess>,
-    ) -> Result<Arc<Self>, MLSError> {
-        drop(driver);
-        drop(keychain);
-        Err(MLSError::OperationNotSupported {
-            reason: "storage-driver-prototype exposes the FFI contract only; production MLSContext storage still uses openmls_sqlite_storage until fixture compatibility is proven".to_string(),
-        })
-    }
 }
 
 /// Map an OpenMLS [`ProcessMessageError`] to a typed [`MLSError`] class (N38).
@@ -410,7 +386,6 @@ fn process_protocol_message<Provider: OpenMlsProvider>(
 /// - SQLite Connection uses RefCell (requires Send but not Sync)
 /// - Swift actor provides higher-level synchronization
 /// - Per-DID contexts are isolated (no shared state across accounts)
-#[derive(uniffi::Object)]
 pub struct MLSContext {
     /// Inner context wrapped in Option to allow taking/dropping for database close.
     /// When close_database() is called, this is set to None to drop the inner
@@ -842,8 +817,6 @@ pub fn set_post_build_key_package_hook<F: Fn() + Send + Sync + 'static>(hook: Op
         *h.borrow_mut() = hook.map(|f| Arc::new(f) as Arc<dyn Fn() + Send + Sync>);
     });
 }
-
-#[uniffi::export]
 impl MLSContext {
     /// Create a new context with per-DID SQLite storage
     ///
@@ -852,7 +825,6 @@ impl MLSContext {
     ///
     /// The SQLite connection is single-threaded (uses RefCell internally).
     /// Synchronization is provided by Swift's actor system at a higher level.
-    #[uniffi::constructor]
     pub fn new(
         storage_path: String,
         encryption_key: String,
@@ -885,6 +857,61 @@ impl MLSContext {
             pending_outgoing_commits: Arc::new(Mutex::new(HashMap::new())),
             staged_commit_nonce: Arc::new(AtomicU64::new(0)),
         }))
+    }
+
+    /// Construct [`MLSContext`] sharing an already-opened [`MlsAccountDb`] (`Spec §6.1`).
+    pub fn from_account_db(
+        db: Arc<MlsAccountDb>,
+        keychain: Arc<dyn KeychainAccess>,
+    ) -> Result<Arc<Self>, MLSError> {
+        let (mut context, interrupt_handles) = MLSContextInner::from_account_db(db, keychain)?;
+        let storage_registry = Arc::new(StorageConnectionRegistry::new(interrupt_handles));
+        let _ = context.reconcile_key_package_bundles()?;
+
+        Ok(Arc::new(Self {
+            inner: Arc::new(Mutex::new(Some(context))),
+            credential_validator: Arc::new(Mutex::new(None)),
+            external_join_authorizer: Arc::new(Mutex::new(None)),
+            storage_registry,
+            is_suspended: Arc::new(AtomicBool::new(false)),
+            pending_incoming_merges: Arc::new(Mutex::new(HashMap::new())),
+            pending_incoming_proposals: Arc::new(Mutex::new(HashMap::new())),
+            pending_outgoing_commits: Arc::new(Mutex::new(HashMap::new())),
+            staged_commit_nonce: Arc::new(AtomicU64::new(0)),
+        }))
+    }
+
+    /// Return the underlying [`MlsAccountDb`] handle.
+    pub fn account_db(&self) -> Result<Arc<MlsAccountDb>, MLSError> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_ref().ok_or(MLSError::ContextClosed)?;
+        Ok(Arc::clone(inner.account_db()))
+    }
+
+    /// Non-blocking suspend path (`I9` — `< 50 ms`, `PASSIVE` checkpoint, closes SQLite FDs).
+    pub fn prepare_for_background(&self) -> Result<BackgroundCheckpointReport, MLSError> {
+        self.is_suspended.store(true, Ordering::Release);
+        self.interrupt();
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        inner.prepare_for_background()
+    }
+
+    /// Reopen `<did_hash>.db` on foreground resume after [`Self::prepare_for_background`].
+    pub fn resume_from_background(&self) -> Result<(), MLSError> {
+        self.is_suspended.store(false, Ordering::Release);
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| MLSError::ContextNotInitialized)?;
+        let inner = guard.as_mut().ok_or(MLSError::ContextClosed)?;
+        inner.resume_from_background()
     }
 
     /// Set the epoch secret storage backend
@@ -989,11 +1016,11 @@ impl MLSContext {
             .map_err(|_| MLSError::ContextNotInitialized)?;
 
         // Get the inner context (if it exists)
-        if let Some(ref inner) = *guard {
-            // Flush the manifest storage (WAL checkpoint - PASSIVE mode)
-            let _ = inner.flush_database();
+        if let Some(ref mut inner) = *guard {
+            // Non-blocking PASSIVE checkpoint + immediate SQLite FD release (I9)
+            let _ = inner.prepare_for_background();
             crate::info_log!(
-                "[MLS-FFI/{}/pid={}] flush_and_prepare_close: Database flushed (PASSIVE)",
+                "[MLS-FFI/{}/pid={}] flush_and_prepare_close: Database flushed (PASSIVE) and FDs closed",
                 process_tag,
                 pid
             );
@@ -1839,8 +1866,6 @@ impl MLSContext {
         })
     }
 }
-
-#[uniffi::export]
 impl MLSContext {
     /// Remove members from the group (cryptographically secure)
     ///
@@ -2074,8 +2099,6 @@ impl MLSContext {
         })
     }
 }
-
-#[uniffi::export]
 impl MLSContext {
     /// Propose adding a member (does not commit)
     ///
@@ -5211,8 +5234,6 @@ impl MLSContext {
         })
     }
 }
-
-#[uniffi::export]
 impl MLSContext {
     /// Merge a pending commit after validation.
     ///
@@ -5585,8 +5606,6 @@ impl MLSContext {
         Ok(Some(receipt.target_epoch))
     }
 }
-
-#[uniffi::export]
 impl MLSContext {
     /// Task #33: discard an incoming `StagedCommit` that was previously staged,
     /// without advancing the local epoch.
@@ -7113,7 +7132,6 @@ impl MLSContext {
 /// fence against (mirror of `SKIP_SERVER_EPOCH_FENCE` on the orchestrator
 /// side). When `server_epoch == SKIP_SERVER_EPOCH_FENCE`, `confirm_commit`
 /// skips the fence check.
-#[uniffi::export]
 pub fn mls_skip_server_epoch_fence() -> u64 {
     SKIP_SERVER_EPOCH_FENCE
 }
@@ -7200,8 +7218,6 @@ impl MLSContext {
         })
     }
 }
-
-#[uniffi::export]
 impl MLSContext {
     /// Stage a commit without sending it to the delivery service or merging
     /// it locally. Returns a [`crate::orchestrator_bridge::FFICommitPlan`]
@@ -7225,24 +7241,27 @@ impl MLSContext {
     pub fn stage_commit(
         &self,
         conversation_id: String,
-        kind: crate::orchestrator_bridge::FFICommitKind,
+        kind: crate::orchestrator::types::CommitKind,
         signer_identity_bytes: Vec<u8>,
-    ) -> Result<crate::orchestrator_bridge::FFICommitPlan, crate::MLSCommitError> {
-        use crate::orchestrator_bridge::{FFICommitKind, FFICommitPlan, FFIStagedCommitHandle};
+    ) -> Result<crate::orchestrator::types::CommitPlan, crate::MLSCommitError> {
+        use crate::orchestrator::types::{CommitKind, CommitPlan, StagedCommitHandle};
 
         // Enforce count, per-package, and aggregate byte ceilings before
         // converting the raw FFI vectors or asking a TLS parser to inspect
         // attacker-controlled bytes.
         match &kind {
-            FFICommitKind::AddMembers { key_packages, .. } => {
-                validate_outbound_raw_key_package_batch(key_packages)?;
+            CommitKind::AddMembers { key_packages, .. } => {
+                let raw_kps: Vec<Vec<u8>> = key_packages.iter().map(|kp| kp.data.clone()).collect();
+                validate_outbound_raw_key_package_batch(&raw_kps)?;
             }
-            FFICommitKind::SwapMembers {
+            CommitKind::SwapMembers {
                 add_key_packages, ..
             } => {
-                validate_outbound_raw_key_package_batch(add_key_packages)?;
+                let raw_kps: Vec<Vec<u8>> =
+                    add_key_packages.iter().map(|kp| kp.data.clone()).collect();
+                validate_outbound_raw_key_package_batch(&raw_kps)?;
             }
-            FFICommitKind::RemoveMembers { .. } | FFICommitKind::UpdateMetadata { .. } => {}
+            CommitKind::RemoveMembers { .. } | CommitKind::UpdateMetadata { .. } => {}
         }
 
         let group_id_bytes = hex::decode(&conversation_id)
@@ -7267,23 +7286,19 @@ impl MLSContext {
         let source_epoch = self.get_epoch(group_id_bytes.clone())?;
 
         let (commit_bytes, welcome_bytes) = match kind {
-            FFICommitKind::AddMembers {
+            CommitKind::AddMembers {
                 member_dids,
                 key_packages,
             } => {
-                let kp_data: Vec<KeyPackageData> = key_packages
-                    .into_iter()
-                    .map(|data| KeyPackageData { data })
-                    .collect();
                 crate::orchestrator::credential_binding::enforce_outbound_key_package_did_bindings(
                     &member_dids,
-                    &kp_data,
+                    &key_packages,
                 )
                 .map_err(|error| MLSError::invalid_input(error.to_string()))?;
-                let add_result = self.add_members(group_id_bytes.clone(), kp_data)?;
+                let add_result = self.add_members(group_id_bytes.clone(), key_packages)?;
                 (add_result.commit_data, Some(add_result.welcome_data))
             }
-            FFICommitKind::RemoveMembers { member_dids } => {
+            CommitKind::RemoveMembers { member_dids } => {
                 let member_identities: Vec<Vec<u8>> = member_dids
                     .iter()
                     .map(|did| did.as_bytes().to_vec())
@@ -7291,25 +7306,23 @@ impl MLSContext {
                 let commit = self.remove_members(group_id_bytes.clone(), member_identities)?;
                 (commit, None)
             }
-            FFICommitKind::SwapMembers {
+            CommitKind::SwapMembers {
                 remove_dids,
                 add_dids,
                 add_key_packages,
             } => {
                 let remove_ids: Vec<Vec<u8>> =
                     remove_dids.iter().map(|d| d.as_bytes().to_vec()).collect();
-                let kp_data: Vec<KeyPackageData> = add_key_packages
-                    .into_iter()
-                    .map(|data| KeyPackageData { data })
-                    .collect();
                 crate::orchestrator::credential_binding::enforce_outbound_key_package_did_bindings(
-                    &add_dids, &kp_data,
+                    &add_dids,
+                    &add_key_packages,
                 )
                 .map_err(|error| MLSError::invalid_input(error.to_string()))?;
-                let swap_result = self.swap_members(group_id_bytes.clone(), remove_ids, kp_data)?;
+                let swap_result =
+                    self.swap_members(group_id_bytes.clone(), remove_ids, add_key_packages)?;
                 (swap_result.commit_data, Some(swap_result.welcome_data))
             }
-            FFICommitKind::UpdateMetadata {
+            CommitKind::UpdateMetadata {
                 group_info_extension,
             } => {
                 let commit =
@@ -7351,8 +7364,8 @@ impl MLSContext {
             target_epoch
         );
 
-        Ok(FFICommitPlan {
-            handle: FFIStagedCommitHandle {
+        Ok(CommitPlan {
+            handle: StagedCommitHandle {
                 group_id: conversation_id,
                 nonce,
             },
@@ -7366,24 +7379,12 @@ impl MLSContext {
 
     /// Confirm a previously staged commit: merge it locally, advance the
     /// epoch, and remove the handle from the pending map.
-    ///
-    /// `server_epoch` is used to fence against confirm calls that reference
-    /// a different epoch than the one the DS actually accepted. Pass the
-    /// value returned by [`mls_skip_server_epoch_fence`] for API paths that
-    /// don't echo an epoch; non-sentinel values must equal the plan's
-    /// `target_epoch`, otherwise the staged commit is left in place and
-    /// `MLSError::EpochMismatch` is returned so the caller can choose to
-    /// `discard_pending` and re-sync.
-    ///
-    /// Post-merge bookkeeping (storage writes, GroupInfo publish,
-    /// group-state cache update, epoch-secret cleanup) is the caller's
-    /// responsibility — see the module-level comment for rationale.
     pub fn confirm_commit(
         &self,
-        handle: crate::orchestrator_bridge::FFIStagedCommitHandle,
+        handle: crate::orchestrator::types::StagedCommitHandle,
         server_epoch: u64,
-    ) -> Result<crate::orchestrator_bridge::FFIConfirmedCommit, crate::MLSCommitError> {
-        use crate::orchestrator_bridge::FFIConfirmedCommit;
+    ) -> Result<crate::orchestrator::types::ConfirmedCommit, crate::MLSCommitError> {
+        use crate::orchestrator::types::ConfirmedCommit;
 
         // Preserve the exact handle until the epoch fence, merge, and durability
         // barrier all succeed. Holding the map lock serializes confirm/discard.
@@ -7478,7 +7479,7 @@ impl MLSContext {
             new_epoch
         );
 
-        Ok(FFIConfirmedCommit {
+        Ok(ConfirmedCommit {
             new_epoch,
             // Metadata key / reference plumbing is reserved for a future
             // trait extension on `MlsCryptoContext`. See the same field on
@@ -7496,7 +7497,7 @@ impl MLSContext {
     /// returns `MLSError::InvalidInput`.
     pub fn discard_pending(
         &self,
-        handle: crate::orchestrator_bridge::FFIStagedCommitHandle,
+        handle: crate::orchestrator::types::StagedCommitHandle,
     ) -> Result<(), crate::MLSCommitError> {
         // Keep the exact handle registered until OpenMLS confirms its pending
         // state is cleared. Holding this map lock serializes a concurrent
@@ -7558,7 +7559,6 @@ impl MLSContext {
 
 /// Set the global MLS logger to receive Rust logs in Swift
 /// This allows forwarding internal MLS logs to OSLog or other Swift logging systems
-#[uniffi::export]
 pub fn mls_set_logger(logger: Box<dyn MLSLogger>) {
     crate::logging::set_logger(logger);
 }
@@ -7566,7 +7566,6 @@ pub fn mls_set_logger(logger: Box<dyn MLSLogger>) {
 /// Compute the hash reference for a serialized KeyPackage
 /// Accepts either an MlsMessage-wrapped KeyPackage or raw KeyPackage bytes
 /// This is useful when you need to compute a hash from KeyPackage bytes received from the server
-#[uniffi::export]
 pub fn mls_compute_key_package_hash(key_package_bytes: Vec<u8>) -> Result<Vec<u8>, MLSError> {
     use openmls::prelude::*;
     use openmls_libcrux_crypto::Provider as LibcruxProvider;
@@ -7585,7 +7584,6 @@ pub fn mls_compute_key_package_hash(key_package_bytes: Vec<u8>) -> Result<Vec<u8
 
 /// Classify a serialized KeyPackage against an expected DID and, when
 /// available, the DID-resolved set of authorized MLS signing keys.
-#[uniffi::export]
 pub fn mls_classify_key_package_binding(
     expected_did: String,
     key_package_bytes: Vec<u8>,
@@ -7677,7 +7675,6 @@ pub fn mls_classify_key_package_binding(
 
 /// Classify an MLS processing error using the same Layer-3 peer-bad rules the
 /// orchestrator applies before it increments quarantine-trigger counters.
-#[uniffi::export]
 pub fn mls_classify_peer_bad_error(
     error_kind: FfiMlsErrorKind,
     error_message: String,
@@ -7728,7 +7725,6 @@ pub fn mls_classify_peer_bad_error(
 /// embedded in the key package's leaf node credential.
 ///
 /// This is useful for deduplicating key packages by device on the client side.
-#[uniffi::export]
 pub fn mls_extract_key_package_identity(key_package_bytes: Vec<u8>) -> Result<String, MLSError> {
     use openmls::prelude::*;
     use openmls_libcrux_crypto::Provider as LibcruxProvider;
@@ -7746,7 +7742,6 @@ pub fn mls_extract_key_package_identity(key_package_bytes: Vec<u8>) -> Result<St
 /// Extract the MLS leaf signature public key from a serialized KeyPackage.
 ///
 /// The returned key is the device key used to sign MLS leaf nodes/commits.
-#[uniffi::export]
 pub fn mls_extract_key_package_signature_public_key(
     key_package_bytes: Vec<u8>,
 ) -> Result<Vec<u8>, MLSError> {
@@ -7764,7 +7759,6 @@ pub fn mls_extract_key_package_signature_public_key(
 /// Extract the MLS leaf signature algorithm from a serialized KeyPackage.
 ///
 /// Returns a normalized lowercase algorithm label (e.g. "ed25519", "p256").
-#[uniffi::export]
 pub fn mls_extract_key_package_signature_algorithm(
     key_package_bytes: Vec<u8>,
 ) -> Result<String, MLSError> {
@@ -7792,7 +7786,6 @@ pub fn mls_extract_key_package_signature_algorithm(
 
 /// Generate a random Pre-Shared Key (PSK) for external commit authentication
 /// Returns 32 random bytes (256 bits) suitable for use as a PSK
-#[uniffi::export]
 pub fn mls_generate_psk() -> Result<Vec<u8>, MLSError> {
     use openmls_libcrux_crypto::Provider as LibcruxProvider;
     use openmls_traits::random::OpenMlsRand;
@@ -7807,7 +7800,6 @@ pub fn mls_generate_psk() -> Result<Vec<u8>, MLSError> {
 
 /// Hash a Pre-Shared Key (PSK) using SHA256
 /// Returns a hex-encoded string (64 characters) that can be used as a PSK identifier
-#[uniffi::export]
 pub fn mls_hash_psk(psk: Vec<u8>) -> String {
     use sha2::{Digest, Sha256};
 
@@ -9255,7 +9247,6 @@ impl MlsCryptoContext for MLSContext {
 /// - `metadata_json`: JSON-encoded `GroupMetadataV1` payload.
 ///
 /// Returns the encrypted blob: `nonce (12) || ciphertext || tag (16)`.
-#[uniffi::export]
 pub fn mls_encrypt_metadata_blob(
     key: Vec<u8>,
     group_id_hex: String,
@@ -9282,7 +9273,6 @@ pub fn mls_encrypt_metadata_blob(
 /// - `ciphertext`: Encrypted blob: `nonce (12) || ciphertext || tag (16)`.
 ///
 /// Returns JSON-encoded `GroupMetadataV1`.
-#[uniffi::export]
 pub fn mls_decrypt_metadata_blob(
     key: Vec<u8>,
     group_id_hex: String,
@@ -9310,7 +9300,6 @@ pub fn mls_decrypt_metadata_blob(
 ///
 /// Uses domain-separated AAD (appends `b"avatar"`) to prevent confusion
 /// with metadata blobs encrypted under the same key.
-#[uniffi::export]
 pub fn mls_encrypt_avatar_blob(
     key: Vec<u8>,
     group_id_hex: String,
@@ -9330,7 +9319,6 @@ pub fn mls_encrypt_avatar_blob(
 /// Decrypt an avatar blob back into raw image bytes.
 ///
 /// Uses domain-separated AAD (appends `b"avatar"`).
-#[uniffi::export]
 pub fn mls_decrypt_avatar_blob(
     key: Vec<u8>,
     group_id_hex: String,
@@ -9356,7 +9344,6 @@ pub fn mls_decrypt_avatar_blob(
 // Kotlin via UniFFI. The content root key is held in-memory inside
 // `MLSContextInner` and supplied by the platform; this layer never persists
 // it.
-#[uniffi::export]
 impl MLSContext {
     /// Install the content root key used by all subsequent
     /// encrypt/decrypt/hmac calls. Must be exactly 32 bytes.

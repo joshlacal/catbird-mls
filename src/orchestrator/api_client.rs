@@ -116,7 +116,7 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     /// `request.headers` unchanged (the signed `labyrinthWriteBody` on
     /// procedures), and returns the raw response. The default refuses, so a
     /// gateway that has not adopted Labyrinth fails closed.
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     async fn submit_labyrinth_request(
         &self,
         request: crate::labyrinth::LabyrinthRequest,
@@ -129,14 +129,14 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
 
     /// True when the gateway publishes and reads `blue.catbird.labyrinth.mailboxKeys`
     /// records in atproto repos (the PDS half of the Labyrinth directory).
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     async fn labyrinth_pds_enabled(&self) -> bool {
         false
     }
 
     /// `putRecord` `blue.catbird.labyrinth.mailboxKeys/{rkey}` (record JSON)
     /// in the signed-in account's repo.
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     async fn put_labyrinth_mailbox_keys(&self, rkey: &str, record: &[u8]) -> Result<()> {
         let _ = (rkey, record);
         Err(crate::orchestrator::error::OrchestratorError::Api(
@@ -144,9 +144,24 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         ))
     }
 
+    /// `putRecord` `blue.catbird.labyrinth.mailboxKeys/{rkey}` with optional `swapRecord` CAS CID.
+    #[cfg(feature = "labyrinth")]
+    async fn put_labyrinth_mailbox_keys_cas(
+        &self,
+        rkey: &str,
+        record: &[u8],
+        swap_cid: Option<&str>,
+    ) -> Result<String> {
+        let _ = swap_cid;
+        self.put_labyrinth_mailbox_keys(rkey, record).await?;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(record);
+        Ok(format!("bafyreie{}", hex::encode(&digest[..16])))
+    }
+
     /// `getRecord` `blue.catbird.labyrinth.mailboxKeys/{rkey}` from `did`'s
     /// repo; `None` if absent.
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     async fn get_labyrinth_mailbox_keys(&self, did: &str, rkey: &str) -> Result<Option<Vec<u8>>> {
         let _ = (did, rkey);
         Err(crate::orchestrator::error::OrchestratorError::Api(
@@ -154,9 +169,25 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         ))
     }
 
+    /// `getRecord` `blue.catbird.labyrinth.mailboxKeys/{rkey}` returning `(record_bytes, cid)`.
+    #[cfg(feature = "labyrinth")]
+    async fn get_labyrinth_mailbox_keys_with_cid(
+        &self,
+        did: &str,
+        rkey: &str,
+    ) -> Result<Option<(Vec<u8>, String)>> {
+        let Some(bytes) = self.get_labyrinth_mailbox_keys(did, rkey).await? else {
+            return Ok(None);
+        };
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&bytes);
+        let cid = format!("bafyreie{}", hex::encode(&digest[..16]));
+        Ok(Some((bytes, cid)))
+    }
+
     /// Delete every `blue.catbird.labyrinth.mailboxKeys` record of the
     /// signed-in account.
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     async fn delete_labyrinth_mailbox_keys(&self) -> Result<()> {
         Err(crate::orchestrator::error::OrchestratorError::Api(
             "this gateway does not delete mailboxKeys".into(),
@@ -164,18 +195,14 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
     }
 
     /// True when the gateway implements owner OAuth Space operations and
-    /// verified foreign conversation record reads. This advertises adapter
-    /// capability; the client probes the host and pins actual placement.
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    /// verified foreign conversation record reads.
+    #[cfg(feature = "labyrinth")]
     async fn labyrinth_space_enabled(&self) -> bool {
         false
     }
 
-    /// Send an allowlisted Space operation. Owner reads/writes use account
-    /// OAuth. Foreign conversation getRecord must verify the October 22
-    /// credential response MAC, requested URI and CID before success.
-    /// Return raw non-2xx statuses; an unavailable adapter refuses.
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    /// Send an allowlisted Space operation.
+    #[cfg(feature = "labyrinth")]
     async fn submit_labyrinth_space_request(
         &self,
         request: crate::labyrinth::LabyrinthSpaceRequest,
@@ -188,12 +215,12 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
 
     /// Sequencer DS DID and Ed25519 verifying key (`[CB-38]`) trusted to sign
     /// server `accountDeleted` redactions, when configured by the gateway.
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     async fn labyrinth_sequencer_key(&self) -> Option<(String, [u8; 32])> {
         None
     }
 
-    /// Download an encrypted metadata blob from the DS via `blue.catbird.chat.getBlob`.
+    /// Download an encrypted metadata blob from the DS (retired under `1A`; returns unsupported).
     async fn get_group_metadata_blob(
         &self,
         convo_id: &str,

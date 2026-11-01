@@ -1,37 +1,9 @@
-//! The background archive queue: sent messages are archived off the send
-//! critical path, in batches, from crash-safe pending state
-//! (docs/plans/2026-10-05-labyrinth-history-backup.md, D7 as amended).
+//! Crash-safe durable Labyrinth archive queue (`labyrinthArchiveQueue`).
 //!
-//! **Enqueue (send path).** The send hook writes one [`PendingArchive`]
-//! row into the encrypted MLS database ([`MlsArchiveQueue`], request-value
-//! namespace [`QUEUE_NAMESPACE`]) and wakes the worker. No network call
-//! happens on the send path.
-//!
-//! **Flush (worker).** One worker per orchestrator and account waits until
-//! [`QueueConfig::max_batch`] rows are pending or [`QueueConfig::max_delay`]
-//! has passed since the first, then archives every pending row, one
-//! conversation at a time ([`super::flush`]): rows are marked `inflight`,
-//! the conversation's roster is resolved, its messages are archived and
-//! written (one `appendBatch` per MEK, [CB-20]), and only then removed. One
-//! conversation failing never holds back another.
-//!
-//! **Failures (review 2).** A roster member whose epoch fails a trust
-//! check is excluded and reported, not fatal ([`super::status`]). A
-//! conversation that fails for a non-transient reason counts a failure on
-//! each of its rows; after [`MAX_FAILURES`] the rows are quarantined (kept,
-//! skipped, reported) until the platform retries them. A conversation
-//! mls-ds no longer has drops its rows with the reason recorded. The queue
-//! holds at most [`MAX_QUEUE_ROWS`] rows per account: a full queue first
-//! evicts quarantined rows, then refuses the new message, recording either
-//! as dropped.
-//!
-//! **Crash safety.** A row leaves the queue only after its batch was
-//! written, so a crash loses nothing. A crash *after* the write but
-//! *before* the removal leaves `inflight` rows behind; the next flush looks
-//! each of those up (`load_message`) and drops the ones already archived
-//! by this account instead of archiving them twice. A failed flush drops
-//! the in-memory session, so its unflushed outbox is discarded and the
-//! rows are retried from the queue.
+//! Compliant with Spec §3.2 `G1`: holds zero internal `tokio::runtime::Runtime`
+//! or detached `tokio::spawn` background tasks. Sent frames are durably queued in
+//! the encrypted SQLite/SQLCipher database and flushed cooperatively when batch
+//! thresholds are reached or when the platform calls `labyrinth_flush_archive`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,9 +11,8 @@ use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use labyrinth::store::{MaybeSend, MaybeSync};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
 
 pub use super::flush::{flush_queue, FlushReport};
 use super::session::SessionDeps;
@@ -72,8 +43,7 @@ pub struct PendingArchive {
     /// The last failure, transient or not.
     #[serde(default)]
     pub last_error: Option<String>,
-    /// Skipped by flushes after [`MAX_FAILURES`] failures, until
-    /// [`retry_quarantined`].
+    /// Skipped by flushes after [`MAX_FAILURES`] failures, until [`retry_quarantined`].
     #[serde(default)]
     pub quarantined: bool,
     /// Hex-encoded local OpenMLS group ID at send time.
@@ -82,8 +52,7 @@ pub struct PendingArchive {
     /// Local OpenMLS epoch at send time.
     #[serde(default)]
     pub mls_epoch: Option<u64>,
-    /// Sorted, deduplicated root account DIDs of active local OpenMLS ratchet-tree
-    /// leaves at the exact moment this message was encrypted.
+    /// Sorted, deduplicated root account DIDs of active local OpenMLS leaves at send time.
     #[serde(default)]
     pub expected_member_dids: Option<Vec<String>>,
 }
@@ -134,7 +103,7 @@ impl PendingArchive {
 }
 
 /// Durable storage of the pending rows (one per sent message).
-pub trait ArchiveQueueStore: Send + Sync {
+pub trait ArchiveQueueStore: MaybeSend + MaybeSync {
     fn put(&self, row: &PendingArchive) -> Result<()>;
     /// The account's rows, oldest first.
     fn list(&self, did: &str) -> Result<Vec<PendingArchive>>;
@@ -160,8 +129,7 @@ pub trait ArchiveQueueStore: Send + Sync {
         Ok(())
     }
     /// Clears per-conversation status metadata (`excluded_members`, `dropped`)
-    /// on sign-out or account removal while preserving any
-    /// `pending_remote_deletion` retry intent.
+    /// while preserving any `pending_remote_deletion` retry intent.
     fn clear_status_preserving_deletion(&self, did: &str) -> Result<()> {
         self.update_status(did, &mut |s| {
             s.excluded_members.clear();
@@ -170,10 +138,7 @@ pub trait ArchiveQueueStore: Send + Sync {
     }
 }
 
-/// Queues `row` (the send path), keeping the account's queue within
-/// [`MAX_QUEUE_ROWS`]: a full queue evicts its oldest quarantined row,
-/// else refuses `row`. Either is recorded as dropped. Returns whether
-/// `row` was queued.
+/// Queues `row` (the send path), keeping the account's queue within [`MAX_QUEUE_ROWS`].
 pub fn enqueue(store: &dyn ArchiveQueueStore, row: &PendingArchive) -> Result<bool> {
     let rows = store.list(&row.did)?;
     let mut dropped = None;
@@ -193,7 +158,11 @@ pub fn enqueue(store: &dyn ArchiveQueueStore, row: &PendingArchive) -> Result<bo
         store.put(row)?;
     }
     if let Some((d, reason)) = dropped {
-        tracing::warn!(conversation_id = %d.conversation_id, reason, "labyrinth: archive row dropped");
+        tracing::warn!(
+            conversation_id = %d.conversation_id,
+            reason,
+            "labyrinth: archive row dropped"
+        );
         store.update_status(&row.did, &mut |s| {
             s.drop_row(DroppedArchive {
                 conversation_id: d.conversation_id.clone(),
@@ -206,8 +175,7 @@ pub fn enqueue(store: &dyn ArchiveQueueStore, row: &PendingArchive) -> Result<bo
     Ok(queued)
 }
 
-/// Clears quarantine on every row of `did` so the next flush retries
-/// them. Returns how many were quarantined.
+/// Clears quarantine on every row of `did` so the next flush retries them.
 pub fn retry_quarantined(store: &dyn ArchiveQueueStore, did: &str) -> Result<usize> {
     let mut n = 0;
     for mut row in store.list(did)?.into_iter().filter(|r| r.quarantined) {
@@ -299,12 +267,12 @@ impl<M: MlsCryptoContext + 'static> ArchiveQueueStore for MlsArchiveQueue<M> {
     }
 }
 
-/// When the worker flushes.
+/// Cooperative batch policy for the archive queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QueueConfig {
-    /// Flush as soon as this many rows are pending.
+    /// Flush immediately once this many rows are pending.
     pub max_batch: usize,
-    /// Otherwise flush this long after the first pending row.
+    /// Advisory maximum delay between flushes for platform schedulers.
     pub max_delay: Duration,
 }
 
@@ -317,167 +285,71 @@ impl Default for QueueConfig {
     }
 }
 
-/// Opens the session if needed and flushes, on a blocking thread. A
-/// failure drops the session so its unflushed outbox is not reused.
+/// Opens the session if needed and flushes pending archive rows. A failure drops
+/// the in-memory session so its unflushed outbox is never reused.
 pub async fn flush_in_slot(
     slot: LabyrinthSlot,
     deps: SessionDeps,
     store: Arc<dyn ArchiveQueueStore>,
 ) -> Result<FlushReport> {
-    tokio::task::spawn_blocking(move || {
-        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
-        let key = deps.signer.public_key();
-        if !guard.as_ref().is_some_and(|s| s.is_for(&deps.did, &key)) {
-            *guard = deps.clone().open()?;
-        }
-        let Some(session) = guard.as_mut() else {
-            return Ok(FlushReport::default());
-        };
-        let out = flush_queue(session, &deps, store.as_ref());
-        if out.is_err() {
-            *guard = None;
-        }
-        out
-    })
-    .await
-    .map_err(|e| OrchestratorError::Api(format!("labyrinth flush task failed: {e}")))?
+    let mut guard = slot.lock().await;
+    let key = deps.signer.public_key();
+    if !guard.as_ref().is_some_and(|s| s.is_for(&deps.did, &key)) {
+        *guard = deps.clone().open().await?;
+    }
+    let Some(session) = guard.as_mut() else {
+        return Ok(FlushReport::default());
+    };
+    let out = flush_queue(session, &deps, store.as_ref()).await;
+    if out.is_err() {
+        *guard = None;
+    }
+    out
 }
 
-/// The running worker: account DID, chat key, task.
-type WorkerTask = (String, [u8; 32], JoinHandle<()>);
-
-/// The orchestrator's archive worker state (one account at a time).
+/// Cooperative archive queue state (`G1` zero-spawn design).
 #[derive(Default)]
 pub struct ArchiveWorker {
-    /// Covers complete blocking remote deletion and enrollment operations.
-    /// The guard lives inside the blocking task, so cancellation of its async
-    /// caller cannot release it while a remote purge is still executing.
-    lifecycle: Arc<Mutex<()>>,
-    notify: Arc<Notify>,
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
     pending: Arc<AtomicUsize>,
     config: Mutex<QueueConfig>,
-    task: Mutex<Option<WorkerTask>>,
 }
 
 impl ArchiveWorker {
-    pub(super) fn lifecycle_lock(&self) -> Arc<Mutex<()>> {
+    pub(super) fn lifecycle_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         self.lifecycle.clone()
     }
 
     pub fn set_config(&self, config: QueueConfig) {
         *self.config.lock().unwrap_or_else(|e| e.into_inner()) = config;
-        self.notify.notify_one();
     }
 
-    /// One more row is pending: wake the worker.
-    pub fn enqueued(&self) {
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        self.notify.notify_one();
+    pub fn config(&self) -> QueueConfig {
+        *self.config.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Starts the worker for `deps`' account and chat key unless it runs;
-    /// a worker for another account is stopped first. `already` rows are
-    /// pending from before (a previous process).
-    pub fn ensure(
-        &self,
-        slot: LabyrinthSlot,
-        deps: SessionDeps,
-        store: Arc<dyn ArchiveQueueStore>,
-        already: usize,
-    ) {
-        let mut task = self.task.lock().unwrap_or_else(|e| e.into_inner());
-        let key = deps.signer.public_key();
-        if let Some((did, k, h)) = task.as_ref() {
-            if *did == deps.did && *k == key && !h.is_finished() {
-                return;
-            }
-        }
-        if let Some((_, _, h)) = task.take() {
-            h.abort();
-        }
+    pub fn enqueued(&self) -> usize {
+        self.pending.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    pub fn should_auto_flush(&self) -> bool {
+        let cfg = self.config();
+        self.pending.load(Ordering::SeqCst) >= cfg.max_batch.max(1)
+    }
+
+    pub fn ensure(&self, already: usize) {
         self.pending.store(already, Ordering::SeqCst);
-        let config = *self.config.lock().unwrap_or_else(|e| e.into_inner());
-        let (notify, pending) = (self.notify.clone(), self.pending.clone());
-        let did = deps.did.clone();
-        let handle = tokio::spawn(run(slot, deps, store, notify.clone(), pending, config));
-        if already > 0 {
-            notify.notify_one();
-        }
-        *task = Some((did, key, handle));
     }
 
-    /// Stops the worker (shutdown, account switch, sign-out). Pending rows
-    /// stay in the database.
     pub fn stop(&self) {
-        if let Some((_, _, h)) = self.task.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            h.abort();
-        }
+        self.pending.store(0, Ordering::SeqCst);
     }
 
-    /// Rows flushed outside the worker (an explicit flush).
     pub fn flushed(&self, n: usize) {
         let _ = self
             .pending
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
                 Some(p.saturating_sub(n))
             });
-    }
-}
-
-async fn run(
-    slot: LabyrinthSlot,
-    deps: SessionDeps,
-    store: Arc<dyn ArchiveQueueStore>,
-    notify: Arc<Notify>,
-    pending: Arc<AtomicUsize>,
-    config: QueueConfig,
-) {
-    let mut backoff = config.max_delay;
-    loop {
-        if pending.load(Ordering::SeqCst) == 0 {
-            notify.notified().await;
-            continue;
-        }
-        let deadline = tokio::time::Instant::now() + config.max_delay;
-        while pending.load(Ordering::SeqCst) < config.max_batch {
-            tokio::select! {
-                _ = notify.notified() => {}
-                _ = tokio::time::sleep_until(deadline) => break,
-            }
-        }
-        match flush_in_slot(slot.clone(), deps.clone(), store.clone()).await {
-            Ok(report) if report.failed_conversations == 0 => {
-                let n = report.left_queue();
-                let _ = pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
-                    Some(p.saturating_sub(n))
-                });
-                if n == 0 {
-                    // Nothing flushable (not enabled, quarantined, or rows
-                    // of another flush): wait for the next enqueue.
-                    pending.store(0, Ordering::SeqCst);
-                }
-                backoff = config.max_delay;
-            }
-            Ok(report) => {
-                // Some conversations failed; their rows stay (or were
-                // quarantined). Back off before retrying them.
-                let n = report.left_queue();
-                let _ = pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| {
-                    Some(p.saturating_sub(n))
-                });
-                tracing::warn!(
-                    failed = report.failed_conversations,
-                    quarantined = report.quarantined,
-                    "labyrinth: some conversations failed to archive; retrying"
-                );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(300));
-            }
-            Err(error) => {
-                tracing::warn!(%error, "labyrinth: archive flush failed; retrying");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(300));
-            }
-        }
     }
 }

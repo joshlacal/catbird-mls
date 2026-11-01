@@ -820,7 +820,7 @@ where
                 },
                 other => OrchestratorError::Mls(other),
             })?;
-        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        #[cfg(feature = "labyrinth")]
         let mut labyrinth_mls_snapshot = self
             .snapshot_group_root_member_dids(&group_id_bytes)
             .ok()
@@ -913,7 +913,7 @@ where
                 let retry_transition_guard = retry_transition_lock.lock().await;
                 self.reject_send_if_reset_pending(conversation_id).await?;
                 self.validate_send_actor(&actor).await?;
-                #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+                #[cfg(feature = "labyrinth")]
                 {
                     labyrinth_mls_snapshot = self
                         .snapshot_group_root_member_dids(&group_id_bytes)
@@ -1041,7 +1041,7 @@ where
         self.validate_send_actor(&actor).await?;
 
         // Labyrinth history backup (best effort: the send already succeeded).
-        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        #[cfg(feature = "labyrinth")]
         {
             let canonical_id = send_response
                 .as_ref()
@@ -1062,7 +1062,7 @@ where
         Ok(message)
     }
 
-    #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+    #[cfg(feature = "labyrinth")]
     pub(crate) fn snapshot_group_root_member_dids(
         &self,
         group_id_bytes: &[u8],

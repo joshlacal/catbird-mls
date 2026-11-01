@@ -245,15 +245,15 @@ pub(crate) fn request_value_read(
     checked_namespace(namespace)?;
     checked_id(id)?;
     let key = format!("direct_request_value_v2:{namespace}:{id}");
-    storage
-        .welcome_ack_connection()
-        .query_row(
-            "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
+    storage.with_connection(|conn| {
+        conn.query_row(
+            "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
             [&key],
             |row| row.get(0),
         )
         .optional()
         .map_err(|_| MLSError::StorageFailed)
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -265,14 +265,14 @@ pub(crate) fn request_value_exists(
     checked_namespace(namespace)?;
     checked_id(id)?;
     let key = format!("direct_request_value_v2:{namespace}:{id}");
-    storage
-        .welcome_ack_connection()
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM mls_manifests WHERE key=?1)",
+    storage.with_connection(|conn| {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM account_meta WHERE key=?1)",
             [&key],
             |row| row.get::<_, bool>(0),
         )
         .map_err(|_| MLSError::StorageFailed)
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -290,30 +290,34 @@ pub(crate) fn request_value_cas(
         return Err(MLSError::invalid_input("Request value exceeds storage bound"));
     }
     let key = format!("direct_request_value_v2:{namespace}:{id}");
-    let tx = storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(|_| MLSError::StorageFailed)?;
-    let old: Option<zeroize::Zeroizing<Vec<u8>>> = tx
-        .query_row(
-            "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
-            [&key],
-            |r| r.get::<_, Vec<u8>>(0),
+    let changed = storage.with_connection(|conn| {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|_| MLSError::StorageFailed)?;
+        let old: Option<zeroize::Zeroizing<Vec<u8>>> = tx
+            .query_row(
+                "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
+                [&key],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|_| MLSError::StorageFailed)?
+            .map(zeroize::Zeroizing::new);
+        if old.as_deref().map(Vec::as_slice) != expected {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES(?1, ?2)",
+            rusqlite::params![&key, next],
         )
-        .optional()
-        .map_err(|_| MLSError::StorageFailed)?
-        .map(zeroize::Zeroizing::new);
-    if old.as_deref().map(Vec::as_slice) != expected {
-        return Ok(false);
+        .map_err(|_| MLSError::StorageFailed)?;
+        tx.commit().map_err(|_| MLSError::StorageFailed)?;
+        Ok(true)
+    })?;
+    if changed {
+        storage.flush_database()?;
     }
-    tx.execute(
-        "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES(?1,?2)",
-        rusqlite::params![key, next],
-    )
-    .map_err(|_| MLSError::StorageFailed)?;
-    tx.commit().map_err(|_| MLSError::StorageFailed)?;
-    storage.flush_database()?;
-    Ok(true)
+    Ok(changed)
 }
 
 /// Deletes one request value; `Ok(false)` if it did not exist.
@@ -326,10 +330,10 @@ pub(crate) fn request_value_delete(
     checked_namespace(namespace)?;
     checked_id(id)?;
     let key = format!("direct_request_value_v2:{namespace}:{id}");
-    let n = storage
-        .welcome_ack_connection()
-        .execute("DELETE FROM mls_manifests WHERE key=?1", [&key])
-        .map_err(|_| MLSError::StorageFailed)?;
+    let n = storage.with_connection(|conn| {
+        conn.execute("DELETE FROM account_meta WHERE key=?1", [&key])
+            .map_err(|_| MLSError::StorageFailed)
+    })?;
     storage.flush_database()?;
     Ok(n > 0)
 }
@@ -341,15 +345,16 @@ pub(crate) fn request_values_list(
 ) -> std::result::Result<Vec<Vec<u8>>, MLSError> {
     checked_namespace(namespace)?;
     let pattern = format!("direct_request_value_v2:{namespace}:%");
-    let mut query = storage
-        .welcome_ack_connection()
-        .prepare("SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key LIKE ?1 ORDER BY key")
-        .map_err(|_| MLSError::StorageFailed)?;
-    let rows = query
-        .query_map([&pattern], |r| r.get::<_, Vec<u8>>(0))
-        .map_err(|_| MLSError::StorageFailed)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| MLSError::StorageFailed)
+    storage.with_connection(|conn| {
+        let mut query = conn
+            .prepare("SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key LIKE ?1 ORDER BY key")
+            .map_err(|_| MLSError::StorageFailed)?;
+        let rows = query
+            .query_map([&pattern], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(|_| MLSError::StorageFailed)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| MLSError::StorageFailed)
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -359,14 +364,14 @@ pub(crate) fn request_values_total_bytes(
 ) -> std::result::Result<u64, MLSError> {
     checked_namespace(namespace)?;
     let pattern = format!("direct_request_value_v2:{namespace}:%");
-    let total: i64 = storage
-        .welcome_ack_connection()
-        .query_row(
-            "SELECT COALESCE(SUM(length(value)),0) FROM mls_manifests WHERE key LIKE ?1",
+    let total: i64 = storage.with_connection(|conn| {
+        conn.query_row(
+            "SELECT COALESCE(SUM(length(value_json)), 0) FROM account_meta WHERE key LIKE ?1",
             [&pattern],
             |r| r.get(0),
         )
-        .map_err(|_| MLSError::StorageFailed)?;
+        .map_err(|_| MLSError::StorageFailed)
+    })?;
     Ok(total.max(0) as u64)
 }
 

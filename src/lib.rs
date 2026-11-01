@@ -1,13 +1,7 @@
-#[cfg(not(target_arch = "wasm32"))]
-mod api;
 pub mod blob_crypto;
 /// Clean chat protocol (`blue.catbird.chat.*`). Isolated from `orchestrator`;
 /// the two protocols never interoperate.
 pub mod chat_v2;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod client;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod client_bridge;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod engine;
 #[cfg(not(target_arch = "wasm32"))]
@@ -15,23 +9,20 @@ mod epoch_storage;
 mod error;
 pub mod field_encryption;
 #[cfg(not(target_arch = "wasm32"))]
-mod hybrid_storage;
-#[cfg(not(target_arch = "wasm32"))]
 mod keychain;
-#[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+#[cfg(feature = "labyrinth")]
 pub mod labyrinth;
 pub mod logging;
 mod message_limits;
 pub mod metadata;
 #[cfg(not(target_arch = "wasm32"))]
 mod mls_context;
+#[cfg(not(target_arch = "wasm32"))]
+mod mls_engine_context;
 pub mod orchestrator;
 #[cfg(not(target_arch = "wasm32"))]
-pub mod orchestrator_bridge;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod platform_lifecycle;
-#[cfg(all(not(target_arch = "wasm32"), feature = "storage-driver-prototype"))]
-pub mod storage_driver_prototype;
+pub mod storage;
 mod types;
 // Voice depends on audiopus which has no wasm32 sysroot.
 #[cfg(not(target_arch = "wasm32"))]
@@ -40,8 +31,6 @@ pub mod voice;
 // ATProto serde helpers (standalone, no external dependency)
 pub mod atproto_bytes;
 
-#[cfg(not(target_arch = "wasm32"))]
-pub use api::*;
 pub use catbird_atproto as atproto;
 #[cfg(not(target_arch = "wasm32"))]
 pub use engine::*;
@@ -52,6 +41,8 @@ pub use keychain::*;
 pub use mls_context::canonical_signer_keychain_key;
 #[cfg(not(target_arch = "wasm32"))]
 pub use mls_context::validate_serialized_signer_keypair_coherence;
+#[cfg(not(target_arch = "wasm32"))]
+pub use mls_engine_context::*;
 pub use orchestrator::direct_request_types::{
     DirectRequestInput, DirectRequestOutcome, DirectRequestView, GroupInvitationReference,
     RequestCapabilities, RequestConsent, RequestCrypto, RequestIntroductionMetadata,
@@ -63,18 +54,12 @@ pub use types::*;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
-pub use api::set_post_build_key_package_hook;
+pub use mls_context::set_simulate_extension_process_for_test;
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
-pub use mls_context::set_simulate_extension_process_for_test;
-// ═══════════════════════════════════════════════════════════════════════════
-// Build ID for verifying correct FFI version is shipped
-// ═══════════════════════════════════════════════════════════════════════════
+pub use mls_engine_context::set_post_build_key_package_hook;
 
 /// Returns the build identifier for this FFI version.
-///
-/// Call this at app startup in both main app and NSE to verify both processes
-/// are using the same FFI binary. Log mismatches as errors.
 ///
 /// Format: "mls-ffi-{version}-{build_timestamp}"
 #[cfg(not(target_arch = "wasm32"))]
@@ -86,11 +71,6 @@ pub fn get_ffi_build_id() -> String {
 }
 
 /// Returns detailed build information for diagnostics.
-///
-/// Includes:
-/// - Version from Cargo.toml
-/// - Build timestamp (if set during build)
-/// - SQLCipher pragma settings (for verification)
 #[cfg(not(target_arch = "wasm32"))]
 #[uniffi::export]
 pub fn get_ffi_build_info() -> String {
@@ -103,50 +83,43 @@ pub fn get_ffi_build_info() -> String {
     };
 
     format!(
-        "mls-ffi v{} ({}) profile={} | SQLCipher: plaintext_header=32, kdf_iter=256000, page_size=4096",
+        "mls-ffi v{} ({}) profile={} | SQLCipher: 96-hex raw+salt, plaintext_header=32, page_size=4096",
         version, timestamp, profile
     )
 }
 
-// Shared async runtime for FFI→async bridging
-// Used when synchronous FFI methods need to call async code
+// Synchronous FFI/CLI -> async bridging without a background worker pool (`Spec §6.5` / `G1`).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod async_runtime {
-    use once_cell::sync::Lazy;
-    use tokio::runtime::Runtime;
-
-    /// Shared Tokio runtime for async operations at FFI boundary
-    pub static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4) // Increased from 2 to reduce contention
-            .thread_name("mls-async-worker")
-            .enable_all()
-            .build()
-            .expect("Failed to create async runtime")
-    });
-
-    /// Execute an async operation from synchronous code.
-    /// Handles the case where we're already inside a tokio runtime
-    /// (both multi-thread and current-thread flavors).
+    /// Execute an async operation from synchronous code using a zero-pool
+    /// single-thread reactor when outside Tokio, `block_in_place` when inside
+    /// a multi-thread runtime, or a short-lived scoped current-thread runtime
+    /// when nested inside a current-thread runtime.
     pub fn block_on<F>(f: F) -> F::Output
     where
         F: std::future::Future + Send,
         F::Output: Send,
     {
+        let build_current_thread = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create current-thread async runtime")
+        };
+
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             match handle.runtime_flavor() {
                 tokio::runtime::RuntimeFlavor::MultiThread => {
                     tokio::task::block_in_place(|| handle.block_on(f))
                 }
                 _ => std::thread::scope(|s| {
-                    s.spawn(|| RUNTIME.block_on(f))
+                    s.spawn(|| build_current_thread().block_on(f))
                         .join()
                         .expect("async_runtime::block_on worker panicked")
                 }),
             }
         } else {
-            // Not inside a runtime — use our own
-            RUNTIME.block_on(f)
+            build_current_thread().block_on(f)
         }
     }
 }

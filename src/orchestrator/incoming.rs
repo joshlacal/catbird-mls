@@ -191,6 +191,56 @@ impl IncomingEnvelope {
         envelope.validate_server_metadata()?;
         Ok(Some(envelope))
     }
+
+    pub fn from_wire_envelope(
+        envelope: WireIncomingEnvelope,
+        server_epoch: Option<u64>,
+    ) -> Result<Self> {
+        if envelope
+            .server_epoch
+            .zip(server_epoch)
+            .is_some_and(|(field, argument)| field != argument)
+        {
+            return Err(OrchestratorError::InvalidInput(
+                "Conflicting incoming message epochs".into(),
+            ));
+        }
+        if envelope.server_sequence.is_some() {
+            CanonicalTimestamp::parse(&envelope.timestamp).map_err(|_| {
+                OrchestratorError::InvalidInput("Invalid canonical message timestamp".into())
+            })?;
+        }
+        let timestamp = envelope
+            .timestamp
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .map_err(|_| {
+                OrchestratorError::InvalidInput("Invalid incoming message timestamp".into())
+            })?;
+        let result = Self {
+            canonical_entry_json: envelope.canonical_entry_json,
+            conversation_id: envelope.conversation_id,
+            sender_did: envelope.sender_did,
+            ciphertext: envelope.ciphertext,
+            timestamp,
+            server_message_id: envelope.server_message_id,
+            server_sequence: envelope.server_sequence,
+            server_epoch: envelope.server_epoch.or(server_epoch),
+        };
+        result.validate_server_metadata()?;
+        Ok(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct WireIncomingEnvelope {
+    pub canonical_entry_json: Option<String>,
+    pub conversation_id: String,
+    pub sender_did: String,
+    pub ciphertext: Vec<u8>,
+    pub timestamp: String,
+    pub server_message_id: Option<String>,
+    pub server_sequence: Option<u64>,
+    pub server_epoch: Option<u64>,
 }
 
 #[cfg(test)]
@@ -313,7 +363,7 @@ mod tests {
     }
     #[test]
     fn ffi_projection_preserves_metadata_and_rejects_conflicting_epochs_or_invalid_time() {
-        let envelope = crate::orchestrator_bridge::FFIIncomingEnvelope {
+        let envelope = super::WireIncomingEnvelope {
             canonical_entry_json: None,
             conversation_id: CID.into(),
             sender_did: "did:plc:alice".into(),
@@ -323,37 +373,20 @@ mod tests {
             server_sequence: Some(519),
             server_epoch: Some(7),
         };
-        let mapped = crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(
-            envelope.clone(),
-            Some(7),
-        )
-        .unwrap();
+        let mapped = IncomingEnvelope::from_wire_envelope(envelope.clone(), Some(7)).unwrap();
         assert_eq!(mapped.server_sequence, Some(519));
         assert_eq!(mapped.server_epoch, Some(7));
         let mut wrong_conversation = envelope.clone();
         wrong_conversation.conversation_id = "not-a-canonical-conversation".into();
-        assert!(
-            crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(wrong_conversation, None)
-                .is_err()
-        );
-        assert!(
-            crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(
-                envelope.clone(),
-                Some(8)
-            )
-            .is_err()
-        );
+        assert!(IncomingEnvelope::from_wire_envelope(wrong_conversation, None).is_err());
+        assert!(IncomingEnvelope::from_wire_envelope(envelope.clone(), Some(8)).is_err());
         let mut malformed = envelope.clone();
         malformed.timestamp = "bad timestamp".into();
-        assert!(
-            crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(malformed, None).is_err()
-        );
+        assert!(IncomingEnvelope::from_wire_envelope(malformed, None).is_err());
         let mut legacy = envelope;
         legacy.server_sequence = None;
         legacy.server_epoch = None;
         legacy.server_message_id = Some("arbitrary-legacy-id".into());
-        assert!(
-            crate::orchestrator_bridge::ffi_incoming_envelope_to_internal(legacy, None).is_ok()
-        );
+        assert!(IncomingEnvelope::from_wire_envelope(legacy, None).is_ok());
     }
 }

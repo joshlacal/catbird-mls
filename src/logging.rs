@@ -44,22 +44,49 @@ macro_rules! error_log {
     };
 }
 
-/// Internal function to send log messages to the platform logger (fire-and-forget)
+/// Synchronous log sink callback so NSE (`<= 15 MB` budget) never initializes
+/// a multi-threaded Tokio worker pool just to emit a log line.
+pub trait SyncLogSink: Send + Sync {
+    fn log_sync(&self, level: &str, message: &str);
+}
+
+static SYNC_SINK: Lazy<RwLock<Option<Arc<dyn SyncLogSink>>>> = Lazy::new(|| RwLock::new(None));
+
+/// Register a zero-Tokio synchronous log sink (used by iOS NSE and Android FCM).
+pub fn set_sync_log_sink(sink: Arc<dyn SyncLogSink>) {
+    if let Ok(mut guard) = SYNC_SINK.write() {
+        *guard = Some(sink);
+    }
+}
+
+/// Internal function to emit log messages without ever spawning or initializing
+/// a multi-thread Tokio runtime (`G1`, `I9`).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn log_message(level: &str, message: &str) {
+    match level {
+        "error" => tracing::error!(target: "catbird_mls", "{message}"),
+        "warning" => tracing::warn!(target: "catbird_mls", "{message}"),
+        "debug" => tracing::debug!(target: "catbird_mls", "{message}"),
+        _ => tracing::info!(target: "catbird_mls", "{message}"),
+    }
+    if let Ok(guard) = SYNC_SINK.read() {
+        if let Some(sink) = guard.as_ref() {
+            sink.log_sync(level, message);
+        }
+    }
     if let Ok(guard) = LOGGER.read() {
         if let Some(logger) = guard.as_ref() {
-            // Clone the Arc for the async task (safe, no unsafe needed)
-            let logger_clone = Arc::clone(logger);
-            let level = level.to_string();
-            let message = message.to_string();
-
-            // Fire-and-forget: spawn async log without blocking
-            crate::async_runtime::RUNTIME.spawn(async move {
-                logger_clone.log(level, message).await;
-            });
+            // Only forward to legacy async MLSLogger if the caller is ALREADY inside
+            // an active Tokio runtime — NEVER initialize `async_runtime::RUNTIME`.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let logger_clone = Arc::clone(logger);
+                let level = level.to_string();
+                let message = message.to_string();
+                handle.spawn(async move {
+                    logger_clone.log(level, message).await;
+                });
+            }
         }
-        // If no logger set, silently ignore (no-op on iOS without stderr)
     }
 }
 

@@ -262,21 +262,16 @@ fn native_snapshot(world: &TestWorld) -> Vec<(String, Vec<String>)> {
     let connection =
         rusqlite::Connection::open(world.client("Bob")._temp_dir.join("mls.db")).unwrap();
     let key = "test-key-Bob";
-    for (name, value) in [
-        ("cipher_memory_security", "OFF".into()),
-        ("key", key.into()),
-        ("cipher_plaintext_header_size", "32".into()),
-        (
-            "cipher_salt",
-            format!("x'{}'", hex::encode(&Sha256::digest(key.as_bytes())[..16])),
-        ),
-        ("cipher_page_size", "4096".into()),
-        ("kdf_iter", "256000".into()),
-        ("cipher_hmac_algorithm", "HMAC_SHA512".into()),
-        ("cipher_kdf_algorithm", "PBKDF2_HMAC_SHA512".into()),
-    ] {
-        connection.pragma_update(None, name, value).unwrap();
-    }
+    let key_32 = catbird_mls::storage::derive_db_key_32_from_str(key);
+    let key_spec = catbird_mls::storage::derive_sqlcipher_96hex_key_spec(&key_32);
+    connection
+        .execute_batch(&format!(
+            "PRAGMA cipher_memory_security = OFF;\n\
+             PRAGMA key = \"{key_spec}\";\n\
+             PRAGMA cipher_plaintext_header_size = 32;\n\
+             PRAGMA journal_mode = WAL;"
+        ))
+        .unwrap();
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
         .unwrap()

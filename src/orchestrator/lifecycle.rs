@@ -142,7 +142,7 @@ where
             };
         // [CB-22] Labyrinth re-archive before losing access (best effort,
         // outside the transition lock because it is network-bound).
-        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        #[cfg(feature = "labyrinth")]
         {
             self.labyrinth_rearchive_before_leave(&conversation_id)
                 .await;

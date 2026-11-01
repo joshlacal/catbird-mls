@@ -233,10 +233,10 @@ fn direct_stage_rejects_key_package_count_before_group_lookup_or_conversion() {
 
     let error = match ctx.stage_commit(
         "not-a-group-id".to_string(),
-        catbird_mls::orchestrator_bridge::FFICommitKind::SwapMembers {
+        catbird_mls::orchestrator::types::CommitKind::SwapMembers {
             remove_dids: Vec::new(),
             add_dids: (0..101).map(|i| format!("did:plc:member{i}")).collect(),
-            add_key_packages: vec![Vec::new(); 101],
+            add_key_packages: vec![catbird_mls::KeyPackageData { data: Vec::new() }; 101],
         },
         IDENTITY.to_vec(),
     ) {

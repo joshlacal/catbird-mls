@@ -630,22 +630,23 @@ pub(crate) mod native {
         MLSError::StorageFailed
     }
     pub(crate) fn list(storage: &ManifestStorage) -> Result<Vec<AccountExitRecord>, MLSError> {
-        let mut query = storage
-            .welcome_ack_connection()
-            .prepare(
-                "SELECT value FROM mls_manifests WHERE key LIKE 'account_exit_v1:%' ORDER BY rowid",
-            )
-            .map_err(failed)?;
-        let rows = query
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(failed)?;
-        rows.map(|row| {
-            let record: AccountExitRecord =
-                serde_json::from_str(&row.map_err(failed)?).map_err(failed)?;
-            record.validate().map_err(failed)?;
-            Ok(record)
+        storage.with_connection(|conn| {
+            let mut query = conn
+                .prepare(
+                    "SELECT value_json FROM account_meta WHERE key LIKE 'account_exit_v1:%' ORDER BY rowid",
+                )
+                .map_err(failed)?;
+            let rows = query
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(failed)?;
+            rows.map(|row| {
+                let record: AccountExitRecord =
+                    serde_json::from_str(&row.map_err(failed)?).map_err(failed)?;
+                record.validate().map_err(failed)?;
+                Ok(record)
+            })
+            .collect()
         })
-        .collect()
     }
     pub(crate) fn put(
         storage: &ManifestStorage,
@@ -662,52 +663,56 @@ pub(crate) mod native {
         // Serialize immutable lineage selection and insertion across native
         // contexts opening the same encrypted database.
         use rusqlite::{OptionalExtension as _, TransactionBehavior};
-        let tx = rusqlite::Transaction::new_unchecked(
-            storage.welcome_ack_connection(),
-            TransactionBehavior::Immediate,
-        )
-        .map_err(failed)?;
-        let raw: Option<String> = tx
-            .query_row(
-                "SELECT value FROM mls_manifests WHERE key=?1",
-                [&key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(failed)?;
-        let old: Option<AccountExitRecord> = raw
-            .map(|raw| serde_json::from_str(&raw))
-            .transpose()
-            .map_err(failed)?;
-        let latest = if old.is_none() {
-            let identity = record.storage_identity().map_err(failed)?;
-            let mut latest = None;
-            let mut query = tx.prepare("SELECT value FROM mls_manifests WHERE key LIKE 'account_exit_v1:%' ORDER BY rowid DESC").map_err(failed)?;
-            let rows = query
-                .query_map([], |row| row.get::<_, String>(0))
+        storage.with_connection(|conn| {
+            let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
                 .map_err(failed)?;
-            for raw in rows {
-                let previous: AccountExitRecord =
-                    serde_json::from_str(&raw.map_err(failed)?).map_err(failed)?;
-                let previous = previous.storage_identity().map_err(failed)?;
-                if previous.conversation_id == identity.conversation_id
-                    && previous.actor_did == identity.actor_did
-                    && previous.actor_device_id == identity.actor_device_id
-                {
-                    latest = Some(previous.transition_id);
-                    break;
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT value_json FROM account_meta WHERE key=?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(failed)?;
+            let old: Option<AccountExitRecord> = raw
+                .map(|raw| serde_json::from_str(&raw))
+                .transpose()
+                .map_err(failed)?;
+            let latest = if old.is_none() {
+                let identity = record.storage_identity().map_err(failed)?;
+                let mut latest = None;
+                let mut query = tx
+                    .prepare("SELECT value_json FROM account_meta WHERE key LIKE 'account_exit_v1:%' ORDER BY rowid DESC")
+                    .map_err(failed)?;
+                let rows = query
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .map_err(failed)?;
+                for raw in rows {
+                    let previous: AccountExitRecord =
+                        serde_json::from_str(&raw.map_err(failed)?).map_err(failed)?;
+                    let previous = previous.storage_identity().map_err(failed)?;
+                    if previous.conversation_id == identity.conversation_id
+                        && previous.actor_did == identity.actor_did
+                        && previous.actor_device_id == identity.actor_device_id
+                    {
+                        latest = Some(previous.transition_id);
+                        break;
+                    }
                 }
-            }
-            latest
-        } else {
-            None
-        };
-        record
-            .validate_storage_update(old.as_ref(), latest.as_deref())
+                latest
+            } else {
+                None
+            };
+            record
+                .validate_storage_update(old.as_ref(), latest.as_deref())
+                .map_err(failed)?;
+            tx.execute(
+                "INSERT INTO account_meta(key, value_json) VALUES(?1, ?2) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                [&key, &serde_json::to_string(record).map_err(failed)?],
+            )
             .map_err(failed)?;
-        tx.execute("INSERT INTO mls_manifests(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [&key, &serde_json::to_string(record).map_err(failed)?]).map_err(failed)?;
-        tx.commit().map_err(failed)?;
+            tx.commit().map_err(failed)
+        })?;
         storage.flush_database()
     }
 }

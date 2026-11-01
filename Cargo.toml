@@ -23,7 +23,9 @@ path = "examples/generate_mls_chat_crypto_wire.rs"
 required-features = ["test-utils"]
 
 [dependencies]
-catbird-atproto = { path = "../catbird-atproto", version = "0.1.0", features = ["streaming"] }
+catbird-atproto = { path = "../catbird-atproto", version = "0.1.0", features = ["streaming", "namespace-bluecatbird", "namespace-atproto-space"] }
+atproto-spaces = { path = "../catbird-atproto/atproto-spaces", default-features = false }
+labyrinth-protocol = { path = "../labyrinth/labyrinth-protocol" }
 # OpenMLS 0.9 release-candidate cutover. The exact revision keeps every
 # OpenMLS crate on one coherent source snapshot.
 openmls = { version = "=0.9.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["js", "extensions-draft", "fork-resolution", "draft-ietf-mls-pq-ciphersuites"] }
@@ -41,40 +43,9 @@ base64 = "0.22"
 multibase = "0.9"
 hex = "0.4"
 sha2 = "0.10"
-# Promoted from transitive to direct for the clean-chat (`chat_v2`) signing
-# transcript, which must be byte-identical to the mls-ds server's. Both were
-# already linked — ed25519-dalek via openmls_basic_credential, and
-# serde_ipld_dagcbor via jacquard-common <- catbird-atproto — and both already
-# resolved to the exact versions mls-ds declares directly (2.2.0 and 0.6.4), so
-# this is promotion only: no new resolution and no new supply-chain surface.
-#
-# serde_ipld_dagcbor in particular is used rather than reimplemented BECAUSE
-# byte-identity depends on DAG-CBOR's canonical map-key ordering, which is
-# length-first and so differs from the plain byte-lexicographic order a BTreeMap
-# iterates in. Sharing the crate makes that identity structural.
 ed25519-dalek = "2"
 serde_ipld_dagcbor = "0.6"
-# Promoted from transitive (via catbird-atproto and jacquard-common) for the
-# clean-chat reaction predicate, which requires a reaction to be exactly one
-# UAX #29 extended grapheme cluster under Unicode 17.0.0. Version 1.13.3
-# reports UNICODE_VERSION = (17, 0, 0), and a test asserts that constant rather
-# than trusting the pin — a silent data-version bump would otherwise change
-# which reactions are accepted.
 unicode-segmentation = "1.13"
-# A NEW direct dependency, not a promotion — unlike the two above, this crate was
-# not previously in the tree. Chosen over icu_normalizer, which only LOOKS free:
-# it appears in Cargo.lock but reaches this crate solely via
-# openmls_sqlite_storage, which is excluded on wasm32, so promoting it would add
-# ICU4X plus its data crate to the wasm build for one predicate.
-#
-# It provides `is_nfc`, a CHECK rather than a transform, which is what this tree
-# needs — reactions are rejected when not already NFC, never normalized, because
-# composing a peer's value would change bytes a signature covers.
-#
-# Version 0.1.25 reports UNICODE_VERSION = (17, 0, 0), matching the segmenter
-# above. A test asserts both against each other and against the protocol pin: a
-# value accepted as one grapheme under one Unicode version but NFC-checked under
-# another would be a cross-version seam.
 unicode-normalization = "0.1"
 chacha20poly1305 = "0.10"
 aes-gcm = "0.10"
@@ -93,18 +64,12 @@ hkdf = "0.12"
 hmac = "0.12"
 subtle = "2"
 
-# Voice message processing (non-wasm only — audiopus_sys's opus C lib has no wasm32 sysroot)
-
 # Optional: echo-bot binary
 reqwest = { version = "0.12", features = ["json"], optional = true }
 clap = { version = "4", features = ["derive", "env"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
-# Labyrinth 1.1 encrypted chat history (feature `labyrinth`, off by default).
-# Pinned by git rev on joshlacal/labyrinth (decision D1, amended 2026-10-14:
-# the repo is public). Bump the rev to pick up labyrinth changes. To build
-# against a local checkout, use a `[patch."https://github.com/joshlacal/labyrinth"]`
-# override in your own `.cargo/config.toml` rather than editing this line.
+# Labyrinth 1.1 encrypted chat history over ATProto Spaces (on by default per D4).
 labyrinth = { path = "../labyrinth", features = ["space"], optional = true }
 
 [build-dependencies]
@@ -116,27 +81,21 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 
 [features]
-# Android-specific feature flag (currently unused but reserved for future Android-specific code)
+default = ["labyrinth"]
+# Android-specific feature flag
 android = []
-browser = []
+browser = ["labyrinth"]
 # Echo bot testing binary — adds reqwest + clap + tracing-subscriber
 echo-bot = ["reqwest", "clap", "tracing-subscriber"]
 # Enables Catbird's fork-recovery orchestration paths.
 fork-resolution = []
-# Disabled-by-default prototype for letting host platforms provide the OpenMLS
-# key-value storage driver over UniFFI. Production native clients continue to
-# use openmls_sqlite_storage + HybridStorageProvider unless this feature is
-# explicitly enabled for fixture work.
-storage-driver-prototype = []
 # In-process AAD emitters for cross-repository container tests; never UniFFI-exported.
 e2e-aad = []
 test-utils = ["openmls/test-utils", "openmls_rust_crypto/test-utils", "openmls_memory_storage/test-utils"]
-# Labyrinth 1.1 encrypted history backup over the mls-ds
-# `blue.catbird.labyrinth.*` endpoints (src/labyrinth/). Native targets only.
+# Labyrinth 1.1 encrypted history backup over ATProto Spaces (enabled by default per D4).
 labyrinth = ["dep:labyrinth"]
 
 [target.'cfg(all(not(target_os = "android"), not(target_arch = "wasm32")))'.dependencies]
-openmls_sqlite_storage = { version = "=0.3.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 audiopus = { version = "0.3.0-rc.0" }
@@ -144,7 +103,6 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 ogg = "0.9"
 
 [target.'cfg(all(target_os = "android", not(target_arch = "wasm32")))'.dependencies]
-openmls_sqlite_storage = { version = "=0.3.0-rc.3", git = "https://github.com/openmls/openmls", rev = "e7c2437e845eb767d2cdd22eece2b3c5d484e4e7", features = ["extensions-draft", "draft-ietf-mls-pq-ciphersuites"] }
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
 audiopus = { version = "0.3.0-rc.0" }
@@ -158,9 +116,7 @@ web-sys = { version = "0.3", features = ["Window", "Performance", "console"] }
 # WASM-compatible getrandom feature unification across transitive semver lines.
 getrandom = { version = "0.2", features = ["js"] }
 getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
-
-[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-getrandom04_test = { package = "getrandom", version = "=0.4.3", features = ["wasm_js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 
 [profile.release]
 debug = true  # Generate debug symbols for dSYM creation

@@ -178,23 +178,25 @@ impl Fixture {
     // Comparing digests prevents a failed assertion from printing test keys.
     fn native_rows(&self) -> BTreeMap<String, Vec<[u8; 32]>> {
         let conn = rusqlite::Connection::open(&self.database).unwrap();
-        conn.pragma_update(None, "cipher_memory_security", "OFF")
-            .unwrap();
-        conn.pragma_update(None, "key", DATABASE_KEY).unwrap();
-        conn.pragma_update(None, "cipher_plaintext_header_size", 32)
-            .unwrap();
-        conn.pragma_update(
-            None,
-            "cipher_salt",
-            format!(
-                "x'{}'",
-                hex::encode(&Sha256::digest(DATABASE_KEY.as_bytes())[..16])
-            ),
-        )
+        let key_32 = catbird_mls::storage::derive_db_key_32_from_str(DATABASE_KEY);
+        let key_spec = catbird_mls::storage::derive_sqlcipher_96hex_key_spec(&key_32);
+        conn.execute_batch(&format!(
+            "PRAGMA cipher_memory_security = OFF;\n\
+             PRAGMA key = \"{key_spec}\";\n\
+             PRAGMA cipher_plaintext_header_size = 32;\n\
+             PRAGMA journal_mode = WAL;"
+        ))
         .unwrap();
-        let tables: Vec<String> = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'openmls_%' OR name IN ('mls_manifests','mls_key_package_bundles')) ORDER BY name")
-            .unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        assert!(tables.iter().any(|table| table == "openmls_key_packages"));
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('openmls_kv','account_meta','pending_ops') ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(tables.iter().any(|table| table == "openmls_kv"));
         tables
             .into_iter()
             .map(|table| {

@@ -690,11 +690,8 @@ pub(crate) fn adopt_request_welcome(
     inner: &mut crate::mls_context::MLSContext,
     input: &DirectRequestWelcomeInput,
 ) -> Result<crate::types::WelcomeResult, MLSError> {
-    use super::direct_request_journal::{
-        native::{error, Provider},
-        DirectRequestJournal, DirectRequestJournalPhase,
-    };
-    use crate::chat_v2::transcript::direct_request::{verify_signed_request, DirectRequestKind};
+    use super::direct_request_journal::native::{error, Provider};
+    use crate::storage::{driver_native::RusqliteKvBackend, openmls_kv::OpenMlsKvStorage};
     use rusqlite::OptionalExtension;
     let (ctx, _) = context(&input.bootstrap.context_json)?;
     let request_id = ctx["requestId"].as_str().unwrap();
@@ -716,97 +713,100 @@ pub(crate) fn adopt_request_welcome(
     );
     let input_bytes = serde_json::to_vec(input).map_err(error)?;
     let input_digest = hex::encode(Sha256::digest(&input_bytes));
-    let tx = inner
-        .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
-    let old: Option<String> = tx
-        .query_row(
-            "SELECT value FROM mls_manifests WHERE key=?1",
-            [&key],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(error)?;
-    if let Some(old) = old {
-        if old != input_digest || !inner.groups.contains_key(&group_id) {
-            return Err(MLSError::StorageFailed);
+    let has_group_in_mem = inner.groups.contains_key(&group_id);
+    let crypto = inner.provider.crypto();
+    let imported = inner.manifest_storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(error)?;
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT value_json FROM account_meta WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        if let Some(old) = old {
+            if old != input_digest || !has_group_in_mem {
+                return Err(MLSError::StorageFailed);
+            }
+            return Ok(None);
         }
-        return Ok(crate::types::WelcomeResult { group_id });
-    }
-    let provider = Provider {
-        storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
-        crypto: inner.provider.crypto(),
-    };
-    if MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
-        .map_err(error)?
-        .is_some()
-    {
-        return Err(invalid("Request Welcome cannot replace an existing group"));
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(error)?
-        .as_secs();
-    let group = import_with_provider(
-        &provider,
-        &input.bootstrap,
-        &input.local_identity,
-        &input.local_package_ref,
-        now,
-    )?;
-    if group
-        .own_leaf_node()
-        .is_none_or(|leaf| leaf.signature_key().as_slice() != signer.public())
-    {
-        return Err(invalid("Request Welcome local signer mismatch"));
-    }
-    let raw: Option<String> = tx
-        .query_row(
-            "SELECT value FROM mls_manifests WHERE key='group_ids'",
-            [],
-            |r| r.get(0),
+        let provider = Provider {
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            crypto,
+        };
+        if MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
+            .map_err(error)?
+            .is_some()
+        {
+            return Err(invalid("Request Welcome cannot replace an existing group"));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(error)?
+            .as_secs();
+        let group = import_with_provider(
+            &provider,
+            &input.bootstrap,
+            &input.local_identity,
+            &input.local_package_ref,
+            now,
+        )?;
+        if group
+            .own_leaf_node()
+            .is_none_or(|leaf| leaf.signature_key().as_slice() != signer.public())
+        {
+            return Err(invalid("Request Welcome local signer mismatch"));
+        }
+        let raw: Option<String> = tx
+            .query_row(
+                "SELECT value_json FROM account_meta WHERE key='group_ids'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        let mut ids: Vec<String> = raw
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(error)?
+            .unwrap_or_default();
+        let hex_id = hex::encode(&group_id);
+        if !ids.contains(&hex_id) {
+            ids.push(hex_id);
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES('group_ids', ?1)",
+            [serde_json::to_string(&ids).map_err(error)?],
         )
-        .optional()
         .map_err(error)?;
-    let mut ids: Vec<String> = raw
-        .map(|s| serde_json::from_str(&s))
-        .transpose()
-        .map_err(error)?
-        .unwrap_or_default();
-    let hex_id = hex::encode(&group_id);
-    if !ids.contains(&hex_id) {
-        ids.push(hex_id);
-    }
-    tx.execute(
-        "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES('group_ids',?1)",
-        [serde_json::to_string(&ids).map_err(error)?],
-    )
-    .map_err(error)?;
-    tx.execute(
-        "INSERT INTO mls_manifests(key,value) VALUES(?1,?2)",
-        [key, input_digest],
-    )
-    .map_err(error)?;
-    // Retain complete authenticated provenance separately, encrypted at rest.
-    tx.execute(
-        "INSERT INTO mls_manifests(key,value) VALUES(?1,?2)",
-        rusqlite::params![
-            format!(
-                "direct_request_import_proof_v2:{request_id}:{}",
-                hex::encode(&input.local_package_ref)
-            ),
-            input_bytes
-        ],
-    )
-    .map_err(error)?;
-    tx.execute(
-        "DELETE FROM mls_key_package_bundles WHERE hash_ref=?1",
-        [hex::encode(&input.local_package_ref)],
-    )
-    .map_err(error)?;
-    tx.commit().map_err(error)?;
+        tx.execute(
+            "INSERT INTO account_meta(key, value_json) VALUES(?1, ?2)",
+            [key, input_digest],
+        )
+        .map_err(error)?;
+        tx.execute(
+            "INSERT INTO account_meta(key, value_json) VALUES(?1, ?2)",
+            rusqlite::params![
+                format!(
+                    "direct_request_import_proof_v2:{request_id}:{}",
+                    hex::encode(&input.local_package_ref)
+                ),
+                input_bytes
+            ],
+        )
+        .map_err(error)?;
+        tx.execute(
+            "DELETE FROM pending_ops WHERE op_kind = 'kp_bundle' AND op_key = ?1",
+            [hex::encode(&input.local_package_ref)],
+        )
+        .map_err(error)?;
+        tx.commit().map_err(error)?;
+        Ok(Some(group))
+    })?;
+    let Some(group) = imported else {
+        return Ok(crate::types::WelcomeResult { group_id });
+    };
     inner.publish_welcome_group(group, signer.public().to_vec());
     inner.key_package_bundles.remove(&input.local_package_ref);
     inner.manifest_storage.flush_database()?;
@@ -825,6 +825,7 @@ pub(crate) fn decrypt_introduction(
     input: &DirectRequestWelcomeInput,
 ) -> Result<DirectRequestIntroductionResult, MLSError> {
     use super::direct_request_journal::native::{error, Provider};
+    use crate::storage::{driver_native::RusqliteKvBackend, openmls_kv::OpenMlsKvStorage};
     use rusqlite::OptionalExtension;
     let (ctx, hash) = context(&input.bootstrap.context_json)?;
     if hash != input.bootstrap.context_hash {
@@ -840,65 +841,67 @@ pub(crate) fn decrypt_introduction(
         hex::encode(Sha256::digest(&input.bootstrap.initial_ciphertext))
     );
     let input_digest = hex::encode(Sha256::digest(serde_json::to_vec(input).map_err(error)?));
-    let tx = inner
-        .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
-    let proof: Option<String> = tx
-        .query_row(
-            "SELECT value FROM mls_manifests WHERE key=?1",
-            [&import_key],
-            |r| r.get(0),
+    let crypto = inner.provider.crypto();
+    let (outcome, updated_group) = inner.manifest_storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(error)?;
+        let proof: Option<String> = tx
+            .query_row(
+                "SELECT value_json FROM account_meta WHERE key=?1",
+                [&import_key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        if proof.as_deref() != Some(&input_digest) {
+            return Err(invalid(
+                "Introduction requires its exact accepted Welcome provenance",
+            ));
+        }
+        let old: Option<String> = tx
+            .query_row(
+                "SELECT value_json FROM account_meta WHERE key=?1",
+                [&cache_key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        if let Some(old) = old {
+            return Ok((serde_json::from_str(&old).map_err(error)?, None));
+        }
+        let group_id = STANDARD
+            .decode(
+                input.bootstrap.coordinates["groupId"]
+                    .as_str()
+                    .ok_or(MLSError::StorageFailed)?,
+            )
+            .map_err(error)?;
+        let provider = Provider {
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            crypto,
+        };
+        let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
+            .map_err(error)?
+            .ok_or(MLSError::StorageFailed)?;
+        let signer_public = group
+            .own_leaf_node()
+            .ok_or(MLSError::StorageFailed)?
+            .signature_key()
+            .as_slice()
+            .to_vec();
+        let outcome = super::direct_request_shared_crypto::decrypt_introduction_with_provider(
+            &provider, &mut group, input,
+        )?;
+        tx.execute(
+            "INSERT INTO account_meta(key, value_json) VALUES(?1, ?2)",
+            [cache_key, serde_json::to_string(&outcome).map_err(error)?],
         )
-        .optional()
         .map_err(error)?;
-    if proof.as_deref() != Some(&input_digest) {
-        return Err(invalid(
-            "Introduction requires its exact accepted Welcome provenance",
-        ));
+        tx.commit().map_err(error)?;
+        Ok((outcome, Some((group, signer_public))))
+    })?;
+    if let Some((group, signer_public)) = updated_group {
+        inner.publish_welcome_group(group, signer_public);
+        inner.manifest_storage.flush_database()?;
     }
-    let old: Option<String> = tx
-        .query_row(
-            "SELECT value FROM mls_manifests WHERE key=?1",
-            [&cache_key],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(error)?;
-    if let Some(old) = old {
-        return serde_json::from_str(&old).map_err(error);
-    }
-    let group_id = STANDARD
-        .decode(
-            input.bootstrap.coordinates["groupId"]
-                .as_str()
-                .ok_or(MLSError::StorageFailed)?,
-        )
-        .map_err(error)?;
-    let provider = Provider {
-        storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
-        crypto: inner.provider.crypto(),
-    };
-    let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
-        .map_err(error)?
-        .ok_or(MLSError::StorageFailed)?;
-    let signer_public = group
-        .own_leaf_node()
-        .ok_or(MLSError::StorageFailed)?
-        .signature_key()
-        .as_slice()
-        .to_vec();
-    let outcome = super::direct_request_shared_crypto::decrypt_introduction_with_provider(
-        &provider, &mut group, input,
-    )?;
-    tx.execute(
-        "INSERT INTO mls_manifests(key,value) VALUES(?1,?2)",
-        [cache_key, serde_json::to_string(&outcome).map_err(error)?],
-    )
-    .map_err(error)?;
-    tx.commit().map_err(error)?;
-    inner.publish_welcome_group(group, signer_public);
-    inner.manifest_storage.flush_database()?;
     Ok(outcome)
 }

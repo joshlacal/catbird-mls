@@ -1,21 +1,23 @@
 //! Fault injection tests for MLS key package replenish crash boundaries.
 //!
 //! Simulates crashes at storage write boundaries without mocking underlying logic:
-//! 1. Crash after OpenMLS writes to `openmls_key_packages`, before bundle write to `mls_key_package_bundles`
-//!    (unmanifested OpenMLS orphan causing "Key package drift detected").
-//! 2. Crash after OpenMLS deletes from `openmls_key_packages` during Welcome consumption,
-//!    before bundle deletion from `mls_key_package_bundles` (stale bundle).
+//! 1. Crash after OpenMLS writes to `openmls_kv` (`scope = 'KeyPackage'`), before bundle write to
+//!    `pending_ops` (`op_kind = 'kp_bundle'`) (unmanifested OpenMLS orphan).
+//! 2. Crash after OpenMLS deletes from `openmls_kv` (`scope = 'KeyPackage'`) during Welcome consumption,
+//!    before bundle deletion from `pending_ops` (stale bundle).
 //! 3. Crash during replenish with active replenish journal in `Started` phase.
 //!
 //! Verifies that startup reconciles, unmanifested orphans are safely quarantined into
-//! `mls_manifests` (never lost, never resurrected, never published), and `MLSContext::new` succeeds.
+//! `account_meta` (never lost, never resurrected, never published), and `MLSContext::new` succeeds.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use catbird_mls::storage::{
+    derive_db_key_32_from_str, derive_sqlcipher_96hex_key_spec, SCOPE_KEY_PACKAGE,
+};
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
-use sha2::{Digest, Sha256};
 
 #[derive(Clone)]
 struct TestKeychain {
@@ -56,21 +58,34 @@ fn make_db_path() -> (String, tempfile::TempDir) {
 
 fn open_raw_sqlite(path: &str, encryption_key: &str) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.pragma_update(None, "cipher_memory_security", "OFF")
-        .unwrap();
-    conn.pragma_update(None, "key", encryption_key).unwrap();
-    conn.pragma_update(None, "cipher_plaintext_header_size", 32)
-        .unwrap();
-    let salt = hex::encode(&Sha256::digest(encryption_key.as_bytes())[..16]);
-    conn.pragma_update(None, "cipher_salt", format!("x'{salt}'"))
-        .unwrap();
-    conn.pragma_update(None, "cipher_page_size", 4096).unwrap();
-    conn.pragma_update(None, "kdf_iter", 256000).unwrap();
-    conn.pragma_update(None, "cipher_hmac_algorithm", "HMAC_SHA512")
-        .unwrap();
-    conn.pragma_update(None, "cipher_kdf_algorithm", "PBKDF2_HMAC_SHA512")
-        .unwrap();
+    let key_32 = derive_db_key_32_from_str(encryption_key);
+    let key_spec = derive_sqlcipher_96hex_key_spec(&key_32);
+    conn.execute_batch(&format!(
+        "PRAGMA cipher_memory_security = OFF;\n\
+         PRAGMA key = \"{key_spec}\";\n\
+         PRAGMA cipher_plaintext_header_size = 32;\n\
+         PRAGMA journal_mode = WAL;"
+    ))
+    .unwrap();
     conn
+}
+
+fn count_openmls_kps(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT count(*) FROM openmls_kv WHERE version = 1 AND scope = ?1",
+        [SCOPE_KEY_PACKAGE],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn count_kp_bundles(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT count(*) FROM pending_ops WHERE op_kind = 'kp_bundle'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -78,7 +93,7 @@ fn test_crash_boundary_unmanifested_openmls_orphan_reconciles_on_startup() {
     let (db_path, _dir) = make_db_path();
     let keychain = TestKeychain::new();
 
-    // 1. Clean startup and create 3 key packages. Both tables have 3 entries.
+    // 1. Clean startup and create 3 key packages. Both stores have 3 entries.
     {
         let ctx = MLSContext::new(
             db_path.clone(),
@@ -94,50 +109,29 @@ fn test_crash_boundary_unmanifested_openmls_orphan_reconciles_on_startup() {
     }
 
     // 2. Fault injection at storage seam:
-    // Simulate crash after OpenMLS writes to `openmls_key_packages` but before `mls_key_package_bundles` is written.
+    // Simulate crash after OpenMLS writes to `openmls_kv` (`KeyPackage`) before `pending_ops` (`kp_bundle`).
     let orphan_ref = hex::decode("deadbeef0102030405060708deadbeef").unwrap();
     let orphan_kp_bytes = hex::decode("cafe0102030405060708cafe01020304").unwrap();
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
-
-        // Checkpoint WAL first so raw connection sees all tables cleanly.
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
 
-        let initial_kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let initial_bundle_count: i64 = conn
-            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(initial_kp_count, 3);
-        assert_eq!(initial_bundle_count, 3);
+        assert_eq!(count_openmls_kps(&conn), 3);
+        assert_eq!(count_kp_bundles(&conn), 3);
 
-        // Inject the orphan directly into openmls_key_packages.
         conn.execute(
-            "INSERT INTO openmls_key_packages (provider_version, key_package_ref, key_package) VALUES (?1, ?2, ?3)",
-            rusqlite::params![1i64, orphan_ref, orphan_kp_bytes],
+            "INSERT INTO openmls_kv (version, scope, key_bytes, value_bytes) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![1i64, SCOPE_KEY_PACKAGE, orphan_ref, orphan_kp_bytes],
         )
         .expect("inject orphan row");
 
-        let drifted_kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(drifted_kp_count, 4);
-
+        assert_eq!(count_openmls_kps(&conn), 4);
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
     }
 
-    // 3. Reopen MLSContext:
-    // PRE-FIX: Panics/errors with "Key package drift detected: 3 manifested bundles vs 4 OpenMLS key packages"
-    // POST-FIX: Startup reconciles the orphan, quarantines it into `mls_manifests`, and opens cleanly!
+    // 3. Reopen MLSContext: reconciles orphan into `account_meta` and opens cleanly.
     let reopen_result = MLSContext::new(
         db_path.clone(),
         TEST_KEY.to_string(),
@@ -150,41 +144,29 @@ fn test_crash_boundary_unmanifested_openmls_orphan_reconciles_on_startup() {
     );
 
     // 4. Verify post-reconcile invariants:
-    // - openmls_key_packages count is 3
-    // - mls_key_package_bundles count is 3
-    // - The orphan was quarantined in mls_manifests
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
-        let final_kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let final_bundle_count: i64 = conn
-            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
         assert_eq!(
-            final_kp_count, 3,
-            "openmls_key_packages should have 3 rows after quarantine"
+            count_openmls_kps(&conn),
+            3,
+            "openmls_kv KeyPackage scope should have 3 rows after quarantine"
         );
         assert_eq!(
-            final_bundle_count, 3,
-            "mls_key_package_bundles should have 3 rows"
+            count_kp_bundles(&conn),
+            3,
+            "pending_ops kp_bundle should have 3 rows"
         );
 
-        // Verify orphan exists in quarantine
         let quarantined_row: Option<String> = conn
             .query_row(
-                "SELECT value FROM mls_manifests WHERE key LIKE 'quarantined_key_package:openmls_orphan:%'",
+                "SELECT value_json FROM account_meta WHERE key LIKE 'quarantined_key_package:openmls_orphan:%'",
                 [],
                 |r| r.get(0),
             )
             .ok();
         assert!(
             quarantined_row.is_some(),
-            "Quarantined orphan record must exist in mls_manifests"
+            "Quarantined orphan record must exist in account_meta"
         );
         let record_str = quarantined_row.unwrap();
         assert!(
@@ -199,7 +181,6 @@ fn test_crash_boundary_stale_manifested_bundle_reconciles_on_startup() {
     let (db_path, _dir) = make_db_path();
     let keychain = TestKeychain::new();
 
-    // 1. Clean startup and create 3 key packages.
     {
         let ctx = MLSContext::new(
             db_path.clone(),
@@ -214,48 +195,31 @@ fn test_crash_boundary_stale_manifested_bundle_reconciles_on_startup() {
         assert_eq!(kps.len(), 3);
     }
 
-    // 2. Fault injection at storage seam:
-    // Simulate crash after OpenMLS deletes from `openmls_key_packages` during Welcome consumption,
-    // before bundle deletion from `mls_key_package_bundles`.
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
 
-        // Delete ONE row from openmls_key_packages to create reverse drift (3 bundles vs 2 OpenMLS packages).
         let first_ref: Vec<u8> = conn
             .query_row(
-                "SELECT key_package_ref FROM openmls_key_packages LIMIT 1",
-                [],
+                "SELECT key_bytes FROM openmls_kv WHERE version = 1 AND scope = ?1 LIMIT 1",
+                [SCOPE_KEY_PACKAGE],
                 |r| r.get(0),
             )
             .unwrap();
         conn.execute(
-            "DELETE FROM openmls_key_packages WHERE key_package_ref = ?1",
-            [&first_ref],
+            "DELETE FROM openmls_kv WHERE version = 1 AND scope = ?1 AND key_bytes = ?2",
+            rusqlite::params![SCOPE_KEY_PACKAGE, first_ref],
         )
         .unwrap();
 
-        let kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let bundle_count: i64 = conn
-            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(kp_count, 2);
-        assert_eq!(bundle_count, 3);
+        assert_eq!(count_openmls_kps(&conn), 2);
+        assert_eq!(count_kp_bundles(&conn), 3);
 
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
     }
 
-    // 3. Reopen MLSContext:
-    // PRE-FIX: Fails with "Manifested key package bundle ... missing from openmls_key_packages"
-    // POST-FIX: Quarantines the stale manifested bundle and opens cleanly!
     let reopen_result = MLSContext::new(
         db_path.clone(),
         TEST_KEY.to_string(),
@@ -267,21 +231,10 @@ fn test_crash_boundary_stale_manifested_bundle_reconciles_on_startup() {
         reopen_result.err()
     );
 
-    // 4. Verify post-reconcile counts match:
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
-        let final_kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let final_bundle_count: i64 = conn
-            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(final_kp_count, 2);
-        assert_eq!(final_bundle_count, 2);
+        assert_eq!(count_openmls_kps(&conn), 2);
+        assert_eq!(count_kp_bundles(&conn), 2);
     }
 }
 
@@ -290,7 +243,6 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
     let (db_path, _dir) = make_db_path();
     let keychain = TestKeychain::new();
 
-    // 1. Clean startup and create 2 key packages.
     {
         let ctx = MLSContext::new(
             db_path.clone(),
@@ -305,9 +257,6 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
         assert_eq!(kps.len(), 2);
     }
 
-    // 2. Fault injection at storage seam:
-    // Simulate a crash during replenish where an intent was recorded in mls_manifests,
-    // OpenMLS wrote an orphan key package, and the app was killed before the bundle was manifested.
     let orphan_ref = hex::decode("feedbeef0102030405060708feedbeef").unwrap();
     let orphan_kp_bytes = hex::decode("babe0102030405060708babe01020304").unwrap();
     {
@@ -315,7 +264,6 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
 
-        // Record replenish intent in Started phase
         let intent_json = serde_json::json!({
             "operation_id": "test-replenish-op-1",
             "needed": 5,
@@ -326,15 +274,14 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
         })
         .to_string();
         conn.execute(
-            "INSERT OR REPLACE INTO mls_manifests (key, value) VALUES ('key_package_replenish_journal', ?1)",
+            "INSERT OR REPLACE INTO account_meta (key, value_json, updated_at_ms) VALUES ('key_package_replenish_journal', ?1, 0)",
             [&intent_json],
         )
         .unwrap();
 
-        // Inject orphan package into openmls_key_packages
         conn.execute(
-            "INSERT INTO openmls_key_packages (provider_version, key_package_ref, key_package) VALUES (1, ?1, ?2)",
-            rusqlite::params![orphan_ref, orphan_kp_bytes],
+            "INSERT INTO openmls_kv (version, scope, key_bytes, value_bytes) VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![SCOPE_KEY_PACKAGE, orphan_ref, orphan_kp_bytes],
         )
         .unwrap();
 
@@ -342,9 +289,6 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
             .unwrap();
     }
 
-    // 3. Reopen MLSContext:
-    // PRE-FIX: Fails with drift.
-    // POST-FIX: Quarantines orphan, clears incomplete journal, opens cleanly!
     let reopen_result = MLSContext::new(
         db_path.clone(),
         TEST_KEY.to_string(),
@@ -356,26 +300,14 @@ fn test_crash_boundary_replenish_journal_aborted_generation() {
         reopen_result.err()
     );
 
-    // 4. Verify post-reconcile state:
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
-        let final_kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let final_bundle_count: i64 = conn
-            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(final_kp_count, 2);
-        assert_eq!(final_bundle_count, 2);
+        assert_eq!(count_openmls_kps(&conn), 2);
+        assert_eq!(count_kp_bundles(&conn), 2);
 
-        // Journal should be cleared
         let journal_row: Option<String> = conn
             .query_row(
-                "SELECT value FROM mls_manifests WHERE key = 'key_package_replenish_journal'",
+                "SELECT value_json FROM account_meta WHERE key = 'key_package_replenish_journal'",
                 [],
                 |r| r.get(0),
             )
@@ -399,8 +331,6 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
     )
     .expect("context A init");
 
-    // Simulate Context A being an external process (e.g. PID 1 / launchd, always alive on Unix)
-    // by recording an active replenish journal with a foreign PID.
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -414,13 +344,13 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
             "needed": 1,
             "identity": "did:plc:testuser#device-1",
             "phase": "Started",
-            "owner_pid": 1u32, // PID 1 is always alive
+            "owner_pid": 1u32,
             "staged_hash_refs": [],
             "created_at": now,
         })
         .to_string();
         conn.execute(
-            "INSERT OR REPLACE INTO mls_manifests (key, value) VALUES ('key_package_replenish_journal', ?1)",
+            "INSERT OR REPLACE INTO account_meta (key, value_json, updated_at_ms) VALUES ('key_package_replenish_journal', ?1, 0)",
             [&intent_json],
         )
         .unwrap();
@@ -431,8 +361,6 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
     let db_path_clone = db_path.clone();
     let keychain_clone = keychain.clone();
 
-    // Hook between Context A's OpenMLS build and manifest insert:
-    // Context B opens on the same DB while A has an in-flight key package in openmls_key_packages.
     catbird_mls::set_post_build_key_package_hook(Some(move || {
         let ctx_b = MLSContext::new(
             db_path_clone.clone(),
@@ -445,11 +373,10 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
             ctx_b.err()
         );
 
-        // Verify Context B did NOT quarantine Context A's in-flight package!
         let conn = open_raw_sqlite(&db_path_clone, TEST_KEY);
         let quarantined_count: i64 = conn
             .query_row(
-                "SELECT count(*) FROM mls_manifests WHERE key LIKE 'quarantined_key_package:%'",
+                "SELECT count(*) FROM account_meta WHERE key LIKE 'quarantined_key_package:%'",
                 [],
                 |r| r.get(0),
             )
@@ -465,32 +392,20 @@ fn test_multi_process_race_context_b_does_not_quarantine_in_flight_package_of_co
         .expect("context A create key package");
     assert_eq!(kps.len(), 1);
 
-    // Reset hook
     catbird_mls::set_post_build_key_package_hook::<fn()>(None);
 
-    // Verify final state: both stores have 1 row, 0 quarantined
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
-        let kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        let bundle_count: i64 = conn
-            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
         let quarantined_count: i64 = conn
             .query_row(
-                "SELECT count(*) FROM mls_manifests WHERE key LIKE 'quarantined_key_package:%'",
+                "SELECT count(*) FROM account_meta WHERE key LIKE 'quarantined_key_package:%'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
 
-        assert_eq!(kp_count, 1, "openmls_key_packages must have 1 row");
-        assert_eq!(bundle_count, 1, "mls_key_package_bundles must have 1 row");
+        assert_eq!(count_openmls_kps(&conn), 1, "openmls_kv KeyPackage must have 1 row");
+        assert_eq!(count_kp_bundles(&conn), 1, "pending_ops kp_bundle must have 1 row");
         assert_eq!(quarantined_count, 0, "Quarantined count must be 0");
     }
 }
@@ -500,7 +415,6 @@ fn test_extension_process_tolerates_drift_without_destructive_reconciliation() {
     let (db_path, _dir) = make_db_path();
     let keychain = TestKeychain::new();
 
-    // 1. Clean startup and create 2 key packages
     {
         let ctx = MLSContext::new(
             db_path.clone(),
@@ -511,7 +425,6 @@ fn test_extension_process_tolerates_drift_without_destructive_reconciliation() {
         ctx.create_key_packages(IDENTITY.to_vec(), 2).unwrap();
     }
 
-    // 2. Inject an orphan into openmls_key_packages
     let orphan_ref = hex::decode("deadbeef0102030405060708deadbeef").unwrap();
     let orphan_kp_bytes = hex::decode("cafe0102030405060708cafe01020304").unwrap();
     {
@@ -519,15 +432,14 @@ fn test_extension_process_tolerates_drift_without_destructive_reconciliation() {
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
         conn.execute(
-            "INSERT INTO openmls_key_packages (provider_version, key_package_ref, key_package) VALUES (1, ?1, ?2)",
-            rusqlite::params![orphan_ref, orphan_kp_bytes],
+            "INSERT INTO openmls_kv (version, scope, key_bytes, value_bytes) VALUES (1, ?1, ?2, ?3)",
+            rusqlite::params![SCOPE_KEY_PACKAGE, orphan_ref, orphan_kp_bytes],
         )
         .unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
     }
 
-    // 3. Open with extension process simulation enabled
     catbird_mls::set_simulate_extension_process_for_test(true);
     let ext_ctx = MLSContext::new(
         db_path.clone(),
@@ -538,25 +450,19 @@ fn test_extension_process_tolerates_drift_without_destructive_reconciliation() {
 
     assert!(ext_ctx.is_ok(), "Extension process must open without error");
 
-    // 4. Verify no destructive changes were made:
-    // openmls_key_packages still has 3, mls_manifests has 0 quarantined records
     {
         let conn = open_raw_sqlite(&db_path, TEST_KEY);
-        let kp_count: i64 = conn
-            .query_row("SELECT count(*) FROM openmls_key_packages", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
         let quarantined_count: i64 = conn
             .query_row(
-                "SELECT count(*) FROM mls_manifests WHERE key LIKE 'quarantined_key_package:%'",
+                "SELECT count(*) FROM account_meta WHERE key LIKE 'quarantined_key_package:%'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(
-            kp_count, 3,
-            "Extension process must not delete orphan from openmls_key_packages"
+            count_openmls_kps(&conn),
+            3,
+            "Extension process must not delete orphan from openmls_kv"
         );
         assert_eq!(
             quarantined_count, 0,

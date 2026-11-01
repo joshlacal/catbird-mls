@@ -164,21 +164,15 @@ fn derive_cipher_salt_hex(encryption_key: &str) -> String {
 
 fn open_manifest_connection(path: &std::path::Path, encryption_key: &str) -> rusqlite::Connection {
     let connection = rusqlite::Connection::open(path).expect("open test database");
+    let key_32 = catbird_mls::storage::derive_db_key_32_from_str(encryption_key);
+    let key_spec = catbird_mls::storage::derive_sqlcipher_96hex_key_spec(&key_32);
     connection
-        .pragma_update(None, "cipher_memory_security", "OFF")
-        .unwrap();
-    connection
-        .pragma_update(None, "key", encryption_key)
-        .unwrap();
-    connection
-        .pragma_update(None, "cipher_plaintext_header_size", 32)
-        .unwrap();
-    connection
-        .pragma_update(
-            None,
-            "cipher_salt",
-            format!("x'{}'", derive_cipher_salt_hex(encryption_key)),
-        )
+        .execute_batch(&format!(
+            "PRAGMA cipher_memory_security = OFF;\n\
+             PRAGMA key = \"{key_spec}\";\n\
+             PRAGMA cipher_plaintext_header_size = 32;\n\
+             PRAGMA journal_mode = WAL;"
+        ))
         .unwrap();
     connection
 }
@@ -263,8 +257,8 @@ fn post_export_welcome_failure_deletes_the_exact_epoch_secret() {
     failure_connection
         .execute_batch(
             "CREATE TRIGGER fail_nonempty_group_manifest_write
-             BEFORE INSERT ON mls_manifests
-             WHEN NEW.key = 'group_ids' AND NEW.value <> '[]'
+             BEFORE INSERT ON account_meta
+             WHEN NEW.key = 'group_ids' AND NEW.value_json <> '[]'
              BEGIN
                  SELECT RAISE(FAIL, 'injected group_ids manifest failure');
              END;",

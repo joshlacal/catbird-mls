@@ -2358,10 +2358,7 @@ impl MLSAPIClient for MockDeliveryService {
             }
         }
         let body_bytes = request.body.as_deref().unwrap_or(&[]);
-        let body_val: serde_json::Value = if !body_bytes.is_empty()
-            && request.operation
-                != catbird_mls::orchestrator::canonical_transport::CanonicalOperation::UploadBlob
-        {
+        let body_val: serde_json::Value = if !body_bytes.is_empty() {
             serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null)
         } else {
             serde_json::Value::Null
@@ -3507,11 +3504,11 @@ impl MLSAPIClient for MockDeliveryService {
                 drop(guard);
                 self.account_exit_response(body_bytes, output)
             }
-            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::PrepareBlobUpload => {
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::AcknowledgeEntries => {
+                let up_to_seq = body_val["upToSeq"].as_i64().unwrap_or(0);
                 let output = serde_json::json!({
-                    "result": {
-                        "uploadUrl": "/upload"
-                    }
+                    "acknowledgedSeq": up_to_seq,
+                    "prunedCount": 0
                 });
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
@@ -3519,11 +3516,14 @@ impl MLSAPIClient for MockDeliveryService {
                     body: serde_json::to_vec(&output).unwrap(),
                 })
             }
-            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::UploadBlob => {
+            catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RegisterPushGateway => {
+                let output = serde_json::json!({
+                    "registeredAt": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                });
                 Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
                     status: 200,
                     content_type: Some("application/json".into()),
-                    body: serde_json::to_vec(&serde_json::json!({"result": {"uploaded": true}})).unwrap(),
+                    body: serde_json::to_vec(&output).unwrap(),
                 })
             }
             catbird_mls::orchestrator::canonical_transport::CanonicalOperation::AcceptConversation => {

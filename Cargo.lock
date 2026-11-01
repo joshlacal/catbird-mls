@@ -168,6 +168,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "askama"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -233,6 +239,40 @@ name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+
+[[package]]
+name = "atproto-spaces"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "blake3",
+ "bytes",
+ "catbird-atproto",
+ "ciborium",
+ "cid",
+ "getrandom 0.2.17",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "http",
+ "ipld-core",
+ "jacquard-common",
+ "k256",
+ "multibase",
+ "multihash",
+ "p256",
+ "rand 0.8.5",
+ "serde",
+ "serde_bytes",
+ "serde_ipld_dagcbor 0.6.4",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 1.0.69",
+ "url",
+ "uuid",
+ "web-time",
+]
 
 [[package]]
 name = "audiopus"
@@ -358,6 +398,19 @@ name = "bitflags"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
+
+[[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.1",
+]
 
 [[package]]
 name = "block-buffer"
@@ -499,6 +552,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "async-trait",
+ "atproto-spaces",
  "audiopus",
  "audiopus_sys",
  "base64 0.22.1",
@@ -515,6 +569,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "labyrinth",
+ "labyrinth-protocol",
  "lazy_static",
  "multibase",
  "ogg",
@@ -524,7 +579,6 @@ dependencies = [
  "openmls_libcrux_crypto",
  "openmls_memory_storage",
  "openmls_rust_crypto",
- "openmls_sqlite_storage",
  "openmls_traits",
  "p256",
  "rand 0.8.5",
@@ -809,6 +863,12 @@ name = "const-str"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f421161cb492475f1661ddc9815a745a1c894592070661180fdec3d4872e9c3"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
@@ -1330,6 +1390,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
 dependencies = [
  "base16ct",
+ "base64ct",
  "crypto-bigint",
  "digest 0.10.7",
  "ff",
@@ -1340,6 +1401,8 @@ dependencies = [
  "pkcs8 0.10.2",
  "rand_core 0.6.4",
  "sec1",
+ "serde_json",
+ "serdect",
  "subtle",
  "zeroize",
 ]
@@ -2475,7 +2538,9 @@ dependencies = [
  "cfg-if",
  "ecdsa",
  "elliptic-curve",
+ "once_cell",
  "sha2 0.10.9",
+ "signature 2.2.0",
 ]
 
 [[package]]
@@ -2504,25 +2569,48 @@ version = "0.1.0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.11.1",
+ "async-trait",
+ "atproto-spaces",
  "base64 0.23.1",
  "chacha20 0.10.2",
  "cid",
  "curve25519-dalek 5.0.0",
  "ed25519-dalek 3.0.0",
+ "getrandom 0.2.17",
  "getrandom 0.4.3",
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "labyrinth-protocol",
  "ml-kem",
+ "p256",
  "rand_core 0.10.0",
  "serde",
- "serde_ipld_dagcbor 0.7.0",
+ "serde_ipld_dagcbor 0.6.4",
  "serde_json",
  "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.18",
+ "web-time",
  "x25519-dalek 3.0.0",
  "zeroize",
+]
+
+[[package]]
+name = "labyrinth-protocol"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "ed25519-dalek 2.2.0",
+ "getrandom 0.2.17",
+ "hex",
+ "hmac 0.12.1",
+ "p256",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4173,6 +4261,7 @@ dependencies = [
  "der 0.7.10",
  "generic-array",
  "pkcs8 0.10.2",
+ "serdect",
  "subtle",
  "zeroize",
 ]
@@ -4374,6 +4463,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.114",
+]
+
+[[package]]
+name = "serdect"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a84f14a19e9a014bb9f4512488d9829a68e04ecabffb0f9904cd1ace94598177"
+dependencies = [
+ "base16ct",
+ "serde",
 ]
 
 [[package]]
@@ -4677,7 +4776,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -5353,6 +5452,7 @@ checksum = "ee48d38b119b0cd71fe4141b30f5ba9c7c5d9f4e7a3a8b4a674e4b6ef789976f"
 dependencies = [
  "getrandom 0.3.4",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

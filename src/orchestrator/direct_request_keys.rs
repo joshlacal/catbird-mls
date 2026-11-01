@@ -113,7 +113,10 @@ impl DirectRequestKeyPublication {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod native {
     use super::*;
-    use crate::orchestrator::direct_request_journal::native::{error, Provider};
+    use crate::{
+        orchestrator::direct_request_journal::native::{error, Provider},
+        storage::{driver_native::RusqliteKvBackend, openmls_kv::OpenMlsKvStorage},
+    };
     use openmls::prelude::*;
     use openmls_traits::{signatures::Signer, OpenMlsProvider};
     use rusqlite::OptionalExtension;
@@ -126,15 +129,16 @@ pub(crate) mod native {
         storage: &crate::mls_context::ManifestStorage,
         device: &str,
     ) -> Result<Option<Vec<u8>>, MLSError> {
-        storage
-            .welcome_ack_connection()
-            .query_row(
-                "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
-                [key(device)?],
+        let storage_key = key(device)?;
+        storage.with_connection(|conn| {
+            conn.query_row(
+                "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
+                [&storage_key],
                 |r| r.get(0),
             )
             .optional()
             .map_err(error)
+        })
     }
     pub(crate) fn cas(
         storage: &crate::mls_context::ManifestStorage,
@@ -150,13 +154,14 @@ pub(crate) mod native {
         {
             return Err(invalid());
         }
-        let changed = storage
-            .welcome_ack_connection()
-            .execute(
-                "UPDATE mls_manifests SET value=?1 WHERE key=?2 AND CAST(value AS BLOB)=?3",
-                rusqlite::params![next, key(device)?, expected],
+        let storage_key = key(device)?;
+        let changed = storage.with_connection(|conn| {
+            conn.execute(
+                "UPDATE account_meta SET value_json=?1 WHERE key=?2 AND CAST(value_json AS BLOB)=?3",
+                rusqlite::params![next, &storage_key, expected],
             )
-            .map_err(error)?;
+            .map_err(error)
+        })?;
         storage.flush_database()?;
         Ok(changed == 1)
     }
@@ -179,78 +184,94 @@ pub(crate) mod native {
             .get_signer_for_identity(&identity)
             .ok_or(MLSError::StorageFailed)?;
         let now = chrono::Utc::now().timestamp();
-        let tx = inner
-            .manifest_storage
-            .welcome_ack_connection()
-            .unchecked_transaction()
-            .map_err(error)?;
-        let old: Option<Vec<u8>> = tx
-            .query_row(
-                "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
-                [&storage_key],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(error)?;
-        if old.as_deref() != expected {
-            return Ok(None);
-        }
-        // Unknown publications retain private custody. Bound new allocation;
-        // reaching the limit never discards old evidence or infers failure.
-        let private_count: u64 = tx
-            .query_row("SELECT count(*) FROM mls_key_package_bundles", [], |r| {
-                r.get(0)
-            })
-            .map_err(error)?;
-        let history_count: u64 = tx.query_row(
-            "SELECT count(*) FROM mls_manifests WHERE key LIKE 'direct_request_key_publication_history_v2:%'", [], |r| r.get(0)
-        ).map_err(error)?;
-        if (input.count > 0 && private_count.saturating_add(u64::from(input.count)) > 128)
-            || history_count >= 256
-        {
-            return Err(MLSError::OperationNotSupported {
-                reason: "Request key custody quota reached; reconcile retained publications before replenishing".into(),
-            });
-        }
-        if let Some(raw) = &old {
-            let previous =
-                DirectRequestKeyPublication::decode(raw, &input.actor_did, &input.actor_device_id)?;
-            let body = previous.body()?;
-            // A higher signed capability revision fences late older writes.
-            // Preserve all old evidence/private bundles; supersession does not
-            // claim that the old publication never happened.
-            if body["revision"].as_i64().ok_or_else(invalid)? >= input.revision {
-                return Err(invalid());
+        let now_ms = now * 1000;
+        let crypto = inner.provider.crypto();
+        let prepared = inner.manifest_storage.with_connection(|conn| {
+            let tx = conn.unchecked_transaction().map_err(error)?;
+            let old: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
+                    [&storage_key],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(error)?;
+            if old.as_deref() != expected {
+                return Ok(None);
+            }
+            let private_count: u64 = tx
+                .query_row(
+                    "SELECT count(*) FROM pending_ops WHERE op_kind = 'kp_bundle'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(error)?;
+            let history_count: u64 = tx
+                .query_row(
+                    "SELECT count(*) FROM account_meta WHERE key LIKE 'direct_request_key_publication_history_v2:%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(error)?;
+            if (input.count > 0 && private_count.saturating_add(u64::from(input.count)) > 128)
+                || history_count >= 256
+            {
+                return Err(MLSError::OperationNotSupported {
+                    reason: "Request key custody quota reached; reconcile retained publications before replenishing".into(),
+                });
+            }
+            if let Some(raw) = &old {
+                let previous = DirectRequestKeyPublication::decode(
+                    raw,
+                    &input.actor_did,
+                    &input.actor_device_id,
+                )?;
+                let body = previous.body()?;
+                if body["revision"].as_i64().ok_or_else(invalid)? >= input.revision {
+                    return Err(invalid());
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO account_meta(key, value_json) VALUES(?1, ?2)",
+                    rusqlite::params![
+                        format!(
+                            "direct_request_key_publication_history_v2:{}",
+                            hex::encode(Sha256::digest(raw))
+                        ),
+                        raw
+                    ],
+                )
+                .map_err(error)?;
+            }
+            let provider = Provider {
+                storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+                crypto,
+            };
+            let (raw, bundles) =
+                super::super::direct_request_shared_crypto::build_request_key_publication(
+                    &provider, &signer, input, now,
+                )?;
+            for (reference, bundle) in &bundles {
+                tx.execute(
+                    "INSERT INTO pending_ops(op_kind, op_key, payload_json, created_at_ms) VALUES('kp_bundle', ?1, ?2, ?3)",
+                    rusqlite::params![
+                        hex::encode(reference),
+                        STANDARD.encode(serde_json::to_vec(bundle).map_err(error)?),
+                        now_ms
+                    ],
+                )
+                .map_err(error)?;
             }
             tx.execute(
-                "INSERT OR IGNORE INTO mls_manifests(key,value) VALUES(?1,?2)",
-                rusqlite::params![
-                    format!(
-                        "direct_request_key_publication_history_v2:{}",
-                        hex::encode(Sha256::digest(raw))
-                    ),
-                    raw
-                ],
+                "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES(?1, ?2)",
+                rusqlite::params![&storage_key, &raw],
             )
             .map_err(error)?;
-        }
-        let provider = Provider {
-            storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
-            crypto: inner.provider.crypto(),
+            tx.commit().map_err(error)?;
+            Ok(Some((raw, bundles)))
+        })?;
+        let Some((raw, bundles)) = prepared else {
+            return Ok(None);
         };
-        let (raw, bundles) =
-            super::super::direct_request_shared_crypto::build_request_key_publication(
-                &provider, &signer, input, now,
-            )?;
-        for (reference, bundle) in &bundles {
-            tx.execute("INSERT INTO mls_key_package_bundles(hash_ref,bundle_b64,created_at) VALUES(?1,?2,?3)",rusqlite::params![hex::encode(reference),STANDARD.encode(serde_json::to_vec(bundle).map_err(error)?),now]).map_err(error)?;
-        }
-        tx.execute(
-            "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES(?1,?2)",
-            rusqlite::params![storage_key, &raw],
-        )
-        .map_err(error)?;
-        tx.commit().map_err(error)?;
         for (reference, bundle) in bundles {
             inner.key_package_bundles.insert(reference, bundle);
         }

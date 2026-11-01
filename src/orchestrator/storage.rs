@@ -85,12 +85,10 @@ pub(crate) fn require_recovery_persistence_capabilities<S: MLSStorageBackend + ?
 /// the documented generation comparisons with an atomic database transaction;
 /// the in-process orchestrator lock cannot serialize another process.
 ///
-/// This trait is not the OpenMLS cryptographic state store. Native Rust
-/// engines keep OpenMLS group state, key packages, ratchets, and manifest
-/// data inside `MLSContext` via `openmls_sqlite_storage` and
-/// `HybridStorageProvider`. Platform callbacks project app-facing rows only:
-/// conversation metadata, message rows, recovery flags, cursors, and other UI
-/// or orchestration state that Swift/Kotlin/catmos own outside OpenMLS.
+/// This trait is the internal orchestrator storage projection contract backed by
+/// `SqlStorageBackend` in `MlsAccountDb`. Native and WASM engines keep OpenMLS
+/// group state, key packages, ratchets, and account metadata inside `openmls_kv`
+/// and `account_meta` in the unified per-account SQLite database.
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait MLSStorageBackend: MLSStorageBackendBounds {

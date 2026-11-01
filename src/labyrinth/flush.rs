@@ -1,30 +1,12 @@
-//! One flush of the archive queue, conversation by conversation
-//! ([`super::queue`] module docs; labyrinth review 2).
-//!
-//! For each conversation with pending rows:
-//!
-//! 1. Rows left `inflight` by a crash are looked up and dropped if this
-//!    account's copy is already stored (nothing is archived twice).
-//! 2. The roster comes from `getConversationState`. A conversation mls-ds
-//!    no longer has (`ConversationNotFound`) drops its rows, recorded in
-//!    the status.
-//! 3. The crate resolves the roster per member: a member whose epoch fails
-//!    a trust check is excluded and recorded ([`super::status`]); the rest
-//!    get the MEK.
-//! 4. The messages are archived and written; the rows are removed.
-//!
-//! A failure in steps 1–4 only affects that conversation: its unwritten
-//! buffer is discarded and each of its rows records the error, counting a
-//! failure unless it is transient. Rows reaching
-//! [`super::queue::MAX_FAILURES`] are quarantined. A local storage error
-//! (the queue itself) still fails the whole flush.
+//! One async flush of the archive queue, conversation by conversation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::hooks::roster_members;
 use super::queue::{ArchiveQueueStore, PendingArchive, MAX_FAILURES};
 use super::session::{LabyrinthSession, SessionDeps};
 use super::status::{now_ms, DroppedArchive, MemberExclusion};
+use super::transport::map_xrpc_error;
 use crate::orchestrator::error::Result;
 
 /// What one flush did.
@@ -49,9 +31,6 @@ impl FlushReport {
     }
 }
 
-/// Failures that say nothing about the conversation: no response, a
-/// server error, rate limiting, no randomness. They are recorded but do
-/// not count towards quarantine.
 pub(crate) fn is_transient(e: &labyrinth::Error) -> bool {
     match e {
         labyrinth::Error::Backend(m) => [
@@ -72,7 +51,7 @@ pub(crate) fn is_transient(e: &labyrinth::Error) -> bool {
 }
 
 /// Archives every pending, unquarantined row of the session's account.
-pub fn flush_queue(
+pub async fn flush_queue(
     session: &mut LabyrinthSession,
     deps: &SessionDeps,
     store: &dyn ArchiveQueueStore,
@@ -93,7 +72,9 @@ pub fn flush_queue(
             &conversation,
             rows.clone(),
             &mut report,
-        )? {
+        )
+        .await?
+        {
             session.discard_pending(&conversation);
             report.failed_conversations += 1;
             fail_rows(store, rows, &error, &mut report)?;
@@ -102,9 +83,7 @@ pub fn flush_queue(
     Ok(report)
 }
 
-/// One conversation. The outer error is local storage; the inner one is
-/// the conversation's failure.
-fn flush_conversation(
+async fn flush_conversation(
     session: &mut LabyrinthSession,
     deps: &SessionDeps,
     store: &dyn ArchiveQueueStore,
@@ -112,8 +91,6 @@ fn flush_conversation(
     rows: Vec<PendingArchive>,
     report: &mut FlushReport,
 ) -> Result<labyrinth::Result<()>> {
-    use std::collections::BTreeSet;
-
     let did = session.did().to_owned();
     let mut todo = Vec::with_capacity(rows.len());
     let mut quarantined_legacy = false;
@@ -135,7 +112,7 @@ fn flush_conversation(
             continue;
         }
         if row.inflight {
-            match session.has_archived(conversation, &row.message_id)? {
+            match session.has_archived(conversation, &row.message_id).await? {
                 Ok(true) => {
                     store.remove(&did, &row.message_id)?;
                     report.archived += 1;
@@ -158,14 +135,15 @@ fn flush_conversation(
     }
 
     let first_group_id_hex = todo.first().and_then(|r| r.group_id_hex.as_deref());
-    let local_snapshot = deps
-        .local_authority
-        .as_ref()
-        .map(|auth| auth.current_group_snapshot(conversation, first_group_id_hex))
-        .transpose()?
-        .flatten();
+    let local_snapshot = match &deps.local_authority {
+        Some(auth) => {
+            auth.current_group_snapshot(conversation, first_group_id_hex)
+                .await?
+        }
+        None => None,
+    };
 
-    let ds_members = match conversation_roster(deps, conversation) {
+    let ds_members = match conversation_roster(deps, conversation).await {
         Ok(m) => m,
         Err(labyrinth::Error::NotFound("conversation")) => {
             if local_snapshot.is_some() {
@@ -186,9 +164,6 @@ fn flush_conversation(
     };
     let ds_set: BTreeSet<&str> = ds_members.iter().map(String::as_str).collect();
 
-    // Partition contiguous rows by `(group_id_hex, mls_epoch, expected_member_dids)`
-    // so pre-join/post-join or pre-removal/post-removal messages never share a
-    // roster batch or MEK.
     type ChunkKey = (Option<String>, Option<u64>, Vec<String>);
     let mut chunks: Vec<(ChunkKey, Vec<PendingArchive>)> = Vec::new();
     for row in todo {
@@ -232,11 +207,13 @@ fn flush_conversation(
             .iter()
             .map(|r| Ok((r.message_id.clone(), r.timestamp_ms, r.frame_bytes()?)))
             .collect::<Result<Vec<_>>>()?;
-        let excluded =
-            match session.archive_conversation(conversation, &expected_members, &items)? {
-                Ok(x) => x,
-                Err(e) => return Ok(Err(e)),
-            };
+        let excluded = match session
+            .archive_conversation(conversation, &expected_members, &items)
+            .await?
+        {
+            Ok(x) => x,
+            Err(e) => return Ok(Err(e)),
+        };
         for row in &chunk_rows {
             store.remove(&did, &row.message_id)?;
             report.archived += 1;
@@ -261,14 +238,17 @@ fn flush_conversation(
             }
         })?;
         for x in &excluded {
-            tracing::warn!(conversation, did = %x.did, error = %x.error, "labyrinth: member excluded from the archive roster");
+            tracing::warn!(
+                conversation,
+                did = %x.did,
+                error = %x.error,
+                "labyrinth: member excluded from the archive roster"
+            );
         }
     }
     Ok(Ok(()))
 }
 
-/// Records `error` on every row; quarantines the ones that reach
-/// [`MAX_FAILURES`] non-transient failures.
 fn fail_rows(
     store: &dyn ArchiveQueueStore,
     rows: Vec<PendingArchive>,
@@ -286,7 +266,6 @@ fn fail_rows(
         .map(|r| (r.message_id.clone(), r))
         .collect();
     for mut row in rows {
-        // A row the inflight check already removed is not re-added.
         let Some(current) = stored.get(&row.message_id) else {
             continue;
         };
@@ -328,15 +307,15 @@ fn drop_rows(
     Ok(())
 }
 
-/// The member DIDs of `conversation` from `getConversationState`.
-fn conversation_roster(deps: &SessionDeps, conversation: &str) -> labyrinth::Result<Vec<String>> {
+async fn conversation_roster(deps: &SessionDeps, conversation: &str) -> labyrinth::Result<Vec<String>> {
     let body = deps
         .transport
         .query(
             "blue.catbird.chat.getConversationState",
             &[("conversationId", conversation.to_owned())],
         )
-        .map_err(labyrinth::store::xrpc::map_error)?;
+        .await
+        .map_err(map_xrpc_error)?;
     let state: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|e| labyrinth::Error::Backend(format!("conversation state: {e}")))?;
     roster_members(&state)

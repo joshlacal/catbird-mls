@@ -24,6 +24,7 @@ macro_rules! with_entry {
         match $value {
             ConversationEntry::DirectRequestEntry($entry) => $body,
             ConversationEntry::DirectRequestAcceptanceEntry($entry) => $body,
+            ConversationEntry::AccountDeletedEntry($entry) => $body,
             ConversationEntry::ApplicationEntry($entry) => $body,
             ConversationEntry::CommitEntry($entry) => $body,
             ConversationEntry::PolicyEntry($entry) => $body,
@@ -50,6 +51,8 @@ macro_rules! with_entry {
 // failure, which is why they are named constants used both by `entry_kind` and
 // by [`ENTRY_KINDS`] rather than repeated string literals.
 
+/// `#accountDeletedEntry` — server-emitted account deletion purge signal (`I13`).
+pub const ACCOUNT_DELETED_ENTRY_KIND: &str = "blue.catbird.chat.defs#accountDeletedEntry";
 /// `#applicationEntry` — the one arm that is not a control kind.
 pub const APPLICATION_ENTRY_KIND: &str = "blue.catbird.chat.defs#applicationEntry";
 /// `#commitEntry`, signed by `#signedCommitTransition`.
@@ -130,6 +133,7 @@ impl<S: BosStr> WireEntry for ConversationEntry<S> {
             Self::DirectRequestAcceptanceEntry(_) => {
                 "blue.catbird.chat.defs#directRequestAcceptanceEntry"
             }
+            Self::AccountDeletedEntry(_) => ACCOUNT_DELETED_ENTRY_KIND,
             Self::ApplicationEntry(_) => APPLICATION_ENTRY_KIND,
             Self::CommitEntry(_) => COMMIT_ENTRY_KIND,
             Self::PolicyEntry(_) => POLICY_ENTRY_KIND,
@@ -159,6 +163,7 @@ impl<S: BosStr> AppendLogEntry for ConversationEntry<S> {
             Self::DirectRequestAcceptanceEntry(entry) => {
                 entry.signed_request.body.prior.conversation_id.as_ref()
             }
+            Self::AccountDeletedEntry(entry) => entry.conversation_id.as_ref(),
             Self::ApplicationEntry(entry) => entry.conversation_id.as_ref(),
             Self::CommitEntry(entry) => entry.conversation_id.as_ref(),
             Self::PolicyEntry(entry) => entry.conversation_id.as_ref(),

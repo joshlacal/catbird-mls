@@ -26,3 +26,5 @@ build/
 
 # Cargo
 **/*.rs.bk
+/_trash/
+

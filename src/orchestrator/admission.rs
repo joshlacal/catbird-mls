@@ -686,15 +686,15 @@ pub(crate) mod native {
         cid: &str,
     ) -> std::result::Result<Option<CanonicalState>, MLSError> {
         let key = key(user_did, cid)?;
-        let raw: Option<String> = storage
-            .welcome_ack_connection()
-            .query_row(
-                "SELECT value FROM mls_manifests WHERE key = ?1",
+        let raw: Option<String> = storage.with_connection(|conn| {
+            conn.query_row(
+                "SELECT value_json FROM account_meta WHERE key = ?1",
                 [&key],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(failed)?;
+            .map_err(failed)
+        })?;
         raw.map(|raw| decode(&raw, user_did, cid)).transpose()
     }
     pub(crate) fn put(
@@ -704,34 +704,41 @@ pub(crate) mod native {
     ) -> std::result::Result<bool, MLSError> {
         let cid = state.coordinates.conversation_id.to_string();
         let key = key(user_did, &cid)?;
-        let tx = rusqlite::Transaction::new_unchecked(
-            storage.welcome_ack_connection(),
-            TransactionBehavior::Immediate,
-        )
-        .map_err(failed)?;
-        let raw: Option<String> = tx
-            .query_row(
-                "SELECT value FROM mls_manifests WHERE key = ?1",
-                [&key],
-                |row| row.get(0),
-            )
-            .optional()
+        let changed = storage.with_connection(|conn| {
+            let tx =
+                rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+                    .map_err(failed)?;
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT value_json FROM account_meta WHERE key = ?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(failed)?;
+            let previous = raw.map(|raw| decode(&raw, user_did, &cid)).transpose()?;
+            let Some(state) =
+                merge_protected_conversation_policy(previous.as_ref(), state).map_err(failed)?
+            else {
+                return Ok(false);
+            };
+            let raw = serde_json::to_string(&PolicyRecord {
+                user_did: user_did.into(),
+                state: state.clone(),
+            })
             .map_err(failed)?;
-        let previous = raw.map(|raw| decode(&raw, user_did, &cid)).transpose()?;
-        let Some(state) =
-            merge_protected_conversation_policy(previous.as_ref(), state).map_err(failed)?
-        else {
-            return Ok(false);
-        };
-        let raw = serde_json::to_string(&PolicyRecord {
-            user_did: user_did.into(),
-            state: state.clone(),
-        })
-        .map_err(failed)?;
-        tx.execute("INSERT INTO mls_manifests (key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![key,raw]).map_err(failed)?;
-        tx.commit().map_err(failed)?;
-        storage.flush_database()?;
-        Ok(true)
+            tx.execute(
+                "INSERT INTO account_meta (key, value_json) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                rusqlite::params![&key, raw],
+            )
+            .map_err(failed)?;
+            tx.commit().map_err(failed)?;
+            Ok(true)
+        })?;
+        if changed {
+            storage.flush_database()?;
+        }
+        Ok(changed)
     }
 
     #[derive(Serialize, Deserialize)]
@@ -767,15 +774,15 @@ pub(crate) mod native {
         MLSError,
     > {
         let key = departure_key(user_did, cid)?;
-        let raw: Option<String> = storage
-            .welcome_ack_connection()
-            .query_row(
-                "SELECT value FROM mls_manifests WHERE key=?1",
+        let raw: Option<String> = storage.with_connection(|conn| {
+            conn.query_row(
+                "SELECT value_json FROM account_meta WHERE key = ?1",
                 [&key],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(failed)?;
+            .map_err(failed)
+        })?;
         raw.map(|raw| departure_record(&raw, user_did, cid))
             .transpose()
     }
@@ -790,37 +797,44 @@ pub(crate) mod native {
         .map_err(failed)?;
         let cid = coordinate.conversation_id.as_str();
         let key = departure_key(user_did, cid)?;
-        let tx = rusqlite::Transaction::new_unchecked(
-            storage.welcome_ack_connection(),
-            TransactionBehavior::Immediate,
-        )
-        .map_err(failed)?;
-        let old: Option<String> = tx
-            .query_row(
-                "SELECT value FROM mls_manifests WHERE key=?1",
-                [&key],
-                |row| row.get(0),
-            )
-            .optional()
+        let changed = storage.with_connection(|conn| {
+            let tx =
+                rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+                    .map_err(failed)?;
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT value_json FROM account_meta WHERE key = ?1",
+                    [&key],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(failed)?;
+            let previous = old
+                .map(|raw| departure_record(&raw, user_did, cid))
+                .transpose()?;
+            let Some(coordinate) =
+                merge_protected_conversation_departure(previous.as_ref(), &coordinate)
+                    .map_err(failed)?
+            else {
+                return Ok(false);
+            };
+            let raw = serde_json::to_string(&DepartureRecord {
+                user_did: user_did.into(),
+                coordinate,
+            })
             .map_err(failed)?;
-        let previous = old
-            .map(|raw| departure_record(&raw, user_did, cid))
-            .transpose()?;
-        let Some(coordinate) =
-            merge_protected_conversation_departure(previous.as_ref(), &coordinate)
-                .map_err(failed)?
-        else {
-            return Ok(false);
-        };
-        let raw = serde_json::to_string(&DepartureRecord {
-            user_did: user_did.into(),
-            coordinate,
-        })
-        .map_err(failed)?;
-        tx.execute("INSERT INTO mls_manifests(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", rusqlite::params![key,raw]).map_err(failed)?;
-        tx.commit().map_err(failed)?;
-        storage.flush_database()?;
-        Ok(true)
+            tx.execute(
+                "INSERT INTO account_meta (key, value_json) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json",
+                rusqlite::params![&key, raw],
+            )
+            .map_err(failed)?;
+            tx.commit().map_err(failed)?;
+            Ok(true)
+        })?;
+        if changed {
+            storage.flush_database()?;
+        }
+        Ok(changed)
     }
 }
 

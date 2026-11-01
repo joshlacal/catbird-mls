@@ -147,8 +147,10 @@ impl DirectRequestJournal {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod native {
     use super::*;
-    use crate::mls_context::{JsonCodec, ManifestStorage};
-    use openmls_sqlite_storage::SqliteStorageProvider;
+    use crate::{
+        mls_context::ManifestStorage,
+        storage::{driver_native::RusqliteKvBackend, openmls_kv::OpenMlsKvStorage},
+    };
     use openmls_traits::OpenMlsProvider;
     use rusqlite::{Connection, OptionalExtension};
     pub(crate) fn error(_: impl std::fmt::Debug) -> MLSError {
@@ -163,7 +165,7 @@ pub(crate) mod native {
     ) -> Result<Option<DirectRequestJournal>, MLSError> {
         let raw: Option<String> = conn
             .query_row(
-                "SELECT value FROM mls_manifests WHERE key=?1",
+                "SELECT value_json FROM account_meta WHERE key=?1",
                 [key(id)],
                 |r| r.get(0),
             )
@@ -181,7 +183,7 @@ pub(crate) mod native {
     pub(crate) fn write(conn: &Connection, record: &DirectRequestJournal) -> Result<(), MLSError> {
         record.validate()?;
         conn.execute(
-            "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES(?1,?2)",
+            "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES(?1, ?2)",
             [
                 key(&record.request_id),
                 serde_json::to_string(record).map_err(error)?,
@@ -191,29 +193,30 @@ pub(crate) mod native {
         Ok(())
     }
     pub(crate) fn list(storage: &ManifestStorage) -> Result<Vec<DirectRequestJournal>, MLSError> {
-        let mut statement = storage
-            .welcome_ack_connection()
-            .prepare("SELECT value FROM mls_manifests WHERE key LIKE 'direct_request_v2:%'")
-            .map_err(error)?;
-        let rows = statement
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(error)?;
-        rows.map(|row| {
-            let record: DirectRequestJournal =
-                serde_json::from_str(&row.map_err(error)?).map_err(error)?;
-            record.validate()?;
-            Ok(record)
+        storage.with_connection(|conn| {
+            let mut statement = conn
+                .prepare("SELECT value_json FROM account_meta WHERE key LIKE 'direct_request_v2:%'")
+                .map_err(error)?;
+            let rows = statement
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(error)?;
+            rows.map(|row| {
+                let record: DirectRequestJournal =
+                    serde_json::from_str(&row.map_err(error)?).map_err(error)?;
+                record.validate()?;
+                Ok(record)
+            })
+            .collect()
         })
-        .collect()
     }
     pub(crate) struct Provider<'a> {
-        pub storage: SqliteStorageProvider<JsonCodec, &'a Connection>,
+        pub storage: OpenMlsKvStorage<RusqliteKvBackend<'a>>,
         pub crypto: &'a openmls_libcrux_crypto::CryptoProvider,
     }
     impl<'a> OpenMlsProvider for Provider<'a> {
         type CryptoProvider = openmls_libcrux_crypto::CryptoProvider;
         type RandProvider = openmls_libcrux_crypto::CryptoProvider;
-        type StorageProvider = SqliteStorageProvider<JsonCodec, &'a Connection>;
+        type StorageProvider = OpenMlsKvStorage<RusqliteKvBackend<'a>>;
         fn storage(&self) -> &Self::StorageProvider {
             &self.storage
         }
@@ -231,6 +234,7 @@ pub(crate) fn retire_published_group(
     inner: &mut crate::mls_context::MLSContext,
     group_id: &[u8],
 ) -> Result<Option<bool>, MLSError> {
+    use crate::storage::{driver_native::RusqliteKvBackend, openmls_kv::OpenMlsKvStorage};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use native::*;
     use openmls::prelude::*;
@@ -256,8 +260,6 @@ pub(crate) fn retire_published_group(
         return Ok(None);
     };
     if record.phase == DirectRequestJournalPhase::RetiredPublished {
-        // A durability barrier can fail after commit; repeat it before the
-        // caller releases any remaining in-memory copy.
         inner.manifest_storage.flush_database()?;
         return Ok(Some(false));
     }
@@ -270,58 +272,57 @@ pub(crate) fn retire_published_group(
             "Cannot delete an unpublished request-owned group".into(),
         ));
     }
-    let tx = inner
-        .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
-    let provider = Provider {
-        storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
-        crypto: inner.provider.crypto(),
-    };
-    let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(group_id))
-        .map_err(error)?
-        .ok_or(MLSError::StorageFailed)?;
-    group.delete(provider.storage()).map_err(error)?;
-    let encoded = hex::encode(group_id);
-    let raw: String = tx
-        .query_row(
-            "SELECT value FROM mls_manifests WHERE key='group_ids'",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(error)?;
-    let mut ids: Vec<String> = serde_json::from_str(&raw).map_err(error)?;
-    if !ids.contains(&encoded) {
-        return Err(MLSError::StorageFailed);
-    }
-    ids.retain(|id| id != &encoded);
-    tx.execute(
-        "UPDATE mls_manifests SET value=?1 WHERE key='group_ids'",
-        [serde_json::to_string(&ids).map_err(error)?],
-    )
-    .map_err(error)?;
-    let pending: Option<String> = tx
-        .query_row(
-            "SELECT value FROM mls_manifests WHERE key='pending_external_joins'",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(error)?;
-    if let Some(raw) = pending {
-        let mut pending: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(&raw).map_err(error)?;
-        pending.remove(&encoded);
+    let crypto = inner.provider.crypto();
+    inner.manifest_storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(error)?;
+        let provider = Provider {
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            crypto,
+        };
+        let mut group = MlsGroup::load(provider.storage(), &GroupId::from_slice(group_id))
+            .map_err(error)?
+            .ok_or(MLSError::StorageFailed)?;
+        group.delete(provider.storage()).map_err(error)?;
+        let encoded = hex::encode(group_id);
+        let raw: String = tx
+            .query_row(
+                "SELECT value_json FROM account_meta WHERE key='group_ids'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(error)?;
+        let mut ids: Vec<String> = serde_json::from_str(&raw).map_err(error)?;
+        if !ids.contains(&encoded) {
+            return Err(MLSError::StorageFailed);
+        }
+        ids.retain(|id| id != &encoded);
         tx.execute(
-            "UPDATE mls_manifests SET value=?1 WHERE key='pending_external_joins'",
-            [serde_json::to_string(&pending).map_err(error)?],
+            "UPDATE account_meta SET value_json=?1 WHERE key='group_ids'",
+            [serde_json::to_string(&ids).map_err(error)?],
         )
         .map_err(error)?;
-    }
-    record.phase = DirectRequestJournalPhase::RetiredPublished;
-    write(&tx, &record)?;
-    tx.commit().map_err(error)?;
+        let pending: Option<String> = tx
+            .query_row(
+                "SELECT value_json FROM account_meta WHERE key='pending_external_joins'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        if let Some(raw) = pending {
+            let mut pending: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_str(&raw).map_err(error)?;
+            pending.remove(&encoded);
+            tx.execute(
+                "UPDATE account_meta SET value_json=?1 WHERE key='pending_external_joins'",
+                [serde_json::to_string(&pending).map_err(error)?],
+            )
+            .map_err(error)?;
+        }
+        record.phase = DirectRequestJournalPhase::RetiredPublished;
+        write(&tx, &record)?;
+        tx.commit().map_err(error)
+    })?;
     inner.manifest_storage.flush_database()?;
     Ok(Some(true))
 }
@@ -331,12 +332,16 @@ pub(crate) fn prepare(
     inner: &mut crate::mls_context::MLSContext,
     input: &DirectRequestBootstrapInput,
 ) -> Result<DirectRequestJournal, MLSError> {
+    use crate::storage::{driver_native::RusqliteKvBackend, openmls_kv::OpenMlsKvStorage};
     use native::*;
     use openmls::prelude::*;
     use openmls_traits::OpenMlsProvider;
     let (ctx, _) = super::direct_request_bootstrap::context(&input.context_json)?;
     let id = ctx["requestId"].as_str().unwrap();
-    if let Some(old) = read(inner.manifest_storage.welcome_ack_connection(), id)? {
+    if let Some(old) = inner
+        .manifest_storage
+        .with_connection(|conn| read(conn, id))?
+    {
         if old.input_sha256 != DirectRequestJournal::input_digest(input)? {
             return Err(MLSError::invalid_input(
                 "Request attempt already owns different crypto",
@@ -356,26 +361,26 @@ pub(crate) fn prepare(
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(error)?
         .as_secs();
-    let tx = inner
-        .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
-    let provider = Provider {
-        storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
-        crypto: inner.provider.crypto(),
-    };
-    if MlsGroup::load(provider.storage(), &GroupId::from_slice(&input.group_id))
-        .map_err(error)?
-        .is_some()
-    {
-        return Err(MLSError::invalid_input("Request group ID already exists"));
-    }
-    let (_group, bootstrap) =
-        super::direct_request_bootstrap::prepare_with_provider(&provider, &signer, input, now)?;
-    let record = DirectRequestJournal::from_prepared(input, bootstrap)?;
-    write(&tx, &record)?;
-    tx.commit().map_err(error)?;
+    let crypto = inner.provider.crypto();
+    let record = inner.manifest_storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(error)?;
+        let provider = Provider {
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            crypto,
+        };
+        if MlsGroup::load(provider.storage(), &GroupId::from_slice(&input.group_id))
+            .map_err(error)?
+            .is_some()
+        {
+            return Err(MLSError::invalid_input("Request group ID already exists"));
+        }
+        let (_group, bootstrap) =
+            super::direct_request_bootstrap::prepare_with_provider(&provider, &signer, input, now)?;
+        let record = DirectRequestJournal::from_prepared(input, bootstrap)?;
+        write(&tx, &record)?;
+        tx.commit().map_err(error)?;
+        Ok(record)
+    })?;
     inner.manifest_storage.flush_database()?;
     Ok(record)
 }
@@ -388,43 +393,49 @@ pub(crate) fn persist_publish(
     bytes: &[u8],
 ) -> Result<(), MLSError> {
     use native::*;
-    let tx = inner
+    let existing = inner
         .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
-    let mut record = read(&tx, id)?.ok_or(MLSError::StorageFailed)?;
-    let identity = format!("{}#{}", record.actor_did, record.actor_device_id);
+        .with_connection(|conn| read(conn, id))?
+        .ok_or(MLSError::StorageFailed)?;
+    let identity = format!("{}#{}", existing.actor_did, existing.actor_device_id);
     let signer = inner
         .get_signer_for_identity(&identity)
         .ok_or(MLSError::StorageFailed)?;
-    let publication_digest = record.verify_publication(bytes, signer.public())?;
-    let b = &record.bootstrap;
-    if let Some(old) = &record.publish_request {
-        if old != bytes {
-            return Err(MLSError::invalid_input(
-                "Cannot replace transmitted request bytes",
-            ));
+    let changed = inner.manifest_storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(error)?;
+        let mut record = read(&tx, id)?.ok_or(MLSError::StorageFailed)?;
+        let publication_digest = record.verify_publication(bytes, signer.public())?;
+        let b = &record.bootstrap;
+        if let Some(old) = &record.publish_request {
+            if old != bytes {
+                return Err(MLSError::invalid_input(
+                    "Cannot replace transmitted request bytes",
+                ));
+            }
+            return Ok(false);
         }
-        return Ok(());
+        if record.phase != DirectRequestJournalPhase::PreparedCrypto {
+            return Err(MLSError::StorageFailed);
+        }
+        super::direct_request_bootstrap::require_import_horizon(
+            b.import_until,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(error)?
+                .as_secs(),
+        )?;
+        record.publish_request = Some(bytes.into());
+        record.publish_request_sha256 = Some(Sha256::digest(bytes).into());
+        record.publication_digest = Some(publication_digest);
+        record.phase = DirectRequestJournalPhase::OutcomeUnknown;
+        write(&tx, &record)?;
+        tx.commit().map_err(error)?;
+        Ok(true)
+    })?;
+    if changed {
+        inner.manifest_storage.flush_database()?;
     }
-    if record.phase != DirectRequestJournalPhase::PreparedCrypto {
-        return Err(MLSError::StorageFailed);
-    }
-    super::direct_request_bootstrap::require_import_horizon(
-        b.import_until,
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(error)?
-            .as_secs(),
-    )?;
-    record.publish_request = Some(bytes.into());
-    record.publish_request_sha256 = Some(Sha256::digest(bytes).into());
-    record.publication_digest = Some(publication_digest);
-    record.phase = DirectRequestJournalPhase::OutcomeUnknown;
-    write(&tx, &record)?;
-    tx.commit().map_err(error)?;
-    inner.manifest_storage.flush_database()
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -435,91 +446,93 @@ pub(crate) fn resolve(
     authority_key: &[u8],
     published: bool,
 ) -> Result<DirectRequestJournal, MLSError> {
+    use crate::storage::{driver_native::RusqliteKvBackend, openmls_kv::OpenMlsKvStorage};
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use native::*;
     use openmls::prelude::*;
     use openmls_traits::OpenMlsProvider;
-    let tx = inner
-        .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
-    let mut record = read(&tx, id)?.ok_or(MLSError::StorageFailed)?;
-    record.verify_terminal_receipt(receipt, authority_key, published)?;
-    if let Some(old) = &record.terminal_receipt {
-        if old != receipt {
-            return Err(MLSError::invalid_input("Terminal receipt is immutable"));
+    let crypto = inner.provider.crypto();
+    let (record, published_group) = inner.manifest_storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(error)?;
+        let mut record = read(&tx, id)?.ok_or(MLSError::StorageFailed)?;
+        record.verify_terminal_receipt(receipt, authority_key, published)?;
+        if let Some(old) = &record.terminal_receipt {
+            if old != receipt {
+                return Err(MLSError::invalid_input("Terminal receipt is immutable"));
+            }
+            return Ok((record, None));
         }
-        return Ok(record);
-    }
-    let provider = Provider {
-        storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
-        crypto: inner.provider.crypto(),
-    };
-    let group_id = STANDARD
-        .decode(
-            record.bootstrap.coordinates["groupId"]
-                .as_str()
-                .ok_or(MLSError::StorageFailed)?,
-        )
-        .map_err(error)?;
-    let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
-        .map_err(error)?
-        .ok_or(MLSError::StorageFailed)?;
-    if super::direct_request_bootstrap::group_coordinates(
-        &group,
-        &provider,
-        &record.conversation_id,
-        record.bootstrap.coordinates["generation"]
-            .as_u64()
-            .ok_or(MLSError::StorageFailed)?,
-        record.bootstrap.coordinates["stateVersion"]
-            .as_u64()
-            .ok_or(MLSError::StorageFailed)?,
-    )? != record.bootstrap.coordinates
-    {
-        return Err(MLSError::StorageFailed);
-    }
-    let signer_public = group
-        .own_leaf_node()
-        .ok_or(MLSError::StorageFailed)?
-        .signature_key()
-        .as_slice()
-        .to_vec();
-    if published {
-        use rusqlite::OptionalExtension;
-        let raw: Option<String> = tx
-            .query_row(
-                "SELECT value FROM mls_manifests WHERE key='group_ids'",
-                [],
-                |r| r.get(0),
+        let provider = Provider {
+            storage: OpenMlsKvStorage::new(RusqliteKvBackend(&*tx)),
+            crypto,
+        };
+        let group_id = STANDARD
+            .decode(
+                record.bootstrap.coordinates["groupId"]
+                    .as_str()
+                    .ok_or(MLSError::StorageFailed)?,
             )
-            .optional()
             .map_err(error)?;
-        let mut ids: Vec<String> = raw
-            .map(|s| serde_json::from_str(&s))
-            .transpose()
+        let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&group_id))
             .map_err(error)?
-            .unwrap_or_default();
-        let hex_id = hex::encode(&group_id);
-        if !ids.contains(&hex_id) {
-            ids.push(hex_id);
+            .ok_or(MLSError::StorageFailed)?;
+        if super::direct_request_bootstrap::group_coordinates(
+            &group,
+            &provider,
+            &record.conversation_id,
+            record.bootstrap.coordinates["generation"]
+                .as_u64()
+                .ok_or(MLSError::StorageFailed)?,
+            record.bootstrap.coordinates["stateVersion"]
+                .as_u64()
+                .ok_or(MLSError::StorageFailed)?,
+        )? != record.bootstrap.coordinates
+        {
+            return Err(MLSError::StorageFailed);
         }
-        tx.execute(
-            "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES('group_ids',?1)",
-            [serde_json::to_string(&ids).map_err(error)?],
-        )
-        .map_err(error)?;
-        record.phase = DirectRequestJournalPhase::PublishedAwaitingProjection;
-    } else {
-        // Retain encrypted candidate state and terminal evidence; never add a live index.
-        record.phase = DirectRequestJournalPhase::TerminalNotPublished;
-    }
-    record.terminal_receipt = Some(receipt.into());
-    record.terminal_authority_key = Some(authority_key.into());
-    write(&tx, &record)?;
-    tx.commit().map_err(error)?;
-    if published {
+        let signer_public = group
+            .own_leaf_node()
+            .ok_or(MLSError::StorageFailed)?
+            .signature_key()
+            .as_slice()
+            .to_vec();
+        let published_group = if published {
+            use rusqlite::OptionalExtension;
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT value_json FROM account_meta WHERE key='group_ids'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(error)?;
+            let mut ids: Vec<String> = raw
+                .map(|s| serde_json::from_str(&s))
+                .transpose()
+                .map_err(error)?
+                .unwrap_or_default();
+            let hex_id = hex::encode(&group_id);
+            if !ids.contains(&hex_id) {
+                ids.push(hex_id);
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES('group_ids', ?1)",
+                [serde_json::to_string(&ids).map_err(error)?],
+            )
+            .map_err(error)?;
+            record.phase = DirectRequestJournalPhase::PublishedAwaitingProjection;
+            Some((group, signer_public))
+        } else {
+            record.phase = DirectRequestJournalPhase::TerminalNotPublished;
+            None
+        };
+        record.terminal_receipt = Some(receipt.into());
+        record.terminal_authority_key = Some(authority_key.into());
+        write(&tx, &record)?;
+        tx.commit().map_err(error)?;
+        Ok((record, published_group))
+    })?;
+    if let Some((group, signer_public)) = published_group {
         inner.publish_welcome_group(group, signer_public);
     }
     inner.manifest_storage.flush_database()?;
@@ -532,22 +545,24 @@ pub(crate) fn projected(
     id: &str,
 ) -> Result<(), MLSError> {
     use native::*;
-    let tx = inner
-        .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
-    let mut record = read(&tx, id)?.ok_or(MLSError::StorageFailed)?;
-    if record.phase == DirectRequestJournalPhase::RequestSent {
-        return Ok(());
+    let changed = inner.manifest_storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(error)?;
+        let mut record = read(&tx, id)?.ok_or(MLSError::StorageFailed)?;
+        if record.phase == DirectRequestJournalPhase::RequestSent {
+            return Ok(false);
+        }
+        if record.phase != DirectRequestJournalPhase::PublishedAwaitingProjection {
+            return Err(MLSError::StorageFailed);
+        }
+        record.phase = DirectRequestJournalPhase::RequestSent;
+        write(&tx, &record)?;
+        tx.commit().map_err(error)?;
+        Ok(true)
+    })?;
+    if changed {
+        inner.manifest_storage.flush_database()?;
     }
-    if record.phase != DirectRequestJournalPhase::PublishedAwaitingProjection {
-        return Err(MLSError::StorageFailed);
-    }
-    record.phase = DirectRequestJournalPhase::RequestSent;
-    write(&tx, &record)?;
-    tx.commit().map_err(error)?;
-    inner.manifest_storage.flush_database()
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -569,15 +584,16 @@ pub(crate) fn intent_read(
     id: &str,
 ) -> Result<Option<Vec<u8>>, MLSError> {
     use rusqlite::OptionalExtension;
-    storage
-        .welcome_ack_connection()
-        .query_row(
-            "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
-            [intent_key(id)?],
+    let key = intent_key(id)?;
+    storage.with_connection(|conn| {
+        conn.query_row(
+            "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
+            [&key],
             |row| row.get(0),
         )
         .optional()
         .map_err(native::error)
+    })
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn intent_cas(
@@ -593,39 +609,45 @@ pub(crate) fn intent_cas(
         ));
     }
     let key = intent_key(id)?;
-    let tx = storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(native::error)?;
-    let old: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
-            [&key],
-            |r| r.get(0),
+    let changed = storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(native::error)?;
+        let old: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(native::error)?;
+        if old.as_deref() != expected {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES(?1, ?2)",
+            rusqlite::params![&key, next],
         )
-        .optional()
         .map_err(native::error)?;
-    if old.as_deref() != expected {
-        return Ok(false);
+        tx.commit().map_err(native::error)?;
+        Ok(true)
+    })?;
+    if changed {
+        storage.flush_database()?;
     }
-    tx.execute(
-        "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES(?1,?2)",
-        rusqlite::params![key, next],
-    )
-    .map_err(native::error)?;
-    tx.commit().map_err(native::error)?;
-    storage.flush_database()?;
-    Ok(true)
+    Ok(changed)
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn intent_list(
     storage: &crate::mls_context::ManifestStorage,
 ) -> Result<Vec<Vec<u8>>, MLSError> {
-    let mut query=storage.welcome_ack_connection().prepare("SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key LIKE 'direct_request_intent_v2:%'").map_err(native::error)?;
-    let rows = query
-        .query_map([], |r| r.get::<_, Vec<u8>>(0))
-        .map_err(native::error)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(native::error)
+    storage.with_connection(|conn| {
+        let mut query = conn
+            .prepare("SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key LIKE 'direct_request_intent_v2:%'")
+            .map_err(native::error)?;
+        let rows = query
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(native::error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(native::error)
+    })
 }
 #[cfg(not(target_arch = "wasm32"))]
 fn projection_key(id: &str) -> Result<String, MLSError> {
@@ -646,15 +668,16 @@ pub(crate) fn projection_read(
     id: &str,
 ) -> Result<Option<Vec<u8>>, MLSError> {
     use rusqlite::OptionalExtension;
-    storage
-        .welcome_ack_connection()
-        .query_row(
-            "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
-            [projection_key(id)?],
+    let key = projection_key(id)?;
+    storage.with_connection(|conn| {
+        conn.query_row(
+            "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
+            [&key],
             |row| row.get(0),
         )
         .optional()
         .map_err(native::error)
+    })
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn projection_cas(
@@ -670,39 +693,45 @@ pub(crate) fn projection_cas(
         ));
     }
     let key = projection_key(id)?;
-    let tx = storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(native::error)?;
-    let old: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
-            [&key],
-            |r| r.get(0),
+    let changed = storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(native::error)?;
+        let old: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(native::error)?;
+        if old.as_deref() != expected {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES(?1, ?2)",
+            rusqlite::params![&key, next],
         )
-        .optional()
         .map_err(native::error)?;
-    if old.as_deref() != expected {
-        return Ok(false);
+        tx.commit().map_err(native::error)?;
+        Ok(true)
+    })?;
+    if changed {
+        storage.flush_database()?;
     }
-    tx.execute(
-        "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES(?1,?2)",
-        rusqlite::params![key, next],
-    )
-    .map_err(native::error)?;
-    tx.commit().map_err(native::error)?;
-    storage.flush_database()?;
-    Ok(true)
+    Ok(changed)
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn projection_list(
     storage: &crate::mls_context::ManifestStorage,
 ) -> Result<Vec<Vec<u8>>, MLSError> {
-    let mut query=storage.welcome_ack_connection().prepare("SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key LIKE 'direct_request_projection_v2:%'").map_err(native::error)?;
-    let rows = query
-        .query_map([], |r| r.get::<_, Vec<u8>>(0))
-        .map_err(native::error)?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(native::error)
+    storage.with_connection(|conn| {
+        let mut query = conn
+            .prepare("SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key LIKE 'direct_request_projection_v2:%'")
+            .map_err(native::error)?;
+        let rows = query
+            .query_map([], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(native::error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(native::error)
+    })
 }
 
 impl DirectRequestJournal {
@@ -905,71 +934,75 @@ pub(crate) fn commit_closed_projection(
         }
     }
     let key = projection_key(cid)?;
-    let tx = inner
-        .manifest_storage
-        .welcome_ack_connection()
-        .unchecked_transaction()
-        .map_err(error)?;
-    let current: Option<Vec<u8>> = tx
-        .query_row(
-            "SELECT CAST(value AS BLOB) FROM mls_manifests WHERE key=?1",
-            [&key],
-            |r| r.get(0),
+    let retired = inner.manifest_storage.with_connection(|conn| {
+        let tx = conn.unchecked_transaction().map_err(error)?;
+        let current: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT CAST(value_json AS BLOB) FROM account_meta WHERE key=?1",
+                [&key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        if current.as_deref() == Some(next) {
+            return Ok(Some(true));
+        }
+        if current.as_deref() != Some(expected) {
+            return Ok(None);
+        }
+        let provider = Provider {
+            storage: crate::storage::openmls_kv::OpenMlsKvStorage::new(
+                crate::storage::driver_native::RusqliteKvBackend(&*tx),
+            ),
+            crypto: inner.provider.crypto(),
+        };
+        let group =
+            MlsGroup::load(provider.storage(), &GroupId::from_slice(&gid)).map_err(error)?;
+        let was_loaded = group.is_some();
+        if let Some(mut group) = group {
+            group.delete(provider.storage()).map_err(error)?;
+        }
+        let encoded = hex::encode(&gid);
+        let ids: Option<String> = tx
+            .query_row(
+                "SELECT value_json FROM account_meta WHERE key='group_ids'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(error)?;
+        let mut ids: Vec<String> = ids
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()
+            .map_err(error)?
+            .unwrap_or_default();
+        if was_loaded != ids.contains(&encoded) {
+            return Err(MLSError::StorageFailed);
+        }
+        ids.retain(|id| id != &encoded);
+        tx.execute(
+            "INSERT OR REPLACE INTO account_meta(key, value_json) VALUES('group_ids', ?1)",
+            [serde_json::to_string(&ids).map_err(error)?],
         )
-        .optional()
         .map_err(error)?;
-    if current.as_deref() == Some(next) {
-        drop(tx);
-        inner.manifest_storage.flush_database()?;
-        inner.groups.remove(&gid);
-        return Ok(true);
-    }
-    if current.as_deref() != Some(expected) {
-        return Ok(false);
-    }
-    let provider = Provider {
-        storage: openmls_sqlite_storage::SqliteStorageProvider::new(&*tx),
-        crypto: inner.provider.crypto(),
-    };
-    let group = MlsGroup::load(provider.storage(), &GroupId::from_slice(&gid)).map_err(error)?;
-    let was_loaded = group.is_some();
-    if let Some(mut group) = group {
-        group.delete(provider.storage()).map_err(error)?;
-    }
-    let encoded = hex::encode(&gid);
-    let ids: Option<String> = tx
-        .query_row(
-            "SELECT value FROM mls_manifests WHERE key='group_ids'",
-            [],
-            |r| r.get(0),
+        if let Some(mut journal) = journal {
+            journal.phase = DirectRequestJournalPhase::RetiredPublished;
+            write(&tx, &journal)?;
+        }
+        tx.execute(
+            "UPDATE account_meta SET value_json=?1 WHERE key=?2",
+            rusqlite::params![next, key],
         )
-        .optional()
         .map_err(error)?;
-    let mut ids: Vec<String> = ids
-        .map(|raw| serde_json::from_str(&raw))
-        .transpose()
-        .map_err(error)?
-        .unwrap_or_default();
-    if was_loaded != ids.contains(&encoded) {
-        return Err(MLSError::StorageFailed);
+        tx.commit().map_err(error)?;
+        Ok(Some(false))
+    })?;
+    match retired {
+        Some(_) => {
+            inner.manifest_storage.flush_database()?;
+            inner.groups.remove(&gid);
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    ids.retain(|id| id != &encoded);
-    tx.execute(
-        "INSERT OR REPLACE INTO mls_manifests(key,value) VALUES('group_ids',?1)",
-        [serde_json::to_string(&ids).map_err(error)?],
-    )
-    .map_err(error)?;
-    if let Some(mut journal) = journal {
-        journal.phase = DirectRequestJournalPhase::RetiredPublished;
-        write(&tx, &journal)?;
-    }
-    tx.execute(
-        "UPDATE mls_manifests SET value=?1 WHERE key=?2",
-        rusqlite::params![next, key],
-    )
-    .map_err(error)?;
-    tx.commit().map_err(error)?;
-    inner.manifest_storage.flush_database()?;
-    inner.groups.remove(&gid);
-    Ok(true)
 }

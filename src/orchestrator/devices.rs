@@ -373,7 +373,7 @@ where
             .find(|d| d.device_id == target_device_id || d.device_uuid == target_device_id);
         // The revoked chat device's Ed25519 key: its Labyrinth device is
         // found by the chat binding that names this key ([CB-36]).
-        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        #[cfg(feature = "labyrinth")]
         let target_chat_key: Option<[u8; 32]> = target
             .as_ref()
             .and_then(|d| d.signature_public_key.as_deref())
@@ -412,7 +412,7 @@ where
         // Labyrinth: the chat device is revoked first (mls-ds requires that
         // order), then the Labyrinth device it enrolled. Best effort: every
         // later rotation excludes a device whose chat device is gone.
-        #[cfg(all(feature = "labyrinth", not(target_arch = "wasm32")))]
+        #[cfg(feature = "labyrinth")]
         if let Some(key) = target_chat_key {
             match self.labyrinth_revoke_chat_device(key).await {
                 Ok(epochs) if !epochs.is_empty() => {
