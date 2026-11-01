@@ -691,3 +691,204 @@ fn catbird_mls_client_memory_space_host_cross_device_recovery_and_700_row_pagina
         "all 425 own messages (275 cached + 150 queued) must retain Alice's sender_did on fresh Device 2"
     );
 }
+
+#[test]
+fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
+    use catbird_mls::client::{PlatformChangeEvent, PlatformChangeObserver};
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: Mutex<Vec<PlatformChangeEvent>>,
+    }
+    impl PlatformChangeObserver for RecordingObserver {
+        fn on_change(&self, event: PlatformChangeEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    let space_host = labyrinth::store::space::host::MemorySpaceHost::new();
+    let alice = "did:plc:aliceuniffi000000000";
+    let bob = "did:plc:bobuniffi00000000000";
+    let ds_did = "did:web:chat.catbird.blue";
+    let conv_id = "convo-uniffi-concurrent";
+    let convo_space = labyrinth::store::space::SpaceRef::parse(&format!(
+        "at://{ds_did}/space/blue.catbird.labyrinth.conversation/{conv_id}-0"
+    ))
+    .unwrap();
+    space_host.grant_space_member(&convo_space, alice);
+
+    let all_scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    let tmp1 = TempDir::new().expect("tempdir1");
+    let keystore1 = Arc::new(TestKeystore::default());
+    let transport1 = Arc::new(RecordingSpaceTransport::new());
+    let client1 = CatbirdMlsClient::ffi_open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp1.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "dev-ffi-1".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        keystore1,
+        transport1.clone(),
+        None,
+    )
+    .expect("ffi_open");
+    client1
+        .ffi_enroll_device(all_scopes.clone())
+        .expect("ffi_enroll_device");
+    let convo = client1
+        .ffi_create_group(
+            conv_id.to_string(),
+            ds_did.to_string(),
+            Some("UniFFI Concurrent".to_string()),
+            None,
+        )
+        .expect("ffi_create_group");
+
+    for idx in 0..20 {
+        client1
+            .ffi_send_message(
+                conv_id.to_string(),
+                format!("msg-conc-{idx:02}"),
+                format!("concurrent payload {idx}"),
+            )
+            .expect("ffi_send_message");
+    }
+    assert_eq!(
+        client1
+            .ffi_list_pending_labyrinth_queue(Some(conv_id.to_string()), 50)
+            .expect("ffi_list_pending_labyrinth_queue")
+            .len(),
+        20
+    );
+
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let c = Arc::clone(&client1);
+        let b = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            c.ffi_flush_labyrinth_queue().expect("concurrent ffi_flush")
+        }));
+    }
+    let total_drained: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    assert_eq!(
+        total_drained, 20,
+        "serialized concurrent ffi_flush_labyrinth_queue calls must commit each item once"
+    );
+    assert_eq!(
+        transport1.write_requests.lock().unwrap().len(),
+        20,
+        "outbox_flush_lock must prevent duplicate Space applyWrites across concurrent threads"
+    );
+    assert!(client1
+        .ffi_list_pending_labyrinth_queue(None, 50)
+        .unwrap()
+        .is_empty());
+
+    // Verify closed handle returns ContextClosed immediately on ffi_flush_labyrinth_queue.
+    client1
+        .ffi_prepare_for_background()
+        .expect("ffi_prepare_for_background");
+    assert!(matches!(
+        client1.ffi_flush_labyrinth_queue(),
+        Err(MLSError::ContextClosed)
+    ));
+    client1
+        .ffi_resume_from_background()
+        .expect("ffi_resume_from_background");
+
+    // End-to-end UniFFI rescue + fresh-device restore with observer verification on MemorySpaceHost.
+    let tmp_space1 = TempDir::new().expect("tmp_space1");
+    let ks_space1 = Arc::new(TestKeystore::default());
+    let tr_space1 = Arc::new(MemorySpacePlatformTransport::new(&space_host, alice));
+    let space_client1 = CatbirdMlsClient::ffi_open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp_space1.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "dev-space-1".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        ks_space1,
+        tr_space1,
+        None,
+    )
+    .unwrap();
+    space_client1.ffi_enroll_device(all_scopes).unwrap();
+    let code = space_client1.ffi_setup_recovery_code().unwrap();
+    space_client1
+        .ffi_create_group(conv_id.to_string(), ds_did.to_string(), None, None)
+        .unwrap();
+    space_client1
+        .ffi_import_conversation_history(
+            conv_id.to_string(),
+            vec![MessageRow {
+                message_id: "peer-bob-ffi".to_string(),
+                conversation_id: conv_id.to_string(),
+                group_id: convo.group_id,
+                epoch: 0,
+                seq: 1,
+                sender_did: bob.to_string(),
+                sender_device_id: "dev-bob".to_string(),
+                plaintext_json: r#"{"text":"bob via ffi"}"#.to_string(),
+                created_at_ms: 1_700_200_000_000,
+                is_own: false,
+            }],
+        )
+        .unwrap();
+    space_client1
+        .ffi_send_message(
+            conv_id.to_string(),
+            "own-alice-ffi".to_string(),
+            "alice via ffi".to_string(),
+        )
+        .unwrap();
+    space_host.revoke_space_member(&convo_space, alice);
+    assert_eq!(
+        space_client1
+            .ffi_rescue_conversation_on_kick(conv_id.to_string())
+            .expect("ffi_rescue_conversation_on_kick"),
+        2
+    );
+
+    let tmp_space2 = TempDir::new().expect("tmp_space2");
+    let obs2 = Arc::new(RecordingObserver::default());
+    let obs_dyn: Arc<dyn PlatformChangeObserver> = obs2.clone();
+    let space_client2 = CatbirdMlsClient::ffi_open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp_space2.path().display().to_string(),
+            account_did: alice.to_string(),
+            device_id: "dev-space-2".to_string(),
+            home_ds_did: ds_did.to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        Arc::new(TestKeystore::default()),
+        Arc::new(MemorySpacePlatformTransport::new(&space_host, alice)),
+        Some(obs_dyn),
+    )
+    .unwrap();
+    space_client2.ffi_restore_with_recovery_code(code).unwrap();
+    obs2.events.lock().unwrap().clear();
+
+    assert_eq!(
+        space_client2
+            .ffi_restore_conversation_from_owner_mailbox(conv_id.to_string())
+            .expect("ffi_restore_conversation_from_owner_mailbox"),
+        2
+    );
+    let recorded = obs2.events.lock().unwrap().clone();
+    assert!(recorded.contains(&PlatformChangeEvent::ConversationsUpdated));
+    assert!(recorded.contains(&PlatformChangeEvent::MessagesUpdated {
+        conversation_id: conv_id.to_string(),
+    }));
+}

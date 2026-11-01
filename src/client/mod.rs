@@ -74,6 +74,7 @@ pub struct OtcPairingCompletion {
 /// Durable outbox envelope persisted in `labyrinth_queue.payload_bytes` atomically inside
 /// `CatbirdMlsClient::send_message`'s `write_tx` (`Spec §5 I6`, `[CB-30]`, `[CB-22]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
 pub struct QueuedLabyrinthArchivePayload {
     pub version: u8,
     pub message_id: String,
@@ -532,6 +533,7 @@ mod native_client {
         transport: Arc<dyn PlatformTransport>,
         observer: Option<Arc<dyn PlatformChangeObserver>>,
         cached_group_titles: Arc<Mutex<std::collections::HashMap<String, String>>>,
+        outbox_flush_lock: Mutex<()>,
         wipe_report: PreCutoverWipeReport,
     }
 
@@ -624,6 +626,7 @@ mod native_client {
                 transport,
                 observer,
                 cached_group_titles,
+                outbox_flush_lock: Mutex::new(()),
                 wipe_report,
             }))
         }
@@ -1928,6 +1931,15 @@ mod native_client {
         pub fn flush_labyrinth_queue(&self) -> Result<u32, MLSError> {
             use labyrinth::sign::TransportSigner as _;
 
+            let _outbox_guard = self
+                .outbox_flush_lock
+                .lock()
+                .map_err(|_| MLSError::lock_poisoned("CatbirdMlsClient.outbox_flush_lock"))?;
+
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
+
             let (status, owner_root) = self.load_status_and_owner_root()?;
             if !status.backup_enabled {
                 return Ok(0);
@@ -1940,6 +1952,9 @@ mod native_client {
             let mut total_committed: u32 = 0;
 
             loop {
+                if self.is_handle_closed() {
+                    return Err(MLSError::ContextClosed);
+                }
                 let rows = self.db.read_tx(|tx| tx.list_labyrinth_queue(None, 100))?;
                 if rows.is_empty() {
                     break;
@@ -2161,12 +2176,26 @@ mod native_client {
             Ok(total_committed)
         }
 
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn flush_labyrinth_queue(&self) -> Result<u32, MLSError> {
+            Ok(0)
+        }
+
         /// Rescue ALL locally cached SQLCipher conversation messages + pending outbox items
         /// (paginating past the 500-row SQL page cap) into the account's personal mailbox Space
         /// (`v5` `OwnerBatch` with `KIND_ATTRIBUTED_FRAME`) when involuntarily kicked or before
         /// local conversation deletion (`[CB-22]`, `[CB-37]`, `I6`).
         #[cfg(feature = "labyrinth")]
         pub fn rescue_conversation_on_kick(&self, conversation_id: &str) -> Result<u32, MLSError> {
+            let _outbox_guard = self
+                .outbox_flush_lock
+                .lock()
+                .map_err(|_| MLSError::lock_poisoned("CatbirdMlsClient.outbox_flush_lock"))?;
+
+            if self.is_handle_closed() {
+                return Err(MLSError::ContextClosed);
+            }
+
             let (mut cached_msgs, queued_rows) = self.db.read_tx(|tx| {
                 let mut all_msgs: Vec<MessageRow> = Vec::new();
                 let mut after_rowid: i64 = 0;
@@ -2547,11 +2576,29 @@ mod native_client {
             })?;
 
             if imported > 0 {
+                self.notify(PlatformChangeEvent::ConversationsUpdated);
                 self.notify(PlatformChangeEvent::MessagesUpdated {
                     conversation_id: conversation_id.to_string(),
                 });
             }
             Ok(imported)
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn rescue_conversation_on_kick(&self, _conversation_id: &str) -> Result<u32, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
+        }
+
+        #[cfg(not(feature = "labyrinth"))]
+        pub fn restore_conversation_from_owner_mailbox(
+            &self,
+            _conversation_id: &str,
+        ) -> Result<u32, MLSError> {
+            Err(MLSError::InvalidState(
+                "Labyrinth feature is disabled".to_string(),
+            ))
         }
     }
 }

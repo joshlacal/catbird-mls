@@ -7,7 +7,8 @@ use crate::client::{
     account_did_hash_hex, evaluate_spaces_eligibility, wipe_pre_cutover_local_artifacts,
     CatbirdMlsClient, CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus,
     OtcPairingCompletion, OtcPairingOffer, PlatformChangeObserver, PlatformKeyStore,
-    PlatformTransport, PreCutoverWipeReport, SpacesEligibilityInput, SpacesEligibilityStatus,
+    PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload, SpacesEligibilityInput,
+    SpacesEligibilityStatus,
 };
 use crate::error::MLSError;
 use crate::groups::lifecycle::MemberRole;
@@ -283,5 +284,35 @@ impl CatbirdMlsClient {
         messages: Vec<MessageRow>,
     ) -> Result<u32, MLSError> {
         self.import_conversation_history(&conversation_id, messages)
+    }
+
+    #[uniffi::method(name = "list_pending_labyrinth_queue")]
+    pub fn ffi_list_pending_labyrinth_queue(
+        &self,
+        conversation_id: Option<String>,
+        limit: u32,
+    ) -> Result<Vec<QueuedLabyrinthArchivePayload>, MLSError> {
+        self.list_pending_labyrinth_queue(conversation_id.as_deref(), limit)
+    }
+
+    #[uniffi::method(name = "flush_labyrinth_queue")]
+    pub fn ffi_flush_labyrinth_queue(&self) -> Result<u32, MLSError> {
+        self.flush_labyrinth_queue()
+    }
+
+    #[uniffi::method(name = "rescue_conversation_on_kick")]
+    pub fn ffi_rescue_conversation_on_kick(
+        &self,
+        conversation_id: String,
+    ) -> Result<u32, MLSError> {
+        self.rescue_conversation_on_kick(&conversation_id)
+    }
+
+    #[uniffi::method(name = "restore_conversation_from_owner_mailbox")]
+    pub fn ffi_restore_conversation_from_owner_mailbox(
+        &self,
+        conversation_id: String,
+    ) -> Result<u32, MLSError> {
+        self.restore_conversation_from_owner_mailbox(&conversation_id)
     }
 }
