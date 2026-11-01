@@ -7,8 +7,8 @@ use crate::client::{
     account_did_hash_hex, evaluate_spaces_eligibility, wipe_pre_cutover_local_artifacts,
     CatbirdMlsClient, CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus,
     OtcPairingCompletion, OtcPairingOffer, PlatformChangeObserver, PlatformKeyStore,
-    PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload, SpacesEligibilityInput,
-    SpacesEligibilityStatus,
+    PlatformTransport, PreCutoverWipeReport, QueuedLabyrinthArchivePayload,
+    SignedPushGatewayRegistration, SpacesEligibilityInput, SpacesEligibilityStatus,
 };
 use crate::error::MLSError;
 use crate::groups::lifecycle::MemberRole;
@@ -227,6 +227,17 @@ impl CatbirdMlsClient {
         up_to_seq: i64,
     ) -> Result<(), MLSError> {
         self.acknowledge_entries_up_to(&conversation_id, up_to_seq)
+    }
+
+    #[uniffi::method(name = "build_signed_push_gateway_registration")]
+    pub fn ffi_build_signed_push_gateway_registration(
+        &self,
+        gateway_url: String,
+        app_id: String,
+        push_key: String,
+        enabled: bool,
+    ) -> Result<SignedPushGatewayRegistration, MLSError> {
+        self.build_signed_push_gateway_registration(&gateway_url, &app_id, &push_key, enabled)
     }
 
     #[uniffi::method(name = "labyrinth_status")]

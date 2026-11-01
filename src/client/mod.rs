@@ -41,6 +41,23 @@ pub struct EnrollmentReceipt {
     pub labyrinth_backup_enabled: bool,
 }
 
+/// Signed `blue.catbird.chat.registerPushGateway` payload minted with the enrolled Ed25519
+/// device key (`CATBIRD-CHAT-PUSH-GATEWAY\0 || DAG-CBOR(...)`, `D2`, `M-F06`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
+pub struct SignedPushGatewayRegistration {
+    pub device_id: String,
+    pub key_id: String,
+    pub auth_generation: i64,
+    pub gateway_url: String,
+    pub app_id: String,
+    pub push_key: String,
+    pub enabled: bool,
+    pub signed_at: String,
+    pub signature_bytes: Vec<u8>,
+    pub request_json: String,
+}
+
 /// Labyrinth 1.1 backup & recovery status (`D4`, `Spec §6.7`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(not(target_arch = "wasm32"), derive(uniffi::Record))]
@@ -192,14 +209,16 @@ mod native_client {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
     use base64::Engine as _;
+    use chrono::{SecondsFormat, Utc};
     use openmls::prelude::tls_codec::Serialize as TlsSerialize;
     use openmls::prelude::*;
     use openmls_basic_credential::SignatureKeyPair;
     use openmls_traits::signatures::Signer as _;
     use openmls_traits::OpenMlsProvider;
     use rand::RngCore;
+    use serde::Serialize;
     use sha2::{Digest as _, Sha256};
     use zeroize::Zeroizing;
 
@@ -229,10 +248,43 @@ mod native_client {
         CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus, OtcPairingCompletion,
         OtcPairingOffer, PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader,
         PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
-        PreCutoverWipeReport, QueuedLabyrinthArchivePayload, SpacesEligibilityStatus,
+        PreCutoverWipeReport, QueuedLabyrinthArchivePayload, SignedPushGatewayRegistration,
+        SpacesEligibilityStatus,
     };
 
     const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+    const ACK_ENTRIES_SIGNATURE_DOMAIN: &[u8] = b"CATBIRD-CHAT-ACK-ENTRIES\0";
+    const PUSH_GATEWAY_SIGNATURE_DOMAIN: &[u8] = b"CATBIRD-CHAT-PUSH-GATEWAY\0";
+
+    #[derive(Serialize)]
+    struct AckTranscriptPayload<'a> {
+        #[serde(rename = "keyId")]
+        key_id: &'a str,
+        #[serde(rename = "upToSeq")]
+        up_to_seq: i64,
+        #[serde(rename = "signedAt")]
+        signed_at: &'a str,
+        generation: i64,
+        #[serde(rename = "actorDeviceId")]
+        actor_device_id: String,
+        #[serde(rename = "authGeneration")]
+        auth_generation: i64,
+        #[serde(rename = "conversationId")]
+        conversation_id: String,
+    }
+
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PushGatewayTranscriptPayload<'a> {
+        app_id: &'a str,
+        auth_generation: i64,
+        device_id: String,
+        enabled: bool,
+        gateway_url: &'a str,
+        key_id: &'a str,
+        push_key: &'a str,
+        signed_at: &'a str,
+    }
 
     fn owner_epoch_root_key(epoch_seq: u64) -> String {
         format!("owner_epoch_root:{epoch_seq}")
@@ -1235,34 +1287,266 @@ mod native_client {
             Ok(())
         }
 
-        /// Commit `acked_seq` locally BEFORE dispatching `blue.catbird.chat.acknowledgeEntries` (`I2`, `I6`).
+        fn load_device_ed25519_signer(
+            &self,
+        ) -> Result<
+            (
+                [u8; 32],
+                Arc<dyn Fn(&[u8]) -> Result<[u8; 64], MLSError> + Send + Sync>,
+            ),
+            MLSError,
+        > {
+            let keychain_key = format!("mls-signer:{}", self.account_did_hash);
+            if let Some(raw_bytes) = self.keystore.load_signature_keypair(keychain_key)? {
+                if raw_bytes.len() == 32 {
+                    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
+                        <[u8; 32]>::try_from(raw_bytes.as_slice())
+                            .map_err(|_| MLSError::Internal("invalid 32-byte seed".to_string()))?,
+                    );
+                    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+                    let pub_key = signing_key.verifying_key().to_bytes();
+                    return Ok((
+                        pub_key,
+                        Arc::new(move |msg: &[u8]| {
+                            use ed25519_dalek::Signer as _;
+                            Ok(signing_key.sign(msg).to_bytes())
+                        }),
+                    ));
+                }
+                let signer: SignatureKeyPair = serde_json::from_slice(&raw_bytes).map_err(|e| {
+                    MLSError::Internal(format!("deserialize mls-signer SignatureKeyPair: {e}"))
+                })?;
+                let pub_key: [u8; 32] = signer.public().try_into().map_err(|_| {
+                    MLSError::Cryptography("enrolled signer public key is not 32 bytes".to_string())
+                })?;
+                return Ok((
+                    pub_key,
+                    Arc::new(move |msg: &[u8]| {
+                        let sig = signer.sign(msg).map_err(|e| {
+                            MLSError::Cryptography(format!("sign with SignatureKeyPair: {e:?}"))
+                        })?;
+                        sig.as_slice().try_into().map_err(|_| {
+                            MLSError::Cryptography("Ed25519 signature is not 64 bytes".to_string())
+                        })
+                    }),
+                ));
+            }
+
+            if let Some(signer_json) = self
+                .db
+                .read_tx(|tx| tx.get_account_meta("enrolled_signer_json"))?
+            {
+                let signer: SignatureKeyPair = serde_json::from_str(&signer_json).map_err(|e| {
+                    MLSError::Internal(format!("deserialize enrolled_signer_json: {e}"))
+                })?;
+                let pub_key: [u8; 32] = signer.public().try_into().map_err(|_| {
+                    MLSError::Cryptography("enrolled signer public key is not 32 bytes".to_string())
+                })?;
+                return Ok((
+                    pub_key,
+                    Arc::new(move |msg: &[u8]| {
+                        let sig = signer.sign(msg).map_err(|e| {
+                            MLSError::Cryptography(format!("sign with SignatureKeyPair: {e:?}"))
+                        })?;
+                        sig.as_slice().try_into().map_err(|_| {
+                            MLSError::Cryptography("Ed25519 signature is not 64 bytes".to_string())
+                        })
+                    }),
+                ));
+            }
+
+            Err(MLSError::InvalidState(
+                "MLS device Ed25519 signer is not enrolled yet".to_string(),
+            ))
+        }
+
+        /// Build a canonical Ed25519-signed `blue.catbird.chat.registerPushGateway` payload (`D2`, `M-F06`).
+        pub fn build_signed_push_gateway_registration(
+            &self,
+            gateway_url: &str,
+            app_id: &str,
+            push_key: &str,
+            enabled: bool,
+        ) -> Result<SignedPushGatewayRegistration, MLSError> {
+            let device_uuid =
+                uuid::Uuid::parse_str(self.config.device_id.trim()).map_err(|_| {
+                    MLSError::invalid_input(
+                        "CatbirdMlsClientConfig.device_id must be a canonical UUIDv4",
+                    )
+                })?;
+            if device_uuid.get_version_num() != 4 {
+                return Err(MLSError::invalid_input(
+                    "CatbirdMlsClientConfig.device_id must be UUID version 4",
+                ));
+            }
+            let canonical_device_id = device_uuid.hyphenated().to_string();
+            let (pub_key, sign_fn) = self.load_device_ed25519_signer()?;
+            let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(pub_key));
+            let auth_generation = self
+                .db
+                .read_tx(|tx| tx.get_account_meta("auth_generation"))?
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+
+            let transcript_payload = PushGatewayTranscriptPayload {
+                app_id,
+                auth_generation,
+                device_id: canonical_device_id.clone(),
+                enabled,
+                gateway_url,
+                key_id: &key_id,
+                push_key,
+                signed_at: &signed_at,
+            };
+            let cbor = serde_ipld_dagcbor::to_vec(&transcript_payload).map_err(|e| {
+                MLSError::Internal(format!("encode push gateway transcript DAG-CBOR: {e}"))
+            })?;
+            let mut transcript =
+                Vec::with_capacity(PUSH_GATEWAY_SIGNATURE_DOMAIN.len() + cbor.len());
+            transcript.extend_from_slice(PUSH_GATEWAY_SIGNATURE_DOMAIN);
+            transcript.extend_from_slice(&cbor);
+
+            let sig_64 = sign_fn(&transcript)?;
+            let sig_b64 = BASE64_STANDARD.encode(sig_64);
+            let request_json = serde_json::to_string(&serde_json::json!({
+                "deviceId": canonical_device_id,
+                "keyId": key_id,
+                "authGeneration": auth_generation,
+                "gatewayUrl": gateway_url,
+                "appId": app_id,
+                "pushKey": push_key,
+                "enabled": enabled,
+                "signedAt": signed_at,
+                "signature": { "$bytes": sig_b64 },
+            }))
+            .map_err(|e| MLSError::Internal(format!("serialize registerPushGateway JSON: {e}")))?;
+
+            Ok(SignedPushGatewayRegistration {
+                device_id: canonical_device_id,
+                key_id,
+                auth_generation,
+                gateway_url: gateway_url.to_string(),
+                app_id: app_id.to_string(),
+                push_key: push_key.to_string(),
+                enabled,
+                signed_at,
+                signature_bytes: sig_64.to_vec(),
+                request_json,
+            })
+        }
+
+        /// Commit `acked_seq` locally BEFORE dispatching signed `blue.catbird.chat.acknowledgeEntries` (`I2`, `I6`, `I14`).
         pub fn acknowledge_entries_up_to(
             &self,
             conversation_id: &str,
             up_to_seq: i64,
         ) -> Result<(), MLSError> {
+            if up_to_seq < 1 {
+                return Err(MLSError::invalid_input(
+                    "acknowledge_entries_up_to requires up_to_seq >= 1",
+                ));
+            }
             let endpoint = format!(
                 "{}/xrpc/blue.catbird.chat.acknowledgeEntries",
                 self.config.home_ds_endpoint.trim_end_matches('/')
             );
-            let conv_id = conversation_id.to_string();
-            let conv_for_ack = conversation_id.to_string();
+            let device_uuid =
+                uuid::Uuid::parse_str(self.config.device_id.trim()).map_err(|_| {
+                    MLSError::invalid_input(
+                        "CatbirdMlsClientConfig.device_id must be a canonical UUIDv4",
+                    )
+                })?;
+            if device_uuid.get_version_num() != 4 {
+                return Err(MLSError::invalid_input(
+                    "CatbirdMlsClientConfig.device_id must be UUID version 4",
+                ));
+            }
+            let conv_uuid = uuid::Uuid::parse_str(conversation_id.trim()).map_err(|_| {
+                MLSError::invalid_input("conversation_id must be a canonical UUIDv4")
+            })?;
+            if conv_uuid.get_version_num() != 4 {
+                return Err(MLSError::invalid_input(
+                    "conversation_id must be UUID version 4",
+                ));
+            }
+            let canonical_device_id = device_uuid.hyphenated().to_string();
+            let canonical_conv_id = conv_uuid.hyphenated().to_string();
+            let (pub_key, sign_fn) = self.load_device_ed25519_signer()?;
+            let key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(pub_key));
+
+            let conv_id_db = canonical_conv_id.clone();
+            let ack_meta = Arc::new(Mutex::new((0_i64, 1_i64)));
+            let ack_meta_tx = Arc::clone(&ack_meta);
             let transport = Arc::clone(&self.transport);
+
             crate::async_runtime::block_on(persist_entries_then_acknowledge(
                 &self.db,
                 move |tx| {
                     tx.conn()
                         .execute(
                             "UPDATE conversations SET acked_seq = MAX(acked_seq, ?1) WHERE conversation_id = ?2;",
-                            rusqlite::params![up_to_seq, conv_id],
+                            rusqlite::params![up_to_seq, conv_id_db],
                         )
                         .map_err(|e| MLSError::Internal(format!("update acked_seq: {e}")))?;
+                    let generation: i64 = match tx.conn().query_row(
+                        "SELECT generation FROM conversations WHERE conversation_id = ?1;",
+                        rusqlite::params![conv_id_db],
+                        |row| row.get(0),
+                    ) {
+                        Ok(gen_val) => gen_val,
+                        Err(rusqlite::Error::QueryReturnedNoRows) => 0,
+                        Err(e) => {
+                            return Err(MLSError::Internal(format!(
+                                "query conversation generation: {e}"
+                            )))
+                        }
+                    };
+                    let auth_gen = tx
+                        .get_account_meta("auth_generation")?
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(1)
+                        .max(1);
+                    if let Ok(mut guard) = ack_meta_tx.lock() {
+                        *guard = (generation.max(0), auth_gen);
+                    }
                     Ok(vec![up_to_seq])
                 },
                 move |seqs| async move {
+                    let effective_seq = seqs.into_iter().max().unwrap_or(up_to_seq);
+                    let (generation, auth_generation) = ack_meta
+                        .lock()
+                        .map(|g| *g)
+                        .unwrap_or((1, 1));
+                    let signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+                    let transcript_payload = AckTranscriptPayload {
+                        key_id: &key_id,
+                        up_to_seq: effective_seq,
+                        signed_at: &signed_at,
+                        generation,
+                        actor_device_id: canonical_device_id.clone(),
+                        auth_generation,
+                        conversation_id: canonical_conv_id.clone(),
+                    };
+                    let cbor = serde_ipld_dagcbor::to_vec(&transcript_payload).map_err(|e| {
+                        MLSError::Internal(format!("encode ack transcript DAG-CBOR: {e}"))
+                    })?;
+                    let mut transcript =
+                        Vec::with_capacity(ACK_ENTRIES_SIGNATURE_DOMAIN.len() + cbor.len());
+                    transcript.extend_from_slice(ACK_ENTRIES_SIGNATURE_DOMAIN);
+                    transcript.extend_from_slice(&cbor);
+                    let sig_64 = sign_fn(&transcript)?;
+
                     let body = serde_json::to_vec(&serde_json::json!({
-                        "conversationId": conv_for_ack,
-                        "upToSeq": seqs.into_iter().max().unwrap_or(up_to_seq),
+                        "conversationId": canonical_conv_id,
+                        "generation": generation,
+                        "actorDeviceId": canonical_device_id,
+                        "keyId": key_id,
+                        "authGeneration": auth_generation,
+                        "upToSeq": effective_seq,
+                        "signedAt": signed_at,
+                        "signature": { "$bytes": BASE64_STANDARD.encode(sig_64) },
                     }))
                     .map_err(|e| MLSError::Internal(e.to_string()))?;
                     let resp = transport.execute_http(PlatformHttpRequest {

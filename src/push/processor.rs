@@ -739,6 +739,12 @@ pub fn process_push_notification(
             if entry.seq <= current_convo.last_seq && entry.entry_id != wake.message_id {
                 continue;
             }
+            if entry.mls_bytes.is_empty() {
+                // I14 pruned entry: ciphertext was deleted on `mls-ds` once all active devices
+                // acknowledged it. Advance `last_seq` monotonically and continue catching up.
+                current_convo.last_seq = current_convo.last_seq.max(entry.seq);
+                continue;
+            }
 
             let mls_in = MlsMessageIn::tls_deserialize_exact(&entry.mls_bytes).map_err(|e| {
                 MLSError::InvalidInput {

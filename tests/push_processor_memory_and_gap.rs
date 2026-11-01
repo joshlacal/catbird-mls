@@ -1069,3 +1069,326 @@ fn catbird_mls_client_enforces_i8_i9_i15_d3_d4_and_pq_otc() {
         .expect("resume_from_background");
     assert!(!client.is_handle_closed());
 }
+
+#[test]
+fn push_catchup_skips_i14_pruned_entry_and_decrypts_live_message() {
+    let fixture = setup_alice_and_bob_group(true);
+
+    let live_msg_bytes = fixture
+        .bob_db
+        .write_tx(|tx| {
+            let storage = OpenMlsKvStorage::new(RusqliteKvBackend(tx.conn()));
+            let provider = OpenMlsKvProvider::new(storage)?;
+            let mut group =
+                MlsGroup::load(provider.storage(), &GroupId::from_slice(&fixture.group_id))
+                    .map_err(|e| MLSError::Internal(format!("load bob group: {e:?}")))?
+                    .expect("bob group");
+            let payload_json =
+                serde_json::json!({ "text": "Message after pruned seq 2!" }).to_string();
+            let (inner_plaintext, aad) = PrivateMessagePlaintextEnvelope::seal_with_aad(
+                [0x88u8; 32],
+                payload_json.into_bytes(),
+            )
+            .expect("seal_with_aad");
+            group.set_aad(aad);
+            let msg_out = group
+                .create_message(&provider, &fixture.bob_signer, &inner_plaintext)
+                .map_err(|e| MLSError::Internal(format!("create_message: {e:?}")))?;
+            msg_out
+                .tls_serialize_detached()
+                .map_err(|e| MLSError::Internal(format!("ser msg: {e:?}")))
+        })
+        .expect("bob live msg");
+
+    struct PrunedWindowTransport {
+        bundle: PushFetchBundle,
+    }
+    impl PushFetchTransport for PrunedWindowTransport {
+        fn fetch_missing_entries(
+            &self,
+            _conversation_id: String,
+            after_seq: i64,
+            _chat_dpop_token: String,
+        ) -> Result<PushFetchBundle, MLSError> {
+            assert_eq!(after_seq, 1);
+            Ok(self.bundle.clone())
+        }
+        fn get_authorized_device_keys(
+            &self,
+            _did: String,
+            _chat_dpop_token: Option<String>,
+        ) -> Result<Vec<AuthorizedPeerDeviceKey>, MLSError> {
+            Ok(Vec::new())
+        }
+    }
+
+    let mut dpop_map = HashMap::new();
+    dpop_map.insert(
+        fixture.alice_hash.clone(),
+        Some("cached-chat-dpop-jwt".to_string()),
+    );
+    let mut db_keys = HashMap::new();
+    db_keys.insert(fixture.alice_hash.clone(), fixture.alice_db_key);
+    let keystore = Arc::new(MemoryPushKeystore {
+        db_keys: Mutex::new(db_keys),
+        sig_keys: Mutex::new(HashMap::new()),
+        dpop_tokens: Mutex::new(dpop_map),
+    });
+
+    let transport = Arc::new(PrunedWindowTransport {
+        bundle: PushFetchBundle {
+            entries: vec![
+                FetchedPushEntry {
+                    entry_id: "entry-pruned-seq-2".to_string(),
+                    seq: 2,
+                    epoch: 1,
+                    entry_kind: "application_message".to_string(),
+                    sender_did: fixture.bob_did.clone(),
+                    mls_bytes: Vec::new(), // I14 pruned ciphertext!
+                },
+                FetchedPushEntry {
+                    entry_id: "entry-live-seq-3".to_string(),
+                    seq: 3,
+                    epoch: 1,
+                    entry_kind: "application_message".to_string(),
+                    sender_did: fixture.bob_did.clone(),
+                    mls_bytes: live_msg_bytes,
+                },
+            ],
+            metadata_snapshot: None,
+            authorized_device_keys: Vec::new(),
+        },
+    });
+
+    let wake = PushWakePayload {
+        message_id: "entry-live-seq-3".to_string(),
+        conversation_id: fixture.conversation_id.clone(),
+        generation: 1,
+        entry_seq: 3,
+        kind: "application_message".to_string(),
+        fetch_required: true,
+        inline_ciphertext: None,
+        sender_did: Some(fixture.bob_did.clone()),
+        recipient_account_hash: fixture.alice_hash.clone(),
+    };
+
+    let preview = process_push_notification(
+        fixture.temp_dir.path(),
+        &fixture.alice_hash,
+        keystore,
+        Some(transport),
+        &wake,
+    )
+    .expect("catch-up across I14 pruned entry must succeed");
+
+    assert!(!preview.fallback_generic);
+    assert_eq!(preview.body, "Message after pruned seq 2!");
+    assert_eq!(preview.seq, 3);
+}
+
+#[test]
+fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() {
+    use base64::{
+        engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+        Engine as _,
+    };
+    use catbird_mls::client::{
+        CatbirdMlsClient, CatbirdMlsClientConfig, PlatformHttpRequest, PlatformHttpResponse,
+        PlatformKeyStore, PlatformTransport, REQUIRED_LABYRINTH_OAUTH_SCOPES,
+    };
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+    use sha2::{Digest as _, Sha256};
+
+    struct CapturingKeystore {
+        keys: Mutex<HashMap<String, Vec<u8>>>,
+    }
+    impl PlatformKeyStore for CapturingKeystore {
+        fn load_or_create_db_key(&self, account_did_hash: String) -> Result<Vec<u8>, MLSError> {
+            let mut g = self.keys.lock().unwrap();
+            Ok(g.entry(format!("db:{account_did_hash}"))
+                .or_insert_with(|| vec![0x61u8; 32])
+                .clone())
+        }
+        fn load_signature_keypair(&self, key_id: String) -> Result<Option<Vec<u8>>, MLSError> {
+            Ok(self.keys.lock().unwrap().get(&key_id).cloned())
+        }
+        fn store_signature_keypair(
+            &self,
+            key_id: String,
+            keypair_bytes: Vec<u8>,
+        ) -> Result<(), MLSError> {
+            self.keys.lock().unwrap().insert(key_id, keypair_bytes);
+            Ok(())
+        }
+        fn delete_account_keys(&self, account_did_hash: String) -> Result<(), MLSError> {
+            self.keys
+                .lock()
+                .unwrap()
+                .retain(|k, _| !k.contains(&account_did_hash));
+            Ok(())
+        }
+        fn load_cached_chat_dpop_token(
+            &self,
+            _account_did_hash: String,
+        ) -> Result<Option<String>, MLSError> {
+            Ok(None)
+        }
+        fn store_cached_chat_dpop_token(
+            &self,
+            _account_did_hash: String,
+            _token: String,
+            _expires_at_ms: i64,
+        ) -> Result<(), MLSError> {
+            Ok(())
+        }
+    }
+
+    struct CapturingTransport {
+        ack_bodies: Mutex<Vec<serde_json::Value>>,
+    }
+    impl PlatformTransport for CapturingTransport {
+        fn execute_http(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformHttpResponse, MLSError> {
+            if request.url.ends_with("/xrpc/com.atproto.space.getSpace") {
+                return Ok(PlatformHttpResponse {
+                    status: 400,
+                    headers: Vec::new(),
+                    body: br#"{"error":"InvalidRequest"}"#.to_vec(),
+                });
+            }
+            if request
+                .url
+                .ends_with("/xrpc/blue.catbird.chat.acknowledgeEntries")
+            {
+                let v: serde_json::Value =
+                    serde_json::from_slice(request.body.as_deref().expect("ack body"))
+                        .expect("ack json");
+                self.ack_bodies.lock().unwrap().push(v);
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: br#"{"acknowledgedSeq":7,"prunedCount":2}"#.to_vec(),
+                });
+            }
+            Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            })
+        }
+        fn connect_realtime_stream(
+            &self,
+            _home_ds_endpoint: String,
+            _cursor_seq: Option<i64>,
+        ) -> Result<(), MLSError> {
+            Ok(())
+        }
+        fn disconnect_realtime_stream(&self) -> Result<(), MLSError> {
+            Ok(())
+        }
+    }
+
+    let tmp = TempDir::new().expect("tmp");
+    let device_id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let conv_id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let keystore = Arc::new(CapturingKeystore {
+        keys: Mutex::new(HashMap::new()),
+    });
+    let transport = Arc::new(CapturingTransport {
+        ack_bodies: Mutex::new(Vec::new()),
+    });
+
+    let client = CatbirdMlsClient::open(
+        CatbirdMlsClientConfig {
+            storage_root: tmp.path().display().to_string(),
+            account_did: "did:plc:signedtranscriptuser0001".to_string(),
+            device_id: device_id.clone(),
+            home_ds_did: "did:web:chat.catbird.blue".to_string(),
+            home_ds_endpoint: "https://chat.catbird.blue".to_string(),
+            pds_endpoint: "https://swan.place".to_string(),
+        },
+        keystore,
+        transport.clone(),
+        None,
+    )
+    .expect("open client");
+
+    let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let receipt = client.enroll_device(&scopes).expect("enroll device");
+    let vk = VerifyingKey::from_bytes(receipt.signature_public_key.as_slice().try_into().unwrap())
+        .unwrap();
+    let expected_key_id = URL_SAFE_NO_PAD.encode(Sha256::digest(&receipt.signature_public_key));
+    assert_eq!(expected_key_id.len(), 43);
+
+    // 1. Verify `build_signed_push_gateway_registration`
+    let gw_reg = client
+        .build_signed_push_gateway_registration(
+            "https://api.catbird.blue/xrpc/blue.catbird.push.deliver",
+            "blue.catbird.ios",
+            "push_key_opaque_valid_length_0123456789abcdef",
+            true,
+        )
+        .expect("build_signed_push_gateway_registration");
+    assert_eq!(gw_reg.key_id, expected_key_id);
+    assert_eq!(gw_reg.device_id, device_id);
+    let gw_json: serde_json::Value = serde_json::from_str(&gw_reg.request_json).unwrap();
+    let gw_sig_bytes = STANDARD
+        .decode(gw_json["signature"]["$bytes"].as_str().unwrap())
+        .unwrap();
+    let gw_sig = Signature::from_slice(&gw_sig_bytes).unwrap();
+    let gw_cbor = serde_ipld_dagcbor::to_vec(&serde_json::json!({
+        "appId": "blue.catbird.ios",
+        "authGeneration": 1,
+        "deviceId": device_id,
+        "enabled": true,
+        "gatewayUrl": "https://api.catbird.blue/xrpc/blue.catbird.push.deliver",
+        "keyId": expected_key_id,
+        "pushKey": "push_key_opaque_valid_length_0123456789abcdef",
+        "signedAt": gw_reg.signed_at,
+    }))
+    .unwrap();
+    let mut gw_transcript = b"CATBIRD-CHAT-PUSH-GATEWAY\0".to_vec();
+    gw_transcript.extend_from_slice(&gw_cbor);
+    vk.verify(&gw_transcript, &gw_sig)
+        .expect("push gateway Ed25519 signature must verify");
+
+    // 2. Verify `acknowledge_entries_up_to`
+    client
+        .create_group(&conv_id, "did:web:chat.catbird.blue", None, None)
+        .expect("create_group");
+    client
+        .acknowledge_entries_up_to(&conv_id, 7)
+        .expect("acknowledge_entries_up_to");
+
+    let acks = transport.ack_bodies.lock().unwrap();
+    assert_eq!(acks.len(), 1);
+    let ack = &acks[0];
+    assert_eq!(ack["conversationId"], conv_id);
+    assert_eq!(ack["actorDeviceId"], device_id);
+    assert_eq!(ack["keyId"], expected_key_id);
+    assert_eq!(ack["authGeneration"], 1);
+    assert_eq!(ack["upToSeq"], 7);
+    let ack_sig_bytes = STANDARD
+        .decode(ack["signature"]["$bytes"].as_str().unwrap())
+        .unwrap();
+    let ack_sig = Signature::from_slice(&ack_sig_bytes).unwrap();
+    let ack_cbor = serde_ipld_dagcbor::to_vec(&serde_json::json!({
+        "keyId": expected_key_id,
+        "upToSeq": 7,
+        "signedAt": ack["signedAt"].as_str().unwrap(),
+        "generation": ack["generation"].as_i64().unwrap(),
+        "actorDeviceId": device_id,
+        "authGeneration": 1,
+        "conversationId": conv_id,
+    }))
+    .unwrap();
+    let mut ack_transcript = b"CATBIRD-CHAT-ACK-ENTRIES\0".to_vec();
+    ack_transcript.extend_from_slice(&ack_cbor);
+    vk.verify(&ack_transcript, &ack_sig)
+        .expect("acknowledgeEntries Ed25519 signature must verify");
+}
