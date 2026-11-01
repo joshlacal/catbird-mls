@@ -145,24 +145,53 @@ async fn flush_conversation(
 
     let ds_members = match conversation_roster(deps, conversation).await {
         Ok(m) => m,
+        Err(labyrinth::Error::Forbidden) => {
+            tracing::info!(
+                conversation,
+                count = todo.len(),
+                "labyrinth: kicked/forbidden on conversation state; rescuing queued messages into personal mailbox Space"
+            );
+            return rescue_as_owner(session, store, report, &did, conversation, &todo).await;
+        }
         Err(labyrinth::Error::NotFound("conversation")) => {
-            if local_snapshot.is_some() {
+            let local_has_self = local_snapshot
+                .as_ref()
+                .is_some_and(|snap| snap.member_dids.iter().any(|m| m == &did));
+            if local_has_self {
                 return Ok(Err(labyrinth::Error::Backend(
                     "xrpc 503: conversation missing on mls-ds while local MLS group exists".into(),
                 )));
             }
-            drop_rows(
-                store,
-                &did,
-                &todo,
-                "conversation no longer exists on mls-ds",
-            )?;
-            report.dropped += todo.len();
-            return Ok(Ok(()));
+            match rescue_as_owner(session, store, report, &did, conversation, &todo).await? {
+                Ok(()) => return Ok(Ok(())),
+                Err(e) => {
+                    tracing::warn!(
+                        conversation,
+                        %e,
+                        "labyrinth: owner fallback failed for missing conversation; dropping queued rows"
+                    );
+                    drop_rows(
+                        store,
+                        &did,
+                        &todo,
+                        "conversation no longer exists on mls-ds",
+                    )?;
+                    report.dropped += todo.len();
+                    return Ok(Ok(()));
+                }
+            }
         }
         Err(e) => return Ok(Err(e)),
     };
     let ds_set: BTreeSet<&str> = ds_members.iter().map(String::as_str).collect();
+    if !ds_set.contains(did.as_str()) {
+        tracing::info!(
+            conversation,
+            count = todo.len(),
+            "labyrinth: local DID removed from conversation roster; rescuing queued messages into personal mailbox Space"
+        );
+        return rescue_as_owner(session, store, report, &did, conversation, &todo).await;
+    }
 
     type ChunkKey = (Option<String>, Option<u64>, Vec<String>);
     let mut chunks: Vec<(ChunkKey, Vec<PendingArchive>)> = Vec::new();
@@ -212,6 +241,37 @@ async fn flush_conversation(
             .await?
         {
             Ok(x) => x,
+            Err(labyrinth::Error::Forbidden) => {
+                tracing::info!(
+                    conversation,
+                    count = chunk_rows.len(),
+                    "labyrinth: Space write forbidden (kicked mid-flush); rescuing chunk into personal mailbox Space"
+                );
+                let owner_items = chunk_rows
+                    .iter()
+                    .map(|r| {
+                        Ok((
+                            r.message_id.clone(),
+                            r.timestamp_ms,
+                            did.clone(),
+                            r.frame_bytes()?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                match session
+                    .archive_owner_fallback(conversation, &owner_items)
+                    .await?
+                {
+                    Ok(_) => {
+                        for row in &chunk_rows {
+                            store.remove(&did, &row.message_id)?;
+                            report.archived += 1;
+                        }
+                        continue;
+                    }
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
             Err(e) => return Ok(Err(e)),
         };
         for row in &chunk_rows {
@@ -247,6 +307,40 @@ async fn flush_conversation(
         }
     }
     Ok(Ok(()))
+}
+
+async fn rescue_as_owner(
+    session: &mut LabyrinthSession,
+    store: &dyn ArchiveQueueStore,
+    report: &mut FlushReport,
+    did: &str,
+    conversation: &str,
+    rows_to_rescue: &[PendingArchive],
+) -> Result<labyrinth::Result<()>> {
+    let owner_items = rows_to_rescue
+        .iter()
+        .map(|r| {
+            Ok((
+                r.message_id.clone(),
+                r.timestamp_ms,
+                did.to_owned(),
+                r.frame_bytes()?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    match session
+        .archive_owner_fallback(conversation, &owner_items)
+        .await?
+    {
+        Ok(_) => {
+            for row in rows_to_rescue {
+                store.remove(did, &row.message_id)?;
+                report.archived += 1;
+            }
+            Ok(Ok(()))
+        }
+        Err(e) => Ok(Err(e)),
+    }
 }
 
 fn fail_rows(

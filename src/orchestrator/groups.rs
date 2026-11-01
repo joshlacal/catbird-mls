@@ -6927,6 +6927,11 @@ where
             }
         }
 
+        #[cfg(feature = "labyrinth")]
+        {
+            self.labyrinth_rearchive_on_kick(convo_id).await;
+        }
+
         let mut all_ok = true;
         if let Err(error) = self
             .storage()

@@ -71,6 +71,26 @@ pub struct OtcPairingCompletion {
     pub new_epoch_seq: u64,
 }
 
+/// Durable outbox envelope persisted in `labyrinth_queue.payload_bytes` atomically inside
+/// `CatbirdMlsClient::send_message`'s `write_tx` (`Spec §5 I6`, `[CB-30]`, `[CB-22]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedLabyrinthArchivePayload {
+    pub version: u8,
+    pub message_id: String,
+    pub conversation_id: String,
+    pub group_id_hex: String,
+    pub epoch: i64,
+    pub seq: i64,
+    pub sender_did: String,
+    pub sender_device_id: String,
+    pub sequencer_did: String,
+    pub space_uri: Option<String>,
+    pub plaintext_json: String,
+    pub labyrinth_frame_json: String,
+    pub mls_ciphertext_b64: String,
+    pub created_at_ms: i64,
+}
+
 /// Canonical personal mailbox Space URI for an account (`Spec §6.4`, `D4`).
 pub fn personal_mailbox_space_uri(account_did: &str) -> String {
     format!("at://{account_did}/space/blue.catbird.labyrinth.mailbox/self")
@@ -169,6 +189,8 @@ mod native_client {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine as _;
     use openmls::prelude::tls_codec::Serialize as TlsSerialize;
     use openmls::prelude::*;
     use openmls_basic_credential::SignatureKeyPair;
@@ -192,7 +214,7 @@ mod native_client {
     use crate::storage::{
         BackgroundCheckpointReport, ConversationRow, GroupMetadataRow, LabyrinthQueueRow,
         MessageRow, MlsAccountDb, MutationJournalRow, OpenMlsKvProvider, OpenMlsKvStorage,
-        OpenMode, RequestRow, RusqliteKvBackend,
+        OpenMode, RequestRow, RusqliteKvBackend, SqlTx,
     };
     use crate::sync::reconcile::persist_entries_then_acknowledge;
 
@@ -202,10 +224,72 @@ mod native_client {
         CatbirdMlsClientConfig, EnrollmentReceipt, LabyrinthBackupStatus, OtcPairingCompletion,
         OtcPairingOffer, PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader,
         PlatformHttpRequest, PlatformKeyStore, PlatformTransport, PreCutoverWipeReport,
-        SpacesEligibilityStatus,
+        QueuedLabyrinthArchivePayload, SpacesEligibilityStatus,
     };
 
     const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
+
+    fn owner_epoch_root_key(epoch_seq: u64) -> String {
+        format!("owner_epoch_root:{epoch_seq}")
+    }
+
+    fn ensure_owner_epoch_root(
+        tx: &SqlTx<'_>,
+        epoch_seq: u64,
+        now_ms: i64,
+    ) -> Result<Zeroizing<[u8; 32]>, MLSError> {
+        let key = owner_epoch_root_key(epoch_seq);
+        if let Some(existing) = tx.get_labyrinth_state(&key)? {
+            if let Ok(arr) = <[u8; 32]>::try_from(existing.as_slice()) {
+                return Ok(Zeroizing::new(arr));
+            }
+        }
+        let mut fresh = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(&mut *fresh);
+        tx.put_labyrinth_state(&key, fresh.as_slice(), now_ms)?;
+        Ok(fresh)
+    }
+
+    fn canonical_labyrinth_frame_json(plaintext_json: &str) -> String {
+        if serde_json::from_str::<crate::orchestrator::MLSMessagePayload>(plaintext_json).is_ok() {
+            return plaintext_json.to_string();
+        }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(plaintext_json) {
+            if let Some(text) = val.get("text").and_then(|v| v.as_str()) {
+                if let Ok(encoded) =
+                    serde_json::to_string(&crate::orchestrator::MLSMessagePayload::text(text))
+                {
+                    return encoded;
+                }
+            }
+        }
+        plaintext_json.to_string()
+    }
+
+    fn sanitize_rkey(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len().min(48));
+        for ch in raw.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                out.push(ch);
+            } else {
+                out.push('_');
+            }
+            if out.len() >= 48 {
+                break;
+            }
+        }
+        if out.is_empty() {
+            "item".to_string()
+        } else {
+            out
+        }
+    }
+
+    fn rfc3339_from_ms(ms: i64) -> String {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
 
     struct ClientKeychainBridge {
         keystore: Arc<dyn PlatformKeyStore>,
@@ -307,7 +391,11 @@ mod native_client {
                 tx.put_account_meta("owner_did", &normalized_did, now_ms)?;
                 tx.put_account_meta("device_id", &config.device_id, now_ms)?;
                 tx.put_account_meta("home_ds_did", &config.home_ds_did, now_ms)?;
-                if tx.get_labyrinth_state("status_json")?.is_none() {
+                let epoch_seq = if let Some(raw) = tx.get_labyrinth_state("status_json")? {
+                    serde_json::from_slice::<LabyrinthBackupStatus>(&raw)
+                        .map(|s| s.epoch_seq.max(1))
+                        .unwrap_or(1)
+                } else {
                     let initial = LabyrinthBackupStatus {
                         backup_enabled: true,
                         mailbox_space_uri: mailbox_uri.clone(),
@@ -320,7 +408,9 @@ mod native_client {
                         MLSError::Internal(format!("serialize initial LabyrinthBackupStatus: {e}"))
                     })?;
                     tx.put_labyrinth_state("status_json", &bytes, now_ms)?;
-                }
+                    1
+                };
+                let _ = ensure_owner_epoch_root(tx, epoch_seq, now_ms)?;
                 Ok(())
             })?;
 
@@ -770,12 +860,33 @@ mod native_client {
                 };
                 tx.insert_message(&row)?;
 
+                let group_id_hex = hex::encode(&convo.group_id);
+                let queued_payload = QueuedLabyrinthArchivePayload {
+                    version: 1,
+                    message_id: message_id.to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    group_id_hex: group_id_hex.clone(),
+                    epoch: convo.epoch,
+                    seq: next_seq,
+                    sender_did: self.normalized_did.clone(),
+                    sender_device_id: self.config.device_id.clone(),
+                    sequencer_did: convo.sequencer_did.clone(),
+                    space_uri: convo.space_uri.clone(),
+                    plaintext_json: canonical_json.clone(),
+                    labyrinth_frame_json: canonical_labyrinth_frame_json(&canonical_json),
+                    mls_ciphertext_b64: BASE64_STANDARD.encode(&ciphertext_bytes),
+                    created_at_ms: now_ms,
+                };
+                let queued_bytes = serde_json::to_vec(&queued_payload).map_err(|e| {
+                    MLSError::Internal(format!("serialize QueuedLabyrinthArchivePayload: {e}"))
+                })?;
+
                 tx.enqueue_labyrinth_item(&LabyrinthQueueRow {
                     item_id: message_id.to_string(),
                     conversation_id: conversation_id.to_string(),
-                    group_id_hex: hex::encode(&convo.group_id),
+                    group_id_hex,
                     seq: next_seq,
-                    payload_bytes: ciphertext_bytes,
+                    payload_bytes: queued_bytes,
                     created_at_ms: now_ms,
                 })?;
 
@@ -1046,6 +1157,7 @@ mod native_client {
                 if !st.active_device_ids.contains(&self.config.device_id) {
                     st.active_device_ids.push(self.config.device_id.clone());
                 }
+                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
 
                 tx.upsert_mutation_journal(&MutationJournalRow {
                     journal_id: format!("restore-epoch-{}", st.epoch_seq),
@@ -1173,6 +1285,7 @@ mod native_client {
                 if !st.active_device_ids.contains(&self.config.device_id) {
                     st.active_device_ids.push(self.config.device_id.clone());
                 }
+                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
                 tx.upsert_mutation_journal(&MutationJournalRow {
                     journal_id: format!("otc-epoch-{}", st.epoch_seq),
                     op_type: "epoch_rotation".to_string(),
@@ -1220,6 +1333,7 @@ mod native_client {
                     serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
                 st.active_device_ids.retain(|d| d != target_device_id);
                 st.epoch_seq = st.epoch_seq.saturating_add(1);
+                let _ = ensure_owner_epoch_root(tx, st.epoch_seq, now_ms)?;
                 tx.upsert_mutation_journal(&MutationJournalRow {
                     journal_id: format!("revoke-{target_device_id}-{}", st.epoch_seq),
                     op_type: "device_revocation".to_string(),
@@ -1266,6 +1380,404 @@ mod native_client {
                 conversation_id: conversation_id.to_string(),
             });
             Ok(count)
+        }
+
+        /// Inspect durable outbox rows persisted in `labyrinth_queue` (`[CB-30]`, `I6`).
+        pub fn list_pending_labyrinth_queue(
+            &self,
+            conversation_id: Option<&str>,
+            limit: u32,
+        ) -> Result<Vec<QueuedLabyrinthArchivePayload>, MLSError> {
+            let rows = self
+                .db
+                .read_tx(|tx| tx.list_labyrinth_queue(conversation_id, limit as usize))?;
+            rows.into_iter()
+                .map(|r| self.decode_queue_row(&r))
+                .collect()
+        }
+
+        fn decode_queue_row(
+            &self,
+            row: &LabyrinthQueueRow,
+        ) -> Result<QueuedLabyrinthArchivePayload, MLSError> {
+            if let Ok(parsed) =
+                serde_json::from_slice::<QueuedLabyrinthArchivePayload>(&row.payload_bytes)
+            {
+                return Ok(parsed);
+            }
+            let fallback_json = serde_json::json!({ "text": "" }).to_string();
+            Ok(QueuedLabyrinthArchivePayload {
+                version: 0,
+                message_id: row.item_id.clone(),
+                conversation_id: row.conversation_id.clone(),
+                group_id_hex: row.group_id_hex.clone(),
+                epoch: 0,
+                seq: row.seq,
+                sender_did: self.normalized_did.clone(),
+                sender_device_id: self.config.device_id.clone(),
+                sequencer_did: self.config.home_ds_did.clone(),
+                space_uri: None,
+                plaintext_json: fallback_json.clone(),
+                labyrinth_frame_json: canonical_labyrinth_frame_json(&fallback_json),
+                mls_ciphertext_b64: BASE64_STANDARD.encode(&row.payload_bytes),
+                created_at_ms: row.created_at_ms,
+            })
+        }
+
+        fn load_status_and_owner_root(
+            &self,
+        ) -> Result<(LabyrinthBackupStatus, Zeroizing<[u8; 32]>), MLSError> {
+            let maybe = self.db.read_tx(|tx| {
+                let raw = tx.get_labyrinth_state("status_json")?.ok_or_else(|| {
+                    MLSError::InvalidState("Labyrinth status not initialized".to_string())
+                })?;
+                let st: LabyrinthBackupStatus =
+                    serde_json::from_slice(&raw).map_err(|e| MLSError::Internal(e.to_string()))?;
+                let root_opt = tx.get_labyrinth_state(&owner_epoch_root_key(st.epoch_seq))?;
+                Ok((st, root_opt))
+            })?;
+            if let Some(bytes) = maybe.1 {
+                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                    return Ok((maybe.0, Zeroizing::new(arr)));
+                }
+            }
+            let now_ms = unix_now_ms();
+            let epoch_seq = maybe.0.epoch_seq;
+            let root = self
+                .db
+                .write_tx(|tx| ensure_owner_epoch_root(tx, epoch_seq, now_ms))?;
+            Ok((maybe.0, root))
+        }
+
+        fn put_space_record(
+            &self,
+            space_uri: &str,
+            collection: &str,
+            rkey: &str,
+            record_value: serde_json::Value,
+        ) -> Result<u16, MLSError> {
+            let endpoint = format!(
+                "{}/xrpc/com.atproto.space.putRecords",
+                self.config.pds_endpoint.trim_end_matches('/')
+            );
+            let body = serde_json::to_vec(&serde_json::json!({
+                "space": space_uri,
+                "records": [{
+                    "collection": collection,
+                    "rkey": rkey,
+                    "value": record_value,
+                }],
+            }))
+            .map_err(|e| MLSError::Internal(format!("serialize Space putRecords: {e}")))?;
+            let resp = self.transport.execute_http(PlatformHttpRequest {
+                method: "POST".to_string(),
+                url: endpoint,
+                headers: vec![PlatformHttpHeader {
+                    name: "content-type".to_string(),
+                    value: "application/json".to_string(),
+                }],
+                body: Some(body),
+            })?;
+            Ok(resp.status)
+        }
+
+        /// Drain durable `labyrinth_queue` items strictly outside `write_tx` (`Spec §5 I6`).
+        ///
+        /// If the conversation Space rejects the write with `401`/`403`/`404` (e.g. involuntary
+        /// MLS kick or closed Space per `[CB-22]`), seals a canonical `v5` `OwnerBatch`
+        /// (`KIND_ATTRIBUTED_FRAME = 0x03`, preserving `sender_did`) into the account's personal
+        /// mailbox Space (`at://{did}/space/blue.catbird.labyrinth.mailbox/self`) and deletes
+        /// committed rows idempotently (`200..300` or `409 RecordAlreadyExists`).
+        #[cfg(feature = "labyrinth")]
+        pub fn flush_labyrinth_queue(&self) -> Result<u32, MLSError> {
+            let rows = self.db.read_tx(|tx| tx.list_labyrinth_queue(None, 100))?;
+            if rows.is_empty() {
+                return Ok(0);
+            }
+            let (status, owner_root) = self.load_status_and_owner_root()?;
+            if !status.backup_enabled {
+                return Ok(0);
+            }
+
+            let mut committed_ids: Vec<String> = Vec::with_capacity(rows.len());
+            let mut first_err: Option<MLSError> = None;
+
+            for row in &rows {
+                let payload = match self.decode_queue_row(row) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        first_err = Some(e);
+                        break;
+                    }
+                };
+                let convo_space = payload.space_uri.clone().unwrap_or_else(|| {
+                    format!(
+                        "at://{}/space/blue.catbird.labyrinth.conversation/{}-0",
+                        payload.sequencer_did, payload.conversation_id
+                    )
+                });
+                let rkey = format!("outbox-{}", sanitize_rkey(&row.item_id));
+                let primary_val = serde_json::json!({
+                    "$type": "blue.catbird.labyrinth.outboxEntry",
+                    "threadId": payload.conversation_id,
+                    "messageId": payload.message_id,
+                    "seq": payload.seq,
+                    "epoch": payload.epoch,
+                    "senderDid": payload.sender_did,
+                    "mlsCiphertextB64": payload.mls_ciphertext_b64,
+                    "createdAt": rfc3339_from_ms(payload.created_at_ms),
+                });
+
+                let primary_status = match self.put_space_record(
+                    &convo_space,
+                    "blue.catbird.labyrinth.batch",
+                    &rkey,
+                    primary_val,
+                ) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        first_err = Some(e);
+                        break;
+                    }
+                };
+
+                if (200..300).contains(&primary_status) || primary_status == 409 {
+                    committed_ids.push(row.item_id.clone());
+                    continue;
+                }
+
+                if matches!(primary_status, 401 | 403 | 404) {
+                    // Involuntary kick / Space access revoked ([CB-22]): seal into personal mailbox Space
+                    // using v5 KIND_ATTRIBUTED_FRAME so sender attribution survives restore.
+                    let owner_msg = labyrinth::message::seal_owner_attributed(
+                        &owner_root,
+                        status.epoch_seq,
+                        &payload.conversation_id,
+                        &payload.message_id,
+                        payload.created_at_ms.max(0) as u64,
+                        &payload.sender_did,
+                        payload.labyrinth_frame_json.as_bytes(),
+                    )
+                    .map_err(|e| {
+                        MLSError::Cryptography(format!("seal_owner_attributed fallback: {e}"))
+                    })?;
+                    let batch = labyrinth::records::OwnerBatch::from_messages(
+                        &[owner_msg],
+                        rfc3339_from_ms(payload.created_at_ms),
+                    )
+                    .map_err(|e| MLSError::Internal(format!("OwnerBatch::from_messages: {e}")))?;
+                    let batch_val = serde_json::to_value(&batch)
+                        .map_err(|e| MLSError::Internal(format!("serialize OwnerBatch: {e}")))?;
+                    let fb_rkey = format!("fallback-{}", sanitize_rkey(&row.item_id));
+                    match self.put_space_record(
+                        &status.mailbox_space_uri,
+                        "blue.catbird.labyrinth.ownerBatch",
+                        &fb_rkey,
+                        batch_val,
+                    ) {
+                        Ok(fb_code) if (200..300).contains(&fb_code) || fb_code == 409 => {
+                            committed_ids.push(row.item_id.clone());
+                        }
+                        Ok(fb_code) => {
+                            first_err = Some(MLSError::Internal(format!(
+                                "personal mailbox OwnerBatch fallback returned HTTP {fb_code}"
+                            )));
+                            break;
+                        }
+                        Err(e) => {
+                            first_err = Some(e);
+                            break;
+                        }
+                    }
+                } else {
+                    first_err = Some(MLSError::Internal(format!(
+                        "conversation Space putRecords returned HTTP {primary_status}"
+                    )));
+                    break;
+                }
+            }
+
+            if !committed_ids.is_empty() {
+                self.db.write_tx(|tx| {
+                    for id in &committed_ids {
+                        tx.dequeue_labyrinth_item(id)?;
+                    }
+                    Ok(())
+                })?;
+            }
+
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+            Ok(committed_ids.len() as u32)
+        }
+
+        /// Rescue locally cached SQLCipher conversation messages + pending outbox items into
+        /// the account's personal mailbox Space (`v5` `OwnerBatch` with `KIND_ATTRIBUTED_FRAME`)
+        /// when involuntarily kicked or before local conversation deletion (`[CB-22]`, `[CB-37]`, `I6`).
+        #[cfg(feature = "labyrinth")]
+        pub fn rescue_conversation_on_kick(&self, conversation_id: &str) -> Result<u32, MLSError> {
+            let (mut cached_msgs, queued_rows) = self.db.read_tx(|tx| {
+                let msgs = tx.list_messages(conversation_id, None, 1_000)?;
+                let queued = tx.list_labyrinth_queue(Some(conversation_id), 500)?;
+                Ok((msgs, queued))
+            })?;
+            cached_msgs.reverse();
+
+            let (status, owner_root) = self.load_status_and_owner_root()?;
+            if !status.backup_enabled {
+                return Ok(0);
+            }
+
+            let mut seen_ids = std::collections::HashSet::new();
+            let mut sealed_items = Vec::new();
+            for msg in &cached_msgs {
+                if !seen_ids.insert(msg.message_id.clone()) {
+                    continue;
+                }
+                let frame_json = canonical_labyrinth_frame_json(&msg.plaintext_json);
+                let owner_msg = labyrinth::message::seal_owner_attributed(
+                    &owner_root,
+                    status.epoch_seq,
+                    conversation_id,
+                    &msg.message_id,
+                    msg.created_at_ms.max(0) as u64,
+                    &msg.sender_did,
+                    frame_json.as_bytes(),
+                )
+                .map_err(|e| MLSError::Cryptography(format!("seal_owner_attributed: {e}")))?;
+                sealed_items.push(owner_msg);
+            }
+
+            for row in &queued_rows {
+                let payload = self.decode_queue_row(row)?;
+                if !seen_ids.insert(payload.message_id.clone()) {
+                    continue;
+                }
+                let owner_msg = labyrinth::message::seal_owner_attributed(
+                    &owner_root,
+                    status.epoch_seq,
+                    conversation_id,
+                    &payload.message_id,
+                    payload.created_at_ms.max(0) as u64,
+                    &payload.sender_did,
+                    payload.labyrinth_frame_json.as_bytes(),
+                )
+                .map_err(|e| MLSError::Cryptography(format!("seal_owner_attributed: {e}")))?;
+                sealed_items.push(owner_msg);
+            }
+
+            if sealed_items.is_empty() {
+                return Ok(0);
+            }
+
+            let now_ms = unix_now_ms();
+            for (chunk_idx, chunk) in sealed_items
+                .chunks(labyrinth::records::MAX_BATCH_ITEMS)
+                .enumerate()
+            {
+                let first_id = chunk
+                    .first()
+                    .map(|m| sanitize_rkey(&m.message_id))
+                    .unwrap_or_else(|| "0".to_string());
+                let rkey = format!(
+                    "rescue-{}-{chunk_idx}-{first_id}",
+                    sanitize_rkey(conversation_id)
+                );
+                let batch = labyrinth::records::OwnerBatch::from_messages(
+                    chunk,
+                    rfc3339_from_ms(now_ms),
+                )
+                .map_err(|e| MLSError::Internal(format!("OwnerBatch::from_messages: {e}")))?;
+                let batch_val = serde_json::to_value(&batch)
+                    .map_err(|e| MLSError::Internal(format!("serialize OwnerBatch: {e}")))?;
+                let code = self.put_space_record(
+                    &status.mailbox_space_uri,
+                    "blue.catbird.labyrinth.ownerBatch",
+                    &rkey,
+                    batch_val,
+                )?;
+                if !((200..300).contains(&code) || code == 409) {
+                    return Err(MLSError::Internal(format!(
+                        "rescue_conversation_on_kick putRecords returned HTTP {code}"
+                    )));
+                }
+            }
+
+            self.db.write_tx(|tx| {
+                for row in &queued_rows {
+                    tx.dequeue_labyrinth_item(&row.item_id)?;
+                }
+                tx.upsert_mutation_journal(&MutationJournalRow {
+                    journal_id: format!("kick-rescue-{conversation_id}-{}", status.epoch_seq),
+                    op_type: "kick_rescue".to_string(),
+                    epoch_seq: status.epoch_seq,
+                    state_json: serde_json::json!({
+                        "conversationId": conversation_id,
+                        "rescuedCount": sealed_items.len(),
+                    })
+                    .to_string(),
+                    status: "completed".to_string(),
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                })?;
+                Ok(())
+            })?;
+
+            Ok(sealed_items.len() as u32)
+        }
+
+        /// Decrypt a rescued `blue.catbird.labyrinth.ownerBatch` JSON record using the account's
+        /// stored `owner_epoch_root:{epoch_seq}`, returning `(message_id, sender_did, frame_bytes)`.
+        #[cfg(feature = "labyrinth")]
+        pub fn open_rescued_owner_batch(
+            &self,
+            batch_json: &[u8],
+        ) -> Result<Vec<(String, Option<String>, Vec<u8>)>, MLSError> {
+            let batch: labyrinth::records::OwnerBatch = serde_json::from_slice(batch_json)
+                .map_err(|e| MLSError::Internal(format!("parse OwnerBatch: {e}")))?;
+            let msgs = batch
+                .to_messages()
+                .map_err(|e| MLSError::Internal(format!("OwnerBatch::to_messages: {e}")))?;
+            let mut out = Vec::with_capacity(msgs.len());
+            for msg in msgs {
+                let root_bytes = self
+                    .db
+                    .read_tx(|tx| tx.get_labyrinth_state(&owner_epoch_root_key(msg.epoch_seq)))?
+                    .ok_or_else(|| {
+                        MLSError::InvalidState(format!(
+                            "missing owner_epoch_root for epoch {}",
+                            msg.epoch_seq
+                        ))
+                    })?;
+                let root: [u8; 32] = root_bytes.as_slice().try_into().map_err(|_| {
+                    MLSError::Internal("invalid owner_epoch_root length".to_string())
+                })?;
+                match labyrinth::message::open_owner_content(&root, &msg)
+                    .map_err(|e| MLSError::Cryptography(format!("open_owner_content: {e}")))?
+                {
+                    labyrinth::message::OwnerContent::Frame(frame) => {
+                        out.push((msg.message_id, None, frame));
+                    }
+                    labyrinth::message::OwnerContent::AttributedFrame { sender_did, frame } => {
+                        out.push((msg.message_id, Some(sender_did), frame));
+                    }
+                    labyrinth::message::OwnerContent::CommittedFrame { frame, .. } => {
+                        let sender = msg.sequencer_receipt.as_ref().and_then(|r| {
+                            r.signed
+                                .payload
+                                .sender_device_did_url
+                                .split('#')
+                                .next()
+                                .filter(|s| s.starts_with("did:"))
+                                .map(str::to_string)
+                        });
+                        out.push((msg.message_id, sender, frame));
+                    }
+                    labyrinth::message::OwnerContent::Tombstone { .. } => {}
+                }
+            }
+            Ok(out)
         }
     }
 }

@@ -72,6 +72,26 @@ pub trait LabyrinthGateway: MaybeSend + MaybeSync {
     async fn submit_labyrinth(&self, request: LabyrinthRequest) -> Result<GatewayResponse, String>;
     /// A clean-chat query through the existing prepared-request route.
     async fn submit_canonical(&self, request: PreparedRequest) -> Result<GatewayResponse, String>;
+    /// Per-conversation `[CB-38]` Ed25519 redaction verifying key for `sequencer_did`.
+    async fn resolve_sequencer_key_for(
+        &self,
+        _conversation_id: &str,
+        _sequencer_did: Option<&str>,
+    ) -> Option<(String, [u8; 32])> {
+        None
+    }
+    /// Per-conversation `I13` P-256 ES256 receipt verifying key for `sequencer_did`.
+    async fn resolve_sequencer_receipt_key_for(
+        &self,
+        _conversation_id: &str,
+        _sequencer_did: Option<&str>,
+    ) -> Option<(String, Vec<u8>)> {
+        None
+    }
+    /// Resolve a DID document JSON payload (`did:web` / `did:plc`) for federated sequencer key discovery.
+    async fn resolve_did_document(&self, _did: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(None)
+    }
 }
 
 /// [`LabyrinthGateway`] over [`MLSAPIClient`].
@@ -98,6 +118,33 @@ impl<A: MLSAPIClient + 'static> LabyrinthGateway for ApiGateway<A> {
     async fn submit_canonical(&self, request: PreparedRequest) -> Result<GatewayResponse, String> {
         self.api
             .submit_prepared_request(request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn resolve_sequencer_key_for(
+        &self,
+        conversation_id: &str,
+        sequencer_did: Option<&str>,
+    ) -> Option<(String, [u8; 32])> {
+        self.api
+            .labyrinth_sequencer_key_for(conversation_id, sequencer_did)
+            .await
+    }
+
+    async fn resolve_sequencer_receipt_key_for(
+        &self,
+        conversation_id: &str,
+        sequencer_did: Option<&str>,
+    ) -> Option<(String, Vec<u8>)> {
+        self.api
+            .labyrinth_sequencer_receipt_key_for(conversation_id, sequencer_did)
+            .await
+    }
+
+    async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {
+        self.api
+            .resolve_labyrinth_did_document(did)
             .await
             .map_err(|e| e.to_string())
     }
@@ -356,6 +403,30 @@ impl GatewayXrpcTransport {
                 .await,
         )
     }
+
+    pub async fn resolve_sequencer_key_for(
+        &self,
+        conversation_id: &str,
+        sequencer_did: Option<&str>,
+    ) -> Option<(String, [u8; 32])> {
+        self.gateway
+            .resolve_sequencer_key_for(conversation_id, sequencer_did)
+            .await
+    }
+
+    pub async fn resolve_sequencer_receipt_key_for(
+        &self,
+        conversation_id: &str,
+        sequencer_did: Option<&str>,
+    ) -> Option<(String, Vec<u8>)> {
+        self.gateway
+            .resolve_sequencer_receipt_key_for(conversation_id, sequencer_did)
+            .await
+    }
+
+    pub async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {
+        self.gateway.resolve_did_document(did).await
+    }
 }
 
 pub(crate) const SIGNING_FAILED: &str = "ChatKeySigningFailed";
@@ -482,11 +553,99 @@ fn deterministic_op_id(tag: &str, payload: &[u8]) -> [u8; 16] {
     out
 }
 
+#[derive(Clone, Default)]
+struct CachedSequencerKeys {
+    redaction_key: Option<SequencerKey>,
+    receipt_key: Option<SequencerReceiptKey>,
+}
+
+fn normalize_sequencer_did(raw: &str) -> String {
+    raw.split('#')
+        .next()
+        .unwrap_or(raw)
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+fn decode_wire_bytes_any(v: &serde_json::Value) -> Option<Vec<u8>> {
+    let encoded = v.as_str().or_else(|| v.get("$bytes")?.as_str())?;
+    STANDARD_NO_PAD
+        .decode(encoded)
+        .or_else(|_| STANDARD.decode(encoded))
+        .ok()
+}
+
+fn parse_did_doc_sequencer_keys(
+    expected_did: &str,
+    doc_bytes: &[u8],
+) -> labyrinth::Result<(Option<SequencerKey>, Option<SequencerReceiptKey>)> {
+    enforce_pds_record_cap(doc_bytes).map_err(labyrinth::Error::Backend)?;
+    let doc: serde_json::Value = serde_json::from_slice(doc_bytes)
+        .map_err(|_| labyrinth::Error::Malformed("sequencer DID document JSON"))?;
+    let base_did = normalize_sequencer_did(expected_did);
+    if let Some(doc_id) = doc.get("id").and_then(|v| v.as_str()) {
+        if normalize_sequencer_did(doc_id) != base_did {
+            return Err(labyrinth::Error::Malformed(
+                "sequencer DID document id mismatch",
+            ));
+        }
+    }
+    let mut redaction: Option<SequencerKey> = None;
+    let mut receipt: Option<SequencerReceiptKey> = None;
+    if let Some(methods) = doc.get("verificationMethod").and_then(|v| v.as_array()) {
+        let receipt_full_id = format!("{base_did}#mls-receipt-1");
+        let redaction_full_id = format!("{base_did}#labyrinth-redaction-1");
+        for m in methods {
+            let Some(id) = m.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some(ctrl) = m.get("controller").and_then(|v| v.as_str()) {
+                if normalize_sequencer_did(ctrl) != base_did {
+                    continue;
+                }
+            }
+            let Some(mb) = m.get("publicKeyMultibase").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Ok((_, raw)) = multibase::decode(mb) else {
+                continue;
+            };
+            if (id == receipt_full_id || id == "#mls-receipt-1")
+                && raw.starts_with(&[0x80, 0x24])
+                && p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw[2..]).is_ok()
+            {
+                receipt = Some(SequencerReceiptKey {
+                    did: base_did.clone(),
+                    public_key_sec1: raw[2..].to_vec(),
+                });
+            } else if (id == redaction_full_id
+                || id == "#labyrinth-redaction-1"
+                || id == format!("{base_did}#labyrinth-1")
+                || id == "#labyrinth-1")
+                && raw.starts_with(&[0xed, 0x01])
+                && raw[2..].len() == 32
+            {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&raw[2..]);
+                redaction = Some(SequencerKey {
+                    did: base_did.clone(),
+                    key,
+                });
+            }
+        }
+    }
+    Ok((redaction, receipt))
+}
+
 /// Verifying `mls-ds` directory & epoch-head publisher over the 6 clean-slate endpoints.
 pub struct DsDirectoryStore {
     transport: Arc<GatewayXrpcTransport>,
     sequencer_key: Option<SequencerKey>,
     sequencer_receipt_key: Option<SequencerReceiptKey>,
+    thread_keys: std::sync::Mutex<std::collections::HashMap<String, CachedSequencerKeys>>,
+    did_doc_keys: std::sync::Mutex<
+        std::collections::HashMap<String, (Option<SequencerKey>, Option<SequencerReceiptKey>)>,
+    >,
 }
 
 impl DsDirectoryStore {
@@ -499,7 +658,189 @@ impl DsDirectoryStore {
             transport,
             sequencer_key,
             sequencer_receipt_key,
+            thread_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
+            did_doc_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    async fn resolve_did_doc_keys(
+        &self,
+        sequencer_did: &str,
+    ) -> labyrinth::Result<(Option<SequencerKey>, Option<SequencerReceiptKey>)> {
+        if let Some(cached) = self
+            .did_doc_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(sequencer_did)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+        let doc_opt = self
+            .transport
+            .resolve_did_document(sequencer_did)
+            .await
+            .map_err(labyrinth::Error::Backend)?;
+        let Some(doc_bytes) = doc_opt else {
+            return Ok((None, None));
+        };
+        let parsed = parse_did_doc_sequencer_keys(sequencer_did, &doc_bytes)?;
+        self.did_doc_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sequencer_did.to_owned(), parsed.clone());
+        Ok(parsed)
+    }
+
+    async fn resolve_thread_sequencer_keys(
+        &self,
+        thread_id: &str,
+    ) -> labyrinth::Result<(Option<SequencerKey>, Option<SequencerReceiptKey>)> {
+        if let Some(cached) = self
+            .thread_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(thread_id)
+            .cloned()
+        {
+            return Ok((cached.redaction_key, cached.receipt_key));
+        }
+
+        let state_res = self
+            .transport
+            .query(
+                "blue.catbird.chat.getConversationState",
+                &[("conversationId", thread_id.to_owned())],
+            )
+            .await;
+
+        let mut sequencer_did: Option<String> = None;
+        let mut inline_redaction: Option<SequencerKey> = None;
+        let mut inline_receipt: Option<SequencerReceiptKey> = None;
+
+        if let Ok(body) = state_res {
+            let parsed: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|_| labyrinth::Error::Malformed("getConversationState JSON"))?;
+            if let Some(raw_ds) = parsed["state"]["sequencerDid"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                let norm_ds = normalize_sequencer_did(raw_ds);
+                if let Some(raw_ed) = parsed["state"]
+                    .get("sequencerPublicKey")
+                    .and_then(decode_wire_bytes_any)
+                {
+                    if let Ok(key) = <[u8; 32]>::try_from(raw_ed.as_slice()) {
+                        inline_redaction = Some(SequencerKey {
+                            did: norm_ds.clone(),
+                            key,
+                        });
+                    }
+                }
+                if let Some(raw_p256) = parsed["state"]
+                    .get("sequencerReceiptPublicKey")
+                    .and_then(decode_wire_bytes_any)
+                {
+                    if p256::ecdsa::VerifyingKey::from_sec1_bytes(&raw_p256).is_ok() {
+                        inline_receipt = Some(SequencerReceiptKey {
+                            did: norm_ds.clone(),
+                            public_key_sec1: raw_p256,
+                        });
+                    }
+                }
+                sequencer_did = Some(norm_ds);
+            }
+        }
+
+        let matches_target = |candidate_did: &str, target: Option<&str>| match target {
+            Some(expected) => normalize_sequencer_did(candidate_did) == expected,
+            None => true,
+        };
+
+        let mut redaction_key = inline_redaction;
+        if redaction_key.is_none() {
+            if let Some(ref sk) = self.sequencer_key {
+                if matches_target(&sk.did, sequencer_did.as_deref()) {
+                    redaction_key = Some(SequencerKey {
+                        did: normalize_sequencer_did(&sk.did),
+                        key: sk.key,
+                    });
+                }
+            }
+        }
+        if redaction_key.is_none() {
+            if let Some((did, key)) = self
+                .transport
+                .resolve_sequencer_key_for(thread_id, sequencer_did.as_deref())
+                .await
+            {
+                let norm = normalize_sequencer_did(&did);
+                if matches_target(&norm, sequencer_did.as_deref()) {
+                    if sequencer_did.is_none() {
+                        sequencer_did = Some(norm.clone());
+                    }
+                    redaction_key = Some(SequencerKey { did: norm, key });
+                }
+            }
+        }
+
+        let mut receipt_key = inline_receipt;
+        if receipt_key.is_none() {
+            if let Some(ref rk) = self.sequencer_receipt_key {
+                if matches_target(&rk.did, sequencer_did.as_deref())
+                    && p256::ecdsa::VerifyingKey::from_sec1_bytes(&rk.public_key_sec1).is_ok()
+                {
+                    receipt_key = Some(SequencerReceiptKey {
+                        did: normalize_sequencer_did(&rk.did),
+                        public_key_sec1: rk.public_key_sec1.clone(),
+                    });
+                }
+            }
+        }
+        if receipt_key.is_none() {
+            if let Some((did, sec1)) = self
+                .transport
+                .resolve_sequencer_receipt_key_for(thread_id, sequencer_did.as_deref())
+                .await
+            {
+                let norm = normalize_sequencer_did(&did);
+                if matches_target(&norm, sequencer_did.as_deref())
+                    && p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).is_ok()
+                {
+                    if sequencer_did.is_none() {
+                        sequencer_did = Some(norm.clone());
+                    }
+                    receipt_key = Some(SequencerReceiptKey {
+                        did: norm,
+                        public_key_sec1: sec1,
+                    });
+                }
+            }
+        }
+
+        if let Some(ref seq_did) = sequencer_did {
+            if redaction_key.is_none() || receipt_key.is_none() {
+                let (doc_redaction, doc_receipt) = self.resolve_did_doc_keys(seq_did).await?;
+                if redaction_key.is_none() {
+                    redaction_key = doc_redaction;
+                }
+                if receipt_key.is_none() {
+                    receipt_key = doc_receipt;
+                }
+            }
+            self.thread_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(
+                    thread_id.to_owned(),
+                    CachedSequencerKeys {
+                        redaction_key: redaction_key.clone(),
+                        receipt_key: receipt_key.clone(),
+                    },
+                );
+        }
+
+        Ok((redaction_key, receipt_key))
     }
 
     pub async fn publish_epoch_head_public(&self, epoch: &EpochPublicDef) -> labyrinth::Result<()> {
@@ -697,15 +1038,17 @@ impl MailboxDirectory for DsDirectoryStore {
         ))
     }
 
-    async fn sequencer_key(&self, _thread_id: &str) -> labyrinth::Result<Option<SequencerKey>> {
-        Ok(self.sequencer_key.clone())
+    async fn sequencer_key(&self, thread_id: &str) -> labyrinth::Result<Option<SequencerKey>> {
+        let (redaction_key, _) = self.resolve_thread_sequencer_keys(thread_id).await?;
+        Ok(redaction_key)
     }
 
     async fn sequencer_receipt_key(
         &self,
-        _thread_id: &str,
+        thread_id: &str,
     ) -> labyrinth::Result<Option<SequencerReceiptKey>> {
-        Ok(self.sequencer_receipt_key.clone())
+        let (_, receipt_key) = self.resolve_thread_sequencer_keys(thread_id).await?;
+        Ok(receipt_key)
     }
 }
 

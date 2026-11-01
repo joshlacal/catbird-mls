@@ -513,6 +513,9 @@ impl MailboxStore for SpaceMailbox {
         }
         self.space.purge_mailbox().await
     }
+    async fn delete_squatted_epoch(&self, seq: u64) -> labyrinth::Result<()> {
+        self.space.delete_squatted_epoch(seq).await
+    }
 }
 
 /// Conversation [`ThreadStore`] backed by [`labyrinth::store::space::SpaceThreadStore`]

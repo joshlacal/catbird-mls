@@ -119,6 +119,11 @@ where
         // Persist terminal authority before clearing the retry hint. A failure
         // here remains safely unsendable across restart and may be retried.
         self.storage().clear_rejoin_flag(conversation_id).await?;
+        drop(_guard);
+        #[cfg(feature = "labyrinth")]
+        {
+            self.labyrinth_rearchive_on_kick(conversation_id).await;
+        }
         tracing::info!(
             conversation_id,
             group_id = expected_group_id,

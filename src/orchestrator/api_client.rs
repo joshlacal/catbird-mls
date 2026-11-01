@@ -220,6 +220,48 @@ pub trait MLSAPIClient: MLSAPIClientBounds {
         None
     }
 
+    /// Per-conversation sequencer Ed25519 redaction verifying key (`[CB-38]`),
+    /// keyed by the conversation's `sequencerDid` under federation.
+    ///
+    /// Defaults to [`Self::labyrinth_sequencer_key`] ONLY when `sequencer_did`
+    /// is unspecified or matches the home DS DID — never returning a home DS
+    /// key for a foreign federated `sequencer_did`.
+    #[cfg(feature = "labyrinth")]
+    async fn labyrinth_sequencer_key_for(
+        &self,
+        _conversation_id: &str,
+        sequencer_did: Option<&str>,
+    ) -> Option<(String, [u8; 32])> {
+        fn normalize_ds_did(s: &str) -> &str {
+            s.split('#').next().unwrap_or(s).trim_end_matches('/')
+        }
+        let home = self.labyrinth_sequencer_key().await?;
+        match sequencer_did {
+            None => Some(home),
+            Some(expected) if normalize_ds_did(&home.0) == normalize_ds_did(expected) => Some(home),
+            Some(_) => None,
+        }
+    }
+
+    /// Per-conversation sequencer P-256 ES256 receipt verifying key (`I13`,
+    /// `{sequencerDid}#mls-receipt-1` SEC1 bytes).
+    #[cfg(feature = "labyrinth")]
+    async fn labyrinth_sequencer_receipt_key_for(
+        &self,
+        _conversation_id: &str,
+        _sequencer_did: Option<&str>,
+    ) -> Option<(String, Vec<u8>)> {
+        None
+    }
+
+    /// Resolve a DID document JSON payload (`did:web` or `did:plc`) so
+    /// federated `{sequencerDid}#mls-receipt-1` and `#labyrinth-redaction-1`
+    /// verification methods can be discovered and cached per conversation.
+    #[cfg(feature = "labyrinth")]
+    async fn resolve_labyrinth_did_document(&self, _did: &str) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
     /// Download an encrypted metadata blob from the DS (retired under `1A`; returns unsupported).
     async fn get_group_metadata_blob(
         &self,

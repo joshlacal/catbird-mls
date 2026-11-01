@@ -362,10 +362,16 @@ impl SessionDeps {
 
     fn session(
         self,
-        lab: Labyrinth,
+        mut lab: Labyrinth,
         fault: SignerFault,
         persisted: Option<Zeroizing<Vec<u8>>>,
     ) -> LabyrinthSession {
+        let persisted = Arc::new(std::sync::Mutex::new(persisted));
+        lab.set_state_sink(Box::new(VaultStateSink {
+            did: self.did.clone(),
+            vault: self.vault.clone(),
+            persisted: persisted.clone(),
+        }));
         LabyrinthSession {
             did: self.did.clone(),
             transport_key: self.signer.public_key(),
@@ -399,7 +405,7 @@ impl SessionDeps {
         let lab = lab.map_err(map_error)?;
         let mut s = self.clone().session(lab, fault, Some(saved));
         self.backfill_pds(&mut s).await?;
-        let sync_res = s.lab.sync_epochs().await.map(|_| ());
+        let sync_res = s.sync_epochs_healing_squats().await;
         s.finish(sync_res)?;
         self.backfill_pds(&mut s).await?;
         Ok(Some(s))
@@ -450,6 +456,32 @@ impl SessionDeps {
     }
 }
 
+struct VaultStateSink {
+    did: String,
+    vault: Arc<dyn StateVault>,
+    persisted: Arc<std::sync::Mutex<Option<Zeroizing<Vec<u8>>>>>,
+}
+
+impl labyrinth::client::StateSink for VaultStateSink {
+    fn save_state(&self, state: &[u8]) -> labyrinth::Result<()> {
+        let mut guard = self.persisted.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().map(|p| p.as_slice()) == Some(state) {
+            return Ok(());
+        }
+        let swapped = self
+            .vault
+            .compare_exchange(&self.did, guard.as_deref().map(|v| v.as_slice()), state)
+            .map_err(|e| labyrinth::Error::Backend(format!("state vault: {e}")))?;
+        if !swapped {
+            return Err(labyrinth::Error::Backend(
+                "labyrinth: client state changed concurrently; reopen the session".into(),
+            ));
+        }
+        *guard = Some(Zeroizing::new(state.to_vec()));
+        Ok(())
+    }
+}
+
 /// One conversation's messages for [`LabyrinthSession::archive_many`]:
 /// `(conversationId, member DIDs, [(messageId, timestampMs, frame)])`.
 pub type ArchiveBatch = (String, Vec<String>, Vec<(String, u64, Vec<u8>)>);
@@ -462,12 +494,16 @@ pub struct LabyrinthSession {
     fault: SignerFault,
     vault: Arc<dyn StateVault>,
     placements: Arc<dyn StateVault>,
-    persisted: Option<Zeroizing<Vec<u8>>>,
+    persisted: Arc<std::sync::Mutex<Option<Zeroizing<Vec<u8>>>>>,
 }
 
 impl LabyrinthSession {
     pub fn did(&self) -> &str {
         &self.did
+    }
+
+    pub fn latest_epoch(&self) -> u64 {
+        self.lab.latest_epoch()
     }
 
     pub fn is_for(&self, did: &str, transport_key: &[u8; 32]) -> bool {
@@ -484,8 +520,38 @@ impl LabyrinthSession {
         self.placements
             .delete(&thread_placement_key(&self.did))
             .map_err(OrchestratorError::Mls)?;
-        self.persisted = None;
+        *self.persisted.lock().unwrap_or_else(|e| e.into_inner()) = None;
         Ok(())
+    }
+
+    /// Safely clear an unanchored, unverified squatted epoch record (`[CB-40]`)
+    /// from the personal mailbox Space if `seq` is strictly ahead of the
+    /// verified local epoch and not anchored in `CompositeDirectory`.
+    pub async fn clear_squatted_epoch(&mut self, seq: u64) -> Result<bool> {
+        let out = self.lab.clear_squatted_epoch(seq).await;
+        self.finish(out)
+    }
+
+    async fn try_heal_squat(&mut self, seq: u64) -> bool {
+        if seq <= self.lab.latest_epoch() {
+            return false;
+        }
+        matches!(self.lab.clear_squatted_epoch(seq).await, Ok(true))
+    }
+
+    async fn sync_epochs_healing_squats(&mut self) -> labyrinth::Result<()> {
+        for _ in 0..8 {
+            match self.lab.sync_epochs().await {
+                Ok(_) => return Ok(()),
+                Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                    if !self.try_heal_squat(seq).await {
+                        return Err(labyrinth::Error::EpochSquatted { seq, reason });
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.lab.sync_epochs().await.map(|_| ())
     }
 
     pub async fn purge_account(&mut self) -> Result<PurgeReport> {
@@ -505,12 +571,31 @@ impl LabyrinthSession {
     }
 
     pub async fn propose_repin(&mut self, did: &str) -> Result<RepinProposal> {
-        let out = self.lab.propose_repin(did).await;
+        let out = match self.lab.propose_repin(did).await {
+            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                if self.try_heal_squat(seq).await {
+                    self.lab.propose_repin(did).await
+                } else {
+                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+                }
+            }
+            other => other,
+        };
         self.finish(out)
     }
 
     pub async fn repin_peer(&mut self, did: &str, confirmed_head: [u8; 32]) -> Result<()> {
-        let out = self.lab.repin_peer(did, &confirmed_head).await.map(|_| ());
+        let out = match self.lab.repin_peer(did, &confirmed_head).await {
+            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                if self.try_heal_squat(seq).await {
+                    self.lab.repin_peer(did, &confirmed_head).await
+                } else {
+                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+                }
+            }
+            other => other,
+        }
+        .map(|_| ());
         self.finish(out)
     }
 
@@ -520,11 +605,17 @@ impl LabyrinthSession {
     }
 
     pub async fn revoke_chat_device(&mut self, chat_key: [u8; 32]) -> Result<Vec<u64>> {
-        let out = self
-            .lab
-            .revoke_chat_device(&chat_key)
-            .await
-            .map(|v| v.into_iter().map(|r| r.new_epoch).collect());
+        let out = match self.lab.revoke_chat_device(&chat_key).await {
+            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                if self.try_heal_squat(seq).await {
+                    self.lab.revoke_chat_device(&chat_key).await
+                } else {
+                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+                }
+            }
+            other => other,
+        }
+        .map(|v| v.into_iter().map(|r| r.new_epoch).collect());
         self.finish(out)
     }
 
@@ -532,47 +623,63 @@ impl LabyrinthSession {
         hex::encode(self.lab.device_public().device_key_pub.0)
     }
 
+    pub fn device_key_pub(&self) -> [u8; 32] {
+        self.lab.device_public().device_key_pub.0
+    }
+
     fn try_finish<R>(&mut self, out: labyrinth::Result<R>) -> Result<labyrinth::Result<R>> {
+        let save_res = self.save();
         surface(&self.fault)?;
-        self.save()?;
+        save_res?;
         Ok(out)
     }
 
     fn finish<R>(&mut self, out: labyrinth::Result<R>) -> Result<R> {
+        let save_res = self.save();
         surface(&self.fault)?;
-        let out = out.map_err(map_error)?;
-        self.save()?;
-        Ok(out)
+        match out {
+            Ok(val) => {
+                save_res?;
+                Ok(val)
+            }
+            Err(err) => {
+                save_res?;
+                Err(map_error(err))
+            }
+        }
     }
 
     fn save(&mut self) -> Result<()> {
         let next = self.lab.export_state().map_err(map_error)?;
-        if self.persisted.as_ref().map(|p| p.as_slice()) == Some(next.as_slice()) {
+        let mut guard = self.persisted.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().map(|p| p.as_slice()) == Some(next.as_slice()) {
             return Ok(());
         }
         let swapped = self
             .vault
-            .compare_exchange(
-                &self.did,
-                self.persisted.as_deref().map(|v| v.as_slice()),
-                &next,
-            )
+            .compare_exchange(&self.did, guard.as_deref().map(|v| v.as_slice()), &next)
             .map_err(OrchestratorError::Mls)?;
         if !swapped {
             return Err(OrchestratorError::Storage(
                 "labyrinth: client state changed concurrently; reopen the session".into(),
             ));
         }
-        self.persisted = Some(next);
+        *guard = Some(next);
         Ok(())
     }
 
     pub async fn create_recovery_code(&mut self) -> Result<String> {
-        let out = self
-            .lab
-            .create_recovery_code(Mechanism::Code)
-            .await
-            .map(|setup| setup.code.to_string());
+        let out = match self.lab.create_recovery_code(Mechanism::Code).await {
+            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                if self.try_heal_squat(seq).await {
+                    self.lab.create_recovery_code(Mechanism::Code).await
+                } else {
+                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+                }
+            }
+            other => other,
+        }
+        .map(|setup| setup.code.to_string());
         self.finish(out)
     }
 
@@ -594,6 +701,7 @@ impl LabyrinthSession {
 
     pub async fn archive_many(&mut self, batches: &[ArchiveBatch]) -> Result<()> {
         let out = async {
+            self.sync_epochs_healing_squats().await?;
             for (conversation_id, members, items) in batches {
                 let members: Vec<&str> = members.iter().map(String::as_str).collect();
                 let roster = self.lab.resolve_roster(&members).await?;
@@ -606,6 +714,11 @@ impl LabyrinthSession {
             self.lab.flush().await.map(|_| ())
         }
         .await;
+        if out.is_err() {
+            for (conversation_id, _, _) in batches {
+                self.lab.discard_pending(conversation_id);
+            }
+        }
         self.finish(out)
     }
 
@@ -634,6 +747,7 @@ impl LabyrinthSession {
         items: &[(String, u64, Vec<u8>)],
     ) -> Result<labyrinth::Result<Vec<RosterExclusion>>> {
         let raw = async {
+            self.sync_epochs_healing_squats().await?;
             let members: Vec<&str> = members.iter().map(String::as_str).collect();
             let r = self.lab.resolve_roster_report(&members).await?;
             for (message_id, ts, frame) in items {
@@ -643,6 +757,40 @@ impl LabyrinthSession {
             }
             self.lab.flush_thread(conversation_id).await?;
             Ok(r.excluded)
+        }
+        .await;
+        let out = self.try_finish(raw);
+        if !matches!(out, Ok(Ok(_))) {
+            self.lab.discard_pending(conversation_id);
+        }
+        out
+    }
+
+    /// `[CB-22]` / `[CB-37]` owner-mode (`v5`, `KIND_ATTRIBUTED_FRAME = 0x03`)
+    /// fallback used when this account has been involuntarily removed (kicked)
+    /// from `conversation_id` and can no longer write to or read from the
+    /// conversation Space. Seals `(message_id, timestamp_ms, sender_did, frame)`
+    /// items into the personal mailbox Space while preserving `sender_did`.
+    pub async fn archive_owner_fallback(
+        &mut self,
+        conversation_id: &str,
+        items: &[(String, u64, String, Vec<u8>)],
+    ) -> Result<labyrinth::Result<usize>> {
+        if items.is_empty() {
+            return Ok(Ok(0));
+        }
+        self.lab.discard_pending(conversation_id);
+        let raw = async {
+            self.sync_epochs_healing_squats().await?;
+            let mut count = 0usize;
+            for (message_id, ts, sender_did, frame) in items {
+                self.lab
+                    .archive_owner_attributed(conversation_id, message_id, *ts, sender_did, frame)
+                    .await?;
+                count += 1;
+            }
+            self.lab.flush_owner(conversation_id).await?;
+            Ok(count)
         }
         .await;
         let out = self.try_finish(raw);
@@ -662,7 +810,7 @@ impl LabyrinthSession {
         range: TimeRange,
     ) -> Result<HistoryPage> {
         let raw = async {
-            self.lab.sync_epochs().await?;
+            self.sync_epochs_healing_squats().await?;
             self.lab.load_thread(conversation_id, range).await
         }
         .await;
@@ -684,7 +832,7 @@ impl LabyrinthSession {
     ) -> Result<(HistoryPage, Option<ThreadCursor>)> {
         let raw = async {
             if sync {
-                self.lab.sync_epochs().await?;
+                self.sync_epochs_healing_squats().await?;
             }
             self.lab
                 .load_thread_page(conversation_id, before, limit)
@@ -704,11 +852,17 @@ impl LabyrinthSession {
     }
 
     pub async fn revoke_device(&mut self, device_key: [u8; 32]) -> Result<u64> {
-        let out = self
-            .lab
-            .revoke_device(&XVerifyingKey(device_key))
-            .await
-            .map(|r| r.new_epoch);
+        let out = match self.lab.revoke_device(&XVerifyingKey(device_key)).await {
+            Err(labyrinth::Error::EpochSquatted { seq, reason }) => {
+                if self.try_heal_squat(seq).await {
+                    self.lab.revoke_device(&XVerifyingKey(device_key)).await
+                } else {
+                    Err(labyrinth::Error::EpochSquatted { seq, reason })
+                }
+            }
+            other => other,
+        }
+        .map(|r| r.new_epoch);
         self.finish(out)
     }
 

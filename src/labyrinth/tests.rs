@@ -129,10 +129,12 @@ impl ArchiveQueueStore for MemoryQueueStore {
     }
 }
 
+#[derive(Default)]
 struct MockDsState {
     heads: HashMap<String, Vec<EpochPublicDef>>,
     chat_keys: HashMap<String, Vec<[u8; 32]>>,
     conversations: HashMap<String, (String, Vec<String>)>,
+    did_docs: HashMap<String, Vec<u8>>,
 }
 
 struct MockSixEndpointGateway {
@@ -290,6 +292,10 @@ impl LabyrinthGateway for MockSixEndpointGateway {
             }),
         }
     }
+
+    async fn resolve_did_document(&self, did: &str) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.state.lock().unwrap().did_docs.get(did).cloned())
+    }
 }
 
 struct StaticAuthority(LocalGroupSnapshot);
@@ -356,12 +362,11 @@ async fn spaces_only_enable_archive_flush_restore_and_rearchive_before_leave() {
     let space_host = MemorySpaceHost::default();
     let pds_host = MemoryPublicRepoHost::default();
     let ds_state = Arc::new(Mutex::new(MockDsState {
-        heads: HashMap::new(),
-        chat_keys: HashMap::new(),
         conversations: HashMap::from([(
             conv_id.to_owned(),
             (ds_did.to_owned(), vec![alice.to_owned(), bob.to_owned()]),
         )]),
+        ..Default::default()
     }));
 
     let authority: Arc<dyn LocalConversationAuthority> =
@@ -443,4 +448,466 @@ async fn spaces_only_enable_archive_flush_restore_and_rearchive_before_leave() {
         .await
         .expect("rearchive_before_leave");
     assert_eq!(copied, 1);
+}
+
+#[tokio::test]
+async fn fault_line_1_session_persists_mek_pin_and_revocation_before_flush_or_publish_error() {
+    let alice = "did:plc:alicefl10000000000000000";
+    let bob = "did:plc:bobfl1000000000000000000";
+    let ds_did = "did:web:ds.catbird.test";
+    let conv_id = "22222222-3333-4444-8555-666666666666";
+
+    let space_host = MemorySpaceHost::default();
+    let pds_host = MemoryPublicRepoHost::default();
+    let ds_state = Arc::new(Mutex::new(MockDsState {
+        conversations: HashMap::from([(
+            conv_id.to_owned(),
+            (ds_did.to_owned(), vec![alice.to_owned(), bob.to_owned()]),
+        )]),
+        ..Default::default()
+    }));
+
+    let alice_d1 = build_deps(
+        alice,
+        "dev-a1",
+        31,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    let bob_d1 = build_deps(
+        bob,
+        "dev-b1",
+        32,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+
+    let mut alice_s1 = alice_d1.clone().enable().await.expect("alice enable");
+    let _bob_s1 = bob_d1.clone().enable().await.expect("bob enable");
+    let state_before = alice_d1
+        .vault
+        .load(alice)
+        .expect("load alice state")
+        .expect("alice state present");
+
+    // Revoke Alice's Space write permission on the conversation Space BEFORE archive_conversation
+    // flushes, forcing `flush_thread` inside `archive_conversation` to fail AFTER `MEK` and
+    // `[CB-29]` peer pins for Bob have mutated in memory!
+    let convo_space =
+        labyrinth::store::space::SpaceRef::conversation(ds_did, &format!("{conv_id}-0"));
+    space_host.revoke_space_member(&convo_space, alice);
+
+    let archive_res = alice_s1
+        .archive_conversation(
+            conv_id,
+            std::slice::from_ref(&bob.to_owned()),
+            &[(
+                "msg-crash-1".to_owned(),
+                1_700_000_010_000,
+                b"survives flush failure".to_vec(),
+            )],
+        )
+        .await
+        .expect("try_finish succeeds and checkpoints state");
+    assert!(matches!(archive_res, Err(labyrinth::Error::Forbidden)));
+
+    // VaultStateSink + try_finish MUST have persisted the newly minted MEK and Bob's peer pin
+    // into `vault` BEFORE the network flush error surfaced.
+    let state_after = alice_d1
+        .vault
+        .load(alice)
+        .expect("load alice state after err")
+        .expect("alice state still present");
+    assert_ne!(
+        state_before, state_after,
+        "vault must checkpoint mutated MEK and peer pins even when network flush fails"
+    );
+
+    // Reopen session from vault after simulated crash, restore Space membership, and archive a
+    // second item: Bob's pin and MEK are intact without re-pinning!
+    space_host.grant_space_member(&convo_space, alice);
+    space_host.grant_space_member(&convo_space, bob);
+    let mut reopened = alice_d1
+        .clone()
+        .open()
+        .await
+        .expect("reopen alice_d1")
+        .expect("alice_d1 session present");
+    let after_reopen = reopened
+        .archive_conversation(
+            conv_id,
+            std::slice::from_ref(&bob.to_owned()),
+            &[(
+                "msg-crash-2".to_owned(),
+                1_700_000_011_000,
+                b"after reopen".to_vec(),
+            )],
+        )
+        .await
+        .expect("try_finish after reopen");
+    assert!(after_reopen.is_ok(), "archive after reopen must succeed");
+}
+
+#[tokio::test]
+async fn fault_line_2_kick_outbox_fallback_and_cached_history_rescue_import_with_sender_attribution(
+) {
+    let alice = "did:plc:alicefl20000000000000000";
+    let bob = "did:plc:bobfl2000000000000000000";
+    let ds_did = "did:web:ds.catbird.test";
+    let conv_id = "33333333-4444-4555-8666-777777777777";
+
+    let space_host = MemorySpaceHost::default();
+    let pds_host = MemoryPublicRepoHost::default();
+    let ds_state = Arc::new(Mutex::new(MockDsState {
+        conversations: HashMap::from([(
+            conv_id.to_owned(),
+            (ds_did.to_owned(), vec![alice.to_owned(), bob.to_owned()]),
+        )]),
+        ..Default::default()
+    }));
+
+    let alice_d1 = build_deps(
+        alice,
+        "dev-a1",
+        41,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    let bob_d1 = build_deps(
+        bob,
+        "dev-b1",
+        42,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+
+    let mut alice_s1 = alice_d1.clone().enable().await.expect("alice enable");
+    let _bob_s1 = bob_d1.clone().enable().await.expect("bob enable");
+    let recovery_code = alice_s1
+        .create_recovery_code()
+        .await
+        .expect("recovery code");
+
+    // Queue an outbox message on Alice, then kick Alice from both DS conversation roster and Space!
+    let queue = MemoryQueueStore::default();
+    let row = PendingArchive::new(
+        alice,
+        conv_id,
+        "msg-kicked-outbox",
+        1_700_000_020_000,
+        b"queued before kick",
+    )
+    .with_mls_snapshot("bb22", 1, vec![alice.to_owned(), bob.to_owned()]);
+    assert!(enqueue(&queue, &row).expect("enqueue"));
+
+    ds_state.lock().unwrap().conversations.insert(
+        conv_id.to_owned(),
+        (ds_did.to_owned(), vec![bob.to_owned()]),
+    );
+    let convo_space =
+        labyrinth::store::space::SpaceRef::conversation(ds_did, &format!("{conv_id}-0"));
+    space_host.revoke_space_member(&convo_space, alice);
+
+    // 1. Outbox flush falls back to owner-mode (`v5` `KIND_ATTRIBUTED_FRAME`) in Alice's personal mailbox Space!
+    let report = flush_queue(&mut alice_s1, &alice_d1, &queue)
+        .await
+        .expect("flush_queue fallback");
+    assert_eq!(report.archived, 1);
+    assert_eq!(report.failed_conversations, 0);
+    assert!(queue.list(alice).unwrap().is_empty());
+
+    // 2. Rescue Bob's locally cached pre-kick message into Alice's personal mailbox Space, preserving `sender_did = bob`!
+    let owner_res = alice_s1
+        .archive_owner_fallback(
+            conv_id,
+            &[(
+                "msg-bob-cached".to_owned(),
+                1_700_000_019_000,
+                bob.to_owned(),
+                b"from bob before kick".to_vec(),
+            )],
+        )
+        .await
+        .expect("archive_owner_fallback finish");
+    assert_eq!(owner_res.expect("owner fallback count"), 1);
+
+    // 3. Alice's second device restores via recovery code while still kicked (`Forbidden` on conversation Space)
+    // and recovers BOTH messages from her personal mailbox with exact sender attribution (`bob` vs `alice`)!
+    let alice_d2 = build_deps(
+        alice,
+        "dev-a2",
+        43,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    let mut alice_s2 = alice_d2
+        .restore_with_recovery_code(&recovery_code)
+        .await
+        .expect("alice_d2 restore");
+    let hist = alice_s2
+        .load_history(conv_id, TimeRange::ALL)
+        .await
+        .expect("load_history on kicked conversation");
+    assert_eq!(hist.messages.len(), 2);
+    assert_eq!(hist.messages[0].message_id, "msg-bob-cached");
+    assert_eq!(hist.messages[0].sender.as_deref(), Some(bob));
+    assert_eq!(hist.messages[0].frame, b"from bob before kick");
+    assert_eq!(hist.messages[1].message_id, "msg-kicked-outbox");
+    assert_eq!(hist.messages[1].sender.as_deref(), Some(alice));
+    assert_eq!(hist.messages[1].frame, b"queued before kick");
+}
+
+#[tokio::test]
+async fn fault_line_3_session_heals_unanchored_squatted_epoch_and_preserves_anchored_revocation_quarantine(
+) {
+    use labyrinth::store::space::SpaceRpc as _;
+
+    let alice = "did:plc:alicefl30000000000000000";
+    let space_host = MemorySpaceHost::default();
+    let pds_host = MemoryPublicRepoHost::default();
+    let ds_state = Arc::new(Mutex::new(MockDsState::default()));
+
+    let alice_d1 = build_deps(
+        alice,
+        "dev-a1",
+        51,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    let mut alice_s1 = alice_d1.clone().enable().await.expect("alice enable");
+    let recovery_code = alice_s1
+        .create_recovery_code()
+        .await
+        .expect("create_recovery_code at genesis epoch 0");
+    assert_eq!(alice_s1.latest_epoch(), 0);
+
+    // Inject an unanchored squatted `epoch/000000000001` into Alice's personal mailbox Space
+    // (simulating an aborted rotation or rogue unanchored write `[CB-40]`).
+    let mailbox_space = labyrinth::store::space::SpaceRef::mailbox(alice);
+    let mut squatted_val = space_host
+        .record(
+            &mailbox_space,
+            alice,
+            labyrinth::records::nsid::EPOCH,
+            "000000000000",
+        )
+        .expect("genesis epoch 0 present");
+    squatted_val["epochNumber"] = serde_json::json!(1);
+    squatted_val["signatureDeviceId"] = serde_json::json!("rogue000000000000000000000000000");
+    space_host
+        .client(alice)
+        .procedure(
+            "com.atproto.space.applyWrites",
+            &serde_json::to_vec(&serde_json::json!({
+                "repo": alice,
+                "space": mailbox_space.to_string(),
+                "writes": [{
+                    "$type": "com.atproto.space.applyWrites#create",
+                    "collection": labyrinth::records::nsid::EPOCH,
+                    "rkey": "000000000001",
+                    "value": squatted_val
+                }]
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("inject squatted epoch 1");
+
+    // Restoring `alice_d2` automatically heals the unanchored squat at epoch 1 and rotates cleanly!
+    let alice_d2 = build_deps(
+        alice,
+        "dev-a2",
+        52,
+        ds_state.clone(),
+        &space_host,
+        &pds_host,
+        None,
+    );
+    let mut alice_s2 = alice_d2
+        .restore_with_recovery_code(&recovery_code)
+        .await
+        .expect("restore_with_recovery_code heals squatted epoch 1 and rotates cleanly");
+    assert!(alice_s2.latest_epoch() >= 1);
+
+    // Now legitimately revoke `alice_d1` from `alice_s2` (anchoring the new epoch in PDS + DS).
+    let d1_key = alice_s1.device_key_pub();
+    let new_ep = alice_s2
+        .revoke_device(d1_key)
+        .await
+        .expect("legitimate revoke_device");
+
+    // `alice_d1.open()` MUST quarantine (fail with `Err`) and MUST NOT delete the anchored revocation epoch!
+    let open_res = alice_d1.clone().open().await;
+    assert!(
+        open_res.is_err(),
+        "revoked device must error on open, never delete anchored epoch"
+    );
+    assert!(
+        space_host
+            .record(
+                &mailbox_space,
+                alice,
+                labyrinth::records::nsid::EPOCH,
+                &format!("{new_ep:012}"),
+            )
+            .is_some(),
+        "directory-anchored revocation epoch must remain intact in Space"
+    );
+}
+
+#[tokio::test]
+async fn fault_line_5_federated_ds_directory_resolves_per_thread_sequencer_and_did_doc_receipt_keys(
+) {
+    use labyrinth::store::{MailboxDirectory as _, SequencerKey, SequencerReceiptKey};
+    use p256::ecdsa::SigningKey as P256SigningKey;
+
+    let alice = "did:plc:alicefl50000000000000000";
+    let home_ds = "did:web:home-ds.catbird.test";
+    let foreign_ds = "did:web:foreign-ds.catbird.test";
+    let unknown_ds = "did:web:unknown-ds.catbird.test";
+    let home_conv = "conv-home-1";
+    let foreign_conv = "conv-foreign-2";
+    let unknown_conv = "conv-unknown-3";
+
+    let home_ed = SigningKey::from_bytes(&[61u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let home_p256_sk = P256SigningKey::from_bytes((&[62u8; 32]).into()).unwrap();
+    let home_p256: [u8; 33] = home_p256_sk
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .unwrap();
+
+    let foreign_ed = SigningKey::from_bytes(&[71u8; 32])
+        .verifying_key()
+        .to_bytes();
+    let foreign_p256_sk = P256SigningKey::from_bytes((&[72u8; 32]).into()).unwrap();
+    let foreign_p256: [u8; 33] = foreign_p256_sk
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .unwrap();
+
+    // Encode foreign DS `#mls-receipt-1` (`[0x80, 0x24]` + 33-byte SEC1 P-256) and
+    // `#labyrinth-redaction-1` (`[0xed, 0x01]` + 32-byte Ed25519) as `Multikey` (`Base58Btc`).
+    let mut p256_mc = Vec::with_capacity(35);
+    p256_mc.extend_from_slice(&[0x80, 0x24]);
+    p256_mc.extend_from_slice(&foreign_p256);
+    let foreign_receipt_mb = multibase::encode(multibase::Base::Base58Btc, &p256_mc);
+
+    let mut ed_mc = Vec::with_capacity(34);
+    ed_mc.extend_from_slice(&[0xed, 0x01]);
+    ed_mc.extend_from_slice(&foreign_ed);
+    let foreign_ed_mb = multibase::encode(multibase::Base::Base58Btc, &ed_mc);
+
+    let foreign_did_doc = serde_json::json!({
+        "id": foreign_ds,
+        "verificationMethod": [
+            {
+                "id": format!("{foreign_ds}#mls-receipt-1"),
+                "type": "Multikey",
+                "controller": foreign_ds,
+                "publicKeyMultibase": foreign_receipt_mb,
+            },
+            {
+                "id": format!("{foreign_ds}#labyrinth-redaction-1"),
+                "type": "Multikey",
+                "controller": foreign_ds,
+                "publicKeyMultibase": foreign_ed_mb,
+            }
+        ]
+    });
+
+    let ds_state = Arc::new(Mutex::new(MockDsState {
+        conversations: HashMap::from([
+            (
+                home_conv.to_owned(),
+                (home_ds.to_owned(), vec![alice.to_owned()]),
+            ),
+            (
+                foreign_conv.to_owned(),
+                (foreign_ds.to_owned(), vec![alice.to_owned()]),
+            ),
+            (
+                unknown_conv.to_owned(),
+                (unknown_ds.to_owned(), vec![alice.to_owned()]),
+            ),
+        ]),
+        did_docs: HashMap::from([(
+            foreign_ds.to_owned(),
+            serde_json::to_vec(&foreign_did_doc).unwrap(),
+        )]),
+        ..Default::default()
+    }));
+
+    let signer = Arc::new(TestChatSigner::from_seed(88));
+    let gw = Arc::new(MockSixEndpointGateway {
+        actor_did: alice.to_owned(),
+        state: ds_state,
+    });
+    let transport = Arc::new(GatewayXrpcTransport::new(
+        gw,
+        signer,
+        alice.to_owned(),
+        "dev-fl5".to_owned(),
+    ));
+
+    let home_seq_key = SequencerKey {
+        did: home_ds.to_owned(),
+        key: home_ed,
+    };
+    let home_rcpt_key = SequencerReceiptKey {
+        did: home_ds.to_owned(),
+        public_key_sec1: home_p256.to_vec(),
+    };
+    let dir = super::transport::DsDirectoryStore::new(
+        transport,
+        Some(home_seq_key.clone()),
+        Some(home_rcpt_key.clone()),
+    );
+
+    // Home conversation resolves home DS keys.
+    assert_eq!(
+        dir.sequencer_key(home_conv).await.unwrap(),
+        Some(home_seq_key)
+    );
+    assert_eq!(
+        dir.sequencer_receipt_key(home_conv).await.unwrap(),
+        Some(home_rcpt_key)
+    );
+
+    // Federated conversation resolves foreign DS's DID document Multikeys, NOT home DS keys!
+    assert_eq!(
+        dir.sequencer_key(foreign_conv).await.unwrap(),
+        Some(SequencerKey {
+            did: foreign_ds.to_owned(),
+            key: foreign_ed,
+        })
+    );
+    assert_eq!(
+        dir.sequencer_receipt_key(foreign_conv).await.unwrap(),
+        Some(SequencerReceiptKey {
+            did: foreign_ds.to_owned(),
+            public_key_sec1: foreign_p256.to_vec(),
+        })
+    );
+
+    // Unknown federated DS with unresolvable DID doc MUST return `None`, NEVER falling back to home DS!
+    assert_eq!(dir.sequencer_key(unknown_conv).await.unwrap(), None);
+    assert_eq!(dir.sequencer_receipt_key(unknown_conv).await.unwrap(), None);
 }

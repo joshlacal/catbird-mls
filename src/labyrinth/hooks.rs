@@ -371,7 +371,9 @@ where
                     report.skipped_conflicts += 1;
                     continue;
                 }
-                let (MessageSource::Sender, Some(sender)) = (m.source, m.sender.clone()) else {
+                let (MessageSource::Sender | MessageSource::Owner, Some(sender)) =
+                    (m.source, m.sender.clone())
+                else {
                     report.skipped_unattributed += 1;
                     continue;
                 };
@@ -700,8 +702,184 @@ where
         }
     }
 
+    /// `[CB-22]` / `[CB-37]` involuntary-removal rescue: archives locally cached
+    /// decrypted conversation messages (`storage().get_messages`) and any pending
+    /// outbox rows for `conversation_id` into the caller's personal mailbox Space
+    /// using owner-mode `v5` (`KIND_ATTRIBUTED_FRAME = 0x03`, preserving each
+    /// message's `sender_did`) before local history is deleted or after Space
+    /// access is revoked (`Forbidden`).
+    pub async fn labyrinth_rescue_cached_history(&self, conversation_id: &str) -> Result<usize> {
+        const PAGE_LIMIT: u32 = 500;
+        const MAX_PAGES: usize = 20;
+        const CHUNK_SIZE: usize = 100;
+
+        let deps = self.labyrinth_deps().await?;
+        let enabled = deps
+            .vault
+            .has_state(&deps.did)
+            .map_err(OrchestratorError::Mls)?;
+        if !enabled {
+            return Ok(0);
+        }
+
+        let mut candidates: std::collections::BTreeMap<String, (u64, String, Vec<u8>)> =
+            std::collections::BTreeMap::new();
+        let mut before_seq: Option<u64> = None;
+
+        for _ in 0..MAX_PAGES {
+            let page = match self
+                .storage()
+                .get_messages(conversation_id, PAGE_LIMIT, before_seq)
+                .await
+            {
+                Ok(msgs) => msgs,
+                Err(_) => break,
+            };
+            if page.is_empty() {
+                break;
+            }
+            let prev_len = candidates.len();
+            let mut min_seq: Option<u64> = None;
+            for msg in &page {
+                if msg.sequence_number > 0 {
+                    min_seq = Some(match min_seq {
+                        Some(cur) => cur.min(msg.sequence_number),
+                        None => msg.sequence_number,
+                    });
+                }
+                if msg.id.is_empty() || msg.id.len() > 128 || msg.id.chars().any(char::is_control) {
+                    continue;
+                }
+                let sender_root =
+                    crate::orchestrator::credential_binding::credential_root_did(&msg.sender_did)
+                        .to_owned();
+                if !sender_root.starts_with("did:") {
+                    continue;
+                }
+                let frame = if let Some(ref pj) = msg.payload_json {
+                    if MLSMessagePayload::decode(pj.as_bytes()).is_ok_and(|p| p.is_displayable()) {
+                        pj.as_bytes().to_vec()
+                    } else if !msg.text.trim().is_empty() {
+                        match serde_json::to_vec(&MLSMessagePayload::text(&msg.text)) {
+                            Ok(b) => b,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        continue;
+                    }
+                } else if !msg.text.trim().is_empty() {
+                    match serde_json::to_vec(&MLSMessagePayload::text(&msg.text)) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    }
+                } else {
+                    continue;
+                };
+                let ts_ms = u64::try_from(msg.timestamp.timestamp_millis().max(0)).unwrap_or(0);
+                candidates
+                    .entry(msg.id.clone())
+                    .or_insert((ts_ms, sender_root, frame));
+            }
+            if candidates.len() == prev_len || page.len() < PAGE_LIMIT as usize {
+                break;
+            }
+            match min_seq {
+                Some(seq) if before_seq.is_none_or(|b| seq < b) => before_seq = Some(seq),
+                _ => break,
+            }
+        }
+
+        let store = self.labyrinth_queue_store();
+        let mut queued_ids = Vec::new();
+        for row in store.list(&deps.did)? {
+            if row.conversation_id != conversation_id {
+                continue;
+            }
+            if let Ok(frame) = row.frame_bytes() {
+                queued_ids.push(row.message_id.clone());
+                candidates.entry(row.message_id).or_insert((
+                    row.timestamp_ms,
+                    deps.did.clone(),
+                    frame,
+                ));
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut guard = self.labyrinth_slot().lock().await;
+        let Some(session) = Self::ensure_opened_in_slot(&mut guard, deps.clone()).await? else {
+            return Ok(0);
+        };
+
+        let existing_owner_ids: std::collections::HashSet<String> = match session
+            .load_history(conversation_id, labyrinth::store::TimeRange::ALL)
+            .await
+        {
+            Ok(h) => h
+                .messages
+                .into_iter()
+                .filter(|m| m.source == MessageSource::Owner)
+                .map(|m| m.message_id)
+                .collect(),
+            Err(_) => std::collections::HashSet::new(),
+        };
+
+        let mut to_archive: Vec<(String, u64, String, Vec<u8>)> = candidates
+            .into_iter()
+            .filter(|(msg_id, _)| !existing_owner_ids.contains(msg_id))
+            .map(|(msg_id, (ts, sender, frame))| (ts, msg_id, sender, frame))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(ts, msg_id, sender, frame)| (msg_id, ts, sender, frame))
+            .collect();
+        to_archive.sort_by(|a, b| (a.1, &a.0).cmp(&(b.1, &b.0)));
+
+        let mut total_archived = 0usize;
+        for chunk in to_archive.chunks(CHUNK_SIZE) {
+            match session
+                .archive_owner_fallback(conversation_id, chunk)
+                .await?
+            {
+                Ok(n) => total_archived += n,
+                Err(e) => return Err(super::map_error(e)),
+            }
+        }
+
+        if !queued_ids.is_empty() {
+            for msg_id in &queued_ids {
+                store.remove(&deps.did, msg_id)?;
+            }
+            self.labyrinth_archive().flushed(queued_ids.len());
+        }
+
+        Ok(total_archived)
+    }
+
+    pub(crate) async fn labyrinth_rearchive_on_kick(&self, conversation_id: &str) {
+        match self.labyrinth_rescue_cached_history(conversation_id).await {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(
+                    conversation_id,
+                    n,
+                    "labyrinth: rescued cached history into personal mailbox Space after removal"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    conversation_id,
+                    %error,
+                    "labyrinth: rescuing cached history into personal mailbox Space failed"
+                );
+            }
+        }
+    }
+
     pub(crate) async fn labyrinth_rearchive_before_leave(&self, conversation_id: &str) {
-        let result = async {
+        let space_result = async {
             let deps = self.labyrinth_deps().await?;
             let mut guard = self.labyrinth_slot().lock().await;
             match Self::ensure_opened_in_slot(&mut guard, deps).await? {
@@ -713,15 +891,22 @@ where
             }
         }
         .await;
-        match result {
+        match space_result {
             Ok(Some(n)) => {
                 tracing::info!(conversation_id, n, "labyrinth: re-archived before leave")
             }
-            Ok(None) => {}
+            Ok(None) => return,
             Err(error) => {
-                tracing::warn!(conversation_id, %error, "labyrinth: re-archive before leave failed")
+                tracing::warn!(
+                    conversation_id,
+                    %error,
+                    "labyrinth: Space re-archive before leave failed; rescuing local cache via owner fallback"
+                )
             }
         }
+        // Also rescue any locally cached messages or queued outbox rows not yet in the Space
+        // (covers both unsent/unflushed local cache and leave-vs-kick Forbidden races).
+        self.labyrinth_rearchive_on_kick(conversation_id).await;
     }
 }
 
