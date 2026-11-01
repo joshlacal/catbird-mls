@@ -146,6 +146,178 @@ pub fn verify_archive_commitment(
     }
 }
 
+/// Parse a canonical message body (`{"text":...}` / `{"content":...}` or raw UTF-8) into
+/// `(display_body, canonical_json_string)`.
+pub fn parse_canonical_message_body(payload_bytes: &[u8]) -> Result<(String, String), MLSError> {
+    let raw_str = std::str::from_utf8(payload_bytes)
+        .map_err(|e| MLSError::invalid_input(format!("message payload is not UTF-8: {e}")))?;
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw_str) {
+        if let Some(text) = val
+            .get("text")
+            .and_then(|v| v.as_str())
+            .or_else(|| val.get("content").and_then(|v| v.as_str()))
+        {
+            return Ok((text.to_string(), raw_str.to_string()));
+        }
+    }
+    let wrapped_json = serde_json::json!({ "text": raw_str }).to_string();
+    Ok((raw_str.to_string(), wrapped_json))
+}
+
+struct CborBytesVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CborBytesVisitor {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a CBOR byte string")
+    }
+
+    fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v.to_vec())
+    }
+
+    fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(v)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CborByteVec(Vec<u8>);
+
+impl<'de> Deserialize<'de> for CborByteVec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_bytes(CborBytesVisitor).map(Self)
+    }
+}
+
+#[derive(Deserialize)]
+struct CanonicalApplicationAadMap {
+    #[serde(rename = "archiveCommitment", default)]
+    archive_commitment: Option<CborByteVec>,
+}
+
+const CANONICAL_APP_AAD_PREFIX: &[u8] = b"CATBIRD-CHAT-MLS-AAD-MESSAGE\0";
+const DIRECT_REQUEST_APP_AAD_PREFIX: &[u8] = b"CATBIRD-DIRECT-REQUEST-APPLICATION-AAD\0";
+
+/// Extract `(body, canonical_json, verified_archive_commitment)` from an OpenMLS
+/// `ApplicationMessage` plaintext and its `PrivateMessage` AAD (`Spec §5 I13`, `C33`).
+pub fn extract_plaintext_body_and_verify_aad(
+    decrypted_bytes: &[u8],
+    aad_bytes: &[u8],
+) -> Result<(String, String, Option<[u8; 32]>), MLSError> {
+    if let Some(cbor_aad) = aad_bytes.strip_prefix(CANONICAL_APP_AAD_PREFIX) {
+        let parsed_aad: CanonicalApplicationAadMap = serde_ipld_dagcbor::from_slice(cbor_aad)
+            .map_err(|e| {
+                MLSError::Cryptography(format!("invalid canonical applicationAad CBOR: {e}"))
+            })?;
+        let expected_commitment: Option<[u8; ARCHIVE_COMMITMENT_LEN]> = match parsed_aad
+            .archive_commitment
+        {
+            Some(CborByteVec(raw)) => Some(raw.as_slice().try_into().map_err(|_| {
+                MLSError::Cryptography(
+                    "I13 canonical applicationAad archiveCommitment must be 32 bytes".to_string(),
+                )
+            })?),
+            None => None,
+        };
+
+        if let Ok(inner) =
+            serde_json::from_slice::<PrivateMessagePlaintextEnvelope>(decrypted_bytes)
+        {
+            let verified = if let Some(expected) = expected_commitment {
+                let actual = labyrinth_protocol::receipt::compute_archive_commitment(
+                    &inner.frame_nonce,
+                    &inner.canonical_payload_bytes,
+                );
+                if !bool::from(actual.ct_eq(&expected)) {
+                    return Err(MLSError::Cryptography(
+                        "I13 canonical applicationAad archiveCommitment mismatch".to_string(),
+                    ));
+                }
+                Some(expected)
+            } else {
+                Some(labyrinth_protocol::receipt::compute_archive_commitment(
+                    &inner.frame_nonce,
+                    &inner.canonical_payload_bytes,
+                ))
+            };
+            let (body, json_str) = parse_canonical_message_body(&inner.canonical_payload_bytes)?;
+            return Ok((body, json_str, verified));
+        }
+
+        if expected_commitment.is_some() {
+            return Err(MLSError::Cryptography(
+                "I13: canonical applicationAad with archiveCommitment requires PrivateMessagePlaintextEnvelope"
+                    .to_string(),
+            ));
+        }
+
+        if let Ok(cbor_val) = serde_ipld_dagcbor::from_slice::<serde_json::Value>(decrypted_bytes) {
+            if let Some(text) = cbor_val
+                .get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| cbor_val.get("content").and_then(|v| v.as_str()))
+            {
+                let json_str = serde_json::to_string(&cbor_val)
+                    .unwrap_or_else(|_| serde_json::json!({ "text": text }).to_string());
+                return Ok((text.to_string(), json_str, None));
+            }
+        }
+        let (body, json_str) = parse_canonical_message_body(decrypted_bytes)?;
+        return Ok((body, json_str, None));
+    }
+
+    if aad_bytes.starts_with(DIRECT_REQUEST_APP_AAD_PREFIX) {
+        let intro_val =
+            crate::chat_v2::transcript::direct_request::decode_direct_request_introduction(
+                decrypted_bytes,
+            )
+            .map_err(|e| MLSError::Cryptography(format!("invalid C33 introduction CBOR: {e}")))?;
+        let text = intro_val
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| MLSError::invalid_input("C33 introduction missing text"))?
+            .to_string();
+        let json_str = serde_json::to_string(&intro_val)
+            .map_err(|e| MLSError::Internal(format!("serialize C33 introduction JSON: {e}")))?;
+        return Ok((text, json_str, None));
+    }
+
+    // Support both PrivateMessagePlaintextEnvelope (carrying secret 32-byte frame_nonce)
+    // and direct JSON/UTF-8 payloads when AAD is empty.
+    if let Ok(inner) = serde_json::from_slice::<PrivateMessagePlaintextEnvelope>(decrypted_bytes) {
+        let commitment = if !aad_bytes.is_empty() {
+            let aad_env = PrivateMessageAadEnvelope::from_aad_bytes(aad_bytes)?;
+            aad_env.verify_payload(&inner.frame_nonce, &inner.canonical_payload_bytes)?;
+            Some(aad_env.archive_commitment)
+        } else {
+            None
+        };
+        let (body, json_str) = parse_canonical_message_body(&inner.canonical_payload_bytes)?;
+        return Ok((body, json_str, commitment));
+    }
+
+    if !aad_bytes.is_empty() {
+        return Err(MLSError::Cryptography(
+            "I13: non-empty PrivateMessage AAD requires PrivateMessagePlaintextEnvelope with frame_nonce"
+                .to_string(),
+        ));
+    }
+
+    let (body, json_str) = parse_canonical_message_body(decrypted_bytes)?;
+    Ok((body, json_str, None))
+}
+
 /// Purge all locally stored messages authored by `deleted_did` across `<did_hash>.db`
 /// upon observing a sequenced `accountDeleted` entry (`Spec §5 I13`).
 #[cfg(not(target_arch = "wasm32"))]

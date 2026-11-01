@@ -1,12 +1,4 @@
 {
-  "_catbird_mls_provenance": {
-    "generator": "scripts/generate_chat_schema.py",
-    "generatorVersion": 9,
-    "sourcePath": "PetrelCatbird/lexicons/blue/catbird/chat/blue.catbird.chat.defs.json",
-    "sourceRevision": "3fe103463e09d4c47077e433883df982ff9e2beb",
-    "sourceSha256": "e7a23bc2b8e383729d8046a33cd24d86ef6cf8261989692f327e816e10343938",
-    "sourceTree": "9feac29cb51cdf46cc92155bb7b56ed4d74e3e08"
-  },
   "defs": {
     "accessEndedEvent": {
       "description": "Frozen-audience notice closing one exact device-leaf interval inclusively; another device of the same DID does not extend it.",
@@ -39,6 +31,50 @@
         "userDid",
         "deviceId",
         "terminalSeq"
+      ],
+      "type": "object"
+    },
+    "accountDeletedEntry": {
+      "description": "[I13] Sequencer-recorded control entry indicating that deletedDid deleted their account and removed their writer repo from the conversation Space.",
+      "properties": {
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "deletedDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "entryId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "receivedAt": {
+          "ref": "#canonicalDatetime",
+          "type": "ref"
+        },
+        "seq": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sequencerDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "entryId",
+        "conversationId",
+        "seq",
+        "deletedDid",
+        "sequencerDid",
+        "receivedAt"
       ],
       "type": "object"
     },
@@ -134,6 +170,11 @@
     "applicationAad": {
       "description": "Exact deterministic DAG-CBOR projection prefixed by CATBIRD-CHAT-MLS-AAD-MESSAGE\\0. All UUIDs are raw 16-byte strings and prior is the active bytes-based context exactly equivalent to the outer signed transport coordinate; it never includes the enclosing MLSMessage hash.",
       "properties": {
+        "archiveCommitment": {
+          "description": "[I13] HMAC-SHA256(key = frameNonce, data = canonicalPayloadBytes) bound into live MLS AAD and echoed in sequencerReceipt.",
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
         "conversationId": {
           "ref": "#identifierBytes",
           "type": "ref"
@@ -205,7 +246,7 @@
       "type": "union"
     },
     "applicationEntry": {
-      "description": "conversationId must byte-equal signedRequest.body.prior.conversationId before append or fingerprinting. Clients strictly validate the signed request and verify its 64-byte Ed25519 signature over the exact CATBIRD-CHAT-MESSAGE\\0 canonical signing transcript before decryption, attribution, display, or effects. The immutable outer-entry fingerprint is raw SHA-256 of UTF8(CATBIRD-CHAT-APPLICATION-ENTRY-FINGERPRINT\\0) followed by canonical DAG-CBOR of exactly {entryId: UUID bytes16, conversationId: UUID bytes16, seq: safe integer, requestDigest: bytes32, signature: bytes64, receivedAt: canonical text}. requestDigest is raw SHA-256 of the exact send signing transcript, so it commits every signed actor, device, coordinate, message, artifact, and blob-binding field; signature and server row identity/time are committed separately. Raw JSON, generated DTO bytes, plaintext-only digests, and unsigned outer surrogates are forbidden. Application visibility is per concrete authenticated (userDid,deviceId) MLS leaf. The genesis creator device begins at creation seq; an ordinary Add begins that added device at its Welcome-producing transition; that exact device's Remove or reset closes its interval inclusively. Reset begins only the activator device's successor interval at the same reset seq. A sibling registered device, logical roster member, or zero-leaf device inherits no ciphertext. Re-addition opens a new interval and never backfills the gap.",
+      "description": "conversationId must byte-equal signedRequest.body.prior.conversationId before append or fingerprinting. Clients strictly validate the signed request and verify its 64-byte Ed25519 signature over the exact CATBIRD-CHAT-MESSAGE\\0 canonical signing transcript before decryption, attribution, display, or effects. The immutable outer-entry fingerprint is raw SHA-256 of UTF8(CATBIRD-CHAT-APPLICATION-ENTRY-FINGERPRINT\\0) followed by canonical DAG-CBOR of exactly {entryId: UUID bytes16, conversationId: UUID bytes16, seq: safe integer, requestDigest: bytes32, signature: bytes64, receivedAt: canonical text}. requestDigest is raw SHA-256 of the exact send signing transcript, so it commits every signed actor, device, coordinate, message, artifact, and blob-binding field; signature and server row identity/time are committed separately. Raw JSON, generated DTO bytes, plaintext-only digests, and unsigned outer surrogates are forbidden. Application visibility is per concrete authenticated (userDid,deviceId) MLS leaf. The genesis creator device begins at creation seq; an ordinary Add begins that added device at its Welcome-producing transition; that exact device's Remove or reset closes its interval inclusively. Reset begins only the activator device's successor interval at the same reset seq. A sibling registered device, logical roster member, or zero-leaf device inherits no ciphertext. Re-addition opens a new interval and never backfills the gap. When payloadPruned is true, signedRequest is absent while seq contiguity and entry metadata remain intact.",
       "properties": {
         "conversationId": {
           "ref": "#operationId",
@@ -214,6 +255,10 @@
         "entryId": {
           "ref": "#operationId",
           "type": "ref"
+        },
+        "payloadPruned": {
+          "description": "True once accepted_payload_bytes was pruned to NULL after all active non-dormant leaves acknowledged seq.",
+          "type": "boolean"
         },
         "receivedAt": {
           "ref": "#canonicalDatetime",
@@ -224,6 +269,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "sequencerReceipt": {
+          "ref": "#sequencerReceipt",
+          "type": "ref"
+        },
         "signedRequest": {
           "ref": "#signedApplicationSend",
           "type": "ref"
@@ -233,7 +282,6 @@
         "entryId",
         "conversationId",
         "seq",
-        "signedRequest",
         "receivedAt"
       ],
       "type": "object"
@@ -1171,7 +1219,7 @@
     },
     "conversationEntry": {
       "closed": true,
-      "description": "The union is closed. For each of its 13 non-application variants, the immutable control outer-entry fingerprint is raw SHA-256 of UTF8(CATBIRD-CHAT-CONTROL-ENTRY-FINGERPRINT\\0) followed by canonical DAG-CBOR of exactly {entryKind,entryId:bytes16,conversationId:bytes16,seq:positive-safe-integer,requestDigest:bytes32,signature:bytes64,serverFields,receivedAt:canonical-text}. entryKind is the exact full type ID of the selected conversationEntry variant. requestDigest is raw SHA-256 of the exact variant domain-prefixed canonical unsigned signing transcript. signature is the exact 64-byte signedRequest signature. serverFields is always present: {} for an ordinary five-field control row, {recovery: exact #leafRecoveryView} for participantAcceptanceEntry, or {tombstone: exact #conversationCloseTombstone} for conversationCloseEntry. Unknown, missing, or extra fields reject at the row, selected variant, serverFields, and fingerprint-projection levels. Every nested closed-union value in an unsigned signing projection carries its exact full $type. Missing, wrong, or unknown nested tags reject before signature acceptance. Exact row/body conversation binding, closed variant consistency, canonical transcript reconstruction, and historical Ed25519 signature verification all succeed before fingerprinting. Raw JSON, generated DTO bytes, and signature-containing wrapper bytes are forbidden fingerprint inputs.",
+      "description": "The union is closed. For each of its signed-request non-application variants, the immutable control outer-entry fingerprint is raw SHA-256 of UTF8(CATBIRD-CHAT-CONTROL-ENTRY-FINGERPRINT\\0) followed by canonical DAG-CBOR of exactly {entryKind,entryId:bytes16,conversationId:bytes16,seq:positive-safe-integer,requestDigest:bytes32,signature:bytes64,serverFields,receivedAt:canonical-text}. entryKind is the exact full type ID of the selected conversationEntry variant. requestDigest is raw SHA-256 of the exact variant domain-prefixed canonical unsigned signing transcript. signature is the exact 64-byte signedRequest signature. serverFields is always present: {} for an ordinary five-field control row, {recovery: exact #leafRecoveryView} for participantAcceptanceEntry, or {tombstone: exact #conversationCloseTombstone} for conversationCloseEntry. Unknown, missing, or extra fields reject at the row, selected variant, serverFields, and fingerprint-projection levels. Every nested closed-union value in an unsigned signing projection carries its exact full $type. Missing, wrong, or unknown nested tags reject before signature acceptance. Exact row/body conversation binding, closed variant consistency, canonical transcript reconstruction, and historical Ed25519 signature verification all succeed before fingerprinting. Raw JSON, generated DTO bytes, and signature-containing wrapper bytes are forbidden fingerprint inputs. accountDeletedEntry is sequencer-recorded under #mls-receipt-1.",
       "refs": [
         "#applicationEntry",
         "#commitEntry",
@@ -1188,7 +1236,8 @@
         "#leaveCancellationEntry",
         "#leaveCommitFulfillmentEntry",
         "#directRequestEntry",
-        "#directRequestAcceptanceEntry"
+        "#directRequestAcceptanceEntry",
+        "#accountDeletedEntry"
       ],
       "type": "union"
     },
@@ -3682,6 +3731,15 @@
           "const": "attachment",
           "type": "string"
         },
+        "setterDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "spaceBlobCid": {
+          "maxLength": 256,
+          "minLength": 16,
+          "type": "string"
+        },
         "transcript": {
           "maxLength": 16384,
           "minLength": 1,
@@ -3782,6 +3840,15 @@
         },
         "purpose": {
           "const": "attachment",
+          "type": "string"
+        },
+        "setterDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "spaceBlobCid": {
+          "maxLength": 256,
+          "minLength": 16,
           "type": "string"
         },
         "width": {
@@ -4112,6 +4179,31 @@
         "keyPackages",
         "idempotencyKey",
         "signedAt"
+      ],
+      "type": "object"
+    },
+    "labyrinthHead": {
+      "description": "The participant's latest Labyrinth epoch head in the mls-ds head directory (blue.catbird.labyrinth.getEpochHead serves the full record). attestationKeyId is the chat device keyId whose key attested the head. Absent when the participant has published no head.",
+      "properties": {
+        "attestationKeyId": {
+          "maxLength": 128,
+          "type": "string"
+        },
+        "epochHead": {
+          "maxLength": 32,
+          "minLength": 32,
+          "type": "bytes"
+        },
+        "epochNumber": {
+          "maximum": 1099511627776,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "epochNumber",
+        "epochHead",
+        "attestationKeyId"
       ],
       "type": "object"
     },
@@ -5294,6 +5386,15 @@
           "const": "metadata",
           "type": "string"
         },
+        "setterDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "spaceBlobCid": {
+          "maxLength": 256,
+          "minLength": 16,
+          "type": "string"
+        },
         "width": {
           "maximum": 16384,
           "minimum": 1,
@@ -5878,6 +5979,10 @@
       "properties": {
         "invitationProvenance": {
           "ref": "#invitationProvenance",
+          "type": "ref"
+        },
+        "labyrinthHead": {
+          "ref": "#labyrinthHead",
           "type": "ref"
         },
         "leafCount": {
@@ -6906,6 +7011,84 @@
       "required": [
         "resetRequestId",
         "conversationId"
+      ],
+      "type": "object"
+    },
+    "sequencerReceipt": {
+      "description": "[I13] Sequencer receipt signed by {sequencerDid}#mls-receipt-1 binding live MLS applicationAad.archiveCommitment to Labyrinth history.",
+      "properties": {
+        "archiveCommitment": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "conversationId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "entryId": {
+          "ref": "#operationId",
+          "type": "ref"
+        },
+        "epoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "generation": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "groupId": {
+          "ref": "#artifactHash",
+          "type": "ref"
+        },
+        "issuedAtMs": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kid": {
+          "maxLength": 320,
+          "type": "string"
+        },
+        "senderDeviceId": {
+          "ref": "#deviceId",
+          "type": "ref"
+        },
+        "senderDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "seq": {
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sequencerDid": {
+          "ref": "#bareDid",
+          "type": "ref"
+        },
+        "signature": {
+          "maxLength": 64,
+          "minLength": 64,
+          "type": "bytes"
+        }
+      },
+      "required": [
+        "conversationId",
+        "generation",
+        "groupId",
+        "epoch",
+        "entryId",
+        "seq",
+        "senderDid",
+        "senderDeviceId",
+        "archiveCommitment",
+        "issuedAtMs",
+        "sequencerDid",
+        "kid",
+        "signature"
       ],
       "type": "object"
     },

@@ -26,7 +26,6 @@ use zeroize::Zeroizing;
 
 use crate::error::MLSError;
 use crate::keychain::KeychainAccess;
-use crate::messaging::receive::{PrivateMessageAadEnvelope, PrivateMessagePlaintextEnvelope};
 use crate::metadata::{decrypt_metadata_snapshot, derive_metadata_key_from_group};
 use crate::storage::{
     ConversationRow, GroupMetadataRow, MessageRow, MlsAccountDb, OpenMlsKvProvider,
@@ -189,7 +188,9 @@ fn resolve_push_db_path(storage_root: &Path, account_did_hash: &str) -> Result<P
     }
 }
 
-fn root_did_from_credential_bytes(identity_bytes: &[u8]) -> Result<(String, String), MLSError> {
+pub(crate) fn root_did_from_credential_bytes(
+    identity_bytes: &[u8],
+) -> Result<(String, String), MLSError> {
     let identity_str = std::str::from_utf8(identity_bytes).map_err(|_| {
         MLSError::insufficient_permissions("I4/F-02: MLS leaf credential identity is not UTF-8")
     })?;
@@ -211,49 +212,17 @@ fn root_did_from_credential_bytes(identity_bytes: &[u8]) -> Result<(String, Stri
     Ok((root_did, device_id))
 }
 
-fn extract_plaintext_body_and_verify_aad(
+pub(crate) fn extract_plaintext_body_and_verify_aad(
     decrypted_bytes: &[u8],
     aad_bytes: &[u8],
 ) -> Result<(String, String, Option<[u8; 32]>), MLSError> {
-    // Support both PrivateMessagePlaintextEnvelope (carrying secret 32-byte frame_nonce)
-    // and direct JSON/UTF-8 payloads when AAD is empty.
-    if let Ok(inner) = serde_json::from_slice::<PrivateMessagePlaintextEnvelope>(decrypted_bytes) {
-        let commitment = if !aad_bytes.is_empty() {
-            let aad_env = PrivateMessageAadEnvelope::from_aad_bytes(aad_bytes)?;
-            aad_env.verify_payload(&inner.frame_nonce, &inner.canonical_payload_bytes)?;
-            Some(aad_env.archive_commitment)
-        } else {
-            None
-        };
-        let (body, json_str) = parse_canonical_message_body(&inner.canonical_payload_bytes)?;
-        return Ok((body, json_str, commitment));
-    }
-
-    if !aad_bytes.is_empty() {
-        return Err(MLSError::Cryptography(
-            "I13: non-empty PrivateMessage AAD requires PrivateMessagePlaintextEnvelope with frame_nonce"
-                .to_string(),
-        ));
-    }
-
-    let (body, json_str) = parse_canonical_message_body(decrypted_bytes)?;
-    Ok((body, json_str, None))
+    crate::messaging::receive::extract_plaintext_body_and_verify_aad(decrypted_bytes, aad_bytes)
 }
 
-fn parse_canonical_message_body(payload_bytes: &[u8]) -> Result<(String, String), MLSError> {
-    let raw_str = std::str::from_utf8(payload_bytes)
-        .map_err(|e| MLSError::invalid_input(format!("message payload is not UTF-8: {e}")))?;
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw_str) {
-        if let Some(text) = val
-            .get("text")
-            .and_then(|v| v.as_str())
-            .or_else(|| val.get("content").and_then(|v| v.as_str()))
-        {
-            return Ok((text.to_string(), raw_str.to_string()));
-        }
-    }
-    let wrapped_json = serde_json::json!({ "text": raw_str }).to_string();
-    Ok((raw_str.to_string(), wrapped_json))
+pub(crate) fn parse_canonical_message_body(
+    payload_bytes: &[u8],
+) -> Result<(String, String), MLSError> {
+    crate::messaging::receive::parse_canonical_message_body(payload_bytes)
 }
 
 fn extract_message_epoch_hint(mls_bytes: &[u8]) -> Option<u64> {
@@ -266,7 +235,7 @@ fn extract_message_epoch_hint(mls_bytes: &[u8]) -> Option<u64> {
     }
 }
 
-fn verify_leaf_binding_i4(
+pub(crate) fn verify_leaf_binding_i4(
     identity_bytes: &[u8],
     signature_key: &[u8],
     owner_did: Option<&str>,
@@ -295,7 +264,7 @@ fn verify_leaf_binding_i4(
     Ok((root_did, device_id))
 }
 
-fn verify_staged_commit_i4(
+pub(crate) fn verify_staged_commit_i4(
     group: &MlsGroup,
     sender: &Sender,
     staged: &StagedCommit,

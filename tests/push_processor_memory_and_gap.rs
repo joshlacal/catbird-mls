@@ -1018,6 +1018,7 @@ fn catbird_mls_client_enforces_i8_i9_i15_d3_d4_and_pq_otc() {
         .create_group(
             "convo-sdk-1",
             "did:web:chat.catbird.blue",
+            Vec::new(),
             Some("SDK Group".to_string()),
             None,
         )
@@ -1359,7 +1360,13 @@ fn client_signs_push_gateway_registration_and_acknowledge_entries_transcripts() 
 
     // 2. Verify `acknowledge_entries_up_to`
     client
-        .create_group(&conv_id, "did:web:chat.catbird.blue", None, None)
+        .create_group(
+            &conv_id,
+            "did:web:chat.catbird.blue",
+            Vec::new(),
+            None,
+            None,
+        )
         .expect("create_group");
     client
         .acknowledge_entries_up_to(&conv_id, 7)

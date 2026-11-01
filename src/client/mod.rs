@@ -4,7 +4,12 @@
 //! Tauri desktop (`catmos`), CLI (`catmos-cli`), `BIRDaemon`, and (via shared DTOs +
 //! `WasmMlsClient`) browser WASM (`catbird-mls-web`).
 
+pub mod chat_wire;
 pub mod config;
+#[cfg(not(target_arch = "wasm32"))]
+mod live_plane;
+#[cfg(not(target_arch = "wasm32"))]
+mod live_sync;
 pub mod spaces_gate;
 pub mod traits;
 
@@ -108,6 +113,8 @@ pub struct QueuedLabyrinthArchivePayload {
     pub mls_ciphertext_b64: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_nonce_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequencer_receipt_json: Option<String>,
     pub created_at_ms: i64,
 }
 
@@ -205,7 +212,7 @@ pub fn execute_pq_otc_handshake(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-mod native_client {
+pub(crate) mod native_client {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
@@ -223,7 +230,7 @@ mod native_client {
     use zeroize::Zeroizing;
 
     use crate::error::MLSError;
-    use crate::groups::lifecycle::{enforce_admin_removal_policy, MemberRole};
+    use crate::groups::lifecycle::MemberRole;
     use crate::groups::metadata_v1::{validate_metadata_snapshot_size, SpaceAvatarPointer};
     use crate::keychain::KeychainAccess;
     use crate::messaging::receive::PrivateMessagePlaintextEnvelope;
@@ -587,13 +594,13 @@ mod native_client {
     /// Unified per-account MLS + Labyrinth SDK client (`Spec §6.3`).
     #[derive(uniffi::Object)]
     pub struct CatbirdMlsClient {
-        config: CatbirdMlsClientConfig,
-        normalized_did: String,
+        pub(crate) config: CatbirdMlsClientConfig,
+        pub(crate) normalized_did: String,
         account_did_hash: String,
         db_path: PathBuf,
-        db: Arc<MlsAccountDb>,
+        pub(crate) db: Arc<MlsAccountDb>,
         keystore: Arc<dyn PlatformKeyStore>,
-        transport: Arc<dyn PlatformTransport>,
+        pub(crate) transport: Arc<dyn PlatformTransport>,
         observer: Option<Arc<dyn PlatformChangeObserver>>,
         cached_group_titles: Arc<Mutex<std::collections::HashMap<String, String>>>,
         outbox_flush_lock: Mutex<()>,
@@ -700,6 +707,18 @@ mod native_client {
             }
         }
 
+        pub(crate) fn notify_change(&self, event: PlatformChangeEvent) {
+            self.notify(event);
+        }
+
+        pub(crate) fn cache_title_if_present(&self, conversation_id: &str, title: &Option<String>) {
+            if let Some(ref t) = title {
+                if let Ok(mut guard) = self.cached_group_titles.lock() {
+                    guard.insert(conversation_id.to_string(), t.clone());
+                }
+            }
+        }
+
         pub fn account_did(&self) -> &str {
             &self.normalized_did
         }
@@ -737,7 +756,7 @@ mod native_client {
             Ok(status)
         }
 
-        /// Enroll this device (`I15` Spaces gate + `I16` `X-Wing` KeyPackages + `D4` Labyrinth default-on).
+        /// Enroll this device (`I15` Spaces gate + `I16` `X-Wing` KeyPackages + `D4` Labyrinth default-on + live `mls-ds` & PDS publication).
         pub fn enroll_device(
             &self,
             granted_oauth_scopes: &[String],
@@ -834,6 +853,13 @@ mod native_client {
                 Ok((direct_bytes, recovery_bytes))
             })?;
 
+            // Strictly outside `write_tx` (`I6`): publish PDS `blue.catbird.chat.device` +
+            // `enrollDevice` + `publishDirectRequestKeys` + `replenishKeyPackages` when using a
+            // canonical UUIDv4 device ID.
+            if let Some(canonical_dev_id) = self.canonical_uuid_v4_device_id() {
+                self.enroll_device_live(&canonical_dev_id, &pub_key)?;
+            }
+
             self.notify(PlatformChangeEvent::LabyrinthStatusChanged { epoch_seq: 1 });
 
             Ok(EnrollmentReceipt {
@@ -857,9 +883,10 @@ mod native_client {
             Ok(report)
         }
 
-        /// Reopen `<did_hash>.db` on foreground resume and trigger `I7` cache reconciliation.
+        /// Reopen `<did_hash>.db` on foreground resume and trigger `I7` cache + `sync()` reconciliation.
         pub fn resume_from_background(&self) -> Result<(), MLSError> {
             self.db.resume_from_background()?;
+            let _ = self.sync();
             self.notify(PlatformChangeEvent::Resumed);
             self.notify(PlatformChangeEvent::ConversationsUpdated);
             Ok(())
@@ -874,6 +901,7 @@ mod native_client {
             if let Ok(mut guard) = self.cached_group_titles.lock() {
                 guard.clear();
             }
+            let _ = self.sync();
             self.notify(PlatformChangeEvent::ConversationsUpdated);
             Ok(())
         }
@@ -938,6 +966,23 @@ mod native_client {
             &self,
             conversation_id: &str,
             sequencer_did: &str,
+            member_dids: Vec<String>,
+            title: Option<String>,
+            description: Option<String>,
+        ) -> Result<ConversationRow, MLSError> {
+            self.create_group_live_or_offline(
+                conversation_id,
+                sequencer_did,
+                member_dids,
+                title,
+                description,
+            )
+        }
+
+        pub(crate) fn create_group_local_offline(
+            &self,
+            conversation_id: &str,
+            sequencer_did: &str,
             title: Option<String>,
             description: Option<String>,
         ) -> Result<ConversationRow, MLSError> {
@@ -976,6 +1021,7 @@ mod native_client {
                 let create_cfg = MlsGroupCreateConfig::builder()
                     .ciphersuite(CIPHERSUITE)
                     .use_ratchet_tree_extension(true)
+                    .wire_format_policy(openmls::group::PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
                     .max_past_epochs(5)
                     .build();
 
@@ -1051,11 +1097,7 @@ mod native_client {
                 Ok(row)
             })?;
 
-            if let Some(ref t) = convo.title {
-                if let Ok(mut guard) = self.cached_group_titles.lock() {
-                    guard.insert(conversation_id.to_string(), t.clone());
-                }
-            }
+            self.cache_title_if_present(conversation_id, &convo.title);
             self.notify(PlatformChangeEvent::ConversationsUpdated);
             Ok(convo)
         }
@@ -1066,14 +1108,22 @@ mod native_client {
             message_id: &str,
             text: &str,
         ) -> Result<MessageRow, MLSError> {
-            let canonical_json = serde_json::json!({ "text": text }).to_string();
-            let mut frame_nonce = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut frame_nonce);
+            self.send_message_live_or_offline(conversation_id, message_id, text)
+        }
+
+        pub(crate) fn send_message_local_offline(
+            &self,
+            conversation_id: &str,
+            message_id: &str,
+            display_json: &str,
+            frame_json: &str,
+            frame_nonce: [u8; 32],
+            now_ms: i64,
+        ) -> Result<MessageRow, MLSError> {
             let (inner_plaintext, aad_bytes) = PrivateMessagePlaintextEnvelope::seal_with_aad(
                 frame_nonce,
-                canonical_json.as_bytes().to_vec(),
+                frame_json.as_bytes().to_vec(),
             )?;
-            let now_ms = unix_now_ms();
 
             let msg_row = self.db.write_tx(|tx| {
                 let mut convo = tx.get_conversation(conversation_id)?.ok_or_else(|| {
@@ -1101,7 +1151,9 @@ mod native_client {
                 group.set_aad(aad_bytes);
                 let mls_out = group
                     .create_message(&provider, &signer, &inner_plaintext)
-                    .map_err(|e| MLSError::Cryptography(format!("create_message: {e:?}")))?;
+                    .map_err(|e| MLSError::Cryptography(format!("create_message: {e:?}")));
+                group.set_aad(Vec::new());
+                let mls_out = mls_out?;
                 let ciphertext_bytes = mls_out
                     .tls_serialize_detached()
                     .map_err(|e| MLSError::Internal(format!("serialize message: {e:?}")))?;
@@ -1120,7 +1172,7 @@ mod native_client {
                     seq: next_seq,
                     sender_did: self.normalized_did.clone(),
                     sender_device_id: self.config.device_id.clone(),
-                    plaintext_json: canonical_json.clone(),
+                    plaintext_json: display_json.to_string(),
                     created_at_ms: now_ms,
                     is_own: true,
                 };
@@ -1138,10 +1190,11 @@ mod native_client {
                     sender_device_id: self.config.device_id.clone(),
                     sequencer_did: convo.sequencer_did.clone(),
                     space_uri: convo.space_uri.clone(),
-                    plaintext_json: canonical_json.clone(),
-                    labyrinth_frame_json: canonical_labyrinth_frame_json(&canonical_json),
+                    plaintext_json: display_json.to_string(),
+                    labyrinth_frame_json: frame_json.to_string(),
                     mls_ciphertext_b64: BASE64_STANDARD.encode(&ciphertext_bytes),
                     frame_nonce_b64: Some(BASE64_STANDARD.encode(frame_nonce)),
+                    sequencer_receipt_json: None,
                     created_at_ms: now_ms,
                 };
                 let queued_bytes = serde_json::to_vec(&queued_payload).map_err(|e| {
@@ -1173,29 +1226,7 @@ mod native_client {
             conversation_id: &str,
             target_did: &str,
         ) -> Result<(), MLSError> {
-            if target_did.trim().is_empty() {
-                return Err(MLSError::invalid_input("target_did must not be empty"));
-            }
-            enforce_admin_removal_policy(
-                &self.normalized_did,
-                actor_role,
-                &[target_did.to_string()],
-            )?;
-            let now_ms = unix_now_ms();
-            self.db.write_tx(|tx| {
-                let convo = tx.get_conversation(conversation_id)?.ok_or_else(|| {
-                    MLSError::GroupNotFound {
-                        message: format!("conversation {conversation_id} not found"),
-                    }
-                })?;
-                tx.put_account_meta(
-                    &format!("last_removed_member:{}", convo.conversation_id),
-                    target_did,
-                    now_ms,
-                )
-            })?;
-            self.notify(PlatformChangeEvent::ConversationsUpdated);
-            Ok(())
+            self.remove_group_member_live_or_offline(actor_role, conversation_id, target_did)
         }
 
         /// Update `1A` encrypted group metadata (`<= 16 KiB` snapshot + optional Space avatar pointer).
@@ -1206,85 +1237,20 @@ mod native_client {
             description: String,
             space_avatar: Option<SpaceAvatarPointer>,
         ) -> Result<GroupMetadataRow, MLSError> {
-            let meta_v1 = GroupMetadataV1 {
-                version: 1,
-                title: title.clone(),
-                description: description.clone(),
-                avatar_blob_locator: None,
-                avatar_content_type: space_avatar.as_ref().and_then(|a| a.mime_type.clone()),
-                space_avatar: space_avatar.clone(),
-            };
-            let serialized = serde_json::to_vec(&meta_v1)
-                .map_err(|e| MLSError::Internal(format!("serialize GroupMetadataV1: {e}")))?;
-            validate_metadata_snapshot_size(&serialized)?;
-
-            let now_ms = unix_now_ms();
-            let updated = self.db.write_tx(|tx| {
-                let mut convo = tx.get_conversation(conversation_id)?.ok_or_else(|| {
-                    MLSError::GroupNotFound {
-                        message: format!("conversation {conversation_id} not found"),
-                    }
-                })?;
-                let next_ver = tx
-                    .get_group_metadata(conversation_id)?
-                    .map(|m| m.metadata_version.saturating_add(1))
-                    .unwrap_or(1);
-
-                let row = GroupMetadataRow {
-                    conversation_id: conversation_id.to_string(),
-                    metadata_version: next_ver,
-                    epoch: convo.epoch,
-                    title: (!title.is_empty()).then(|| title.clone()),
-                    description: (!description.is_empty()).then(|| description.clone()),
-                    avatar_setter_did: space_avatar.as_ref().map(|a| a.setter_did.clone()),
-                    avatar_blob_cid: space_avatar.as_ref().map(|a| a.space_blob_cid.clone()),
-                    avatar_sym_key: space_avatar.as_ref().map(|a| a.sym_key.clone()),
-                    avatar_sha256: space_avatar.as_ref().map(|a| a.sha256.clone()),
-                    avatar_mime_type: space_avatar.as_ref().and_then(|a| a.mime_type.clone()),
-                    metadata_json: String::from_utf8_lossy(&serialized).into_owned(),
-                    updated_at_ms: now_ms,
-                };
-                tx.upsert_group_metadata(&row)?;
-                convo.title = row.title.clone();
-                convo.updated_at_ms = now_ms;
-                tx.upsert_conversation(&convo)?;
-                Ok(row)
-            })?;
-
-            self.notify(PlatformChangeEvent::GroupMetadataUpdated {
-                conversation_id: conversation_id.to_string(),
-            });
-            Ok(updated)
+            self.update_group_metadata_live_or_offline(
+                conversation_id,
+                title,
+                description,
+                space_avatar,
+            )
         }
 
         pub fn accept_direct_request(&self, request_id: &str) -> Result<(), MLSError> {
-            let now_ms = unix_now_ms();
-            self.db.write_tx(|tx| {
-                let mut rows = tx.list_requests(None)?;
-                if let Some(req) = rows.iter_mut().find(|r| r.request_id == request_id) {
-                    req.consent = "accepted".to_string();
-                    req.updated_at_ms = now_ms;
-                    tx.upsert_request(req)?;
-                }
-                Ok(())
-            })?;
-            self.notify(PlatformChangeEvent::RequestsUpdated);
-            Ok(())
+            self.accept_direct_request_live_or_offline(request_id)
         }
 
         pub fn decline_direct_request(&self, request_id: &str) -> Result<(), MLSError> {
-            let now_ms = unix_now_ms();
-            self.db.write_tx(|tx| {
-                let mut rows = tx.list_requests(None)?;
-                if let Some(req) = rows.iter_mut().find(|r| r.request_id == request_id) {
-                    req.consent = "declined".to_string();
-                    req.updated_at_ms = now_ms;
-                    tx.upsert_request(req)?;
-                }
-                Ok(())
-            })?;
-            self.notify(PlatformChangeEvent::RequestsUpdated);
-            Ok(())
+            self.decline_direct_request_live_or_offline(request_id)
         }
 
         fn load_device_ed25519_signer(
@@ -2984,6 +2950,7 @@ mod native_client {
                 labyrinth_frame_json: canonical_labyrinth_frame_json(&fallback_json),
                 mls_ciphertext_b64: BASE64_STANDARD.encode(&row.payload_bytes),
                 frame_nonce_b64: None,
+                sequencer_receipt_json: None,
                 created_at_ms: row.created_at_ms,
             })
         }
@@ -3197,46 +3164,85 @@ mod native_client {
                         };
 
                         let ts_ms = payload.created_at_ms.max(0) as u64;
-                        let sender_data: Zeroizing<Vec<u8>> = if let Some(ref nonce_b64) =
-                            payload.frame_nonce_b64
-                        {
-                            if let Ok(decoded) = BASE64_STANDARD.decode(nonce_b64.as_bytes()) {
-                                if decoded.len() == 32 {
-                                    let mut combined =
-                                        Vec::with_capacity(32 + payload.labyrinth_frame_json.len());
-                                    combined.extend_from_slice(&decoded);
-                                    combined
-                                        .extend_from_slice(payload.labyrinth_frame_json.as_bytes());
-                                    Zeroizing::new(combined)
-                                } else {
-                                    Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
-                                }
-                            } else {
-                                Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
-                            }
-                        } else {
-                            Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
-                        };
+                        let decoded_nonce_32: Option<[u8; 32]> = payload
+                            .frame_nonce_b64
+                            .as_ref()
+                            .and_then(|nonce_b64| BASE64_STANDARD.decode(nonce_b64.as_bytes()).ok())
+                            .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok());
 
-                        let mut sealed_msg = match labyrinth::message::seal_sender(
-                            &mek,
-                            &payload.conversation_id,
-                            &payload.message_id,
-                            ts_ms,
-                            &sender_data,
-                            &transport_signer,
-                        ) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                convo_err = Some(MLSError::Cryptography(format!(
-                                    "seal_sender conversation Batch: {e}"
-                                )));
-                                break;
-                            }
-                        };
                         let item_seq_u64 = payload.seq.max(0) as u64;
                         let item_sub_seq = item_seq_u64 % 1_000;
-                        sealed_msg.seq = Some(item_seq_u64);
+
+                        let sealed_msg = if let (Some(nonce_32), Some(ref receipt_json)) =
+                            (decoded_nonce_32, &payload.sequencer_receipt_json)
+                        {
+                            let stored_receipt: super::chat_wire::StoredArchivedReceipt =
+                                match serde_json::from_str(receipt_json) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        convo_err = Some(MLSError::Internal(format!(
+                                            "parse StoredArchivedReceipt JSON: {e}"
+                                        )));
+                                        break;
+                                    }
+                                };
+                            let archived = match stored_receipt.to_labyrinth_archived() {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    convo_err = Some(e);
+                                    break;
+                                }
+                            };
+                            match labyrinth::message::seal_sender_committed(
+                                &mek,
+                                &payload.conversation_id,
+                                &payload.message_id,
+                                ts_ms,
+                                &nonce_32,
+                                payload.labyrinth_frame_json.as_bytes(),
+                                &archived,
+                                &transport_signer,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    convo_err = Some(MLSError::Cryptography(format!(
+                                        "seal_sender_committed conversation Batch: {e}"
+                                    )));
+                                    break;
+                                }
+                            }
+                        } else {
+                            let sender_data: Zeroizing<Vec<u8>> = if let Some(nonce_32) =
+                                decoded_nonce_32
+                            {
+                                let mut combined =
+                                    Vec::with_capacity(32 + payload.labyrinth_frame_json.len());
+                                combined.extend_from_slice(&nonce_32);
+                                combined.extend_from_slice(payload.labyrinth_frame_json.as_bytes());
+                                Zeroizing::new(combined)
+                            } else {
+                                Zeroizing::new(payload.labyrinth_frame_json.as_bytes().to_vec())
+                            };
+
+                            let mut s = match labyrinth::message::seal_sender(
+                                &mek,
+                                &payload.conversation_id,
+                                &payload.message_id,
+                                ts_ms,
+                                &sender_data,
+                                &transport_signer,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    convo_err = Some(MLSError::Cryptography(format!(
+                                        "seal_sender conversation Batch: {e}"
+                                    )));
+                                    break;
+                                }
+                            };
+                            s.seq = Some(item_seq_u64);
+                            s
+                        };
 
                         let sender_batch = match labyrinth::records::Batch::from_messages(
                             &payload.conversation_id,

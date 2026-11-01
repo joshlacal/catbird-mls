@@ -169,7 +169,13 @@ fn catbird_mls_client_outbox_crash_durability_kick_fallback_and_attributed_histo
             .expect("open client");
         client.enroll_device(&all_scopes).expect("enroll");
         let convo = client
-            .create_group(conv_id, ds_did, Some("FaultLine Group".to_string()), None)
+            .create_group(
+                conv_id,
+                ds_did,
+                Vec::new(),
+                Some("FaultLine Group".to_string()),
+                None,
+            )
             .expect("create_group");
         client
             .send_message(conv_id, "msg-outbox-1", "sent right before crash")
@@ -212,6 +218,7 @@ fn catbird_mls_client_outbox_crash_durability_kick_fallback_and_attributed_histo
         .create_group(
             healthy_convo,
             ds_did,
+            Vec::new(),
             Some("Healthy Batch".to_string()),
             None,
         )
@@ -522,7 +529,13 @@ fn catbird_mls_client_memory_space_host_cross_device_recovery_and_700_row_pagina
             .expect("setup_recovery_code on device 1");
 
         let convo = client1
-            .create_group(conv_id, ds_did, Some("Scale Group".to_string()), None)
+            .create_group(
+                conv_id,
+                ds_did,
+                Vec::new(),
+                Some("Scale Group".to_string()),
+                None,
+            )
             .expect("create_group");
 
         // Import 550 cached messages (> 500 list_messages cap), alternating Bob & Alice!
@@ -746,6 +759,7 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
         .ffi_create_group(
             conv_id.to_string(),
             ds_did.to_string(),
+            Vec::new(),
             Some("UniFFI Concurrent".to_string()),
             None,
         )
@@ -826,7 +840,13 @@ fn uniffi_exports_serialize_concurrent_flushes_and_emit_restore_events() {
     space_client1.ffi_enroll_device(all_scopes).unwrap();
     let code = space_client1.ffi_setup_recovery_code().unwrap();
     space_client1
-        .ffi_create_group(conv_id.to_string(), ds_did.to_string(), None, None)
+        .ffi_create_group(
+            conv_id.to_string(),
+            ds_did.to_string(),
+            Vec::new(),
+            None,
+            None,
+        )
         .unwrap();
     space_client1
         .ffi_import_conversation_history(
@@ -1007,7 +1027,7 @@ fn flush_labyrinth_queue_partial_batch_retry_preserves_deterministic_rkeys_witho
     .unwrap();
     client.enroll_device(&all_scopes).unwrap();
     client
-        .create_group(conv_primary, ds_did, None, None)
+        .create_group(conv_primary, ds_did, Vec::new(), None, None)
         .unwrap();
     for i in 1..=3 {
         client
@@ -1064,7 +1084,7 @@ fn flush_labyrinth_queue_partial_batch_retry_preserves_deterministic_rkeys_witho
     space_host.revoke_space_member(&fallback_space_ref, alice);
 
     client
-        .create_group(conv_fallback, ds_did, None, None)
+        .create_group(conv_fallback, ds_did, Vec::new(), None, None)
         .unwrap();
     for i in 1..=3 {
         client
@@ -1194,10 +1214,10 @@ fn flush_labyrinth_queue_isolates_per_conversation_503_across_120_rows() {
     .unwrap();
     client.enroll_device(&all_scopes).unwrap();
     client
-        .create_group(convo_stalled, ds_did, None, None)
+        .create_group(convo_stalled, ds_did, Vec::new(), None, None)
         .unwrap();
     client
-        .create_group(convo_healthy, ds_did, None, None)
+        .create_group(convo_healthy, ds_did, Vec::new(), None, None)
         .unwrap();
 
     // Enqueue 120 rows (> 100 SQL page cap!) in convo_stalled FIRST, then 15 rows in convo_healthy.
@@ -1340,7 +1360,9 @@ fn flush_labyrinth_queue_aborts_in_flight_loop_immediately_when_handle_closes() 
     )
     .unwrap();
     client.enroll_device(&all_scopes).unwrap();
-    client.create_group(conv_id, ds_did, None, None).unwrap();
+    client
+        .create_group(conv_id, ds_did, Vec::new(), None, None)
+        .unwrap();
     for i in 1..=10 {
         client
             .send_message(conv_id, &format!("close-msg-{i}"), &format!("body #{i}"))
@@ -1417,7 +1439,7 @@ fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches()
         assert_eq!(client1.labyrinth_status().unwrap().epoch_seq, 1);
 
         let c1 = client1
-            .create_group("convo-ep1", ds_did, None, None)
+            .create_group("convo-ep1", ds_did, Vec::new(), None, None)
             .unwrap();
         client1
             .import_conversation_history(
@@ -1444,7 +1466,7 @@ fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches()
         assert_eq!(otc_done.new_epoch_seq, 2);
 
         client1
-            .create_group("convo-ep2", ds_did, None, None)
+            .create_group("convo-ep2", ds_did, Vec::new(), None, None)
             .unwrap();
         client1
             .send_message("convo-ep2", "ep2-alice-msg", "alice at epoch 2")
@@ -1461,7 +1483,7 @@ fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches()
         assert_eq!(rev_status.epoch_seq, 3);
 
         client1
-            .create_group("convo-ep3", ds_did, None, None)
+            .create_group("convo-ep3", ds_did, Vec::new(), None, None)
             .unwrap();
         client1
             .send_message("convo-ep3", "ep3-alice-msg", "alice at epoch 3 post-revoke")
@@ -1524,7 +1546,7 @@ fn multi_epoch_and_three_device_recovery_code_chain_recovers_all_owner_batches()
 
         // Rescue a new conversation at Epoch 4 on Device 2!
         client2
-            .create_group("convo-ep4", ds_did, None, None)
+            .create_group("convo-ep4", ds_did, Vec::new(), None, None)
             .unwrap();
         client2
             .send_message("convo-ep4", "ep4-dev2-msg", "sent on device 2 at epoch 4")

@@ -23,3 +23,7 @@ pub use processor::{
     process_push_notification, AuthorizedPeerDeviceKey, FetchedMetadataSnapshot, FetchedPushEntry,
     NotificationPreview, PushFetchBundle, PushFetchTransport, PushKeystore, PushWakePayload,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use processor::{
+    root_did_from_credential_bytes, verify_leaf_binding_i4, verify_staged_commit_i4,
+};

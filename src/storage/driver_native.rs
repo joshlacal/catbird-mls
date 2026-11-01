@@ -989,19 +989,35 @@ impl<'a> SqlReadTx<'a> {
             })
         };
         if let Some(consent) = consent_filter {
-            let mut stmt = self
-                .conn
-                .prepare(
-                    "SELECT request_id, conversation_id, sender_did, recipient_did, consent, \
-                            first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
-                     FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC",
-                )
-                .map_err(|e| map_rusqlite_err("list_requests.prepare", &e))?;
-            let rows = stmt
-                .query_map([consent], map_row)
-                .map_err(|e| map_rusqlite_err("list_requests.query", &e))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|e| map_rusqlite_err("list_requests.collect", &e))
+            if consent == "pending" {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT request_id, conversation_id, sender_did, recipient_did, consent, \
+                                first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
+                         FROM requests WHERE consent IN ('pending', 'incomingPending', 'outgoingPending') ORDER BY updated_at_ms DESC",
+                    )
+                    .map_err(|e| map_rusqlite_err("list_requests.prepare", &e))?;
+                let rows = stmt
+                    .query_map([], map_row)
+                    .map_err(|e| map_rusqlite_err("list_requests.query", &e))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| map_rusqlite_err("list_requests.collect", &e))
+            } else {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT request_id, conversation_id, sender_did, recipient_did, consent, \
+                                first_message_id, first_message_archived, payload_json, expires_at_ms, updated_at_ms \
+                         FROM requests WHERE consent = ?1 ORDER BY updated_at_ms DESC",
+                    )
+                    .map_err(|e| map_rusqlite_err("list_requests.prepare", &e))?;
+                let rows = stmt
+                    .query_map([consent], map_row)
+                    .map_err(|e| map_rusqlite_err("list_requests.query", &e))?;
+                rows.collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| map_rusqlite_err("list_requests.collect", &e))
+            }
         } else {
             let mut stmt = self
                 .conn

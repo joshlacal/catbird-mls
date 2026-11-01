@@ -162,6 +162,12 @@ pub enum MLSError {
     EpochMismatch { local: u64, remote: u64 },
 }
 
+impl From<crate::metadata::MetadataError> for MLSError {
+    fn from(err: crate::metadata::MetadataError) -> Self {
+        Self::Cryptography(err.to_string())
+    }
+}
+
 impl MLSError {
     pub fn invalid_input(msg: impl Into<String>) -> Self {
         Self::InvalidInput {

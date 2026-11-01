@@ -168,15 +168,46 @@ impl CatbirdMlsClient {
         self.get_group_metadata(&conversation_id)
     }
 
+    #[uniffi::method(name = "list_members")]
+    pub fn ffi_list_members(&self, conversation_id: String) -> Result<Vec<String>, MLSError> {
+        self.list_members(&conversation_id)
+    }
+
     #[uniffi::method(name = "create_group")]
     pub fn ffi_create_group(
         &self,
         conversation_id: String,
         sequencer_did: String,
+        member_dids: Vec<String>,
         title: Option<String>,
         description: Option<String>,
     ) -> Result<ConversationRow, MLSError> {
-        self.create_group(&conversation_id, &sequencer_did, title, description)
+        self.create_group(
+            &conversation_id,
+            &sequencer_did,
+            member_dids,
+            title,
+            description,
+        )
+    }
+
+    #[uniffi::method(name = "add_group_members")]
+    pub fn ffi_add_group_members(
+        &self,
+        conversation_id: String,
+        member_dids: Vec<String>,
+    ) -> Result<ConversationRow, MLSError> {
+        self.add_group_members(&conversation_id, member_dids)
+    }
+
+    #[uniffi::method(name = "replenish_key_packages")]
+    pub fn ffi_replenish_key_packages(&self, count: u32) -> Result<u32, MLSError> {
+        self.replenish_key_packages(count)
+    }
+
+    #[uniffi::method(name = "sync")]
+    pub fn ffi_sync(&self) -> Result<u32, MLSError> {
+        self.sync()
     }
 
     #[uniffi::method(name = "send_message")]

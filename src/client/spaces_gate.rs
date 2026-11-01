@@ -17,7 +17,7 @@ pub const REQUIRED_LABYRINTH_OAUTH_SCOPES: &[&str; 6] = &[
     "atproto",
     "blob:*/*",
     "repo:blue.catbird.labyrinth.mailboxKeys",
-    "repo:blue.catbird.mlsChat.device",
+    "repo:blue.catbird.chat.device",
     "space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete",
     "space:blue.catbird.labyrinth.conversation?authority=*",
 ];

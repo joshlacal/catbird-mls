@@ -3154,21 +3154,18 @@ pub fn canonical_application_aad_bytes(
     )
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_aad_bytes(
     aad_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
     canonical_aad_with_domain(b"CATBIRD-CHAT-METADATA\0", "metadataAad", aad_json)
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_exporter_context_bytes(
     context_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
     canonical_cbor_for_schema_impl("metadataExporterContext", context_json, false)
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_metadata_content_signing_input(
     content_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
@@ -3179,7 +3176,6 @@ pub fn canonical_metadata_content_signing_input(
     )
 }
 
-#[cfg(any(test, feature = "test-utils"))]
 pub fn canonical_application_content(
     frame_json: &serde_json::Value,
 ) -> Result<Vec<u8>, TransportError> {
